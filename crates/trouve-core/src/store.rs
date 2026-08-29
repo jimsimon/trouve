@@ -11274,7 +11274,15 @@ impl Store {
     /// Pushes a pending collapse's next attempt out with bounded exponential
     /// backoff (one minute doubling up to one hour), so a persistently
     /// failing finding cannot consume API quota on every retry pass.
-    pub fn defer_code_review_thread_collapse(&self, id: &str) -> Result<()> {
+    /// Records one failed collapse attempt with exponential backoff.
+    /// Returns `true` when the finding's collapse was abandoned instead:
+    /// past the attempt bound the thread is provably not collapsible from
+    /// here (deleted comments, closed pulls, permission loss), and leaving
+    /// it queued retries a deterministic failure every backoff interval
+    /// forever. Abandonment is cosmetic — the finding's ledger state is
+    /// already durable; only its GitHub thread stays un-collapsed.
+    pub fn defer_code_review_thread_collapse(&self, id: &str) -> Result<bool> {
+        const THREAD_COLLAPSE_MAX_ATTEMPTS: i64 = 24;
         let conn = self.conn.lock().unwrap();
         let tx = write_transaction(&conn)?;
         let attempts: i64 = tx
@@ -11285,17 +11293,29 @@ impl Store {
             )
             .optional()?
             .unwrap_or(0);
-        let delay_seconds = (60_i64 << attempts.clamp(0, 6)).min(3600);
-        let next_attempt = chrono::Utc::now() + chrono::Duration::seconds(delay_seconds);
-        tx.execute(
-            "UPDATE code_review_findings
-             SET collapse_attempts = collapse_attempts + 1,
-                 collapse_next_attempt_at = ?2
-             WHERE id = ?1",
-            params![id, next_attempt.to_rfc3339()],
-        )?;
+        let abandoned = attempts + 1 >= THREAD_COLLAPSE_MAX_ATTEMPTS;
+        if abandoned {
+            tx.execute(
+                "UPDATE code_review_findings
+                 SET collapse_pending = 0,
+                     collapse_attempts = collapse_attempts + 1,
+                     collapse_next_attempt_at = NULL
+                 WHERE id = ?1",
+                params![id],
+            )?;
+        } else {
+            let delay_seconds = (60_i64 << attempts.clamp(0, 6)).min(3600);
+            let next_attempt = chrono::Utc::now() + chrono::Duration::seconds(delay_seconds);
+            tx.execute(
+                "UPDATE code_review_findings
+                 SET collapse_attempts = collapse_attempts + 1,
+                     collapse_next_attempt_at = ?2
+                 WHERE id = ?1",
+                params![id, next_attempt.to_rfc3339()],
+            )?;
+        }
         tx.commit()?;
-        Ok(())
+        Ok(abandoned)
     }
 
     /// Fixed findings whose GitHub review thread has not been confirmed
@@ -13346,6 +13366,59 @@ impl Store {
             "UPDATE code_review_jobs
              SET publication_dispatched = 1, publication_accepted = 1
              WHERE id = ?1 AND publication_claimed != 0",
+            params![id],
+        )? > 0)
+    }
+
+    /// Whether a newer round of the same pull request has already published.
+    /// Publication order is assigned monotonically per pull at claim time,
+    /// so a published row with a higher order (or the same order and a later
+    /// rowid) means this job's round no longer represents the pull — its own
+    /// publication, delivered or not, is history.
+    pub fn code_review_publication_is_superseded(&self, id: &str) -> Result<bool> {
+        Ok(self.conn.lock().unwrap().query_row(
+            "SELECT EXISTS (
+               SELECT 1 FROM code_review_jobs AS newer
+               JOIN code_review_jobs AS current_job ON current_job.id = ?1
+               WHERE newer.repository = current_job.repository
+                 AND newer.pull_number = current_job.pull_number
+                 AND newer.rowid != current_job.rowid
+                 AND newer.review_published != 0
+                 AND (
+                   newer.publication_order > current_job.publication_order
+                   OR (
+                     newer.publication_order = current_job.publication_order
+                     AND newer.rowid > current_job.rowid
+                   )
+                 )
+             )",
+            params![id],
+            |row| row.get::<_, bool>(0),
+        )?)
+    }
+
+    pub fn code_review_projection_retry_count(&self, id: &str) -> Result<u32> {
+        let attempts: i64 = self.conn.lock().unwrap().query_row(
+            "SELECT projection_retry_count FROM code_review_jobs WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )?;
+        Ok(u32::try_from(attempts).unwrap_or(u32::MAX))
+    }
+
+    /// Releases a dispatched-but-never-accepted publication so it can be
+    /// posted again. The dispatched flag is deliberately sticky — a request
+    /// that may have crossed the process boundary must reconcile by marker,
+    /// never re-post — and this is the one sanctioned exception: the caller
+    /// has exhaustively scanned the review listing and proven the marker
+    /// absent, so a fresh POST cannot double-publish.
+    pub fn abandon_unpublished_code_review_dispatch(&self, id: &str) -> Result<bool> {
+        Ok(self.conn.lock().unwrap().execute(
+            "UPDATE code_review_jobs
+             SET publication_claimed = 0, publication_dispatched = 0,
+                 publication_order = 0
+             WHERE id = ?1 AND publication_accepted = 0
+               AND publication_dispatched != 0",
             params![id],
         )? > 0)
     }
@@ -19545,6 +19618,29 @@ mod tests {
             after_requeue > chrono::Duration::minutes(59),
             "{after_requeue}"
         );
+
+        // Past the attempt bound the collapse is abandoned instead of
+        // retrying a deterministic failure hourly forever: pending clears
+        // and the finding leaves the retry queue.
+        let mut abandoned = false;
+        for _ in 0..24 {
+            if store.defer_code_review_thread_collapse(&id).unwrap() {
+                abandoned = true;
+                break;
+            }
+        }
+        assert!(abandoned, "the collapse must abandon at its attempt bound");
+        let pending: bool = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT collapse_pending FROM code_review_findings WHERE id = ?1",
+                params![&id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!pending, "an abandoned collapse must leave the queue");
     }
 
     #[test]
@@ -22710,6 +22806,76 @@ mod tests {
             .enqueue_code_review_job(&backoff_test_job_request())
             .unwrap()
             .unwrap()
+    }
+
+    #[test]
+    fn unpublished_dispatch_recovery_is_supersession_aware() {
+        let store = Store::open_in_memory().unwrap();
+        let first = enqueue_backoff_test_job(&store);
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            first.id
+        );
+        assert!(store.claim_code_review_publication(&first.id).unwrap());
+        assert!(
+            store
+                .mark_code_review_publication_dispatched(&first.id)
+                .unwrap()
+        );
+        store
+            .finish_code_review_job(&first.id, "failed", "GitHub API 500", "")
+            .unwrap();
+        // No newer round has published yet: the dispatch is not superseded,
+        // and proving marker absence releases it for a genuine retry.
+        assert!(
+            !store
+                .code_review_publication_is_superseded(&first.id)
+                .unwrap()
+        );
+        assert!(
+            store
+                .abandon_unpublished_code_review_dispatch(&first.id)
+                .unwrap()
+        );
+        let record = store.code_review_job(&first.id).unwrap().unwrap();
+        assert!(!record.publication_claimed);
+        assert!(!record.publication_dispatched);
+        // Idempotent: a released dispatch has nothing left to abandon.
+        assert!(
+            !store
+                .abandon_unpublished_code_review_dispatch(&first.id)
+                .unwrap()
+        );
+
+        // A newer round publishing for the pull supersedes the first job's
+        // publication, delivered or not.
+        let mut newer_request = backoff_test_job_request();
+        newer_request.dedupe_key = "acme/widgets#42:newer".into();
+        newer_request.head_sha = "3333333333333333333333333333333333333333".into();
+        let newer = store
+            .enqueue_code_review_job(&newer_request)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            newer.id
+        );
+        assert!(store.claim_code_review_publication(&newer.id).unwrap());
+        assert!(
+            store
+                .reconcile_code_review_publication(&newer.id, "https://example/review", &[])
+                .unwrap()
+        );
+        assert!(
+            store
+                .code_review_publication_is_superseded(&first.id)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .code_review_publication_is_superseded(&newer.id)
+                .unwrap()
+        );
     }
 
     #[test]

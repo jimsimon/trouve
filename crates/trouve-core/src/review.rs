@@ -73,6 +73,13 @@ const REVIEW_THREAD_PROGRESS_MAX_ENTRIES: usize = 128;
 const REVIEW_PUBLICATION_LOOKUP_MAX_PAGES: u64 = 100;
 const REVIEW_PUBLICATION_LOOKUP_BUDGET: Duration = Duration::from_secs(60);
 const REVIEW_PUBLICATION_LOOKUP_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// How many exhaustive marker scans must come back definitively empty before
+/// a dispatched-but-unaccepted publication is treated as never created.
+/// Review listings can lag a fresh POST, so early absences stay retryable;
+/// past this bound absence is conclusive — GitHub rejected the dispatch (the
+/// 500 path) — and retrying the lookup forever burns API budget on a result
+/// that cannot change.
+const REVIEW_PUBLICATION_ABSENCE_CONFIRMATIONS: u32 = 3;
 /// Obsolete blocking verdict cleanup is resumable and deliberately small so
 /// it cannot monopolize the repository poll behind a large review history.
 const REVIEW_BLOCKING_CLEANUP_MAX_PAGES_PER_PASS: u64 = 3;
@@ -7759,7 +7766,20 @@ impl Engine {
                             %error,
                             "GitHub accepted the review but its response body could not be read"
                         );
-                        return match self.find_published_review(api, job).await {
+                        // GitHub accepted the POST, so the review exists;
+                        // a definitively empty listing here is lag, not
+                        // absence, and stays pending like any lookup error.
+                        return match self
+                            .find_published_review(api, job)
+                            .await
+                            .and_then(|found| {
+                                found.ok_or_else(|| {
+                                    anyhow!(
+                                        "accepted GitHub review is not yet listed by its \
+                                         publication marker"
+                                    )
+                                })
+                            }) {
                             Ok(published) => {
                                 self.persist_review_level_finding_urls_best_effort(
                                     &job.id,
@@ -7804,7 +7824,17 @@ impl Engine {
                             %error,
                             "GitHub accepted the review but returned an invalid response body"
                         );
-                        match self.find_published_review(api, job).await {
+                        match self
+                            .find_published_review(api, job)
+                            .await
+                            .and_then(|found| {
+                                found.ok_or_else(|| {
+                                    anyhow!(
+                                        "accepted GitHub review is not yet listed by its \
+                                     publication marker"
+                                    )
+                                })
+                            }) {
                             Ok(published) => published,
                             Err(error) => {
                                 tracing::warn!(
@@ -7916,11 +7946,73 @@ impl Engine {
         }
     }
 
+    /// A dispatched publication whose marker is definitively absent from an
+    /// exhaustive review listing. The dispatched flag is deliberately sticky
+    /// against blind re-posting, but conclusive absence is the one state
+    /// where that caution inverts: the review was never created, so nothing
+    /// can be double-published, while retrying the lookup forever burns a
+    /// full review-listing scan per poll on a result that cannot change —
+    /// the failure mode that kept two superseded jobs spinning for a day
+    /// after a single GitHub 500.
+    ///
+    /// A superseded round abandons its publication outright — even a
+    /// late-appearing review would no longer matter. A still-current round
+    /// waits out a short confirmation window (listings can lag), then
+    /// releases its dispatch so publication can genuinely retry.
+    async fn resolve_dispatched_publication_absence(
+        &self,
+        job: &trouve_protocol::CodeReviewJob,
+    ) -> Result<()> {
+        if self.store.code_review_publication_is_superseded(&job.id)? {
+            tracing::warn!(
+                job_id = %job.id,
+                repository = %job.repository,
+                pull_number = job.pull_number,
+                "dispatched review publication was never accepted by GitHub and the round is \
+                 superseded; abandoning its publication"
+            );
+            self.store.record_code_review_projection_failure(
+                &job.id,
+                "review publication was never accepted by GitHub and a newer round has taken \
+                 over this pull request; publication abandoned",
+                false,
+            )?;
+            self.emit_code_review_job_updated(&job.id)?;
+            self.emit_code_review_updated(Some(job.id.clone()))?;
+            return Ok(());
+        }
+        let attempts = self.store.code_review_projection_retry_count(&job.id)?;
+        if attempts < REVIEW_PUBLICATION_ABSENCE_CONFIRMATIONS {
+            bail!("accepted GitHub review could not be found by its publication marker");
+        }
+        if self
+            .store
+            .abandon_unpublished_code_review_dispatch(&job.id)?
+        {
+            tracing::warn!(
+                job_id = %job.id,
+                repository = %job.repository,
+                pull_number = job.pull_number,
+                "dispatched review publication was never accepted by GitHub; releasing the \
+                 dispatch so publication can retry"
+            );
+            self.emit_code_review_job_updated(&job.id)?;
+            self.emit_code_review_updated(Some(job.id.clone()))?;
+        }
+        Ok(())
+    }
+
+    /// Locates a dispatched review by its stable marker. `Ok(None)` is a
+    /// definitive answer — the listing was scanned to its final page and the
+    /// marker is not there — while errors (timeouts, pagination overflow)
+    /// prove nothing. Callers must treat the two differently: absence right
+    /// after an accepted POST is listing lag, but repeated definitive
+    /// absence after a failed dispatch means the review was never created.
     async fn find_published_review(
         &self,
         api: &GithubApi,
         job: &trouve_protocol::CodeReviewJob,
-    ) -> Result<PublishedReview> {
+    ) -> Result<Option<PublishedReview>> {
         let marker = inline_review_marker(&job.id);
         let bot_login = self.github_app_status()?.bot_login;
         let deadline = Instant::now() + REVIEW_PUBLICATION_LOOKUP_BUDGET;
@@ -7953,10 +8045,10 @@ impl Engine {
                         .as_deref()
                         .is_some_and(|body| body.contains(&marker))
             }) {
-                return Ok(review);
+                return Ok(Some(review));
             }
             if count < REVIEW_COMMENT_PAGE_SIZE {
-                bail!("accepted GitHub review could not be found by its publication marker");
+                return Ok(None);
             }
             page = page
                 .checked_add(1)
@@ -8235,10 +8327,14 @@ impl Engine {
             let _ = self
                 .store
                 .record_code_review_projection_failure(&job.id, &message, retryable);
+            // Log the full context chain: the top-level context alone
+            // ("updating GitHub review publication failed") hides which
+            // GitHub call failed and with what status, which is exactly
+            // what an operator needs from this line.
             tracing::warn!(
                 job_id = %job.id,
                 retryable,
-                %error,
+                error = %message,
                 "updating GitHub review progress failed"
             );
         }
@@ -8357,7 +8453,10 @@ impl Engine {
             return Ok(());
         }
 
-        let published = self.find_published_review(api, job).await?;
+        let published = match self.find_published_review(api, job).await? {
+            Some(published) => published,
+            None => return self.resolve_dispatched_publication_absence(job).await,
+        };
         let publication_findings = findings
             .iter()
             .filter(|finding| inline_finding_ids.contains(finding.id.as_str()))
@@ -9016,12 +9115,19 @@ impl Engine {
     /// Defers a finding's collapse retry, logging rather than propagating a
     /// store failure: the finding simply stays due and is retried sooner.
     fn defer_thread_collapse_logged(&self, finding: &trouve_protocol::CodeReviewFinding) {
-        if let Err(error) = self.store.defer_code_review_thread_collapse(&finding.id) {
-            tracing::warn!(
+        match self.store.defer_code_review_thread_collapse(&finding.id) {
+            Ok(true) => tracing::warn!(
+                finding_id = finding.id,
+                path = finding.path,
+                "review thread collapse abandoned after its attempt bound; the finding's \
+                 ledger state is durable and only its GitHub thread stays un-collapsed"
+            ),
+            Ok(false) => {}
+            Err(error) => tracing::warn!(
                 finding_id = finding.id,
                 error = format!("{error:#}"),
                 "failed to defer a review thread collapse retry"
-            );
+            ),
         }
     }
 
@@ -20158,7 +20264,11 @@ mod tests {
         )
         .unwrap();
 
-        let review = engine.find_published_review(&api, &job).await.unwrap();
+        let review = engine
+            .find_published_review(&api, &job)
+            .await
+            .unwrap()
+            .expect("the marker page holds the published review");
         await_mock_server(server).await;
         assert_eq!(review.id, 777);
     }
@@ -26498,6 +26608,127 @@ mod tests {
         ));
         assert!(next_thread_webhook_batch(&dispatch).is_some());
         assert!(next_thread_webhook_batch(&dispatch).is_none());
+    }
+
+    #[tokio::test]
+    async fn dispatched_publication_absence_resolves_terminally() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let with_head = |store: &crate::store::Store, key: &str, head: &str| {
+            let mut request = test_review_job_request(key);
+            request.head_sha = head.into();
+            store.enqueue_code_review_job(&request).unwrap().unwrap()
+        };
+        // A dispatched round whose POST failed (the 500 path) and whose
+        // marker is definitively absent.
+        let first = with_head(
+            &store,
+            "acme/widgets#42:dispatch-absent",
+            "2222222222222222222222222222222222222222",
+        );
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            first.id
+        );
+        assert!(store.claim_code_review_publication(&first.id).unwrap());
+        assert!(
+            store
+                .mark_code_review_publication_dispatched(&first.id)
+                .unwrap()
+        );
+        store
+            .finish_code_review_job(&first.id, "failed", "GitHub API 500", "")
+            .unwrap();
+        // A newer round publishes for the pull.
+        let newer = with_head(
+            &store,
+            "acme/widgets#42:dispatch-absent-newer",
+            "3333333333333333333333333333333333333333",
+        );
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            newer.id
+        );
+        assert!(store.claim_code_review_publication(&newer.id).unwrap());
+        assert!(
+            store
+                .reconcile_code_review_publication(&newer.id, "https://example/review", &[])
+                .unwrap()
+        );
+
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(store, data.path().to_path_buf(), &review_app_test_config());
+
+        // Superseded: the publication is abandoned with a terminal,
+        // non-retryable error so the repair drainer stops selecting it.
+        engine
+            .resolve_dispatched_publication_absence(&first)
+            .await
+            .unwrap();
+        let record = engine.store.code_review_job(&first.id).unwrap().unwrap();
+        assert!(record.job.check_sync_error.contains("newer round"));
+        assert!(
+            engine
+                .store
+                .code_review_jobs_with_projection_errors(10)
+                .unwrap()
+                .iter()
+                .all(|job| job.id != first.id),
+            "an abandoned publication must leave the repair queue"
+        );
+
+        // Still-current: absence stays retryable through the confirmation
+        // window, then releases the dispatch for a genuine retry.
+        let current = with_head(
+            &engine.store,
+            "acme/widgets#42:dispatch-absent-current",
+            "4444444444444444444444444444444444444444",
+        );
+        assert_eq!(
+            engine
+                .store
+                .claim_code_review_job()
+                .unwrap()
+                .unwrap()
+                .job
+                .id,
+            current.id
+        );
+        assert!(
+            engine
+                .store
+                .claim_code_review_publication(&current.id)
+                .unwrap()
+        );
+        assert!(
+            engine
+                .store
+                .mark_code_review_publication_dispatched(&current.id)
+                .unwrap()
+        );
+        engine
+            .store
+            .finish_code_review_job(&current.id, "failed", "GitHub API 500", "")
+            .unwrap();
+        assert!(
+            engine
+                .resolve_dispatched_publication_absence(&current)
+                .await
+                .is_err(),
+            "early absence stays retryable: listings can lag a dispatch"
+        );
+        for _ in 0..REVIEW_PUBLICATION_ABSENCE_CONFIRMATIONS {
+            engine
+                .store
+                .record_code_review_projection_failure(&current.id, "marker absent", true)
+                .unwrap();
+        }
+        engine
+            .resolve_dispatched_publication_absence(&current)
+            .await
+            .unwrap();
+        let record = engine.store.code_review_job(&current.id).unwrap().unwrap();
+        assert!(!record.publication_dispatched);
+        assert!(!record.publication_claimed);
     }
 
     #[tokio::test]
