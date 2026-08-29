@@ -4746,11 +4746,15 @@ impl Engine {
         let active_threads = Arc::new(Mutex::new(HashSet::new()));
         let workspace_registration_fence =
             Arc::new(ReviewWorkspaceRegistrationFence::for_job(job_id.clone()));
-        let previous_attempt_cleanup = self.cleanup_previous_code_review_attempt(&record).await;
         let review_settings = self.effective_code_review_settings();
         let review_timeout = Duration::from_secs(review_settings.total_timeout_seconds);
+        let previous_attempt_cleanup = tokio::time::timeout(
+            review_timeout,
+            self.cleanup_previous_code_review_attempt(&record),
+        )
+        .await;
         let result = match previous_attempt_cleanup {
-            Ok(()) => {
+            Ok(Ok(())) => {
                 tokio::time::timeout(
                     review_timeout,
                     self.execute_code_review(
@@ -4763,8 +4767,12 @@ impl Engine {
                 )
                 .await
             }
-            Err(error) => Ok(Err(anyhow!(error)
+            Ok(Err(error)) => Ok(Err(anyhow!(error)
                 .context("cleaning up the interrupted attempt before restarting review"))),
+            Err(_) => Ok(Err(anyhow!(
+                "cleaning up the interrupted attempt timed out after {}",
+                compact_elapsed(review_timeout.as_millis().try_into().unwrap_or(u64::MAX))
+            ))),
         };
         if !matches!(result, Ok(Ok(_))) {
             // A blocking registration may outlive its dropped join future. If
@@ -4958,7 +4966,7 @@ impl Engine {
     }
 
     async fn cleanup_previous_code_review_attempt(
-        &self,
+        self: &Arc<Self>,
         record: &CodeReviewJobRecord,
     ) -> Result<(), EngineError> {
         if let Some(session_id) = record.job.session_id.as_deref() {
@@ -4970,9 +4978,24 @@ impl Engine {
             }
         }
         if let Some(intent) = self.store.review_workspace_cleanup_intent(&record.job.id)? {
-            self.reconcile_review_workspace_cleanup_with_injection(&intent)?;
+            self.reconcile_review_workspace_cleanup_async(intent)
+                .await?;
         }
         Ok(())
+    }
+
+    async fn reconcile_review_workspace_cleanup_async(
+        self: &Arc<Self>,
+        intent: crate::store::ReviewWorkspaceCleanupIntent,
+    ) -> Result<(), EngineError> {
+        let engine = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            engine.reconcile_review_workspace_cleanup_with_injection(&intent)
+        })
+        .await
+        .map_err(|error| {
+            EngineError::Internal(anyhow!("joining review workspace cleanup worker: {error}"))
+        })?
     }
 
     fn reconcile_review_workspace_cleanup_with_injection(
@@ -4995,7 +5018,7 @@ impl Engine {
         self.reconcile_review_workspace_cleanup(intent)
     }
 
-    async fn retry_code_review_cleanup(&self) {
+    async fn retry_code_review_cleanup(self: &Arc<Self>) {
         let pending = match self.store.pending_code_review_job_cleanups() {
             Ok(pending) => pending,
             Err(error) => {
@@ -5034,7 +5057,10 @@ impl Engine {
             }
         };
         for intent in pending {
-            if let Err(error) = self.reconcile_review_workspace_cleanup_with_injection(&intent) {
+            if let Err(error) = self
+                .reconcile_review_workspace_cleanup_async(intent.clone())
+                .await
+            {
                 self.record_review_error(format!(
                     "cleaning up terminal review workspace for job {}: {error}",
                     intent.job_id

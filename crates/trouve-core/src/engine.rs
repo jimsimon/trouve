@@ -8738,6 +8738,18 @@ impl Engine {
                     "session idempotency key was already used for a different request".into(),
                 ));
             }
+            if let Some(review_job_id) = review_job_id
+                && !self.store.bind_review_job_to_idempotent_session(
+                    review_job_id,
+                    key,
+                    &request_fingerprint,
+                    &existing.id,
+                )?
+            {
+                return Err(EngineError::BadRequest(
+                    "stale: review job cannot adopt the idempotent session".into(),
+                ));
+            }
             return self.get_session(&existing.id);
         }
         let ws =

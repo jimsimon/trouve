@@ -407,6 +407,8 @@ CREATE TABLE IF NOT EXISTS code_review_workspace_cleanup_intents (
 );
 CREATE INDEX IF NOT EXISTS code_review_workspace_cleanup_due
   ON code_review_workspace_cleanup_intents (next_attempt_at, created_at);
+CREATE INDEX IF NOT EXISTS code_review_workspace_cleanup_workspace
+  ON code_review_workspace_cleanup_intents (workspace_id, generation);
 CREATE TABLE IF NOT EXISTS code_review_tasks (
   id TEXT PRIMARY KEY,
   job_id TEXT NOT NULL REFERENCES code_review_jobs(id),
@@ -742,6 +744,8 @@ const MIGRATIONS: &[&str] = &[
      )",
     "CREATE INDEX IF NOT EXISTS code_review_workspace_cleanup_due
        ON code_review_workspace_cleanup_intents (next_attempt_at, created_at)",
+    "CREATE INDEX IF NOT EXISTS code_review_workspace_cleanup_workspace
+       ON code_review_workspace_cleanup_intents (workspace_id, generation)",
     "ALTER TABLE code_review_jobs ADD COLUMN config_hash TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE code_review_jobs ADD COLUMN review_base_sha TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE code_review_jobs ADD COLUMN review_watermark_sha TEXT NOT NULL DEFAULT ''",
@@ -7233,6 +7237,34 @@ impl Store {
         )
         .optional()
         .map_err(Into::into)
+    }
+
+    /// Associate a legacy idempotent review session with its running job.
+    /// The guarded update revalidates the durable request fingerprint and
+    /// rejects conflicting ownership in the same SQLite statement.
+    pub(crate) fn bind_review_job_to_idempotent_session(
+        &self,
+        job_id: &str,
+        key: &str,
+        request_fingerprint: &str,
+        session_id: &str,
+    ) -> Result<bool> {
+        let updated = self.conn.lock().unwrap().execute(
+            "UPDATE code_review_jobs
+             SET session_id = ?4, thread_id = NULL
+             WHERE id = ?1 AND status = 'running'
+               AND (session_id IS NULL OR session_id = ?4)
+               AND EXISTS (
+                 SELECT 1
+                 FROM session_create_requests
+                 JOIN sessions ON sessions.id = session_create_requests.session_id
+                 WHERE session_create_requests.idempotency_key = ?2
+                   AND session_create_requests.request_fingerprint = ?3
+                   AND sessions.id = ?4
+               )",
+            params![job_id, key, request_fingerprint, session_id],
+        )?;
+        Ok(updated == 1)
     }
 
     pub fn list_sessions(&self, workspace_id: Option<&str>) -> Result<Vec<Session>> {
@@ -17314,7 +17346,7 @@ mod tests {
                 .insert_session_with_lifecycle(
                     &session,
                     &invalid_checkpoint,
-                    None,
+                    Some(("review-session-key", "review-session-fingerprint")),
                     Some(&review_job.id),
                     vec![(
                         Scope::Server,
@@ -17353,7 +17385,7 @@ mod tests {
             .insert_session_with_lifecycle(
                 &session,
                 &checkpoint,
-                None,
+                Some(("review-session-key", "review-session-fingerprint")),
                 Some(&review_job.id),
                 vec![(
                     Scope::Server,
@@ -17375,6 +17407,49 @@ mod tests {
                 .as_deref(),
             Some(session.id.as_str())
         );
+        store
+            .clear_code_review_job_session(&review_job.id, &session.id)
+            .unwrap();
+        assert!(
+            !store
+                .bind_review_job_to_idempotent_session(
+                    &review_job.id,
+                    "review-session-key",
+                    "wrong-fingerprint",
+                    &session.id,
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .code_review_job(&review_job.id)
+                .unwrap()
+                .unwrap()
+                .job
+                .session_id
+                .is_none()
+        );
+        assert!(
+            store
+                .bind_review_job_to_idempotent_session(
+                    &review_job.id,
+                    "review-session-key",
+                    "review-session-fingerprint",
+                    &session.id,
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .code_review_job(&review_job.id)
+                .unwrap()
+                .unwrap()
+                .job
+                .session_id
+                .as_deref(),
+            Some(session.id.as_str())
+        );
+        assert_eq!(store.list_sessions(None).unwrap().len(), 1);
     }
 
     #[test]
