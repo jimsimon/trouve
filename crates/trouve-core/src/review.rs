@@ -6375,6 +6375,7 @@ impl Engine {
             let carried_anchor_lines = self
                 .prefetch_carried_anchor_lines(
                     &previous_findings,
+                    &diff_files,
                     repository_path.as_path(),
                     &job.head_sha,
                     superseded,
@@ -10677,57 +10678,43 @@ impl Engine {
     async fn prefetch_carried_anchor_lines(
         &self,
         findings: &[trouve_protocol::CodeReviewFinding],
+        diff_files: &[ReviewDiffFile],
         repository_path: &std::path::Path,
         head_sha: &str,
         cancel: &CancellationToken,
     ) -> HashMap<(String, u64), Option<String>> {
-        const CARRIED_ANCHOR_PREFETCH_MAX: usize = 32;
+        const CARRIED_ANCHOR_PREFETCH_BATCH_SIZE: usize = 32;
+        let targets = carried_anchor_targets(findings, diff_files);
         let mut lines = HashMap::new();
-        for finding in findings
-            .iter()
-            .filter(|finding| {
-                finding.status == "open"
-                    && finding.line > 0
-                    && finding_is_blocking(&finding.severity, &finding.confidence)
-                    && finding_scope_blocks(&finding.evidence)
-            })
-            .take(CARRIED_ANCHOR_PREFETCH_MAX)
-        {
-            let key = (finding.path.clone(), finding.line);
-            if lines.contains_key(&key) {
-                continue;
-            }
-            let relative = std::path::Path::new(&finding.path);
-            if relative.is_absolute()
-                || relative
-                    .components()
-                    .any(|component| !matches!(component, std::path::Component::Normal(_)))
-            {
-                continue;
-            }
-            match self
-                .executor
-                .review_repository_object_line(&crate::tools::ReviewRepositoryObjectLine {
-                    managed_root: self.data_dir.join("review-repositories"),
-                    worktree: repository_path.to_path_buf(),
-                    head_sha: head_sha.to_owned(),
-                    path: finding.path.clone(),
-                    line: finding.line,
-                    max_bytes: REVIEW_ANCHOR_BLOB_MAX_BYTES,
-                    cancel: cancel.clone(),
-                })
-                .await
-            {
-                Ok(content) => {
-                    lines.insert(key, content);
-                }
-                Err(error) => {
-                    tracing::debug!(
-                        path = %finding.path,
-                        line = finding.line,
-                        %error,
-                        "carried anchor line unavailable; its resolution stays claim-gated"
-                    );
+        // Limit each batch rather than the total target set: every carried
+        // blocker remains verifiable while executor work stays incremental.
+        for batch in targets.chunks(CARRIED_ANCHOR_PREFETCH_BATCH_SIZE) {
+            for (path, line) in batch {
+                let key = (path.clone(), *line);
+                match self
+                    .executor
+                    .review_repository_object_line(&crate::tools::ReviewRepositoryObjectLine {
+                        managed_root: self.data_dir.join("review-repositories"),
+                        worktree: repository_path.to_path_buf(),
+                        head_sha: head_sha.to_owned(),
+                        path: path.clone(),
+                        line: *line,
+                        max_bytes: REVIEW_ANCHOR_BLOB_MAX_BYTES,
+                        cancel: cancel.clone(),
+                    })
+                    .await
+                {
+                    Ok(content) => {
+                        lines.insert(key, content);
+                    }
+                    Err(error) => {
+                        tracing::debug!(
+                            path,
+                            line,
+                            %error,
+                            "carried anchor line unavailable; its resolution stays claim-gated"
+                        );
+                    }
                 }
             }
         }
@@ -16974,6 +16961,39 @@ fn finding_scope_blocks(evidence: &trouve_protocol::CodeReviewFindingEvidence) -
     evidence.change_scope != "unverified"
 }
 
+fn carried_anchor_targets(
+    findings: &[trouve_protocol::CodeReviewFinding],
+    files: &[ReviewDiffFile],
+) -> Vec<(String, u64)> {
+    let touched_paths = files
+        .iter()
+        .map(|file| file.path.as_str())
+        .collect::<HashSet<_>>();
+    let mut seen = HashSet::new();
+    findings
+        .iter()
+        .filter(|finding| {
+            finding.status == "open"
+                && finding.line > 0
+                && finding_is_blocking(&finding.severity, &finding.confidence)
+                && finding_scope_blocks(&finding.evidence)
+                && !touched_paths.contains(finding.path.as_str())
+        })
+        .filter_map(|finding| {
+            let relative = std::path::Path::new(&finding.path);
+            if relative.is_absolute()
+                || relative
+                    .components()
+                    .any(|component| !matches!(component, std::path::Component::Normal(_)))
+            {
+                return None;
+            }
+            let key = (finding.path.clone(), finding.line);
+            seen.insert(key.clone()).then_some(key)
+        })
+        .collect()
+}
+
 /// Verifies one carried-resolution claim against the server's own read of
 /// the head revision. `current` is `None` when the anchor was never
 /// prefetched (unverifiable — reject), `Some(None)` when the anchor line no
@@ -19802,6 +19822,37 @@ mod tests {
         assert!(!accepted.contains(&"rvf_stale".to_owned()));
         assert!(accepted.contains(&"rvf_advisory".to_owned()));
         assert!(accepted.contains(&"rvf_unknown".to_owned()));
+    }
+
+    #[test]
+    fn carried_anchor_targets_filter_and_deduplicate_before_batching() {
+        let files = vec![ReviewDiffFile {
+            path: "src/touched.rs".into(),
+            diff: "+changed\n".into(),
+            generated_header: None,
+        }];
+        let mut findings = (1..=32)
+            .map(|line| open_history_finding("rvf_touched", "src/touched.rs", line, "high"))
+            .collect::<Vec<_>>();
+        findings.extend([
+            open_history_finding("rvf_duplicate_1", "src/duplicate.rs", 7, "high"),
+            open_history_finding("rvf_duplicate_2", "src/duplicate.rs", 7, "high"),
+        ]);
+        findings.extend((0..34).map(|index| {
+            open_history_finding(
+                &format!("rvf_carried_{index}"),
+                &format!("src/carried_{index}.rs"),
+                1,
+                "high",
+            )
+        }));
+
+        let targets = carried_anchor_targets(&findings, &files);
+
+        assert_eq!(targets.len(), 35);
+        assert_eq!(targets[0], ("src/duplicate.rs".to_owned(), 7));
+        assert_eq!(targets.last(), Some(&("src/carried_33.rs".to_owned(), 1)));
+        assert!(targets.iter().all(|(path, _)| path != "src/touched.rs"));
     }
 
     #[test]
