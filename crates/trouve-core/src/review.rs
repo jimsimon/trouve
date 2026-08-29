@@ -1208,6 +1208,41 @@ const THREADLESS_COMMAND_PASS_LIMIT: usize = 16;
 /// resolve/unresolve pair; past this window the sibling is not coming.
 const THREADLESS_COMMAND_REPLAY_WINDOW: Duration = Duration::from_secs(120);
 
+/// How a commenter's effective-permission lookup concluded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommenterPermissionLookup {
+    /// The commenter holds write, maintain, or admin.
+    Authorized,
+    /// A definitive no: read-level permission, or GitHub's 404 for "not a
+    /// collaborator".
+    Unauthorized,
+    /// The app itself cannot ask: the installation lacks the permission the
+    /// collaborators API requires ("Resource not accessible by
+    /// integration"). Permanent until the app is reconfigured — retrying
+    /// would block the pull's command queue forever, so the caller must
+    /// consume the command with an explanatory reply instead.
+    Unverifiable,
+}
+
+/// Classifies a failed permission lookup from its error chain. `None` means
+/// transient (rate limits, 5xx, network) and worth retrying; `Some` verdicts
+/// are definitive and must not requeue.
+fn permission_lookup_error_verdict(error_chain: &str) -> Option<CommenterPermissionLookup> {
+    let lower = error_chain.to_lowercase();
+    // 404 is the API's answer for "not a collaborator": a definitive no,
+    // never a retryable failure.
+    if lower.contains("github api 404") {
+        return Some(CommenterPermissionLookup::Unauthorized);
+    }
+    // GitHub's fixed phrasing for an installation whose granted permissions
+    // do not cover the endpoint. A plain 403 stays retryable — that is how
+    // rate limiting and abuse throttling answer.
+    if lower.contains("resource not accessible by integration") {
+        return Some(CommenterPermissionLookup::Unverifiable);
+    }
+    None
+}
+
 /// How one durable command left its processing attempt.
 enum ThreadlessCommandDisposition {
     /// The command reached a definitive outcome and its row was consumed.
@@ -10259,9 +10294,9 @@ impl Engine {
         api: &GithubApi,
         repository: &str,
         username: &str,
-    ) -> Result<bool> {
+    ) -> Result<CommenterPermissionLookup> {
         if username.is_empty() {
-            return Ok(false);
+            return Ok(CommenterPermissionLookup::Unauthorized);
         }
         let (permission, rate): (serde_json::Value, _) = match api
             .get(&format!(
@@ -10271,22 +10306,23 @@ impl Engine {
         {
             Ok(response) => response,
             Err(error) => {
-                // 404 is the API's answer for "not a collaborator": a
-                // definitive no, never a retryable failure.
-                if format!("{error:#}")
-                    .to_lowercase()
-                    .contains("github api 404")
-                {
-                    return Ok(false);
+                if let Some(verdict) = permission_lookup_error_verdict(&format!("{error:#}")) {
+                    return Ok(verdict);
                 }
                 return Err(error).context("looking up commenter repository permission");
             }
         };
         self.record_review_rate(rate);
-        Ok(matches!(
-            permission["permission"].as_str(),
-            Some("admin" | "write" | "maintain")
-        ))
+        Ok(
+            if matches!(
+                permission["permission"].as_str(),
+                Some("admin" | "write" | "maintain")
+            ) {
+                CommenterPermissionLookup::Authorized
+            } else {
+                CommenterPermissionLookup::Unauthorized
+            },
+        )
     }
 
     /// Post a short guidance reply to a malformed command comment.
@@ -10377,7 +10413,7 @@ impl Engine {
                 return;
             }
         };
-        let mut permission_cache: HashMap<String, bool> = HashMap::new();
+        let mut permission_cache: HashMap<String, CommenterPermissionLookup> = HashMap::new();
         let mut halted_pulls: HashSet<u64> = HashSet::new();
         let mut processed = 0usize;
         for command in commands {
@@ -10429,7 +10465,7 @@ impl Engine {
         api: &GithubApi,
         repository: &CodeReviewRepository,
         command: &crate::store::PendingThreadlessCommand,
-        permission_cache: &mut HashMap<String, bool>,
+        permission_cache: &mut HashMap<String, CommenterPermissionLookup>,
     ) -> ThreadlessCommandDisposition {
         // Author association is only a cheap pre-filter: MEMBER admits
         // read-only organization members and COLLABORATOR does not imply
@@ -10437,15 +10473,15 @@ impl Engine {
         // current effective repository permission, checked authoritatively —
         // the same authority GitHub demands before someone could have
         // toggled the old dismissal checkboxes by editing the bot's comment.
-        let authorized = match permission_cache.get(&command.author) {
-            Some(authorized) => *authorized,
+        let lookup = match permission_cache.get(&command.author) {
+            Some(lookup) => *lookup,
             None => match self
                 .commenter_has_write_permission(api, &repository.repository, &command.author)
                 .await
             {
-                Ok(authorized) => {
-                    permission_cache.insert(command.author.clone(), authorized);
-                    authorized
+                Ok(lookup) => {
+                    permission_cache.insert(command.author.clone(), lookup);
+                    lookup
                 }
                 Err(error) => {
                     self.record_review_error(format!(
@@ -10456,7 +10492,42 @@ impl Engine {
             },
         };
         use crate::store::ThreadlessCommandOutcome;
-        if !authorized {
+        if lookup == CommenterPermissionLookup::Unverifiable {
+            // The app cannot answer the authorization question until its
+            // installation is reconfigured; retrying would block this pull's
+            // command queue forever. Consume the command and say why, so the
+            // maintainer can fix the installation and re-issue it.
+            self.record_review_error(format!(
+                "threadless resolve command from @{} could not be authorized: the review app's \
+                 installation lacks access to the collaborator-permission API",
+                command.author
+            ));
+            let unverifiable = crate::store::PendingThreadlessCommand {
+                finding_prefix: "rvf_never-matches".to_owned(),
+                ..command.clone()
+            };
+            if let Err(error) = self
+                .store
+                .apply_threadless_resolve_command(&unverifiable, "", None)
+            {
+                self.record_review_error(format!(
+                    "consuming an unverifiable threadless command failed: {error:#}"
+                ));
+                return ThreadlessCommandDisposition::RetryPull;
+            }
+            self.reply_to_threadless_command(
+                repository,
+                command.pull_number,
+                &command.author,
+                "your command was not applied: the review app cannot verify repository \
+                 permissions (GitHub answered \"Resource not accessible by integration\"). \
+                 Grant the app's installation read access to the collaborators API and \
+                 re-issue the command.",
+            )
+            .await;
+            return ThreadlessCommandDisposition::Done;
+        }
+        if lookup != CommenterPermissionLookup::Authorized {
             tracing::info!(
                 repository = %repository.repository,
                 author = %command.author,
@@ -27261,6 +27332,39 @@ mod tests {
             parse_threadless_resolve_command("resolve rvf_9b7fc0c6 x"),
             None
         );
+    }
+
+    #[test]
+    fn permission_lookup_errors_classify_definitive_and_transient_failures() {
+        use CommenterPermissionLookup::{Unauthorized, Unverifiable};
+        assert_eq!(
+            permission_lookup_error_verdict(
+                "looking up commenter repository permission: GitHub API 404 Not Found"
+            ),
+            Some(Unauthorized)
+        );
+        // The installation lacks the permission the endpoint requires: a
+        // permanent misconfiguration, not the commenter's answer and not a
+        // retryable failure.
+        assert_eq!(
+            permission_lookup_error_verdict(
+                "GitHub API 403 Forbidden: Resource not accessible by integration"
+            ),
+            Some(Unverifiable)
+        );
+        // Throttling answers with 403 too; those stay retryable.
+        for transient in [
+            "GitHub API 403 Forbidden: API rate limit exceeded for installation",
+            "GitHub API 403 Forbidden: You have exceeded a secondary rate limit",
+            "GitHub API 500 Internal Server Error",
+            "connection reset by peer",
+        ] {
+            assert_eq!(
+                permission_lookup_error_verdict(transient),
+                None,
+                "{transient}"
+            );
+        }
     }
 
     #[test]
