@@ -6372,10 +6372,14 @@ impl Engine {
             // so the coordinator can judge — and provably ground — fixes
             // whose commits predate this round's diff window. In-context
             // comparison, no extra model turns or tool calls.
+            let published_rounds = self
+                .store
+                .published_code_review_round_count(&job.repository, job.pull_number)?;
             let carried_anchor_lines = self
                 .prefetch_carried_anchor_lines(
                     &previous_findings,
                     &diff_files,
+                    published_rounds,
                     repository_path.as_path(),
                     &job.head_sha,
                     superseded,
@@ -10663,58 +10667,55 @@ impl Engine {
         Ok(ReviewThreadReconciliationOutcome::Completed)
     }
 
-    /// Prefetch immutable-object lines for every anchor the coordinator's
-    /// findings reference outside the diff, through the executor's audited
-    /// git boundary. Reading before validation keeps verification itself
-    /// pure, and the object store makes the read immune to concurrent
-    /// checkout syncs, symlinks, and replacement refs.
-    /// Current head-revision content at each carried open blocking
-    /// finding's anchor, for the coordinator's carried-finding review and
-    /// the server-side verification of its resolution claims. `Some(None)`
+    /// Prefetch one durable page of immutable-object lines for anchors the
+    /// coordinator's findings reference outside the diff, through the
+    /// executor's audited git boundary. Reading before validation keeps
+    /// verification itself pure, and the object store makes the read immune
+    /// to concurrent checkout syncs, symlinks, and replacement refs.
+    /// Current head-revision content supports the coordinator's carried-finding
+    /// review and server-side verification of its resolution claims. Some(None)
     /// records that the anchor line no longer exists — itself verifiable
     /// evidence — while unreadable or hostile paths are simply absent from
-    /// the map (their resolutions stay claim-rejected). Bounded, audited
-    /// git-object reads through the executor, milliseconds per finding.
+    /// the map (their resolutions stay claim-rejected). Each review advances
+    /// a bounded page after successful publication, so large ledgers remain
+    /// bounded per pass and receive complete coverage across later rounds.
     async fn prefetch_carried_anchor_lines(
         &self,
         findings: &[trouve_protocol::CodeReviewFinding],
         diff_files: &[ReviewDiffFile],
+        published_rounds: u64,
         repository_path: &std::path::Path,
         head_sha: &str,
         cancel: &CancellationToken,
     ) -> HashMap<(String, u64), Option<String>> {
-        const CARRIED_ANCHOR_PREFETCH_BATCH_SIZE: usize = 32;
         let targets = carried_anchor_targets(findings, diff_files);
+        let targets = carried_anchor_page(&targets, published_rounds);
         let mut lines = HashMap::new();
-        // Limit each batch rather than the total target set: every carried
-        // blocker remains verifiable while executor work stays incremental.
-        for batch in targets.chunks(CARRIED_ANCHOR_PREFETCH_BATCH_SIZE) {
-            for (path, line) in batch {
-                let key = (path.clone(), *line);
-                match self
-                    .executor
-                    .review_repository_object_line(&crate::tools::ReviewRepositoryObjectLine {
-                        managed_root: self.data_dir.join("review-repositories"),
-                        worktree: repository_path.to_path_buf(),
-                        head_sha: head_sha.to_owned(),
-                        path: path.clone(),
-                        line: *line,
-                        max_bytes: REVIEW_ANCHOR_BLOB_MAX_BYTES,
-                        cancel: cancel.clone(),
-                    })
-                    .await
-                {
-                    Ok(content) => {
-                        lines.insert(key, content);
-                    }
-                    Err(error) => {
-                        tracing::debug!(
-                            path,
-                            line,
-                            %error,
-                            "carried anchor line unavailable; its resolution stays claim-gated"
-                        );
-                    }
+        for (path, line) in targets {
+            let key = (path.clone(), line);
+            match self
+                .executor
+                .review_repository_object_line(&crate::tools::ReviewRepositoryObjectLine {
+                    managed_root: self.data_dir.join("review-repositories"),
+                    worktree: repository_path.to_path_buf(),
+                    head_sha: head_sha.to_owned(),
+                    path: path.clone(),
+                    line,
+                    max_bytes: REVIEW_ANCHOR_BLOB_MAX_BYTES,
+                    cancel: cancel.clone(),
+                })
+                .await
+            {
+                Ok(content) => {
+                    lines.insert(key, content);
+                }
+                Err(error) => {
+                    tracing::debug!(
+                        path,
+                        line,
+                        %error,
+                        "carried anchor line unavailable; its resolution stays claim-gated"
+                    );
                 }
             }
         }
@@ -16994,6 +16995,22 @@ fn carried_anchor_targets(
         .collect()
 }
 
+const CARRIED_ANCHOR_PREFETCH_PAGE_SIZE: usize = 32;
+
+fn carried_anchor_page(targets: &[(String, u64)], published_rounds: u64) -> Vec<(String, u64)> {
+    if targets.is_empty() {
+        return Vec::new();
+    }
+    let page_count = targets.len().div_ceil(CARRIED_ANCHOR_PREFETCH_PAGE_SIZE);
+    let page = usize::try_from(published_rounds % page_count as u64).unwrap_or_default();
+    targets
+        .iter()
+        .skip(page * CARRIED_ANCHOR_PREFETCH_PAGE_SIZE)
+        .take(CARRIED_ANCHOR_PREFETCH_PAGE_SIZE)
+        .cloned()
+        .collect()
+}
+
 /// Verifies one carried-resolution claim against the server's own read of
 /// the head revision. `current` is `None` when the anchor was never
 /// prefetched (unverifiable — reject), `Some(None)` when the anchor line no
@@ -19825,7 +19842,7 @@ mod tests {
     }
 
     #[test]
-    fn carried_anchor_targets_filter_and_deduplicate_before_batching() {
+    fn carried_anchor_targets_are_filtered_deduplicated_and_durably_paged() {
         let files = vec![ReviewDiffFile {
             path: "src/touched.rs".into(),
             diff: "+changed\n".into(),
@@ -19848,11 +19865,20 @@ mod tests {
         }));
 
         let targets = carried_anchor_targets(&findings, &files);
+        let first = carried_anchor_page(&targets, 0);
+        let second = carried_anchor_page(&targets, 1);
 
         assert_eq!(targets.len(), 35);
         assert_eq!(targets[0], ("src/duplicate.rs".to_owned(), 7));
         assert_eq!(targets.last(), Some(&("src/carried_33.rs".to_owned(), 1)));
         assert!(targets.iter().all(|(path, _)| path != "src/touched.rs"));
+        assert_eq!(first.len(), CARRIED_ANCHOR_PREFETCH_PAGE_SIZE);
+        assert_eq!(second.len(), 3);
+        assert_eq!(carried_anchor_page(&targets, 2), first);
+        assert_eq!(
+            first.iter().chain(&second).cloned().collect::<HashSet<_>>(),
+            targets.into_iter().collect()
+        );
     }
 
     #[test]

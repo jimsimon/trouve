@@ -12514,6 +12514,22 @@ impl Store {
             .optional()?)
     }
 
+    /// Number of successfully published rounds for a pull. This is a durable
+    /// cursor for bounded work that advances only after a round publishes.
+    pub fn published_code_review_round_count(
+        &self,
+        repository: &str,
+        pull_number: u64,
+    ) -> Result<u64> {
+        let count = self.conn.lock().unwrap().query_row(
+            "SELECT COUNT(*) FROM code_review_jobs
+             WHERE repository = ?1 AND pull_number = ?2 AND review_published = 1",
+            params![repository, pull_number as i64],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(count as u64)
+    }
+
     /// The pull request whose lifecycle comment has this GitHub comment id,
     /// if any. Used to attribute checkbox edits on the sticky comment.
     pub fn code_review_pull_for_lifecycle_comment(
@@ -21402,6 +21418,12 @@ mod tests {
         request.scope = trouve_protocol::CodeReviewJobScope::Full;
         let job = store.enqueue_code_review_job(&request).unwrap().unwrap();
         assert_eq!(
+            store
+                .published_code_review_round_count("acme/widgets", 42)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
             store.claim_code_review_job().unwrap().unwrap().job.id,
             job.id
         );
@@ -21424,6 +21446,12 @@ mod tests {
         store
             .finish_code_review_job(&job.id, "succeeded", "", "")
             .unwrap();
+        assert_eq!(
+            store
+                .published_code_review_round_count("acme/widgets", 42)
+                .unwrap(),
+            1
+        );
         // The full round settles coverage only for the head it reviewed; a
         // newer head has no published round and therefore no verdict.
         assert_eq!(
