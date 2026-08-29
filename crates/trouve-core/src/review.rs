@@ -8442,6 +8442,7 @@ impl Engine {
             &job.id,
             REVIEW_PUBLICATION_ABSENCE_CONFIRMATIONS,
         )? {
+            crate::store::CodeReviewPublicationAbsenceOutcome::Published => {}
             crate::store::CodeReviewPublicationAbsenceOutcome::Pending
             | crate::store::CodeReviewPublicationAbsenceOutcome::AcceptedPending
             | crate::store::CodeReviewPublicationAbsenceOutcome::NewerPublicationPending => {

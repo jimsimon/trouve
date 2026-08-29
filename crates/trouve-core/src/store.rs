@@ -3516,6 +3516,9 @@ pub struct CodeReviewJobRecord {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodeReviewPublicationAbsenceOutcome {
+    /// Another worker already reconciled the publication, so the stale
+    /// absence observation must not change durable state.
+    Published,
     /// The remote outcome remains unknown and reconciliation will retry.
     Pending,
     /// GitHub accepted the POST, so absence can only be listing lag.
@@ -14106,7 +14109,15 @@ impl Store {
     ) -> Result<CodeReviewPublicationAbsenceOutcome> {
         let conn = self.conn.lock().unwrap();
         let tx = write_transaction(&conn)?;
-        let (accepted, dispatched, absence_count, superseded, newer_publication_pending): (
+        let (
+            published,
+            accepted,
+            dispatched,
+            absence_count,
+            superseded,
+            newer_publication_pending,
+        ): (
+            bool,
             bool,
             bool,
             i64,
@@ -14114,7 +14125,8 @@ impl Store {
             bool,
         ) = tx.query_row(
             &format!(
-                "SELECT current_job.publication_accepted,
+                "SELECT current_job.review_published,
+                        current_job.publication_accepted,
                         current_job.publication_dispatched,
                         current_job.publication_marker_absence_count,
                         EXISTS (
@@ -14149,10 +14161,13 @@ impl Store {
                     row.get(2)?,
                     row.get(3)?,
                     row.get(4)?,
+                    row.get(5)?,
                 ))
             },
         )?;
-        let outcome = if superseded {
+        let outcome = if published {
+            CodeReviewPublicationAbsenceOutcome::Published
+        } else if superseded {
             tx.execute(
                 "UPDATE code_review_jobs
                  SET publication_marker_absence_count = 0,
@@ -24347,8 +24362,47 @@ mod tests {
             store
                 .resolve_code_review_publication_absence(&newer.id, 1)
                 .unwrap(),
-            CodeReviewPublicationAbsenceOutcome::AcceptedPending,
-            "an accepted publication remains recoverable however long listing lags"
+            CodeReviewPublicationAbsenceOutcome::Published,
+            "a stale absence observation is a no-op after publication is reconciled"
+        );
+        store
+            .finish_code_review_job(&newer.id, "succeeded", "", "published")
+            .unwrap();
+        let mut latest_request = backoff_test_job_request();
+        latest_request.dedupe_key = "acme/widgets#42:latest".into();
+        latest_request.head_sha = "3434343434343434343434343434343434343434".into();
+        let latest = store
+            .enqueue_code_review_job(&latest_request)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            latest.id
+        );
+        assert!(store.claim_code_review_publication(&latest.id).unwrap());
+        assert!(
+            store
+                .mark_code_review_publication_dispatched(&latest.id)
+                .unwrap()
+        );
+        assert!(
+            store
+                .mark_code_review_publication_accepted(&latest.id)
+                .unwrap()
+        );
+        let reconciled_before_stale_absence = store.code_review_job(&newer.id).unwrap().unwrap();
+        assert_eq!(
+            store
+                .resolve_code_review_publication_absence(&newer.id, 1)
+                .unwrap(),
+            CodeReviewPublicationAbsenceOutcome::Published,
+            "a newer accepted round cannot make a stale absence overwrite a reconciled publication"
+        );
+        let reconciled_after_stale_absence = store.code_review_job(&newer.id).unwrap().unwrap();
+        assert!(reconciled_after_stale_absence.review_published);
+        assert_eq!(
+            reconciled_after_stale_absence.job.check_sync_error,
+            reconciled_before_stale_absence.job.check_sync_error
         );
     }
 
