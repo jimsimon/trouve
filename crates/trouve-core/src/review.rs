@@ -1152,17 +1152,56 @@ struct ManualReviewComment {
     trigger_key: String,
 }
 
-fn contains_manual_review_command(body: &str) -> bool {
-    body.lines().any(|line| {
+/// The scope a manual review command names: `@trouve-ai review` runs the
+/// standard incremental round, and `@trouve-ai review full` reviews the
+/// whole branch — the comment-command form of the check run's full-review
+/// action, for unsticking a carried finding whose fix left the incremental
+/// window. Any other trailing word is not a command.
+fn manual_review_command_scope(body: &str) -> Option<trouve_protocol::CodeReviewJobScope> {
+    for line in body.lines() {
         let mut words = line.split_whitespace();
-        words
+        if !words
             .next()
             .is_some_and(|word| word.eq_ignore_ascii_case(MANUAL_REVIEW_MENTION))
-            && words
-                .next()
-                .is_some_and(|word| word.eq_ignore_ascii_case("review"))
-            && words.next().is_none()
-    })
+        {
+            continue;
+        }
+        if !words
+            .next()
+            .is_some_and(|word| word.eq_ignore_ascii_case("review"))
+        {
+            continue;
+        }
+        match words.next() {
+            None => return Some(trouve_protocol::CodeReviewJobScope::Incremental),
+            Some(word) if word.eq_ignore_ascii_case("full") && words.next().is_none() => {
+                return Some(trouve_protocol::CodeReviewJobScope::Full);
+            }
+            _ => continue,
+        }
+    }
+    None
+}
+
+fn contains_manual_review_command(body: &str) -> bool {
+    manual_review_command_scope(body).is_some()
+}
+
+/// The durable trigger key for a manual review comment. Scope rides in the
+/// key (`:full` suffix) so it survives the manual-request table without a
+/// schema change; every other consumer treats the key as opaque.
+fn manual_review_trigger_key(
+    comment_id: u64,
+    scope: trouve_protocol::CodeReviewJobScope,
+) -> String {
+    match scope {
+        trouve_protocol::CodeReviewJobScope::Full => {
+            format!("manual:comment:{comment_id}:full")
+        }
+        trouve_protocol::CodeReviewJobScope::Incremental => {
+            format!("manual:comment:{comment_id}")
+        }
+    }
 }
 
 fn is_trusted_manual_review_command(
@@ -1190,11 +1229,12 @@ fn manual_review_comment(payload: &serde_json::Value) -> Option<ManualReviewComm
     let installation_id = payload["installation"]["id"].as_u64()?;
     let pull_number = payload["issue"]["number"].as_u64()?;
     let comment_id = payload["comment"]["id"].as_u64()?;
+    let scope = manual_review_command_scope(payload["comment"]["body"].as_str()?)?;
     (installation_id > 0 && pull_number > 0 && comment_id > 0).then(|| ManualReviewComment {
         repository,
         installation_id,
         pull_number,
-        trigger_key: format!("manual:comment:{comment_id}"),
+        trigger_key: manual_review_trigger_key(comment_id, scope),
     })
 }
 
@@ -1393,9 +1433,10 @@ fn polled_manual_review_comment(comment: &GithubIssueComment) -> Option<(u64, St
     {
         return None;
     }
+    let scope = manual_review_command_scope(comment.body.as_deref()?)?;
     Some((
         pull_number_from_issue_url(&comment.issue_url)?,
-        format!("manual:comment:{}", comment.id),
+        manual_review_trigger_key(comment.id, scope),
     ))
 }
 
@@ -1550,6 +1591,11 @@ struct ReviewOutput {
     /// Previously published finding ids that are now demonstrably fixed.
     #[serde(default)]
     resolved_finding_ids: Vec<String>,
+    /// Resolution claims for carried findings whose fix predates this
+    /// round's diff window, grounded in the reviewed head revision and
+    /// mechanically verified before they are accepted.
+    #[serde(default)]
+    resolved_findings: Vec<ResolvedFindingClaim>,
     /// Root causes the final editor identified as shared by multiple retained
     /// findings, with a recommended structural direction. Reviewer outputs
     /// never populate this.
@@ -1562,6 +1608,21 @@ struct ReviewCandidateRejection {
     candidate_id: String,
     #[serde(default)]
     reason: String,
+}
+
+/// A coordinator claim that a carried finding is fixed, grounded in the
+/// reviewed head revision. `current_anchor_quote` is the verbatim source
+/// line now at the finding's anchor — empty when that line no longer
+/// exists — and is verified against the server's own read of the head
+/// before the resolution is accepted. The quote proves the coordinator
+/// examined the current code rather than a stale window; the judgment that
+/// the defect is gone remains the coordinator's.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct ResolvedFindingClaim {
+    #[serde(default)]
+    finding_id: String,
+    #[serde(default)]
+    current_anchor_quote: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -4080,11 +4141,21 @@ impl Engine {
                         dedupe_key.push(':');
                         dedupe_key.push_str(&uuid::Uuid::new_v4().simple().to_string());
                     }
-                    let review_base_sha = incremental_review_base_sha(
-                        &pull.base.sha,
-                        &pull.head.sha,
-                        &pull_state.last_reviewed_head_sha,
-                    );
+                    // A `review full` comment names the whole branch as its
+                    // scope; the flag rides in the durable trigger key.
+                    let full_branch = requested
+                        .comment_key
+                        .as_deref()
+                        .is_some_and(|key| key.ends_with(":full"));
+                    let review_base_sha = if full_branch {
+                        pull.base.sha.clone()
+                    } else {
+                        incremental_review_base_sha(
+                            &pull.base.sha,
+                            &pull.head.sha,
+                            &pull_state.last_reviewed_head_sha,
+                        )
+                    };
                     let job = self.store.enqueue_code_review_job(&NewCodeReviewJob {
                         dedupe_key,
                         installation_id: repository.installation_id,
@@ -4097,7 +4168,11 @@ impl Engine {
                         review_base_sha,
                         base_ref: pull.base.sha.clone(),
                         head_ref: pull.head.name.clone(),
-                        scope: trouve_protocol::CodeReviewJobScope::Incremental,
+                        scope: if full_branch {
+                            trouve_protocol::CodeReviewJobScope::Full
+                        } else {
+                            trouve_protocol::CodeReviewJobScope::Incremental
+                        },
                         trigger: requested.trigger.into(),
                         retry_of: None,
                         model: repository.model.clone(),
@@ -6286,15 +6361,30 @@ impl Engine {
                     })
                     .collect(),
                 resolved_finding_ids: Vec::new(),
+                resolved_findings: Vec::new(),
                 themes: Vec::new(),
             }
         } else {
             let mut execution_record = record.clone();
             execution_record.job = job.clone();
+            // Carried-finding verification at head: the server reads the
+            // current code at each carried open blocking finding's anchor
+            // so the coordinator can judge — and provably ground — fixes
+            // whose commits predate this round's diff window. In-context
+            // comparison, no extra model turns or tool calls.
+            let carried_anchor_lines = self
+                .prefetch_carried_anchor_lines(
+                    &previous_findings,
+                    repository_path.as_path(),
+                    &job.head_sha,
+                    superseded,
+                )
+                .await;
             let prompt = validation_prompt(
                 &execution_record,
                 &coordinator_candidates,
                 &finding_history,
+                &carried_anchor_lines,
                 &prior_candidate_rejections,
                 &previous_themes,
                 &external_comments,
@@ -6512,7 +6602,17 @@ impl Engine {
             )? {
                 self.emit_code_review_task(&job.id, task)?;
             }
-            let resolved_finding_ids = validated.resolved_finding_ids;
+            // Resolution claims for carried blocking findings outside this
+            // round's window must verify against the server's own read of
+            // the head revision; unverified claims are dropped and those
+            // findings stay open.
+            let resolved_finding_ids = verified_resolution_ids(
+                validated.resolved_finding_ids,
+                &validated.resolved_findings,
+                &previous_findings,
+                &diff_files,
+                &carried_anchor_lines,
+            );
             let themes = coordinator_validated_themes(
                 validated.themes,
                 &findings,
@@ -6527,6 +6627,7 @@ impl Engine {
                 findings,
                 rejected_candidates: validated.rejected_candidates,
                 resolved_finding_ids,
+                resolved_findings: Vec::new(),
                 themes,
             }
         };
@@ -10566,6 +10667,73 @@ impl Engine {
     /// git boundary. Reading before validation keeps verification itself
     /// pure, and the object store makes the read immune to concurrent
     /// checkout syncs, symlinks, and replacement refs.
+    /// Current head-revision content at each carried open blocking
+    /// finding's anchor, for the coordinator's carried-finding review and
+    /// the server-side verification of its resolution claims. `Some(None)`
+    /// records that the anchor line no longer exists — itself verifiable
+    /// evidence — while unreadable or hostile paths are simply absent from
+    /// the map (their resolutions stay claim-rejected). Bounded, audited
+    /// git-object reads through the executor, milliseconds per finding.
+    async fn prefetch_carried_anchor_lines(
+        &self,
+        findings: &[trouve_protocol::CodeReviewFinding],
+        repository_path: &std::path::Path,
+        head_sha: &str,
+        cancel: &CancellationToken,
+    ) -> HashMap<(String, u64), Option<String>> {
+        const CARRIED_ANCHOR_PREFETCH_MAX: usize = 32;
+        let mut lines = HashMap::new();
+        for finding in findings
+            .iter()
+            .filter(|finding| {
+                finding.status == "open"
+                    && finding.line > 0
+                    && finding_is_blocking(&finding.severity, &finding.confidence)
+                    && finding_scope_blocks(&finding.evidence)
+            })
+            .take(CARRIED_ANCHOR_PREFETCH_MAX)
+        {
+            let key = (finding.path.clone(), finding.line);
+            if lines.contains_key(&key) {
+                continue;
+            }
+            let relative = std::path::Path::new(&finding.path);
+            if relative.is_absolute()
+                || relative
+                    .components()
+                    .any(|component| !matches!(component, std::path::Component::Normal(_)))
+            {
+                continue;
+            }
+            match self
+                .executor
+                .review_repository_object_line(&crate::tools::ReviewRepositoryObjectLine {
+                    managed_root: self.data_dir.join("review-repositories"),
+                    worktree: repository_path.to_path_buf(),
+                    head_sha: head_sha.to_owned(),
+                    path: finding.path.clone(),
+                    line: finding.line,
+                    max_bytes: REVIEW_ANCHOR_BLOB_MAX_BYTES,
+                    cancel: cancel.clone(),
+                })
+                .await
+            {
+                Ok(content) => {
+                    lines.insert(key, content);
+                }
+                Err(error) => {
+                    tracing::debug!(
+                        path = %finding.path,
+                        line = finding.line,
+                        %error,
+                        "carried anchor line unavailable; its resolution stays claim-gated"
+                    );
+                }
+            }
+        }
+        lines
+    }
+
     async fn prefetch_anchor_object_lines(
         &self,
         findings: &[ReviewFinding],
@@ -14679,6 +14847,7 @@ fn validation_prompt(
     record: &CodeReviewJobRecord,
     candidates: &[CandidateFinding],
     finding_history: &[trouve_protocol::CodeReviewFinding],
+    carried_anchor_lines: &HashMap<(String, u64), Option<String>>,
     prior_candidate_rejections: &[trouve_protocol::CodeReviewCandidateRejection],
     previous_themes: &[trouve_protocol::CodeReviewTheme],
     external_comments: &[ExternalReviewComment],
@@ -14732,8 +14901,11 @@ fn validation_prompt(
             Ok(value)
         })
         .collect::<Result<Vec<_>>>()?;
-    let finding_history =
-        compact_finding_history(finding_history, budgets.history_findings_max_bytes)?;
+    let finding_history = compact_finding_history(
+        finding_history,
+        budgets.history_findings_max_bytes,
+        carried_anchor_lines,
+    )?;
     let prior_candidate_rejections = compact_candidate_rejection_history(
         prior_candidate_rejections,
         budgets.history_rejections_max_bytes,
@@ -14877,7 +15049,15 @@ fn validation_prompt(
          sibling to the candidate id that exposed its root cause, while giving it its own changed \
          location and independently complete evidence. Also inspect the \
          previously published finding history. Include an id in `resolved_finding_ids` only \
-         when its status is `open` and this revision demonstrably fixed it. An unchanged, moved, \
+         when its status is `open` and this revision demonstrably fixed it. A still-open \
+         finding whose fix landed before this round's diff window carries a \
+         `current_anchor_line` field in its history entry — the source line now at its anchor \
+         in the head revision, or null when that line no longer exists. When you judge such a \
+         finding fixed, add an entry to `resolved_findings` with its id and \
+         `current_anchor_quote` copied verbatim from `current_anchor_line` (empty when it is \
+         null). The quote is mechanically verified against the head revision; a missing or \
+         mismatching quote leaves the finding open. A carried blocking finding in a file this \
+         diff did not touch can only be resolved this way. An unchanged, moved, \
          already-resolved, or uncertain \
          issue remains open. A historical finding whose status is `dismissed` was closed by a \
          maintainer resolving its review thread; that judgment is final. Never re-report a \
@@ -14944,6 +15124,8 @@ fn validation_prompt(
          \"rejected_candidates\":[{{\"candidate_id\":\"candidate id\",\
          \"reason\":\"specific reason this candidate was not retained\"}}],\
          \"resolved_finding_ids\":[\"previous finding id\"],\
+         \"resolved_findings\":[{{\"finding_id\":\"carried finding id\",\
+         \"current_anchor_quote\":\"the history entry's current_anchor_line, verbatim; empty when it is null\"}}],\
          \"themes\":[{{\"theme_id\":\"existing durable theme id or empty\",\"root_cause\":\"shared mechanism behind multiple findings\",\
          \"recommendation\":\"structural fix that addresses the cause\",\
          \"source_candidate_ids\":[\"candidate id\"],\
@@ -15108,11 +15290,17 @@ fn candidate_adjudication_fingerprint(path: &str, title: &str, body: &str) -> St
 fn compact_finding_history(
     findings: &[trouve_protocol::CodeReviewFinding],
     max_bytes: usize,
+    carried_anchor_lines: &HashMap<(String, u64), Option<String>>,
 ) -> Result<Vec<serde_json::Value>> {
     let values = findings
         .iter()
         .rev()
-        .map(compact_finding_value)
+        .map(|finding| {
+            compact_finding_value(
+                finding,
+                carried_anchor_lines.get(&(finding.path.clone(), finding.line)),
+            )
+        })
         .collect::<Result<Vec<_>>>()?;
     bounded_json_values(values, max_bytes)
 }
@@ -15152,6 +15340,7 @@ fn bounded_json_text(value: &str, max_serialized_bytes: usize, marker: &str) -> 
 
 fn compact_finding_value(
     finding: &trouve_protocol::CodeReviewFinding,
+    current_anchor_line: Option<&Option<String>>,
 ) -> Result<serde_json::Value> {
     let theme_ids = bounded_json_values(
         finding
@@ -15162,7 +15351,7 @@ fn compact_finding_value(
         REVIEW_HISTORY_FINDING_THEME_IDS_MAX_BYTES,
     )?;
     let evidence = &finding.evidence;
-    Ok(serde_json::json!({
+    let mut value = serde_json::json!({
         "id": bounded_json_text(&finding.id, 256, "…"),
         "job_id": bounded_json_text(&finding.job_id, 256, "…"),
         "path": bounded_json_text(&finding.path, 1024, "…"),
@@ -15187,7 +15376,20 @@ fn compact_finding_value(
             "introduction": bounded_json_text(&evidence.introduction, REVIEW_HISTORY_TEXT_MAX_BYTES, "…"),
             "regression_test": bounded_json_text(&evidence.regression_test, REVIEW_HISTORY_TEXT_MAX_BYTES, "…"),
         }
-    }))
+    });
+    // Server-read source line now at the finding's anchor in the reviewed
+    // head — only prefetched for carried open blocking findings. `null`
+    // means the line no longer exists there; the key is absent entirely
+    // when the anchor was not checked.
+    if let Some(current) = current_anchor_line {
+        value["current_anchor_line"] = match current {
+            Some(line) => {
+                serde_json::json!(bounded_json_text(line, REVIEW_HISTORY_TEXT_MAX_BYTES, "…"))
+            }
+            None => serde_json::Value::Null,
+        };
+    }
+    Ok(value)
 }
 
 fn compact_theme_value(theme: &trouve_protocol::CodeReviewTheme) -> Result<serde_json::Value> {
@@ -16770,6 +16972,92 @@ fn apply_change_scope_verdict(
 /// records carry no verdict and keep their pre-scope behavior.
 fn finding_scope_blocks(evidence: &trouve_protocol::CodeReviewFindingEvidence) -> bool {
     evidence.change_scope != "unverified"
+}
+
+/// Verifies one carried-resolution claim against the server's own read of
+/// the head revision. `current` is `None` when the anchor was never
+/// prefetched (unverifiable — reject), `Some(None)` when the anchor line no
+/// longer exists (an empty quote is the verifiable claim), and
+/// `Some(Some(line))` when it does (exact trimmed equality, the anchor-quote
+/// contract).
+fn carried_resolution_claim_is_verified(quote: &str, current: Option<&Option<String>>) -> bool {
+    if quote.len() > REVIEW_QUOTE_MAX_BYTES {
+        return false;
+    }
+    let quote = quote.trim();
+    match current {
+        None => false,
+        Some(None) => quote.is_empty(),
+        Some(Some(line)) => {
+            let line = line.trim();
+            if line.is_empty() {
+                quote.is_empty()
+            } else {
+                !quote.is_empty() && line == quote
+            }
+        }
+    }
+}
+
+/// Filters the coordinator's resolution claims to the acceptable set. A
+/// finding in a file this round's diff touched may resolve by id alone —
+/// the coordinator judged it against changes it was shown. A carried
+/// blocking finding outside the window resolves only through a verified
+/// head-revision claim: that frees fixes whose commits scrolled out of the
+/// incremental window without letting a model hand-wave an open issue
+/// closed. Advisory findings keep the lenient by-id path — they never gate.
+fn verified_resolution_ids(
+    listed: Vec<String>,
+    claims: &[ResolvedFindingClaim],
+    previous_findings: &[trouve_protocol::CodeReviewFinding],
+    files: &[ReviewDiffFile],
+    carried_anchor_lines: &HashMap<(String, u64), Option<String>>,
+) -> Vec<String> {
+    let touched_paths = files
+        .iter()
+        .map(|file| file.path.as_str())
+        .collect::<HashSet<_>>();
+    let claim_by_id = claims
+        .iter()
+        .map(|claim| (claim.finding_id.as_str(), claim))
+        .collect::<HashMap<_, _>>();
+    let mut seen = HashSet::new();
+    listed
+        .iter()
+        .map(String::as_str)
+        .chain(claims.iter().map(|claim| claim.finding_id.as_str()))
+        .filter(|id| !id.is_empty() && seen.insert(id.to_string()))
+        .filter(|id| {
+            let Some(finding) = previous_findings.iter().find(|finding| finding.id == *id) else {
+                // Ids the open ledger does not know keep their legacy
+                // pass-through; downstream resolution guards them.
+                return true;
+            };
+            let requires_head_claim = finding_is_blocking(&finding.severity, &finding.confidence)
+                && finding_scope_blocks(&finding.evidence)
+                && !touched_paths.contains(finding.path.as_str());
+            if !requires_head_claim {
+                return true;
+            }
+            let verified = claim_by_id.get(*id).is_some_and(|claim| {
+                carried_resolution_claim_is_verified(
+                    &claim.current_anchor_quote,
+                    carried_anchor_lines.get(&(finding.path.clone(), finding.line)),
+                )
+            });
+            if !verified {
+                tracing::warn!(
+                    finding_id = %finding.id,
+                    path = %finding.path,
+                    line = finding.line,
+                    "carried-finding resolution claim was not verified against the head \
+                     revision; the finding stays open"
+                );
+            }
+            verified
+        })
+        .map(str::to_owned)
+        .collect()
 }
 
 /// Verify the coordinator's anchor quote mechanically and derive the
@@ -19410,6 +19698,143 @@ mod tests {
         assert_eq!(unknown.evidence.anchor_match, "unchecked");
     }
 
+    fn open_history_finding(
+        id: &str,
+        path: &str,
+        line: u64,
+        severity: &str,
+    ) -> trouve_protocol::CodeReviewFinding {
+        trouve_protocol::CodeReviewFinding {
+            id: id.into(),
+            job_id: "rv_previous".into(),
+            path: path.into(),
+            line,
+            side: "RIGHT".into(),
+            outside_diff: false,
+            severity: severity.into(),
+            confidence: "high".into(),
+            title: "Carried issue".into(),
+            body: "Body".into(),
+            prompt_for_agents: String::new(),
+            status: "open".into(),
+            sources: Vec::new(),
+            github_comment_id: None,
+            github_comment_url: String::new(),
+            github_publication_status: Default::default(),
+            evidence: Default::default(),
+            origin: Default::default(),
+            theme_ids: Vec::new(),
+            github_thread_id: None,
+            resolved_at: None,
+            observed_head: String::new(),
+            resolved_head: String::new(),
+            resolved_by_job_id: String::new(),
+        }
+    }
+
+    #[test]
+    fn carried_resolution_claims_verify_against_the_head_revision() {
+        // Exact trimmed equality against the server's read; absence is
+        // claimable only when the server saw the line absent; unprefetched
+        // anchors verify nothing.
+        assert!(carried_resolution_claim_is_verified(
+            "let retries = 5;",
+            Some(&Some("  let retries = 5;  ".to_owned()))
+        ));
+        assert!(!carried_resolution_claim_is_verified(
+            "let retries = 3;",
+            Some(&Some("let retries = 5;".to_owned()))
+        ));
+        assert!(carried_resolution_claim_is_verified("", Some(&None)));
+        assert!(!carried_resolution_claim_is_verified(
+            "anything",
+            Some(&None)
+        ));
+        assert!(!carried_resolution_claim_is_verified("", None));
+        assert!(!carried_resolution_claim_is_verified(
+            &"x".repeat(600),
+            Some(&Some("x".repeat(600)))
+        ));
+
+        let claim = |id: &str, quote: &str| ResolvedFindingClaim {
+            finding_id: id.into(),
+            current_anchor_quote: quote.into(),
+        };
+        let previous = vec![
+            open_history_finding("rvf_in_window", "src/touched.rs", 3, "high"),
+            open_history_finding("rvf_carried", "src/untouched.rs", 7, "high"),
+            open_history_finding("rvf_stale", "src/untouched.rs", 9, "high"),
+            open_history_finding("rvf_advisory", "src/untouched.rs", 11, "low"),
+        ];
+        let files = vec![ReviewDiffFile {
+            path: "src/touched.rs".into(),
+            diff: "+changed\n".into(),
+            generated_header: None,
+        }];
+        let anchors = HashMap::from([
+            (
+                ("src/untouched.rs".to_owned(), 7),
+                Some("guarded();".to_owned()),
+            ),
+            (
+                ("src/untouched.rs".to_owned(), 9),
+                Some("racy();".to_owned()),
+            ),
+        ]);
+        let accepted = verified_resolution_ids(
+            vec![
+                "rvf_in_window".into(),
+                "rvf_stale".into(),
+                "rvf_advisory".into(),
+                "rvf_unknown".into(),
+            ],
+            &[claim("rvf_carried", "guarded();")],
+            &previous,
+            &files,
+            &anchors,
+        );
+        // The touched-file finding resolves by id; the carried blocking
+        // finding resolves through its verified claim; the claim-less
+        // carried blocking finding stays open; advisory and unknown ids
+        // keep the legacy pass-through.
+        assert!(accepted.contains(&"rvf_in_window".to_owned()));
+        assert!(accepted.contains(&"rvf_carried".to_owned()));
+        assert!(!accepted.contains(&"rvf_stale".to_owned()));
+        assert!(accepted.contains(&"rvf_advisory".to_owned()));
+        assert!(accepted.contains(&"rvf_unknown".to_owned()));
+    }
+
+    #[test]
+    fn manual_review_commands_parse_scope() {
+        use trouve_protocol::CodeReviewJobScope::{Full, Incremental};
+        assert_eq!(
+            manual_review_command_scope("@trouve-ai review"),
+            Some(Incremental)
+        );
+        assert_eq!(
+            manual_review_command_scope("@trouve-ai review full"),
+            Some(Full)
+        );
+        assert_eq!(
+            manual_review_command_scope("@TROUVE-AI REVIEW FULL"),
+            Some(Full)
+        );
+        assert_eq!(
+            manual_review_command_scope("@trouve-ai review fuller"),
+            None
+        );
+        assert_eq!(
+            manual_review_command_scope("@trouve-ai review full now"),
+            None
+        );
+        assert_eq!(manual_review_command_scope("please review"), None);
+        assert_eq!(
+            manual_review_trigger_key(7, Incremental),
+            "manual:comment:7"
+        );
+        assert_eq!(manual_review_trigger_key(7, Full), "manual:comment:7:full");
+    }
+
     #[test]
     fn change_scope_verifies_diff_anchors_and_waypoint_chains() {
         let waypoint =
@@ -19824,6 +20249,7 @@ mod tests {
             &record,
             &[],
             &[],
+            &HashMap::new(),
             &[],
             &[],
             &[],
@@ -19845,6 +20271,9 @@ mod tests {
         assert!(prompt.contains("\"causal_waypoints\""));
         assert!(prompt.contains("never claim `introduced` to make a finding block"));
         assert!(prompt.contains("at least one waypoint on a line this diff changed"));
+        assert!(prompt.contains("\"resolved_findings\""));
+        assert!(prompt.contains("`current_anchor_line`"));
+        assert!(prompt.contains("`current_anchor_quote` copied verbatim"));
     }
 
     #[test]
@@ -19873,6 +20302,7 @@ mod tests {
             &record,
             &[],
             &[],
+            &HashMap::new(),
             &[],
             &[theme(1)],
             &[],
@@ -19890,6 +20320,7 @@ mod tests {
             &record,
             &[],
             &[],
+            &HashMap::new(),
             &[],
             &[theme(3)],
             &[],
@@ -19921,6 +20352,7 @@ mod tests {
             &record,
             &[],
             &[],
+            &HashMap::new(),
             &[],
             &[],
             &[],
@@ -19939,6 +20371,7 @@ mod tests {
             &record,
             &[],
             &[],
+            &HashMap::new(),
             &[],
             &[],
             &[],
@@ -20017,6 +20450,7 @@ mod tests {
             &record,
             &[],
             &[],
+            &HashMap::new(),
             &[],
             &[],
             &[],
@@ -20036,6 +20470,7 @@ mod tests {
             &record,
             &[],
             &[],
+            &HashMap::new(),
             &[],
             &[],
             &[],
@@ -23540,8 +23975,12 @@ mod tests {
             }))
             .unwrap();
         let findings = (0..100).map(|_| finding.clone()).collect::<Vec<_>>();
-        let compact =
-            compact_finding_history(&findings, REVIEW_HISTORY_FINDINGS_MAX_BYTES).unwrap();
+        let compact = compact_finding_history(
+            &findings,
+            REVIEW_HISTORY_FINDINGS_MAX_BYTES,
+            &HashMap::new(),
+        )
+        .unwrap();
         let encoded = serde_json::to_string(&compact).unwrap();
         assert!(encoded.len() <= REVIEW_HISTORY_FINDINGS_MAX_BYTES);
         assert!(!encoded.contains("must not be copied"));
@@ -23579,8 +24018,12 @@ mod tests {
             }))
             .unwrap();
 
-        let findings =
-            compact_finding_history(&[finding], REVIEW_HISTORY_FINDINGS_MAX_BYTES).unwrap();
+        let findings = compact_finding_history(
+            &[finding],
+            REVIEW_HISTORY_FINDINGS_MAX_BYTES,
+            &HashMap::new(),
+        )
+        .unwrap();
         let encoded = serde_json::to_string(&findings).unwrap();
         assert!(encoded.len() <= REVIEW_HISTORY_FINDINGS_MAX_BYTES);
         assert_eq!(findings.len(), 1);
@@ -26016,6 +26459,7 @@ mod tests {
                 },
             ],
             resolved_finding_ids: vec!["invented-finding".into()],
+            resolved_findings: Vec::new(),
             themes: Vec::new(),
         };
         let unadjudicated = normalize_coordinator_output(&mut review, &candidates, &[]);
@@ -26048,6 +26492,7 @@ mod tests {
             findings: Vec::new(),
             rejected_candidates: Vec::new(),
             resolved_finding_ids: Vec::new(),
+            resolved_findings: Vec::new(),
             themes: Vec::new(),
         };
         let rejected_without_reason = candidate_rejections(&unaccounted, &candidates[..1]);
@@ -26078,6 +26523,7 @@ mod tests {
                 })
                 .collect(),
             resolved_finding_ids: Vec::new(),
+            resolved_findings: Vec::new(),
             themes: Vec::new(),
         };
         let unadjudicated = normalize_coordinator_output(&mut anchor_filtered, &candidates, &[]);
@@ -26116,6 +26562,7 @@ mod tests {
                 })
                 .collect(),
             resolved_finding_ids: Vec::new(),
+            resolved_findings: Vec::new(),
             themes: Vec::new(),
         };
         let unadjudicated = normalize_coordinator_output(
@@ -26147,6 +26594,7 @@ mod tests {
             }],
             rejected_candidates: Vec::new(),
             resolved_finding_ids: Vec::new(),
+            resolved_findings: Vec::new(),
             themes: Vec::new(),
         };
         structurally_rejected.findings = coordinator_validated_findings(
@@ -26264,6 +26712,7 @@ mod tests {
                 reason: "false_positive: already settled".into(),
             }],
             resolved_finding_ids: vec!["finding-old".into()],
+            resolved_findings: Vec::new(),
             themes: vec![theme("Original root cause")],
         };
         let repaired = ReviewOutput {
@@ -26280,6 +26729,7 @@ mod tests {
                 reason: "false_positive: reverses the prior decision".into(),
             }],
             resolved_finding_ids: vec!["different-finding".into()],
+            resolved_findings: Vec::new(),
             themes: vec![theme("Rewritten root cause")],
         };
 
@@ -26481,6 +26931,7 @@ mod tests {
             &record,
             &[],
             &[],
+            &HashMap::new(),
             &[],
             &[],
             &[],
@@ -26842,6 +27293,7 @@ mod tests {
             &record,
             &[],
             &[],
+            &HashMap::new(),
             &[],
             &[],
             &[],
@@ -28748,6 +29200,7 @@ mod tests {
             &record,
             &[],
             &[],
+            &HashMap::new(),
             &[],
             &[],
             &[],
