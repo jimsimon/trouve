@@ -8454,7 +8454,8 @@ impl Engine {
             REVIEW_PUBLICATION_ABSENCE_CONFIRMATIONS,
         )? {
             crate::store::CodeReviewPublicationAbsenceOutcome::Pending
-            | crate::store::CodeReviewPublicationAbsenceOutcome::AcceptedPending => {
+            | crate::store::CodeReviewPublicationAbsenceOutcome::AcceptedPending
+            | crate::store::CodeReviewPublicationAbsenceOutcome::NewerPublicationPending => {
                 bail!("accepted GitHub review could not be found by its publication marker");
             }
             crate::store::CodeReviewPublicationAbsenceOutcome::Superseded => tracing::warn!(

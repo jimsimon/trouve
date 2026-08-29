@@ -3510,6 +3510,9 @@ pub enum CodeReviewPublicationAbsenceOutcome {
     Pending,
     /// GitHub accepted the POST, so absence can only be listing lag.
     AcceptedPending,
+    /// A newer round is publishing but has not reached an accepted outcome,
+    /// so the older dispatch must stay fenced without becoming terminal.
+    NewerPublicationPending,
     /// A newer published round made this publication terminally obsolete.
     Superseded,
     /// The unaccepted dispatch was released for a safe retry.
@@ -14087,9 +14090,14 @@ impl Store {
     ) -> Result<CodeReviewPublicationAbsenceOutcome> {
         let conn = self.conn.lock().unwrap();
         let tx = write_transaction(&conn)?;
-        let (accepted, dispatched, absence_count, superseded): (bool, bool, i64, bool) = tx
-            .query_row(
-                "SELECT current_job.publication_accepted,
+        let (accepted, dispatched, absence_count, superseded, newer_publication_pending): (
+            bool,
+            bool,
+            i64,
+            bool,
+            bool,
+        ) = tx.query_row(
+            "SELECT current_job.publication_accepted,
                         current_job.publication_dispatched,
                         current_job.publication_marker_absence_count,
                         EXISTS (
@@ -14097,7 +14105,25 @@ impl Store {
                           WHERE newer.repository = current_job.repository
                             AND newer.pull_number = current_job.pull_number
                             AND newer.rowid != current_job.rowid
-                            AND newer.review_published != 0
+                            AND (newer.publication_accepted != 0
+                                 OR newer.review_published != 0)
+                            AND (
+                              newer.publication_order > current_job.publication_order
+                              OR (
+                                newer.publication_order = current_job.publication_order
+                                AND newer.rowid > current_job.rowid
+                              )
+                            )
+                        ),
+                        EXISTS (
+                          SELECT 1 FROM code_review_jobs AS newer
+                          WHERE newer.repository = current_job.repository
+                            AND newer.pull_number = current_job.pull_number
+                            AND newer.rowid != current_job.rowid
+                            AND newer.publication_accepted = 0
+                            AND newer.review_published = 0
+                            AND (newer.publication_claimed != 0
+                                 OR newer.publication_dispatched != 0)
                             AND (
                               newer.publication_order > current_job.publication_order
                               OR (
@@ -14108,9 +14134,17 @@ impl Store {
                         )
                  FROM code_review_jobs AS current_job
                  WHERE current_job.id = ?1",
-                params![id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )?;
+            params![id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )?;
         let absence_count = u32::try_from(absence_count)
             .unwrap_or(u32::MAX)
             .saturating_add(1);
@@ -14135,6 +14169,14 @@ impl Store {
                 params![id, i64::from(absence_count)],
             )?;
             CodeReviewPublicationAbsenceOutcome::Superseded
+        } else if newer_publication_pending {
+            tx.execute(
+                "UPDATE code_review_jobs
+                 SET publication_marker_absence_count = ?2
+                 WHERE id = ?1",
+                params![id, i64::from(absence_count)],
+            )?;
+            CodeReviewPublicationAbsenceOutcome::NewerPublicationPending
         } else if absence_count < confirmation_threshold || !dispatched {
             tx.execute(
                 "UPDATE code_review_jobs
@@ -24127,8 +24169,8 @@ mod tests {
             .finish_code_review_job(&superseded.id, "failed", "GitHub API 500", "")
             .unwrap();
 
-        // A newer round publishing for the pull supersedes the first job's
-        // publication, delivered or not.
+        // A newer round in flight fences the old dispatch without terminally
+        // superseding it until GitHub has accepted the newer POST.
         let mut newer_request = backoff_test_job_request();
         newer_request.dedupe_key = "acme/widgets#42:newer".into();
         newer_request.head_sha = "3333333333333333333333333333333333333333".into();
@@ -24141,16 +24183,41 @@ mod tests {
             newer.id
         );
         assert!(store.claim_code_review_publication(&newer.id).unwrap());
+        assert_eq!(
+            store
+                .resolve_code_review_publication_absence(&superseded.id, 1)
+                .unwrap(),
+            CodeReviewPublicationAbsenceOutcome::NewerPublicationPending,
+            "a claimed newer publication fences release"
+        );
         assert!(
             store
-                .reconcile_code_review_publication(&newer.id, "https://example/review", &[])
+                .mark_code_review_publication_dispatched(&newer.id)
                 .unwrap()
         );
         assert_eq!(
             store
                 .resolve_code_review_publication_absence(&superseded.id, 1)
                 .unwrap(),
-            CodeReviewPublicationAbsenceOutcome::Superseded
+            CodeReviewPublicationAbsenceOutcome::NewerPublicationPending,
+            "a dispatched newer publication fences release"
+        );
+        assert!(
+            store
+                .mark_code_review_publication_accepted(&newer.id)
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .resolve_code_review_publication_absence(&superseded.id, 1)
+                .unwrap(),
+            CodeReviewPublicationAbsenceOutcome::Superseded,
+            "an accepted newer publication terminally supersedes the old dispatch"
+        );
+        assert!(
+            store
+                .reconcile_code_review_publication(&newer.id, "https://example/review", &[])
+                .unwrap()
         );
         assert_eq!(
             store
