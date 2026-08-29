@@ -10939,7 +10939,7 @@ impl Engine {
     async fn process_pending_threadless_commands(&self, repository: &CodeReviewRepository) {
         let mut commands = match self
             .store
-            .pending_threadless_commands(&repository.repository)
+            .pending_threadless_commands(&repository.repository, THREADLESS_COMMAND_PASS_LIMIT)
         {
             Ok(commands) => commands,
             Err(error) => {
@@ -28682,7 +28682,7 @@ mod tests {
             .unwrap();
         let pending = engine
             .store
-            .pending_threadless_commands("acme/widgets")
+            .pending_threadless_commands("acme/widgets", THREADLESS_COMMAND_PASS_LIMIT)
             .unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].trigger_key, "command:comment:250");

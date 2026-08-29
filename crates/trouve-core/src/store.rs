@@ -910,6 +910,10 @@ const MIGRATIONS: &[&str] = &[
      )",
     "ALTER TABLE code_review_jobs ADD COLUMN publication_marker_absence_count INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE code_review_findings ADD COLUMN collapse_terminal_attempts INTEGER NOT NULL DEFAULT 0",
+    "CREATE TABLE IF NOT EXISTS code_review_threadless_command_cursors (
+       repository TEXT PRIMARY KEY,
+       last_comment_id INTEGER NOT NULL DEFAULT 0
+     )",
 ];
 
 /// Blocking-tier predicate for one findings row under the given SQL alias:
@@ -15519,35 +15523,75 @@ impl Store {
         Ok(inserted > 0)
     }
 
-    /// Pending commands ordered by comment id — GitHub's monotonically
-    /// increasing comment ids give comment-creation order even when webhook
-    /// deliveries arrive out of order, so a resolve and its follow-up
-    /// unresolve always apply in the order the maintainer wrote them.
+    /// Return a bounded, durable round-robin page of per-pull head commands.
+    /// Only the oldest command for each pull is eligible, so opposite commands
+    /// cannot overtake one another. The repository cursor rotates across
+    /// retrying pulls and survives restarts, keeping later pulls reachable.
     pub fn pending_threadless_commands(
         &self,
         repository: &str,
+        limit: usize,
     ) -> Result<Vec<PendingThreadlessCommand>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT trigger_key, repository, pull_number, comment_id, author, resolve,
-                    finding_prefix, reason, created_at
-             FROM code_review_pending_threadless_commands
-             WHERE repository = ?1 ORDER BY comment_id",
-        )?;
-        let rows = stmt.query_map(params![repository], |row| {
-            Ok(PendingThreadlessCommand {
-                trigger_key: row.get(0)?,
-                repository: row.get(1)?,
-                pull_number: row.get::<_, i64>(2)? as u64,
-                comment_id: row.get::<_, i64>(3)? as u64,
-                author: row.get(4)?,
-                resolve: row.get(5)?,
-                finding_prefix: row.get(6)?,
-                reason: row.get(7)?,
-                created_at: row.get(8)?,
-            })
-        })?;
-        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        let tx = write_transaction(&conn)?;
+        let cursor = tx
+            .query_row(
+                "SELECT last_comment_id
+                 FROM code_review_threadless_command_cursors
+                 WHERE repository = ?1",
+                params![repository],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        let commands = {
+            let mut stmt = tx.prepare(
+                "SELECT command.trigger_key, command.repository, command.pull_number,
+                        command.comment_id, command.author, command.resolve,
+                        command.finding_prefix, command.reason, command.created_at
+                 FROM code_review_pending_threadless_commands AS command
+                 WHERE command.repository = ?1
+                   AND NOT EXISTS (
+                     SELECT 1
+                     FROM code_review_pending_threadless_commands AS older
+                     WHERE older.repository = command.repository
+                       AND older.pull_number = command.pull_number
+                       AND older.comment_id < command.comment_id
+                   )
+                 ORDER BY CASE WHEN command.comment_id > ?2 THEN 0 ELSE 1 END,
+                          command.comment_id
+                 LIMIT ?3",
+            )?;
+            stmt.query_map(
+                params![repository, cursor, i64::try_from(limit).unwrap_or(i64::MAX)],
+                |row| {
+                    Ok(PendingThreadlessCommand {
+                        trigger_key: row.get(0)?,
+                        repository: row.get(1)?,
+                        pull_number: row.get::<_, i64>(2)? as u64,
+                        comment_id: row.get::<_, i64>(3)? as u64,
+                        author: row.get(4)?,
+                        resolve: row.get(5)?,
+                        finding_prefix: row.get(6)?,
+                        reason: row.get(7)?,
+                        created_at: row.get(8)?,
+                    })
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        if let Some(last) = commands.last() {
+            tx.execute(
+                "INSERT INTO code_review_threadless_command_cursors
+                        (repository, last_comment_id)
+                 VALUES (?1, ?2)
+                 ON CONFLICT(repository) DO UPDATE SET
+                   last_comment_id = excluded.last_comment_id",
+                params![repository, last.comment_id as i64],
+            )?;
+        }
+        tx.commit()?;
+        Ok(commands)
     }
 
     pub fn pending_code_review_manual_requests(
@@ -21224,14 +21268,17 @@ mod tests {
         store
             .claim_github_webhook_delivery("delivery-defer-1", None, Some(&durable))
             .unwrap();
-        let fresh = store.pending_threadless_commands("acme/widgets").unwrap()[0].clone();
+        let fresh = store
+            .pending_threadless_commands("acme/widgets", 1000)
+            .unwrap()[0]
+            .clone();
         let (outcome, _) = store
             .apply_threadless_resolve_command(&fresh, "", Some(std::time::Duration::from_secs(120)))
             .unwrap();
         assert_eq!(outcome, ThreadlessCommandOutcome::NotApplicableDeferred);
         assert_eq!(
             store
-                .pending_threadless_commands("acme/widgets")
+                .pending_threadless_commands("acme/widgets", 1000)
                 .unwrap()
                 .len(),
             1,
@@ -21252,7 +21299,7 @@ mod tests {
         ));
         assert!(
             store
-                .pending_threadless_commands("acme/widgets")
+                .pending_threadless_commands("acme/widgets", 1000)
                 .unwrap()
                 .is_empty(),
             "an expired no-op is consumed"
@@ -21277,7 +21324,7 @@ mod tests {
             .claim_github_webhook_delivery("delivery-consumed-1", None, Some(&durable))
             .unwrap();
         let claimed = store
-            .pending_threadless_commands("acme/widgets")
+            .pending_threadless_commands("acme/widgets", 1000)
             .unwrap()
             .into_iter()
             .find(|pending| pending.trigger_key == durable.trigger_key)
@@ -21305,6 +21352,53 @@ mod tests {
             "open",
             "a consumed command must not reverse the newer decision"
         );
+    }
+
+    #[test]
+    fn pending_threadless_command_pages_are_bounded_and_rotate_across_pulls() {
+        let store = Store::open_in_memory().unwrap();
+        for index in 0..40_u64 {
+            let command = PendingThreadlessCommand {
+                trigger_key: format!("command:comment:{}", 100 + index),
+                repository: "acme/widgets".into(),
+                pull_number: index + 1,
+                comment_id: 100 + index,
+                author: "jim".into(),
+                resolve: true,
+                finding_prefix: format!("rvf_{index:08x}"),
+                reason: "reason".into(),
+                created_at: chrono::Utc::now().to_rfc3339(),
+            };
+            assert!(
+                store
+                    .claim_github_webhook_delivery(
+                        &format!("delivery-{index}"),
+                        None,
+                        Some(&command),
+                    )
+                    .unwrap()
+            );
+        }
+        let first = store
+            .pending_threadless_commands("acme/widgets", 16)
+            .unwrap();
+        let second = store
+            .pending_threadless_commands("acme/widgets", 16)
+            .unwrap();
+        let third = store
+            .pending_threadless_commands("acme/widgets", 16)
+            .unwrap();
+        assert_eq!(first.len(), 16);
+        assert_eq!(second.len(), 16);
+        assert_eq!(third.len(), 16);
+        let reached = first
+            .iter()
+            .chain(&second)
+            .chain(&third)
+            .map(|command| command.comment_id)
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(reached.len(), 40);
+        assert!(reached.contains(&139));
     }
 
     #[test]
