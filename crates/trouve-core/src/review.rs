@@ -8451,8 +8451,8 @@ impl Engine {
                 job_id = %job.id,
                 repository = %job.repository,
                 pull_number = job.pull_number,
-                "review publication acceptance was not observed locally and the round is \
-                 superseded; abandoning its publication without retrying the POST"
+                "review publication was overtaken by a newer accepted or published round; \
+                 abandoning it without retrying the POST"
             ),
             crate::store::CodeReviewPublicationAbsenceOutcome::Quarantined => tracing::warn!(
                 job_id = %job.id,
@@ -11542,8 +11542,7 @@ fn combine_publication_projection_result(
 }
 
 fn projection_error_is_retryable(error: &anyhow::Error) -> bool {
-    let message = format!("{error:#}").to_ascii_lowercase();
-    projection_error_message_is_retryable(&message)
+    projection_error_message_is_retryable(&format!("{error:#}"))
 }
 
 fn github_graphql_error_message(response: &serde_json::Value, operation: &str) -> Option<String> {
@@ -11569,6 +11568,8 @@ fn github_graphql_error_message(response: &serde_json::Value, operation: &str) -
 }
 
 fn projection_error_message_is_retryable(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    let message = message.as_str();
     if let Some((lifecycle, check)) = message.split_once("; updating github check run failed:") {
         return projection_error_message_is_retryable(lifecycle)
             || projection_error_message_is_retryable(check);
@@ -23254,6 +23255,16 @@ mod tests {
         assert!(forbidden.contains("FORBIDDEN"));
         assert!(forbidden.contains("Resource not accessible"));
         assert!(!projection_error_is_retryable(&anyhow!(forbidden)));
+        for kind in ["NOT_FOUND", "INSUFFICIENT_SCOPES"] {
+            let error = github_graphql_error_message(
+                &serde_json::json!({
+                    "errors": [{"type": kind, "message": "terminal"}]
+                }),
+                "loading review threads",
+            )
+            .unwrap();
+            assert!(!projection_error_is_retryable(&anyhow!(error)), "{kind}");
+        }
         let rate_limited = github_graphql_error_message(
             &serde_json::json!({
                 "errors": [{"type": "RATE_LIMITED", "message": "slow down"}]

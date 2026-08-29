@@ -14152,20 +14152,12 @@ impl Store {
                 ))
             },
         )?;
-        let outcome = if accepted {
-            tx.execute(
-                "UPDATE code_review_jobs
-                 SET publication_marker_absence_count = 0
-                 WHERE id = ?1",
-                params![id],
-            )?;
-            CodeReviewPublicationAbsenceOutcome::AcceptedPending
-        } else if superseded {
+        let outcome = if superseded {
             tx.execute(
                 "UPDATE code_review_jobs
                  SET publication_marker_absence_count = 0,
                      check_sync_error =
-                       'review publication acceptance was not observed locally and a newer round has taken over this pull request; publication abandoned without retrying the POST',
+                       'review publication was overtaken by a newer accepted or published round; publication abandoned without retrying the POST',
                      projection_retry_count = projection_retry_count + 1,
                      projection_retry_at = NULL,
                      projection_retryable = 0
@@ -14173,6 +14165,14 @@ impl Store {
                 params![id],
             )?;
             CodeReviewPublicationAbsenceOutcome::Superseded
+        } else if accepted {
+            tx.execute(
+                "UPDATE code_review_jobs
+                 SET publication_marker_absence_count = 0
+                 WHERE id = ?1",
+                params![id],
+            )?;
+            CodeReviewPublicationAbsenceOutcome::AcceptedPending
         } else if newer_publication_pending {
             tx.execute(
                 "UPDATE code_review_jobs
@@ -24200,6 +24200,44 @@ mod tests {
         assert!(record.publication_claimed);
         assert!(record.publication_dispatched);
 
+        // An accepted publication can also remain marker-unreconciled. It
+        // stays recoverable while it is current, but a later accepted round
+        // must terminally supersede it just like an ambiguous dispatch.
+        let mut accepted_superseded_request = backoff_test_job_request();
+        accepted_superseded_request.dedupe_key = "acme/widgets#42:accepted-superseded".into();
+        accepted_superseded_request.head_sha = "2828282828282828282828282828282828282828".into();
+        let accepted_superseded = store
+            .enqueue_code_review_job(&accepted_superseded_request)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            accepted_superseded.id
+        );
+        assert!(
+            store
+                .claim_code_review_publication(&accepted_superseded.id)
+                .unwrap()
+        );
+        assert!(
+            store
+                .mark_code_review_publication_dispatched(&accepted_superseded.id)
+                .unwrap()
+        );
+        assert!(
+            store
+                .mark_code_review_publication_accepted(&accepted_superseded.id)
+                .unwrap()
+        );
+        store
+            .finish_code_review_job(
+                &accepted_superseded.id,
+                "failed",
+                "accepted publication marker is not visible yet",
+                "",
+            )
+            .unwrap();
+
         // A second dispatched round is overtaken while it is awaiting marker
         // reconciliation.
         let mut superseded_request = backoff_test_job_request();
@@ -24239,6 +24277,13 @@ mod tests {
         assert!(store.claim_code_review_publication(&newer.id).unwrap());
         assert_eq!(
             store
+                .resolve_code_review_publication_absence(&accepted_superseded.id, 1)
+                .unwrap(),
+            CodeReviewPublicationAbsenceOutcome::AcceptedPending,
+            "an accepted current publication remains recoverable while a newer POST is only in flight"
+        );
+        assert_eq!(
+            store
                 .resolve_code_review_publication_absence(&superseded.id, 1)
                 .unwrap(),
             CodeReviewPublicationAbsenceOutcome::NewerPublicationPending,
@@ -24267,6 +24312,31 @@ mod tests {
                 .unwrap(),
             CodeReviewPublicationAbsenceOutcome::Superseded,
             "an accepted newer publication terminally supersedes the old dispatch"
+        );
+        assert_eq!(
+            store
+                .resolve_code_review_publication_absence(&accepted_superseded.id, 1)
+                .unwrap(),
+            CodeReviewPublicationAbsenceOutcome::Superseded,
+            "an accepted newer publication also supersedes an older accepted publication"
+        );
+        let accepted_superseded_record = store
+            .code_review_job(&accepted_superseded.id)
+            .unwrap()
+            .unwrap();
+        assert!(
+            accepted_superseded_record
+                .job
+                .check_sync_error
+                .contains("newer accepted or published round")
+        );
+        assert!(
+            store
+                .code_review_jobs_with_projection_errors(10)
+                .unwrap()
+                .iter()
+                .all(|job| job.id != accepted_superseded.id),
+            "a superseded accepted publication must leave the repair queue"
         );
         assert!(
             store
