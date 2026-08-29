@@ -501,6 +501,30 @@ CREATE INDEX IF NOT EXISTS code_review_findings_job
   ON code_review_findings (job_id, status);
 CREATE INDEX IF NOT EXISTS code_review_findings_open_pr
   ON code_review_findings (status, job_id, path, line);
+-- Stable, head-scoped anchor identities let concurrent review jobs reserve
+-- bounded, disjoint verification work. Per-job targets preserve the exact
+-- continuation set even when the live finding ledger changes between passes.
+CREATE TABLE IF NOT EXISTS code_review_carried_anchor_verifications (
+  repository TEXT NOT NULL,
+  pull_number INTEGER NOT NULL,
+  head_sha TEXT NOT NULL,
+  path TEXT NOT NULL,
+  line INTEGER NOT NULL,
+  claim_job_id TEXT REFERENCES code_review_jobs(id),
+  verified_at TEXT,
+  PRIMARY KEY (repository, pull_number, head_sha, path, line)
+);
+CREATE INDEX IF NOT EXISTS code_review_carried_anchor_claims
+  ON code_review_carried_anchor_verifications (claim_job_id, verified_at);
+CREATE TABLE IF NOT EXISTS code_review_carried_anchor_targets (
+  job_id TEXT NOT NULL REFERENCES code_review_jobs(id) ON DELETE CASCADE,
+  repository TEXT NOT NULL,
+  pull_number INTEGER NOT NULL,
+  head_sha TEXT NOT NULL,
+  path TEXT NOT NULL,
+  line INTEGER NOT NULL,
+  PRIMARY KEY (job_id, path, line)
+);
 CREATE TABLE IF NOT EXISTS code_review_finding_sources (
   finding_id TEXT NOT NULL REFERENCES code_review_findings(id),
   candidate_id TEXT NOT NULL,
@@ -3488,6 +3512,12 @@ pub struct NewCodeReviewJob {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CodeReviewCarriedAnchorPage {
+    pub targets: Vec<(String, u64)>,
+    pub has_more: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodeReviewManualRequest {
     pub pull_number: u64,
     pub trigger_key: String,
@@ -3502,6 +3532,7 @@ pub struct CodeReviewJobRecord {
     /// Untrusted claimed intent for review prompts; never serialized to the
     /// protocol.
     pub pull_body: String,
+    pub config_hash: String,
     pub reviewers: Vec<trouve_protocol::ReviewerProfile>,
     pub summary: String,
     pub prompt_for_agents: String,
@@ -3677,6 +3708,7 @@ fn row_to_code_review_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<CodeReviewJ
         can_retry_final_editor: r.get(61)?,
         prompt: r.get(12)?,
         pull_body: r.get(57)?,
+        config_hash: r.get(14)?,
         reviewers,
         summary: r.get(36)?,
         prompt_for_agents: r.get(37)?,
@@ -12514,20 +12546,103 @@ impl Store {
             .optional()?)
     }
 
-    /// Number of successfully published rounds for a pull. This is a durable
-    /// cursor for bounded work that advances only after a round publishes.
-    pub fn published_code_review_round_count(
+    /// Atomically register the current eligible set and reserve one bounded
+    /// page of stable head-revision anchors. Active same-pull jobs cannot
+    /// reserve the same anchor; claims from unpublished terminal jobs are
+    /// reclaimed so a failed pass cannot strand continuation work.
+    pub(crate) fn claim_code_review_carried_anchor_page(
         &self,
+        job_id: &str,
         repository: &str,
         pull_number: u64,
-    ) -> Result<u64> {
-        let count = self.conn.lock().unwrap().query_row(
-            "SELECT COUNT(*) FROM code_review_jobs
-             WHERE repository = ?1 AND pull_number = ?2 AND review_published = 1",
-            params![repository, pull_number as i64],
-            |row| row.get::<_, i64>(0),
+        head_sha: &str,
+        targets: &[(String, u64)],
+        limit: usize,
+    ) -> Result<CodeReviewCarriedAnchorPage> {
+        let conn = self.conn.lock().unwrap();
+        let tx = write_transaction(&conn)?;
+        tx.execute(
+            "UPDATE code_review_carried_anchor_verifications
+             SET claim_job_id = NULL
+             WHERE verified_at IS NULL
+               AND claim_job_id IN (
+                 SELECT id FROM code_review_jobs
+                 WHERE status IN ('failed', 'cancelled', 'stale')
+                   AND review_published = 0
+               )",
+            [],
         )?;
-        Ok(count as u64)
+        for (path, line) in targets {
+            tx.execute(
+                "INSERT OR IGNORE INTO code_review_carried_anchor_verifications
+                        (repository, pull_number, head_sha, path, line)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![repository, pull_number as i64, head_sha, path, *line as i64],
+            )?;
+            tx.execute(
+                "INSERT OR IGNORE INTO code_review_carried_anchor_targets
+                        (job_id, repository, pull_number, head_sha, path, line)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    job_id,
+                    repository,
+                    pull_number as i64,
+                    head_sha,
+                    path,
+                    *line as i64
+                ],
+            )?;
+        }
+        let mut page = Vec::new();
+        for (path, line) in targets {
+            if page.len() >= limit {
+                break;
+            }
+            let state: (bool, Option<String>) = tx.query_row(
+                "SELECT verified_at IS NOT NULL, claim_job_id
+                 FROM code_review_carried_anchor_verifications
+                 WHERE repository = ?1 AND pull_number = ?2 AND head_sha = ?3
+                   AND path = ?4 AND line = ?5",
+                params![repository, pull_number as i64, head_sha, path, *line as i64],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            if state.0 || state.1.as_deref().is_some_and(|claim| claim != job_id) {
+                continue;
+            }
+            tx.execute(
+                "UPDATE code_review_carried_anchor_verifications
+                 SET claim_job_id = ?6
+                 WHERE repository = ?1 AND pull_number = ?2 AND head_sha = ?3
+                   AND path = ?4 AND line = ?5 AND verified_at IS NULL
+                   AND (claim_job_id IS NULL OR claim_job_id = ?6)",
+                params![
+                    repository,
+                    pull_number as i64,
+                    head_sha,
+                    path,
+                    *line as i64,
+                    job_id
+                ],
+            )?;
+            page.push((path.clone(), *line));
+        }
+        let has_more = tx.query_row(
+            "SELECT EXISTS(
+               SELECT 1
+               FROM code_review_carried_anchor_targets AS target
+               JOIN code_review_carried_anchor_verifications AS anchor
+                 USING (repository, pull_number, head_sha, path, line)
+               WHERE target.job_id = ?1 AND anchor.verified_at IS NULL
+                 AND (anchor.claim_job_id IS NULL OR anchor.claim_job_id != ?1)
+             )",
+            params![job_id],
+            |row| row.get(0),
+        )?;
+        tx.commit()?;
+        Ok(CodeReviewCarriedAnchorPage {
+            targets: page,
+            has_more,
+        })
     }
 
     /// The pull request whose lifecycle comment has this GitHub comment id,
@@ -13773,6 +13888,14 @@ impl Store {
         )?;
         let transition = if updated > 0 {
             let updated_tasks = cancel_active_code_review_tasks(&tx, id, None, &now, error)?;
+            if status != "succeeded" {
+                tx.execute(
+                    "UPDATE code_review_carried_anchor_verifications
+                     SET claim_job_id = NULL
+                     WHERE claim_job_id = ?1 AND verified_at IS NULL",
+                    params![id],
+                )?;
+            }
             let record = tx.query_row(
                 &format!("SELECT {CODE_REVIEW_JOB_COLUMNS} FROM code_review_jobs WHERE id = ?1"),
                 params![id],
@@ -14716,6 +14839,34 @@ impl Store {
         blocking_review_cleanup_pending: bool,
         resolved_finding_ids: &[&str],
     ) -> Result<u64> {
+        Ok(self
+            .record_code_review_publication_with_continuation(
+                id,
+                repository,
+                pull_number,
+                base_sha,
+                head_sha,
+                review_url,
+                blocking_review_cleanup_pending,
+                resolved_finding_ids,
+                None,
+            )?
+            .0)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_code_review_publication_with_continuation(
+        &self,
+        id: &str,
+        repository: &str,
+        pull_number: u64,
+        base_sha: &str,
+        head_sha: &str,
+        review_url: &str,
+        blocking_review_cleanup_pending: bool,
+        resolved_finding_ids: &[&str],
+        continuation: Option<&NewCodeReviewJob>,
+    ) -> Result<(u64, Option<trouve_protocol::CodeReviewJob>)> {
         let conn = self.conn.lock().unwrap();
         let tx = write_transaction(&conn)?;
         let current_publication = tx.query_row(
@@ -14819,6 +14970,42 @@ impl Store {
         )?;
         record_code_review_open_issue_count(&tx, id)?;
         tx.execute(
+            "UPDATE code_review_carried_anchor_verifications
+             SET verified_at = COALESCE(verified_at, ?2), claim_job_id = NULL
+             WHERE claim_job_id = ?1",
+            params![id, published_at],
+        )?;
+        let continuation = if let Some(request) = continuation {
+            let has_remaining: bool = tx.query_row(
+                "SELECT EXISTS(
+                   SELECT 1
+                   FROM code_review_carried_anchor_targets AS target
+                   JOIN code_review_carried_anchor_verifications AS anchor
+                     USING (repository, pull_number, head_sha, path, line)
+                   WHERE target.job_id = ?1 AND anchor.verified_at IS NULL
+                 )",
+                params![id],
+                |row| row.get(0),
+            )?;
+            let another_continuation_active: bool = tx.query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM code_review_jobs
+                   WHERE repository = ?1 AND pull_number = ?2 AND head_sha = ?3
+                     AND id != ?4 AND trigger = 'carried-anchor-continuation'
+                     AND status IN ('queued', 'running')
+                 )",
+                params![repository, pull_number as i64, head_sha, id],
+                |row| row.get(0),
+            )?;
+            if has_remaining && !another_continuation_active {
+                Self::enqueue_code_review_job_conn(&tx, request)?
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        tx.execute(
             "INSERT INTO code_review_pr_state
                     (repository, pull_number, last_reviewed_head_sha,
                      last_reviewed_base_sha, last_reviewed_at,
@@ -14848,7 +15035,7 @@ impl Store {
             ],
         )?;
         tx.commit()?;
-        Ok(fixed)
+        Ok((fixed, continuation))
     }
 
     pub fn claim_code_review_blocking_review_cleanup(&self, id: &str) -> Result<Option<String>> {
@@ -21418,12 +21605,6 @@ mod tests {
         request.scope = trouve_protocol::CodeReviewJobScope::Full;
         let job = store.enqueue_code_review_job(&request).unwrap().unwrap();
         assert_eq!(
-            store
-                .published_code_review_round_count("acme/widgets", 42)
-                .unwrap(),
-            0
-        );
-        assert_eq!(
             store.claim_code_review_job().unwrap().unwrap().job.id,
             job.id
         );
@@ -21446,12 +21627,6 @@ mod tests {
         store
             .finish_code_review_job(&job.id, "succeeded", "", "")
             .unwrap();
-        assert_eq!(
-            store
-                .published_code_review_round_count("acme/widgets", 42)
-                .unwrap(),
-            1
-        );
         // The full round settles coverage only for the head it reviewed; a
         // newer head has no published round and therefore no verdict.
         assert_eq!(
@@ -21473,6 +21648,215 @@ mod tests {
                 )
                 .unwrap(),
             None
+        );
+    }
+
+    #[test]
+    fn carried_anchor_pages_continue_durably_without_duplicate_reservations() {
+        let store = Store::open_in_memory().unwrap();
+        let first = enqueue_backoff_test_job(&store);
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            first.id
+        );
+        let targets = (0..65)
+            .map(|index| (format!("src/carried_{index:02}.rs"), 1))
+            .collect::<Vec<_>>();
+        let first_page = store
+            .claim_code_review_carried_anchor_page(
+                &first.id,
+                &first.repository,
+                first.pull_number,
+                &first.head_sha,
+                &targets,
+                32,
+            )
+            .unwrap();
+        assert_eq!(first_page.targets.len(), 32);
+        assert!(first_page.has_more);
+        store
+            .save_code_review_result(&first.id, "first", "", 0, &[], &[])
+            .unwrap();
+        assert!(store.claim_code_review_publication(&first.id).unwrap());
+        let mut second_request = retry_request_for(&store, &first.id, "carried-second");
+        second_request.trigger = "carried-anchor-continuation".into();
+        let (_, second) = store
+            .record_code_review_publication_with_continuation(
+                &first.id,
+                &first.repository,
+                first.pull_number,
+                &first.base_ref,
+                &first.head_sha,
+                "https://example/review/first",
+                false,
+                &[],
+                Some(&second_request),
+            )
+            .unwrap();
+        let second = second.expect("the second bounded pass should be queued");
+        store
+            .finish_code_review_job(&first.id, "succeeded", "", "")
+            .unwrap();
+
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            second.id
+        );
+        let second_page = store
+            .claim_code_review_carried_anchor_page(
+                &second.id,
+                &second.repository,
+                second.pull_number,
+                &second.head_sha,
+                &targets,
+                32,
+            )
+            .unwrap();
+        assert_eq!(second_page.targets.len(), 32);
+        assert!(second_page.has_more);
+        assert!(
+            first_page
+                .targets
+                .iter()
+                .all(|target| !second_page.targets.contains(target))
+        );
+        store
+            .save_code_review_result(&second.id, "second", "", 0, &[], &[])
+            .unwrap();
+        assert!(store.claim_code_review_publication(&second.id).unwrap());
+        let mut third_request = retry_request_for(&store, &second.id, "carried-third");
+        third_request.trigger = "carried-anchor-continuation".into();
+        let (_, third) = store
+            .record_code_review_publication_with_continuation(
+                &second.id,
+                &second.repository,
+                second.pull_number,
+                &second.base_ref,
+                &second.head_sha,
+                "https://example/review/second",
+                false,
+                &[],
+                Some(&third_request),
+            )
+            .unwrap();
+        let third = third.expect("the final bounded pass should be queued");
+        store
+            .finish_code_review_job(&second.id, "succeeded", "", "")
+            .unwrap();
+
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            third.id
+        );
+        let mut changed_targets = targets[1..].to_vec();
+        changed_targets.push(("src/inserted.rs".into(), 7));
+        let third_page = store
+            .claim_code_review_carried_anchor_page(
+                &third.id,
+                &third.repository,
+                third.pull_number,
+                &third.head_sha,
+                &changed_targets,
+                32,
+            )
+            .unwrap();
+        assert_eq!(
+            third_page.targets,
+            vec![
+                ("src/carried_64.rs".to_owned(), 1),
+                ("src/inserted.rs".to_owned(), 7)
+            ]
+        );
+        assert!(!third_page.has_more);
+        let covered = first_page
+            .targets
+            .iter()
+            .chain(&second_page.targets)
+            .chain(&third_page.targets)
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(covered.len(), 66);
+    }
+
+    #[test]
+    fn overlapping_carried_anchor_jobs_reserve_disjoint_pages_and_reclaim_failures() {
+        let store = Store::open_in_memory().unwrap();
+        let first = enqueue_backoff_test_job(&store);
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            first.id
+        );
+        let mut second_request = backoff_test_job_request();
+        second_request.dedupe_key = "carried-overlap-second".into();
+        let second = store
+            .enqueue_code_review_job(&second_request)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            second.id
+        );
+        let targets = (0..65)
+            .map(|index| (format!("src/overlap_{index:02}.rs"), 1))
+            .collect::<Vec<_>>();
+        let first_page = store
+            .claim_code_review_carried_anchor_page(
+                &first.id,
+                &first.repository,
+                first.pull_number,
+                &first.head_sha,
+                &targets,
+                32,
+            )
+            .unwrap();
+        let second_page = store
+            .claim_code_review_carried_anchor_page(
+                &second.id,
+                &second.repository,
+                second.pull_number,
+                &second.head_sha,
+                &targets,
+                32,
+            )
+            .unwrap();
+        assert_eq!(first_page.targets.len(), 32);
+        assert_eq!(second_page.targets.len(), 32);
+        assert!(
+            first_page
+                .targets
+                .iter()
+                .all(|target| !second_page.targets.contains(target))
+        );
+
+        store
+            .finish_code_review_job(&first.id, "failed", "", "temporary failure")
+            .unwrap();
+        let mut third_request = backoff_test_job_request();
+        third_request.dedupe_key = "carried-overlap-third".into();
+        let third = store
+            .enqueue_code_review_job(&third_request)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            third.id
+        );
+        let reclaimed = store
+            .claim_code_review_carried_anchor_page(
+                &third.id,
+                &third.repository,
+                third.pull_number,
+                &third.head_sha,
+                &targets,
+                32,
+            )
+            .unwrap();
+        assert_eq!(reclaimed.targets, first_page.targets);
+        assert!(
+            reclaimed
+                .targets
+                .iter()
+                .all(|target| !second_page.targets.contains(target))
         );
     }
 

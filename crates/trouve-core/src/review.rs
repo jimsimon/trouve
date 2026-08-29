@@ -6335,6 +6335,7 @@ impl Engine {
             } else {
                 analysis_handle.await.ok().flatten()
             };
+        let mut carried_anchor_has_more = false;
         let parsed = if coordinator_candidates.is_empty() && previous_findings.is_empty() {
             if let Some(task) = queued_coordinator.take() {
                 let skipped = self
@@ -6372,19 +6373,16 @@ impl Engine {
             // so the coordinator can judge — and provably ground — fixes
             // whose commits predate this round's diff window. In-context
             // comparison, no extra model turns or tool calls.
-            let published_rounds = self
-                .store
-                .published_code_review_round_count(&job.repository, job.pull_number)?;
-            let carried_anchor_lines = self
+            let (carried_anchor_lines, has_more) = self
                 .prefetch_carried_anchor_lines(
+                    &job,
                     &previous_findings,
                     &diff_files,
-                    published_rounds,
                     repository_path.as_path(),
-                    &job.head_sha,
                     superseded,
                 )
-                .await;
+                .await?;
+            carried_anchor_has_more = has_more;
             let prompt = validation_prompt(
                 &execution_record,
                 &coordinator_candidates,
@@ -6883,16 +6881,21 @@ impl Engine {
             .publish_review(&api, &job, &persisted, has_unresolved_findings)
             .await
             .context("publishing GitHub pull request review")?;
-        self.store.record_code_review_publication(
-            &job.id,
-            &job.repository,
-            job.pull_number,
-            &job.base_ref,
-            &job.head_sha,
-            &published_review.url,
-            !published_review.blocking,
-            &resolved_finding_ids,
-        )?;
+        let continuation_request =
+            carried_anchor_has_more.then(|| carried_anchor_continuation_request(record, &job));
+        let (_, continuation_job) = self
+            .store
+            .record_code_review_publication_with_continuation(
+                &job.id,
+                &job.repository,
+                job.pull_number,
+                &job.base_ref,
+                &job.head_sha,
+                &published_review.url,
+                !published_review.blocking,
+                &resolved_finding_ids,
+                continuation_request.as_ref(),
+            )?;
         // Collapsing the remote threads is cleanup detached from the round
         // entirely: it starts only after every piece of publication
         // bookkeeping, runs outside the job future with individually bounded
@@ -6910,6 +6913,10 @@ impl Engine {
         // publication guard before making the task runnable so its inline
         // attempt does not always lose a try_lock race and defer itself.
         drop(publication_guard);
+        if let Some(continuation_job) = continuation_job {
+            self.emit_code_review_updated(Some(continuation_job.id.clone()))?;
+            self.code_review.job_wake.notify_one();
+        }
         tokio::spawn(async move {
             if let Err(error) = cleanup_engine
                 .resolve_review_threads(
@@ -10667,38 +10674,37 @@ impl Engine {
         Ok(ReviewThreadReconciliationOutcome::Completed)
     }
 
-    /// Prefetch one durable page of immutable-object lines for anchors the
-    /// coordinator's findings reference outside the diff, through the
-    /// executor's audited git boundary. Reading before validation keeps
-    /// verification itself pure, and the object store makes the read immune
-    /// to concurrent checkout syncs, symlinks, and replacement refs.
-    /// Current head-revision content supports the coordinator's carried-finding
-    /// review and server-side verification of its resolution claims. Some(None)
-    /// records that the anchor line no longer exists — itself verifiable
-    /// evidence — while unreadable or hostile paths are simply absent from
-    /// the map (their resolutions stay claim-rejected). Each review advances
-    /// a bounded page after successful publication, so large ledgers remain
-    /// bounded per pass and receive complete coverage across later rounds.
+    /// Prefetch one atomically reserved page of immutable-object lines for
+    /// carried anchors through the executor's audited git boundary. Stable
+    /// head/path/line identities prevent overlapping jobs from duplicating a
+    /// reservation, and successful publication durably completes the page.
+    /// If targets remain, publication atomically queues the next bounded pass.
     async fn prefetch_carried_anchor_lines(
         &self,
+        job: &trouve_protocol::CodeReviewJob,
         findings: &[trouve_protocol::CodeReviewFinding],
         diff_files: &[ReviewDiffFile],
-        published_rounds: u64,
         repository_path: &std::path::Path,
-        head_sha: &str,
         cancel: &CancellationToken,
-    ) -> HashMap<(String, u64), Option<String>> {
+    ) -> Result<(HashMap<(String, u64), Option<String>>, bool)> {
         let targets = carried_anchor_targets(findings, diff_files);
-        let targets = carried_anchor_page(&targets, published_rounds);
+        let page = self.store.claim_code_review_carried_anchor_page(
+            &job.id,
+            &job.repository,
+            job.pull_number,
+            &job.head_sha,
+            &targets,
+            CARRIED_ANCHOR_PREFETCH_PAGE_SIZE,
+        )?;
         let mut lines = HashMap::new();
-        for (path, line) in targets {
+        for (path, line) in page.targets {
             let key = (path.clone(), line);
             match self
                 .executor
                 .review_repository_object_line(&crate::tools::ReviewRepositoryObjectLine {
                     managed_root: self.data_dir.join("review-repositories"),
                     worktree: repository_path.to_path_buf(),
-                    head_sha: head_sha.to_owned(),
+                    head_sha: job.head_sha.clone(),
                     path: path.clone(),
                     line,
                     max_bytes: REVIEW_ANCHOR_BLOB_MAX_BYTES,
@@ -10719,7 +10725,7 @@ impl Engine {
                 }
             }
         }
-        lines
+        Ok((lines, page.has_more))
     }
 
     async fn prefetch_anchor_object_lines(
@@ -16997,18 +17003,39 @@ fn carried_anchor_targets(
 
 const CARRIED_ANCHOR_PREFETCH_PAGE_SIZE: usize = 32;
 
-fn carried_anchor_page(targets: &[(String, u64)], published_rounds: u64) -> Vec<(String, u64)> {
-    if targets.is_empty() {
-        return Vec::new();
+fn carried_anchor_continuation_request(
+    record: &CodeReviewJobRecord,
+    job: &trouve_protocol::CodeReviewJob,
+) -> NewCodeReviewJob {
+    NewCodeReviewJob {
+        dedupe_key: format!("{}:carried-anchor-continuation", job.id),
+        installation_id: job.installation_id,
+        repository: job.repository.clone(),
+        pull_number: job.pull_number,
+        pull_title: job.pull_title.clone(),
+        pull_body: record.pull_body.clone(),
+        pull_url: job.pull_url.clone(),
+        head_sha: job.head_sha.clone(),
+        review_base_sha: job.review_base_sha.clone(),
+        base_ref: job.base_ref.clone(),
+        head_ref: job.head_ref.clone(),
+        scope: job.scope,
+        trigger: "carried-anchor-continuation".into(),
+        retry_of: Some(job.id.clone()),
+        model: job.model.clone(),
+        coordinator_thinking_level: job.coordinator_thinking_level.clone(),
+        router_model: job.router_model.clone(),
+        router_thinking_level: job.router_thinking_level.clone(),
+        analyst_model: job.analyst_model.clone(),
+        analyst_thinking_level: job.analyst_thinking_level.clone(),
+        prompt: record.prompt.clone(),
+        reviewers: record.reviewers.clone(),
+        routing_mode: job.routing_mode,
+        semantic_routing: job.semantic_routing,
+        included_reviewer_ids: job.included_reviewer_ids.clone(),
+        excluded_reviewer_ids: job.excluded_reviewer_ids.clone(),
+        config_hash: record.config_hash.clone(),
     }
-    let page_count = targets.len().div_ceil(CARRIED_ANCHOR_PREFETCH_PAGE_SIZE);
-    let page = usize::try_from(published_rounds % page_count as u64).unwrap_or_default();
-    targets
-        .iter()
-        .skip(page * CARRIED_ANCHOR_PREFETCH_PAGE_SIZE)
-        .take(CARRIED_ANCHOR_PREFETCH_PAGE_SIZE)
-        .cloned()
-        .collect()
 }
 
 /// Verifies one carried-resolution claim against the server's own read of
@@ -19842,7 +19869,7 @@ mod tests {
     }
 
     #[test]
-    fn carried_anchor_targets_are_filtered_deduplicated_and_durably_paged() {
+    fn carried_anchor_targets_are_filtered_and_deduplicated_before_reservation() {
         let files = vec![ReviewDiffFile {
             path: "src/touched.rs".into(),
             diff: "+changed\n".into(),
@@ -19865,20 +19892,11 @@ mod tests {
         }));
 
         let targets = carried_anchor_targets(&findings, &files);
-        let first = carried_anchor_page(&targets, 0);
-        let second = carried_anchor_page(&targets, 1);
 
         assert_eq!(targets.len(), 35);
         assert_eq!(targets[0], ("src/duplicate.rs".to_owned(), 7));
         assert_eq!(targets.last(), Some(&("src/carried_33.rs".to_owned(), 1)));
         assert!(targets.iter().all(|(path, _)| path != "src/touched.rs"));
-        assert_eq!(first.len(), CARRIED_ANCHOR_PREFETCH_PAGE_SIZE);
-        assert_eq!(second.len(), 3);
-        assert_eq!(carried_anchor_page(&targets, 2), first);
-        assert_eq!(
-            first.iter().chain(&second).cloned().collect::<HashSet<_>>(),
-            targets.into_iter().collect()
-        );
     }
 
     #[test]
