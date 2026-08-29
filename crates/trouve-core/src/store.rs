@@ -23330,6 +23330,12 @@ mod tests {
                 &[("rvf-carried".to_owned(), "src/original.rs".to_owned(), 102)],
             )
             .unwrap();
+        store
+            .record_code_review_carried_finding_anchors(
+                "head-4",
+                &[("rvf-carried".to_owned(), "src/original.rs".to_owned(), 0)],
+            )
+            .unwrap();
 
         let ids = vec!["rvf-carried".to_owned()];
         assert_eq!(
@@ -23349,6 +23355,12 @@ mod tests {
                 "rvf-carried".to_owned(),
                 ("src/original.rs".to_owned(), 102),
             )])
+        );
+        assert_eq!(
+            store
+                .code_review_carried_finding_anchors(&ids, "head-4")
+                .unwrap(),
+            HashMap::from([("rvf-carried".to_owned(), ("src/original.rs".to_owned(), 0),)])
         );
         assert!(
             store
