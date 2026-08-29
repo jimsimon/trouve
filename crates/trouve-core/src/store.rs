@@ -522,6 +522,12 @@ CREATE INDEX IF NOT EXISTS code_review_carried_anchor_claims
   ON code_review_carried_anchor_verifications (
     repository, pull_number, head_sha, verified_at, claim_job_id, path, line
   );
+CREATE TABLE IF NOT EXISTS code_review_carried_anchor_targets (
+  job_id TEXT NOT NULL REFERENCES code_review_jobs(id) ON DELETE CASCADE,
+  path TEXT NOT NULL,
+  line INTEGER NOT NULL,
+  PRIMARY KEY (job_id, path, line)
+);
 CREATE TABLE IF NOT EXISTS code_review_finding_sources (
   finding_id TEXT NOT NULL REFERENCES code_review_findings(id),
   candidate_id TEXT NOT NULL,
@@ -938,6 +944,12 @@ const MIGRATIONS: &[&str] = &[
        finding_id TEXT NOT NULL,
        last_comment_id INTEGER NOT NULL,
        PRIMARY KEY (repository, pull_number, finding_id)
+     )",
+    "CREATE TABLE IF NOT EXISTS code_review_carried_anchor_targets (
+       job_id TEXT NOT NULL REFERENCES code_review_jobs(id) ON DELETE CASCADE,
+       path TEXT NOT NULL,
+       line INTEGER NOT NULL,
+       PRIMARY KEY (job_id, path, line)
      )",
 ];
 
@@ -9419,6 +9431,17 @@ impl Store {
         if inserted == 0 {
             return Ok(None);
         }
+        if new_job.trigger == "carried-anchor-continuation"
+            && let Some(parent_job_id) = new_job.retry_of.as_deref()
+        {
+            conn.execute(
+                "INSERT OR IGNORE INTO code_review_carried_anchor_targets (job_id, path, line)
+                 SELECT ?1, path, line
+                 FROM code_review_carried_anchor_targets
+                 WHERE job_id = ?2",
+                params![id, parent_job_id],
+            )?;
+        }
         Ok(Some(
             conn.query_row(
                 &format!("SELECT {CODE_REVIEW_JOB_COLUMNS} FROM code_review_jobs WHERE id = ?1"),
@@ -12610,7 +12633,17 @@ impl Store {
             [],
         )?;
         if register_targets {
+            tx.execute(
+                "DELETE FROM code_review_carried_anchor_targets WHERE job_id = ?1",
+                params![job_id],
+            )?;
             for (path, line) in targets {
+                tx.execute(
+                    "INSERT OR IGNORE INTO code_review_carried_anchor_targets
+                            (job_id, path, line)
+                     VALUES (?1, ?2, ?3)",
+                    params![job_id, path, *line as i64],
+                )?;
                 tx.execute(
                     "INSERT INTO code_review_carried_anchor_verifications
                             (repository, pull_number, head_sha, path, line)
@@ -12622,17 +12655,15 @@ impl Store {
                 )?;
             }
         }
-        let target_json = serde_json::to_string(targets)?;
+
         let selected = {
             let mut stmt = tx.prepare(
-                "WITH active(path, line) AS (
-                   SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]')
-                   FROM json_each(?5)
-                 )
-                 SELECT verification.path, verification.line
+                "SELECT verification.path, verification.line
                  FROM code_review_carried_anchor_verifications AS verification
-                 JOIN active
-                   ON active.path = verification.path AND active.line = verification.line
+                 JOIN code_review_carried_anchor_targets AS active
+                   ON active.job_id = ?5
+                  AND active.path = verification.path
+                  AND active.line = verification.line
                  WHERE verification.repository = ?1 AND verification.pull_number = ?2
                    AND verification.head_sha = ?3
                    AND verification.verified_at IS NULL
@@ -12646,7 +12677,7 @@ impl Store {
                     pull_number as i64,
                     head_sha,
                     limit as i64,
-                    target_json
+                    job_id
                 ],
                 |row| Ok((row.get(0)?, row.get::<_, i64>(1)? as u64)),
             )?
@@ -12654,15 +12685,13 @@ impl Store {
         };
         let cached = {
             let mut stmt = tx.prepare(
-                "WITH active(path, line) AS (
-                   SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]')
-                   FROM json_each(?5)
-                 )
-                 SELECT verification.path, verification.line,
+                "SELECT verification.path, verification.line,
                         verification.line_present, verification.content
                  FROM code_review_carried_anchor_verifications AS verification
-                 JOIN active
-                   ON active.path = verification.path AND active.line = verification.line
+                 JOIN code_review_carried_anchor_targets AS active
+                   ON active.job_id = ?5
+                  AND active.path = verification.path
+                  AND active.line = verification.line
                  WHERE verification.repository = ?1 AND verification.pull_number = ?2
                    AND verification.head_sha = ?3
                    AND verification.verified_at IS NOT NULL
@@ -12676,7 +12705,7 @@ impl Store {
                     pull_number as i64,
                     head_sha,
                     limit.saturating_sub(selected.len()) as i64,
-                    target_json
+                    job_id
                 ],
                 |row| {
                     let present: bool = row.get(2)?;
@@ -12726,15 +12755,13 @@ impl Store {
             )?;
         }
         let has_more = tx.query_row(
-            "WITH active(path, line) AS (
-               SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]')
-               FROM json_each(?4)
-             )
-             SELECT EXISTS(
+            "SELECT EXISTS(
                SELECT 1
                FROM code_review_carried_anchor_verifications AS verification
-               JOIN active
-                 ON active.path = verification.path AND active.line = verification.line
+               JOIN code_review_carried_anchor_targets AS active
+                 ON active.job_id = ?4
+                AND active.path = verification.path
+                AND active.line = verification.line
                WHERE verification.repository = ?1 AND verification.pull_number = ?2
                  AND verification.head_sha = ?3
                  AND (
@@ -12744,7 +12771,7 @@ impl Store {
                        AND verification.presented_at IS NULL)
                  )
              )",
-            params![repository, pull_number as i64, head_sha, target_json],
+            params![repository, pull_number as i64, head_sha, job_id],
             |row| row.get(0),
         )?;
         tx.commit()?;
@@ -14144,18 +14171,27 @@ impl Store {
                 if let Some(request) = continuation {
                     let next_anchor: Option<(String, i64)> = tx
                         .query_row(
-                            "SELECT path, line
-                             FROM code_review_carried_anchor_verifications
-                             WHERE repository = ?1 AND pull_number = ?2 AND head_sha = ?3
+                            "SELECT verification.path, verification.line
+                             FROM code_review_carried_anchor_verifications AS verification
+                             JOIN code_review_carried_anchor_targets AS active
+                               ON active.job_id = ?4
+                              AND active.path = verification.path
+                              AND active.line = verification.line
+                             WHERE verification.repository = ?1
+                               AND verification.pull_number = ?2
+                               AND verification.head_sha = ?3
                                AND (
-                                 (verified_at IS NULL AND claim_job_id IS NULL)
-                                 OR (verified_at IS NOT NULL AND presented_at IS NULL)
+                                 (verification.verified_at IS NULL
+                                  AND verification.claim_job_id IS NULL)
+                                 OR (verification.verified_at IS NOT NULL
+                                     AND verification.presented_at IS NULL)
                                )
-                             ORDER BY path, line LIMIT 1",
+                             ORDER BY verification.path, verification.line LIMIT 1",
                             params![
                                 record.job.repository,
                                 record.job.pull_number as i64,
-                                record.job.head_sha
+                                record.job.head_sha,
+                                id
                             ],
                             |row| Ok((row.get(0)?, row.get(1)?)),
                         )
@@ -15267,16 +15303,23 @@ impl Store {
         let continuation = if let Some(request) = continuation {
             let next_anchor: Option<(String, i64)> = tx
                 .query_row(
-                    "SELECT path, line
-                     FROM code_review_carried_anchor_verifications
-                     WHERE repository = ?1 AND pull_number = ?2 AND head_sha = ?3
+                    "SELECT verification.path, verification.line
+                     FROM code_review_carried_anchor_verifications AS verification
+                     JOIN code_review_carried_anchor_targets AS active
+                       ON active.job_id = ?4
+                      AND active.path = verification.path
+                      AND active.line = verification.line
+                     WHERE verification.repository = ?1 AND verification.pull_number = ?2
+                       AND verification.head_sha = ?3
                        AND (
-                         (verified_at IS NULL AND claim_job_id IS NULL)
-                         OR (verified_at IS NOT NULL AND presented_at IS NULL)
+                         (verification.verified_at IS NULL
+                          AND verification.claim_job_id IS NULL)
+                         OR (verification.verified_at IS NOT NULL
+                             AND verification.presented_at IS NULL)
                        )
-                     ORDER BY path, line
+                     ORDER BY verification.path, verification.line
                      LIMIT 1",
-                    params![repository, pull_number as i64, head_sha],
+                    params![repository, pull_number as i64, head_sha, id],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()?;
@@ -21049,7 +21092,7 @@ mod tests {
                 first.pull_number,
                 &first.head_sha,
                 std::slice::from_ref(&target),
-                false,
+                true,
                 1,
             )
             .unwrap();
@@ -22435,7 +22478,7 @@ mod tests {
         changed_targets.push(("src/inserted.rs".into(), 7));
         store
             .claim_code_review_carried_anchor_page(
-                "target-refresh",
+                &third.id,
                 &third.repository,
                 third.pull_number,
                 &third.head_sha,
@@ -22761,14 +22804,24 @@ mod tests {
 
         let active_targets = all_targets[1..].to_vec();
         let mut cached_pages = Vec::new();
+        let mut previous_job: Option<trouve_protocol::CodeReviewJob> = None;
         for (index, expected_len) in [32, 32, 1].into_iter().enumerate() {
             let mut request = backoff_test_job_request();
             request.dedupe_key = format!("cached-page-{index}");
+            if let Some(parent_job) = previous_job.as_ref() {
+                request.trigger = "carried-anchor-continuation".into();
+                request.retry_of = Some(parent_job.id.clone());
+            }
             let job = store.enqueue_code_review_job(&request).unwrap().unwrap();
             assert_eq!(
                 store.claim_code_review_job().unwrap().unwrap().job.id,
                 job.id
             );
+            if let Some(parent_job) = previous_job.take() {
+                store
+                    .finish_code_review_job(&parent_job.id, "succeeded", "", "")
+                    .unwrap();
+            }
             let page = store
                 .claim_code_review_carried_anchor_page(
                     &job.id,
@@ -22784,11 +22837,79 @@ mod tests {
             assert_eq!(page.cached.len(), expected_len);
             assert_eq!(page.has_more, index < 2);
             cached_pages.extend(page.cached.into_iter().map(|(path, line, _)| (path, line)));
+            previous_job = Some(job);
         }
         assert_eq!(cached_pages, active_targets);
         assert!(
             !cached_pages.contains(&all_targets[0]),
             "inactive cached evidence must not enter the active review"
+        );
+        let last_job = previous_job.unwrap();
+        store
+            .save_code_review_result(&last_job.id, "cached", "", 0, &[], &[])
+            .unwrap();
+        assert!(store.claim_code_review_publication(&last_job.id).unwrap());
+        let mut publication_continuation =
+            retry_request_for(&store, &last_job.id, "cached-publication-continuation");
+        publication_continuation.trigger = "carried-anchor-continuation".into();
+        let (_, chained) = store
+            .record_code_review_publication_with_continuation(
+                &last_job.id,
+                &last_job.repository,
+                last_job.pull_number,
+                &last_job.base_ref,
+                &last_job.head_sha,
+                "https://example/review/cached",
+                false,
+                &[],
+                Some(&publication_continuation),
+            )
+            .unwrap();
+        assert!(
+            chained.is_none(),
+            "publication must ignore pending evidence outside its target epoch"
+        );
+        store
+            .finish_code_review_job(&last_job.id, "succeeded", "", "")
+            .unwrap();
+
+        let mut empty_request = backoff_test_job_request();
+        empty_request.dedupe_key = "cached-empty-epoch".into();
+        let empty_job = store
+            .enqueue_code_review_job(&empty_request)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            empty_job.id
+        );
+        let empty_page = store
+            .claim_code_review_carried_anchor_page(
+                &empty_job.id,
+                &empty_job.repository,
+                empty_job.pull_number,
+                &empty_job.head_sha,
+                &[],
+                true,
+                32,
+            )
+            .unwrap();
+        assert!(!empty_page.has_more);
+        let mut failure_continuation =
+            retry_request_for(&store, &empty_job.id, "cached-failure-continuation");
+        failure_continuation.trigger = "carried-anchor-continuation".into();
+        let (_, chained) = store
+            .finish_code_review_job_with_continuation(
+                &empty_job.id,
+                "failed",
+                "",
+                "test failure",
+                Some(&failure_continuation),
+            )
+            .unwrap();
+        assert!(
+            chained.is_none(),
+            "completion must ignore pending evidence outside its target epoch"
         );
     }
 
