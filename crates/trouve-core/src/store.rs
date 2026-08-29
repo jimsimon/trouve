@@ -872,6 +872,21 @@ const MIGRATIONS: &[&str] = &[
     // even when provider metadata is transiently unavailable.
     "ALTER TABLE code_review_jobs ADD COLUMN prompt_budget_window INTEGER",
     USAGE_MODEL_COLUMN_MIGRATION,
+    // Durable threadless resolve/unresolve commands claimed from webhooks;
+    // rows survive restarts and are deleted when the command reaches a
+    // definitive outcome. Positional append-only history: this must stay
+    // after every migration a deployed database may already have run.
+    "CREATE TABLE IF NOT EXISTS code_review_pending_threadless_commands (
+       trigger_key TEXT PRIMARY KEY,
+       repository TEXT NOT NULL,
+       pull_number INTEGER NOT NULL,
+       comment_id INTEGER NOT NULL,
+       author TEXT NOT NULL,
+       resolve INTEGER NOT NULL,
+       finding_prefix TEXT NOT NULL,
+       reason TEXT NOT NULL,
+       created_at TEXT NOT NULL
+     )",
 ];
 
 /// Blocking-tier predicate for one findings row under the given SQL alias:
@@ -4077,6 +4092,49 @@ fn cancel_active_code_review_tasks(
             .map_err(Into::into)
         })
         .collect()
+}
+
+/// A durable threadless resolve/unresolve command claimed from a webhook
+/// delivery, retried until it reaches a definitive outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingThreadlessCommand {
+    pub trigger_key: String,
+    pub repository: String,
+    pub pull_number: u64,
+    pub comment_id: u64,
+    pub author: String,
+    pub resolve: bool,
+    pub finding_prefix: String,
+    pub reason: String,
+    /// Claim time, set by the store when the delivery is claimed. Used to
+    /// bound how long a premature no-op is retained for replay.
+    pub created_at: String,
+}
+
+/// Outcome of a maintainer resolve/unresolve command against the threadless
+/// finding ledger.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ThreadlessCommandOutcome {
+    Applied {
+        finding_id: String,
+    },
+    AmbiguousPrefix {
+        matches: usize,
+    },
+    NotFound,
+    /// The prefix matched exactly one finding, but it is not in the state
+    /// the verb expects (already resolved, or not resolved).
+    NotApplicable {
+        finding_id: String,
+        status: String,
+    },
+    /// Another processor consumed this command's durable row first; nothing
+    /// was evaluated or mutated.
+    AlreadyConsumed,
+    /// The command is not applicable yet, but an out-of-order sibling
+    /// delivery could still make it applicable, so its row was retained for
+    /// replay instead of being consumed.
+    NotApplicableDeferred,
 }
 
 #[derive(Debug, Clone)]
@@ -12591,6 +12649,196 @@ impl Store {
         Ok((changed, projection_job))
     }
 
+    /// Resolve (won't-fix) or unresolve one threadless finding through a
+    /// maintainer command. The prefix must uniquely identify a threadless
+    /// finding of this pull's published rounds; the command records the
+    /// maintainer's reason and attribution in `dismiss_reason`.
+    pub fn apply_threadless_resolve_command(
+        &self,
+        command: &PendingThreadlessCommand,
+        dismiss_reason: &str,
+        defer_not_applicable_within: Option<std::time::Duration>,
+    ) -> Result<(ThreadlessCommandOutcome, Option<String>)> {
+        let repository = command.repository.as_str();
+        let pull_number = command.pull_number;
+        let finding_prefix = command.finding_prefix.as_str();
+        let resolve = command.resolve;
+        let conn = self.conn.lock().unwrap();
+        let tx = write_transaction(&conn)?;
+        // Outcomes below are definitive (except an in-window NotApplicable,
+        // which re-inserts the row), so the durable command row is consumed
+        // in the same transaction as the state it decides.
+        if !command.trigger_key.is_empty() {
+            // Consumption must be exclusive: a processor whose snapshot lost
+            // the race deletes zero rows and must not evaluate or mutate
+            // anything, or a stale command could reverse a newer opposite
+            // decision.
+            let consumed = tx.execute(
+                "DELETE FROM code_review_pending_threadless_commands WHERE trigger_key = ?1",
+                params![command.trigger_key],
+            )?;
+            if consumed == 0 {
+                tx.commit()?;
+                return Ok((ThreadlessCommandOutcome::AlreadyConsumed, None));
+            }
+        }
+        let mut stmt = tx.prepare(
+            "SELECT f.id, f.status FROM code_review_findings f
+             JOIN code_review_jobs j ON j.id = f.job_id
+             WHERE j.repository = ?1 AND j.pull_number = ?2
+               AND j.review_published = 1
+               AND f.github_comment_id IS NULL
+               AND f.status IN ('open', 'dismissed')
+               AND f.id LIKE ?3 || '%' ESCAPE '\\'",
+        )?;
+        // The command parser only admits `rvf_` plus hex, but this is a
+        // public store method and the prefix is untrusted comment text:
+        // neutralize LIKE metacharacters so a prefix can never
+        // wildcard-match a finding the maintainer did not name.
+        let escaped_prefix = finding_prefix
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let matches = stmt
+            .query_map(
+                params![repository, pull_number as i64, escaped_prefix],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(stmt);
+        let (finding_id, status) = match matches.as_slice() {
+            [] => {
+                tx.commit()?;
+                return Ok((ThreadlessCommandOutcome::NotFound, None));
+            }
+            [only] => only.clone(),
+            many => {
+                let count = many.len();
+                tx.commit()?;
+                return Ok((
+                    ThreadlessCommandOutcome::AmbiguousPrefix { matches: count },
+                    None,
+                ));
+            }
+        };
+        let expected = if resolve { "open" } else { "dismissed" };
+        if status != expected {
+            // Deliveries can arrive out of order: an unresolve whose earlier
+            // resolve has not been delivered yet is inapplicable now but
+            // becomes applicable the moment the sibling lands (comment-id
+            // ordering then replays them in the order the maintainer wrote
+            // them). Retain such a command briefly instead of consuming it;
+            // past the window it is a genuine no-op and gets its reply.
+            if !command.trigger_key.is_empty()
+                && let Some(window) = defer_not_applicable_within
+                && chrono::DateTime::parse_from_rfc3339(&command.created_at)
+                    .ok()
+                    .map(|created| chrono::Utc::now().signed_duration_since(created))
+                    .and_then(|age| age.to_std().ok())
+                    .is_some_and(|age| age < window)
+            {
+                tx.execute(
+                    "INSERT OR IGNORE INTO code_review_pending_threadless_commands
+                            (trigger_key, repository, pull_number, comment_id, author, resolve,
+                             finding_prefix, reason, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    params![
+                        command.trigger_key,
+                        command.repository,
+                        command.pull_number as i64,
+                        command.comment_id as i64,
+                        command.author,
+                        command.resolve,
+                        command.finding_prefix,
+                        command.reason,
+                        command.created_at
+                    ],
+                )?;
+                tx.commit()?;
+                return Ok((ThreadlessCommandOutcome::NotApplicableDeferred, None));
+            }
+            tx.commit()?;
+            return Ok((
+                ThreadlessCommandOutcome::NotApplicable { finding_id, status },
+                None,
+            ));
+        }
+        let now = chrono::Utc::now().to_rfc3339();
+        if resolve {
+            tx.execute(
+                "UPDATE code_review_findings
+                 SET status = 'dismissed', dismiss_reason = ?2, resolved_at = ?3,
+                     resolved_head = '', resolved_by_job_id = '', collapse_pending = 0
+                 WHERE id = ?1",
+                params![finding_id, dismiss_reason, now],
+            )?;
+        } else {
+            tx.execute(
+                "UPDATE code_review_findings
+                 SET status = 'open', dismiss_reason = '', resolved_at = NULL,
+                     resolved_head = '', resolved_by_job_id = ''
+                 WHERE id = ?1",
+                params![finding_id],
+            )?;
+            // Mirror the thread-based reopen path: a theme resolved while
+            // this finding was dismissed is open again now that its
+            // manifestation is.
+            tx.execute(
+                "UPDATE code_review_themes
+                 SET status = 'open', resolved_head = '', updated_at = ?2
+                 WHERE id IN (
+                   SELECT theme_id FROM code_review_finding_themes
+                   WHERE finding_id = ?1
+                 )",
+                params![finding_id, now],
+            )?;
+        }
+        // Legacy checkbox snapshots and commands mutate the same threadless
+        // ledger. Advancing the checkbox watermark in this transaction makes
+        // the command the newer writer: a checkbox snapshot captured before
+        // the command but delivered after it is watermark-rejected instead
+        // of silently reverting the decision. The watermark is compared as
+        // a string in GitHub's second-granularity `Z` timestamp format, and
+        // equal timestamps apply, so the command claims its entire current
+        // second: a snapshot stamped in the same second compares older and
+        // is rejected, and only a strictly later-second checkbox edit
+        // supersedes the command. The column is NOT NULL DEFAULT '', so the
+        // strict comparison also advances initial rows.
+        let watermark = (chrono::Utc::now() + chrono::Duration::seconds(1))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        tx.execute(
+            "UPDATE code_review_pr_state
+             SET lifecycle_checkbox_edited_at = ?3
+             WHERE repository = ?1 AND pull_number = ?2
+               AND lifecycle_checkbox_edited_at < ?3",
+            params![repository, pull_number as i64, watermark],
+        )?;
+        let projection_job =
+            refresh_code_review_pull_projection_counts_in_tx(&tx, repository, pull_number)?;
+        // The GitHub projection (lifecycle comment, check run) runs only
+        // after this transaction commits; a crash in between would leave
+        // durable state and GitHub disagreeing with no pending row left to
+        // replay. Arming the durable projection-retry marker in the same
+        // commit hands the sync to the poll's projection-repair pass, and
+        // the in-process success path clears it immediately.
+        if let Some(job_id) = projection_job.as_deref() {
+            tx.execute(
+                "UPDATE code_review_jobs
+                 SET check_sync_error = 'threadless command applied; projection sync pending',
+                     projection_retry_at = NULL,
+                     projection_retryable = 1
+                 WHERE id = ?1",
+                params![job_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok((
+            ThreadlessCommandOutcome::Applied { finding_id },
+            projection_job,
+        ))
+    }
+
     pub fn code_review_themes_for_pull(
         &self,
         repository: &str,
@@ -14653,10 +14901,16 @@ impl Store {
     /// Claim one GitHub webhook delivery and, when present, durably record its
     /// manual review request in the same transaction. Duplicate delivery ids
     /// are ignored, which makes GitHub's at-least-once delivery safe to retry.
+    /// Claim a webhook delivery, persisting any durable payloads it carries
+    /// — a manual review request and/or a threadless resolve command — in
+    /// the same transaction, so a crash after the claim can never lose
+    /// either: both are retried from their tables until consumed. A comment
+    /// may legitimately carry both a review request and a resolve command.
     pub fn claim_github_webhook_delivery(
         &self,
         delivery_id: &str,
         manual_request: Option<(&str, u64, &str)>,
+        threadless_command: Option<&PendingThreadlessCommand>,
     ) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         let tx = write_transaction(&conn)?;
@@ -14665,23 +14919,73 @@ impl Store {
              VALUES (?1, ?2)",
             params![delivery_id, chrono::Utc::now().to_rfc3339()],
         )?;
-        if inserted > 0
-            && let Some((repository, pull_number, trigger_key)) = manual_request
-        {
-            tx.execute(
-                "INSERT OR IGNORE INTO code_review_manual_requests
-                        (repository, pull_number, trigger_key, created_at)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![
-                    repository,
-                    pull_number as i64,
-                    trigger_key,
-                    chrono::Utc::now().to_rfc3339()
-                ],
-            )?;
+        if inserted > 0 {
+            if let Some((repository, pull_number, trigger_key)) = manual_request {
+                tx.execute(
+                    "INSERT OR IGNORE INTO code_review_manual_requests
+                            (repository, pull_number, trigger_key, created_at)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        repository,
+                        pull_number as i64,
+                        trigger_key,
+                        chrono::Utc::now().to_rfc3339()
+                    ],
+                )?;
+            }
+            if let Some(command) = threadless_command {
+                tx.execute(
+                    "INSERT OR IGNORE INTO code_review_pending_threadless_commands
+                            (trigger_key, repository, pull_number, comment_id, author, resolve,
+                             finding_prefix, reason, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    params![
+                        command.trigger_key,
+                        command.repository,
+                        command.pull_number as i64,
+                        command.comment_id as i64,
+                        command.author,
+                        command.resolve,
+                        command.finding_prefix,
+                        command.reason,
+                        chrono::Utc::now().to_rfc3339()
+                    ],
+                )?;
+            }
         }
         tx.commit()?;
         Ok(inserted > 0)
+    }
+
+    /// Pending commands ordered by comment id — GitHub's monotonically
+    /// increasing comment ids give comment-creation order even when webhook
+    /// deliveries arrive out of order, so a resolve and its follow-up
+    /// unresolve always apply in the order the maintainer wrote them.
+    pub fn pending_threadless_commands(
+        &self,
+        repository: &str,
+    ) -> Result<Vec<PendingThreadlessCommand>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT trigger_key, repository, pull_number, comment_id, author, resolve,
+                    finding_prefix, reason, created_at
+             FROM code_review_pending_threadless_commands
+             WHERE repository = ?1 ORDER BY comment_id",
+        )?;
+        let rows = stmt.query_map(params![repository], |row| {
+            Ok(PendingThreadlessCommand {
+                trigger_key: row.get(0)?,
+                repository: row.get(1)?,
+                pull_number: row.get::<_, i64>(2)? as u64,
+                comment_id: row.get::<_, i64>(3)? as u64,
+                author: row.get(4)?,
+                resolve: row.get(5)?,
+                finding_prefix: row.get(6)?,
+                reason: row.get(7)?,
+                created_at: row.get(8)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     pub fn pending_code_review_manual_requests(
@@ -19777,6 +20081,7 @@ mod tests {
                 .claim_github_webhook_delivery(
                     "delivery-1",
                     Some(("acme/widgets", 42, "comment:100")),
+                    None,
                 )
                 .unwrap()
         );
@@ -19785,6 +20090,7 @@ mod tests {
                 .claim_github_webhook_delivery(
                     "delivery-1",
                     Some(("acme/widgets", 42, "comment:duplicate")),
+                    None,
                 )
                 .unwrap()
         );
@@ -20133,6 +20439,280 @@ mod tests {
         assert!(
             after_requeue > chrono::Duration::minutes(59),
             "{after_requeue}"
+        );
+    }
+
+    #[test]
+    fn threadless_resolve_commands_apply_by_unique_prefix_with_reasons() {
+        let store = Store::open_in_memory().unwrap();
+        let finding_at = |path: &str| NewCodeReviewFinding {
+            path: path.into(),
+            line: 4,
+            side: "RIGHT".into(),
+            severity: "medium".into(),
+            confidence: "high".into(),
+            title: "Finding".into(),
+            body: format!("finding at {path}"),
+            prompt_for_agents: "fix".into(),
+            sources: Vec::new(),
+        };
+        let job = enqueue_backoff_test_job(&store);
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            job.id
+        );
+        let findings = store
+            .save_code_review_result(
+                &job.id,
+                "summary",
+                "prompt",
+                2,
+                &[finding_at("src/a.rs"), finding_at("src/b.rs")],
+                &[],
+            )
+            .unwrap();
+        assert!(store.claim_code_review_publication(&job.id).unwrap());
+        store
+            .record_code_review_publication(
+                &job.id,
+                &job.repository,
+                job.pull_number,
+                &job.base_ref,
+                &job.head_sha,
+                "https://example/review",
+                false,
+                &[],
+            )
+            .unwrap();
+        store
+            .finish_code_review_job(&job.id, "succeeded", "", "")
+            .unwrap();
+        let target = findings[0].id.clone();
+        let command = |prefix: &str, resolve: bool| PendingThreadlessCommand {
+            trigger_key: String::new(),
+            repository: "acme/widgets".into(),
+            pull_number: 42,
+            comment_id: 100,
+            author: "jim".into(),
+            resolve,
+            finding_prefix: prefix.into(),
+            reason: "because".into(),
+            created_at: String::new(),
+        };
+
+        // Every finding id shares the rvf_ prefix, so a bare prefix is
+        // ambiguous and applies nothing.
+        let (outcome, _) = store
+            .apply_threadless_resolve_command(&command("rvf_", true), "reason — @jim", None)
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            ThreadlessCommandOutcome::AmbiguousPrefix { matches: 2 }
+        ));
+
+        // An unknown prefix is reported as such.
+        let (outcome, _) = store
+            .apply_threadless_resolve_command(&command("rvf_000000", true), "reason — @jim", None)
+            .unwrap();
+        assert!(matches!(outcome, ThreadlessCommandOutcome::NotFound));
+
+        // The full id resolves the finding and records reason + attribution.
+        let (outcome, _) = store
+            .apply_threadless_resolve_command(
+                &command(&target, true),
+                "accepted limitation per ADR 0042 — resolved by @jim",
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            outcome,
+            ThreadlessCommandOutcome::Applied {
+                finding_id: target.clone()
+            }
+        );
+        let (listed, _) = store
+            .threadless_code_review_findings("acme/widgets", 42)
+            .unwrap();
+        let resolved = listed.iter().find(|finding| finding.id == target).unwrap();
+        assert_eq!(resolved.status, "dismissed");
+
+        // Resolving again is not applicable — fixed/dismissed states are
+        // reported instead of silently re-applied.
+        let (outcome, _) = store
+            .apply_threadless_resolve_command(&command(&target, true), "again — @jim", None)
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            ThreadlessCommandOutcome::NotApplicable { ref status, .. } if status == "dismissed"
+        ));
+
+        // Unresolve restores it.
+        let (outcome, _) = store
+            .apply_threadless_resolve_command(&command(&target, false), "", None)
+            .unwrap();
+        assert_eq!(
+            outcome,
+            ThreadlessCommandOutcome::Applied {
+                finding_id: target.clone()
+            }
+        );
+        let (listed, _) = store
+            .threadless_code_review_findings("acme/widgets", 42)
+            .unwrap();
+        assert_eq!(
+            listed
+                .iter()
+                .find(|finding| finding.id == target)
+                .unwrap()
+                .status,
+            "open"
+        );
+
+        // A command advances the shared checkbox watermark in its own
+        // transaction: a checkbox snapshot captured before the command but
+        // delivered after it is watermark-rejected instead of reverting the
+        // decision — including one stamped in the command's own second —
+        // while a genuinely newer edit still applies.
+        let command_second = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let (outcome, _) = store
+            .apply_threadless_resolve_command(&command(&target, true), "final — @jim", None)
+            .unwrap();
+        assert!(matches!(outcome, ThreadlessCommandOutcome::Applied { .. }));
+        let (changed, _) = store
+            .apply_lifecycle_dismissal_states(
+                "acme/widgets",
+                42,
+                "2020-01-01T00:00:00Z",
+                &[(target.clone(), false)],
+            )
+            .unwrap();
+        assert!(!changed, "a stale checkbox snapshot must not apply");
+        let (changed, _) = store
+            .apply_lifecycle_dismissal_states(
+                "acme/widgets",
+                42,
+                &command_second,
+                &[(target.clone(), false)],
+            )
+            .unwrap();
+        assert!(
+            !changed,
+            "a snapshot from the command's own second must not supersede it"
+        );
+        let (listed, _) = store
+            .threadless_code_review_findings("acme/widgets", 42)
+            .unwrap();
+        assert_eq!(
+            listed
+                .iter()
+                .find(|finding| finding.id == target)
+                .unwrap()
+                .status,
+            "dismissed"
+        );
+        let future = (chrono::Utc::now() + chrono::Duration::minutes(1))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        let (changed, _) = store
+            .apply_lifecycle_dismissal_states(
+                "acme/widgets",
+                42,
+                &future,
+                &[(target.clone(), false)],
+            )
+            .unwrap();
+        assert!(changed, "a newer checkbox edit still applies");
+
+        // Out-of-order protection: a durable, recently claimed command that
+        // is not applicable yet is retained for replay instead of consumed —
+        // its out-of-order sibling may still land. Past the window it is a
+        // genuine no-op.
+        let mut durable = command(&target, false);
+        durable.trigger_key = "command:comment:100".into();
+        durable.created_at = chrono::Utc::now().to_rfc3339();
+        store
+            .claim_github_webhook_delivery("delivery-defer-1", None, Some(&durable))
+            .unwrap();
+        let fresh = store.pending_threadless_commands("acme/widgets").unwrap()[0].clone();
+        let (outcome, _) = store
+            .apply_threadless_resolve_command(&fresh, "", Some(std::time::Duration::from_secs(120)))
+            .unwrap();
+        assert_eq!(outcome, ThreadlessCommandOutcome::NotApplicableDeferred);
+        assert_eq!(
+            store
+                .pending_threadless_commands("acme/widgets")
+                .unwrap()
+                .len(),
+            1,
+            "the deferred command's row must survive for replay"
+        );
+        let mut expired = fresh.clone();
+        expired.created_at = "2020-01-01T00:00:00Z".into();
+        let (outcome, _) = store
+            .apply_threadless_resolve_command(
+                &expired,
+                "",
+                Some(std::time::Duration::from_secs(120)),
+            )
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            ThreadlessCommandOutcome::NotApplicable { ref status, .. } if status == "open"
+        ));
+        assert!(
+            store
+                .pending_threadless_commands("acme/widgets")
+                .unwrap()
+                .is_empty(),
+            "an expired no-op is consumed"
+        );
+
+        // LIKE metacharacters in the prefix are data, not wildcards: a
+        // prefix whose hex region holds `_` must not match the finding
+        // whose real id differs at that position.
+        let mut wildcard = target[..10].to_string();
+        wildcard.replace_range(6..7, "_");
+        let (outcome, _) = store
+            .apply_threadless_resolve_command(&command(&wildcard, true), "reason — @jim", None)
+            .unwrap();
+        assert!(matches!(outcome, ThreadlessCommandOutcome::NotFound));
+
+        // Exclusive consumption: a stale snapshot of an already-consumed
+        // command must not evaluate or reverse a newer opposite decision.
+        let mut durable = command(&target, true);
+        durable.trigger_key = "command:comment:200".into();
+        durable.created_at = chrono::Utc::now().to_rfc3339();
+        store
+            .claim_github_webhook_delivery("delivery-consumed-1", None, Some(&durable))
+            .unwrap();
+        let claimed = store
+            .pending_threadless_commands("acme/widgets")
+            .unwrap()
+            .into_iter()
+            .find(|pending| pending.trigger_key == durable.trigger_key)
+            .unwrap();
+        let (outcome, _) = store
+            .apply_threadless_resolve_command(&claimed, "first — @jim", None)
+            .unwrap();
+        assert!(matches!(outcome, ThreadlessCommandOutcome::Applied { .. }));
+        store
+            .apply_threadless_resolve_command(&command(&target, false), "", None)
+            .unwrap();
+        let (outcome, _) = store
+            .apply_threadless_resolve_command(&claimed, "replay — @jim", None)
+            .unwrap();
+        assert_eq!(outcome, ThreadlessCommandOutcome::AlreadyConsumed);
+        let (listed, _) = store
+            .threadless_code_review_findings("acme/widgets", 42)
+            .unwrap();
+        assert_eq!(
+            listed
+                .iter()
+                .find(|finding| finding.id == target)
+                .unwrap()
+                .status,
+            "open",
+            "a consumed command must not reverse the newer decision"
         );
     }
 

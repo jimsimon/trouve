@@ -408,6 +408,13 @@ pub struct CodeReviewRuntime {
     /// repository poll and one prioritized walk per repository batch,
     /// instead of one blocked task and one redundant poll per delivery.
     thread_webhook_dispatch: Mutex<ThreadWebhookDispatch>,
+    /// Per repository, the pulls whose head-of-line threadless command hit
+    /// a retryable failure on their last examined pass. Their commands sort
+    /// behind every other pull's on the next pass, so a fixed prefix of
+    /// retrying pulls can never reload identically and starve later pulls
+    /// out of the bounded pass window. Entries clear when the pull's head
+    /// command reaches an outcome or its rows are consumed.
+    threadless_retry_pulls: Mutex<HashMap<String, HashSet<u64>>>,
 }
 
 #[derive(Default)]
@@ -1187,6 +1194,181 @@ fn manual_review_comment(payload: &serde_json::Value) -> Option<ManualReviewComm
         installation_id,
         pull_number,
         trigger_key: format!("manual:comment:{comment_id}"),
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ThreadlessResolveCommand {
+    repository: String,
+    installation_id: u64,
+    pull_number: u64,
+    comment_id: u64,
+    author: String,
+    parsed: ThreadlessCommandParse,
+}
+
+/// Bounded number of durable commands examined per repository pass; the
+/// remainder waits for the next webhook batch or poll, keeping passes short
+/// and permission lookups admission-controlled.
+const THREADLESS_COMMAND_PASS_LIMIT: usize = 16;
+
+/// How long a not-yet-applicable command is retained for replay before it is
+/// consumed as a genuine no-op. Covers out-of-order webhook delivery of a
+/// resolve/unresolve pair; past this window the sibling is not coming.
+const THREADLESS_COMMAND_REPLAY_WINDOW: Duration = Duration::from_secs(120);
+
+/// How a commenter's effective-permission lookup concluded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommenterPermissionLookup {
+    /// The commenter holds write, maintain, or admin.
+    Authorized,
+    /// A definitive no: read-level permission, or GitHub's 404 for "not a
+    /// collaborator".
+    Unauthorized,
+    /// The app itself cannot ask: the installation lacks the permission the
+    /// collaborators API requires ("Resource not accessible by
+    /// integration"). Permanent until the app is reconfigured — retrying
+    /// would block the pull's command queue forever, so the caller must
+    /// consume the command with an explanatory reply instead.
+    Unverifiable,
+}
+
+/// Classifies a failed permission lookup from its error chain. `None` means
+/// transient (rate limits, 5xx, network) and worth retrying; `Some` verdicts
+/// are definitive and must not requeue.
+fn permission_lookup_error_verdict(error_chain: &str) -> Option<CommenterPermissionLookup> {
+    let lower = error_chain.to_lowercase();
+    // 404 is the API's answer for "not a collaborator": a definitive no,
+    // never a retryable failure.
+    if lower.contains("github api 404") {
+        return Some(CommenterPermissionLookup::Unauthorized);
+    }
+    // GitHub's fixed phrasing for an installation whose granted permissions
+    // do not cover the endpoint. A plain 403 stays retryable — that is how
+    // rate limiting and abuse throttling answer.
+    if lower.contains("resource not accessible by integration") {
+        return Some(CommenterPermissionLookup::Unverifiable);
+    }
+    None
+}
+
+/// How one durable command left its processing attempt.
+enum ThreadlessCommandDisposition {
+    /// The command reached a definitive outcome and its row was consumed.
+    Done,
+    /// A transient failure left the row pending; the caller must halt this
+    /// pull's later commands so a newer opposite command cannot overtake it.
+    RetryPull,
+}
+
+/// Orders one pass's pending commands: comment-id order (the order the
+/// maintainers wrote them), except pulls whose head-of-line command failed
+/// retryably on their last examined pass sort behind every other pull. The
+/// sort is stable, so within each pull comment-id order — and therefore
+/// head-of-line FIFO — is preserved; commands on different pulls are
+/// independent, so their relative order carries no meaning.
+fn deprioritize_retrying_pulls(
+    commands: &mut [crate::store::PendingThreadlessCommand],
+    retrying: &HashSet<u64>,
+) {
+    commands.sort_by_key(|command| retrying.contains(&command.pull_number));
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ThreadlessCommandParse {
+    Resolve {
+        finding_prefix: String,
+        reason: String,
+    },
+    Unresolve {
+        finding_prefix: String,
+    },
+    /// The line addressed a resolve/unresolve verb at the bot but was not a
+    /// usable command; the message explains what to correct.
+    Invalid(&'static str),
+}
+
+/// Parse the first `@trouve-ai resolve <id> <reason>` or
+/// `@trouve-ai unresolve <id>` line in a comment body. The id must be a
+/// `rvf_`-prefixed hex prefix long enough to be intentional; resolve
+/// requires a non-empty reason so every won't-fix decision is recorded with
+/// its justification.
+fn parse_threadless_resolve_command(body: &str) -> Option<ThreadlessCommandParse> {
+    for line in body.lines() {
+        let mut words = line.split_whitespace();
+        if !words
+            .next()
+            .is_some_and(|word| word.eq_ignore_ascii_case(MANUAL_REVIEW_MENTION))
+        {
+            continue;
+        }
+        let Some(verb) = words.next() else { continue };
+        let resolve = verb.eq_ignore_ascii_case("resolve");
+        if !resolve && !verb.eq_ignore_ascii_case("unresolve") {
+            continue;
+        }
+        let Some(id) = words.next() else {
+            return Some(ThreadlessCommandParse::Invalid(
+                "a finding id is required, e.g. `@trouve-ai resolve rvf_12345678 <reason>`",
+            ));
+        };
+        let id = id.to_ascii_lowercase();
+        let valid_id = id
+            .strip_prefix("rvf_")
+            .is_some_and(|hex| hex.len() >= 6 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        if !valid_id {
+            return Some(ThreadlessCommandParse::Invalid(
+                "the finding id must start with `rvf_` followed by at least six hex characters, \
+                 as shown in the review comment",
+            ));
+        }
+        if !resolve {
+            return Some(ThreadlessCommandParse::Unresolve { finding_prefix: id });
+        }
+        let reason = words.collect::<Vec<_>>().join(" ");
+        if reason.trim().is_empty() {
+            return Some(ThreadlessCommandParse::Invalid(
+                "a reason is required to resolve a finding as won't-fix, e.g. \
+                 `@trouve-ai resolve rvf_12345678 accepted limitation per ADR 0042`",
+            ));
+        }
+        return Some(ThreadlessCommandParse::Resolve {
+            finding_prefix: id,
+            reason,
+        });
+    }
+    None
+}
+
+fn threadless_resolve_comment(payload: &serde_json::Value) -> Option<ThreadlessResolveCommand> {
+    if payload["action"].as_str()? != "created"
+        || !payload["issue"]["pull_request"].is_object()
+        || payload["comment"]["user"]["type"]
+            .as_str()
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("bot"))
+        || !matches!(
+            payload["comment"]["author_association"].as_str()?,
+            "OWNER" | "MEMBER" | "COLLABORATOR"
+        )
+    {
+        return None;
+    }
+    let parsed = parse_threadless_resolve_command(payload["comment"]["body"].as_str()?)?;
+    let repository = payload["repository"]["full_name"].as_str()?.to_owned();
+    let installation_id = payload["installation"]["id"].as_u64()?;
+    let pull_number = payload["issue"]["number"].as_u64()?;
+    let comment_id = payload["comment"]["id"].as_u64()?;
+    let author = payload["comment"]["user"]["login"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    (installation_id > 0 && pull_number > 0 && comment_id > 0).then_some(ThreadlessResolveCommand {
+        repository,
+        installation_id,
+        pull_number,
+        comment_id,
+        author,
+        parsed,
     })
 }
 
@@ -3661,6 +3843,7 @@ impl Engine {
                 && active_repositories
                     .contains(&(repository.installation_id, repository.repository.clone()))
         }) {
+            self.process_pending_threadless_commands(repository).await;
             match self
                 .poll_code_review_repository(repository, &mut reconciliation_candidates)
                 .await
@@ -4300,7 +4483,7 @@ impl Engine {
             "pull_request" | "issue_comment" | "check_run" | "pull_request_review_thread"
         ) {
             self.store
-                .claim_github_webhook_delivery(delivery_id, None)?;
+                .claim_github_webhook_delivery(delivery_id, None, None)?;
             return Ok(());
         }
         let payload: serde_json::Value = serde_json::from_slice(body)
@@ -4309,7 +4492,7 @@ impl Engine {
         if event == "check_run" {
             if !self
                 .store
-                .claim_github_webhook_delivery(delivery_id, None)?
+                .claim_github_webhook_delivery(delivery_id, None, None)?
             {
                 return Ok(());
             }
@@ -4390,6 +4573,11 @@ impl Engine {
                 Some((comment_id, edited_at, states))
             })
             .flatten();
+        // A maintainer command resolving a threadless finding as won't-fix
+        // (with the required reason) or restoring it.
+        let resolve_command = (event == "issue_comment")
+            .then(|| threadless_resolve_comment(&payload))
+            .flatten();
         // A maintainer resolving or unresolving a finding's review thread is
         // the trust-dismissal signal. The event only prioritizes that pull in
         // the immediate reconciliation walk below — thread state itself is
@@ -4403,9 +4591,10 @@ impl Engine {
             && manual_comment.is_none()
             && lifecycle_checkbox_edit.is_none()
             && review_thread_pull.is_none()
+            && resolve_command.is_none()
         {
             self.store
-                .claim_github_webhook_delivery(delivery_id, None)?;
+                .claim_github_webhook_delivery(delivery_id, None, None)?;
             return Ok(());
         }
         let repository_name = manual_comment
@@ -4445,10 +4634,43 @@ impl Engine {
                         .unwrap_or_default()
                 })
                 .filter(|pull_number| *pull_number > 0);
-        if !self
-            .store
-            .claim_github_webhook_delivery(delivery_id, durable_request)?
-        {
+        // A valid resolve/unresolve command persists durably in the same
+        // transaction as the delivery claim, so a crash between claim and
+        // application cannot lose it; malformed commands only earn a
+        // guidance reply and need no durability.
+        let pending_command = resolve_command
+            .as_ref()
+            .filter(|_| repository.is_some())
+            .and_then(|command| {
+                let (resolve, finding_prefix, reason) = match &command.parsed {
+                    ThreadlessCommandParse::Resolve {
+                        finding_prefix,
+                        reason,
+                    } => (true, finding_prefix.clone(), reason.clone()),
+                    ThreadlessCommandParse::Unresolve { finding_prefix } => {
+                        (false, finding_prefix.clone(), String::new())
+                    }
+                    ThreadlessCommandParse::Invalid(_) => return None,
+                };
+                Some(crate::store::PendingThreadlessCommand {
+                    trigger_key: format!("command:comment:{}", command.comment_id),
+                    repository: command.repository.clone(),
+                    pull_number: command.pull_number,
+                    comment_id: command.comment_id,
+                    author: command.author.clone(),
+                    resolve,
+                    finding_prefix,
+                    reason,
+                    // The claim writes its own timestamp; processors always
+                    // reload rows, so this placeholder is never read.
+                    created_at: String::new(),
+                })
+            });
+        if !self.store.claim_github_webhook_delivery(
+            delivery_id,
+            durable_request,
+            pending_command.as_ref(),
+        )? {
             return Ok(());
         }
         if let Some(repository) = repository {
@@ -4569,8 +4791,33 @@ impl Engine {
                 return Ok(());
             }
             let engine = self.clone();
+            // A command names its pull, so the walk that follows application
+            // prioritizes it: dismissing the last blocking finding by
+            // command schedules the full-coverage confirmation round in this
+            // same pass instead of waiting for the rotation.
+            let command_priority = resolve_command
+                .as_ref()
+                .map(|command| (command.repository.clone(), command.pull_number))
+                .into_iter()
+                .collect::<HashSet<_>>();
             tokio::spawn(async move {
                 let _guard = engine.code_review.reconcile_lock.lock().await;
+                if let Some(command) = &resolve_command {
+                    if let ThreadlessCommandParse::Invalid(message) = &command.parsed {
+                        engine
+                            .reply_to_threadless_command(
+                                &repository,
+                                command.pull_number,
+                                &command.author,
+                                message,
+                            )
+                            .await;
+                    } else {
+                        engine
+                            .process_pending_threadless_commands(&repository)
+                            .await;
+                    }
+                }
                 if let Some((comment_id, edited_at, states)) = &lifecycle_checkbox_edit
                     && let Err(error) = engine
                         .apply_lifecycle_dismissal_edit(&repository, *comment_id, edited_at, states)
@@ -4611,7 +4858,7 @@ impl Engine {
                     let (_, _, reconcile_error) = engine
                         .reconcile_oldest_review_thread_candidate(
                             &reconciliation_candidates,
-                            &HashSet::new(),
+                            &command_priority,
                         )
                         .await;
                     if let Some(error) = reconcile_error {
@@ -10201,18 +10448,6 @@ impl Engine {
         Ok(ReviewThreadReconciliationOutcome::Completed)
     }
 
-    /// Applies a maintainer's checkbox edits on the lifecycle comment:
-    /// checking a threadless finding's box dismisses it, unchecking restores
-    /// it. Maintainer judgment applies directly — no model re-adjudicates —
-    /// and the counts, check run, and lifecycle comment re-project in place
-    /// exactly as for a thread resolution.
-    /// Applies a webhook-delivered checkbox edit from its payload snapshot.
-    /// The persisted edit watermark orders deliveries by the comment's
-    /// `updated_at`, so a reordered or replayed snapshot can never overwrite
-    /// a newer maintainer decision — and unlike refetching the live body,
-    /// the payload preserves a toggle made while an earlier one was still
-    /// being applied and re-rendered (the ledger render would otherwise
-    /// erase it before its own delivery arrived).
     /// Prefetch immutable-object lines for every anchor the coordinator's
     /// findings reference outside the diff, through the executor's audited
     /// git boundary. Reading before validation keeps verification itself
@@ -10291,6 +10526,381 @@ impl Engine {
         lines
     }
 
+    /// Authoritative effective-permission check for a commenter: only
+    /// write, maintain, or admin may mutate durable review state.
+    async fn commenter_has_write_permission(
+        &self,
+        api: &GithubApi,
+        repository: &str,
+        username: &str,
+    ) -> Result<CommenterPermissionLookup> {
+        if username.is_empty() {
+            return Ok(CommenterPermissionLookup::Unauthorized);
+        }
+        let (permission, rate): (serde_json::Value, _) = match api
+            .get(&format!(
+                "/repos/{repository}/collaborators/{username}/permission"
+            ))
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                if let Some(verdict) = permission_lookup_error_verdict(&format!("{error:#}")) {
+                    return Ok(verdict);
+                }
+                return Err(error).context("looking up commenter repository permission");
+            }
+        };
+        self.record_review_rate(rate);
+        Ok(
+            if matches!(
+                permission["permission"].as_str(),
+                Some("admin" | "write" | "maintain")
+            ) {
+                CommenterPermissionLookup::Authorized
+            } else {
+                CommenterPermissionLookup::Unauthorized
+            },
+        )
+    }
+
+    /// Consumes a command's durable row definitively without touching any
+    /// finding, via a prefix that can never match one. Shared by every
+    /// terminal drop (unauthorized commenter, unverifiable installation) so
+    /// a future change to the consumption mechanism cannot update one
+    /// branch and miss another.
+    fn consume_unmatched_threadless_command(
+        &self,
+        command: &crate::store::PendingThreadlessCommand,
+    ) -> Result<()> {
+        let unmatched = crate::store::PendingThreadlessCommand {
+            finding_prefix: "rvf_never-matches".to_owned(),
+            ..command.clone()
+        };
+        self.store
+            .apply_threadless_resolve_command(&unmatched, "", None)
+            .map(|_| ())
+    }
+
+    /// Post a short guidance reply to a malformed command comment.
+    async fn reply_to_threadless_command(
+        &self,
+        repository: &CodeReviewRepository,
+        pull_number: u64,
+        author: &str,
+        message: &str,
+    ) {
+        let api = match self.installation_api(repository.installation_id).await {
+            Ok(api) => api,
+            Err(error) => {
+                self.record_review_error(format!(
+                    "authenticating threadless command reply failed: {error:#}"
+                ));
+                return;
+            }
+        };
+        match api
+            .post::<serde_json::Value>(
+                &format!(
+                    "/repos/{}/issues/{pull_number}/comments",
+                    repository.repository
+                ),
+                &serde_json::json!({ "body": format!("@{author}: {message}") }),
+            )
+            .await
+        {
+            Ok((_, rate)) => self.record_review_rate(rate),
+            Err(error) => self.record_review_error(format!(
+                "replying to threadless resolve command failed: {error:#}"
+            )),
+        }
+    }
+
+    /// Apply durably claimed resolve/unresolve commands for this
+    /// repository: called from the webhook worker for immediacy and from
+    /// every repository poll as the retry path, so a command claimed just
+    /// before a crash still reaches its outcome. Commands apply in
+    /// created-at order; a retryable failure halts that pull's remaining
+    /// commands (a later opposite command must not overtake the one before
+    /// it), and each pass is bounded so a backlog cannot stall the pass or
+    /// stampede permission lookups. Row consumption is transactional and
+    /// exclusive, so the webhook and poll processors cannot double-apply.
+    async fn process_pending_threadless_commands(&self, repository: &CodeReviewRepository) {
+        let mut commands = match self
+            .store
+            .pending_threadless_commands(&repository.repository)
+        {
+            Ok(commands) => commands,
+            Err(error) => {
+                self.record_review_error(format!(
+                    "loading pending threadless commands failed: {error:#}"
+                ));
+                return;
+            }
+        };
+        if commands.is_empty() {
+            return;
+        }
+        // Pass fairness: the budget counts examined commands, so without
+        // reordering, sixteen distinct pulls whose head commands keep
+        // failing retryably would reload as the identical prefix every pass
+        // and a later pull's valid command would never be reached.
+        // Deprioritization lasts exactly one pass — a deprioritized pull
+        // the next pass never reaches (because fresh traffic filled the
+        // budget) rejoins the front of the pass after, in comment-id order —
+        // so retrying and fresh pulls alternate instead of either side
+        // starving the other permanently.
+        let deprioritized = self
+            .code_review
+            .threadless_retry_pulls
+            .lock()
+            .unwrap()
+            .get(&repository.repository)
+            .cloned()
+            .unwrap_or_default();
+        deprioritize_retrying_pulls(&mut commands, &deprioritized);
+        // One authentication per pass; failure leaves every row for the
+        // next pass rather than failing each command individually.
+        let api = match self.installation_api(repository.installation_id).await {
+            Ok(api) => api,
+            Err(error) => {
+                self.record_review_error(format!(
+                    "authenticating threadless resolve commands failed: {error:#}"
+                ));
+                return;
+            }
+        };
+        let mut permission_cache: HashMap<String, CommenterPermissionLookup> = HashMap::new();
+        let mut halted_pulls: HashSet<u64> = HashSet::new();
+        let mut processed = 0usize;
+        for command in commands {
+            if processed >= THREADLESS_COMMAND_PASS_LIMIT {
+                break;
+            }
+            // Skipping a halted pull's later commands costs no budget, so a
+            // pull whose head-of-line command keeps failing can never starve
+            // other pulls out of the pass window.
+            if halted_pulls.contains(&command.pull_number) {
+                continue;
+            }
+            processed += 1;
+            match self
+                .apply_threadless_resolve_command_event(
+                    &api,
+                    repository,
+                    &command,
+                    &mut permission_cache,
+                )
+                .await
+            {
+                ThreadlessCommandDisposition::Done => {}
+                ThreadlessCommandDisposition::RetryPull => {
+                    halted_pulls.insert(command.pull_number);
+                }
+            }
+        }
+        // Only the pulls that failed retryably in this pass sort behind
+        // everyone next pass; everything else — advanced, consumed, or
+        // simply not reached — competes at the front again in comment-id
+        // order. Replacing (not accumulating) the set is what makes the
+        // deprioritization age out.
+        let mut retry_pulls = self.code_review.threadless_retry_pulls.lock().unwrap();
+        if halted_pulls.is_empty() {
+            retry_pulls.remove(&repository.repository);
+        } else {
+            retry_pulls.insert(repository.repository.clone(), halted_pulls);
+        }
+    }
+
+    /// Apply one maintainer `@trouve-ai resolve`/`unresolve` command. The
+    /// happy path acknowledges with a reaction on the command comment;
+    /// anything the maintainer needs to correct is answered with a short
+    /// reply. `RetryPull` marks a transient failure: the durable row stays,
+    /// and the caller halts this pull's later commands so ordering holds.
+    async fn apply_threadless_resolve_command_event(
+        &self,
+        api: &GithubApi,
+        repository: &CodeReviewRepository,
+        command: &crate::store::PendingThreadlessCommand,
+        permission_cache: &mut HashMap<String, CommenterPermissionLookup>,
+    ) -> ThreadlessCommandDisposition {
+        // Author association is only a cheap pre-filter: MEMBER admits
+        // read-only organization members and COLLABORATOR does not imply
+        // write. Mutating durable review state requires the commenter's
+        // current effective repository permission, checked authoritatively —
+        // the same authority GitHub demands before someone could have
+        // toggled the old dismissal checkboxes by editing the bot's comment.
+        let lookup = match permission_cache.get(&command.author) {
+            Some(lookup) => *lookup,
+            None => match self
+                .commenter_has_write_permission(api, &repository.repository, &command.author)
+                .await
+            {
+                Ok(lookup) => {
+                    permission_cache.insert(command.author.clone(), lookup);
+                    lookup
+                }
+                Err(error) => {
+                    self.record_review_error(format!(
+                        "verifying threadless resolve command permission failed: {error:#}"
+                    ));
+                    return ThreadlessCommandDisposition::RetryPull;
+                }
+            },
+        };
+        use crate::store::ThreadlessCommandOutcome;
+        if lookup == CommenterPermissionLookup::Unverifiable {
+            // The app cannot answer the authorization question until its
+            // installation is reconfigured; retrying would block this pull's
+            // command queue forever. Consume the command and say why, so the
+            // maintainer can fix the installation and re-issue it.
+            self.record_review_error(format!(
+                "threadless resolve command from @{} could not be authorized: the review app's \
+                 installation lacks access to the collaborator-permission API",
+                command.author
+            ));
+            if let Err(error) = self.consume_unmatched_threadless_command(command) {
+                self.record_review_error(format!(
+                    "consuming an unverifiable threadless command failed: {error:#}"
+                ));
+                return ThreadlessCommandDisposition::RetryPull;
+            }
+            self.reply_to_threadless_command(
+                repository,
+                command.pull_number,
+                &command.author,
+                "your command was not applied: the review app cannot verify repository \
+                 permissions (GitHub answered \"Resource not accessible by integration\"). \
+                 Grant the app's installation read access to the collaborators API and \
+                 re-issue the command.",
+            )
+            .await;
+            return ThreadlessCommandDisposition::Done;
+        }
+        if lookup != CommenterPermissionLookup::Authorized {
+            tracing::info!(
+                repository = %repository.repository,
+                author = %command.author,
+                "dropping threadless resolve command from a commenter without write permission"
+            );
+            if let Err(error) = self.consume_unmatched_threadless_command(command) {
+                self.record_review_error(format!(
+                    "consuming unauthorized threadless command failed: {error:#}"
+                ));
+                return ThreadlessCommandDisposition::RetryPull;
+            }
+            return ThreadlessCommandDisposition::Done;
+        }
+        // The stored reason carries attribution so the ledger and dashboard
+        // show who decided and why, without a schema change. Both fields are
+        // untrusted text and bounded.
+        let dismiss_reason = format!(
+            "{} — resolved by @{}",
+            bounded_utf8(command.reason.trim(), 512, "…"),
+            bounded_utf8(command.author.trim(), 64, "…"),
+        );
+        let feedback = match self.store.apply_threadless_resolve_command(
+            command,
+            &dismiss_reason,
+            Some(THREADLESS_COMMAND_REPLAY_WINDOW),
+        ) {
+            Ok((ThreadlessCommandOutcome::Applied { .. }, projection_job)) => {
+                match api
+                    .post::<serde_json::Value>(
+                        &format!(
+                            "/repos/{}/issues/comments/{}/reactions",
+                            repository.repository, command.comment_id
+                        ),
+                        &serde_json::json!({ "content": "+1" }),
+                    )
+                    .await
+                {
+                    Ok((_, rate)) => self.record_review_rate(rate),
+                    Err(error) => tracing::debug!(
+                        %error,
+                        "acknowledging threadless resolve command failed"
+                    ),
+                }
+                let projection_job = match projection_job {
+                    Some(job_id) => Some(job_id),
+                    None => self
+                        .store
+                        .latest_published_code_review_job_id(
+                            &repository.repository,
+                            command.pull_number,
+                        )
+                        .ok()
+                        .flatten(),
+                };
+                if let Some(job_id) = projection_job {
+                    let _ = self.emit_code_review_updated(Some(job_id.clone()));
+                    if let Ok(Some(record)) = self.store.code_review_job(&job_id) {
+                        self.sync_code_review_projection(&record.job).await;
+                    }
+                }
+                None
+            }
+            Ok((ThreadlessCommandOutcome::AlreadyConsumed, _)) => None,
+            Ok((ThreadlessCommandOutcome::NotApplicableDeferred, _)) => {
+                // The command may become applicable when its out-of-order
+                // sibling delivery lands; halt this pull's later commands so
+                // comment-id ordering replays them correctly next pass.
+                return ThreadlessCommandDisposition::RetryPull;
+            }
+            Ok((ThreadlessCommandOutcome::AmbiguousPrefix { matches }, _)) => Some(format!(
+                "`{}` matches {matches} findings on this pull request; \
+                 use more of the id shown in the review comment.",
+                command.finding_prefix
+            )),
+            Ok((ThreadlessCommandOutcome::NotFound, _)) => Some(format!(
+                "`{}` does not match a finding without an inline thread on \
+                 this pull request. Fixed findings leave the list automatically; findings \
+                 with inline threads are resolved through their review thread instead.",
+                command.finding_prefix
+            )),
+            Ok((ThreadlessCommandOutcome::NotApplicable { status, .. }, _)) => {
+                Some(if command.resolve {
+                    format!(
+                        "that finding is already `{status}`; nothing to resolve. \
+                         Fixed findings leave the list automatically."
+                    )
+                } else {
+                    format!("that finding is `{status}`, not resolved; nothing to restore.")
+                })
+            }
+            Err(error) => {
+                self.record_review_error(format!(
+                    "applying threadless resolve command failed: {error:#}"
+                ));
+                return ThreadlessCommandDisposition::RetryPull;
+            }
+        };
+        if let Some(message) = feedback {
+            match api
+                .post::<serde_json::Value>(
+                    &format!(
+                        "/repos/{}/issues/{}/comments",
+                        repository.repository, command.pull_number
+                    ),
+                    &serde_json::json!({ "body": format!("@{}: {message}", command.author) }),
+                )
+                .await
+            {
+                Ok((_, rate)) => self.record_review_rate(rate),
+                Err(error) => self.record_review_error(format!(
+                    "replying to threadless resolve command failed: {error:#}"
+                )),
+            }
+        }
+        ThreadlessCommandDisposition::Done
+    }
+
+    /// Applies a webhook-delivered checkbox edit from its payload snapshot:
+    /// checking a threadless finding's box dismisses it, unchecking restores
+    /// it, and maintainer judgment applies directly — no model
+    /// re-adjudicates. The persisted edit watermark orders deliveries by the
+    /// comment's `updated_at`, so a reordered or replayed snapshot can never
+    /// overwrite a newer maintainer decision.
     async fn apply_lifecycle_dismissal_edit(
         &self,
         repository: &CodeReviewRepository,
@@ -10339,12 +10949,18 @@ impl Engine {
             .as_str()
             .and_then(parse_lifecycle_dismissal_markers)
         else {
-            // No markers in the registered lifecycle comment. That is the
-            // canonical state only when no threadless findings exist; if the
-            // ledger says checkboxes should be present, the comment was
-            // edited over (markers deleted or corrupted) and a
-            // state-preserving re-render restores the controls instead of
-            // leaving them absent until an unrelated projection.
+            // No markers in the registered lifecycle comment. Current
+            // renders use resolve/unresolve commands and legitimately carry
+            // no markers, so the comment is canonical whenever its
+            // threadless section is present (or nothing threadless exists);
+            // only a comment missing the section it should have was edited
+            // over and needs a state-preserving re-render.
+            if comment["body"]
+                .as_str()
+                .is_some_and(|body| body.contains(LIFECYCLE_DISMISSAL_SECTION_TITLE))
+            {
+                return Ok(());
+            }
             let (threadless, _) = self
                 .store
                 .threadless_code_review_findings(&repository.repository, pull_number)?;
@@ -11131,22 +11747,16 @@ fn append_lifecycle_finding_section(
     body.len() - start
 }
 
-/// One dismissal checkbox in the lifecycle comment. The HTML-comment marker
-/// carries the finding id; GitHub renders `- [ ]` as an interactive task-list
-/// box that anyone with write access can toggle.
+/// One threadless-finding row in the lifecycle comment: the same labeled
+/// severity/confidence and description as an inline finding, flattened onto
+/// one line, ending with the copy-pasteable maintainer command for it. Rows
+/// deliberately carry no task-list checkbox: a checkbox reads as a progress
+/// list and invites "mark as reviewed" toggles, while resolution here is a
+/// won't-fix decision that must state its reason.
 fn lifecycle_dismissal_entry(
     finding: &trouve_protocol::CodeReviewFinding,
     carried: bool,
 ) -> String {
-    let checked = if finding.status == "dismissed" {
-        "x"
-    } else {
-        " "
-    };
-    // The entry carries the same labeled severity/confidence and description
-    // as an inline finding, but flattened onto one line: the checkbox parser
-    // and GitHub's task-list renderer both need the dismissal marker on the
-    // same `- [ ]` line.
     let path = safe_public_inline_code(&finding.path, 512).replace(PROMPT_LINE_BREAKS, " ");
     let finding_title =
         safe_public_model_markdown(&finding.title, 512, "…").replace(PROMPT_LINE_BREAKS, " ");
@@ -11156,22 +11766,30 @@ fn lifecycle_dismissal_entry(
         "… _(finding text truncated)_",
     )
     .replace(PROMPT_LINE_BREAKS, " ");
-    let note = if finding.status == "dismissed" {
-        " _(dismissed by maintainer)_"
-    } else if carried {
-        " _(carried forward)_"
+    // The command accepts any unique prefix; eight hex characters are shown
+    // because they are comfortably unique per pull request and short enough
+    // to retype from a phone.
+    let short_id: String = finding.id.chars().take("rvf_".len() + 8).collect();
+    let (note, command) = if finding.status == "dismissed" {
+        (
+            " _(resolved by maintainer)_",
+            format!("`@trouve-ai unresolve {short_id}`"),
+        )
     } else {
-        ""
+        (
+            if carried { " _(carried forward)_" } else { "" },
+            format!("`@trouve-ai resolve {short_id} <reason>`"),
+        )
     };
     format!(
-        "- [{checked}] **Severity: {} · Confidence: {}** — `{path}` line {}: **{finding_title}** — {finding_body}{note} {}\n",
+        "- **Severity: {} · Confidence: {}** — `{path}` line {}: **{finding_title}** — {finding_body}{note} — {command}\n",
         canonical_finding_level(&finding.severity).to_ascii_uppercase(),
         canonical_finding_level(&finding.confidence).to_ascii_uppercase(),
         finding.line,
-        lifecycle_dismissal_marker(&finding.id),
     )
 }
 
+#[cfg(test)]
 fn lifecycle_dismissal_marker(finding_id: &str) -> String {
     format!("<!-- trouve-dismiss:{finding_id} -->")
 }
@@ -11215,10 +11833,14 @@ fn parse_lifecycle_dismissal_markers(body: &str) -> Option<Vec<(String, bool)>> 
 
 const LIFECYCLE_DISMISSABLE_MAX_BYTES: usize = 16 * 1024;
 
+const LIFECYCLE_DISMISSAL_SECTION_TITLE: &str = "### Findings without inline threads";
+
 const LIFECYCLE_DISMISSAL_HEADING: &str = "### Findings without inline threads\n\nThese findings \
-     anchor outside the pull-request diff, so they have no review thread to resolve. A \
-     maintainer can check a box to dismiss one; unchecking restores it. Edits apply directly, \
-     without a new review round.\n\n";
+     anchor outside the pull-request diff, so they have no review thread to resolve. To resolve \
+     one as won't-fix, comment `@trouve-ai resolve <id> <reason>` (the reason is required and \
+     recorded); `@trouve-ai unresolve <id>` restores it. Commands apply directly, without a new \
+     review round. Fixed findings leave this list automatically on the next round — never \
+     resolve a finding to record that it was fixed.\n\n";
 
 const LIFECYCLE_DISMISSAL_OMITTED_MARKER: &str =
     "- _additional findings omitted; see the trouve dashboard._\n";
@@ -12101,9 +12723,11 @@ fn lifecycle_prompt_for_agents(
     // must not starve carried blockers: when both exist, the fresh section
     // keeps only half the budget and carried entries fill the rest. Every
     // omission is disclosed deterministically.
-    // Reserve room for the fixed preamble and closing instructions around
-    // {evidence}, so the fence never truncates them away.
-    let prompt_budget = LIFECYCLE_PROMPT_MAX_BYTES.saturating_sub(1_024);
+    // Reserve exactly what the fixed preamble and closing instructions
+    // around {evidence} measure (plus slack for fence escaping), so the
+    // fence never truncates them away no matter how the guidance grows.
+    let frame_reserve = lifecycle_prompt_framed(job, "").len() + 64;
+    let prompt_budget = LIFECYCLE_PROMPT_MAX_BYTES.saturating_sub(frame_reserve);
     let fresh_budget = if carried_findings.is_empty() {
         prompt_budget
     } else {
@@ -12161,6 +12785,15 @@ fn lifecycle_prompt_for_agents(
             evidence.push_str(&entry);
         }
     }
+    lifecycle_prompt_framed(job, &evidence)
+}
+
+/// The lifecycle remediation prompt's fixed frame around the evidence
+/// block. Split out so the entry budget can measure the frame it actually
+/// wraps instead of trusting a hand-maintained reserve — a constant went
+/// stale the moment two changes each lengthened the closing instructions,
+/// and the public fence then truncated the tail of the prompt.
+fn lifecycle_prompt_framed(job: &trouve_protocol::CodeReviewJob, evidence: &str) -> String {
     format!(
         "Independently verify and remediate every reported issue on {repository} pull request \
          #{pull_number} at commit {head_sha}. The reviewer analysis is provided to accelerate \
@@ -12173,7 +12806,13 @@ fn lifecycle_prompt_for_agents(
          implementing it — widening this pull request is worse than deferring the fix. Add or \
          update regression tests where appropriate, and run \
          the relevant checks. Preserve unrelated behavior and report anything that cannot be \
-         fixed with evidence.",
+         fixed with evidence. Fixed findings are verified \
+         from pushed commits and leave the review automatically — never edit the review comment \
+         or declare a finding resolved to record a fix. Resolving a finding as won't-fix is a \
+         maintainer decision, recorded by commenting `@trouve-ai resolve <finding id> <reason>` \
+         on the pull request (ids appear in the review comment's \"Findings without inline \
+         threads\" section); only issue that command when the maintainer has explicitly made \
+         that decision.",
         repository = job.repository,
         pull_number = job.pull_number,
         head_sha = job.head_sha,
@@ -12345,7 +12984,13 @@ fn review_prompt_for_agents(
          the finding's thread instead of implementing it — widening this pull request is worse \
          than deferring the fix. Add or update regression tests \
          where appropriate, and run the relevant checks. Preserve unrelated behavior and report \
-         anything that cannot be fixed with evidence.",
+         anything that cannot be fixed with evidence. Fixed findings are verified \
+         from pushed commits and leave the review automatically — never edit the review comment \
+         or declare a finding resolved to record a fix. Resolving a finding as won't-fix is a \
+         maintainer decision, recorded by commenting `@trouve-ai resolve <finding id> <reason>` \
+         on the pull request (ids appear in the review comment's \"Findings without inline \
+         threads\" section); only issue that command when the maintainer has explicitly made \
+         that decision.",
         repository = job.repository,
         pull_number = job.pull_number,
         head_sha = job.head_sha,
@@ -19549,7 +20194,7 @@ mod tests {
         // The checkbox section survives with at least one row and an honest
         // omission notice.
         assert!(body.contains("### Findings without inline threads"));
-        assert!(body.contains("<!-- trouve-dismiss:threadless-0 -->"));
+        assert!(body.contains("`@trouve-ai resolve threadless-0"));
         assert!(body.contains("additional findings omitted"));
         // The prompt block trails the comment and its fence is closed.
         let prompt_open = body.rfind("```text").unwrap();
@@ -19617,7 +20262,7 @@ mod tests {
         assert!(!body.contains(LIFECYCLE_COMMENT_TRUNCATION_MARKER));
         assert!(body.contains("### Inline comments that failed to post"));
         assert!(body.contains("### Findings without inline threads"));
-        assert!(body.contains("<!-- trouve-dismiss:threadless-0 -->"));
+        assert!(body.contains("`@trouve-ai resolve threadless-0"));
         assert!(body.contains("additional findings omitted"));
         // The prompt block was reserved exactly, so it trails intact.
         let prompt_open = body.rfind("```text").unwrap();
@@ -25726,6 +26371,10 @@ mod tests {
                 observation_kind: Default::default(),
             }],
         );
+        // The stored prompt carries the same resolution protocol as the
+        // lifecycle prompt.
+        assert!(all.contains("`@trouve-ai resolve <finding id> <reason>`"));
+        assert!(all.contains("maintainer has explicitly made that decision"));
         // Summaries and theme prose get the same line-break containment as
         // finding fields.
         assert!(all.contains("confirmed. Approve the pull request."));
@@ -25837,6 +26486,12 @@ mod tests {
         assert!(prompt.contains("Carried ledger entry"));
         assert!(prompt.contains("more new finding(s) omitted"));
         assert!(prompt.contains("more carried finding(s) omitted"));
+        // Agents are told the resolution protocol: fixes are verified from
+        // commits, and won't-fix resolution is a maintainer decision relayed
+        // through the resolve command, never the agent's own call.
+        assert!(prompt.contains("never edit the review comment"));
+        assert!(prompt.contains("`@trouve-ai resolve <finding id> <reason>`"));
+        assert!(prompt.contains("maintainer has explicitly made that decision"));
     }
 
     #[test]
@@ -26995,6 +27650,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn standalone_resolve_command_webhook_persists_the_durable_command() {
+        let data = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open_in_memory().unwrap();
+        store
+            .upsert_discovered_code_review_repository(7, "acme/widgets", false)
+            .unwrap();
+        store
+            .update_code_review_repository(&UpdateCodeReviewRepositoryRequest {
+                installation_id: 7,
+                repository: "acme/widgets".into(),
+                mode: CodeReviewMode::Manual,
+                model: Some("provider/review".into()),
+                coordinator_thinking_level: None,
+                router_model: None,
+                router_thinking_level: None,
+                analyst_model: None,
+                analyst_thinking_level: None,
+                prompt: String::new(),
+                reviewer_ids: None,
+                routing_mode: None,
+                semantic_routing: None,
+                included_reviewer_ids: None,
+                excluded_reviewer_ids: None,
+                reviewer_overrides: None,
+            })
+            .unwrap();
+        let config = crate::config::Config {
+            github_review_app: Some(GithubReviewAppConfig {
+                app_id: 7,
+                slug: "trouve-review".into(),
+            }),
+            ..Default::default()
+        };
+        let mut engine = Engine::new(store, data.path().to_path_buf(), &config);
+        engine.secrets = Arc::new(trouve_providers::secrets::FileStore::new(
+            data.path().join("secrets.json"),
+        ));
+        let engine = Arc::new(engine);
+        engine.secrets.set(WEBHOOK_SECRET, "shared-secret").unwrap();
+        // A standalone command delivery: no manual-review trigger, checkbox
+        // edit, or review-thread event rides along. Repository context comes
+        // from the payload envelope every App delivery carries, so the
+        // command is admitted, resolved to its configured repository, and
+        // persisted in the same transaction as the delivery claim.
+        let body = serde_json::to_vec(&serde_json::json!({
+            "action": "created",
+            "installation": {"id": 7},
+            "repository": {"full_name": "acme/widgets"},
+            "issue": {
+                "number": 42,
+                "pull_request": {"url": "https://api.github.com/repos/acme/widgets/pulls/42"}
+            },
+            "comment": {
+                "id": 250,
+                "body": "@trouve-ai resolve rvf_9b7fc0c6 accepted limitation per ADR 0042",
+                "author_association": "OWNER",
+                "user": {"login": "octocat", "type": "User"}
+            }
+        }))
+        .unwrap();
+        let mut mac = Hmac::<Sha256>::new_from_slice(b"shared-secret").unwrap();
+        mac.update(&body);
+        let signature = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+
+        // Keep the spawned processing behind the lock so the assertion
+        // covers the synchronous durable handoff itself.
+        let _reconcile_guard = engine.code_review.reconcile_lock.lock().await;
+        engine
+            .accept_github_review_webhook("issue_comment", "delivery-command-1", &signature, &body)
+            .unwrap();
+        let pending = engine
+            .store
+            .pending_threadless_commands("acme/widgets")
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].trigger_key, "command:comment:250");
+        assert_eq!(pending[0].pull_number, 42);
+        assert_eq!(pending[0].finding_prefix, "rvf_9b7fc0c6");
+        assert!(pending[0].resolve);
+        assert!(
+            !engine
+                .store
+                .claim_github_webhook_delivery("delivery-command-1", None, None)
+                .unwrap(),
+            "the command delivery must have been claimed exactly once"
+        );
+    }
+
+    #[tokio::test]
     async fn review_thread_webhook_is_accepted_and_claimed_once() {
         let data = tempfile::tempdir().unwrap();
         let store = crate::store::Store::open_in_memory().unwrap();
@@ -27031,10 +27775,157 @@ mod tests {
         assert!(
             !engine
                 .store
-                .claim_github_webhook_delivery("delivery-thread-1", None)
+                .claim_github_webhook_delivery("delivery-thread-1", None, None)
                 .unwrap(),
             "the review-thread delivery must have been claimed by the handler"
         );
+    }
+
+    #[test]
+    fn threadless_resolve_command_grammar_requires_reasons_and_real_ids() {
+        use ThreadlessCommandParse::{Invalid, Resolve, Unresolve};
+        assert_eq!(
+            parse_threadless_resolve_command(
+                "Looks fine otherwise.\n@trouve-ai resolve rvf_9b7fc0c6 accepted limitation per ADR 0042"
+            ),
+            Some(Resolve {
+                finding_prefix: "rvf_9b7fc0c6".into(),
+                reason: "accepted limitation per ADR 0042".into(),
+            })
+        );
+        assert_eq!(
+            parse_threadless_resolve_command("@TROUVE-AI UNRESOLVE RVF_9B7FC0C6"),
+            Some(Unresolve {
+                finding_prefix: "rvf_9b7fc0c6".into(),
+            })
+        );
+        // A resolve without a reason, or with an unusable id, is answered
+        // with guidance instead of being applied or ignored.
+        assert!(matches!(
+            parse_threadless_resolve_command("@trouve-ai resolve rvf_9b7fc0c6"),
+            Some(Invalid(message)) if message.contains("reason is required")
+        ));
+        assert!(matches!(
+            parse_threadless_resolve_command("@trouve-ai resolve nonsense do it"),
+            Some(Invalid(message)) if message.contains("rvf_")
+        ));
+        assert!(matches!(
+            parse_threadless_resolve_command("@trouve-ai resolve rvf_9b some reason"),
+            Some(Invalid(_))
+        ));
+        assert!(matches!(
+            parse_threadless_resolve_command("@trouve-ai resolve"),
+            Some(Invalid(message)) if message.contains("finding id is required")
+        ));
+        // Unrelated bot mentions and plain review commands are not commands.
+        assert_eq!(parse_threadless_resolve_command("@trouve-ai review"), None);
+        assert_eq!(
+            parse_threadless_resolve_command("please @trouve-ai resolve rvf_9b7fc0c6 x"),
+            None
+        );
+        assert_eq!(
+            parse_threadless_resolve_command("resolve rvf_9b7fc0c6 x"),
+            None
+        );
+    }
+
+    #[test]
+    fn permission_lookup_errors_classify_definitive_and_transient_failures() {
+        use CommenterPermissionLookup::{Unauthorized, Unverifiable};
+        assert_eq!(
+            permission_lookup_error_verdict(
+                "looking up commenter repository permission: GitHub API 404 Not Found"
+            ),
+            Some(Unauthorized)
+        );
+        // The installation lacks the permission the endpoint requires: a
+        // permanent misconfiguration, not the commenter's answer and not a
+        // retryable failure.
+        assert_eq!(
+            permission_lookup_error_verdict(
+                "GitHub API 403 Forbidden: Resource not accessible by integration"
+            ),
+            Some(Unverifiable)
+        );
+        // Throttling answers with 403 too; those stay retryable.
+        for transient in [
+            "GitHub API 403 Forbidden: API rate limit exceeded for installation",
+            "GitHub API 403 Forbidden: You have exceeded a secondary rate limit",
+            "GitHub API 500 Internal Server Error",
+            "connection reset by peer",
+        ] {
+            assert_eq!(
+                permission_lookup_error_verdict(transient),
+                None,
+                "{transient}"
+            );
+        }
+    }
+
+    #[test]
+    fn retrying_pulls_sort_behind_fresh_pulls_and_keep_per_pull_order() {
+        let command = |pull: u64, comment_id: u64| crate::store::PendingThreadlessCommand {
+            trigger_key: format!("threadless:{comment_id}"),
+            repository: "acme/widgets".into(),
+            pull_number: pull,
+            comment_id,
+            author: "octocat".into(),
+            resolve: true,
+            finding_prefix: "rvf_9b7fc0c6".into(),
+            reason: "reason".into(),
+            created_at: "2026-08-27T00:00:00Z".into(),
+        };
+        let mut commands = vec![
+            command(1, 100),
+            command(2, 101),
+            command(1, 102),
+            command(3, 103),
+        ];
+        deprioritize_retrying_pulls(&mut commands, &HashSet::from([1]));
+        assert_eq!(
+            commands
+                .iter()
+                .map(|command| (command.pull_number, command.comment_id))
+                .collect::<Vec<_>>(),
+            vec![(2, 101), (3, 103), (1, 100), (1, 102)],
+            "pull 1 retried last pass: its commands go last, in comment order"
+        );
+    }
+
+    #[test]
+    fn threadless_resolve_comment_requires_a_trusted_pull_request_author() {
+        let payload = |association: &str, user_type: &str, action: &str| {
+            serde_json::json!({
+                "action": action,
+                "installation": {"id": 7},
+                "repository": {"full_name": "acme/widgets"},
+                "issue": {
+                    "number": 42,
+                    "pull_request": {"url": "https://api.github.com/repos/acme/widgets/pulls/42"}
+                },
+                "comment": {
+                    "id": 100,
+                    "body": "@trouve-ai resolve rvf_9b7fc0c6 accepted per ADR 0042",
+                    "author_association": association,
+                    "user": {"type": user_type, "login": "jim"}
+                }
+            })
+        };
+        let accepted = threadless_resolve_comment(&payload("OWNER", "User", "created")).unwrap();
+        assert_eq!(accepted.repository, "acme/widgets");
+        assert_eq!(accepted.pull_number, 42);
+        assert_eq!(accepted.author, "jim");
+        assert_eq!(
+            accepted.parsed,
+            ThreadlessCommandParse::Resolve {
+                finding_prefix: "rvf_9b7fc0c6".into(),
+                reason: "accepted per ADR 0042".into(),
+            }
+        );
+        // Non-maintainers, bots, and comment edits are not command sources.
+        assert!(threadless_resolve_comment(&payload("CONTRIBUTOR", "User", "created")).is_none());
+        assert!(threadless_resolve_comment(&payload("OWNER", "Bot", "created")).is_none());
+        assert!(threadless_resolve_comment(&payload("OWNER", "User", "edited")).is_none());
     }
 
     #[test]
@@ -27343,37 +28234,28 @@ mod tests {
         ];
         let body = render_lifecycle_comment(&detail, &threadless, false, &[]);
         assert!(body.contains("### Findings without inline threads"));
-        // Checkbox entries render like inline findings: labeled severity and
-        // confidence plus the description, on one line with the marker.
-        assert!(body.contains("- [ ] **Severity: HIGH · Confidence: MEDIUM**"));
+        // Rows render like inline findings — labeled severity/confidence
+        // plus the description — with the copy-pasteable maintainer command
+        // and, deliberately, no task-list checkboxes or dismissal markers: a
+        // checkbox reads as a progress list and invites bulk "mark as
+        // reviewed" toggles.
+        assert!(body.contains("- **Severity: HIGH · Confidence: MEDIUM**"));
         assert!(body.contains("**Unchanged caller breaks under the new invariant** — details"));
-        assert!(body.contains("<!-- trouve-dismiss:fnd-open -->"));
-        assert!(body.contains("- [x]"));
-        assert!(body.contains("_(dismissed by maintainer)_ <!-- trouve-dismiss:fnd-done -->"));
+        assert!(body.contains("`@trouve-ai resolve fnd-open <reason>`"));
+        assert!(body.contains("_(resolved by maintainer)_ — `@trouve-ai unresolve fnd-done`"));
+        assert!(body.contains("never resolve a finding to record that it was fixed"));
+        assert!(!body.contains("- [ ]"));
+        assert!(!body.contains("- [x]"));
+        assert!(!body.contains("<!-- trouve-dismiss:"));
 
-        // A maintainer toggles both boxes; the parse sees exactly that.
-        let edited = body.replace(
-            "- [ ] **Severity: HIGH · Confidence: MEDIUM**",
-            "- [x] **Severity: HIGH · Confidence: MEDIUM**",
+        // Legacy comments rendered by earlier versions still parse, so a
+        // maintainer's checkbox toggle on an old comment keeps working.
+        let legacy = format!(
+            "- [x] old entry {}\n- [ ] other {}\n",
+            lifecycle_dismissal_marker("fnd-open"),
+            lifecycle_dismissal_marker("fnd-done"),
         );
-        let edited = {
-            // uncheck the dismissed entry
-            let marker = "<!-- trouve-dismiss:fnd-done -->";
-            let line_start = edited.lines().position(|l| l.contains(marker)).unwrap();
-            edited
-                .lines()
-                .enumerate()
-                .map(|(i, l)| {
-                    if i == line_start {
-                        l.replacen("- [x]", "- [ ]", 1)
-                    } else {
-                        l.to_owned()
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-        let states = parse_lifecycle_dismissal_markers(&edited).unwrap();
+        let states = parse_lifecycle_dismissal_markers(&legacy).unwrap();
         assert_eq!(
             states,
             [
