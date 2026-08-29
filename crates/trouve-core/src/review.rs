@@ -5152,24 +5152,29 @@ impl Engine {
                 ),
             ),
         };
-        let (finish_recorded, finish_transition, updated_tasks) = match self
-            .store
-            .finish_code_review_job(&job_id, status, &review_url, &error)
-        {
-            Ok(transition) => {
-                let transitioned = transition.is_some();
-                let updated_tasks = transition
-                    .map(|transition| transition.updated_tasks)
-                    .unwrap_or_default();
-                (true, Some(transitioned), updated_tasks)
-            }
-            Err(finish_error) => {
-                self.record_review_error(format!(
-                    "finishing review job {job_id}: {finish_error:#}"
-                ));
-                (false, None, Vec::new())
-            }
-        };
+        let continuation_request = carried_anchor_continuation_request(&record, &record.job);
+        let (finish_recorded, finish_transition, updated_tasks, continuation_job) =
+            match self.store.finish_code_review_job_with_continuation(
+                &job_id,
+                status,
+                &review_url,
+                &error,
+                Some(&continuation_request),
+            ) {
+                Ok((transition, continuation_job)) => {
+                    let transitioned = transition.is_some();
+                    let updated_tasks = transition
+                        .map(|transition| transition.updated_tasks)
+                        .unwrap_or_default();
+                    (true, Some(transitioned), updated_tasks, continuation_job)
+                }
+                Err(finish_error) => {
+                    self.record_review_error(format!(
+                        "finishing review job {job_id}: {finish_error:#}"
+                    ));
+                    (false, None, Vec::new(), None)
+                }
+            };
         let completed = self.store.code_review_job(&job_id).ok().flatten();
         let completed_status = completed
             .as_ref()
@@ -5194,6 +5199,10 @@ impl Engine {
         let _ = self.emit_code_review_tasks(updated_tasks);
         let _ = self.emit_code_review_job_updated(&job_id);
         let _ = self.emit_code_review_updated(Some(job_id.clone()));
+        if let Some(continuation_job) = continuation_job {
+            let _ = self.emit_code_review_updated(Some(continuation_job.id));
+            self.code_review.job_wake.notify_one();
+        }
         if record.job.scope == trouve_protocol::CodeReviewJobScope::Incremental
             && let Err(cleanup_error) = self
                 .executor
@@ -10674,11 +10683,11 @@ impl Engine {
         Ok(ReviewThreadReconciliationOutcome::Completed)
     }
 
-    /// Prefetch one atomically reserved page of immutable-object lines for
-    /// carried anchors through the executor's audited git boundary. Stable
-    /// head/path/line identities prevent overlapping jobs from duplicating a
-    /// reservation, and successful publication durably completes the page.
-    /// If targets remain, publication atomically queues the next bounded pass.
+    /// Prefetch one atomically reserved page of immutable-object lines through
+    /// the executor's audited git boundary. Initial rounds register eligible
+    /// stable identities; continuation rounds claim directly from the durable
+    /// queue. Successful evidence is persisted for later same-head rounds,
+    /// while failed reads are released and remain claimable.
     async fn prefetch_carried_anchor_lines(
         &self,
         job: &trouve_protocol::CodeReviewJob,
@@ -10694,9 +10703,15 @@ impl Engine {
             job.pull_number,
             &job.head_sha,
             &targets,
+            job.trigger != "carried-anchor-continuation",
             CARRIED_ANCHOR_PREFETCH_PAGE_SIZE,
         )?;
-        let mut lines = HashMap::new();
+        let mut lines = page
+            .cached
+            .into_iter()
+            .map(|(path, line, content)| ((path, line), content))
+            .collect::<HashMap<_, _>>();
+        let mut has_more = page.has_more;
         for (path, line) in page.targets {
             let key = (path.clone(), line);
             match self
@@ -10713,19 +10728,40 @@ impl Engine {
                 .await
             {
                 Ok(content) => {
+                    anyhow::ensure!(
+                        self.store.complete_code_review_carried_anchor_read(
+                            &job.id,
+                            &job.repository,
+                            job.pull_number,
+                            &job.head_sha,
+                            &path,
+                            line,
+                            content.as_deref(),
+                        )?,
+                        "carried anchor reservation changed before its read was recorded"
+                    );
                     lines.insert(key, content);
                 }
                 Err(error) => {
+                    self.store.release_code_review_carried_anchor_read(
+                        &job.id,
+                        &job.repository,
+                        job.pull_number,
+                        &job.head_sha,
+                        &path,
+                        line,
+                    )?;
+                    has_more = true;
                     tracing::debug!(
                         path,
                         line,
                         %error,
-                        "carried anchor line unavailable; its resolution stays claim-gated"
+                        "carried anchor line unavailable; released for a later bounded pass"
                     );
                 }
             }
         }
-        Ok((lines, page.has_more))
+        Ok((lines, has_more))
     }
 
     async fn prefetch_anchor_object_lines(
