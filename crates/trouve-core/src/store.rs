@@ -389,7 +389,8 @@ CREATE TABLE IF NOT EXISTS code_review_jobs (
   blocking_review_cleanup_attempts INTEGER NOT NULL DEFAULT 0,
   blocking_review_cleanup_next_attempt_at TEXT,
   blocking_review_cleanup_claim_token TEXT,
-  blocking_review_cleanup_claim_until TEXT
+  blocking_review_cleanup_claim_until TEXT,
+  carried_anchor_targets_legacy INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS code_review_jobs_status ON code_review_jobs (status, created_at);
 CREATE INDEX IF NOT EXISTS code_review_jobs_repository_history
@@ -676,7 +677,8 @@ const USAGE_MODEL_COLUMN_MIGRATION: &str =
     "ALTER TABLE usage ADD COLUMN model TEXT NOT NULL DEFAULT ''";
 
 const USAGE_MODEL_BACKFILL_MIGRATION: &str = "usage-model-backfill-v1";
-const CARRIED_ANCHOR_TARGET_BACKFILL_MIGRATION: &str = "carried-anchor-target-backfill-v1";
+
+const CARRIED_ANCHOR_TARGET_BACKFILL_MIGRATION: &str = "carried-anchor-target-backfill-v2";
 
 // This repair runs once inside the same transaction as its completion marker.
 // It can therefore resume after an interrupted column migration without
@@ -952,6 +954,8 @@ const MIGRATIONS: &[&str] = &[
        line INTEGER NOT NULL,
        PRIMARY KEY (job_id, path, line)
      )",
+    "ALTER TABLE code_review_jobs
+       ADD COLUMN carried_anchor_targets_legacy INTEGER NOT NULL DEFAULT 0",
 ];
 
 /// Blocking-tier predicate for one findings row under the given SQL alias:
@@ -1062,14 +1066,30 @@ fn backfill_code_review_carried_anchor_targets(conn: &Connection) -> Result<()> 
     }
 
     transaction.execute_batch(
-        "INSERT OR IGNORE INTO code_review_carried_anchor_targets (job_id, path, line)
-         SELECT job.id, verification.path, verification.line
-         FROM code_review_jobs AS job
-         JOIN code_review_carried_anchor_verifications AS verification
-           ON verification.repository = job.repository
-          AND verification.pull_number = job.pull_number
-          AND verification.head_sha = job.head_sha
-         WHERE job.status IN ('queued', 'running')",
+        "UPDATE code_review_jobs
+         SET carried_anchor_targets_legacy = 1
+         WHERE status IN ('queued', 'running');
+         DELETE FROM code_review_carried_anchor_targets
+         WHERE job_id IN (
+           SELECT id FROM code_review_jobs WHERE status IN ('queued', 'running')
+         );
+         INSERT OR IGNORE INTO code_review_carried_anchor_targets (job_id, path, line)
+         SELECT owner.id, verification.path, verification.line
+         FROM code_review_carried_anchor_verifications AS verification
+         JOIN code_review_jobs AS owner ON owner.id = verification.claim_job_id
+         WHERE verification.claim_job_id IS NOT NULL;
+         INSERT OR IGNORE INTO code_review_carried_anchor_targets (job_id, path, line)
+         SELECT owner.id, verification.path, verification.line
+         FROM code_review_carried_anchor_verifications AS verification
+         JOIN code_review_jobs AS owner ON owner.id = verification.presented_job_id
+         WHERE verification.presented_job_id IS NOT NULL;
+         INSERT OR IGNORE INTO code_review_carried_anchor_targets (job_id, path, line)
+         SELECT continuation.id, parent.path, parent.line
+         FROM code_review_jobs AS continuation
+         JOIN code_review_carried_anchor_targets AS parent
+           ON parent.job_id = continuation.retry_of
+         WHERE continuation.status IN ('queued', 'running')
+           AND continuation.trigger = 'carried-anchor-continuation'",
     )?;
     transaction.execute(
         "INSERT INTO data_migrations (name, completed_at)
@@ -12640,8 +12660,8 @@ impl Store {
 
     /// Register newly observed targets once, then atomically reserve a bounded
     /// page directly from the durable head-scoped queue. Continuation jobs
-    /// skip registration, avoiding full-ledger writes on every pass. Evidence
-    /// from successful earlier reads is returned for same-head reuse.
+    /// normally skip registration; a pre-target-table job rebuilds its exact
+    /// epoch once from the supplied targets before claiming any work.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn claim_code_review_carried_anchor_page(
         &self,
@@ -12679,7 +12699,17 @@ impl Store {
                )",
             [],
         )?;
-        if register_targets {
+        let rebuild_targets = register_targets
+            || tx
+                .query_row(
+                    "SELECT carried_anchor_targets_legacy != 0
+                     FROM code_review_jobs WHERE id = ?1",
+                    params![job_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .unwrap_or(false);
+        if rebuild_targets {
             tx.execute(
                 "DELETE FROM code_review_carried_anchor_targets WHERE job_id = ?1",
                 params![job_id],
@@ -12698,6 +12728,10 @@ impl Store {
                     params![repository, pull_number as i64, head_sha, path, *line as i64],
                 )?;
             }
+            tx.execute(
+                "UPDATE code_review_jobs SET carried_anchor_targets_legacy = 0 WHERE id = ?1",
+                params![job_id],
+            )?;
         }
 
         let selected = {
@@ -21193,42 +21227,42 @@ mod tests {
     }
 
     #[test]
-    fn migrations_backfill_in_flight_carried_anchor_target_epochs() {
+    fn migrations_recover_owned_targets_without_crossing_active_epochs() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("legacy-target-epochs.sqlite");
-        let (ordinary_id, continuation_id);
-        {
+        let (ordinary, second) = {
             let store = Store::open(&path).unwrap();
             let ordinary = enqueue_backoff_test_job(&store);
-            let mut continuation_request =
-                retry_request_for(&store, &ordinary.id, "legacy-target-continuation");
-            continuation_request.trigger = "carried-anchor-continuation".into();
-            let continuation = store
-                .enqueue_code_review_job(&continuation_request)
+            let mut second_request = backoff_test_job_request();
+            second_request.dedupe_key = "legacy-target-second".into();
+            let second = store
+                .enqueue_code_review_job(&second_request)
                 .unwrap()
                 .unwrap();
             assert_eq!(
                 store.claim_code_review_job().unwrap().unwrap().job.id,
                 ordinary.id
             );
-            store
-                .conn
-                .lock()
-                .unwrap()
-                .execute(
+            let conn = store.conn.lock().unwrap();
+            for (path, owner) in [
+                ("src/ordinary.rs", Some(ordinary.id.as_str())),
+                ("src/second.rs", Some(second.id.as_str())),
+                ("src/unowned.rs", None),
+            ] {
+                conn.execute(
                     "INSERT INTO code_review_carried_anchor_verifications
-                            (repository, pull_number, head_sha, path, line)
-                     VALUES (?1, ?2, ?3, 'src/in_flight.rs', 9)",
+                            (repository, pull_number, head_sha, path, line, claim_job_id)
+                     VALUES (?1, ?2, ?3, ?4, 9, ?5)",
                     params![
                         ordinary.repository,
                         ordinary.pull_number as i64,
-                        ordinary.head_sha
+                        ordinary.head_sha,
+                        path,
+                        owner
                     ],
                 )
                 .unwrap();
-            ordinary_id = ordinary.id;
-            continuation_id = continuation.id;
-            let conn = store.conn.lock().unwrap();
+            }
             conn.execute(
                 "DELETE FROM data_migrations WHERE name = ?1",
                 [CARRIED_ANCHOR_TARGET_BACKFILL_MIGRATION],
@@ -21236,23 +21270,86 @@ mod tests {
             .unwrap();
             conn.execute_batch("DROP TABLE code_review_carried_anchor_targets")
                 .unwrap();
-        }
+            drop(conn);
+            (ordinary, second)
+        };
 
         let store = Store::open(&path).unwrap();
-        for job_id in [&ordinary_id, &continuation_id] {
-            let targets = store
-                .conn
-                .lock()
-                .unwrap()
+        {
+            let conn = store.conn.lock().unwrap();
+            let target_count = conn
                 .query_row(
-                    "SELECT COUNT(*) FROM code_review_carried_anchor_targets
-                     WHERE job_id = ?1 AND path = 'src/in_flight.rs' AND line = 9",
-                    [job_id],
+                    "SELECT COUNT(*) FROM code_review_carried_anchor_targets",
+                    [],
                     |row| row.get::<_, i64>(0),
                 )
                 .unwrap();
-            assert_eq!(targets, 1, "in-flight job {job_id} lost its target epoch");
+            assert_eq!(
+                target_count, 2,
+                "migration must not form a head-wide cross product"
+            );
+            for (job_id, expected_path) in [
+                (ordinary.id.as_str(), "src/ordinary.rs"),
+                (second.id.as_str(), "src/second.rs"),
+            ] {
+                let exact_targets = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM code_review_carried_anchor_targets
+                         WHERE job_id = ?1 AND path = ?2",
+                        params![job_id, expected_path],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap();
+                let all_targets = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM code_review_carried_anchor_targets
+                         WHERE job_id = ?1",
+                        [job_id],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap();
+                assert_eq!((exact_targets, all_targets), (1, 1));
+            }
         }
+
+        let exact_ordinary_targets = vec![
+            ("src/ordinary.rs".to_owned(), 9),
+            ("src/unowned.rs".to_owned(), 9),
+        ];
+        store
+            .claim_code_review_carried_anchor_page(
+                &ordinary.id,
+                &ordinary.repository,
+                ordinary.pull_number,
+                &ordinary.head_sha,
+                &exact_ordinary_targets,
+                false,
+                0,
+            )
+            .unwrap();
+        let conn = store.conn.lock().unwrap();
+        let rebuilt_targets = conn
+            .query_row(
+                "SELECT COUNT(*) FROM code_review_carried_anchor_targets
+                 WHERE job_id = ?1
+                   AND path IN ('src/ordinary.rs', 'src/unowned.rs')",
+                [&ordinary.id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        let legacy: bool = conn
+            .query_row(
+                "SELECT carried_anchor_targets_legacy != 0
+                 FROM code_review_jobs WHERE id = ?1",
+                [&ordinary.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rebuilt_targets, 2);
+        assert!(
+            !legacy,
+            "the exact lazy rebuild must consume its compatibility flag"
+        );
     }
 
     #[test]
