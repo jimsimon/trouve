@@ -27084,6 +27084,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn standalone_resolve_command_webhook_persists_the_durable_command() {
+        let data = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open_in_memory().unwrap();
+        store
+            .upsert_discovered_code_review_repository(7, "acme/widgets", false)
+            .unwrap();
+        store
+            .update_code_review_repository(&UpdateCodeReviewRepositoryRequest {
+                installation_id: 7,
+                repository: "acme/widgets".into(),
+                mode: CodeReviewMode::Manual,
+                model: Some("provider/review".into()),
+                coordinator_thinking_level: None,
+                router_model: None,
+                router_thinking_level: None,
+                analyst_model: None,
+                analyst_thinking_level: None,
+                prompt: String::new(),
+                reviewer_ids: None,
+                routing_mode: None,
+                semantic_routing: None,
+                included_reviewer_ids: None,
+                excluded_reviewer_ids: None,
+                reviewer_overrides: None,
+            })
+            .unwrap();
+        let config = crate::config::Config {
+            github_review_app: Some(GithubReviewAppConfig {
+                app_id: 7,
+                slug: "trouve-review".into(),
+            }),
+            ..Default::default()
+        };
+        let mut engine = Engine::new(store, data.path().to_path_buf(), &config);
+        engine.secrets = Arc::new(trouve_providers::secrets::FileStore::new(
+            data.path().join("secrets.json"),
+        ));
+        let engine = Arc::new(engine);
+        engine.secrets.set(WEBHOOK_SECRET, "shared-secret").unwrap();
+        // A standalone command delivery: no manual-review trigger, checkbox
+        // edit, or review-thread event rides along. Repository context comes
+        // from the payload envelope every App delivery carries, so the
+        // command is admitted, resolved to its configured repository, and
+        // persisted in the same transaction as the delivery claim.
+        let body = serde_json::to_vec(&serde_json::json!({
+            "action": "created",
+            "installation": {"id": 7},
+            "repository": {"full_name": "acme/widgets"},
+            "issue": {
+                "number": 42,
+                "pull_request": {"url": "https://api.github.com/repos/acme/widgets/pulls/42"}
+            },
+            "comment": {
+                "id": 250,
+                "body": "@trouve-ai resolve rvf_9b7fc0c6 accepted limitation per ADR 0042",
+                "author_association": "OWNER",
+                "user": {"login": "octocat", "type": "User"}
+            }
+        }))
+        .unwrap();
+        let mut mac = Hmac::<Sha256>::new_from_slice(b"shared-secret").unwrap();
+        mac.update(&body);
+        let signature = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+
+        // Keep the spawned processing behind the lock so the assertion
+        // covers the synchronous durable handoff itself.
+        let _reconcile_guard = engine.code_review.reconcile_lock.lock().await;
+        engine
+            .accept_github_review_webhook("issue_comment", "delivery-command-1", &signature, &body)
+            .unwrap();
+        let pending = engine
+            .store
+            .pending_threadless_commands("acme/widgets")
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].trigger_key, "command:comment:250");
+        assert_eq!(pending[0].pull_number, 42);
+        assert_eq!(pending[0].finding_prefix, "rvf_9b7fc0c6");
+        assert!(pending[0].resolve);
+        assert!(
+            !engine
+                .store
+                .claim_github_webhook_delivery("delivery-command-1", None, None)
+                .unwrap(),
+            "the command delivery must have been claimed exactly once"
+        );
+    }
+
+    #[tokio::test]
     async fn review_thread_webhook_is_accepted_and_claimed_once() {
         let data = tempfile::tempdir().unwrap();
         let store = crate::store::Store::open_in_memory().unwrap();
