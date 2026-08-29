@@ -14235,7 +14235,9 @@ impl Store {
                      WHERE presented_job_id = ?1",
                     params![id],
                 )?;
-                if let Some(request) = continuation {
+                if record.job.status == "failed"
+                    && let Some(request) = continuation
+                {
                     let next_anchor: Option<(String, i64)> = tx
                         .query_row(
                             "SELECT verification.path, verification.line
@@ -22956,6 +22958,61 @@ mod tests {
             retried.is_some(),
             "a later attempt at the same anchor needs a distinct dedupe key"
         );
+    }
+
+    #[test]
+    fn cancelled_and_stale_carried_anchor_jobs_do_not_continue() {
+        for status in ["cancelled", "stale"] {
+            let store = Store::open_in_memory().unwrap();
+            let job = enqueue_backoff_test_job(&store);
+            assert_eq!(
+                store.claim_code_review_job().unwrap().unwrap().job.id,
+                job.id
+            );
+            let targets = (0..40)
+                .map(|index| (format!("src/{status}_{index:02}.rs"), 1))
+                .collect::<Vec<_>>();
+            let first_page = store
+                .claim_code_review_carried_anchor_page(
+                    &job.id,
+                    &job.repository,
+                    job.pull_number,
+                    &job.head_sha,
+                    &targets,
+                    true,
+                    32,
+                )
+                .unwrap();
+            assert_eq!(first_page.targets.len(), 32);
+            assert!(first_page.has_more);
+
+            let mut request = retry_request_for(&store, &job.id, &format!("{status}-continuation"));
+            request.trigger = "carried-anchor-continuation".into();
+            let (_, continuation) = store
+                .finish_code_review_job_with_continuation(
+                    &job.id,
+                    status,
+                    "",
+                    status,
+                    Some(&request),
+                )
+                .unwrap();
+            assert!(
+                continuation.is_none(),
+                "{status} work must remain terminal even with unread anchors"
+            );
+            let conn = store.conn.lock().unwrap();
+            let active_continuations = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM code_review_jobs
+                     WHERE trigger = 'carried-anchor-continuation'
+                       AND status IN ('queued', 'running')",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap();
+            assert_eq!(active_continuations, 0);
+        }
     }
 
     #[test]

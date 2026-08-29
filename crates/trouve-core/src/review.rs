@@ -17004,14 +17004,22 @@ fn finding_scope_blocks(evidence: &trouve_protocol::CodeReviewFindingEvidence) -
     evidence.change_scope != "unverified"
 }
 
+fn finding_anchor_is_in_diff(
+    finding: &trouve_protocol::CodeReviewFinding,
+    diff_contents: &HashMap<(String, u64, bool), String>,
+) -> bool {
+    diff_contents.contains_key(&(
+        finding.path.clone(),
+        finding.line,
+        finding.side.eq_ignore_ascii_case("left"),
+    ))
+}
+
 fn carried_anchor_targets(
     findings: &[trouve_protocol::CodeReviewFinding],
     files: &[ReviewDiffFile],
 ) -> Vec<(String, u64)> {
-    let touched_paths = files
-        .iter()
-        .map(|file| file.path.as_str())
-        .collect::<HashSet<_>>();
+    let diff_contents = diff_line_contents(files);
     let mut seen = HashSet::new();
     findings
         .iter()
@@ -17020,7 +17028,7 @@ fn carried_anchor_targets(
                 && finding.line > 0
                 && finding_is_blocking(&finding.severity, &finding.confidence)
                 && finding_scope_blocks(&finding.evidence)
-                && !touched_paths.contains(finding.path.as_str())
+                && !finding_anchor_is_in_diff(finding, &diff_contents)
         })
         .filter_map(|finding| {
             let relative = std::path::Path::new(&finding.path);
@@ -17100,11 +17108,11 @@ fn carried_resolution_claim_is_verified(quote: &str, current: Option<&Option<Str
 }
 
 /// Filters the coordinator's resolution claims to the acceptable set. A
-/// finding in a file this round's diff touched may resolve by id alone —
-/// the coordinator judged it against changes it was shown. A carried
-/// blocking finding outside the window resolves only through a verified
-/// head-revision claim: that frees fixes whose commits scrolled out of the
-/// incremental window without letting a model hand-wave an open issue
+/// finding whose anchor is present in this round's diff may resolve by id
+/// alone — the coordinator judged the exact location against changes it was
+/// shown. A carried blocking finding outside the window resolves only through
+/// a verified head-revision claim: that frees fixes whose commits scrolled out
+/// of the incremental window without letting a model hand-wave an open issue
 /// closed. Advisory findings keep the lenient by-id path — they never gate.
 fn verified_resolution_ids(
     listed: Vec<String>,
@@ -17113,10 +17121,7 @@ fn verified_resolution_ids(
     files: &[ReviewDiffFile],
     carried_anchor_lines: &HashMap<(String, u64), Option<String>>,
 ) -> Vec<String> {
-    let touched_paths = files
-        .iter()
-        .map(|file| file.path.as_str())
-        .collect::<HashSet<_>>();
+    let diff_contents = diff_line_contents(files);
     let claim_by_id = claims
         .iter()
         .map(|claim| (claim.finding_id.as_str(), claim))
@@ -17135,7 +17140,7 @@ fn verified_resolution_ids(
             };
             let requires_head_claim = finding_is_blocking(&finding.severity, &finding.confidence)
                 && finding_scope_blocks(&finding.evidence)
-                && !touched_paths.contains(finding.path.as_str());
+                && !finding_anchor_is_in_diff(finding, &diff_contents);
             if !requires_head_claim {
                 return true;
             }
@@ -19862,13 +19867,21 @@ mod tests {
         };
         let previous = vec![
             open_history_finding("rvf_in_window", "src/touched.rs", 3, "high"),
+            open_history_finding("rvf_same_file_carried", "src/touched.rs", 200, "high"),
             open_history_finding("rvf_carried", "src/untouched.rs", 7, "high"),
             open_history_finding("rvf_stale", "src/untouched.rs", 9, "high"),
             open_history_finding("rvf_advisory", "src/untouched.rs", 11, "low"),
         ];
         let files = vec![ReviewDiffFile {
             path: "src/touched.rs".into(),
-            diff: "+changed\n".into(),
+            diff: "diff --git a/src/touched.rs b/src/touched.rs
+--- a/src/touched.rs
++++ b/src/touched.rs
+@@ -3 +3 @@
+-old
++changed
+"
+            .into(),
             generated_header: None,
         }];
         let anchors = HashMap::from([
@@ -19880,10 +19893,15 @@ mod tests {
                 ("src/untouched.rs".to_owned(), 9),
                 Some("racy();".to_owned()),
             ),
+            (
+                ("src/touched.rs".to_owned(), 200),
+                Some("still_broken();".to_owned()),
+            ),
         ]);
         let accepted = verified_resolution_ids(
             vec![
                 "rvf_in_window".into(),
+                "rvf_same_file_carried".into(),
                 "rvf_stale".into(),
                 "rvf_advisory".into(),
                 "rvf_unknown".into(),
@@ -19893,11 +19911,12 @@ mod tests {
             &files,
             &anchors,
         );
-        // The touched-file finding resolves by id; the carried blocking
-        // finding resolves through its verified claim; the claim-less
-        // carried blocking finding stays open; advisory and unknown ids
-        // keep the legacy pass-through.
+        // Only the exact in-window anchor resolves by id; another anchor in
+        // the same file remains carried. The verified carried claim resolves,
+        // the claim-less carried findings stay open, and advisory and unknown
+        // ids keep the legacy pass-through.
         assert!(accepted.contains(&"rvf_in_window".to_owned()));
+        assert!(!accepted.contains(&"rvf_same_file_carried".to_owned()));
         assert!(accepted.contains(&"rvf_carried".to_owned()));
         assert!(!accepted.contains(&"rvf_stale".to_owned()));
         assert!(accepted.contains(&"rvf_advisory".to_owned()));
@@ -19908,7 +19927,14 @@ mod tests {
     fn carried_anchor_targets_are_filtered_and_deduplicated_before_reservation() {
         let files = vec![ReviewDiffFile {
             path: "src/touched.rs".into(),
-            diff: "+changed\n".into(),
+            diff: "diff --git a/src/touched.rs b/src/touched.rs
+--- a/src/touched.rs
++++ b/src/touched.rs
+@@ -10 +10 @@
+-old
++changed
+"
+            .into(),
             generated_header: None,
         }];
         let mut findings = (1..=32)
@@ -19929,10 +19955,12 @@ mod tests {
 
         let targets = carried_anchor_targets(&findings, &files);
 
-        assert_eq!(targets.len(), 35);
-        assert_eq!(targets[0], ("src/duplicate.rs".to_owned(), 7));
+        assert_eq!(targets.len(), 66);
+        assert!(targets.contains(&("src/touched.rs".to_owned(), 1)));
+        assert!(!targets.contains(&("src/touched.rs".to_owned(), 10)));
+        assert!(targets.contains(&("src/touched.rs".to_owned(), 32)));
+        assert!(targets.contains(&("src/duplicate.rs".to_owned(), 7)));
         assert_eq!(targets.last(), Some(&("src/carried_33.rs".to_owned(), 1)));
-        assert!(targets.iter().all(|(path, _)| path != "src/touched.rs"));
     }
 
     #[test]
