@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 pub const BACKGROUND_ATTACH_PROMPT: &str = "[background agent activity]";
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, TryLockError, Weak};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -26,6 +26,7 @@ use trouve_protocol::{
     ForkCheckpointResponse, ProviderInfo, ProvidersResponse, RestoreDirection, Scope, Session,
     SessionDiffFileSummary, SessionDiffSummary, SessionFileDiff, Thread, ToolStatus, TurnAccepted,
     TurnPhase, UpdateSessionRequest, UpdateThreadRequest, UpsertProviderRequest, Usage, Workspace,
+    WorkspaceListItem,
 };
 use trouve_providers::{Message, Provider, ProviderEvent, ToolSpec};
 
@@ -35,7 +36,7 @@ use crate::permissions::{
 };
 use crate::store::{
     ArtifactCleanupClaim, ArtifactCleanupJob, CheckpointRow, PromptAcceptance,
-    SessionPrVerificationIntent, Store,
+    ReviewWorkspaceCleanupIntent, SessionPrVerificationIntent, Store,
 };
 use crate::tools::{
     AttachmentMaterialization, AttachmentMaterializationFile, BackgroundMutationLease,
@@ -70,6 +71,13 @@ const MAX_SESSION_PR_HEAD_MOVED_ATTEMPTS: u32 = 12;
 const MAX_SESSION_PR_REQUEST_ATTEMPTS: u32 = 48;
 const SESSION_PR_AUTH_RETRY_SECONDS: i64 = 30;
 const SESSION_PR_LEGACY_EVIDENCE_LOCK_TIMEOUT: Duration = Duration::from_secs(1);
+/// Repository identity changes rarely, but Git remotes remain mutable outside
+/// trouve. Revalidate periodically without spawning Git on every list poll.
+const WORKSPACE_LIST_CACHE_TTL: Duration = Duration::from_secs(30);
+/// Repository identity is presentation metadata. Fall back to workspace
+/// identity instead of allowing a hostile or unhealthy Git probe to stall a
+/// workspace-list request indefinitely.
+const WORKSPACE_REPOSITORY_IDENTITY_TIMEOUT: Duration = Duration::from_secs(2);
 const PR_VERIFICATION_FAILURE_AUTH: &str = "authentication";
 const PR_VERIFICATION_FAILURE_CONTENTION: &str = "contention";
 const PR_VERIFICATION_FAILURE_EVIDENCE: &str = "evidence";
@@ -1931,6 +1939,83 @@ struct GlobalDefaults {
     thinking_level: Option<String>,
     permission_mode: trouve_protocol::PermissionMode,
 }
+struct WorkspaceListCacheEntry {
+    item: WorkspaceListItem,
+    refreshed_at: Instant,
+}
+
+#[derive(Clone)]
+struct ReviewWorkspaceRegistrationCommit {
+    job_id: Option<String>,
+    workspace_id: String,
+    canonical_path: PathBuf,
+    lifecycle: Arc<Mutex<ReviewWorkspaceRegistrationLifecycle>>,
+    lease_id: Option<u64>,
+    cleanup_generation: Option<u64>,
+    provisional_session_id: Option<String>,
+}
+
+#[derive(Default)]
+struct ReviewWorkspaceRegistrationLifecycle {
+    next_lease_id: u64,
+    provisional_workspace_id: Option<String>,
+    provisional_generation: Option<u64>,
+    outstanding_leases: HashSet<u64>,
+}
+
+impl ReviewWorkspaceRegistrationLifecycle {
+    fn register(
+        &mut self,
+        workspace_id: &str,
+        mutated: bool,
+        cleanup_generation: Option<u64>,
+    ) -> Option<u64> {
+        if mutated {
+            self.stabilize();
+            self.provisional_workspace_id = Some(workspace_id.to_string());
+            self.provisional_generation = cleanup_generation;
+        } else if self.provisional_workspace_id.is_none() && cleanup_generation.is_some() {
+            // A fresh engine can recover provisional ownership from the
+            // durable intent even though its process-local lifecycle starts
+            // empty. Cache that generation locally; the store remains the
+            // authority for whether it may be adopted.
+            self.provisional_workspace_id = Some(workspace_id.to_string());
+            self.provisional_generation = cleanup_generation;
+        }
+        if self.provisional_workspace_id.as_deref() != Some(workspace_id)
+            || self.provisional_generation != cleanup_generation
+        {
+            return None;
+        }
+        self.next_lease_id = self
+            .next_lease_id
+            .checked_add(1)
+            .expect("review workspace registration lease overflow");
+        self.outstanding_leases.insert(self.next_lease_id);
+        Some(self.next_lease_id)
+    }
+
+    fn stabilize(&mut self) {
+        self.provisional_workspace_id = None;
+        self.provisional_generation = None;
+        self.outstanding_leases.clear();
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct ReviewWorkspaceRegistrationFence {
+    job_id: Option<String>,
+    committed: Mutex<Option<ReviewWorkspaceRegistrationCommit>>,
+}
+
+impl ReviewWorkspaceRegistrationFence {
+    pub(crate) fn for_job(job_id: String) -> Self {
+        Self {
+            job_id: Some(job_id),
+            committed: Mutex::new(None),
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 struct AutomatedReviewToolBudget {
@@ -2027,6 +2112,17 @@ pub struct Engine {
     pub(crate) store: Store,
     pub(crate) data_dir: PathBuf,
     pub(crate) config_dir: Option<PathBuf>,
+    /// Cache repository identity so frequent workspace-list polls normally
+    /// avoid Git while still observing external remote changes within a bound.
+    workspace_list_cache: Mutex<HashMap<String, WorkspaceListCacheEntry>>,
+    /// Deduplicate expired repository-identity probes per workspace. Entries
+    /// are weak so closed or inactive workspaces do not grow this registry.
+    workspace_list_refresh_locks: Mutex<HashMap<String, Weak<Mutex<()>>>>,
+    /// Provisional review leases for each canonical workspace path. A
+    /// successful review or foreground registration stabilizes the workspace;
+    /// cancellation compensates only after the final provisional lease ends.
+    workspace_registration_lifecycles:
+        Mutex<HashMap<String, Weak<Mutex<ReviewWorkspaceRegistrationLifecycle>>>>,
     /// Canonical provider/model rosters, metadata, and option-schema catalog
     /// shared by API providers and CLI backends. Explicit integrations may
     /// still contribute newly released or account-specific live models.
@@ -2489,6 +2585,9 @@ impl Engine {
             store,
             data_dir,
             config_dir,
+            workspace_list_cache: Mutex::new(HashMap::new()),
+            workspace_list_refresh_locks: Mutex::new(HashMap::new()),
+            workspace_registration_lifecycles: Mutex::new(HashMap::new()),
             model_catalog,
             providers: RwLock::new(providers),
             injected_providers: Mutex::new(injected_providers),
@@ -7659,14 +7758,175 @@ impl Engine {
 
     // --- workspaces ---------------------------------------------------------
 
-    pub fn register_workspace(
+    fn resolve_workspace_list_item(workspace: Workspace, timeout: Duration) -> WorkspaceListItem {
+        let repository = Path::new(&workspace.path);
+        let (remote_url, common_directory) =
+            git::workspace_repository_sources(repository, "origin", timeout, |remote| {
+                crate::github::parse_remote(remote).is_some()
+            });
+        let remote_identity = remote_url.and_then(|remote| crate::github::parse_remote(&remote));
+        let (repository_key, repository_name) = if let Some((host, owner, name)) = remote_identity {
+            (
+                format!(
+                    "remote:{host}/{owner}/{name}",
+                    host = host.to_ascii_lowercase(),
+                    owner = owner.to_ascii_lowercase(),
+                    name = name.to_ascii_lowercase(),
+                ),
+                name,
+            )
+        } else {
+            (
+                common_directory
+                    .map(|directory| format!("local:{}", directory.to_string_lossy()))
+                    .unwrap_or_else(|| format!("workspace:{}", workspace.id)),
+                workspace.name.clone(),
+            )
+        };
+        WorkspaceListItem {
+            id: workspace.id,
+            name: workspace.name,
+            path: workspace.path,
+            repository_key: Some(repository_key),
+            repository_name: Some(repository_name),
+        }
+    }
+
+    fn fallback_workspace_list_item(workspace: Workspace) -> WorkspaceListItem {
+        WorkspaceListItem {
+            repository_key: Some(format!("workspace:{}", workspace.id)),
+            repository_name: Some(workspace.name.clone()),
+            id: workspace.id,
+            name: workspace.name,
+            path: workspace.path,
+        }
+    }
+
+    fn workspace_list_refresh_lock(&self, workspace_id: &str) -> Arc<Mutex<()>> {
+        let mut locks = self.workspace_list_refresh_locks.lock().unwrap();
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(workspace_id).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(Mutex::new(()));
+        locks.insert(workspace_id.to_string(), Arc::downgrade(&lock));
+        lock
+    }
+
+    fn cache_workspace_list_item(&self, item: WorkspaceListItem) -> WorkspaceListItem {
+        self.workspace_list_cache.lock().unwrap().insert(
+            item.id.clone(),
+            WorkspaceListCacheEntry {
+                item: item.clone(),
+                refreshed_at: Instant::now(),
+            },
+        );
+        item
+    }
+
+    fn cached_workspace_list_item(
         &self,
-        path: &str,
-        name: Option<String>,
-    ) -> Result<Workspace, EngineError> {
+        workspace: Workspace,
+        request_deadline: Instant,
+    ) -> WorkspaceListItem {
+        self.cached_workspace_list_item_with(
+            workspace,
+            request_deadline,
+            Self::resolve_workspace_list_item,
+        )
+    }
+
+    fn cached_workspace_list_item_with(
+        &self,
+        workspace: Workspace,
+        request_deadline: Instant,
+        resolve: impl FnOnce(Workspace, Duration) -> WorkspaceListItem,
+    ) -> WorkspaceListItem {
+        let cached = self
+            .workspace_list_cache
+            .lock()
+            .unwrap()
+            .get(&workspace.id)
+            .map(|entry| (entry.item.clone(), entry.refreshed_at));
+        if let Some((cached, refreshed_at)) = &cached
+            && refreshed_at.elapsed() < WORKSPACE_LIST_CACHE_TTL
+        {
+            return cached.clone();
+        }
+
+        let refresh_lock = self.workspace_list_refresh_lock(&workspace.id);
+        let Ok(_refresh) = refresh_lock.try_lock() else {
+            return cached
+                .map(|(item, _)| item)
+                .unwrap_or_else(|| Self::fallback_workspace_list_item(workspace));
+        };
+        let cached = self
+            .workspace_list_cache
+            .lock()
+            .unwrap()
+            .get(&workspace.id)
+            .map(|entry| (entry.item.clone(), entry.refreshed_at));
+        if let Some((cached, refreshed_at)) = &cached
+            && refreshed_at.elapsed() < WORKSPACE_LIST_CACHE_TTL
+        {
+            return cached.clone();
+        }
+        let Some(remaining) = request_deadline.checked_duration_since(Instant::now()) else {
+            return cached
+                .map(|(item, _)| item)
+                .unwrap_or_else(|| Self::fallback_workspace_list_item(workspace));
+        };
+        self.cache_workspace_list_item(resolve(workspace, remaining))
+    }
+
+    fn canonical_workspace_registration_path(path: &str) -> Result<PathBuf, EngineError> {
         let canonical = std::fs::canonicalize(path)
             .map_err(|e| EngineError::BadRequest(format!("invalid path {path}: {e}")))?;
-        if !git::is_git_repo(&canonical) {
+        Ok(canonical)
+    }
+
+    fn workspace_registration_lock(&self, canonical: &Path) -> Arc<Mutex<()>> {
+        self.workspace_list_refresh_lock(&format!("registration:{}", canonical.to_string_lossy()))
+    }
+
+    fn workspace_registration_lifecycle(
+        &self,
+        canonical: &Path,
+    ) -> Arc<Mutex<ReviewWorkspaceRegistrationLifecycle>> {
+        let key = canonical.to_string_lossy().to_string();
+        let mut lifecycles = self.workspace_registration_lifecycles.lock().unwrap();
+        lifecycles.retain(|_, lifecycle| lifecycle.strong_count() > 0);
+        if let Some(lifecycle) = lifecycles.get(&key).and_then(Weak::upgrade) {
+            return lifecycle;
+        }
+        let lifecycle = Arc::new(Mutex::new(ReviewWorkspaceRegistrationLifecycle::default()));
+        lifecycles.insert(key, Arc::downgrade(&lifecycle));
+        lifecycle
+    }
+
+    fn acquire_workspace_registration_lock<'a>(
+        registration_lock: &'a Mutex<()>,
+        on_lock_attempt: impl FnOnce(bool),
+    ) -> MutexGuard<'a, ()> {
+        match registration_lock.try_lock() {
+            Ok(guard) => {
+                on_lock_attempt(false);
+                guard
+            }
+            Err(TryLockError::WouldBlock) => {
+                on_lock_attempt(true);
+                registration_lock.lock().unwrap()
+            }
+            Err(TryLockError::Poisoned(error)) => panic!("{error}"),
+        }
+    }
+
+    fn prepare_workspace_registration(
+        &self,
+        canonical: &Path,
+        name: Option<String>,
+    ) -> Result<(Workspace, bool), EngineError> {
+        if !git::is_git_repo(canonical) {
             return Err(EngineError::BadRequest(format!(
                 "{} is not a git repository",
                 canonical.display()
@@ -7674,8 +7934,30 @@ impl Engine {
         }
         let path_str = canonical.to_string_lossy().to_string();
         if let Some(existing) = self.store.workspace_by_path(&path_str)? {
-            if self.store.set_workspace_closed(&existing.id, false)? {
-                for session in self.store.list_sessions(Some(&existing.id))? {
+            return Ok((existing, true));
+        }
+        let workspace = Workspace {
+            id: new_id("ws"),
+            name: name.unwrap_or_else(|| {
+                canonical
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "workspace".into())
+            }),
+            path: path_str.clone(),
+        };
+        Ok((workspace, false))
+    }
+
+    fn commit_workspace_registration(
+        &self,
+        workspace: Workspace,
+        item: WorkspaceListItem,
+        existing: bool,
+    ) -> Result<(WorkspaceListItem, bool), EngineError> {
+        let mutated = if existing {
+            if self.store.set_workspace_closed(&workspace.id, false)? {
+                for session in self.store.list_sessions(Some(&workspace.id))? {
                     if !session.archived {
                         self.terminals.reopen_session(&session.id);
                     }
@@ -7683,36 +7965,363 @@ impl Engine {
                 self.store.append_event(
                     Scope::Server,
                     Event::WorkspaceRegistered {
-                        workspace_id: existing.id.clone(),
-                        path: path_str,
+                        workspace_id: workspace.id.clone(),
+                        path: workspace.path,
                     },
                 )?;
+                true
+            } else {
+                false
             }
-            return Ok(existing);
-        }
-        let ws = Workspace {
-            id: new_id("ws"),
-            name: name.unwrap_or_else(|| {
-                canonical
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "workspace".into())
-            }),
-            path: path_str.clone(),
+        } else {
+            self.store.insert_workspace(&workspace)?;
+            self.store.append_event(
+                Scope::Server,
+                Event::WorkspaceRegistered {
+                    workspace_id: workspace.id.clone(),
+                    path: workspace.path,
+                },
+            )?;
+            true
         };
-        self.store.insert_workspace(&ws)?;
-        self.store.append_event(
-            Scope::Server,
-            Event::WorkspaceRegistered {
-                workspace_id: ws.id.clone(),
-                path: path_str,
-            },
-        )?;
-        Ok(ws)
+        Ok((self.cache_workspace_list_item(item), mutated))
     }
 
-    pub fn list_workspaces(&self) -> Result<Vec<Workspace>, EngineError> {
-        Ok(self.store.list_workspaces()?)
+    pub fn register_workspace(
+        &self,
+        path: &str,
+        name: Option<String>,
+    ) -> Result<WorkspaceListItem, EngineError> {
+        self.register_workspace_with(path, name, |_| {}, || {})
+    }
+
+    fn register_workspace_with(
+        &self,
+        path: &str,
+        name: Option<String>,
+        on_lock_attempt: impl FnOnce(bool),
+        after_prepare: impl FnOnce(),
+    ) -> Result<WorkspaceListItem, EngineError> {
+        let canonical = Self::canonical_workspace_registration_path(path)?;
+        let registration_lock = self.workspace_registration_lock(&canonical);
+        let lifecycle = self.workspace_registration_lifecycle(&canonical);
+        let _registration =
+            Self::acquire_workspace_registration_lock(&registration_lock, on_lock_attempt);
+        let (workspace, existing) = self.prepare_workspace_registration(&canonical, name)?;
+        after_prepare();
+        let refresh_lock = self.workspace_list_refresh_lock(&workspace.id);
+        let _refresh = refresh_lock.lock().unwrap();
+        let item = Self::resolve_workspace_list_item(
+            workspace.clone(),
+            WORKSPACE_REPOSITORY_IDENTITY_TIMEOUT,
+        );
+        let (item, _mutated) = self.commit_workspace_registration(workspace, item, existing)?;
+        self.store.stabilize_workspace_registration(&item.id)?;
+        lifecycle.lock().unwrap().stabilize();
+        Ok(item)
+    }
+
+    pub(crate) fn register_review_workspace(
+        &self,
+        path: &str,
+        name: Option<String>,
+        cancel: &tokio_util::sync::CancellationToken,
+        commit_fence: &ReviewWorkspaceRegistrationFence,
+    ) -> Result<WorkspaceListItem, EngineError> {
+        self.register_review_workspace_with(path, name, cancel, commit_fence, || {}, || {})
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cancel_review_workspace_registration(
+        &self,
+        cancel: &tokio_util::sync::CancellationToken,
+        commit_fence: &ReviewWorkspaceRegistrationFence,
+    ) -> Result<(), EngineError> {
+        cancel.cancel();
+        let committed = commit_fence.committed.lock().unwrap().take();
+        if let Some(committed) = committed {
+            self.compensate_review_workspace_registration(committed)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn cancel_review_workspace_registration_and_session(
+        &self,
+        cancel: &tokio_util::sync::CancellationToken,
+        commit_fence: &ReviewWorkspaceRegistrationFence,
+    ) -> Result<(), EngineError> {
+        self.cancel_review_workspace_registration_and_session_with(cancel, commit_fence, || {})
+            .await
+    }
+
+    async fn cancel_review_workspace_registration_and_session_with(
+        &self,
+        cancel: &tokio_util::sync::CancellationToken,
+        commit_fence: &ReviewWorkspaceRegistrationFence,
+        after_first_snapshot: impl FnOnce() + Send,
+    ) -> Result<(), EngineError> {
+        cancel.cancel();
+        let mut after_first_snapshot = Some(after_first_snapshot);
+        loop {
+            let committed = commit_fence.committed.lock().unwrap().clone();
+            let Some(committed) = committed else {
+                return Ok(());
+            };
+            if let Some(after_first_snapshot) = after_first_snapshot.take() {
+                after_first_snapshot();
+            }
+            let session_cleanup =
+                if let Some(session_id) = committed.provisional_session_id.as_deref() {
+                    match self.store.session(session_id) {
+                        Ok(Some(_)) => self.delete_session(session_id).await,
+                        Ok(None) => Ok(()),
+                        Err(error) => Err(error.into()),
+                    }
+                } else {
+                    Ok(())
+                };
+            let workspace_compensation =
+                self.compensate_review_workspace_registration(committed.clone());
+            if Self::finish_review_workspace_cancellation(
+                commit_fence,
+                &committed,
+                session_cleanup,
+                workspace_compensation,
+            )? {
+                return Ok(());
+            }
+        }
+    }
+
+    fn finish_review_workspace_cancellation(
+        commit_fence: &ReviewWorkspaceRegistrationFence,
+        committed: &ReviewWorkspaceRegistrationCommit,
+        session_cleanup: Result<(), EngineError>,
+        workspace_compensation: Result<(), EngineError>,
+    ) -> Result<bool, EngineError> {
+        let session_cleaned = session_cleanup.is_ok();
+        let workspace_compensated = workspace_compensation.is_ok();
+        let finished = {
+            let mut current = commit_fence.committed.lock().unwrap();
+            if let Some(current_commit) = current.as_mut()
+                && current_commit.job_id == committed.job_id
+                && current_commit.workspace_id == committed.workspace_id
+                && current_commit.lease_id == committed.lease_id
+                && current_commit.cleanup_generation == committed.cleanup_generation
+                && Arc::ptr_eq(&current_commit.lifecycle, &committed.lifecycle)
+                && current_commit.provisional_session_id == committed.provisional_session_id
+            {
+                if session_cleaned {
+                    current_commit.provisional_session_id = None;
+                }
+                if session_cleaned && workspace_compensated {
+                    current.take();
+                }
+            }
+            current.is_none()
+        };
+
+        match (session_cleanup, workspace_compensation) {
+            (Ok(()), Ok(())) => Ok(finished),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Err(session_error), Err(workspace_error)) => {
+                Err(EngineError::Internal(anyhow::anyhow!(
+                    "review workspace cleanup failed: session cleanup failed: {session_error}; workspace compensation failed: {workspace_error}"
+                )))
+            }
+        }
+    }
+
+    fn compensate_review_workspace_registration(
+        &self,
+        committed: ReviewWorkspaceRegistrationCommit,
+    ) -> Result<(), EngineError> {
+        if let (Some(job_id), Some(cleanup_generation)) =
+            (committed.job_id.as_deref(), committed.cleanup_generation)
+        {
+            if let Some(intent) = self.store.review_workspace_cleanup_intent(job_id)?
+                && intent.workspace_id == committed.workspace_id
+                && intent.generation == cleanup_generation
+            {
+                self.reconcile_review_workspace_cleanup(&intent)?;
+            }
+            if let Some(lease_id) = committed.lease_id {
+                let mut lifecycle = committed.lifecycle.lock().unwrap();
+                lifecycle.outstanding_leases.remove(&lease_id);
+                if lifecycle.outstanding_leases.is_empty() {
+                    lifecycle.stabilize();
+                }
+            }
+            return Ok(());
+        }
+        if let Some(lease_id) = committed.lease_id {
+            let registration_lock = self.workspace_registration_lock(&committed.canonical_path);
+            let _registration = registration_lock.lock().unwrap();
+            let mut lifecycle = committed.lifecycle.lock().unwrap();
+            if lifecycle.outstanding_leases.contains(&lease_id)
+                && lifecycle.outstanding_leases.len() == 1
+                && lifecycle.provisional_workspace_id.as_deref()
+                    == Some(committed.workspace_id.as_str())
+            {
+                self.commit_workspace_close(&committed.workspace_id)?;
+                lifecycle.stabilize();
+            } else {
+                lifecycle.outstanding_leases.remove(&lease_id);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn reconcile_review_workspace_cleanup(
+        &self,
+        intent: &ReviewWorkspaceCleanupIntent,
+    ) -> Result<(), EngineError> {
+        let Some(workspace) = self.store.workspace(&intent.workspace_id)? else {
+            self.store.complete_review_workspace_cleanup(intent)?;
+            return Ok(());
+        };
+        let canonical_path = PathBuf::from(&workspace.path);
+        let registration_lock = self.workspace_registration_lock(&canonical_path);
+        let lifecycle = self.workspace_registration_lifecycle(&canonical_path);
+        let _registration = registration_lock.lock().unwrap();
+        let Some(current) = self.store.review_workspace_cleanup_intent(&intent.job_id)? else {
+            return Ok(());
+        };
+        if current.workspace_id != intent.workspace_id || current.generation != intent.generation {
+            return Ok(());
+        }
+        if self.store.review_workspace_cleanup_should_close(&current)? {
+            self.commit_workspace_close(&current.workspace_id)?;
+            lifecycle.lock().unwrap().stabilize();
+        }
+        self.store.complete_review_workspace_cleanup(&current)?;
+        Ok(())
+    }
+
+    pub(crate) fn complete_review_workspace_registration(
+        &self,
+        cancel: &tokio_util::sync::CancellationToken,
+        commit_fence: &ReviewWorkspaceRegistrationFence,
+    ) -> Result<(), EngineError> {
+        if cancel.is_cancelled() {
+            return Err(EngineError::BadRequest(
+                "stale: review workspace registration was cancelled".into(),
+            ));
+        }
+        let committed = commit_fence.committed.lock().unwrap().clone();
+        if let Some(committed) = committed
+            .as_ref()
+            .filter(|committed| committed.lease_id.is_some())
+        {
+            let registration_lock = self.workspace_registration_lock(&committed.canonical_path);
+            let _registration = registration_lock.lock().unwrap();
+            // This is the review's admission point. Recheck cancellation while
+            // holding the same guard that protects lease compensation so
+            // cancellation before admission cannot race lease stabilization.
+            if cancel.is_cancelled() {
+                return Err(EngineError::BadRequest(
+                    "stale: review workspace registration was cancelled".into(),
+                ));
+            }
+            let lease_id = committed.lease_id.unwrap();
+            let mut lifecycle = committed.lifecycle.lock().unwrap();
+            if lifecycle.outstanding_leases.contains(&lease_id) {
+                self.store
+                    .stabilize_workspace_registration(&committed.workspace_id)?;
+                lifecycle.stabilize();
+            }
+        }
+        commit_fence.committed.lock().unwrap().take();
+        Ok(())
+    }
+
+    fn register_review_workspace_with(
+        &self,
+        path: &str,
+        name: Option<String>,
+        cancel: &tokio_util::sync::CancellationToken,
+        commit_fence: &ReviewWorkspaceRegistrationFence,
+        before_commit: impl FnOnce(),
+        after_cancel_check: impl FnOnce(),
+    ) -> Result<WorkspaceListItem, EngineError> {
+        if cancel.is_cancelled() {
+            return Err(EngineError::BadRequest(
+                "stale: review workspace registration was cancelled".into(),
+            ));
+        }
+        let canonical = Self::canonical_workspace_registration_path(path)?;
+        let registration_lock = self.workspace_registration_lock(&canonical);
+        let lifecycle = self.workspace_registration_lifecycle(&canonical);
+        let _registration = registration_lock.lock().unwrap();
+        if cancel.is_cancelled() {
+            return Err(EngineError::BadRequest(
+                "stale: review workspace registration was cancelled".into(),
+            ));
+        }
+        let (workspace, existing) = self.prepare_workspace_registration(&canonical, name)?;
+        let refresh_lock = self.workspace_list_refresh_lock(&workspace.id);
+        let _refresh = refresh_lock.lock().unwrap();
+        let item = Self::resolve_workspace_list_item(
+            workspace.clone(),
+            WORKSPACE_REPOSITORY_IDENTITY_TIMEOUT,
+        );
+        before_commit();
+        let mut committed = commit_fence.committed.lock().unwrap();
+        if cancel.is_cancelled() {
+            return Err(EngineError::BadRequest(
+                "stale: review workspace registration was cancelled".into(),
+            ));
+        }
+        after_cancel_check();
+        let inherited_generation = lifecycle.lock().unwrap().provisional_generation;
+        let (item, mutated, cleanup_generation) = if let Some(job_id) =
+            commit_fence.job_id.as_deref()
+        {
+            let result = self.store.commit_review_workspace_registration(
+                job_id,
+                &workspace,
+                inherited_generation,
+            )?;
+            if result.mutated {
+                for session in self.store.list_sessions(Some(&workspace.id))? {
+                    if !session.archived {
+                        self.terminals.reopen_session(&session.id);
+                    }
+                }
+            }
+            (
+                self.cache_workspace_list_item(item),
+                result.mutated,
+                result.cleanup_generation,
+            )
+        } else {
+            let (item, mutated) = self.commit_workspace_registration(workspace, item, existing)?;
+            (item, mutated, None)
+        };
+        let lease_id = lifecycle
+            .lock()
+            .unwrap()
+            .register(&item.id, mutated, cleanup_generation);
+        *committed = Some(ReviewWorkspaceRegistrationCommit {
+            job_id: commit_fence.job_id.clone(),
+            workspace_id: item.id.clone(),
+            canonical_path: canonical,
+            lifecycle,
+            lease_id,
+            cleanup_generation,
+            provisional_session_id: None,
+        });
+        Ok(item)
+    }
+
+    pub fn list_workspaces(&self) -> Result<Vec<WorkspaceListItem>, EngineError> {
+        let request_deadline = Instant::now() + WORKSPACE_REPOSITORY_IDENTITY_TIMEOUT;
+        Ok(self
+            .store
+            .list_workspaces()?
+            .into_iter()
+            .map(|workspace| self.cached_workspace_list_item(workspace, request_deadline))
+            .collect())
     }
 
     /// Capture authenticated hosts and register their cache handles as one
@@ -7891,9 +8500,33 @@ impl Engine {
     /// while retaining existing sessions, worktrees, and automation records.
     /// Registering the same path later reopens it.
     pub fn close_workspace(&self, id: &str) -> Result<(), EngineError> {
-        if self.store.workspace(id)?.is_none() {
-            return Err(EngineError::NotFound(format!("workspace {id}")));
-        }
+        self.close_workspace_with(id, |_| {})
+    }
+
+    fn close_workspace_with(
+        &self,
+        id: &str,
+        on_lock_attempt: impl FnOnce(bool),
+    ) -> Result<(), EngineError> {
+        let workspace = self
+            .store
+            .workspace(id)?
+            .ok_or_else(|| EngineError::NotFound(format!("workspace {id}")))?;
+        // Re-registration may spend time resolving repository identity between
+        // reading and reopening an existing row. Serialize close against that
+        // whole lifecycle so whichever operation completes last owns the
+        // durable visibility and terminal state.
+        let registration_lock = self.workspace_registration_lock(Path::new(&workspace.path));
+        let lifecycle = self.workspace_registration_lifecycle(Path::new(&workspace.path));
+        let _registration =
+            Self::acquire_workspace_registration_lock(&registration_lock, on_lock_attempt);
+        self.commit_workspace_close(id)?;
+        self.store.stabilize_workspace_registration(id)?;
+        lifecycle.lock().unwrap().stabilize();
+        Ok(())
+    }
+
+    fn commit_workspace_close(&self, id: &str) -> Result<(), EngineError> {
         if self.store.set_workspace_closed(id, true)? {
             for session in self.store.list_sessions(Some(id))? {
                 self.terminals.remove_session(&session.id);
@@ -7905,6 +8538,7 @@ impl Engine {
                 },
             )?;
         }
+        self.workspace_list_cache.lock().unwrap().remove(id);
         Ok(())
     }
 
@@ -7956,6 +8590,35 @@ impl Engine {
         .map_err(|error| EngineError::Internal(error.into()))
     }
 
+    fn workspace_for_session_creation(
+        &self,
+        workspace_id: &str,
+        adopt_registration: bool,
+    ) -> Result<Workspace, EngineError> {
+        let workspace = self
+            .store
+            .workspace(workspace_id)?
+            .ok_or_else(|| EngineError::NotFound(format!("workspace {workspace_id}")))?;
+        if !adopt_registration {
+            return self
+                .store
+                .open_workspace(workspace_id)?
+                .ok_or_else(|| EngineError::NotFound(format!("workspace {workspace_id}")));
+        }
+
+        let canonical_path = PathBuf::from(&workspace.path);
+        let registration_lock = self.workspace_registration_lock(&canonical_path);
+        let lifecycle = self.workspace_registration_lifecycle(&canonical_path);
+        let _registration = registration_lock.lock().unwrap();
+        let workspace = self
+            .store
+            .open_workspace(workspace_id)?
+            .ok_or_else(|| EngineError::NotFound(format!("workspace {workspace_id}")))?;
+        self.store.stabilize_workspace_registration(workspace_id)?;
+        lifecycle.lock().unwrap().stabilize();
+        Ok(workspace)
+    }
+
     async fn rollback_failed_session_creation(
         &self,
         worktree: &Path,
@@ -7989,6 +8652,58 @@ impl Engine {
     }
 
     pub async fn create_session(&self, req: CreateSessionRequest) -> Result<Session, EngineError> {
+        self.create_session_with_workspace_adoption(req, true, None)
+            .await
+    }
+
+    pub(crate) async fn create_review_session(
+        &self,
+        req: CreateSessionRequest,
+        cancel: &tokio_util::sync::CancellationToken,
+        commit_fence: &ReviewWorkspaceRegistrationFence,
+    ) -> Result<Session, EngineError> {
+        let session = self
+            .create_session_with_workspace_adoption(req, false, commit_fence.job_id.as_deref())
+            .await?;
+        let (recorded, cancelled) = {
+            let mut committed = commit_fence.committed.lock().unwrap();
+            let cancelled = cancel.is_cancelled();
+            let recorded = if let Some(committed) = committed
+                .as_mut()
+                .filter(|committed| committed.workspace_id == session.workspace_id)
+            {
+                // Record ownership before observing cancellation so the
+                // retryable outer cleanup retains this session even if its
+                // first deletion attempt fails.
+                committed.provisional_session_id = Some(session.id.clone());
+                true
+            } else {
+                false
+            };
+            (recorded, cancelled)
+        };
+        if recorded && !cancelled {
+            return Ok(session);
+        }
+
+        if recorded {
+            return Err(EngineError::BadRequest(
+                "stale: review workspace registration was cancelled".into(),
+            ));
+        }
+
+        self.delete_session(&session.id).await?;
+        Err(EngineError::BadRequest(
+            "stale: review workspace registration was cancelled".into(),
+        ))
+    }
+
+    async fn create_session_with_workspace_adoption(
+        &self,
+        req: CreateSessionRequest,
+        adopt_workspace_registration: bool,
+        review_job_id: Option<&str>,
+    ) -> Result<Session, EngineError> {
         let create_started = Instant::now();
         let idempotency_key = match req.idempotency_key.as_deref() {
             Some(key)
@@ -8023,12 +8738,22 @@ impl Engine {
                     "session idempotency key was already used for a different request".into(),
                 ));
             }
+            if let Some(review_job_id) = review_job_id
+                && !self.store.bind_review_job_to_idempotent_session(
+                    review_job_id,
+                    key,
+                    &request_fingerprint,
+                    &existing.id,
+                )?
+            {
+                return Err(EngineError::BadRequest(
+                    "stale: review job cannot adopt the idempotent session".into(),
+                ));
+            }
             return self.get_session(&existing.id);
         }
-        let ws = self
-            .store
-            .open_workspace(&req.workspace_id)?
-            .ok_or_else(|| EngineError::NotFound(format!("workspace {}", req.workspace_id)))?;
+        let ws =
+            self.workspace_for_session_creation(&req.workspace_id, adopt_workspace_registration)?;
         let repo = PathBuf::from(&ws.path);
         let title = req.title.unwrap_or_else(|| "New session".into());
         let session_id = new_id("se");
@@ -8114,6 +8839,7 @@ impl Engine {
             idempotency_key
                 .as_deref()
                 .map(|key| (key, request_fingerprint.as_str())),
+            review_job_id,
             vec![
                 (
                     Scope::Server,
@@ -19092,6 +19818,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_idempotency_replay_is_side_effect_free_after_workspace_close() {
+        let temp = tempfile::tempdir().unwrap();
+        let repository = temp.path().join("repository");
+        let data_dir = temp.path().join("data");
+        init_engine_test_repo(&repository);
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data_dir,
+            &Config::default(),
+        );
+        let workspace = engine
+            .register_workspace(repository.to_str().unwrap(), None)
+            .unwrap();
+        let request = CreateSessionRequest {
+            workspace_id: workspace.id.clone(),
+            idempotency_key: Some("closed-workspace-replay".into()),
+            title: Some("closed workspace replay".into()),
+            base_ref: Some("main".into()),
+            checkout_ref: None,
+            fetch_latest: false,
+        };
+        let first = engine.create_session(request.clone()).await.unwrap();
+        engine.create_terminal(&first.id, 80, 24).unwrap();
+        assert_eq!(engine.list_terminals(&first.id).unwrap().len(), 1);
+
+        engine.close_workspace(&workspace.id).unwrap();
+        assert!(engine.list_workspaces().unwrap().is_empty());
+        assert!(engine.list_terminals(&first.id).unwrap().is_empty());
+        let registrations_before_replay = engine
+            .store
+            .events_after(&Scope::Server, 0)
+            .unwrap()
+            .into_iter()
+            .filter(|envelope| {
+                matches!(
+                    &envelope.event,
+                    Event::WorkspaceRegistered { workspace_id, .. }
+                        if workspace_id == &workspace.id
+                )
+            })
+            .count();
+
+        let replay = engine.create_session(request).await.unwrap();
+
+        assert_eq!(replay.id, first.id);
+        assert!(engine.list_workspaces().unwrap().is_empty());
+        assert!(engine.list_terminals(&first.id).unwrap().is_empty());
+        assert_eq!(
+            engine
+                .store
+                .events_after(&Scope::Server, 0)
+                .unwrap()
+                .into_iter()
+                .filter(|envelope| {
+                    matches!(
+                        &envelope.event,
+                        Event::WorkspaceRegistered { workspace_id, .. }
+                            if workspace_id == &workspace.id
+                    )
+                })
+                .count(),
+            registrations_before_replay
+        );
+        engine.delete_session(&first.id).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn session_creation_idempotency_key_rejects_a_different_request() {
         let probe = Arc::new(SessionCreationProbeExecutor::new(
             false,
@@ -22208,6 +23001,1126 @@ default_permission_mode = "ask"
         let evidence = pr_evidence_from_events(events, "github.com", "jimsimon", "trouve");
         assert_eq!(evidence.numbers, HashSet::from([267, 268, 271]));
         assert_eq!(evidence.successful_tool_args.len(), 3);
+    }
+
+    #[test]
+    fn workspace_list_items_cache_normalized_remote_identity() {
+        let first_directory = tempfile::tempdir().unwrap();
+        let second_directory = tempfile::tempdir().unwrap();
+        for repository in [first_directory.path(), second_directory.path()] {
+            let mut init = std::process::Command::new("git");
+            init.args(["init", "-b", "main"]).arg(repository);
+            assert!(trouve_process::output(&mut init).unwrap().status.success());
+            let mut remote = std::process::Command::new("git");
+            remote.arg("-C").arg(repository).args([
+                "remote",
+                "add",
+                "origin",
+                "git@GitHub.com:Acme/Widgets.git",
+            ]);
+            assert!(
+                trouve_process::output(&mut remote)
+                    .unwrap()
+                    .status
+                    .success()
+            );
+        }
+
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &Config::default(),
+        );
+        let first = engine
+            .register_workspace(
+                first_directory.path().to_str().unwrap(),
+                Some("first clone".into()),
+            )
+            .unwrap();
+        let second = engine
+            .register_workspace(
+                second_directory.path().to_str().unwrap(),
+                Some("second clone".into()),
+            )
+            .unwrap();
+
+        assert_eq!(first.repository_key, second.repository_key);
+        assert_eq!(first.repository_name.as_deref(), Some("Widgets"));
+        assert_eq!(second.repository_name.as_deref(), Some("Widgets"));
+
+        let mut remote = std::process::Command::new("git");
+        remote.arg("-C").arg(second_directory.path()).args([
+            "remote",
+            "set-url",
+            "origin",
+            "git@github.com:Acme/Other.git",
+        ]);
+        assert!(
+            trouve_process::output(&mut remote)
+                .unwrap()
+                .status
+                .success()
+        );
+        engine
+            .workspace_list_cache
+            .lock()
+            .unwrap()
+            .get_mut(&second.id)
+            .unwrap()
+            .refreshed_at = Instant::now() - WORKSPACE_LIST_CACHE_TTL;
+
+        let listed = engine.list_workspaces().unwrap();
+        let refreshed = listed
+            .iter()
+            .find(|workspace| workspace.id == second.id)
+            .unwrap();
+        assert_ne!(refreshed.repository_key, first.repository_key);
+        assert_eq!(refreshed.repository_name.as_deref(), Some("Other"));
+
+        drop(first_directory);
+        drop(second_directory);
+        let cached = engine.list_workspaces().unwrap();
+        assert_eq!(cached.len(), 2);
+        assert_eq!(
+            cached
+                .iter()
+                .find(|workspace| workspace.id == second.id)
+                .and_then(|workspace| workspace.repository_name.as_deref()),
+            Some("Other")
+        );
+    }
+
+    #[test]
+    fn concurrent_first_workspace_registrations_share_one_workspace() {
+        let repository = tempfile::tempdir().unwrap();
+        let mut init = std::process::Command::new("git");
+        init.args(["init", "-b", "main"]).arg(repository.path());
+        assert!(trouve_process::output(&mut init).unwrap().status.success());
+
+        let data = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &Config::default(),
+        ));
+        let repository_path = repository.path().to_path_buf();
+        let (first_prepared_tx, first_prepared_rx) = std::sync::mpsc::channel();
+        let (release_first_tx, release_first_rx) = std::sync::mpsc::channel();
+        let first_engine = Arc::clone(&engine);
+        let first_path = repository_path.clone();
+        let first = std::thread::spawn(move || {
+            first_engine.register_workspace_with(
+                first_path.to_str().unwrap(),
+                Some("first registration".into()),
+                |contended| assert!(!contended),
+                || {
+                    first_prepared_tx.send(()).unwrap();
+                    release_first_rx.recv().unwrap();
+                },
+            )
+        });
+        first_prepared_rx.recv().unwrap();
+
+        let (second_lock_tx, second_lock_rx) = std::sync::mpsc::channel();
+        let second_engine = Arc::clone(&engine);
+        let second = std::thread::spawn(move || {
+            second_engine.register_workspace_with(
+                repository_path.to_str().unwrap(),
+                Some("second registration".into()),
+                |contended| second_lock_tx.send(contended).unwrap(),
+                || {},
+            )
+        });
+        assert!(second_lock_rx.recv().unwrap());
+        release_first_tx.send(()).unwrap();
+
+        let registrations = [
+            first.join().unwrap().unwrap(),
+            second.join().unwrap().unwrap(),
+        ];
+
+        assert_eq!(registrations[0].id, registrations[1].id);
+        assert_eq!(engine.list_workspaces().unwrap().len(), 1);
+        assert_eq!(
+            engine
+                .store
+                .events_after(&Scope::Server, 0)
+                .unwrap()
+                .into_iter()
+                .filter(|envelope| matches!(envelope.event, Event::WorkspaceRegistered { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn workspace_close_waits_for_reregistration_and_remains_final() {
+        let repository = tempfile::tempdir().unwrap();
+        let mut init = std::process::Command::new("git");
+        init.args(["init", "-b", "main"]).arg(repository.path());
+        assert!(trouve_process::output(&mut init).unwrap().status.success());
+
+        let data = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &Config::default(),
+        ));
+        let workspace = engine
+            .register_workspace(repository.path().to_str().unwrap(), None)
+            .unwrap();
+        let workspace_id = workspace.id.clone();
+        let repository_path = repository.path().to_path_buf();
+        let (prepared_tx, prepared_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let registration_engine = Arc::clone(&engine);
+        let registration = std::thread::spawn(move || {
+            registration_engine.register_workspace_with(
+                repository_path.to_str().unwrap(),
+                None,
+                |_| {},
+                || {
+                    prepared_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                },
+            )
+        });
+        prepared_rx.recv().unwrap();
+
+        let (close_lock_tx, close_lock_rx) = std::sync::mpsc::channel();
+        let close_engine = Arc::clone(&engine);
+        let close_workspace_id = workspace_id.clone();
+        let close = std::thread::spawn(move || {
+            close_engine.close_workspace_with(&close_workspace_id, |contended| {
+                close_lock_tx.send(contended).unwrap();
+            })
+        });
+        assert!(close_lock_rx.recv().unwrap());
+        release_tx.send(()).unwrap();
+        registration.join().unwrap().unwrap();
+        close.join().unwrap().unwrap();
+
+        assert!(engine.list_workspaces().unwrap().is_empty());
+        let lifecycle = engine
+            .store
+            .events_after(&Scope::Server, 0)
+            .unwrap()
+            .into_iter()
+            .filter_map(|envelope| match envelope.event {
+                Event::WorkspaceRegistered {
+                    workspace_id: registered_id,
+                    ..
+                } if registered_id == workspace_id => Some("registered"),
+                Event::WorkspaceClosed {
+                    workspace_id: closed_id,
+                } if closed_id == workspace_id => Some("closed"),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(lifecycle, ["registered", "closed"]);
+    }
+
+    #[test]
+    fn workspace_list_identity_refresh_is_single_flight_per_workspace() {
+        let data = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &Config::default(),
+        ));
+        let workspace = Workspace {
+            id: "ws_single_flight".into(),
+            name: "single flight".into(),
+            path: data.path().to_string_lossy().into_owned(),
+        };
+        engine.workspace_list_cache.lock().unwrap().insert(
+            workspace.id.clone(),
+            WorkspaceListCacheEntry {
+                item: WorkspaceListItem {
+                    id: workspace.id.clone(),
+                    name: workspace.name.clone(),
+                    path: workspace.path.clone(),
+                    repository_key: Some("remote:github.com/acme/widgets".into()),
+                    repository_name: Some("widgets".into()),
+                },
+                refreshed_at: Instant::now() - WORKSPACE_LIST_CACHE_TTL,
+            },
+        );
+        let start = Arc::new(std::sync::Barrier::new(3));
+        let resolutions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handles = (0..2)
+            .map(|_| {
+                let engine = Arc::clone(&engine);
+                let workspace = workspace.clone();
+                let start = Arc::clone(&start);
+                let resolutions = Arc::clone(&resolutions);
+                std::thread::spawn(move || {
+                    start.wait();
+                    engine.cached_workspace_list_item_with(
+                        workspace,
+                        Instant::now() + Duration::from_secs(1),
+                        move |workspace, _timeout| {
+                            resolutions.fetch_add(1, Ordering::SeqCst);
+                            std::thread::sleep(Duration::from_millis(50));
+                            WorkspaceListItem {
+                                id: workspace.id,
+                                name: workspace.name,
+                                path: workspace.path,
+                                repository_key: Some("remote:github.com/acme/widgets".into()),
+                                repository_name: Some("widgets".into()),
+                            }
+                        },
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        start.wait();
+        let items = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(resolutions.load(Ordering::SeqCst), 1);
+        assert!(items.iter().all(|item| {
+            item.repository_key.as_deref() == Some("remote:github.com/acme/widgets")
+        }));
+    }
+
+    #[test]
+    fn workspace_list_identity_refreshes_share_one_request_deadline() {
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &Config::default(),
+        );
+        let first = Workspace {
+            id: "ws_budget_first".into(),
+            name: "first".into(),
+            path: data.path().join("first").to_string_lossy().into_owned(),
+        };
+        let second = Workspace {
+            id: "ws_budget_second".into(),
+            name: "second".into(),
+            path: data.path().join("second").to_string_lossy().into_owned(),
+        };
+        let resolutions = std::sync::atomic::AtomicUsize::new(0);
+        let deadline = Instant::now() + Duration::from_millis(30);
+        let first_item =
+            engine.cached_workspace_list_item_with(first, deadline, |workspace, remaining| {
+                resolutions.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(remaining + Duration::from_millis(10));
+                Engine::fallback_workspace_list_item(workspace)
+            });
+        let second_item =
+            engine.cached_workspace_list_item_with(second, deadline, |workspace, _remaining| {
+                resolutions.fetch_add(1, Ordering::SeqCst);
+                Engine::fallback_workspace_list_item(workspace)
+            });
+
+        assert_eq!(resolutions.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            first_item.repository_key.as_deref(),
+            Some("workspace:ws_budget_first")
+        );
+        assert_eq!(
+            second_item.repository_key.as_deref(),
+            Some("workspace:ws_budget_second")
+        );
+    }
+
+    #[test]
+    fn cancelled_review_workspace_registration_does_not_commit() {
+        let repository = tempfile::tempdir().unwrap();
+        let mut init = std::process::Command::new("git");
+        init.args(["init", "-b", "main"]).arg(repository.path());
+        assert!(trouve_process::output(&mut init).unwrap().status.success());
+
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &Config::default(),
+        );
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let commit_fence = ReviewWorkspaceRegistrationFence::default();
+        let error = engine
+            .register_review_workspace_with(
+                repository.path().to_str().unwrap(),
+                Some("cancelled review".into()),
+                &cancel,
+                &commit_fence,
+                || cancel.cancel(),
+                || {},
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().starts_with("stale:"));
+        assert!(engine.list_workspaces().unwrap().is_empty());
+    }
+
+    #[test]
+    fn cancellation_before_workspace_admission_preserves_compensation() {
+        let repository = tempfile::tempdir().unwrap();
+        let mut init = std::process::Command::new("git");
+        init.args(["init", "-b", "main"]).arg(repository.path());
+        assert!(trouve_process::output(&mut init).unwrap().status.success());
+
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &Config::default(),
+        );
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let commit_fence = ReviewWorkspaceRegistrationFence::default();
+        engine
+            .register_review_workspace(
+                repository.path().to_str().unwrap(),
+                Some("cancelled before admission".into()),
+                &cancel,
+                &commit_fence,
+            )
+            .unwrap();
+        assert!(!cancel.is_cancelled());
+
+        // Model the cancellation becoming visible after the caller's
+        // preceding check but before the guarded admission point.
+        cancel.cancel();
+        let error = engine
+            .complete_review_workspace_registration(&cancel, &commit_fence)
+            .unwrap_err();
+        assert!(error.to_string().starts_with("stale:"));
+        engine
+            .cancel_review_workspace_registration(&cancel, &commit_fence)
+            .unwrap();
+
+        assert!(engine.list_workspaces().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancellation_removes_the_provisional_review_session_and_worktree() {
+        let temp = tempfile::tempdir().unwrap();
+        let repository = temp.path().join("repository");
+        let data_dir = temp.path().join("data");
+        init_engine_test_repo(&repository);
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data_dir,
+            &Config::default(),
+        );
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let commit_fence = ReviewWorkspaceRegistrationFence::default();
+        let workspace = engine
+            .register_review_workspace(
+                repository.to_str().unwrap(),
+                Some("provisional review".into()),
+                &cancel,
+                &commit_fence,
+            )
+            .unwrap();
+        let session = engine
+            .create_review_session(
+                CreateSessionRequest {
+                    workspace_id: workspace.id.clone(),
+                    idempotency_key: None,
+                    title: Some("provisional review".into()),
+                    base_ref: Some("main".into()),
+                    checkout_ref: None,
+                    fetch_latest: false,
+                },
+                &cancel,
+                &commit_fence,
+            )
+            .await
+            .unwrap();
+        let worktree = PathBuf::from(&session.worktree_path);
+        assert!(engine.store.session(&session.id).unwrap().is_some());
+        assert!(worktree.exists());
+
+        engine
+            .cancel_review_workspace_registration_and_session(&cancel, &commit_fence)
+            .await
+            .unwrap();
+
+        assert!(engine.store.session(&session.id).unwrap().is_none());
+        assert!(engine.list_workspaces().unwrap().is_empty());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while worktree.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("provisional review worktree was not cleaned up");
+    }
+
+    #[tokio::test]
+    async fn cancelled_review_session_is_recorded_before_retryable_cleanup() {
+        let temp = tempfile::tempdir().unwrap();
+        let repository = temp.path().join("repository");
+        let data_dir = temp.path().join("data");
+        init_engine_test_repo(&repository);
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data_dir,
+            &Config::default(),
+        );
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let commit_fence = ReviewWorkspaceRegistrationFence::default();
+        let workspace = engine
+            .register_review_workspace(
+                repository.to_str().unwrap(),
+                Some("cancelled review session".into()),
+                &cancel,
+                &commit_fence,
+            )
+            .unwrap();
+
+        // Model cancellation becoming visible after durable session creation
+        // but before create_review_session records ownership in the fence.
+        cancel.cancel();
+        let error = engine
+            .create_review_session(
+                CreateSessionRequest {
+                    workspace_id: workspace.id,
+                    idempotency_key: None,
+                    title: Some("cancelled review session".into()),
+                    base_ref: Some("main".into()),
+                    checkout_ref: None,
+                    fetch_latest: false,
+                },
+                &cancel,
+                &commit_fence,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().starts_with("stale:"));
+
+        let session_id = commit_fence
+            .committed
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|commit| commit.provisional_session_id.clone())
+            .expect("cancelled review session must remain cleanup-addressable");
+        let session = engine.store.session(&session_id).unwrap().unwrap();
+        let worktree = PathBuf::from(&session.worktree_path);
+        assert!(worktree.exists());
+
+        engine
+            .cancel_review_workspace_registration_and_session(&cancel, &commit_fence)
+            .await
+            .unwrap();
+
+        assert!(engine.store.session(&session_id).unwrap().is_none());
+        assert!(engine.list_workspaces().unwrap().is_empty());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while worktree.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cancelled review session worktree was not cleaned up");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancellation_retries_when_a_session_is_published_after_its_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let repository = temp.path().join("repository");
+        let data_dir = temp.path().join("data");
+        init_engine_test_repo(&repository);
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data_dir,
+            &Config::default(),
+        ));
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let commit_fence = Arc::new(ReviewWorkspaceRegistrationFence::default());
+        let workspace = engine
+            .register_review_workspace(
+                repository.to_str().unwrap(),
+                Some("racing review cancellation".into()),
+                &cancel,
+                &commit_fence,
+            )
+            .unwrap();
+        let (snapshot_tx, snapshot_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let cancellation = tokio::spawn({
+            let engine = Arc::clone(&engine);
+            let cancel = cancel.clone();
+            let commit_fence = Arc::clone(&commit_fence);
+            async move {
+                engine
+                    .cancel_review_workspace_registration_and_session_with(
+                        &cancel,
+                        &commit_fence,
+                        move || {
+                            snapshot_tx.send(()).unwrap();
+                            release_rx.recv().unwrap();
+                        },
+                    )
+                    .await
+            }
+        });
+        snapshot_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("cancellation did not snapshot the empty session handle");
+
+        let error = engine
+            .create_review_session(
+                CreateSessionRequest {
+                    workspace_id: workspace.id,
+                    idempotency_key: None,
+                    title: Some("racing review cancellation".into()),
+                    base_ref: Some("main".into()),
+                    checkout_ref: None,
+                    fetch_latest: false,
+                },
+                &cancel,
+                &commit_fence,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().starts_with("stale:"));
+        let session_id = commit_fence
+            .committed
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|commit| commit.provisional_session_id.clone())
+            .expect("the newly published session must remain cleanup-addressable");
+        let session = engine.store.session(&session_id).unwrap().unwrap();
+        let worktree = PathBuf::from(&session.worktree_path);
+        assert!(worktree.exists());
+
+        release_tx.send(()).unwrap();
+        cancellation.await.unwrap().unwrap();
+
+        assert!(commit_fence.committed.lock().unwrap().is_none());
+        assert!(engine.store.session(&session_id).unwrap().is_none());
+        assert!(engine.list_workspaces().unwrap().is_empty());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while worktree.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("racing review session worktree was not cleaned up");
+    }
+
+    #[test]
+    fn cancellation_cleanup_failures_remain_retryable_after_workspace_compensation() {
+        for failure_stage in ["session lookup", "session deletion"] {
+            let repository = tempfile::tempdir().unwrap();
+            let mut init = std::process::Command::new("git");
+            init.args(["init", "-b", "main"]).arg(repository.path());
+            assert!(trouve_process::output(&mut init).unwrap().status.success());
+
+            let data = tempfile::tempdir().unwrap();
+            let engine = Engine::new(
+                Store::open_in_memory().unwrap(),
+                data.path().to_path_buf(),
+                &Config::default(),
+            );
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let commit_fence = ReviewWorkspaceRegistrationFence::default();
+            engine
+                .register_review_workspace(
+                    repository.path().to_str().unwrap(),
+                    Some(format!("{failure_stage} failure")),
+                    &cancel,
+                    &commit_fence,
+                )
+                .unwrap();
+            commit_fence
+                .committed
+                .lock()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .provisional_session_id = Some("provisional-session".into());
+            let committed = commit_fence.committed.lock().unwrap().clone().unwrap();
+
+            let mut compensation_attempts = 0;
+            compensation_attempts += 1;
+            let workspace_compensation =
+                engine.compensate_review_workspace_registration(committed.clone());
+            let error = Engine::finish_review_workspace_cancellation(
+                &commit_fence,
+                &committed,
+                Err(EngineError::Internal(anyhow::anyhow!(
+                    "injected {failure_stage} failure"
+                ))),
+                workspace_compensation,
+            )
+            .unwrap_err();
+
+            assert!(error.to_string().contains(failure_stage));
+            assert_eq!(compensation_attempts, 1);
+            assert!(engine.list_workspaces().unwrap().is_empty());
+            assert_eq!(
+                commit_fence
+                    .committed
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(|commit| commit.provisional_session_id.as_deref()),
+                Some("provisional-session")
+            );
+
+            let committed = commit_fence.committed.lock().unwrap().clone().unwrap();
+            compensation_attempts += 1;
+            let workspace_compensation =
+                engine.compensate_review_workspace_registration(committed.clone());
+            Engine::finish_review_workspace_cancellation(
+                &commit_fence,
+                &committed,
+                Ok(()),
+                workspace_compensation,
+            )
+            .unwrap();
+
+            assert_eq!(compensation_attempts, 2);
+            assert!(commit_fence.committed.lock().unwrap().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_session_creation_adopts_a_provisional_review_workspace() {
+        let temp = tempfile::tempdir().unwrap();
+        let repository = temp.path().join("repository");
+        let data_dir = temp.path().join("data");
+        init_engine_test_repo(&repository);
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data_dir,
+            &Config::default(),
+        );
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let commit_fence = ReviewWorkspaceRegistrationFence::default();
+        let workspace = engine
+            .register_review_workspace(
+                repository.to_str().unwrap(),
+                Some("adopted review workspace".into()),
+                &cancel,
+                &commit_fence,
+            )
+            .unwrap();
+        let session = engine
+            .create_session(CreateSessionRequest {
+                workspace_id: workspace.id.clone(),
+                idempotency_key: None,
+                title: Some("independent work".into()),
+                base_ref: Some("main".into()),
+                checkout_ref: None,
+                fetch_latest: false,
+            })
+            .await
+            .unwrap();
+        engine.create_terminal(&session.id, 80, 24).unwrap();
+
+        engine
+            .cancel_review_workspace_registration_and_session(&cancel, &commit_fence)
+            .await
+            .unwrap();
+
+        assert_eq!(engine.list_workspaces().unwrap().len(), 1);
+        assert!(engine.store.session(&session.id).unwrap().is_some());
+        assert_eq!(engine.list_terminals(&session.id).unwrap().len(), 1);
+        engine.delete_session(&session.id).await.unwrap();
+    }
+
+    #[test]
+    fn cancellation_compensates_registration_admitted_before_timeout() {
+        let repository = tempfile::tempdir().unwrap();
+        let mut init = std::process::Command::new("git");
+        init.args(["init", "-b", "main"]).arg(repository.path());
+        assert!(trouve_process::output(&mut init).unwrap().status.success());
+
+        let data = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &Config::default(),
+        ));
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let commit_fence = Arc::new(ReviewWorkspaceRegistrationFence::default());
+        let (admitted_tx, admitted_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let registration_engine = Arc::clone(&engine);
+        let registration_cancel = cancel.clone();
+        let registration_fence = Arc::clone(&commit_fence);
+        let repository_path = repository.path().to_path_buf();
+        let registration = std::thread::spawn(move || {
+            registration_engine.register_review_workspace_with(
+                repository_path.to_str().unwrap(),
+                Some("timed out review".into()),
+                &registration_cancel,
+                &registration_fence,
+                || {},
+                || {
+                    admitted_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                },
+            )
+        });
+        admitted_rx.recv().unwrap();
+
+        let cancellation_engine = Arc::clone(&engine);
+        let cancellation_token = cancel.clone();
+        let cancellation_fence = Arc::clone(&commit_fence);
+        let (cancelled_tx, cancelled_rx) = std::sync::mpsc::channel();
+        let cancellation = std::thread::spawn(move || {
+            let result = cancellation_engine
+                .cancel_review_workspace_registration(&cancellation_token, &cancellation_fence);
+            cancelled_tx.send(()).unwrap();
+            result
+        });
+        assert!(matches!(
+            cancelled_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        release_tx.send(()).unwrap();
+
+        let workspace = registration.join().unwrap().unwrap();
+        cancellation.join().unwrap().unwrap();
+
+        assert!(cancel.is_cancelled());
+        assert!(engine.list_workspaces().unwrap().is_empty());
+        let lifecycle = engine
+            .store
+            .events_after(&Scope::Server, 0)
+            .unwrap()
+            .into_iter()
+            .filter_map(|envelope| match envelope.event {
+                Event::WorkspaceRegistered { workspace_id, .. } if workspace_id == workspace.id => {
+                    Some("registered")
+                }
+                Event::WorkspaceClosed { workspace_id } if workspace_id == workspace.id => {
+                    Some("closed")
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(lifecycle, ["registered", "closed"]);
+    }
+
+    #[test]
+    fn cancellation_recloses_workspace_reopened_before_timeout() {
+        let repository = tempfile::tempdir().unwrap();
+        let mut init = std::process::Command::new("git");
+        init.args(["init", "-b", "main"]).arg(repository.path());
+        assert!(trouve_process::output(&mut init).unwrap().status.success());
+
+        let data = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &Config::default(),
+        ));
+        let workspace = engine
+            .register_workspace(repository.path().to_str().unwrap(), None)
+            .unwrap();
+        engine.close_workspace(&workspace.id).unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let commit_fence = Arc::new(ReviewWorkspaceRegistrationFence::default());
+        let (admitted_tx, admitted_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let registration_engine = Arc::clone(&engine);
+        let registration_cancel = cancel.clone();
+        let registration_fence = Arc::clone(&commit_fence);
+        let repository_path = repository.path().to_path_buf();
+        let registration = std::thread::spawn(move || {
+            registration_engine.register_review_workspace_with(
+                repository_path.to_str().unwrap(),
+                None,
+                &registration_cancel,
+                &registration_fence,
+                || {},
+                || {
+                    admitted_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                },
+            )
+        });
+        admitted_rx.recv().unwrap();
+
+        let cancellation_engine = Arc::clone(&engine);
+        let cancellation_token = cancel.clone();
+        let cancellation_fence = Arc::clone(&commit_fence);
+        let cancellation = std::thread::spawn(move || {
+            cancellation_engine
+                .cancel_review_workspace_registration(&cancellation_token, &cancellation_fence)
+        });
+        release_tx.send(()).unwrap();
+
+        let reopened = registration.join().unwrap().unwrap();
+        cancellation.join().unwrap().unwrap();
+
+        assert_eq!(reopened.id, workspace.id);
+        assert!(engine.list_workspaces().unwrap().is_empty());
+        let lifecycle = engine
+            .store
+            .events_after(&Scope::Server, 0)
+            .unwrap()
+            .into_iter()
+            .filter_map(|envelope| match envelope.event {
+                Event::WorkspaceRegistered { workspace_id, .. } if workspace_id == workspace.id => {
+                    Some("registered")
+                }
+                Event::WorkspaceClosed { workspace_id } if workspace_id == workspace.id => {
+                    Some("closed")
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(lifecycle, ["registered", "closed", "registered", "closed"]);
+    }
+
+    #[test]
+    fn later_review_registration_adopts_workspace_before_earlier_cancellation() {
+        let repository = tempfile::tempdir().unwrap();
+        let mut init = std::process::Command::new("git");
+        init.args(["init", "-b", "main"]).arg(repository.path());
+        assert!(trouve_process::output(&mut init).unwrap().status.success());
+
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &Config::default(),
+        );
+        let first_cancel = tokio_util::sync::CancellationToken::new();
+        let first_fence = ReviewWorkspaceRegistrationFence::default();
+        let workspace = engine
+            .register_review_workspace(
+                repository.path().to_str().unwrap(),
+                Some("first review".into()),
+                &first_cancel,
+                &first_fence,
+            )
+            .unwrap();
+        let second_cancel = tokio_util::sync::CancellationToken::new();
+        let second_fence = ReviewWorkspaceRegistrationFence::default();
+        let adopted = engine
+            .register_review_workspace(
+                repository.path().to_str().unwrap(),
+                Some("second review".into()),
+                &second_cancel,
+                &second_fence,
+            )
+            .unwrap();
+
+        engine
+            .cancel_review_workspace_registration(&first_cancel, &first_fence)
+            .unwrap();
+        engine
+            .complete_review_workspace_registration(&second_cancel, &second_fence)
+            .unwrap();
+
+        assert_eq!(adopted.id, workspace.id);
+        assert_eq!(engine.list_workspaces().unwrap().len(), 1);
+        let lifecycle = engine
+            .store
+            .events_after(&Scope::Server, 0)
+            .unwrap()
+            .into_iter()
+            .filter_map(|envelope| match envelope.event {
+                Event::WorkspaceRegistered { workspace_id, .. } if workspace_id == workspace.id => {
+                    Some("registered")
+                }
+                Event::WorkspaceClosed { workspace_id } if workspace_id == workspace.id => {
+                    Some("closed")
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(lifecycle, ["registered"]);
+    }
+
+    #[test]
+    fn later_cancelled_review_inherits_workspace_compensation() {
+        let repository = tempfile::tempdir().unwrap();
+        let mut init = std::process::Command::new("git");
+        init.args(["init", "-b", "main"]).arg(repository.path());
+        assert!(trouve_process::output(&mut init).unwrap().status.success());
+
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &Config::default(),
+        );
+        let first_cancel = tokio_util::sync::CancellationToken::new();
+        let first_fence = ReviewWorkspaceRegistrationFence::default();
+        let workspace = engine
+            .register_review_workspace(
+                repository.path().to_str().unwrap(),
+                None,
+                &first_cancel,
+                &first_fence,
+            )
+            .unwrap();
+        let second_cancel = tokio_util::sync::CancellationToken::new();
+        let second_fence = ReviewWorkspaceRegistrationFence::default();
+        engine
+            .register_review_workspace(
+                repository.path().to_str().unwrap(),
+                None,
+                &second_cancel,
+                &second_fence,
+            )
+            .unwrap();
+
+        engine
+            .cancel_review_workspace_registration(&first_cancel, &first_fence)
+            .unwrap();
+        assert_eq!(engine.list_workspaces().unwrap().len(), 1);
+        engine
+            .cancel_review_workspace_registration(&second_cancel, &second_fence)
+            .unwrap();
+
+        assert!(engine.list_workspaces().unwrap().is_empty());
+        let lifecycle = engine
+            .store
+            .events_after(&Scope::Server, 0)
+            .unwrap()
+            .into_iter()
+            .filter_map(|envelope| match envelope.event {
+                Event::WorkspaceRegistered { workspace_id, .. } if workspace_id == workspace.id => {
+                    Some("registered")
+                }
+                Event::WorkspaceClosed { workspace_id } if workspace_id == workspace.id => {
+                    Some("closed")
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(lifecycle, ["registered", "closed"]);
+    }
+
+    #[test]
+    fn later_review_cancellation_preserves_active_or_completed_earlier_review() {
+        for complete_first_before_cancel in [false, true] {
+            let repository = tempfile::tempdir().unwrap();
+            let mut init = std::process::Command::new("git");
+            init.args(["init", "-b", "main"]).arg(repository.path());
+            assert!(trouve_process::output(&mut init).unwrap().status.success());
+
+            let data = tempfile::tempdir().unwrap();
+            let engine = Engine::new(
+                Store::open_in_memory().unwrap(),
+                data.path().to_path_buf(),
+                &Config::default(),
+            );
+            let first_cancel = tokio_util::sync::CancellationToken::new();
+            let first_fence = ReviewWorkspaceRegistrationFence::default();
+            let workspace = engine
+                .register_review_workspace(
+                    repository.path().to_str().unwrap(),
+                    None,
+                    &first_cancel,
+                    &first_fence,
+                )
+                .unwrap();
+            let second_cancel = tokio_util::sync::CancellationToken::new();
+            let second_fence = ReviewWorkspaceRegistrationFence::default();
+            engine
+                .register_review_workspace(
+                    repository.path().to_str().unwrap(),
+                    None,
+                    &second_cancel,
+                    &second_fence,
+                )
+                .unwrap();
+
+            if complete_first_before_cancel {
+                engine
+                    .complete_review_workspace_registration(&first_cancel, &first_fence)
+                    .unwrap();
+            }
+            engine
+                .cancel_review_workspace_registration(&second_cancel, &second_fence)
+                .unwrap();
+            if !complete_first_before_cancel {
+                engine
+                    .complete_review_workspace_registration(&first_cancel, &first_fence)
+                    .unwrap();
+            }
+
+            assert_eq!(engine.list_workspaces().unwrap().len(), 1);
+            let lifecycle = engine
+                .store
+                .events_after(&Scope::Server, 0)
+                .unwrap()
+                .into_iter()
+                .filter_map(|envelope| match envelope.event {
+                    Event::WorkspaceRegistered { workspace_id, .. }
+                        if workspace_id == workspace.id =>
+                    {
+                        Some("registered")
+                    }
+                    Event::WorkspaceClosed { workspace_id } if workspace_id == workspace.id => {
+                        Some("closed")
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(lifecycle, ["registered"]);
+        }
+    }
+
+    #[test]
+    fn foreground_registration_adopts_workspace_before_review_cancellation() {
+        let repository = tempfile::tempdir().unwrap();
+        let mut init = std::process::Command::new("git");
+        init.args(["init", "-b", "main"]).arg(repository.path());
+        assert!(trouve_process::output(&mut init).unwrap().status.success());
+
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &Config::default(),
+        );
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let commit_fence = ReviewWorkspaceRegistrationFence::default();
+        let workspace = engine
+            .register_review_workspace(
+                repository.path().to_str().unwrap(),
+                Some("review".into()),
+                &cancel,
+                &commit_fence,
+            )
+            .unwrap();
+        let adopted = engine
+            .register_workspace(repository.path().to_str().unwrap(), None)
+            .unwrap();
+
+        engine
+            .cancel_review_workspace_registration(&cancel, &commit_fence)
+            .unwrap();
+
+        assert_eq!(adopted.id, workspace.id);
+        assert_eq!(engine.list_workspaces().unwrap().len(), 1);
+        let lifecycle = engine
+            .store
+            .events_after(&Scope::Server, 0)
+            .unwrap()
+            .into_iter()
+            .filter_map(|envelope| match envelope.event {
+                Event::WorkspaceRegistered { workspace_id, .. } if workspace_id == workspace.id => {
+                    Some("registered")
+                }
+                Event::WorkspaceClosed { workspace_id } if workspace_id == workspace.id => {
+                    Some("closed")
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(lifecycle, ["registered"]);
     }
 
     #[test]

@@ -149,7 +149,24 @@ impl ProtocolClient {
         .await
     }
 
+    /// Register a workspace and retain its repository grouping metadata.
+    pub async fn register_workspace_item(&self, path: &str) -> Result<WorkspaceListItem> {
+        self.post_json(
+            "/workspaces",
+            &RegisterWorkspaceRequest {
+                path: path.into(),
+                name: None,
+            },
+        )
+        .await
+    }
+
     pub async fn list_workspaces(&self) -> Result<Vec<Workspace>> {
+        self.get_json("/workspaces").await
+    }
+
+    /// List workspaces with repository grouping metadata retained.
+    pub async fn list_workspace_items(&self) -> Result<Vec<WorkspaceListItem>> {
         self.get_json("/workspaces").await
     }
 
@@ -1475,6 +1492,19 @@ mod tests {
         ProtocolClient, ProtocolResponseError, decode_terminal_output_data, response_error,
         urlencode, urlencode_path_segment,
     };
+
+    #[test]
+    fn workspace_methods_preserve_their_source_compatible_return_types() {
+        fn assert_result<T>(_: impl Future<Output = anyhow::Result<T>>) {}
+
+        let client = ProtocolClient::new("http://127.0.0.1:1");
+        assert_result::<trouve_protocol::Workspace>(client.register_workspace("/tmp/workspace"));
+        assert_result::<Vec<trouve_protocol::Workspace>>(client.list_workspaces());
+        assert_result::<trouve_protocol::WorkspaceListItem>(
+            client.register_workspace_item("/tmp/workspace"),
+        );
+        assert_result::<Vec<trouve_protocol::WorkspaceListItem>>(client.list_workspace_items());
+    }
 
     #[test]
     fn legacy_terminal_decoder_ignores_json_replay_marker_data() {

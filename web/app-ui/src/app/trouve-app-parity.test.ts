@@ -27,6 +27,13 @@ describe("root shell parity wiring", () => {
     expect(source).toContain("this.#workspaceOrder.move(workspaceId, offset)");
   });
 
+  it("applies named-workspace filters to orphan session lists", () => {
+    const orphanLists = source.slice(source.indexOf("${orphanWorkspaceIds.map("));
+    expect(orphanLists).toContain("filtersFor(workspaceId)");
+    expect(orphanLists).toContain(".statusFilter=${workspaceFilters.status}");
+    expect(orphanLists).toContain(".pullRequestFilter=${workspaceFilters.pullRequest}");
+  });
+
   it("refreshes durable pull-request projections in the background", () => {
     expect(source).toContain("const GITHUB_REFRESH_INTERVAL_MS = 30_000");
     expect(source).toContain("await this.#protocolClient.refreshGithubPrs()");

@@ -1468,8 +1468,8 @@ return errors === 0;
 validate85.evaluated = {"props":{"cursor":true,"summaries":true},"dynamicProps":false,"dynamicItems":false};
 
 export const workspace = validate97;
-const schema39 = {"$id":"urn:trouve:protocol-validator:workspace","$ref":"urn:trouve:protocol-openapi#/components/schemas/Workspace"};
-const schema40 = {"type":"object","required":["id","name","path"],"properties":{"id":{"$ref":"#/components/schemas/String"},"name":{"type":"string"},"path":{"type":"string"}}};
+const schema39 = {"$id":"urn:trouve:protocol-validator:workspace","$ref":"urn:trouve:protocol-openapi#/components/schemas/WorkspaceListItem"};
+const schema40 = {"type":"object","description":"Workspace presentation returned by the list and registration endpoints.\nSeparate checkouts and linked worktrees share repository_key when they\nresolve to the same configured remote or local Git common directory.","required":["id","name","path"],"properties":{"id":{"$ref":"#/components/schemas/String"},"name":{"type":"string"},"path":{"type":"string"},"repository_key":{"type":["string","null"]},"repository_name":{"type":["string","null"]}}};
 
 function validate98(data, {instancePath="", parentData, parentDataProperty, rootData=data, dynamicAnchors={}}={}){
 let vErrors = null;
@@ -1524,6 +1524,34 @@ var valid0 = _errs4 === errors;
 else {
 var valid0 = true;
 }
+if(valid0){
+if(data.repository_key !== undefined){
+let data3 = data.repository_key;
+const _errs6 = errors;
+if((typeof data3 !== "string") && (data3 !== null)){
+validate98.errors = [{instancePath:instancePath+"/repository_key",schemaPath:"#/properties/repository_key/type",keyword:"type",params:{type: schema40.properties.repository_key.type},message:"must be string,null"}];
+return false;
+}
+var valid0 = _errs6 === errors;
+}
+else {
+var valid0 = true;
+}
+if(valid0){
+if(data.repository_name !== undefined){
+let data4 = data.repository_name;
+const _errs8 = errors;
+if((typeof data4 !== "string") && (data4 !== null)){
+validate98.errors = [{instancePath:instancePath+"/repository_name",schemaPath:"#/properties/repository_name/type",keyword:"type",params:{type: schema40.properties.repository_name.type},message:"must be string,null"}];
+return false;
+}
+var valid0 = _errs8 === errors;
+}
+else {
+var valid0 = true;
+}
+}
+}
 }
 }
 }
@@ -1536,7 +1564,7 @@ return false;
 validate98.errors = vErrors;
 return errors === 0;
 }
-validate98.evaluated = {"props":{"id":true,"name":true,"path":true},"dynamicProps":false,"dynamicItems":false};
+validate98.evaluated = {"props":{"id":true,"name":true,"path":true,"repository_key":true,"repository_name":true},"dynamicProps":false,"dynamicItems":false};
 
 
 function validate97(data, {instancePath="", parentData, parentDataProperty, rootData=data, dynamicAnchors={}}={}){
@@ -1557,10 +1585,10 @@ errors = vErrors.length;
 validate97.errors = vErrors;
 return errors === 0;
 }
-validate97.evaluated = {"props":{"id":true,"name":true,"path":true},"dynamicProps":false,"dynamicItems":false};
+validate97.evaluated = {"props":{"id":true,"name":true,"path":true,"repository_key":true,"repository_name":true},"dynamicProps":false,"dynamicItems":false};
 
 export const workspaces = validate101;
-const schema41 = {"$id":"urn:trouve:protocol-validator:workspaces","type":"array","items":{"$ref":"urn:trouve:protocol-openapi#/components/schemas/Workspace"}};
+const schema41 = {"$id":"urn:trouve:protocol-validator:workspaces","type":"array","items":{"$ref":"urn:trouve:protocol-openapi#/components/schemas/WorkspaceListItem"}};
 
 function validate102(data, {instancePath="", parentData, parentDataProperty, rootData=data, dynamicAnchors={}}={}){
 let vErrors = null;
@@ -1615,6 +1643,34 @@ var valid0 = _errs4 === errors;
 else {
 var valid0 = true;
 }
+if(valid0){
+if(data.repository_key !== undefined){
+let data3 = data.repository_key;
+const _errs6 = errors;
+if((typeof data3 !== "string") && (data3 !== null)){
+validate102.errors = [{instancePath:instancePath+"/repository_key",schemaPath:"#/properties/repository_key/type",keyword:"type",params:{type: schema40.properties.repository_key.type},message:"must be string,null"}];
+return false;
+}
+var valid0 = _errs6 === errors;
+}
+else {
+var valid0 = true;
+}
+if(valid0){
+if(data.repository_name !== undefined){
+let data4 = data.repository_name;
+const _errs8 = errors;
+if((typeof data4 !== "string") && (data4 !== null)){
+validate102.errors = [{instancePath:instancePath+"/repository_name",schemaPath:"#/properties/repository_name/type",keyword:"type",params:{type: schema40.properties.repository_name.type},message:"must be string,null"}];
+return false;
+}
+var valid0 = _errs8 === errors;
+}
+else {
+var valid0 = true;
+}
+}
+}
 }
 }
 }
@@ -1627,7 +1683,7 @@ return false;
 validate102.errors = vErrors;
 return errors === 0;
 }
-validate102.evaluated = {"props":{"id":true,"name":true,"path":true},"dynamicProps":false,"dynamicItems":false};
+validate102.evaluated = {"props":{"id":true,"name":true,"path":true,"repository_key":true,"repository_name":true},"dynamicProps":false,"dynamicItems":false};
 
 
 function validate101(data, {instancePath="", parentData, parentDataProperty, rootData=data, dynamicAnchors={}}={}){

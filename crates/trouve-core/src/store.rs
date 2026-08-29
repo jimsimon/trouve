@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS workspaces (
   name TEXT NOT NULL,
   path TEXT NOT NULL UNIQUE,
   closed INTEGER NOT NULL DEFAULT 0,
+  review_registration_generation INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS sessions (
@@ -392,6 +393,22 @@ CREATE TABLE IF NOT EXISTS code_review_jobs (
 CREATE INDEX IF NOT EXISTS code_review_jobs_status ON code_review_jobs (status, created_at);
 CREATE INDEX IF NOT EXISTS code_review_jobs_repository_history
   ON code_review_jobs (repository, status, completed_at, created_at);
+-- A review may provisionally create or reopen a workspace before its session
+-- is admitted. Keep that ownership durable so timeout/crash cleanup can be
+-- handed to the scheduler without letting an old attempt close a workspace
+-- that a user or later review has since adopted.
+CREATE TABLE IF NOT EXISTS code_review_workspace_cleanup_intents (
+  job_id TEXT PRIMARY KEY REFERENCES code_review_jobs(id) ON DELETE CASCADE,
+  workspace_id TEXT NOT NULL,
+  generation INTEGER NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS code_review_workspace_cleanup_due
+  ON code_review_workspace_cleanup_intents (next_attempt_at, created_at);
+CREATE INDEX IF NOT EXISTS code_review_workspace_cleanup_workspace
+  ON code_review_workspace_cleanup_intents (workspace_id, generation);
 CREATE TABLE IF NOT EXISTS code_review_tasks (
   id TEXT PRIMARY KEY,
   job_id TEXT NOT NULL REFERENCES code_review_jobs(id),
@@ -680,6 +697,7 @@ WHERE usage.model = ''
 const MIGRATIONS: &[&str] = &[
     "ALTER TABLE session_create_requests ADD COLUMN request_fingerprint TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE workspaces ADD COLUMN closed INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE workspaces ADD COLUMN review_registration_generation INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE sessions ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE queued_prompts ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]'",
     "ALTER TABLE queued_prompts ADD COLUMN claimed INTEGER NOT NULL DEFAULT 0",
@@ -716,6 +734,18 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE code_review_repositories ADD COLUMN router_thinking_level TEXT",
     "ALTER TABLE code_review_repositories ADD COLUMN coordinator_thinking_level TEXT",
     "ALTER TABLE code_review_jobs ADD COLUMN identities TEXT NOT NULL DEFAULT '[]'",
+    "CREATE TABLE IF NOT EXISTS code_review_workspace_cleanup_intents (
+       job_id TEXT PRIMARY KEY REFERENCES code_review_jobs(id) ON DELETE CASCADE,
+       workspace_id TEXT NOT NULL,
+       generation INTEGER NOT NULL,
+       attempts INTEGER NOT NULL DEFAULT 0,
+       next_attempt_at TEXT,
+       created_at TEXT NOT NULL
+     )",
+    "CREATE INDEX IF NOT EXISTS code_review_workspace_cleanup_due
+       ON code_review_workspace_cleanup_intents (next_attempt_at, created_at)",
+    "CREATE INDEX IF NOT EXISTS code_review_workspace_cleanup_workspace
+       ON code_review_workspace_cleanup_intents (workspace_id, generation)",
     "ALTER TABLE code_review_jobs ADD COLUMN config_hash TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE code_review_jobs ADD COLUMN review_base_sha TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE code_review_jobs ADD COLUMN review_watermark_sha TEXT NOT NULL DEFAULT ''",
@@ -4322,6 +4352,20 @@ pub(crate) struct ArtifactCleanupJob {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReviewWorkspaceCleanupIntent {
+    pub job_id: String,
+    pub workspace_id: String,
+    pub generation: u64,
+    pub attempts: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReviewWorkspaceRegistrationResult {
+    pub mutated: bool,
+    pub cleanup_generation: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SessionPrVerificationIntent {
     pub session_id: String,
     pub host: String,
@@ -4551,6 +4595,12 @@ enum StoreMutation {
         initial_checkpoint: Box<CheckpointRow>,
         idempotency_key: Option<String>,
         request_fingerprint: Option<String>,
+        review_job_id: Option<String>,
+    },
+    RegisterReviewWorkspace {
+        job_id: String,
+        workspace: Box<Workspace>,
+        inherited_generation: Option<u64>,
     },
     Update {
         id: String,
@@ -5061,6 +5111,104 @@ fn insert_artifact_cleanup_job(
     Ok(())
 }
 
+fn commit_review_workspace_registration_rows(
+    conn: &Connection,
+    job_id: &str,
+    workspace: &Workspace,
+    inherited_generation: Option<u64>,
+    timestamp: chrono::DateTime<chrono::Utc>,
+) -> Result<ReviewWorkspaceRegistrationResult> {
+    let existing: Option<(String, bool, i64)> = conn
+        .query_row(
+            "SELECT id, closed, review_registration_generation
+             FROM workspaces WHERE path = ?1",
+            params![workspace.path],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let running = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM code_review_jobs
+         WHERE id = ?1 AND status = 'running')",
+        params![job_id],
+        |row| row.get::<_, bool>(0),
+    )?;
+    anyhow::ensure!(running, "stale: review job {job_id} is no longer running");
+
+    let (mutated, cleanup_generation) = match existing {
+        Some((workspace_id, closed, generation)) => {
+            anyhow::ensure!(
+                workspace_id == workspace.id,
+                "workspace path changed identity during review registration"
+            );
+            let generation = u64::try_from(generation)
+                .context("workspace review-registration generation is negative")?;
+            let durable_provisional = conn.query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM code_review_workspace_cleanup_intents
+                   WHERE workspace_id = ?1 AND generation = ?2
+                 )",
+                params![workspace.id, i64::try_from(generation)?],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if closed {
+                let next = generation
+                    .checked_add(1)
+                    .context("workspace review-registration generation overflow")?;
+                conn.execute(
+                    "UPDATE workspaces
+                     SET closed = 0, review_registration_generation = ?2
+                     WHERE id = ?1",
+                    params![workspace.id, i64::try_from(next)?],
+                )?;
+                (true, Some(next))
+            } else if durable_provisional || inherited_generation == Some(generation) {
+                (false, Some(generation))
+            } else {
+                (false, None)
+            }
+        }
+        None => {
+            let generation = 1_u64;
+            conn.execute(
+                "INSERT INTO workspaces
+                     (id, name, path, closed, review_registration_generation, created_at)
+                 VALUES (?1, ?2, ?3, 0, ?4, ?5)",
+                params![
+                    workspace.id,
+                    workspace.name,
+                    workspace.path,
+                    i64::try_from(generation)?,
+                    timestamp.to_rfc3339()
+                ],
+            )?;
+            (true, Some(generation))
+        }
+    };
+
+    if let Some(generation) = cleanup_generation {
+        conn.execute(
+            "INSERT INTO code_review_workspace_cleanup_intents
+                    (job_id, workspace_id, generation, attempts, next_attempt_at, created_at)
+             VALUES (?1, ?2, ?3, 0, NULL, ?4)
+             ON CONFLICT(job_id) DO UPDATE SET
+               workspace_id = excluded.workspace_id,
+               generation = excluded.generation,
+               attempts = 0,
+               next_attempt_at = NULL",
+            params![
+                job_id,
+                workspace.id,
+                i64::try_from(generation)?,
+                timestamp.to_rfc3339()
+            ],
+        )?;
+    }
+    Ok(ReviewWorkspaceRegistrationResult {
+        mutated,
+        cleanup_generation,
+    })
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum StoreMutationOutcome {
     AppendEvent,
@@ -5079,6 +5227,7 @@ fn apply_store_mutation(
             initial_checkpoint,
             idempotency_key,
             request_fingerprint,
+            review_job_id,
         } => {
             insert_session_row(conn, session)?;
             if let (Some(idempotency_key), Some(request_fingerprint)) =
@@ -5091,7 +5240,35 @@ fn apply_store_mutation(
                     params![idempotency_key, session.id, request_fingerprint],
                 )?;
             }
+            if let Some(review_job_id) = review_job_id {
+                let updated = conn.execute(
+                    "UPDATE code_review_jobs SET session_id = ?2, thread_id = NULL
+                     WHERE id = ?1 AND status = 'running' AND session_id IS NULL",
+                    params![review_job_id, session.id],
+                )?;
+                anyhow::ensure!(
+                    updated == 1,
+                    "stale: review job {review_job_id} cannot own session {}",
+                    session.id
+                );
+            }
             insert_initial_checkpoint_row(conn, initial_checkpoint, timestamp)?;
+        }
+        StoreMutation::RegisterReviewWorkspace {
+            job_id,
+            workspace,
+            inherited_generation,
+        } => {
+            let registration = commit_review_workspace_registration_rows(
+                conn,
+                job_id,
+                workspace,
+                *inherited_generation,
+                timestamp,
+            )?;
+            if !registration.mutated {
+                return Ok(StoreMutationOutcome::CommitWithoutEvent);
+            }
         }
         StoreMutation::Update {
             id,
@@ -5953,12 +6130,27 @@ impl Store {
     }
 
     fn append_pending_events(&self, events: Vec<PendingEvent>) -> Result<Vec<EventEnvelope>> {
+        self.append_pending_events_with_isolation(events, false)
+    }
+
+    fn append_pending_events_isolated(
+        &self,
+        events: Vec<PendingEvent>,
+    ) -> Result<Vec<EventEnvelope>> {
+        self.append_pending_events_with_isolation(events, true)
+    }
+
+    fn append_pending_events_with_isolation(
+        &self,
+        events: Vec<PendingEvent>,
+        isolated: bool,
+    ) -> Result<Vec<EventEnvelope>> {
         let (reply, reply_rx) = std::sync::mpsc::sync_channel(1);
         self.append_tx
             .send(AppendRequest {
                 events,
                 code_review_outbox_ids: Vec::new(),
-                isolated: false,
+                isolated,
                 reply: AppendReply::Sync(reply),
                 queued_at: std::time::Instant::now(),
             })
@@ -6724,6 +6916,195 @@ impl Store {
         Ok(())
     }
 
+    /// Commit a review-owned workspace registration and its compensating
+    /// cleanup intent in one transaction. `inherited_generation` identifies
+    /// an already-open workspace that is still provisional for another
+    /// concurrent review; a stable open workspace is never owned by review
+    /// cleanup.
+    pub(crate) fn commit_review_workspace_registration(
+        &self,
+        job_id: &str,
+        workspace: &Workspace,
+        inherited_generation: Option<u64>,
+    ) -> Result<ReviewWorkspaceRegistrationResult> {
+        let pending = serialize_lifecycle_events(
+            vec![(
+                Scope::Server,
+                Event::WorkspaceRegistered {
+                    workspace_id: workspace.id.clone(),
+                    path: workspace.path.clone(),
+                },
+            )],
+            StoreMutation::RegisterReviewWorkspace {
+                job_id: job_id.to_owned(),
+                workspace: Box::new(workspace.clone()),
+                inherited_generation,
+            },
+        )?;
+        let mutated = !self.append_pending_events_isolated(pending)?.is_empty();
+        let cleanup_generation = self
+            .review_workspace_cleanup_intent(job_id)?
+            .map(|intent| intent.generation);
+        Ok(ReviewWorkspaceRegistrationResult {
+            mutated,
+            cleanup_generation,
+        })
+    }
+
+    /// Invalidate every provisional review registration for a workspace.
+    /// This is called while the engine's per-path registration lock is held
+    /// whenever a user/session adopts the workspace.
+    pub(crate) fn stabilize_workspace_registration(&self, workspace_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let tx = write_transaction(&conn)?;
+        let has_intents = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM code_review_workspace_cleanup_intents
+             WHERE workspace_id = ?1)",
+            params![workspace_id],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if has_intents {
+            tx.execute(
+                "UPDATE workspaces
+                 SET review_registration_generation = review_registration_generation + 1
+                 WHERE id = ?1",
+                params![workspace_id],
+            )?;
+            tx.execute(
+                "DELETE FROM code_review_workspace_cleanup_intents WHERE workspace_id = ?1",
+                params![workspace_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn review_workspace_cleanup_intent(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<ReviewWorkspaceCleanupIntent>> {
+        self.conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT job_id, workspace_id, generation, attempts
+                 FROM code_review_workspace_cleanup_intents WHERE job_id = ?1",
+                params![job_id],
+                |row| {
+                    let generation = row.get::<_, i64>(2)?;
+                    let attempts = row.get::<_, i64>(3)?;
+                    Ok(ReviewWorkspaceCleanupIntent {
+                        job_id: row.get(0)?,
+                        workspace_id: row.get(1)?,
+                        generation: generation.max(0) as u64,
+                        attempts: attempts.max(0) as u32,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn pending_review_workspace_cleanups(
+        &self,
+    ) -> Result<Vec<ReviewWorkspaceCleanupIntent>> {
+        let conn = self.conn.lock().unwrap();
+        let mut statement = conn.prepare(
+            "SELECT intents.job_id, intents.workspace_id, intents.generation, intents.attempts
+             FROM code_review_workspace_cleanup_intents AS intents
+             JOIN code_review_jobs AS jobs ON jobs.id = intents.job_id
+             WHERE jobs.status IN ('succeeded', 'failed', 'cancelled', 'stale')
+               AND (intents.next_attempt_at IS NULL OR intents.next_attempt_at <= ?1)
+             ORDER BY COALESCE(intents.next_attempt_at, intents.created_at), intents.job_id",
+        )?;
+        let rows = statement.query_map([chrono::Utc::now().to_rfc3339()], |row| {
+            let generation = row.get::<_, i64>(2)?;
+            let attempts = row.get::<_, i64>(3)?;
+            Ok(ReviewWorkspaceCleanupIntent {
+                job_id: row.get(0)?,
+                workspace_id: row.get(1)?,
+                generation: generation.max(0) as u64,
+                attempts: attempts.max(0) as u32,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Return whether this intent still owns the last provisional lease for
+    /// its exact workspace generation. The caller holds the per-path lock
+    /// while acting on this answer.
+    pub(crate) fn review_workspace_cleanup_should_close(
+        &self,
+        intent: &ReviewWorkspaceCleanupIntent,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let current_generation: Option<i64> = conn
+            .query_row(
+                "SELECT review_registration_generation FROM workspaces WHERE id = ?1",
+                params![intent.workspace_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if current_generation != Some(i64::try_from(intent.generation)?) {
+            return Ok(false);
+        }
+        let other = conn.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM code_review_workspace_cleanup_intents
+               WHERE workspace_id = ?1 AND generation = ?2 AND job_id != ?3
+             )",
+            params![
+                intent.workspace_id,
+                i64::try_from(intent.generation)?,
+                intent.job_id
+            ],
+            |row| row.get::<_, bool>(0),
+        )?;
+        Ok(!other)
+    }
+
+    pub(crate) fn complete_review_workspace_cleanup(
+        &self,
+        intent: &ReviewWorkspaceCleanupIntent,
+    ) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "DELETE FROM code_review_workspace_cleanup_intents
+             WHERE job_id = ?1 AND workspace_id = ?2 AND generation = ?3",
+            params![
+                intent.job_id,
+                intent.workspace_id,
+                i64::try_from(intent.generation)?
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn defer_review_workspace_cleanup(
+        &self,
+        intent: &ReviewWorkspaceCleanupIntent,
+    ) -> Result<()> {
+        let attempt = intent.attempts.saturating_add(1);
+        #[cfg(not(test))]
+        let delay_seconds = 1_i64 << attempt.min(8);
+        #[cfg(not(test))]
+        let next_attempt = chrono::Utc::now() + chrono::Duration::seconds(delay_seconds);
+        #[cfg(test)]
+        let next_attempt = chrono::Utc::now() + chrono::Duration::milliseconds(1);
+        self.conn.lock().unwrap().execute(
+            "UPDATE code_review_workspace_cleanup_intents
+             SET attempts = ?4, next_attempt_at = ?5
+             WHERE job_id = ?1 AND workspace_id = ?2 AND generation = ?3",
+            params![
+                intent.job_id,
+                intent.workspace_id,
+                i64::try_from(intent.generation)?,
+                i64::from(attempt),
+                next_attempt.to_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn set_workspace_closed(&self, id: &str, closed: bool) -> Result<bool> {
         let changed = self.conn.lock().unwrap().execute(
             "UPDATE workspaces SET closed = ?2 WHERE id = ?1 AND closed != ?2",
@@ -6812,6 +7193,7 @@ impl Store {
         session: &Session,
         initial_checkpoint: &CheckpointRow,
         idempotency: Option<(&str, &str)>,
+        review_job_id: Option<&str>,
         events: Vec<(Scope, Event)>,
     ) -> Result<Vec<EventEnvelope>> {
         self.append_pending_events(serialize_lifecycle_events(
@@ -6821,6 +7203,7 @@ impl Store {
                 initial_checkpoint: Box::new(initial_checkpoint.clone()),
                 idempotency_key: idempotency.map(|(key, _)| key.to_owned()),
                 request_fingerprint: idempotency.map(|(_, fingerprint)| fingerprint.to_owned()),
+                review_job_id: review_job_id.map(str::to_owned),
             },
         )?)
     }
@@ -6854,6 +7237,35 @@ impl Store {
         )
         .optional()
         .map_err(Into::into)
+    }
+
+    /// Associate a legacy idempotent review session with its running job.
+    /// The guarded update revalidates the durable request fingerprint and
+    /// rejects conflicting ownership in the same SQLite statement.
+    pub(crate) fn bind_review_job_to_idempotent_session(
+        &self,
+        job_id: &str,
+        key: &str,
+        request_fingerprint: &str,
+        session_id: &str,
+    ) -> Result<bool> {
+        let updated = self.conn.lock().unwrap().execute(
+            "UPDATE code_review_jobs
+             SET session_id = ?4,
+                 thread_id = CASE WHEN session_id IS NULL THEN NULL ELSE thread_id END
+             WHERE id = ?1 AND status = 'running'
+               AND (session_id IS NULL OR session_id = ?4)
+               AND EXISTS (
+                 SELECT 1
+                 FROM session_create_requests
+                 JOIN sessions ON sessions.id = session_create_requests.session_id
+                 WHERE session_create_requests.idempotency_key = ?2
+                   AND session_create_requests.request_fingerprint = ?3
+                   AND sessions.id = ?4
+               )",
+            params![job_id, key, request_fingerprint, session_id],
+        )?;
+        Ok(updated == 1)
     }
 
     pub fn list_sessions(&self, workspace_id: Option<&str>) -> Result<Vec<Session>> {
@@ -9452,6 +9864,15 @@ impl Store {
             params![id, session_id, thread_id],
         )?;
         Ok(updated > 0)
+    }
+
+    pub(crate) fn clear_code_review_job_session(&self, id: &str, session_id: &str) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE code_review_jobs SET session_id = NULL, thread_id = NULL
+             WHERE id = ?1 AND session_id = ?2",
+            params![id, session_id],
+        )?;
+        Ok(())
     }
 
     pub fn set_code_review_job_review_base(
@@ -16889,6 +17310,11 @@ mod tests {
     #[test]
     fn lifecycle_mutation_rolls_back_when_its_event_transaction_fails() {
         let store = Store::open_in_memory().unwrap();
+        let review_job = store
+            .enqueue_code_review_job(&backoff_test_job_request())
+            .unwrap()
+            .unwrap();
+        store.claim_code_review_job().unwrap().unwrap();
         store
             .insert_workspace(&Workspace {
                 id: "ws_atomic".into(),
@@ -16921,7 +17347,8 @@ mod tests {
                 .insert_session_with_lifecycle(
                     &session,
                     &invalid_checkpoint,
-                    None,
+                    Some(("review-session-key", "review-session-fingerprint")),
+                    Some(&review_job.id),
                     vec![(
                         Scope::Server,
                         Event::SessionCreated {
@@ -16933,6 +17360,15 @@ mod tests {
                 .is_err()
         );
         assert!(store.session(&session.id).unwrap().is_none());
+        assert!(
+            store
+                .code_review_job(&review_job.id)
+                .unwrap()
+                .unwrap()
+                .job
+                .session_id
+                .is_none()
+        );
         assert!(store.events_after(&Scope::Server, 0).unwrap().is_empty());
         assert!(
             store
@@ -16941,6 +17377,159 @@ mod tests {
                 .summaries
                 .is_empty()
         );
+
+        let checkpoint = CheckpointRow {
+            session_id: session.id.clone(),
+            ..invalid_checkpoint
+        };
+        store
+            .insert_session_with_lifecycle(
+                &session,
+                &checkpoint,
+                Some(("review-session-key", "review-session-fingerprint")),
+                Some(&review_job.id),
+                vec![(
+                    Scope::Server,
+                    Event::SessionCreated {
+                        session_id: session.id.clone(),
+                        workspace_id: session.workspace_id.clone(),
+                    },
+                )],
+            )
+            .unwrap();
+        assert!(store.session(&session.id).unwrap().is_some());
+        assert_eq!(
+            store
+                .code_review_job(&review_job.id)
+                .unwrap()
+                .unwrap()
+                .job
+                .session_id
+                .as_deref(),
+            Some(session.id.as_str())
+        );
+        store
+            .clear_code_review_job_session(&review_job.id, &session.id)
+            .unwrap();
+        assert!(
+            !store
+                .bind_review_job_to_idempotent_session(
+                    &review_job.id,
+                    "review-session-key",
+                    "wrong-fingerprint",
+                    &session.id,
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .code_review_job(&review_job.id)
+                .unwrap()
+                .unwrap()
+                .job
+                .session_id
+                .is_none()
+        );
+        assert!(
+            store
+                .bind_review_job_to_idempotent_session(
+                    &review_job.id,
+                    "review-session-key",
+                    "review-session-fingerprint",
+                    &session.id,
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .code_review_job(&review_job.id)
+                .unwrap()
+                .unwrap()
+                .job
+                .session_id
+                .as_deref(),
+            Some(session.id.as_str())
+        );
+        assert!(
+            store
+                .set_code_review_job_session(&review_job.id, &session.id, "th_review_atomic")
+                .unwrap()
+        );
+        assert!(
+            store
+                .bind_review_job_to_idempotent_session(
+                    &review_job.id,
+                    "review-session-key",
+                    "review-session-fingerprint",
+                    &session.id,
+                )
+                .unwrap()
+        );
+        let rebound = store.code_review_job(&review_job.id).unwrap().unwrap();
+        assert_eq!(rebound.job.session_id.as_deref(), Some(session.id.as_str()));
+        assert_eq!(rebound.job.thread_id.as_deref(), Some("th_review_atomic"));
+        assert_eq!(store.list_sessions(None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn review_workspace_registration_rolls_back_with_its_lifecycle_event() {
+        let store = Store::open_in_memory().unwrap();
+        let review_job = store
+            .enqueue_code_review_job(&backoff_test_job_request())
+            .unwrap()
+            .unwrap();
+        store.claim_code_review_job().unwrap().unwrap();
+        let workspace = Workspace {
+            id: "ws_review_atomic".into(),
+            name: "atomic review".into(),
+            path: "/tmp/review-atomic".into(),
+        };
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_review_workspace_registration_event
+                 BEFORE INSERT ON events
+                 WHEN json_extract(NEW.payload, '$.type') = 'workspace.registered'
+                 BEGIN
+                   SELECT RAISE(ABORT, 'injected workspace event failure');
+                 END;",
+            )
+            .unwrap();
+
+        assert!(
+            store
+                .commit_review_workspace_registration(&review_job.id, &workspace, None)
+                .is_err()
+        );
+        assert!(store.workspace_by_path(&workspace.path).unwrap().is_none());
+        assert!(
+            store
+                .review_workspace_cleanup_intent(&review_job.id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(store.events_after(&Scope::Server, 0).unwrap().is_empty());
+
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_review_workspace_registration_event;")
+            .unwrap();
+        let registration = store
+            .commit_review_workspace_registration(&review_job.id, &workspace, None)
+            .unwrap();
+        assert!(registration.mutated);
+        assert_eq!(registration.cleanup_generation, Some(1));
+        let events = store.events_after(&Scope::Server, 0).unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0].event,
+            Event::WorkspaceRegistered { workspace_id, path }
+                if workspace_id == &workspace.id && path == &workspace.path
+        ));
     }
 
     #[test]

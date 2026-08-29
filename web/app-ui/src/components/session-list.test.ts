@@ -1,11 +1,28 @@
 import { readFileSync } from "node:fs";
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
+import type { AppStore, SessionListItem } from "../state/app-store.js";
 import {
   sessionIndicatorPresentation,
   type SessionIndicatorFields,
 } from "../state/session-indicator-model.js";
+import { enrichWorkspaceSessions } from "./session-list.js";
+
+const session = (id: string, workspaceId: string): SessionListItem => ({
+  id,
+  workspaceId,
+  title: id,
+  branch: "main",
+  archived: false,
+  active: false,
+  attention: "none",
+  outcome: "idle",
+  latestThreadId: undefined,
+  updatedAt: "2026-08-22T00:00:00Z",
+  state: "idle",
+  unread: false,
+});
 
 describe("session list component contract", () => {
   const read = (path: string): string =>
@@ -14,15 +31,36 @@ describe("session list component contract", () => {
   const shell = read("../app/trouve-app.ts");
   const styles = read("../styles/app.css");
 
+  it("filters by workspace before deriving metadata and pull-request state", () => {
+    const sessionMetadata = vi.fn(() => undefined);
+    const sessionPullRequests = vi.fn(() => []);
+    const store = {
+      sessionMetadata,
+      sessionPullRequests,
+    } as unknown as Pick<AppStore, "sessionMetadata" | "sessionPullRequests">;
+
+    const enriched = enrichWorkspaceSessions(
+      store,
+      [session("se_first", "ws_first"), session("se_second", "ws_second")],
+      "ws_first",
+    );
+
+    expect(enriched.map(({ id }) => id)).toEqual(["se_first"]);
+    expect(sessionMetadata).toHaveBeenCalledOnce();
+    expect(sessionMetadata).toHaveBeenCalledWith("se_first");
+    expect(sessionPullRequests).toHaveBeenCalledOnce();
+    expect(sessionPullRequests).toHaveBeenCalledWith("se_first");
+  });
+
   it("renders archived sessions as a separate accessible disclosure", () => {
-    expect(component).toContain("groupWorkspaceSessions(sessions");
+    expect(component).toContain("organizeWorkspaceSessions(organizedSessions");
     expect(component).toContain("repeat(");
     expect(component).toContain("(session) => session.id");
-    expect(component).toContain('aria-label="Active sessions"');
+    expect(component).toContain('? "Active sessions" : `${section.label} sessions`');
     expect(component).toContain('class="archived-session-toggle"');
-    expect(component).toContain("aria-expanded=${groups.archivedExpanded}");
+    expect(component).toContain("aria-expanded=${archivedExpanded}");
     expect(component).toContain("aria-controls=${this.#archivedListId}");
-    expect(component).toContain("?hidden=${!groups.archivedExpanded}");
+    expect(component).toContain("?hidden=${!archivedExpanded}");
     expect(component).toContain("Archived (${groups.archived.length})");
     expect(styles).toContain(".archived-session-list .session-copy strong");
     expect(styles).toContain("var(--trouve-text-mid)");
@@ -35,15 +73,17 @@ describe("session list component contract", () => {
     expect(component).toContain("Status: ${sessionStatusText(session)}");
   });
 
-  it("keeps navigation sessions to one line without rendering branch names", () => {
+  it("keeps compact rows while optionally rendering branch names", () => {
     expect(component).toContain('<span class="session-copy">');
     expect(component).toContain("<strong>${session.title}</strong>");
     expect(component).toContain("sessionAgePresentation(session.updatedAt, now)");
     expect(component).toContain('class="session-age"');
-    expect(component).not.toContain("session.branch");
-    expect(component).not.toContain("<small>");
+    expect(component).toContain("this.showBranches");
+    expect(component).toContain('class="session-branch"');
+    expect(component).toContain("${session.branch}");
     expect(styles).toMatch(/\.session-row-wrap \{[^}]*height:\s*34px/s);
     expect(styles).toMatch(/\.session-row \{[^}]*height:\s*34px/s);
+    expect(styles).toContain(".session-row-wrap.with-branch, .session-row.with-branch { height: 46px; }");
     expect(styles).toMatch(
       /\.session-copy strong \{[^}]*overflow:\s*hidden[^}]*text-overflow:\s*ellipsis[^}]*white-space:\s*nowrap/s,
     );
