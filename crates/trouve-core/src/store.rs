@@ -1072,24 +1072,7 @@ fn backfill_code_review_carried_anchor_targets(conn: &Connection) -> Result<()> 
          DELETE FROM code_review_carried_anchor_targets
          WHERE job_id IN (
            SELECT id FROM code_review_jobs WHERE status IN ('queued', 'running')
-         );
-         INSERT OR IGNORE INTO code_review_carried_anchor_targets (job_id, path, line)
-         SELECT owner.id, verification.path, verification.line
-         FROM code_review_carried_anchor_verifications AS verification
-         JOIN code_review_jobs AS owner ON owner.id = verification.claim_job_id
-         WHERE verification.claim_job_id IS NOT NULL;
-         INSERT OR IGNORE INTO code_review_carried_anchor_targets (job_id, path, line)
-         SELECT owner.id, verification.path, verification.line
-         FROM code_review_carried_anchor_verifications AS verification
-         JOIN code_review_jobs AS owner ON owner.id = verification.presented_job_id
-         WHERE verification.presented_job_id IS NOT NULL;
-         INSERT OR IGNORE INTO code_review_carried_anchor_targets (job_id, path, line)
-         SELECT continuation.id, parent.path, parent.line
-         FROM code_review_jobs AS continuation
-         JOIN code_review_carried_anchor_targets AS parent
-           ON parent.job_id = continuation.retry_of
-         WHERE continuation.status IN ('queued', 'running')
-           AND continuation.trigger = 'carried-anchor-continuation'",
+         )",
     )?;
     transaction.execute(
         "INSERT INTO data_migrations (name, completed_at)
@@ -9483,27 +9466,15 @@ impl Store {
         if inserted == 0 {
             return Ok(None);
         }
-        if new_job.trigger == "carried-anchor-continuation"
-            && let Some(parent_job_id) = new_job.retry_of.as_deref()
-        {
+        if new_job.trigger == "carried-anchor-continuation" {
+            // A continuation receives the coordinator's exact current target
+            // set at claim time. Rebuild from that set instead of inheriting a
+            // possibly legacy or contaminated terminal-parent epoch.
             conn.execute(
-                "INSERT OR IGNORE INTO code_review_carried_anchor_targets (job_id, path, line)
-                 SELECT ?1, path, line
-                 FROM code_review_carried_anchor_targets
-                 WHERE job_id = ?2",
-                params![id, parent_job_id],
-            )?;
-            conn.execute(
-                "UPDATE code_review_carried_anchor_verifications AS verification
-                 SET presented_job_id = ?1
-                 WHERE verification.presented_job_id = ?2
-                   AND EXISTS (
-                     SELECT 1 FROM code_review_carried_anchor_targets AS active
-                     WHERE active.job_id = ?1
-                       AND active.path = verification.path
-                       AND active.line = verification.line
-                   )",
-                params![id, parent_job_id],
+                "UPDATE code_review_jobs
+                 SET carried_anchor_targets_legacy = 1
+                 WHERE id = ?1",
+                params![id],
             )?;
         }
         Ok(Some(
@@ -12686,19 +12657,6 @@ impl Store {
                )",
             [],
         )?;
-        tx.execute(
-            "UPDATE code_review_carried_anchor_verifications
-             SET presented_at = NULL, presented_job_id = NULL
-             WHERE presented_at IS NOT NULL
-               AND (
-                 presented_job_id IS NULL
-                 OR presented_job_id IN (
-                   SELECT id FROM code_review_jobs
-                   WHERE status NOT IN ('queued', 'running')
-                 )
-               )",
-            [],
-        )?;
         let rebuild_targets = register_targets
             || tx
                 .query_row(
@@ -12733,6 +12691,37 @@ impl Store {
                 params![job_id],
             )?;
         }
+        // Transfer cached-page ownership only after the continuation has
+        // rebuilt its exact target epoch. This preserves pagination without
+        // copying unrelated targets from a legacy terminal parent.
+        tx.execute(
+            "UPDATE code_review_carried_anchor_verifications AS verification
+             SET presented_job_id = ?1
+             WHERE verification.presented_job_id = (
+               SELECT retry_of FROM code_review_jobs
+               WHERE id = ?1 AND trigger = 'carried-anchor-continuation'
+             )
+               AND EXISTS (
+                 SELECT 1 FROM code_review_carried_anchor_targets AS active
+                 WHERE active.job_id = ?1
+                   AND active.path = verification.path
+                   AND active.line = verification.line
+               )",
+            params![job_id],
+        )?;
+        tx.execute(
+            "UPDATE code_review_carried_anchor_verifications
+             SET presented_at = NULL, presented_job_id = NULL
+             WHERE presented_at IS NOT NULL
+               AND (
+                 presented_job_id IS NULL
+                 OR presented_job_id IN (
+                   SELECT id FROM code_review_jobs
+                   WHERE status NOT IN ('queued', 'running')
+                 )
+               )",
+            [],
+        )?;
 
         let selected = {
             let mut stmt = tx.prepare(
@@ -21227,7 +21216,7 @@ mod tests {
     }
 
     #[test]
-    fn migrations_recover_owned_targets_without_crossing_active_epochs() {
+    fn migrations_defer_active_target_epochs_to_exact_lazy_rebuilds() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("legacy-target-epochs.sqlite");
         let (ordinary, second) = {
@@ -21285,30 +21274,19 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(
-                target_count, 2,
-                "migration must not form a head-wide cross product"
+                target_count, 0,
+                "migration must not materialize targets from historical ownership"
             );
-            for (job_id, expected_path) in [
-                (ordinary.id.as_str(), "src/ordinary.rs"),
-                (second.id.as_str(), "src/second.rs"),
-            ] {
-                let exact_targets = conn
+            for job_id in [&ordinary.id, &second.id] {
+                let legacy: bool = conn
                     .query_row(
-                        "SELECT COUNT(*) FROM code_review_carried_anchor_targets
-                         WHERE job_id = ?1 AND path = ?2",
-                        params![job_id, expected_path],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .unwrap();
-                let all_targets = conn
-                    .query_row(
-                        "SELECT COUNT(*) FROM code_review_carried_anchor_targets
-                         WHERE job_id = ?1",
+                        "SELECT carried_anchor_targets_legacy != 0
+                         FROM code_review_jobs WHERE id = ?1",
                         [job_id],
-                        |row| row.get::<_, i64>(0),
+                        |row| row.get(0),
                     )
                     .unwrap();
-                assert_eq!((exact_targets, all_targets), (1, 1));
+                assert!(legacy, "active epochs must request an exact lazy rebuild");
             }
         }
 
@@ -21350,6 +21328,108 @@ mod tests {
             !legacy,
             "the exact lazy rebuild must consume its compatibility flag"
         );
+    }
+
+    #[test]
+    fn fresh_store_applies_carried_anchor_target_column_once() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn.lock().unwrap();
+        let column_count = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('code_review_jobs')
+                 WHERE name = 'carried_anchor_targets_legacy'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        let migration_count = conn
+            .query_row(
+                "SELECT COUNT(*) FROM data_migrations WHERE name = ?1",
+                [CARRIED_ANCHOR_TARGET_BACKFILL_MIGRATION],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(column_count, 1);
+        assert_eq!(migration_count, 1);
+    }
+
+    #[test]
+    fn terminal_legacy_parent_continuation_rebuilds_exact_targets() {
+        let store = Store::open_in_memory().unwrap();
+        let parent = enqueue_backoff_test_job(&store);
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            parent.id
+        );
+        {
+            let conn = store.conn.lock().unwrap();
+            for (path, line) in [("src/exact.rs", 9_i64), ("src/foreign.rs", 10_i64)] {
+                conn.execute(
+                    "INSERT INTO code_review_carried_anchor_verifications
+                            (repository, pull_number, head_sha, path, line)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        parent.repository,
+                        parent.pull_number as i64,
+                        parent.head_sha,
+                        path,
+                        line
+                    ],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO code_review_carried_anchor_targets (job_id, path, line)
+                     VALUES (?1, ?2, ?3)",
+                    params![parent.id, path, line],
+                )
+                .unwrap();
+            }
+        }
+        store
+            .finish_code_review_job(&parent.id, "failed", "", "legacy terminal parent")
+            .unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "DELETE FROM data_migrations WHERE name = ?1",
+                [CARRIED_ANCHOR_TARGET_BACKFILL_MIGRATION],
+            )
+            .unwrap();
+            backfill_code_review_carried_anchor_targets(&conn).unwrap();
+        }
+
+        let mut request =
+            retry_request_for(&store, &parent.id, "terminal-legacy-target-continuation");
+        request.trigger = "carried-anchor-continuation".into();
+        let continuation = store.enqueue_code_review_job(&request).unwrap().unwrap();
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            continuation.id
+        );
+        let exact_targets = vec![("src/exact.rs".to_owned(), 9)];
+        let page = store
+            .claim_code_review_carried_anchor_page(
+                &continuation.id,
+                &continuation.repository,
+                continuation.pull_number,
+                &continuation.head_sha,
+                &exact_targets,
+                false,
+                10,
+            )
+            .unwrap();
+        assert_eq!(page.targets, exact_targets);
+        assert!(page.cached.is_empty());
+        let conn = store.conn.lock().unwrap();
+        let child_targets = conn
+            .query_row(
+                "SELECT COUNT(*) FROM code_review_carried_anchor_targets
+                 WHERE job_id = ?1",
+                [&continuation.id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(child_targets, 1);
     }
 
     #[test]
