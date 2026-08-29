@@ -14372,6 +14372,7 @@ impl Store {
                                AND verification.head_sha = ?3
                                AND (
                                  (verification.verified_at IS NULL
+                                  AND verification.unreadable_at IS NULL
                                   AND verification.claim_job_id IS NULL)
                                  OR (verification.verified_at IS NOT NULL
                                      AND verification.presented_at IS NULL)
@@ -15503,6 +15504,7 @@ impl Store {
                        AND verification.head_sha = ?3
                        AND (
                          (verification.verified_at IS NULL
+                          AND verification.unreadable_at IS NULL
                           AND verification.claim_job_id IS NULL)
                          OR (verification.verified_at IS NOT NULL
                              AND verification.presented_at IS NULL)
@@ -23210,6 +23212,95 @@ mod tests {
             state,
             (3, true, "permanent object read failure".to_owned(),)
         );
+    }
+
+    #[test]
+    fn unreadable_anchors_do_not_schedule_completion_continuations() {
+        for publication_path in [false, true] {
+            let store = Store::open_in_memory().unwrap();
+            let job = enqueue_backoff_test_job(&store);
+            assert_eq!(
+                store.claim_code_review_job().unwrap().unwrap().job.id,
+                job.id
+            );
+            let targets = vec![("src/unreadable.rs".to_owned(), 17)];
+            assert_eq!(
+                store
+                    .claim_code_review_carried_anchor_page(
+                        &job.id,
+                        &job.repository,
+                        job.pull_number,
+                        &job.head_sha,
+                        &targets,
+                        true,
+                        32,
+                    )
+                    .unwrap()
+                    .targets,
+                targets
+            );
+            assert_eq!(
+                store
+                    .fail_code_review_carried_anchor_read(
+                        &job.id,
+                        &job.repository,
+                        job.pull_number,
+                        &job.head_sha,
+                        "src/unreadable.rs",
+                        17,
+                        "permanent failure",
+                        1,
+                    )
+                    .unwrap(),
+                Some(false)
+            );
+            let mut request = retry_request_for(
+                &store,
+                &job.id,
+                if publication_path {
+                    "unreadable-publication-continuation"
+                } else {
+                    "unreadable-finish-continuation"
+                },
+            );
+            request.trigger = "carried-anchor-continuation".into();
+
+            let continuation = if publication_path {
+                store
+                    .save_code_review_result(&job.id, "result", "", 0, &[], &[])
+                    .unwrap();
+                assert!(store.claim_code_review_publication(&job.id).unwrap());
+                store
+                    .record_code_review_publication_with_continuation(
+                        &job.id,
+                        &job.repository,
+                        job.pull_number,
+                        &job.base_ref,
+                        &job.head_sha,
+                        "https://example/review",
+                        false,
+                        &[],
+                        Some(&request),
+                    )
+                    .unwrap()
+                    .1
+            } else {
+                store
+                    .finish_code_review_job_with_continuation(
+                        &job.id,
+                        "failed",
+                        "",
+                        "failed",
+                        Some(&request),
+                    )
+                    .unwrap()
+                    .1
+            };
+            assert!(
+                continuation.is_none(),
+                "terminal unreadable evidence must not schedule a no-work successor"
+            );
+        }
     }
     #[test]
     fn carried_finding_anchor_positions_advance_across_heads() {
