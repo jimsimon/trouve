@@ -78,13 +78,6 @@ const REVIEW_THREAD_PROGRESS_MAX_ENTRIES: usize = 128;
 const REVIEW_PUBLICATION_LOOKUP_MAX_PAGES: u64 = 100;
 const REVIEW_PUBLICATION_LOOKUP_BUDGET: Duration = Duration::from_secs(60);
 const REVIEW_PUBLICATION_LOOKUP_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-/// How many exhaustive marker scans must come back definitively empty before
-/// a dispatched-but-unaccepted publication is treated as never created.
-/// Review listings can lag a fresh POST, so early absences stay retryable;
-/// past this bound absence is conclusive — GitHub rejected the dispatch (the
-/// 500 path) — and retrying the lookup forever burns API budget on a result
-/// that cannot change.
-const REVIEW_PUBLICATION_ABSENCE_CONFIRMATIONS: u32 = 3;
 /// Obsolete blocking verdict cleanup is resumable and deliberately small so
 /// it cannot monopolize the repository poll behind a large review history.
 const REVIEW_BLOCKING_CLEANUP_MAX_PAGES_PER_PASS: u64 = 3;
@@ -8432,27 +8425,22 @@ impl Engine {
         }
     }
 
-    /// A dispatched publication whose marker is definitively absent from an
-    /// exhaustive review listing. The dispatched flag is deliberately sticky
-    /// against blind re-posting, but conclusive absence is the one state
-    /// where that caution inverts: the review was never created, so nothing
-    /// can be double-published, while retrying the lookup forever burns a
-    /// full review-listing scan per poll on a result that cannot change —
-    /// the failure mode that kept two superseded jobs spinning for a day
-    /// after a single GitHub 500.
+    /// Handles a dispatched publication whose marker is absent from an
+    /// exhaustive review listing. The dispatch remains sticky because a POST
+    /// can create the review before its response is lost or replaced by a 5xx;
+    /// bounded listing absence cannot authoritatively prove non-creation.
     ///
     /// A superseded round abandons its publication outright — even a
     /// late-appearing review would no longer matter. A still-current round
-    /// waits out a short confirmation window (listings can lag), then
-    /// releases its dispatch so publication can genuinely retry.
+    /// keeps reconciling by its stable marker and never issues a second POST.
     async fn resolve_dispatched_publication_absence(
         &self,
         job: &trouve_protocol::CodeReviewJob,
     ) -> Result<()> {
-        match self.store.resolve_code_review_publication_absence(
-            &job.id,
-            REVIEW_PUBLICATION_ABSENCE_CONFIRMATIONS,
-        )? {
+        match self
+            .store
+            .resolve_code_review_publication_absence(&job.id)?
+        {
             crate::store::CodeReviewPublicationAbsenceOutcome::Pending
             | crate::store::CodeReviewPublicationAbsenceOutcome::AcceptedPending
             | crate::store::CodeReviewPublicationAbsenceOutcome::NewerPublicationPending => {
@@ -8462,15 +8450,8 @@ impl Engine {
                 job_id = %job.id,
                 repository = %job.repository,
                 pull_number = job.pull_number,
-                "dispatched review publication was never accepted by GitHub and the round is \
-                 superseded; abandoning its publication"
-            ),
-            crate::store::CodeReviewPublicationAbsenceOutcome::Released => tracing::warn!(
-                job_id = %job.id,
-                repository = %job.repository,
-                pull_number = job.pull_number,
-                "dispatched review publication was never accepted by GitHub; releasing the \
-                 dispatch so publication can retry"
+                "review publication acceptance was not observed locally and the round is \
+                 superseded; abandoning its publication without retrying the POST"
             ),
         }
         self.emit_code_review_job_updated(&job.id)?;
@@ -8481,9 +8462,9 @@ impl Engine {
     /// Locates a dispatched review by its stable marker. `Ok(None)` is a
     /// definitive answer — the listing was scanned to its final page and the
     /// marker is not there — while errors (timeouts, pagination overflow)
-    /// prove nothing. Callers must treat the two differently: absence right
-    /// after an accepted POST is listing lag, but repeated definitive
-    /// absence after a failed dispatch means the review was never created.
+    /// prove nothing. Callers must treat the two differently, while also
+    /// remembering that even repeated definitive absence cannot disprove a
+    /// remotely accepted POST whose response was lost.
     async fn find_published_review(
         &self,
         api: &GithubApi,
@@ -8930,17 +8911,9 @@ impl Engine {
         }
 
         let published = match self.find_published_review(api, job).await {
-            Ok(Some(published)) => {
-                self.store
-                    .reset_code_review_publication_marker_absences(&job.id)?;
-                published
-            }
+            Ok(Some(published)) => published,
             Ok(None) => return self.resolve_dispatched_publication_absence(job).await,
-            Err(error) => {
-                self.store
-                    .reset_code_review_publication_marker_absences(&job.id)?;
-                return Err(error);
-            }
+            Err(error) => return Err(error),
         };
         let publication_findings = findings
             .iter()
@@ -27771,7 +27744,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatched_publication_absence_resolves_terminally() {
+    async fn dispatched_publication_absence_stays_sticky_until_superseded() {
         let store = crate::store::Store::open_in_memory().unwrap();
         let with_head = |store: &crate::store::Store, key: &str, head: &str| {
             let mut request = test_review_job_request(key);
@@ -27836,8 +27809,9 @@ mod tests {
             "an abandoned publication must leave the repair queue"
         );
 
-        // Still-current: absence stays retryable through the confirmation
-        // window, then releases the dispatch for a genuine retry.
+        // Still-current: the failed POST may have created a review before its
+        // response was lost. Repeated exhaustive marker misses therefore stay
+        // retryable without ever releasing the dispatch for a duplicate POST.
         let current = with_head(
             &engine.store,
             "acme/widgets#42:dispatch-absent-current",
@@ -27869,21 +27843,20 @@ mod tests {
             .store
             .finish_code_review_job(&current.id, "failed", "GitHub API 500", "")
             .unwrap();
-        // Unrelated projection failures do not shorten the dedicated
-        // marker-absence confirmation window.
+        // Unrelated projection failures do not change the sticky outcome.
         for _ in 0..5 {
             engine
                 .store
                 .record_code_review_projection_failure(&current.id, "other projection", true)
                 .unwrap();
         }
-        for absence in 1..REVIEW_PUBLICATION_ABSENCE_CONFIRMATIONS {
+        for absence in 1..=5 {
             assert!(
                 engine
                     .resolve_dispatched_publication_absence(&current)
                     .await
                     .is_err(),
-                "absence {absence} must remain retryable"
+                "absence {absence} must remain retryable without re-publication"
             );
             assert!(
                 engine
@@ -27894,16 +27867,12 @@ mod tests {
                     .publication_dispatched
             );
         }
-        engine
-            .resolve_dispatched_publication_absence(&current)
-            .await
-            .unwrap();
         let record = engine.store.code_review_job(&current.id).unwrap().unwrap();
-        assert!(!record.publication_dispatched);
-        assert!(!record.publication_claimed);
+        assert!(record.publication_dispatched);
+        assert!(record.publication_claimed);
 
         // An accepted POST can only be experiencing listing lag. It remains
-        // queued for reconciliation even past the absence threshold.
+        // queued for reconciliation however long listing visibility lags.
         let accepted = with_head(
             &engine.store,
             "acme/widgets#42:dispatch-accepted",
@@ -27937,7 +27906,7 @@ mod tests {
                 .mark_code_review_publication_accepted(&accepted.id)
                 .unwrap()
         );
-        for _ in 0..=REVIEW_PUBLICATION_ABSENCE_CONFIRMATIONS {
+        for _ in 0..=5 {
             assert!(
                 engine
                     .resolve_dispatched_publication_absence(&accepted)

@@ -356,7 +356,6 @@ CREATE TABLE IF NOT EXISTS code_review_jobs (
   check_run_url TEXT NOT NULL DEFAULT '',
   check_sync_error TEXT NOT NULL DEFAULT '',
   projection_retry_count INTEGER NOT NULL DEFAULT 0,
-  publication_marker_absence_count INTEGER NOT NULL DEFAULT 0,
   projection_retry_at TEXT,
   projection_retryable INTEGER NOT NULL DEFAULT 1,
   cancel_requested INTEGER NOT NULL DEFAULT 0,
@@ -889,7 +888,6 @@ const MIGRATIONS: &[&str] = &[
        reason TEXT NOT NULL,
        created_at TEXT NOT NULL
      )",
-    "ALTER TABLE code_review_jobs ADD COLUMN publication_marker_absence_count INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE code_review_findings ADD COLUMN collapse_terminal_attempts INTEGER NOT NULL DEFAULT 0",
 ];
 
@@ -3506,17 +3504,15 @@ pub struct CodeReviewJobRecord {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodeReviewPublicationAbsenceOutcome {
-    /// The marker has not been absent often enough to release the dispatch.
+    /// The remote outcome remains unknown, so the dispatch stays sticky.
     Pending,
     /// GitHub accepted the POST, so absence can only be listing lag.
     AcceptedPending,
     /// A newer round is publishing but has not reached an accepted outcome,
     /// so the older dispatch must stay fenced without becoming terminal.
     NewerPublicationPending,
-    /// A newer published round made this publication terminally obsolete.
+    /// A newer accepted or published round made this publication obsolete.
     Superseded,
-    /// The unaccepted dispatch was released for a safe retry.
-    Released,
 }
 
 #[derive(Debug, Clone)]
@@ -14078,28 +14074,21 @@ impl Store {
         )? > 0)
     }
 
-    /// Records one definitive marker absence and atomically decides whether
-    /// the dispatch remains pending, is superseded, or can be released.
+    /// Atomically decides whether a marker-less dispatch remains pending or
+    /// is superseded by a newer accepted publication.
     ///
-    /// Supersession and release deliberately share this transaction: a newer
-    /// round cannot publish between the decision and the state transition.
+    /// An unaccepted local POST has an ambiguous remote outcome: GitHub may
+    /// have created the review before the client observed a transport or 5xx
+    /// failure. No finite number of empty listings can prove non-creation, so
+    /// a current dispatch is deliberately never released for another POST.
     pub fn resolve_code_review_publication_absence(
         &self,
         id: &str,
-        confirmation_threshold: u32,
     ) -> Result<CodeReviewPublicationAbsenceOutcome> {
         let conn = self.conn.lock().unwrap();
         let tx = write_transaction(&conn)?;
-        let (accepted, dispatched, absence_count, superseded, newer_publication_pending): (
-            bool,
-            bool,
-            i64,
-            bool,
-            bool,
-        ) = tx.query_row(
+        let (accepted, superseded, newer_publication_pending): (bool, bool, bool) = tx.query_row(
             "SELECT current_job.publication_accepted,
-                        current_job.publication_dispatched,
-                        current_job.publication_marker_absence_count,
                         EXISTS (
                           SELECT 1 FROM code_review_jobs AS newer
                           WHERE newer.repository = current_job.repository
@@ -14135,80 +14124,29 @@ impl Store {
                  FROM code_review_jobs AS current_job
                  WHERE current_job.id = ?1",
             params![id],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
-            },
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
-        let absence_count = u32::try_from(absence_count)
-            .unwrap_or(u32::MAX)
-            .saturating_add(1);
         let outcome = if accepted {
-            tx.execute(
-                "UPDATE code_review_jobs
-                 SET publication_marker_absence_count = ?2
-                 WHERE id = ?1",
-                params![id, i64::from(absence_count)],
-            )?;
             CodeReviewPublicationAbsenceOutcome::AcceptedPending
         } else if superseded {
             tx.execute(
                 "UPDATE code_review_jobs
-                 SET publication_marker_absence_count = ?2,
-                     check_sync_error =
-                       'review publication was never accepted by GitHub and a newer round has taken over this pull request; publication abandoned',
+                 SET check_sync_error =
+                       'review publication acceptance was not observed locally and a newer round has taken over this pull request; publication abandoned without retrying the POST',
                      projection_retry_count = projection_retry_count + 1,
                      projection_retry_at = NULL,
                      projection_retryable = 0
                  WHERE id = ?1",
-                params![id, i64::from(absence_count)],
+                params![id],
             )?;
             CodeReviewPublicationAbsenceOutcome::Superseded
         } else if newer_publication_pending {
-            tx.execute(
-                "UPDATE code_review_jobs
-                 SET publication_marker_absence_count = ?2
-                 WHERE id = ?1",
-                params![id, i64::from(absence_count)],
-            )?;
             CodeReviewPublicationAbsenceOutcome::NewerPublicationPending
-        } else if absence_count < confirmation_threshold || !dispatched {
-            tx.execute(
-                "UPDATE code_review_jobs
-                 SET publication_marker_absence_count = ?2
-                 WHERE id = ?1",
-                params![id, i64::from(absence_count)],
-            )?;
-            CodeReviewPublicationAbsenceOutcome::Pending
         } else {
-            tx.execute(
-                "UPDATE code_review_jobs
-                 SET publication_claimed = 0,
-                     publication_dispatched = 0,
-                     publication_order = 0,
-                     publication_marker_absence_count = 0
-                 WHERE id = ?1 AND publication_accepted = 0
-                   AND publication_dispatched != 0",
-                params![id],
-            )?;
-            CodeReviewPublicationAbsenceOutcome::Released
+            CodeReviewPublicationAbsenceOutcome::Pending
         };
         tx.commit()?;
         Ok(outcome)
-    }
-
-    pub fn reset_code_review_publication_marker_absences(&self, id: &str) -> Result<bool> {
-        Ok(self.conn.lock().unwrap().execute(
-            "UPDATE code_review_jobs
-             SET publication_marker_absence_count = 0
-             WHERE id = ?1 AND publication_marker_absence_count != 0",
-            params![id],
-        )? > 0)
     }
 
     pub fn release_code_review_publication_claim(&self, id: &str) -> Result<bool> {
@@ -24127,23 +24065,24 @@ mod tests {
         store
             .finish_code_review_job(&first.id, "failed", "GitHub API 500", "")
             .unwrap();
-        // No newer round has published yet: one required confirmation
-        // releases the unaccepted dispatch for a genuine retry.
+        // No newer round has published yet. Even repeated definitive marker
+        // absence cannot prove that GitHub did not create the review before
+        // the client lost the POST response, so the dispatch stays sticky.
         assert_eq!(
             store
-                .resolve_code_review_publication_absence(&first.id, 1)
+                .resolve_code_review_publication_absence(&first.id)
                 .unwrap(),
-            CodeReviewPublicationAbsenceOutcome::Released
+            CodeReviewPublicationAbsenceOutcome::Pending
         );
         let record = store.code_review_job(&first.id).unwrap().unwrap();
-        assert!(!record.publication_claimed);
-        assert!(!record.publication_dispatched);
+        assert!(record.publication_claimed);
+        assert!(record.publication_dispatched);
         assert_eq!(
             store
-                .resolve_code_review_publication_absence(&first.id, 1)
+                .resolve_code_review_publication_absence(&first.id)
                 .unwrap(),
             CodeReviewPublicationAbsenceOutcome::Pending,
-            "a released dispatch has nothing left to release"
+            "an ambiguous dispatch must never become eligible for a second POST"
         );
 
         // A second dispatched round is overtaken while it is awaiting marker
@@ -24185,10 +24124,10 @@ mod tests {
         assert!(store.claim_code_review_publication(&newer.id).unwrap());
         assert_eq!(
             store
-                .resolve_code_review_publication_absence(&superseded.id, 1)
+                .resolve_code_review_publication_absence(&superseded.id)
                 .unwrap(),
             CodeReviewPublicationAbsenceOutcome::NewerPublicationPending,
-            "a claimed newer publication fences release"
+            "a claimed newer publication fences the older dispatch"
         );
         assert!(
             store
@@ -24197,10 +24136,10 @@ mod tests {
         );
         assert_eq!(
             store
-                .resolve_code_review_publication_absence(&superseded.id, 1)
+                .resolve_code_review_publication_absence(&superseded.id)
                 .unwrap(),
             CodeReviewPublicationAbsenceOutcome::NewerPublicationPending,
-            "a dispatched newer publication fences release"
+            "a dispatched newer publication fences the older dispatch"
         );
         assert!(
             store
@@ -24209,7 +24148,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .resolve_code_review_publication_absence(&superseded.id, 1)
+                .resolve_code_review_publication_absence(&superseded.id)
                 .unwrap(),
             CodeReviewPublicationAbsenceOutcome::Superseded,
             "an accepted newer publication terminally supersedes the old dispatch"
@@ -24221,7 +24160,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .resolve_code_review_publication_absence(&newer.id, 1)
+                .resolve_code_review_publication_absence(&newer.id)
                 .unwrap(),
             CodeReviewPublicationAbsenceOutcome::AcceptedPending,
             "an accepted publication remains recoverable however long listing lags"
