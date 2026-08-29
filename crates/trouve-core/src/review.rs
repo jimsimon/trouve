@@ -8459,7 +8459,7 @@ impl Engine {
                 repository = %job.repository,
                 pull_number = job.pull_number,
                 "review publication outcome remains ambiguous after repeated marker scans; \
-                 stopping automatic reconciliation without retrying the POST"
+                 slowing reconciliation to marker-only probes without retrying the POST"
             ),
         }
         self.emit_code_review_job_updated(&job.id)?;
@@ -9924,9 +9924,9 @@ impl Engine {
                     }
                 };
             self.record_review_rate(rate);
-            if response["errors"].is_array() {
+            if let Some(error) = github_graphql_error_message(&response, "loading review threads") {
                 self.save_review_thread_listing_progress(progress_key, progress);
-                bail!("GitHub GraphQL error while loading review threads");
+                bail!(error);
             }
             let threads = &response["data"]["repository"]["pullRequest"]["reviewThreads"];
             for thread in threads["nodes"].as_array().into_iter().flatten() {
@@ -10011,9 +10011,11 @@ impl Engine {
                     }
                 };
             self.record_review_rate(rate);
-            if response["errors"].is_array() {
+            if let Some(error) =
+                github_graphql_error_message(&response, "refreshing review thread states")
+            {
                 self.save_review_thread_listing_progress(progress_key, progress);
-                bail!("GitHub GraphQL error while refreshing review thread states");
+                bail!(error);
             }
             let mut returned_ids = HashSet::new();
             for thread in response["data"]["nodes"].as_array().into_iter().flatten() {
@@ -10095,9 +10097,11 @@ impl Engine {
                         }
                     };
                 self.record_review_rate(rate);
-                if response["errors"].is_array() {
+                if let Some(error) =
+                    github_graphql_error_message(&response, "verifying review thread states")
+                {
                     self.save_review_thread_listing_progress(progress_key, progress);
-                    bail!("GitHub GraphQL error while verifying review thread states");
+                    bail!(error);
                 }
                 let mut returned_ids = HashSet::new();
                 for thread in response["data"]["nodes"].as_array().into_iter().flatten() {
@@ -10221,8 +10225,10 @@ impl Engine {
                     Err(_) => bail!("reverifying review thread states timed out"),
                 };
             self.record_review_rate(rate);
-            if response["errors"].is_array() {
-                bail!("GitHub GraphQL error while reverifying review thread states");
+            if let Some(error) =
+                github_graphql_error_message(&response, "reverifying review thread states")
+            {
+                bail!(error);
             }
             for thread in response["data"]["nodes"].as_array().into_iter().flatten() {
                 if let (Some(thread_id), Some(is_resolved)) =
@@ -11195,8 +11201,8 @@ impl Engine {
             )
             .await?;
         self.record_review_rate(rate);
-        if response["errors"].is_array() {
-            bail!("GitHub GraphQL error while resolving review thread");
+        if let Some(error) = github_graphql_error_message(&response, "resolving review thread") {
+            bail!(error);
         }
         Ok(())
     }
@@ -11540,6 +11546,28 @@ fn projection_error_is_retryable(error: &anyhow::Error) -> bool {
     projection_error_message_is_retryable(&message)
 }
 
+fn github_graphql_error_message(response: &serde_json::Value, operation: &str) -> Option<String> {
+    let errors = response["errors"].as_array()?;
+    if errors.is_empty() {
+        return None;
+    }
+    let details = errors
+        .iter()
+        .take(3)
+        .map(|error| {
+            let kind = error["type"].as_str().unwrap_or("UNKNOWN").trim();
+            let message = error["message"].as_str().unwrap_or_default().trim();
+            if message.is_empty() {
+                kind.to_owned()
+            } else {
+                format!("{kind}: {}", message.chars().take(256).collect::<String>())
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    Some(format!("GitHub GraphQL error while {operation}: {details}"))
+}
+
 fn projection_error_message_is_retryable(message: &str) -> bool {
     if let Some((lifecycle, check)) = message.split_once("; updating github check run failed:") {
         return projection_error_message_is_retryable(lifecycle)
@@ -11552,6 +11580,17 @@ fn projection_error_message_is_retryable(message: &str) -> bool {
         || message.contains("github api 5")
     {
         return true;
+    }
+    if message.contains("github graphql error") {
+        if message.contains("rate_limited") {
+            return true;
+        }
+        if ["not_found", "forbidden", "insufficient_scopes"]
+            .iter()
+            .any(|kind| message.contains(kind))
+        {
+            return false;
+        }
     }
     ![
         "github api 400",
@@ -23202,6 +23241,27 @@ mod tests {
             "updating GitHub review status comment failed: GitHub API 404; \
              updating GitHub Check Run failed: GitHub API 422"
         )));
+        let forbidden = github_graphql_error_message(
+            &serde_json::json!({
+                "errors": [{
+                    "type": "FORBIDDEN",
+                    "message": "Resource not accessible by integration"
+                }]
+            }),
+            "resolving review thread",
+        )
+        .unwrap();
+        assert!(forbidden.contains("FORBIDDEN"));
+        assert!(forbidden.contains("Resource not accessible"));
+        assert!(!projection_error_is_retryable(&anyhow!(forbidden)));
+        let rate_limited = github_graphql_error_message(
+            &serde_json::json!({
+                "errors": [{"type": "RATE_LIMITED", "message": "slow down"}]
+            }),
+            "loading review threads",
+        )
+        .unwrap();
+        assert!(projection_error_is_retryable(&anyhow!(rate_limited)));
     }
 
     #[test]
@@ -27903,7 +27963,7 @@ mod tests {
                 .unwrap()
                 .iter()
                 .all(|job| job.id != current.id),
-            "quarantine must bound marker scans without releasing the POST fence"
+            "quarantine must pause marker scans without releasing the POST fence"
         );
 
         // An accepted POST can only be experiencing listing lag. It remains

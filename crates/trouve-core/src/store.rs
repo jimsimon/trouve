@@ -906,6 +906,14 @@ fn blocking_finding_predicate(alias: &str) -> String {
     )
 }
 
+fn newer_code_review_publication_predicate(alias: &str, current: &str) -> String {
+    format!(
+        "({alias}.publication_order > {current}.publication_order OR \
+         ({alias}.publication_order = {current}.publication_order \
+          AND {alias}.rowid > {current}.rowid))"
+    )
+}
+
 /// Legacy snapshots counted every open finding; recompute both tiers —
 /// blocking (severity/confidence cutoff with a non-`unverified` scope
 /// verdict) and advisory (everything else) — on the
@@ -2934,12 +2942,14 @@ fn migrate_automatic_code_review_routing(conn: &Connection) -> Result<()> {
 
 fn projection_retry_delay_seconds(attempt: u32) -> u64 {
     const BASE_SECONDS: u64 = 60;
-    const MAX_SECONDS: u64 = 6 * 60 * 60;
+    const MAX_SECONDS: u64 = AMBIGUOUS_PUBLICATION_RETRY_SECONDS;
     let exponent = attempt.saturating_sub(1).min(9);
     BASE_SECONDS
         .saturating_mul(1_u64 << exponent)
         .min(MAX_SECONDS)
 }
+
+const AMBIGUOUS_PUBLICATION_RETRY_SECONDS: u64 = 6 * 60 * 60;
 
 /// Rebuild `backend_sessions` for databases created before it was keyed by
 /// (thread, backend) — adding a column to the primary key needs a new
@@ -3515,8 +3525,8 @@ pub enum CodeReviewPublicationAbsenceOutcome {
     NewerPublicationPending,
     /// A newer accepted or published round made this publication obsolete.
     Superseded,
-    /// Automatic reconciliation stopped without releasing the ambiguous
-    /// dispatch, so an operator can investigate without risking a duplicate.
+    /// Reconciliation is quarantined to low-frequency marker-only probes
+    /// without releasing the ambiguous dispatch for another POST.
     Quarantined,
 }
 
@@ -14086,8 +14096,9 @@ impl Store {
     /// have created the review before the client observed a transport or 5xx
     /// failure. No finite number of empty listings can prove non-creation, so
     /// a current dispatch is deliberately never released for another POST.
-    /// Repeated definitive misses instead stop automatic reconciliation with
-    /// a durable diagnostic, bounding API work while preserving that fence.
+    /// Repeated definitive misses instead slow reconciliation to a six-hour
+    /// marker-only cadence with a durable diagnostic, bounding API work while
+    /// preserving eventual reconciliation and the no-repost fence.
     pub fn resolve_code_review_publication_absence(
         &self,
         id: &str,
@@ -14102,7 +14113,8 @@ impl Store {
             bool,
             bool,
         ) = tx.query_row(
-            "SELECT current_job.publication_accepted,
+            &format!(
+                "SELECT current_job.publication_accepted,
                         current_job.publication_dispatched,
                         current_job.publication_marker_absence_count,
                         EXISTS (
@@ -14112,13 +14124,7 @@ impl Store {
                             AND newer.rowid != current_job.rowid
                             AND (newer.publication_accepted != 0
                                  OR newer.review_published != 0)
-                            AND (
-                              newer.publication_order > current_job.publication_order
-                              OR (
-                                newer.publication_order = current_job.publication_order
-                                AND newer.rowid > current_job.rowid
-                              )
-                            )
+                            AND {newer_publication}
                         ),
                         EXISTS (
                           SELECT 1 FROM code_review_jobs AS newer
@@ -14129,16 +14135,12 @@ impl Store {
                             AND newer.review_published = 0
                             AND (newer.publication_claimed != 0
                                  OR newer.publication_dispatched != 0)
-                            AND (
-                              newer.publication_order > current_job.publication_order
-                              OR (
-                                newer.publication_order = current_job.publication_order
-                                AND newer.rowid > current_job.rowid
-                              )
-                            )
+                            AND {newer_publication}
                         )
                  FROM code_review_jobs AS current_job
                  WHERE current_job.id = ?1",
+                newer_publication = newer_code_review_publication_predicate("newer", "current_job")
+            ),
             params![id],
             |row| {
                 Ok((
@@ -14192,17 +14194,20 @@ impl Store {
                 )?;
                 CodeReviewPublicationAbsenceOutcome::Pending
             } else {
+                let retry_at = (chrono::Utc::now()
+                    + chrono::Duration::seconds(AMBIGUOUS_PUBLICATION_RETRY_SECONDS as i64))
+                .to_rfc3339();
                 tx.execute(
                     "UPDATE code_review_jobs
                      SET publication_marker_absence_count = ?2,
                          check_sync_error =
-                           'review publication outcome remains ambiguous after repeated exhaustive marker scans; automatic reconciliation stopped without retrying the POST',
+                           'review publication outcome remains ambiguous after repeated exhaustive marker scans; reconciliation reduced to low-frequency marker-only probes without retrying the POST',
                          projection_retry_count = projection_retry_count + 1,
-                         projection_retry_at = NULL,
-                         projection_retryable = 0
+                         projection_retry_at = ?3,
+                         projection_retryable = 1
                      WHERE id = ?1 AND publication_accepted = 0
                        AND publication_dispatched != 0",
-                    params![id, i64::from(absence_count)],
+                    params![id, i64::from(absence_count), retry_at],
                 )?;
                 CodeReviewPublicationAbsenceOutcome::Quarantined
             }
@@ -24166,8 +24171,34 @@ mod tests {
                 .unwrap()
                 .iter()
                 .all(|job| job.id != first.id),
-            "a quarantined dispatch must stop automatic scans without becoming repostable"
+            "a quarantined dispatch must pause automatic scans without becoming repostable"
         );
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE code_review_jobs SET projection_retry_at = ?2 WHERE id = ?1",
+                params![first.id, "1970-01-01T00:00:00Z"],
+            )
+            .unwrap();
+        assert!(
+            store
+                .code_review_jobs_with_projection_errors(10)
+                .unwrap()
+                .iter()
+                .any(|job| job.id == first.id),
+            "quarantine must resume low-frequency marker-only reconciliation"
+        );
+        assert_eq!(
+            store
+                .resolve_code_review_publication_absence(&first.id, 2)
+                .unwrap(),
+            CodeReviewPublicationAbsenceOutcome::Quarantined
+        );
+        let record = store.code_review_job(&first.id).unwrap().unwrap();
+        assert!(record.publication_claimed);
+        assert!(record.publication_dispatched);
 
         // A second dispatched round is overtaken while it is awaiting marker
         // reconciliation.
