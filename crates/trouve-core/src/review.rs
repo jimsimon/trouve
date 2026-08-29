@@ -78,6 +78,7 @@ const REVIEW_THREAD_PROGRESS_MAX_ENTRIES: usize = 128;
 const REVIEW_PUBLICATION_LOOKUP_MAX_PAGES: u64 = 100;
 const REVIEW_PUBLICATION_LOOKUP_BUDGET: Duration = Duration::from_secs(60);
 const REVIEW_PUBLICATION_LOOKUP_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const REVIEW_PUBLICATION_ABSENCE_CONFIRMATIONS: u32 = 3;
 /// Obsolete blocking verdict cleanup is resumable and deliberately small so
 /// it cannot monopolize the repository poll behind a large review history.
 const REVIEW_BLOCKING_CLEANUP_MAX_PAGES_PER_PASS: u64 = 3;
@@ -8245,7 +8246,20 @@ impl Engine {
                             %error,
                             "GitHub accepted the review but its response body could not be read"
                         );
-                        return match self.find_published_review(api, job).await {
+                        // GitHub accepted the POST, so the review exists;
+                        // a definitively empty listing here is lag, not
+                        // absence, and stays pending like any lookup error.
+                        return match self
+                            .find_published_review(api, job)
+                            .await
+                            .and_then(|found| {
+                                found.ok_or_else(|| {
+                                    anyhow!(
+                                        "accepted GitHub review is not yet listed by its \
+                                         publication marker"
+                                    )
+                                })
+                            }) {
                             Ok(published) => {
                                 self.persist_review_level_finding_urls_best_effort(
                                     &job.id,
@@ -8290,7 +8304,17 @@ impl Engine {
                             %error,
                             "GitHub accepted the review but returned an invalid response body"
                         );
-                        match self.find_published_review(api, job).await {
+                        match self
+                            .find_published_review(api, job)
+                            .await
+                            .and_then(|found| {
+                                found.ok_or_else(|| {
+                                    anyhow!(
+                                        "accepted GitHub review is not yet listed by its \
+                                     publication marker"
+                                    )
+                                })
+                            }) {
                             Ok(published) => published,
                             Err(error) => {
                                 tracing::warn!(
@@ -8402,11 +8426,59 @@ impl Engine {
         }
     }
 
+    /// Handles a dispatched publication whose marker is absent from an
+    /// exhaustive review listing. The dispatch remains sticky because a POST
+    /// can create the review before its response is lost or replaced by a 5xx;
+    /// bounded listing absence cannot authoritatively prove non-creation.
+    ///
+    /// A superseded round abandons its publication outright — even a
+    /// late-appearing review would no longer matter. A still-current round
+    /// keeps reconciling by its stable marker and never issues a second POST.
+    async fn resolve_dispatched_publication_absence(
+        &self,
+        job: &trouve_protocol::CodeReviewJob,
+    ) -> Result<()> {
+        match self.store.resolve_code_review_publication_absence(
+            &job.id,
+            REVIEW_PUBLICATION_ABSENCE_CONFIRMATIONS,
+        )? {
+            crate::store::CodeReviewPublicationAbsenceOutcome::Published => {}
+            crate::store::CodeReviewPublicationAbsenceOutcome::Pending
+            | crate::store::CodeReviewPublicationAbsenceOutcome::AcceptedPending
+            | crate::store::CodeReviewPublicationAbsenceOutcome::NewerPublicationPending => {
+                bail!("accepted GitHub review could not be found by its publication marker");
+            }
+            crate::store::CodeReviewPublicationAbsenceOutcome::Superseded => tracing::warn!(
+                job_id = %job.id,
+                repository = %job.repository,
+                pull_number = job.pull_number,
+                "review publication was overtaken by a newer round that was accepted or published; \
+                 abandoning it without retrying the POST"
+            ),
+            crate::store::CodeReviewPublicationAbsenceOutcome::Quarantined => tracing::warn!(
+                job_id = %job.id,
+                repository = %job.repository,
+                pull_number = job.pull_number,
+                "review publication outcome remains ambiguous after repeated marker scans; \
+                 slowing reconciliation to marker-only probes without retrying the POST"
+            ),
+        }
+        self.emit_code_review_job_updated(&job.id)?;
+        self.emit_code_review_updated(Some(job.id.clone()))?;
+        Ok(())
+    }
+
+    /// Locates a dispatched review by its stable marker. `Ok(None)` is a
+    /// definitive answer — the listing was scanned to its final page and the
+    /// marker is not there — while errors (timeouts, pagination overflow)
+    /// prove nothing. Callers must treat the two differently, while also
+    /// remembering that even repeated definitive absence cannot disprove a
+    /// remotely accepted POST whose response was lost.
     async fn find_published_review(
         &self,
         api: &GithubApi,
         job: &trouve_protocol::CodeReviewJob,
-    ) -> Result<PublishedReview> {
+    ) -> Result<Option<PublishedReview>> {
         let marker = inline_review_marker(&job.id);
         let bot_login = self.github_app_status()?.bot_login;
         let deadline = Instant::now() + REVIEW_PUBLICATION_LOOKUP_BUDGET;
@@ -8439,10 +8511,10 @@ impl Engine {
                         .as_deref()
                         .is_some_and(|body| body.contains(&marker))
             }) {
-                return Ok(review);
+                return Ok(Some(review));
             }
             if count < REVIEW_COMMENT_PAGE_SIZE {
-                bail!("accepted GitHub review could not be found by its publication marker");
+                return Ok(None);
             }
             page = page
                 .checked_add(1)
@@ -8721,10 +8793,14 @@ impl Engine {
             let _ = self
                 .store
                 .record_code_review_projection_failure(&job.id, &message, retryable);
+            // Log the full context chain: the top-level context alone
+            // ("updating GitHub review publication failed") hides which
+            // GitHub call failed and with what status, which is exactly
+            // what an operator needs from this line.
             tracing::warn!(
                 job_id = %job.id,
                 retryable,
-                %error,
+                error = %message,
                 "updating GitHub review progress failed"
             );
         }
@@ -8843,7 +8919,19 @@ impl Engine {
             return Ok(());
         }
 
-        let published = self.find_published_review(api, job).await?;
+        let published = match self.find_published_review(api, job).await {
+            Ok(Some(published)) => {
+                self.store
+                    .reset_code_review_publication_marker_absences(&job.id)?;
+                published
+            }
+            Ok(None) => return self.resolve_dispatched_publication_absence(job).await,
+            Err(error) => {
+                self.store
+                    .reset_code_review_publication_marker_absences(&job.id)?;
+                return Err(error);
+            }
+        };
         let publication_findings = findings
             .iter()
             .filter(|finding| inline_finding_ids.contains(finding.id.as_str()))
@@ -9404,8 +9492,9 @@ impl Engine {
                             break;
                         }
                         Err(error) => {
+                            let terminal_failure = !projection_error_is_retryable(&error);
                             for remaining in &ordered[index..] {
-                                self.defer_thread_collapse_logged(remaining);
+                                self.defer_thread_collapse_logged(remaining, terminal_failure);
                             }
                             first_error.get_or_insert(error);
                             break;
@@ -9430,13 +9519,14 @@ impl Engine {
                     self.requeue_thread_collapse_logged(finding);
                 }
                 Err(error) => {
+                    let terminal_failure = !projection_error_is_retryable(&error);
                     tracing::warn!(
                         finding_id = finding.id,
                         path = finding.path,
                         error = format!("{error:#}"),
                         "collapsing a finding's review thread failed; deferred with backoff"
                     );
-                    self.defer_thread_collapse_logged(finding);
+                    self.defer_thread_collapse_logged(finding, terminal_failure);
                     first_error.get_or_insert(error);
                 }
             }
@@ -9499,15 +9589,31 @@ impl Engine {
         Ok(())
     }
 
-    /// Defers a finding's collapse retry, logging rather than propagating a
-    /// store failure: the finding simply stays due and is retried sooner.
-    fn defer_thread_collapse_logged(&self, finding: &trouve_protocol::CodeReviewFinding) {
-        if let Err(error) = self.store.defer_code_review_thread_collapse(&finding.id) {
-            tracing::warn!(
+    /// Defers a finding's collapse retry. Consecutive terminal failures can
+    /// abandon the cosmetic collapse after the attempt bound; transient
+    /// failures only back off. Store failures are logged rather than
+    /// propagated, so the finding simply stays due and is retried sooner.
+    fn defer_thread_collapse_logged(
+        &self,
+        finding: &trouve_protocol::CodeReviewFinding,
+        terminal_failure: bool,
+    ) {
+        match self
+            .store
+            .defer_code_review_thread_collapse(&finding.id, terminal_failure)
+        {
+            Ok(true) => tracing::warn!(
+                finding_id = finding.id,
+                path = finding.path,
+                "review thread collapse abandoned after its attempt bound; the finding's \
+                 ledger state is durable and only its GitHub thread stays un-collapsed"
+            ),
+            Ok(false) => {}
+            Err(error) => tracing::warn!(
                 finding_id = finding.id,
                 error = format!("{error:#}"),
                 "failed to defer a review thread collapse retry"
-            );
+            ),
         }
     }
 
@@ -9661,6 +9767,7 @@ impl Engine {
         {
             Ok(Ok(api)) => api,
             Ok(Err(error)) => {
+                let terminal_failure = !projection_error_is_retryable(&error);
                 tracing::warn!(
                     repository,
                     pull_number,
@@ -9669,7 +9776,7 @@ impl Engine {
                      the group was deferred"
                 );
                 for finding in findings {
-                    self.defer_thread_collapse_logged(finding);
+                    self.defer_thread_collapse_logged(finding, terminal_failure);
                 }
                 return;
             }
@@ -9682,7 +9789,7 @@ impl Engine {
                      the group was deferred"
                 );
                 for finding in findings {
-                    self.defer_thread_collapse_logged(finding);
+                    self.defer_thread_collapse_logged(finding, false);
                 }
                 return;
             }
@@ -9818,9 +9925,9 @@ impl Engine {
                     }
                 };
             self.record_review_rate(rate);
-            if response["errors"].is_array() {
+            if let Some(error) = github_graphql_error_message(&response, "loading review threads") {
                 self.save_review_thread_listing_progress(progress_key, progress);
-                bail!("GitHub GraphQL error while loading review threads");
+                bail!(error);
             }
             let threads = &response["data"]["repository"]["pullRequest"]["reviewThreads"];
             for thread in threads["nodes"].as_array().into_iter().flatten() {
@@ -9905,9 +10012,11 @@ impl Engine {
                     }
                 };
             self.record_review_rate(rate);
-            if response["errors"].is_array() {
+            if let Some(error) =
+                github_graphql_error_message(&response, "refreshing review thread states")
+            {
                 self.save_review_thread_listing_progress(progress_key, progress);
-                bail!("GitHub GraphQL error while refreshing review thread states");
+                bail!(error);
             }
             let mut returned_ids = HashSet::new();
             for thread in response["data"]["nodes"].as_array().into_iter().flatten() {
@@ -9989,9 +10098,11 @@ impl Engine {
                         }
                     };
                 self.record_review_rate(rate);
-                if response["errors"].is_array() {
+                if let Some(error) =
+                    github_graphql_error_message(&response, "verifying review thread states")
+                {
                     self.save_review_thread_listing_progress(progress_key, progress);
-                    bail!("GitHub GraphQL error while verifying review thread states");
+                    bail!(error);
                 }
                 let mut returned_ids = HashSet::new();
                 for thread in response["data"]["nodes"].as_array().into_iter().flatten() {
@@ -10115,8 +10226,10 @@ impl Engine {
                     Err(_) => bail!("reverifying review thread states timed out"),
                 };
             self.record_review_rate(rate);
-            if response["errors"].is_array() {
-                bail!("GitHub GraphQL error while reverifying review thread states");
+            if let Some(error) =
+                github_graphql_error_message(&response, "reverifying review thread states")
+            {
+                bail!(error);
             }
             for thread in response["data"]["nodes"].as_array().into_iter().flatten() {
                 if let (Some(thread_id), Some(is_resolved)) =
@@ -11089,8 +11202,8 @@ impl Engine {
             )
             .await?;
         self.record_review_rate(rate);
-        if response["errors"].is_array() {
-            bail!("GitHub GraphQL error while resolving review thread");
+        if let Some(error) = github_graphql_error_message(&response, "resolving review thread") {
+            bail!(error);
         }
         Ok(())
     }
@@ -11430,11 +11543,34 @@ fn combine_publication_projection_result(
 }
 
 fn projection_error_is_retryable(error: &anyhow::Error) -> bool {
-    let message = format!("{error:#}").to_ascii_lowercase();
-    projection_error_message_is_retryable(&message)
+    projection_error_message_is_retryable(&format!("{error:#}"))
+}
+
+fn github_graphql_error_message(response: &serde_json::Value, operation: &str) -> Option<String> {
+    let errors = response["errors"].as_array()?;
+    if errors.is_empty() {
+        return None;
+    }
+    let details = errors
+        .iter()
+        .take(3)
+        .map(|error| {
+            let kind = error["type"].as_str().unwrap_or("UNKNOWN").trim();
+            let message = error["message"].as_str().unwrap_or_default().trim();
+            if message.is_empty() {
+                kind.to_owned()
+            } else {
+                format!("{kind}: {}", message.chars().take(256).collect::<String>())
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    Some(format!("GitHub GraphQL error while {operation}: {details}"))
 }
 
 fn projection_error_message_is_retryable(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    let message = message.as_str();
     if let Some((lifecycle, check)) = message.split_once("; updating github check run failed:") {
         return projection_error_message_is_retryable(lifecycle)
             || projection_error_message_is_retryable(check);
@@ -11446,6 +11582,17 @@ fn projection_error_message_is_retryable(message: &str) -> bool {
         || message.contains("github api 5")
     {
         return true;
+    }
+    if message.contains("github graphql error") {
+        if message.contains("rate_limited") {
+            return true;
+        }
+        if ["not_found", "forbidden", "insufficient_scopes"]
+            .iter()
+            .any(|kind| message.contains(kind))
+        {
+            return false;
+        }
     }
     ![
         "github api 400",
@@ -21297,7 +21444,11 @@ mod tests {
         )
         .unwrap();
 
-        let review = engine.find_published_review(&api, &job).await.unwrap();
+        let review = engine
+            .find_published_review(&api, &job)
+            .await
+            .unwrap()
+            .expect("the marker page holds the published review");
         await_mock_server(server).await;
         assert_eq!(review.id, 777);
     }
@@ -23092,6 +23243,37 @@ mod tests {
             "updating GitHub review status comment failed: GitHub API 404; \
              updating GitHub Check Run failed: GitHub API 422"
         )));
+        let forbidden = github_graphql_error_message(
+            &serde_json::json!({
+                "errors": [{
+                    "type": "FORBIDDEN",
+                    "message": "Resource not accessible by integration"
+                }]
+            }),
+            "resolving review thread",
+        )
+        .unwrap();
+        assert!(forbidden.contains("FORBIDDEN"));
+        assert!(forbidden.contains("Resource not accessible"));
+        assert!(!projection_error_is_retryable(&anyhow!(forbidden)));
+        for kind in ["NOT_FOUND", "INSUFFICIENT_SCOPES"] {
+            let error = github_graphql_error_message(
+                &serde_json::json!({
+                    "errors": [{"type": kind, "message": "terminal"}]
+                }),
+                "loading review threads",
+            )
+            .unwrap();
+            assert!(!projection_error_is_retryable(&anyhow!(error)), "{kind}");
+        }
+        let rate_limited = github_graphql_error_message(
+            &serde_json::json!({
+                "errors": [{"type": "RATE_LIMITED", "message": "slow down"}]
+            }),
+            "loading review threads",
+        )
+        .unwrap();
+        assert!(projection_error_is_retryable(&anyhow!(rate_limited)));
     }
 
     #[test]
@@ -25282,7 +25464,7 @@ mod tests {
         // Seed one real failure. Another failure defer would now schedule a
         // two-minute retry; a budget requeue must remain due after one minute.
         store
-            .defer_code_review_thread_collapse(&finding.id)
+            .defer_code_review_thread_collapse(&finding.id, false)
             .unwrap();
         let data = tempfile::tempdir().unwrap();
         let engine = Engine::new(
@@ -27647,6 +27829,201 @@ mod tests {
         ));
         assert!(next_thread_webhook_batch(&dispatch).is_some());
         assert!(next_thread_webhook_batch(&dispatch).is_none());
+    }
+
+    #[tokio::test]
+    async fn dispatched_publication_absence_quarantines_without_reposting() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let with_head = |store: &crate::store::Store, key: &str, head: &str| {
+            let mut request = test_review_job_request(key);
+            request.head_sha = head.into();
+            store.enqueue_code_review_job(&request).unwrap().unwrap()
+        };
+        // A dispatched round whose POST failed (the 500 path) and whose
+        // marker is definitively absent.
+        let first = with_head(
+            &store,
+            "acme/widgets#42:dispatch-absent",
+            "2222222222222222222222222222222222222222",
+        );
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            first.id
+        );
+        assert!(store.claim_code_review_publication(&first.id).unwrap());
+        assert!(
+            store
+                .mark_code_review_publication_dispatched(&first.id)
+                .unwrap()
+        );
+        store
+            .finish_code_review_job(&first.id, "failed", "GitHub API 500", "")
+            .unwrap();
+        // A newer round publishes for the pull.
+        let newer = with_head(
+            &store,
+            "acme/widgets#42:dispatch-absent-newer",
+            "3333333333333333333333333333333333333333",
+        );
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            newer.id
+        );
+        assert!(store.claim_code_review_publication(&newer.id).unwrap());
+        assert!(
+            store
+                .reconcile_code_review_publication(&newer.id, "https://example/review", &[])
+                .unwrap()
+        );
+
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(store, data.path().to_path_buf(), &review_app_test_config());
+
+        // Superseded: the publication is abandoned with a terminal,
+        // non-retryable error so the repair drainer stops selecting it.
+        engine
+            .resolve_dispatched_publication_absence(&first)
+            .await
+            .unwrap();
+        let record = engine.store.code_review_job(&first.id).unwrap().unwrap();
+        assert!(record.job.check_sync_error.contains("newer round"));
+        assert!(
+            engine
+                .store
+                .code_review_jobs_with_projection_errors(10)
+                .unwrap()
+                .iter()
+                .all(|job| job.id != first.id),
+            "an abandoned publication must leave the repair queue"
+        );
+
+        // Still-current: the failed POST may have created a review before its
+        // response was lost. Repeated exhaustive marker misses therefore stay
+        // retryable without ever releasing the dispatch for a duplicate POST.
+        let current = with_head(
+            &engine.store,
+            "acme/widgets#42:dispatch-absent-current",
+            "4444444444444444444444444444444444444444",
+        );
+        assert_eq!(
+            engine
+                .store
+                .claim_code_review_job()
+                .unwrap()
+                .unwrap()
+                .job
+                .id,
+            current.id
+        );
+        assert!(
+            engine
+                .store
+                .claim_code_review_publication(&current.id)
+                .unwrap()
+        );
+        assert!(
+            engine
+                .store
+                .mark_code_review_publication_dispatched(&current.id)
+                .unwrap()
+        );
+        engine
+            .store
+            .finish_code_review_job(&current.id, "failed", "GitHub API 500", "")
+            .unwrap();
+        // Unrelated projection failures do not change the sticky outcome.
+        for _ in 0..5 {
+            engine
+                .store
+                .record_code_review_projection_failure(&current.id, "other projection", true)
+                .unwrap();
+        }
+        for absence in 1..REVIEW_PUBLICATION_ABSENCE_CONFIRMATIONS {
+            assert!(
+                engine
+                    .resolve_dispatched_publication_absence(&current)
+                    .await
+                    .is_err(),
+                "absence {absence} must remain retryable without re-publication"
+            );
+            assert!(
+                engine
+                    .store
+                    .code_review_job(&current.id)
+                    .unwrap()
+                    .unwrap()
+                    .publication_dispatched
+            );
+        }
+        engine
+            .resolve_dispatched_publication_absence(&current)
+            .await
+            .unwrap();
+        let record = engine.store.code_review_job(&current.id).unwrap().unwrap();
+        assert!(record.publication_dispatched);
+        assert!(record.publication_claimed);
+        assert!(
+            record
+                .job
+                .check_sync_error
+                .contains("outcome remains ambiguous")
+        );
+        assert!(
+            engine
+                .store
+                .code_review_jobs_with_projection_errors(10)
+                .unwrap()
+                .iter()
+                .all(|job| job.id != current.id),
+            "quarantine must pause marker scans without releasing the POST fence"
+        );
+
+        // An accepted POST can only be experiencing listing lag. It remains
+        // queued for reconciliation however long listing visibility lags.
+        let accepted = with_head(
+            &engine.store,
+            "acme/widgets#42:dispatch-accepted",
+            "5555555555555555555555555555555555555555",
+        );
+        assert_eq!(
+            engine
+                .store
+                .claim_code_review_job()
+                .unwrap()
+                .unwrap()
+                .job
+                .id,
+            accepted.id
+        );
+        assert!(
+            engine
+                .store
+                .claim_code_review_publication(&accepted.id)
+                .unwrap()
+        );
+        assert!(
+            engine
+                .store
+                .mark_code_review_publication_dispatched(&accepted.id)
+                .unwrap()
+        );
+        assert!(
+            engine
+                .store
+                .mark_code_review_publication_accepted(&accepted.id)
+                .unwrap()
+        );
+        for _ in 0..=REVIEW_PUBLICATION_ABSENCE_CONFIRMATIONS {
+            assert!(
+                engine
+                    .resolve_dispatched_publication_absence(&accepted)
+                    .await
+                    .is_err()
+            );
+        }
+        let record = engine.store.code_review_job(&accepted.id).unwrap().unwrap();
+        assert!(record.publication_dispatched);
+        assert!(record.publication_accepted);
     }
 
     #[tokio::test]
