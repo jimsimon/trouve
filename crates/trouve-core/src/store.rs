@@ -532,6 +532,13 @@ CREATE TABLE IF NOT EXISTS code_review_carried_anchor_targets (
   line INTEGER NOT NULL,
   PRIMARY KEY (job_id, path, line)
 );
+CREATE TABLE IF NOT EXISTS code_review_carried_finding_anchors (
+  finding_id TEXT NOT NULL REFERENCES code_review_findings(id) ON DELETE CASCADE,
+  head_sha TEXT NOT NULL,
+  path TEXT NOT NULL,
+  line INTEGER NOT NULL,
+  PRIMARY KEY (finding_id, head_sha)
+);
 CREATE TABLE IF NOT EXISTS code_review_finding_sources (
   finding_id TEXT NOT NULL REFERENCES code_review_findings(id),
   candidate_id TEXT NOT NULL,
@@ -964,6 +971,13 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE code_review_carried_anchor_verifications ADD COLUMN unreadable_at TEXT",
     "ALTER TABLE code_review_carried_anchor_verifications
        ADD COLUMN last_read_error TEXT NOT NULL DEFAULT ''",
+    "CREATE TABLE IF NOT EXISTS code_review_carried_finding_anchors (
+       finding_id TEXT NOT NULL REFERENCES code_review_findings(id) ON DELETE CASCADE,
+       head_sha TEXT NOT NULL,
+       path TEXT NOT NULL,
+       line INTEGER NOT NULL,
+       PRIMARY KEY (finding_id, head_sha)
+     )",
 ];
 
 /// Blocking-tier predicate for one findings row under the given SQL alias:
@@ -12636,6 +12650,50 @@ impl Store {
             )
             .optional()?)
     }
+    /// Coordinates advanced to a prior reviewed head let findings survive
+    /// more than one incremental diff without trusting their original line.
+    pub(crate) fn code_review_carried_finding_anchors(
+        &self,
+        finding_ids: &[String],
+        head_sha: &str,
+    ) -> Result<HashMap<String, (String, u64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT path, line FROM code_review_carried_finding_anchors
+             WHERE finding_id = ?1 AND head_sha = ?2",
+        )?;
+        let mut anchors = HashMap::new();
+        for finding_id in finding_ids {
+            if let Some((path, line)) = stmt
+                .query_row(params![finding_id, head_sha], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+                })
+                .optional()?
+            {
+                anchors.insert(finding_id.clone(), (path, line));
+            }
+        }
+        Ok(anchors)
+    }
+
+    pub(crate) fn record_code_review_carried_finding_anchors(
+        &self,
+        head_sha: &str,
+        anchors: &[(String, String, u64)],
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let tx = write_transaction(&conn)?;
+        for (finding_id, path, line) in anchors {
+            tx.execute(
+                "INSERT OR IGNORE INTO code_review_carried_finding_anchors
+                        (finding_id, head_sha, path, line)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![finding_id, head_sha, path, *line as i64],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
 
     /// Register newly observed targets once, then atomically reserve a bounded
     /// page directly from the durable head-scoped queue. Continuation jobs
@@ -23151,6 +23209,61 @@ mod tests {
         assert_eq!(
             state,
             (3, true, "permanent object read failure".to_owned(),)
+        );
+    }
+    #[test]
+    fn carried_finding_anchor_positions_advance_across_heads() {
+        let store = Store::open_in_memory().unwrap();
+        let job = enqueue_backoff_test_job(&store);
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO code_review_findings
+                        (id, job_id, path, line, side, severity, body, created_at)
+                 VALUES ('rvf-carried', ?1, 'src/original.rs', 100, 'RIGHT',
+                         'high', 'body', ?2)",
+                params![job.id, chrono::Utc::now().to_rfc3339()],
+            )
+            .unwrap();
+        }
+
+        store
+            .record_code_review_carried_finding_anchors(
+                "head-2",
+                &[("rvf-carried".to_owned(), "src/original.rs".to_owned(), 101)],
+            )
+            .unwrap();
+        store
+            .record_code_review_carried_finding_anchors(
+                "head-3",
+                &[("rvf-carried".to_owned(), "src/original.rs".to_owned(), 102)],
+            )
+            .unwrap();
+
+        let ids = vec!["rvf-carried".to_owned()];
+        assert_eq!(
+            store
+                .code_review_carried_finding_anchors(&ids, "head-2")
+                .unwrap(),
+            HashMap::from([(
+                "rvf-carried".to_owned(),
+                ("src/original.rs".to_owned(), 101),
+            )])
+        );
+        assert_eq!(
+            store
+                .code_review_carried_finding_anchors(&ids, "head-3")
+                .unwrap(),
+            HashMap::from([(
+                "rvf-carried".to_owned(),
+                ("src/original.rs".to_owned(), 102),
+            )])
+        );
+        assert!(
+            store
+                .code_review_carried_finding_anchors(&ids, "unreviewed-head")
+                .unwrap()
+                .is_empty()
         );
     }
 

@@ -6347,6 +6347,19 @@ impl Engine {
             };
         let mut carried_anchor_has_more = false;
         let carried_diff_contents = diff_line_contents(&diff_files);
+        let carried_finding_ids = previous_findings
+            .iter()
+            .map(|finding| finding.id.clone())
+            .collect::<Vec<_>>();
+        let carried_base_anchors = self
+            .store
+            .code_review_carried_finding_anchors(&carried_finding_ids, &job.review_base_sha)?;
+        let carried_mapping = CarriedAnchorMappingContext {
+            files: &diff_files,
+            diff_contents: &carried_diff_contents,
+            review_base_sha: &job.review_base_sha,
+            base_anchors: &carried_base_anchors,
+        };
         let parsed = if coordinator_candidates.is_empty() && previous_findings.is_empty() {
             if let Some(task) = queued_coordinator.take() {
                 let skipped = self
@@ -6388,8 +6401,7 @@ impl Engine {
                 .prefetch_carried_anchor_lines(
                     &job,
                     &previous_findings,
-                    &diff_files,
-                    &carried_diff_contents,
+                    &carried_mapping,
                     repository_path.as_path(),
                     superseded,
                 )
@@ -6625,9 +6637,7 @@ impl Engine {
                 validated.resolved_finding_ids,
                 &validated.resolved_findings,
                 &previous_findings,
-                &diff_files,
-                &carried_diff_contents,
-                &job.review_base_sha,
+                &carried_mapping,
                 &carried_anchor_lines,
             );
             let themes = coordinator_validated_themes(
@@ -10697,13 +10707,16 @@ impl Engine {
         &self,
         job: &trouve_protocol::CodeReviewJob,
         findings: &[trouve_protocol::CodeReviewFinding],
-        diff_files: &[ReviewDiffFile],
-        diff_contents: &HashMap<(String, u64, bool), String>,
+        mapping: &CarriedAnchorMappingContext<'_>,
         repository_path: &std::path::Path,
         cancel: &CancellationToken,
     ) -> Result<(HashMap<(String, u64), Option<String>>, bool)> {
-        let targets =
-            carried_anchor_targets(findings, diff_files, diff_contents, &job.review_base_sha);
+        let positions = carried_anchor_positions(findings, mapping);
+        if job.trigger != "carried-anchor-continuation" {
+            self.store
+                .record_code_review_carried_finding_anchors(&job.head_sha, &positions)?;
+        }
+        let targets = carried_anchor_targets(findings, mapping);
         let page = self.store.claim_code_review_carried_anchor_page(
             &job.id,
             &job.repository,
@@ -17049,40 +17062,53 @@ fn finding_scope_blocks(evidence: &trouve_protocol::CodeReviewFindingEvidence) -
     evidence.change_scope != "unverified"
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+type CarriedFindingAnchorMap = HashMap<String, (String, u64)>;
+struct CarriedAnchorMappingContext<'a> {
+    files: &'a [ReviewDiffFile],
+    diff_contents: &'a HashMap<(String, u64, bool), String>,
+    review_base_sha: &'a str,
+    base_anchors: &'a CarriedFindingAnchorMap,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum HistoricalAnchorLocation {
     InDiff,
-    HeadLine(u64),
+    HeadLine { path: String, line: u64 },
     Unverifiable,
 }
 
-/// Map a finding's durable head coordinate through this round's diff. The
-/// historical coordinate is meaningful only when its observed head is the
-/// review base. If the exact old-side line is in a hunk, the coordinator has
-/// already seen the anchor; otherwise additions and deletions before it shift
-/// the current-head line deterministically.
+/// Map a finding's coordinate from the current review base to its head. A
+/// finding starts at its reporting head; each successful mapping is also
+/// recorded at the new head so later incremental rounds can continue from
+/// that durable coordinate instead of reusing the original numeric line.
 fn historical_anchor_location(
     finding: &trouve_protocol::CodeReviewFinding,
-    files: &[ReviewDiffFile],
-    diff_contents: &HashMap<(String, u64, bool), String>,
-    review_base_sha: &str,
+    mapping: &CarriedAnchorMappingContext<'_>,
 ) -> HistoricalAnchorLocation {
-    if finding.side.eq_ignore_ascii_case("left")
-        || finding.observed_head.is_empty()
-        || finding.observed_head != review_base_sha
-    {
+    if finding.side.eq_ignore_ascii_case("left") {
         return HistoricalAnchorLocation::Unverifiable;
     }
-    if diff_contents.contains_key(&(finding.path.clone(), finding.line, true)) {
+    let (path, line) = if let Some((path, line)) = mapping.base_anchors.get(&finding.id) {
+        (path.clone(), *line)
+    } else {
+        if finding.observed_head.is_empty() || finding.observed_head != mapping.review_base_sha {
+            return HistoricalAnchorLocation::Unverifiable;
+        }
+        (finding.path.clone(), finding.line)
+    };
+    if mapping
+        .diff_contents
+        .contains_key(&(path.clone(), line, true))
+    {
         return HistoricalAnchorLocation::InDiff;
     }
-    let Some(file) = files.iter().find(|file| file.path == finding.path) else {
-        return HistoricalAnchorLocation::HeadLine(finding.line);
+    let Some(file) = mapping.files.iter().find(|file| file.path == path) else {
+        return HistoricalAnchorLocation::HeadLine { path, line };
     };
-    let mut mapped = i128::from(finding.line);
+    let mut mapped = i128::from(line);
     let mut saw_hunk = false;
-    for line in file.diff.lines().filter(|line| line.starts_with("@@ ")) {
-        let mut ranges = line.split_whitespace();
+    for diff_line in file.diff.lines().filter(|line| line.starts_with("@@ ")) {
+        let mut ranges = diff_line.split_whitespace();
         let _marker = ranges.next();
         let Some((old_start, old_count)) = ranges.next().and_then(|range| diff_range(range, '-'))
         else {
@@ -17093,16 +17119,13 @@ fn historical_anchor_location(
             continue;
         };
         saw_hunk = true;
-        if old_count > 0
-            && finding.line >= old_start
-            && finding.line < old_start.saturating_add(old_count)
-        {
+        if old_count > 0 && line >= old_start && line < old_start.saturating_add(old_count) {
             return HistoricalAnchorLocation::InDiff;
         }
         let hunk_is_before = if old_count == 0 {
-            old_start < finding.line
+            old_start < line
         } else {
-            old_start.saturating_add(old_count) <= finding.line
+            old_start.saturating_add(old_count) <= line
         };
         if hunk_is_before {
             mapped += i128::from(new_count) - i128::from(old_count);
@@ -17111,33 +17134,39 @@ fn historical_anchor_location(
     if !saw_hunk {
         return HistoricalAnchorLocation::Unverifiable;
     }
-    u64::try_from(mapped).ok().filter(|line| *line > 0).map_or(
-        HistoricalAnchorLocation::Unverifiable,
-        HistoricalAnchorLocation::HeadLine,
-    )
+    u64::try_from(mapped)
+        .ok()
+        .filter(|line| *line > 0)
+        .map_or(HistoricalAnchorLocation::Unverifiable, |line| {
+            HistoricalAnchorLocation::HeadLine { path, line }
+        })
 }
 
 fn finding_requires_head_verification(
     finding: &trouve_protocol::CodeReviewFinding,
-    location: HistoricalAnchorLocation,
+    location: &HistoricalAnchorLocation,
 ) -> bool {
     finding_is_blocking(&finding.severity, &finding.confidence)
         && finding_scope_blocks(&finding.evidence)
-        && location != HistoricalAnchorLocation::InDiff
+        && *location != HistoricalAnchorLocation::InDiff
 }
 
-fn carried_anchor_targets(
+fn carried_anchor_positions(
     findings: &[trouve_protocol::CodeReviewFinding],
-    files: &[ReviewDiffFile],
-    diff_contents: &HashMap<(String, u64, bool), String>,
-    review_base_sha: &str,
-) -> Vec<(String, u64)> {
-    let mut seen = HashSet::new();
+    mapping: &CarriedAnchorMappingContext<'_>,
+) -> Vec<(String, String, u64)> {
     findings
         .iter()
         .filter(|finding| finding.status == "open" && finding.line > 0)
         .filter_map(|finding| {
-            let relative = std::path::Path::new(&finding.path);
+            let location = historical_anchor_location(finding, mapping);
+            if !finding_requires_head_verification(finding, &location) {
+                return None;
+            }
+            let HistoricalAnchorLocation::HeadLine { path, line } = location else {
+                return None;
+            };
+            let relative = std::path::Path::new(&path);
             if relative.is_absolute()
                 || relative
                     .components()
@@ -17145,15 +17174,20 @@ fn carried_anchor_targets(
             {
                 return None;
             }
-            let location =
-                historical_anchor_location(finding, files, diff_contents, review_base_sha);
-            if !finding_requires_head_verification(finding, location) {
-                return None;
-            }
-            let HistoricalAnchorLocation::HeadLine(line) = location else {
-                return None;
-            };
-            let key = (finding.path.clone(), line);
+            Some((finding.id.clone(), path, line))
+        })
+        .collect()
+}
+
+fn carried_anchor_targets(
+    findings: &[trouve_protocol::CodeReviewFinding],
+    mapping: &CarriedAnchorMappingContext<'_>,
+) -> Vec<(String, u64)> {
+    let mut seen = HashSet::new();
+    carried_anchor_positions(findings, mapping)
+        .into_iter()
+        .filter_map(|(_finding_id, path, line)| {
+            let key = (path, line);
             seen.insert(key.clone()).then_some(key)
         })
         .collect()
@@ -17233,9 +17267,7 @@ fn verified_resolution_ids(
     listed: Vec<String>,
     claims: &[ResolvedFindingClaim],
     previous_findings: &[trouve_protocol::CodeReviewFinding],
-    files: &[ReviewDiffFile],
-    diff_contents: &HashMap<(String, u64, bool), String>,
-    review_base_sha: &str,
+    mapping: &CarriedAnchorMappingContext<'_>,
     carried_anchor_lines: &HashMap<(String, u64), Option<String>>,
 ) -> Vec<String> {
     let claim_by_id = claims
@@ -17254,14 +17286,13 @@ fn verified_resolution_ids(
                 // pass-through; downstream resolution guards them.
                 return true;
             };
-            let location =
-                historical_anchor_location(finding, files, diff_contents, review_base_sha);
-            if !finding_requires_head_verification(finding, location) {
+            let location = historical_anchor_location(finding, mapping);
+            if !finding_requires_head_verification(finding, &location) {
                 return true;
             }
             let current = match location {
-                HistoricalAnchorLocation::HeadLine(line) => {
-                    carried_anchor_lines.get(&(finding.path.clone(), line))
+                HistoricalAnchorLocation::HeadLine { path, line } => {
+                    carried_anchor_lines.get(&(path, line))
                 }
                 HistoricalAnchorLocation::InDiff | HistoricalAnchorLocation::Unverifiable => None,
             };
@@ -20003,6 +20034,13 @@ mod tests {
             generated_header: None,
         }];
         let diff_contents = diff_line_contents(&files);
+        let base_anchors = CarriedFindingAnchorMap::new();
+        let mapping = CarriedAnchorMappingContext {
+            files: &files,
+            diff_contents: &diff_contents,
+            review_base_sha: "base",
+            base_anchors: &base_anchors,
+        };
         let anchors = HashMap::from([
             (
                 ("src/untouched.rs".to_owned(), 7),
@@ -20027,9 +20065,7 @@ mod tests {
             ],
             &[claim("rvf_carried", "guarded();")],
             &previous,
-            &files,
-            &diff_contents,
-            "base",
+            &mapping,
             &anchors,
         );
         // Only the exact in-window anchor resolves by id; another anchor in
@@ -20075,7 +20111,14 @@ mod tests {
         }));
 
         let diff_contents = diff_line_contents(&files);
-        let targets = carried_anchor_targets(&findings, &files, &diff_contents, "base");
+        let base_anchors = CarriedFindingAnchorMap::new();
+        let mapping = CarriedAnchorMappingContext {
+            files: &files,
+            diff_contents: &diff_contents,
+            review_base_sha: "base",
+            base_anchors: &base_anchors,
+        };
+        let targets = carried_anchor_targets(&findings, &mapping);
 
         assert_eq!(targets.len(), 66);
         assert!(targets.contains(&("src/touched.rs".to_owned(), 1)));
@@ -20099,13 +20142,15 @@ mod tests {
             generated_header: None,
         }];
         let diff_contents = diff_line_contents(&files);
+        let base_anchors = CarriedFindingAnchorMap::new();
+        let mapping = CarriedAnchorMappingContext {
+            files: &files,
+            diff_contents: &diff_contents,
+            review_base_sha: "base",
+            base_anchors: &base_anchors,
+        };
         assert_eq!(
-            carried_anchor_targets(
-                std::slice::from_ref(&finding),
-                &files,
-                &diff_contents,
-                "base",
-            ),
+            carried_anchor_targets(std::slice::from_ref(&finding), &mapping),
             vec![("src/shifted.rs".to_owned(), 101)]
         );
 
@@ -20122,9 +20167,7 @@ mod tests {
                 Vec::new(),
                 std::slice::from_ref(&claim),
                 std::slice::from_ref(&finding),
-                &files,
-                &diff_contents,
-                "base",
+                &mapping,
                 &stale_line,
             )
             .is_empty()
@@ -20137,12 +20180,51 @@ mod tests {
         assert_eq!(
             verified_resolution_ids(
                 Vec::new(),
+                std::slice::from_ref(&claim),
+                std::slice::from_ref(&finding),
+                &mapping,
+                &remapped_line,
+            ),
+            vec!["rvf_shifted".to_owned()]
+        );
+
+        let advanced = CarriedFindingAnchorMap::from([(
+            finding.id.clone(),
+            ("src/shifted.rs".to_owned(), 101),
+        )]);
+        let next_files = vec![ReviewDiffFile {
+            path: "src/shifted.rs".into(),
+            diff: "diff --git a/src/shifted.rs b/src/shifted.rs
+--- a/src/shifted.rs
++++ b/src/shifted.rs
+@@ -75,0 +76 @@
++inserted_again();
+"
+            .into(),
+            generated_header: None,
+        }];
+        let next_diff_contents = diff_line_contents(&next_files);
+        let next_mapping = CarriedAnchorMappingContext {
+            files: &next_files,
+            diff_contents: &next_diff_contents,
+            review_base_sha: "head-2",
+            base_anchors: &advanced,
+        };
+        assert_eq!(
+            carried_anchor_targets(std::slice::from_ref(&finding), &next_mapping),
+            vec![("src/shifted.rs".to_owned(), 102)]
+        );
+        let head_three_line = HashMap::from([(
+            ("src/shifted.rs".to_owned(), 102),
+            Some("still_broken();".to_owned()),
+        )]);
+        assert_eq!(
+            verified_resolution_ids(
+                Vec::new(),
                 &[claim],
                 &[finding],
-                &files,
-                &diff_contents,
-                "base",
-                &remapped_line,
+                &next_mapping,
+                &head_three_line,
             ),
             vec!["rvf_shifted".to_owned()]
         );
