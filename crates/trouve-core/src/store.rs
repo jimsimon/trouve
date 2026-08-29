@@ -7251,7 +7251,8 @@ impl Store {
     ) -> Result<bool> {
         let updated = self.conn.lock().unwrap().execute(
             "UPDATE code_review_jobs
-             SET session_id = ?4, thread_id = NULL
+             SET session_id = ?4,
+                 thread_id = CASE WHEN session_id IS NULL THEN NULL ELSE thread_id END
              WHERE id = ?1 AND status = 'running'
                AND (session_id IS NULL OR session_id = ?4)
                AND EXISTS (
@@ -17449,6 +17450,24 @@ mod tests {
                 .as_deref(),
             Some(session.id.as_str())
         );
+        assert!(
+            store
+                .set_code_review_job_session(&review_job.id, &session.id, "th_review_atomic")
+                .unwrap()
+        );
+        assert!(
+            store
+                .bind_review_job_to_idempotent_session(
+                    &review_job.id,
+                    "review-session-key",
+                    "review-session-fingerprint",
+                    &session.id,
+                )
+                .unwrap()
+        );
+        let rebound = store.code_review_job(&review_job.id).unwrap().unwrap();
+        assert_eq!(rebound.job.session_id.as_deref(), Some(session.id.as_str()));
+        assert_eq!(rebound.job.thread_id.as_deref(), Some("th_review_atomic"));
         assert_eq!(store.list_sessions(None).unwrap().len(), 1);
     }
 
