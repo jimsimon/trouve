@@ -676,6 +676,7 @@ const USAGE_MODEL_COLUMN_MIGRATION: &str =
     "ALTER TABLE usage ADD COLUMN model TEXT NOT NULL DEFAULT ''";
 
 const USAGE_MODEL_BACKFILL_MIGRATION: &str = "usage-model-backfill-v1";
+const CARRIED_ANCHOR_TARGET_BACKFILL_MIGRATION: &str = "carried-anchor-target-backfill-v1";
 
 // This repair runs once inside the same transaction as its completion marker.
 // It can therefore resume after an interrupted column migration without
@@ -1048,6 +1049,36 @@ fn backfill_usage_models(conn: &Connection) -> Result<()> {
     transaction.commit()?;
     Ok(())
 }
+fn backfill_code_review_carried_anchor_targets(conn: &Connection) -> Result<()> {
+    let transaction = write_transaction(conn)?;
+    let complete = transaction.query_row(
+        "SELECT EXISTS (SELECT 1 FROM data_migrations WHERE name = ?1)",
+        [CARRIED_ANCHOR_TARGET_BACKFILL_MIGRATION],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if complete {
+        transaction.commit()?;
+        return Ok(());
+    }
+
+    transaction.execute_batch(
+        "INSERT OR IGNORE INTO code_review_carried_anchor_targets (job_id, path, line)
+         SELECT job.id, verification.path, verification.line
+         FROM code_review_jobs AS job
+         JOIN code_review_carried_anchor_verifications AS verification
+           ON verification.repository = job.repository
+          AND verification.pull_number = job.pull_number
+          AND verification.head_sha = job.head_sha
+         WHERE job.status IN ('queued', 'running')",
+    )?;
+    transaction.execute(
+        "INSERT INTO data_migrations (name, completed_at)
+         VALUES (?1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+        [CARRIED_ANCHOR_TARGET_BACKFILL_MIGRATION],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
 
 fn apply_migrations(conn: &mut Connection) -> Result<()> {
     let had_theme_observation_publication_authority = conn.query_row(
@@ -1067,6 +1098,7 @@ fn apply_migrations(conn: &mut Connection) -> Result<()> {
         }
     }
     backfill_usage_models(conn)?;
+    backfill_code_review_carried_anchor_targets(conn)?;
     preserve_pre_authority_code_review_theme_transitions(conn)?;
     backfill_code_review_watermarks(conn)?;
     repair_legacy_code_review_publications(conn)?;
@@ -9441,6 +9473,18 @@ impl Store {
                  WHERE job_id = ?2",
                 params![id, parent_job_id],
             )?;
+            conn.execute(
+                "UPDATE code_review_carried_anchor_verifications AS verification
+                 SET presented_job_id = ?1
+                 WHERE verification.presented_job_id = ?2
+                   AND EXISTS (
+                     SELECT 1 FROM code_review_carried_anchor_targets AS active
+                     WHERE active.job_id = ?1
+                       AND active.path = verification.path
+                       AND active.line = verification.line
+                   )",
+                params![id, parent_job_id],
+            )?;
         }
         Ok(Some(
             conn.query_row(
@@ -12625,11 +12669,14 @@ impl Store {
         tx.execute(
             "UPDATE code_review_carried_anchor_verifications
              SET presented_at = NULL, presented_job_id = NULL
-             WHERE presented_job_id IN (
-               SELECT id FROM code_review_jobs
-               WHERE status IN ('failed', 'cancelled', 'stale')
-                 AND review_published = 0
-             )",
+             WHERE presented_at IS NOT NULL
+               AND (
+                 presented_job_id IS NULL
+                 OR presented_job_id IN (
+                   SELECT id FROM code_review_jobs
+                   WHERE status NOT IN ('queued', 'running')
+                 )
+               )",
             [],
         )?;
         if register_targets {
@@ -12645,12 +12692,9 @@ impl Store {
                     params![job_id, path, *line as i64],
                 )?;
                 tx.execute(
-                    "INSERT INTO code_review_carried_anchor_verifications
+                    "INSERT OR IGNORE INTO code_review_carried_anchor_verifications
                             (repository, pull_number, head_sha, path, line)
-                     VALUES (?1, ?2, ?3, ?4, ?5)
-                     ON CONFLICT(repository, pull_number, head_sha, path, line)
-                     DO UPDATE SET presented_at = NULL, presented_job_id = NULL
-                     WHERE verified_at IS NOT NULL",
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
                     params![repository, pull_number as i64, head_sha, path, *line as i64],
                 )?;
             }
@@ -14216,7 +14260,7 @@ impl Store {
                     {
                         let mut request = request.clone();
                         request.dedupe_key = format!(
-                            "{}#{}:{}:carried-anchor:{path}:{line}",
+                            "{}#{}:{}:carried-anchor:{path}:{line}:{id}",
                             record.job.repository, record.job.pull_number, record.job.head_sha
                         );
                         continuation_job = Self::enqueue_code_review_job_conn(&tx, &request)?;
@@ -15337,8 +15381,9 @@ impl Store {
                 && !another_continuation_active
             {
                 let mut request = request.clone();
-                request.dedupe_key =
-                    format!("{repository}#{pull_number}:{head_sha}:carried-anchor:{path}:{line}");
+                request.dedupe_key = format!(
+                    "{repository}#{pull_number}:{head_sha}:carried-anchor:{path}:{line}:{id}"
+                );
                 Self::enqueue_code_review_job_conn(&tx, &request)?
             } else {
                 None
@@ -21084,6 +21129,10 @@ mod tests {
 
         let store = Store::open(&path).unwrap();
         let first = enqueue_backoff_test_job(&store);
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            first.id
+        );
         let target = ("src/legacy.rs".to_owned(), 7);
         let migrated = store
             .claim_code_review_carried_anchor_page(
@@ -21111,6 +21160,9 @@ mod tests {
                 )
                 .unwrap()
         );
+        store
+            .finish_code_review_job(&first.id, "succeeded", "", "")
+            .unwrap();
 
         let mut second_request = backoff_test_job_request();
         second_request.dedupe_key = "legacy-anchor-evidence-reuse".into();
@@ -21138,6 +21190,69 @@ mod tests {
                 Some("migrated();".to_owned())
             )]
         );
+    }
+
+    #[test]
+    fn migrations_backfill_in_flight_carried_anchor_target_epochs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy-target-epochs.sqlite");
+        let (ordinary_id, continuation_id);
+        {
+            let store = Store::open(&path).unwrap();
+            let ordinary = enqueue_backoff_test_job(&store);
+            let mut continuation_request =
+                retry_request_for(&store, &ordinary.id, "legacy-target-continuation");
+            continuation_request.trigger = "carried-anchor-continuation".into();
+            let continuation = store
+                .enqueue_code_review_job(&continuation_request)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                store.claim_code_review_job().unwrap().unwrap().job.id,
+                ordinary.id
+            );
+            store
+                .conn
+                .lock()
+                .unwrap()
+                .execute(
+                    "INSERT INTO code_review_carried_anchor_verifications
+                            (repository, pull_number, head_sha, path, line)
+                     VALUES (?1, ?2, ?3, 'src/in_flight.rs', 9)",
+                    params![
+                        ordinary.repository,
+                        ordinary.pull_number as i64,
+                        ordinary.head_sha
+                    ],
+                )
+                .unwrap();
+            ordinary_id = ordinary.id;
+            continuation_id = continuation.id;
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "DELETE FROM data_migrations WHERE name = ?1",
+                [CARRIED_ANCHOR_TARGET_BACKFILL_MIGRATION],
+            )
+            .unwrap();
+            conn.execute_batch("DROP TABLE code_review_carried_anchor_targets")
+                .unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        for job_id in [&ordinary_id, &continuation_id] {
+            let targets = store
+                .conn
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM code_review_carried_anchor_targets
+                     WHERE job_id = ?1 AND path = 'src/in_flight.rs' AND line = 9",
+                    [job_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap();
+            assert_eq!(targets, 1, "in-flight job {job_id} lost its target epoch");
+        }
     }
 
     #[test]
@@ -22506,8 +22621,8 @@ mod tests {
             ]
         );
         assert!(
-            third_page.has_more,
-            "a refreshed review epoch must continue through omitted cached evidence"
+            !third_page.has_more,
+            "a continuation must preserve already presented cached evidence"
         );
         let covered = first_page
             .targets
@@ -22648,6 +22763,22 @@ mod tests {
             )
             .unwrap();
         assert_eq!(reclaimed.targets, first_page.targets);
+        let mut retry_released_request =
+            retry_request_for(&store, &released.id, "retry-released-continuation");
+        retry_released_request.trigger = "carried-anchor-continuation".into();
+        let (_, retried) = store
+            .finish_code_review_job_with_continuation(
+                &released.id,
+                "failed",
+                "",
+                "another temporary failure",
+                Some(&retry_released_request),
+            )
+            .unwrap();
+        assert!(
+            retried.is_some(),
+            "a later attempt at the same anchor needs a distinct dedupe key"
+        );
     }
 
     #[test]
@@ -22714,6 +22845,41 @@ mod tests {
                 .unwrap()
         );
 
+        let mut overlapping_request = backoff_test_job_request();
+        overlapping_request.dedupe_key = "carried-evidence-overlapping".into();
+        let overlapping = store
+            .enqueue_code_review_job(&overlapping_request)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            overlapping.id
+        );
+        let overlapping_page = store
+            .claim_code_review_carried_anchor_page(
+                &overlapping.id,
+                &overlapping.repository,
+                overlapping.pull_number,
+                &overlapping.head_sha,
+                &targets,
+                true,
+                3,
+            )
+            .unwrap();
+        assert_eq!(
+            overlapping_page.targets,
+            vec![("src/retry.rs".to_owned(), 3)]
+        );
+        assert!(
+            overlapping_page.cached.is_empty(),
+            "an active presenter must retain exclusive cached evidence ownership"
+        );
+        store
+            .finish_code_review_job(&overlapping.id, "failed", "", "overlap failed")
+            .unwrap();
+        store
+            .finish_code_review_job(&first.id, "succeeded", "", "")
+            .unwrap();
         let mut second_request = backoff_test_job_request();
         second_request.dedupe_key = "carried-evidence-second".into();
         let second = store
@@ -22787,19 +22953,11 @@ mod tests {
                     .unwrap()
             );
         }
-        // Simulate an older overlapping epoch that left every cached row
-        // pending. The current review excludes the first target, so neither
-        // its page nor its continuation signal may observe that stale row.
+        // Finish the older review so a new ordinary epoch can replay its
+        // cached evidence. Continuations below inherit presentation ownership
+        // and therefore advance instead of restarting at the first page.
         store
-            .claim_code_review_carried_anchor_page(
-                &first.id,
-                &first.repository,
-                first.pull_number,
-                &first.head_sha,
-                &all_targets,
-                true,
-                0,
-            )
+            .finish_code_review_job(&first.id, "succeeded", "", "")
             .unwrap();
 
         let active_targets = all_targets[1..].to_vec();
