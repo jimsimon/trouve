@@ -10325,6 +10325,24 @@ impl Engine {
         )
     }
 
+    /// Consumes a command's durable row definitively without touching any
+    /// finding, via a prefix that can never match one. Shared by every
+    /// terminal drop (unauthorized commenter, unverifiable installation) so
+    /// a future change to the consumption mechanism cannot update one
+    /// branch and miss another.
+    fn consume_unmatched_threadless_command(
+        &self,
+        command: &crate::store::PendingThreadlessCommand,
+    ) -> Result<()> {
+        let unmatched = crate::store::PendingThreadlessCommand {
+            finding_prefix: "rvf_never-matches".to_owned(),
+            ..command.clone()
+        };
+        self.store
+            .apply_threadless_resolve_command(&unmatched, "", None)
+            .map(|_| ())
+    }
+
     /// Post a short guidance reply to a malformed command comment.
     async fn reply_to_threadless_command(
         &self,
@@ -10502,14 +10520,7 @@ impl Engine {
                  installation lacks access to the collaborator-permission API",
                 command.author
             ));
-            let unverifiable = crate::store::PendingThreadlessCommand {
-                finding_prefix: "rvf_never-matches".to_owned(),
-                ..command.clone()
-            };
-            if let Err(error) = self
-                .store
-                .apply_threadless_resolve_command(&unverifiable, "", None)
-            {
+            if let Err(error) = self.consume_unmatched_threadless_command(command) {
                 self.record_review_error(format!(
                     "consuming an unverifiable threadless command failed: {error:#}"
                 ));
@@ -10533,17 +10544,7 @@ impl Engine {
                 author = %command.author,
                 "dropping threadless resolve command from a commenter without write permission"
             );
-            // A definitive outcome: consume the row (via a prefix that can
-            // never match a finding) so an unauthorized command is not
-            // retried forever.
-            let unauthorized = crate::store::PendingThreadlessCommand {
-                finding_prefix: "rvf_never-matches".to_owned(),
-                ..command.clone()
-            };
-            if let Err(error) = self
-                .store
-                .apply_threadless_resolve_command(&unauthorized, "", None)
-            {
+            if let Err(error) = self.consume_unmatched_threadless_command(command) {
                 self.record_review_error(format!(
                     "consuming unauthorized threadless command failed: {error:#}"
                 ));
