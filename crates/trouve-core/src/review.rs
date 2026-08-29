@@ -78,6 +78,7 @@ const REVIEW_THREAD_PROGRESS_MAX_ENTRIES: usize = 128;
 const REVIEW_PUBLICATION_LOOKUP_MAX_PAGES: u64 = 100;
 const REVIEW_PUBLICATION_LOOKUP_BUDGET: Duration = Duration::from_secs(60);
 const REVIEW_PUBLICATION_LOOKUP_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const REVIEW_PUBLICATION_ABSENCE_CONFIRMATIONS: u32 = 3;
 /// Obsolete blocking verdict cleanup is resumable and deliberately small so
 /// it cannot monopolize the repository poll behind a large review history.
 const REVIEW_BLOCKING_CLEANUP_MAX_PAGES_PER_PASS: u64 = 3;
@@ -8437,10 +8438,10 @@ impl Engine {
         &self,
         job: &trouve_protocol::CodeReviewJob,
     ) -> Result<()> {
-        match self
-            .store
-            .resolve_code_review_publication_absence(&job.id)?
-        {
+        match self.store.resolve_code_review_publication_absence(
+            &job.id,
+            REVIEW_PUBLICATION_ABSENCE_CONFIRMATIONS,
+        )? {
             crate::store::CodeReviewPublicationAbsenceOutcome::Pending
             | crate::store::CodeReviewPublicationAbsenceOutcome::AcceptedPending
             | crate::store::CodeReviewPublicationAbsenceOutcome::NewerPublicationPending => {
@@ -8452,6 +8453,13 @@ impl Engine {
                 pull_number = job.pull_number,
                 "review publication acceptance was not observed locally and the round is \
                  superseded; abandoning its publication without retrying the POST"
+            ),
+            crate::store::CodeReviewPublicationAbsenceOutcome::Quarantined => tracing::warn!(
+                job_id = %job.id,
+                repository = %job.repository,
+                pull_number = job.pull_number,
+                "review publication outcome remains ambiguous after repeated marker scans; \
+                 stopping automatic reconciliation without retrying the POST"
             ),
         }
         self.emit_code_review_job_updated(&job.id)?;
@@ -8911,9 +8919,17 @@ impl Engine {
         }
 
         let published = match self.find_published_review(api, job).await {
-            Ok(Some(published)) => published,
+            Ok(Some(published)) => {
+                self.store
+                    .reset_code_review_publication_marker_absences(&job.id)?;
+                published
+            }
             Ok(None) => return self.resolve_dispatched_publication_absence(job).await,
-            Err(error) => return Err(error),
+            Err(error) => {
+                self.store
+                    .reset_code_review_publication_marker_absences(&job.id)?;
+                return Err(error);
+            }
         };
         let publication_findings = findings
             .iter()
@@ -27744,7 +27760,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatched_publication_absence_stays_sticky_until_superseded() {
+    async fn dispatched_publication_absence_quarantines_without_reposting() {
         let store = crate::store::Store::open_in_memory().unwrap();
         let with_head = |store: &crate::store::Store, key: &str, head: &str| {
             let mut request = test_review_job_request(key);
@@ -27850,7 +27866,7 @@ mod tests {
                 .record_code_review_projection_failure(&current.id, "other projection", true)
                 .unwrap();
         }
-        for absence in 1..=5 {
+        for absence in 1..REVIEW_PUBLICATION_ABSENCE_CONFIRMATIONS {
             assert!(
                 engine
                     .resolve_dispatched_publication_absence(&current)
@@ -27867,9 +27883,28 @@ mod tests {
                     .publication_dispatched
             );
         }
+        engine
+            .resolve_dispatched_publication_absence(&current)
+            .await
+            .unwrap();
         let record = engine.store.code_review_job(&current.id).unwrap().unwrap();
         assert!(record.publication_dispatched);
         assert!(record.publication_claimed);
+        assert!(
+            record
+                .job
+                .check_sync_error
+                .contains("outcome remains ambiguous")
+        );
+        assert!(
+            engine
+                .store
+                .code_review_jobs_with_projection_errors(10)
+                .unwrap()
+                .iter()
+                .all(|job| job.id != current.id),
+            "quarantine must bound marker scans without releasing the POST fence"
+        );
 
         // An accepted POST can only be experiencing listing lag. It remains
         // queued for reconciliation however long listing visibility lags.
@@ -27906,7 +27941,7 @@ mod tests {
                 .mark_code_review_publication_accepted(&accepted.id)
                 .unwrap()
         );
-        for _ in 0..=5 {
+        for _ in 0..=REVIEW_PUBLICATION_ABSENCE_CONFIRMATIONS {
             assert!(
                 engine
                     .resolve_dispatched_publication_absence(&accepted)
