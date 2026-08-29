@@ -157,6 +157,7 @@ const COORDINATOR_MAX_TOOL_CALLS: u64 = 4;
 const REVIEW_ANCHOR_TREE_MAX_BYTES: usize = 16 * 1024 * 1024;
 const REVIEW_ANCHOR_MAX_DISTINCT_BLOBS: usize = MAX_CANDIDATE_FINDINGS;
 const REVIEW_ANCHOR_BLOB_MAX_BYTES: usize = 2 * 1024 * 1024;
+const REVIEW_ANCHOR_ERROR_MAX_BYTES: usize = 2 * 1024;
 const REVIEW_ANCHOR_BLOBS_MAX_BYTES: usize = 16 * 1024 * 1024;
 const INVALID_OUTSIDE_ANCHOR_REJECTION: &str = "insufficient_evidence: final finding anchor does not identify a validated line in a tracked regular file at the immutable review head";
 const MANUAL_REVIEW_MENTION: &str = "@trouve-ai";
@@ -6345,6 +6346,7 @@ impl Engine {
                 analysis_handle.await.ok().flatten()
             };
         let mut carried_anchor_has_more = false;
+        let carried_diff_contents = diff_line_contents(&diff_files);
         let parsed = if coordinator_candidates.is_empty() && previous_findings.is_empty() {
             if let Some(task) = queued_coordinator.take() {
                 let skipped = self
@@ -6387,6 +6389,7 @@ impl Engine {
                     &job,
                     &previous_findings,
                     &diff_files,
+                    &carried_diff_contents,
                     repository_path.as_path(),
                     superseded,
                 )
@@ -6623,6 +6626,8 @@ impl Engine {
                 &validated.resolved_findings,
                 &previous_findings,
                 &diff_files,
+                &carried_diff_contents,
+                &job.review_base_sha,
                 &carried_anchor_lines,
             );
             let themes = coordinator_validated_themes(
@@ -10693,10 +10698,12 @@ impl Engine {
         job: &trouve_protocol::CodeReviewJob,
         findings: &[trouve_protocol::CodeReviewFinding],
         diff_files: &[ReviewDiffFile],
+        diff_contents: &HashMap<(String, u64, bool), String>,
         repository_path: &std::path::Path,
         cancel: &CancellationToken,
     ) -> Result<(HashMap<(String, u64), Option<String>>, bool)> {
-        let targets = carried_anchor_targets(findings, diff_files);
+        let targets =
+            carried_anchor_targets(findings, diff_files, diff_contents, &job.review_base_sha);
         let page = self.store.claim_code_review_carried_anchor_page(
             &job.id,
             &job.repository,
@@ -10743,21 +10750,52 @@ impl Engine {
                     lines.insert(key, content);
                 }
                 Err(error) => {
-                    self.store.release_code_review_carried_anchor_read(
-                        &job.id,
-                        &job.repository,
-                        job.pull_number,
-                        &job.head_sha,
-                        &path,
-                        line,
-                    )?;
-                    has_more = true;
-                    tracing::debug!(
-                        path,
-                        line,
-                        %error,
-                        "carried anchor line unavailable; released for a later bounded pass"
-                    );
+                    if cancel.is_cancelled() {
+                        self.store.release_code_review_carried_anchor_read(
+                            &job.id,
+                            &job.repository,
+                            job.pull_number,
+                            &job.head_sha,
+                            &path,
+                            line,
+                        )?;
+                        ensure_review_current(cancel)?;
+                    }
+                    let error = bounded_utf8(&error, REVIEW_ANCHOR_ERROR_MAX_BYTES, "…");
+                    let retryable = self
+                        .store
+                        .fail_code_review_carried_anchor_read(
+                            &job.id,
+                            &job.repository,
+                            job.pull_number,
+                            &job.head_sha,
+                            &path,
+                            line,
+                            &error,
+                            CARRIED_ANCHOR_MAX_READ_ATTEMPTS,
+                        )?
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "carried anchor reservation changed before failure was recorded"
+                            )
+                        })?;
+                    has_more |= retryable;
+                    if retryable {
+                        tracing::debug!(
+                            path,
+                            line,
+                            error,
+                            "carried anchor line unavailable; released for a later bounded pass"
+                        );
+                    } else {
+                        tracing::warn!(
+                            path,
+                            line,
+                            error,
+                            "carried anchor line remains unavailable after bounded retries; \
+                             left open for manual verification"
+                        );
+                    }
                 }
             }
         }
@@ -16767,8 +16805,15 @@ fn diff_comment_lines(files: &[ReviewDiffFile]) -> HashSet<(String, u64, bool)> 
     valid
 }
 
+fn diff_range(range: &str, prefix: char) -> Option<(u64, u64)> {
+    let mut fields = range.strip_prefix(prefix)?.split(',');
+    let start = fields.next()?.parse().ok()?;
+    let count = fields.next().map(str::parse).transpose().ok()?.unwrap_or(1);
+    Some((start, count))
+}
+
 fn diff_range_start(range: &str, prefix: char) -> Option<u64> {
-    range.strip_prefix(prefix)?.split(',').next()?.parse().ok()
+    diff_range(range, prefix).map(|(start, _count)| start)
 }
 
 /// Source text per (path, line, left-side) for every line the diff carries,
@@ -17004,32 +17049,93 @@ fn finding_scope_blocks(evidence: &trouve_protocol::CodeReviewFindingEvidence) -
     evidence.change_scope != "unverified"
 }
 
-fn finding_anchor_is_in_diff(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HistoricalAnchorLocation {
+    InDiff,
+    HeadLine(u64),
+    Unverifiable,
+}
+
+/// Map a finding's durable head coordinate through this round's diff. The
+/// historical coordinate is meaningful only when its observed head is the
+/// review base. If the exact old-side line is in a hunk, the coordinator has
+/// already seen the anchor; otherwise additions and deletions before it shift
+/// the current-head line deterministically.
+fn historical_anchor_location(
     finding: &trouve_protocol::CodeReviewFinding,
+    files: &[ReviewDiffFile],
     diff_contents: &HashMap<(String, u64, bool), String>,
+    review_base_sha: &str,
+) -> HistoricalAnchorLocation {
+    if finding.side.eq_ignore_ascii_case("left")
+        || finding.observed_head.is_empty()
+        || finding.observed_head != review_base_sha
+    {
+        return HistoricalAnchorLocation::Unverifiable;
+    }
+    if diff_contents.contains_key(&(finding.path.clone(), finding.line, true)) {
+        return HistoricalAnchorLocation::InDiff;
+    }
+    let Some(file) = files.iter().find(|file| file.path == finding.path) else {
+        return HistoricalAnchorLocation::HeadLine(finding.line);
+    };
+    let mut mapped = i128::from(finding.line);
+    let mut saw_hunk = false;
+    for line in file.diff.lines().filter(|line| line.starts_with("@@ ")) {
+        let mut ranges = line.split_whitespace();
+        let _marker = ranges.next();
+        let Some((old_start, old_count)) = ranges.next().and_then(|range| diff_range(range, '-'))
+        else {
+            continue;
+        };
+        let Some((_new_start, new_count)) = ranges.next().and_then(|range| diff_range(range, '+'))
+        else {
+            continue;
+        };
+        saw_hunk = true;
+        if old_count > 0
+            && finding.line >= old_start
+            && finding.line < old_start.saturating_add(old_count)
+        {
+            return HistoricalAnchorLocation::InDiff;
+        }
+        let hunk_is_before = if old_count == 0 {
+            old_start < finding.line
+        } else {
+            old_start.saturating_add(old_count) <= finding.line
+        };
+        if hunk_is_before {
+            mapped += i128::from(new_count) - i128::from(old_count);
+        }
+    }
+    if !saw_hunk {
+        return HistoricalAnchorLocation::Unverifiable;
+    }
+    u64::try_from(mapped).ok().filter(|line| *line > 0).map_or(
+        HistoricalAnchorLocation::Unverifiable,
+        HistoricalAnchorLocation::HeadLine,
+    )
+}
+
+fn finding_requires_head_verification(
+    finding: &trouve_protocol::CodeReviewFinding,
+    location: HistoricalAnchorLocation,
 ) -> bool {
-    diff_contents.contains_key(&(
-        finding.path.clone(),
-        finding.line,
-        finding.side.eq_ignore_ascii_case("left"),
-    ))
+    finding_is_blocking(&finding.severity, &finding.confidence)
+        && finding_scope_blocks(&finding.evidence)
+        && location != HistoricalAnchorLocation::InDiff
 }
 
 fn carried_anchor_targets(
     findings: &[trouve_protocol::CodeReviewFinding],
     files: &[ReviewDiffFile],
+    diff_contents: &HashMap<(String, u64, bool), String>,
+    review_base_sha: &str,
 ) -> Vec<(String, u64)> {
-    let diff_contents = diff_line_contents(files);
     let mut seen = HashSet::new();
     findings
         .iter()
-        .filter(|finding| {
-            finding.status == "open"
-                && finding.line > 0
-                && finding_is_blocking(&finding.severity, &finding.confidence)
-                && finding_scope_blocks(&finding.evidence)
-                && !finding_anchor_is_in_diff(finding, &diff_contents)
-        })
+        .filter(|finding| finding.status == "open" && finding.line > 0)
         .filter_map(|finding| {
             let relative = std::path::Path::new(&finding.path);
             if relative.is_absolute()
@@ -17039,13 +17145,22 @@ fn carried_anchor_targets(
             {
                 return None;
             }
-            let key = (finding.path.clone(), finding.line);
+            let location =
+                historical_anchor_location(finding, files, diff_contents, review_base_sha);
+            if !finding_requires_head_verification(finding, location) {
+                return None;
+            }
+            let HistoricalAnchorLocation::HeadLine(line) = location else {
+                return None;
+            };
+            let key = (finding.path.clone(), line);
             seen.insert(key.clone()).then_some(key)
         })
         .collect()
 }
 
 const CARRIED_ANCHOR_PREFETCH_PAGE_SIZE: usize = 32;
+const CARRIED_ANCHOR_MAX_READ_ATTEMPTS: u32 = 3;
 
 fn carried_anchor_continuation_request(
     record: &CodeReviewJobRecord,
@@ -17119,9 +17234,10 @@ fn verified_resolution_ids(
     claims: &[ResolvedFindingClaim],
     previous_findings: &[trouve_protocol::CodeReviewFinding],
     files: &[ReviewDiffFile],
+    diff_contents: &HashMap<(String, u64, bool), String>,
+    review_base_sha: &str,
     carried_anchor_lines: &HashMap<(String, u64), Option<String>>,
 ) -> Vec<String> {
-    let diff_contents = diff_line_contents(files);
     let claim_by_id = claims
         .iter()
         .map(|claim| (claim.finding_id.as_str(), claim))
@@ -17138,17 +17254,19 @@ fn verified_resolution_ids(
                 // pass-through; downstream resolution guards them.
                 return true;
             };
-            let requires_head_claim = finding_is_blocking(&finding.severity, &finding.confidence)
-                && finding_scope_blocks(&finding.evidence)
-                && !finding_anchor_is_in_diff(finding, &diff_contents);
-            if !requires_head_claim {
+            let location =
+                historical_anchor_location(finding, files, diff_contents, review_base_sha);
+            if !finding_requires_head_verification(finding, location) {
                 return true;
             }
+            let current = match location {
+                HistoricalAnchorLocation::HeadLine(line) => {
+                    carried_anchor_lines.get(&(finding.path.clone(), line))
+                }
+                HistoricalAnchorLocation::InDiff | HistoricalAnchorLocation::Unverifiable => None,
+            };
             let verified = claim_by_id.get(*id).is_some_and(|claim| {
-                carried_resolution_claim_is_verified(
-                    &claim.current_anchor_quote,
-                    carried_anchor_lines.get(&(finding.path.clone(), finding.line)),
-                )
+                carried_resolution_claim_is_verified(&claim.current_anchor_quote, current)
             });
             if !verified {
                 tracing::warn!(
@@ -19831,7 +19949,7 @@ mod tests {
             theme_ids: Vec::new(),
             github_thread_id: None,
             resolved_at: None,
-            observed_head: String::new(),
+            observed_head: "base".into(),
             resolved_head: String::new(),
             resolved_by_job_id: String::new(),
         }
@@ -19884,6 +20002,7 @@ mod tests {
             .into(),
             generated_header: None,
         }];
+        let diff_contents = diff_line_contents(&files);
         let anchors = HashMap::from([
             (
                 ("src/untouched.rs".to_owned(), 7),
@@ -19909,6 +20028,8 @@ mod tests {
             &[claim("rvf_carried", "guarded();")],
             &previous,
             &files,
+            &diff_contents,
+            "base",
             &anchors,
         );
         // Only the exact in-window anchor resolves by id; another anchor in
@@ -19953,7 +20074,8 @@ mod tests {
             )
         }));
 
-        let targets = carried_anchor_targets(&findings, &files);
+        let diff_contents = diff_line_contents(&files);
+        let targets = carried_anchor_targets(&findings, &files, &diff_contents, "base");
 
         assert_eq!(targets.len(), 66);
         assert!(targets.contains(&("src/touched.rs".to_owned(), 1)));
@@ -19961,6 +20083,69 @@ mod tests {
         assert!(targets.contains(&("src/touched.rs".to_owned(), 32)));
         assert!(targets.contains(&("src/duplicate.rs".to_owned(), 7)));
         assert_eq!(targets.last(), Some(&("src/carried_33.rs".to_owned(), 1)));
+    }
+    #[test]
+    fn carried_anchor_verification_remaps_lines_shifted_by_the_current_diff() {
+        let finding = open_history_finding("rvf_shifted", "src/shifted.rs", 100, "high");
+        let files = vec![ReviewDiffFile {
+            path: "src/shifted.rs".into(),
+            diff: "diff --git a/src/shifted.rs b/src/shifted.rs
+--- a/src/shifted.rs
++++ b/src/shifted.rs
+@@ -50,0 +51 @@
++inserted();
+"
+            .into(),
+            generated_header: None,
+        }];
+        let diff_contents = diff_line_contents(&files);
+        assert_eq!(
+            carried_anchor_targets(
+                std::slice::from_ref(&finding),
+                &files,
+                &diff_contents,
+                "base",
+            ),
+            vec![("src/shifted.rs".to_owned(), 101)]
+        );
+
+        let claim = ResolvedFindingClaim {
+            finding_id: finding.id.clone(),
+            current_anchor_quote: "still_broken();".into(),
+        };
+        let stale_line = HashMap::from([(
+            ("src/shifted.rs".to_owned(), 100),
+            Some("still_broken();".to_owned()),
+        )]);
+        assert!(
+            verified_resolution_ids(
+                Vec::new(),
+                std::slice::from_ref(&claim),
+                std::slice::from_ref(&finding),
+                &files,
+                &diff_contents,
+                "base",
+                &stale_line,
+            )
+            .is_empty()
+        );
+
+        let remapped_line = HashMap::from([(
+            ("src/shifted.rs".to_owned(), 101),
+            Some("still_broken();".to_owned()),
+        )]);
+        assert_eq!(
+            verified_resolution_ids(
+                Vec::new(),
+                &[claim],
+                &[finding],
+                &files,
+                &diff_contents,
+                "base",
+                &remapped_line,
+            ),
+            vec!["rvf_shifted".to_owned()]
+        );
     }
 
     #[test]

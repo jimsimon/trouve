@@ -517,6 +517,9 @@ CREATE TABLE IF NOT EXISTS code_review_carried_anchor_verifications (
   content TEXT,
   presented_at TEXT,
   presented_job_id TEXT REFERENCES code_review_jobs(id),
+  read_attempts INTEGER NOT NULL DEFAULT 0,
+  unreadable_at TEXT,
+  last_read_error TEXT NOT NULL DEFAULT '',
   PRIMARY KEY (repository, pull_number, head_sha, path, line)
 );
 CREATE INDEX IF NOT EXISTS code_review_carried_anchor_claims
@@ -956,6 +959,11 @@ const MIGRATIONS: &[&str] = &[
      )",
     "ALTER TABLE code_review_jobs
        ADD COLUMN carried_anchor_targets_legacy INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE code_review_carried_anchor_verifications
+       ADD COLUMN read_attempts INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE code_review_carried_anchor_verifications ADD COLUMN unreadable_at TEXT",
+    "ALTER TABLE code_review_carried_anchor_verifications
+       ADD COLUMN last_read_error TEXT NOT NULL DEFAULT ''",
 ];
 
 /// Blocking-tier predicate for one findings row under the given SQL alias:
@@ -12712,7 +12720,8 @@ impl Store {
         tx.execute(
             "UPDATE code_review_carried_anchor_verifications
              SET presented_at = NULL, presented_job_id = NULL
-             WHERE presented_at IS NOT NULL
+             WHERE repository = ?1 AND pull_number = ?2 AND head_sha = ?3
+               AND presented_at IS NOT NULL
                AND (
                  presented_job_id IS NULL
                  OR presented_job_id IN (
@@ -12720,7 +12729,7 @@ impl Store {
                    WHERE status NOT IN ('queued', 'running')
                  )
                )",
-            [],
+            params![repository, pull_number as i64, head_sha],
         )?;
 
         let selected = {
@@ -12734,6 +12743,7 @@ impl Store {
                  WHERE verification.repository = ?1 AND verification.pull_number = ?2
                    AND verification.head_sha = ?3
                    AND verification.verified_at IS NULL
+                   AND verification.unreadable_at IS NULL
                    AND verification.claim_job_id IS NULL
                  ORDER BY verification.path, verification.line
                  LIMIT ?4",
@@ -12792,6 +12802,7 @@ impl Store {
                  SET claim_job_id = ?6
                  WHERE repository = ?1 AND pull_number = ?2 AND head_sha = ?3
                    AND path = ?4 AND line = ?5 AND verified_at IS NULL
+                   AND unreadable_at IS NULL
                    AND claim_job_id IS NULL",
                 params![
                     repository,
@@ -12833,6 +12844,7 @@ impl Store {
                  AND verification.head_sha = ?3
                  AND (
                    (verification.verified_at IS NULL
+                    AND verification.unreadable_at IS NULL
                     AND verification.claim_job_id IS NULL)
                    OR (verification.verified_at IS NOT NULL
                        AND verification.presented_at IS NULL)
@@ -12907,6 +12919,57 @@ impl Store {
                 job_id
             ],
         )? > 0)
+    }
+
+    /// Record an unsuccessful immutable-object read. Transient failures return
+    /// `Some(true)` and release the target for another bounded pass. Once the
+    /// attempt budget is exhausted the row enters an explicit unreadable
+    /// state, returns `Some(false)`, and is excluded from future claims while
+    /// its finding remains open for manual verification.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn fail_code_review_carried_anchor_read(
+        &self,
+        job_id: &str,
+        repository: &str,
+        pull_number: u64,
+        head_sha: &str,
+        path: &str,
+        line: u64,
+        error: &str,
+        max_attempts: u32,
+    ) -> Result<Option<bool>> {
+        let now = chrono::Utc::now().to_rfc3339();
+        Ok(self
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "UPDATE code_review_carried_anchor_verifications
+                 SET read_attempts = read_attempts + 1,
+                     claim_job_id = NULL,
+                     last_read_error = ?7,
+                     unreadable_at = CASE
+                       WHEN read_attempts + 1 >= ?8 THEN ?9
+                       ELSE NULL
+                     END
+                 WHERE repository = ?1 AND pull_number = ?2 AND head_sha = ?3
+                   AND path = ?4 AND line = ?5 AND claim_job_id = ?6
+                   AND verified_at IS NULL AND unreadable_at IS NULL
+                 RETURNING unreadable_at IS NULL",
+                params![
+                    repository,
+                    pull_number as i64,
+                    head_sha,
+                    path,
+                    line as i64,
+                    job_id,
+                    error,
+                    i64::from(max_attempts.max(1)),
+                    now
+                ],
+                |row| row.get(0),
+            )
+            .optional()?)
     }
 
     /// The pull request whose lifecycle comment has this GitHub comment id,
@@ -23013,6 +23076,82 @@ mod tests {
                 .unwrap();
             assert_eq!(active_continuations, 0);
         }
+    }
+    #[test]
+    fn permanently_unreadable_carried_anchors_stop_retrying() {
+        let store = Store::open_in_memory().unwrap();
+        let job = enqueue_backoff_test_job(&store);
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            job.id
+        );
+        let targets = vec![("src/unreadable.rs".to_owned(), 17)];
+
+        for attempt in 1..=3 {
+            let page = store
+                .claim_code_review_carried_anchor_page(
+                    &job.id,
+                    &job.repository,
+                    job.pull_number,
+                    &job.head_sha,
+                    &targets,
+                    attempt == 1,
+                    32,
+                )
+                .unwrap();
+            assert_eq!(page.targets, targets);
+            assert_eq!(
+                store
+                    .fail_code_review_carried_anchor_read(
+                        &job.id,
+                        &job.repository,
+                        job.pull_number,
+                        &job.head_sha,
+                        "src/unreadable.rs",
+                        17,
+                        "permanent object read failure",
+                        3,
+                    )
+                    .unwrap(),
+                Some(attempt < 3)
+            );
+        }
+
+        let exhausted = store
+            .claim_code_review_carried_anchor_page(
+                &job.id,
+                &job.repository,
+                job.pull_number,
+                &job.head_sha,
+                &targets,
+                false,
+                32,
+            )
+            .unwrap();
+        assert!(exhausted.targets.is_empty());
+        assert!(!exhausted.has_more);
+
+        let conn = store.conn.lock().unwrap();
+        let state = conn
+            .query_row(
+                "SELECT read_attempts, unreadable_at IS NOT NULL, last_read_error
+                 FROM code_review_carried_anchor_verifications
+                 WHERE repository = ?1 AND pull_number = ?2 AND head_sha = ?3
+                   AND path = 'src/unreadable.rs' AND line = 17",
+                params![&job.repository, job.pull_number as i64, &job.head_sha],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, bool>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            state,
+            (3, true, "permanent object read failure".to_owned(),)
+        );
     }
 
     #[test]
