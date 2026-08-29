@@ -912,8 +912,19 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE code_review_findings ADD COLUMN collapse_terminal_attempts INTEGER NOT NULL DEFAULT 0",
     "CREATE TABLE IF NOT EXISTS code_review_threadless_command_cursors (
        repository TEXT PRIMARY KEY,
-       last_comment_id INTEGER NOT NULL DEFAULT 0
+       last_comment_id INTEGER NOT NULL DEFAULT 0,
+       last_retry_comment_id INTEGER NOT NULL DEFAULT 0,
+       retry_next INTEGER NOT NULL DEFAULT 1
      )",
+    "ALTER TABLE code_review_carried_anchor_verifications ADD COLUMN line_present INTEGER",
+    "ALTER TABLE code_review_carried_anchor_verifications ADD COLUMN content TEXT",
+    "UPDATE code_review_carried_anchor_verifications
+       SET verified_at = NULL, claim_job_id = NULL
+       WHERE verified_at IS NOT NULL AND line_present IS NULL",
+    "ALTER TABLE code_review_threadless_command_cursors
+       ADD COLUMN last_retry_comment_id INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE code_review_threadless_command_cursors
+       ADD COLUMN retry_next INTEGER NOT NULL DEFAULT 1",
 ];
 
 /// Blocking-tier predicate for one findings row under the given SQL alias:
@@ -12584,24 +12595,6 @@ impl Store {
                 )?;
             }
         }
-        let cached = {
-            let mut stmt = tx.prepare(
-                "SELECT path, line, line_present, content
-                 FROM code_review_carried_anchor_verifications
-                 WHERE repository = ?1 AND pull_number = ?2 AND head_sha = ?3
-                   AND verified_at IS NOT NULL
-                 ORDER BY path, line",
-            )?;
-            stmt.query_map(params![repository, pull_number as i64, head_sha], |row| {
-                let present: bool = row.get(2)?;
-                Ok((
-                    row.get(0)?,
-                    row.get::<_, i64>(1)? as u64,
-                    present.then(|| row.get(3)).transpose()?,
-                ))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-        };
         let selected = {
             let mut stmt = tx.prepare(
                 "SELECT path, line
@@ -12614,6 +12607,33 @@ impl Store {
             stmt.query_map(
                 params![repository, pull_number as i64, head_sha, limit as i64],
                 |row| Ok((row.get(0)?, row.get::<_, i64>(1)? as u64)),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let cached = {
+            let mut stmt = tx.prepare(
+                "SELECT path, line, line_present, content
+                 FROM code_review_carried_anchor_verifications
+                 WHERE repository = ?1 AND pull_number = ?2 AND head_sha = ?3
+                   AND verified_at IS NOT NULL
+                 ORDER BY path, line
+                 LIMIT ?4",
+            )?;
+            stmt.query_map(
+                params![
+                    repository,
+                    pull_number as i64,
+                    head_sha,
+                    limit.saturating_sub(selected.len()) as i64
+                ],
+                |row| {
+                    let present: bool = row.get(2)?;
+                    Ok((
+                        row.get(0)?,
+                        row.get::<_, i64>(1)? as u64,
+                        present.then(|| row.get(3)).transpose()?,
+                    ))
+                },
             )?
             .collect::<rusqlite::Result<Vec<_>>>()?
         };
@@ -15523,75 +15543,166 @@ impl Store {
         Ok(inserted > 0)
     }
 
-    /// Return a bounded, durable round-robin page of per-pull head commands.
+    /// Return a bounded, durable two-lane page of per-pull head commands.
     /// Only the oldest command for each pull is eligible, so opposite commands
-    /// cannot overtake one another. The repository cursor rotates across
-    /// retrying pulls and survives restarts, keeping later pulls reachable.
+    /// cannot overtake one another. Fresh IDs advance one high-water mark,
+    /// while retrying IDs rotate behind a separate cursor and always receive
+    /// capacity even when new commands continuously arrive.
     pub fn pending_threadless_commands(
         &self,
         repository: &str,
         limit: usize,
     ) -> Result<Vec<PendingThreadlessCommand>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
         let conn = self.conn.lock().unwrap();
         let tx = write_transaction(&conn)?;
-        let cursor = tx
+        let (cursor, retry_cursor, retry_next) = tx
             .query_row(
-                "SELECT last_comment_id
+                "SELECT last_comment_id, last_retry_comment_id, retry_next
                  FROM code_review_threadless_command_cursors
                  WHERE repository = ?1",
                 params![repository],
-                |row| row.get::<_, i64>(0),
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, bool>(2)?,
+                    ))
+                },
             )
             .optional()?
-            .unwrap_or(0);
-        let commands = {
+            .unwrap_or((0, 0, true));
+        let (retrying, fresh) = {
             let mut stmt = tx.prepare(
-                "SELECT command.trigger_key, command.repository, command.pull_number,
-                        command.comment_id, command.author, command.resolve,
-                        command.finding_prefix, command.reason, command.created_at
-                 FROM code_review_pending_threadless_commands AS command
-                 WHERE command.repository = ?1
-                   AND NOT EXISTS (
-                     SELECT 1
-                     FROM code_review_pending_threadless_commands AS older
-                     WHERE older.repository = command.repository
-                       AND older.pull_number = command.pull_number
-                       AND older.comment_id < command.comment_id
-                   )
-                 ORDER BY CASE WHEN command.comment_id > ?2 THEN 0 ELSE 1 END,
-                          command.comment_id
-                 LIMIT ?3",
+                "WITH eligible AS (
+                   SELECT command.trigger_key, command.repository, command.pull_number,
+                          command.comment_id, command.author, command.resolve,
+                          command.finding_prefix, command.reason, command.created_at
+                   FROM code_review_pending_threadless_commands AS command
+                   WHERE command.repository = ?1
+                     AND NOT EXISTS (
+                       SELECT 1
+                       FROM code_review_pending_threadless_commands AS older
+                       WHERE older.repository = command.repository
+                         AND older.pull_number = command.pull_number
+                         AND older.comment_id < command.comment_id
+                     )
+                 ),
+                 retry AS (
+                   SELECT eligible.*, 0 AS lane,
+                          CASE WHEN comment_id > ?3 THEN 0 ELSE 1 END AS lane_wrap
+                   FROM eligible
+                   WHERE comment_id <= ?2
+                   ORDER BY lane_wrap, comment_id
+                   LIMIT ?4
+                 ),
+                 fresh AS (
+                   SELECT eligible.*, 1 AS lane, 0 AS lane_wrap
+                   FROM eligible
+                   WHERE comment_id > ?2
+                   ORDER BY comment_id
+                   LIMIT ?4
+                 )
+                 SELECT trigger_key, repository, pull_number, comment_id, author,
+                        resolve, finding_prefix, reason, created_at, lane, lane_wrap
+                 FROM retry
+                 UNION ALL
+                 SELECT trigger_key, repository, pull_number, comment_id, author,
+                        resolve, finding_prefix, reason, created_at, lane, lane_wrap
+                 FROM fresh
+                 ORDER BY lane, lane_wrap, comment_id",
             )?;
-            stmt.query_map(
-                params![repository, cursor, i64::try_from(limit).unwrap_or(i64::MAX)],
-                |row| {
-                    Ok(PendingThreadlessCommand {
-                        trigger_key: row.get(0)?,
-                        repository: row.get(1)?,
-                        pull_number: row.get::<_, i64>(2)? as u64,
-                        comment_id: row.get::<_, i64>(3)? as u64,
-                        author: row.get(4)?,
-                        resolve: row.get(5)?,
-                        finding_prefix: row.get(6)?,
-                        reason: row.get(7)?,
-                        created_at: row.get(8)?,
-                    })
-                },
-            )?
-            .collect::<rusqlite::Result<Vec<_>>>()?
+            let candidates = stmt
+                .query_map(
+                    params![
+                        repository,
+                        cursor,
+                        retry_cursor,
+                        i64::try_from(limit).unwrap_or(i64::MAX)
+                    ],
+                    |row| {
+                        Ok((
+                            PendingThreadlessCommand {
+                                trigger_key: row.get(0)?,
+                                repository: row.get(1)?,
+                                pull_number: row.get::<_, i64>(2)? as u64,
+                                comment_id: row.get::<_, i64>(3)? as u64,
+                                author: row.get(4)?,
+                                resolve: row.get(5)?,
+                                finding_prefix: row.get(6)?,
+                                reason: row.get(7)?,
+                                created_at: row.get(8)?,
+                            },
+                            row.get::<_, i64>(9)? == 0,
+                        ))
+                    },
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            candidates
+                .into_iter()
+                .partition::<Vec<_>, _>(|(_, is_retry)| *is_retry)
         };
-        if let Some(last) = commands.last() {
+        let mut retrying = retrying
+            .into_iter()
+            .map(|(command, _)| command)
+            .collect::<Vec<_>>()
+            .into_iter();
+        let mut fresh = fresh
+            .into_iter()
+            .map(|(command, _)| command)
+            .collect::<Vec<_>>()
+            .into_iter();
+        let have_retry = retrying.len() > 0;
+        let have_fresh = fresh.len() > 0;
+        let retry_quota = if have_retry && have_fresh {
+            if limit == 1 {
+                usize::from(retry_next)
+            } else {
+                1
+            }
+        } else if have_retry {
+            limit
+        } else {
+            0
+        };
+        let mut selected_retry = retrying.by_ref().take(retry_quota).collect::<Vec<_>>();
+        let mut selected_fresh = fresh
+            .by_ref()
+            .take(limit.saturating_sub(selected_retry.len()))
+            .collect::<Vec<_>>();
+        selected_retry.extend(
+            retrying.take(limit.saturating_sub(selected_retry.len() + selected_fresh.len())),
+        );
+        selected_fresh
+            .extend(fresh.take(limit.saturating_sub(selected_retry.len() + selected_fresh.len())));
+        let next_cursor = selected_fresh
+            .last()
+            .map_or(cursor, |command| command.comment_id as i64);
+        let next_retry_cursor = selected_retry
+            .last()
+            .map_or(retry_cursor, |command| command.comment_id as i64);
+        let next_retry_turn = if limit == 1 && have_retry && have_fresh {
+            !retry_next
+        } else {
+            retry_next
+        };
+        if !selected_retry.is_empty() || !selected_fresh.is_empty() {
             tx.execute(
                 "INSERT INTO code_review_threadless_command_cursors
-                        (repository, last_comment_id)
-                 VALUES (?1, ?2)
+                        (repository, last_comment_id, last_retry_comment_id, retry_next)
+                 VALUES (?1, ?2, ?3, ?4)
                  ON CONFLICT(repository) DO UPDATE SET
-                   last_comment_id = excluded.last_comment_id",
-                params![repository, last.comment_id as i64],
+                   last_comment_id = excluded.last_comment_id,
+                   last_retry_comment_id = excluded.last_retry_comment_id,
+                   retry_next = excluded.retry_next",
+                params![repository, next_cursor, next_retry_cursor, next_retry_turn],
             )?;
         }
         tx.commit()?;
-        Ok(commands)
+        selected_retry.extend(selected_fresh);
+        Ok(selected_retry)
     }
 
     pub fn pending_code_review_manual_requests(
@@ -20759,6 +20870,90 @@ mod tests {
     }
 
     #[test]
+    fn migrations_upgrade_legacy_carried_anchor_evidence_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.sqlite");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE code_review_carried_anchor_verifications (
+                   repository TEXT NOT NULL,
+                   pull_number INTEGER NOT NULL,
+                   head_sha TEXT NOT NULL,
+                   path TEXT NOT NULL,
+                   line INTEGER NOT NULL,
+                   claim_job_id TEXT,
+                   verified_at TEXT,
+                   PRIMARY KEY (repository, pull_number, head_sha, path, line)
+                 );
+                 INSERT INTO code_review_carried_anchor_verifications
+                        (repository, pull_number, head_sha, path, line, verified_at)
+                 VALUES ('acme/widgets', 42,
+                         '2222222222222222222222222222222222222222',
+                         'src/legacy.rs', 7, '2026-08-29T00:00:00Z');",
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        let first = enqueue_backoff_test_job(&store);
+        let target = ("src/legacy.rs".to_owned(), 7);
+        let migrated = store
+            .claim_code_review_carried_anchor_page(
+                &first.id,
+                &first.repository,
+                first.pull_number,
+                &first.head_sha,
+                std::slice::from_ref(&target),
+                false,
+                1,
+            )
+            .unwrap();
+        assert_eq!(migrated.targets, vec![target.clone()]);
+        assert!(migrated.cached.is_empty());
+        assert!(
+            store
+                .complete_code_review_carried_anchor_read(
+                    &first.id,
+                    &first.repository,
+                    first.pull_number,
+                    &first.head_sha,
+                    &target.0,
+                    target.1,
+                    Some("migrated();"),
+                )
+                .unwrap()
+        );
+
+        let mut second_request = backoff_test_job_request();
+        second_request.dedupe_key = "legacy-anchor-evidence-reuse".into();
+        let second = store
+            .enqueue_code_review_job(&second_request)
+            .unwrap()
+            .unwrap();
+        let reused = store
+            .claim_code_review_carried_anchor_page(
+                &second.id,
+                &second.repository,
+                second.pull_number,
+                &second.head_sha,
+                std::slice::from_ref(&target),
+                false,
+                1,
+            )
+            .unwrap();
+        assert!(reused.targets.is_empty());
+        assert_eq!(
+            reused.cached,
+            vec![(
+                "src/legacy.rs".to_owned(),
+                7,
+                Some("migrated();".to_owned())
+            )]
+        );
+    }
+
+    #[test]
     fn migrations_add_indexed_turn_boundaries_to_legacy_thread_view_items() {
         let mut conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
@@ -21399,6 +21594,60 @@ mod tests {
             .collect::<std::collections::HashSet<_>>();
         assert_eq!(reached.len(), 40);
         assert!(reached.contains(&139));
+    }
+
+    #[test]
+    fn retrying_threadless_commands_receive_capacity_during_continuous_arrivals() {
+        let store = Store::open_in_memory().unwrap();
+        let insert = |index: u64| {
+            let command = PendingThreadlessCommand {
+                trigger_key: format!("command:comment:{}", 100 + index),
+                repository: "acme/widgets".into(),
+                pull_number: index + 1,
+                comment_id: 100 + index,
+                author: "jim".into(),
+                resolve: true,
+                finding_prefix: format!("rvf_{index:08x}"),
+                reason: "reason".into(),
+                created_at: chrono::Utc::now().to_rfc3339(),
+            };
+            assert!(
+                store
+                    .claim_github_webhook_delivery(
+                        &format!("continuous-delivery-{index}"),
+                        None,
+                        Some(&command),
+                    )
+                    .unwrap()
+            );
+        };
+        for index in 0..16 {
+            insert(index);
+        }
+        assert_eq!(
+            store
+                .pending_threadless_commands("acme/widgets", 16)
+                .unwrap()
+                .len(),
+            16
+        );
+
+        let mut next = 16;
+        for expected_retry in 100..103 {
+            for _ in 0..16 {
+                insert(next);
+                next += 1;
+            }
+            let page = store
+                .pending_threadless_commands("acme/widgets", 16)
+                .unwrap();
+            assert_eq!(page.len(), 16);
+            assert!(
+                page.iter()
+                    .any(|command| command.comment_id == expected_retry),
+                "retry {expected_retry} was starved by a full page of newer commands"
+            );
+        }
     }
 
     #[test]
@@ -22269,6 +22518,11 @@ mod tests {
                 ("src/line.rs".to_owned(), 1, Some("guarded();".to_owned())),
                 ("src/missing.rs".to_owned(), 2, None),
             ]
+        );
+        assert_eq!(
+            next.targets.len() + next.cached.len(),
+            3,
+            "new reads and cached evidence share one bounded page"
         );
     }
 
