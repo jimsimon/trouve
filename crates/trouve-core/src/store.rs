@@ -14157,7 +14157,7 @@ impl Store {
                 "UPDATE code_review_jobs
                  SET publication_marker_absence_count = 0,
                      check_sync_error =
-                       'review publication was overtaken by a newer accepted or published round; publication abandoned without retrying the POST',
+                       'review publication was overtaken by a newer round that was accepted or published; publication abandoned without retrying the POST',
                      projection_retry_count = projection_retry_count + 1,
                      projection_retry_at = NULL,
                      projection_retryable = 0
@@ -24328,7 +24328,7 @@ mod tests {
             accepted_superseded_record
                 .job
                 .check_sync_error
-                .contains("newer accepted or published round")
+                .contains("newer round")
         );
         assert!(
             store

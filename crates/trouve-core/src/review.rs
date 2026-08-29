@@ -8451,7 +8451,7 @@ impl Engine {
                 job_id = %job.id,
                 repository = %job.repository,
                 pull_number = job.pull_number,
-                "review publication was overtaken by a newer accepted or published round; \
+                "review publication was overtaken by a newer round that was accepted or published; \
                  abandoning it without retrying the POST"
             ),
             crate::store::CodeReviewPublicationAbsenceOutcome::Quarantined => tracing::warn!(
