@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS workspaces (
   name TEXT NOT NULL,
   path TEXT NOT NULL UNIQUE,
   closed INTEGER NOT NULL DEFAULT 0,
+  review_registration_generation INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS sessions (
@@ -355,6 +356,7 @@ CREATE TABLE IF NOT EXISTS code_review_jobs (
   check_run_url TEXT NOT NULL DEFAULT '',
   check_sync_error TEXT NOT NULL DEFAULT '',
   projection_retry_count INTEGER NOT NULL DEFAULT 0,
+  publication_marker_absence_count INTEGER NOT NULL DEFAULT 0,
   projection_retry_at TEXT,
   projection_retryable INTEGER NOT NULL DEFAULT 1,
   cancel_requested INTEGER NOT NULL DEFAULT 0,
@@ -392,6 +394,22 @@ CREATE TABLE IF NOT EXISTS code_review_jobs (
 CREATE INDEX IF NOT EXISTS code_review_jobs_status ON code_review_jobs (status, created_at);
 CREATE INDEX IF NOT EXISTS code_review_jobs_repository_history
   ON code_review_jobs (repository, status, completed_at, created_at);
+-- A review may provisionally create or reopen a workspace before its session
+-- is admitted. Keep that ownership durable so timeout/crash cleanup can be
+-- handed to the scheduler without letting an old attempt close a workspace
+-- that a user or later review has since adopted.
+CREATE TABLE IF NOT EXISTS code_review_workspace_cleanup_intents (
+  job_id TEXT PRIMARY KEY REFERENCES code_review_jobs(id) ON DELETE CASCADE,
+  workspace_id TEXT NOT NULL,
+  generation INTEGER NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS code_review_workspace_cleanup_due
+  ON code_review_workspace_cleanup_intents (next_attempt_at, created_at);
+CREATE INDEX IF NOT EXISTS code_review_workspace_cleanup_workspace
+  ON code_review_workspace_cleanup_intents (workspace_id, generation);
 CREATE TABLE IF NOT EXISTS code_review_tasks (
   id TEXT PRIMARY KEY,
   job_id TEXT NOT NULL REFERENCES code_review_jobs(id),
@@ -471,6 +489,7 @@ CREATE TABLE IF NOT EXISTS code_review_findings (
   resolved_by_job_id TEXT NOT NULL DEFAULT '',
   collapse_pending INTEGER NOT NULL DEFAULT 0,
   collapse_attempts INTEGER NOT NULL DEFAULT 0,
+  collapse_terminal_attempts INTEGER NOT NULL DEFAULT 0,
   collapse_next_attempt_at TEXT,
   publication_resolution_job_id TEXT,
   created_at TEXT NOT NULL
@@ -680,6 +699,7 @@ WHERE usage.model = ''
 const MIGRATIONS: &[&str] = &[
     "ALTER TABLE session_create_requests ADD COLUMN request_fingerprint TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE workspaces ADD COLUMN closed INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE workspaces ADD COLUMN review_registration_generation INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE sessions ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE queued_prompts ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]'",
     "ALTER TABLE queued_prompts ADD COLUMN claimed INTEGER NOT NULL DEFAULT 0",
@@ -716,6 +736,18 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE code_review_repositories ADD COLUMN router_thinking_level TEXT",
     "ALTER TABLE code_review_repositories ADD COLUMN coordinator_thinking_level TEXT",
     "ALTER TABLE code_review_jobs ADD COLUMN identities TEXT NOT NULL DEFAULT '[]'",
+    "CREATE TABLE IF NOT EXISTS code_review_workspace_cleanup_intents (
+       job_id TEXT PRIMARY KEY REFERENCES code_review_jobs(id) ON DELETE CASCADE,
+       workspace_id TEXT NOT NULL,
+       generation INTEGER NOT NULL,
+       attempts INTEGER NOT NULL DEFAULT 0,
+       next_attempt_at TEXT,
+       created_at TEXT NOT NULL
+     )",
+    "CREATE INDEX IF NOT EXISTS code_review_workspace_cleanup_due
+       ON code_review_workspace_cleanup_intents (next_attempt_at, created_at)",
+    "CREATE INDEX IF NOT EXISTS code_review_workspace_cleanup_workspace
+       ON code_review_workspace_cleanup_intents (workspace_id, generation)",
     "ALTER TABLE code_review_jobs ADD COLUMN config_hash TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE code_review_jobs ADD COLUMN review_base_sha TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE code_review_jobs ADD COLUMN review_watermark_sha TEXT NOT NULL DEFAULT ''",
@@ -842,6 +874,23 @@ const MIGRATIONS: &[&str] = &[
     // even when provider metadata is transiently unavailable.
     "ALTER TABLE code_review_jobs ADD COLUMN prompt_budget_window INTEGER",
     USAGE_MODEL_COLUMN_MIGRATION,
+    // Durable threadless resolve/unresolve commands claimed from webhooks;
+    // rows survive restarts and are deleted when the command reaches a
+    // definitive outcome. Positional append-only history: this must stay
+    // after every migration a deployed database may already have run.
+    "CREATE TABLE IF NOT EXISTS code_review_pending_threadless_commands (
+       trigger_key TEXT PRIMARY KEY,
+       repository TEXT NOT NULL,
+       pull_number INTEGER NOT NULL,
+       comment_id INTEGER NOT NULL,
+       author TEXT NOT NULL,
+       resolve INTEGER NOT NULL,
+       finding_prefix TEXT NOT NULL,
+       reason TEXT NOT NULL,
+       created_at TEXT NOT NULL
+     )",
+    "ALTER TABLE code_review_jobs ADD COLUMN publication_marker_absence_count INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE code_review_findings ADD COLUMN collapse_terminal_attempts INTEGER NOT NULL DEFAULT 0",
 ];
 
 /// Blocking-tier predicate for one findings row under the given SQL alias:
@@ -3455,6 +3504,18 @@ pub struct CodeReviewJobRecord {
     pub blocking_review_cleanup_pending: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodeReviewPublicationAbsenceOutcome {
+    /// The marker has not been absent often enough to release the dispatch.
+    Pending,
+    /// GitHub accepted the POST, so absence can only be listing lag.
+    AcceptedPending,
+    /// A newer published round made this publication terminally obsolete.
+    Superseded,
+    /// The unaccepted dispatch was released for a safe retry.
+    Released,
+}
+
 #[derive(Debug, Clone)]
 pub enum CodeReviewJobRetryOutcome {
     Replacement(CodeReviewJobRetry),
@@ -4049,6 +4110,49 @@ fn cancel_active_code_review_tasks(
         .collect()
 }
 
+/// A durable threadless resolve/unresolve command claimed from a webhook
+/// delivery, retried until it reaches a definitive outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingThreadlessCommand {
+    pub trigger_key: String,
+    pub repository: String,
+    pub pull_number: u64,
+    pub comment_id: u64,
+    pub author: String,
+    pub resolve: bool,
+    pub finding_prefix: String,
+    pub reason: String,
+    /// Claim time, set by the store when the delivery is claimed. Used to
+    /// bound how long a premature no-op is retained for replay.
+    pub created_at: String,
+}
+
+/// Outcome of a maintainer resolve/unresolve command against the threadless
+/// finding ledger.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ThreadlessCommandOutcome {
+    Applied {
+        finding_id: String,
+    },
+    AmbiguousPrefix {
+        matches: usize,
+    },
+    NotFound,
+    /// The prefix matched exactly one finding, but it is not in the state
+    /// the verb expects (already resolved, or not resolved).
+    NotApplicable {
+        finding_id: String,
+        status: String,
+    },
+    /// Another processor consumed this command's durable row first; nothing
+    /// was evaluated or mutated.
+    AlreadyConsumed,
+    /// The command is not applicable yet, but an out-of-order sibling
+    /// delivery could still make it applicable, so its row was retained for
+    /// replay instead of being consumed.
+    NotApplicableDeferred,
+}
+
 #[derive(Debug, Clone)]
 pub struct NewCodeReviewFinding {
     pub path: String,
@@ -4322,6 +4426,20 @@ pub(crate) struct ArtifactCleanupJob {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReviewWorkspaceCleanupIntent {
+    pub job_id: String,
+    pub workspace_id: String,
+    pub generation: u64,
+    pub attempts: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReviewWorkspaceRegistrationResult {
+    pub mutated: bool,
+    pub cleanup_generation: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SessionPrVerificationIntent {
     pub session_id: String,
     pub host: String,
@@ -4551,6 +4669,12 @@ enum StoreMutation {
         initial_checkpoint: Box<CheckpointRow>,
         idempotency_key: Option<String>,
         request_fingerprint: Option<String>,
+        review_job_id: Option<String>,
+    },
+    RegisterReviewWorkspace {
+        job_id: String,
+        workspace: Box<Workspace>,
+        inherited_generation: Option<u64>,
     },
     Update {
         id: String,
@@ -5061,6 +5185,104 @@ fn insert_artifact_cleanup_job(
     Ok(())
 }
 
+fn commit_review_workspace_registration_rows(
+    conn: &Connection,
+    job_id: &str,
+    workspace: &Workspace,
+    inherited_generation: Option<u64>,
+    timestamp: chrono::DateTime<chrono::Utc>,
+) -> Result<ReviewWorkspaceRegistrationResult> {
+    let existing: Option<(String, bool, i64)> = conn
+        .query_row(
+            "SELECT id, closed, review_registration_generation
+             FROM workspaces WHERE path = ?1",
+            params![workspace.path],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let running = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM code_review_jobs
+         WHERE id = ?1 AND status = 'running')",
+        params![job_id],
+        |row| row.get::<_, bool>(0),
+    )?;
+    anyhow::ensure!(running, "stale: review job {job_id} is no longer running");
+
+    let (mutated, cleanup_generation) = match existing {
+        Some((workspace_id, closed, generation)) => {
+            anyhow::ensure!(
+                workspace_id == workspace.id,
+                "workspace path changed identity during review registration"
+            );
+            let generation = u64::try_from(generation)
+                .context("workspace review-registration generation is negative")?;
+            let durable_provisional = conn.query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM code_review_workspace_cleanup_intents
+                   WHERE workspace_id = ?1 AND generation = ?2
+                 )",
+                params![workspace.id, i64::try_from(generation)?],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if closed {
+                let next = generation
+                    .checked_add(1)
+                    .context("workspace review-registration generation overflow")?;
+                conn.execute(
+                    "UPDATE workspaces
+                     SET closed = 0, review_registration_generation = ?2
+                     WHERE id = ?1",
+                    params![workspace.id, i64::try_from(next)?],
+                )?;
+                (true, Some(next))
+            } else if durable_provisional || inherited_generation == Some(generation) {
+                (false, Some(generation))
+            } else {
+                (false, None)
+            }
+        }
+        None => {
+            let generation = 1_u64;
+            conn.execute(
+                "INSERT INTO workspaces
+                     (id, name, path, closed, review_registration_generation, created_at)
+                 VALUES (?1, ?2, ?3, 0, ?4, ?5)",
+                params![
+                    workspace.id,
+                    workspace.name,
+                    workspace.path,
+                    i64::try_from(generation)?,
+                    timestamp.to_rfc3339()
+                ],
+            )?;
+            (true, Some(generation))
+        }
+    };
+
+    if let Some(generation) = cleanup_generation {
+        conn.execute(
+            "INSERT INTO code_review_workspace_cleanup_intents
+                    (job_id, workspace_id, generation, attempts, next_attempt_at, created_at)
+             VALUES (?1, ?2, ?3, 0, NULL, ?4)
+             ON CONFLICT(job_id) DO UPDATE SET
+               workspace_id = excluded.workspace_id,
+               generation = excluded.generation,
+               attempts = 0,
+               next_attempt_at = NULL",
+            params![
+                job_id,
+                workspace.id,
+                i64::try_from(generation)?,
+                timestamp.to_rfc3339()
+            ],
+        )?;
+    }
+    Ok(ReviewWorkspaceRegistrationResult {
+        mutated,
+        cleanup_generation,
+    })
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum StoreMutationOutcome {
     AppendEvent,
@@ -5079,6 +5301,7 @@ fn apply_store_mutation(
             initial_checkpoint,
             idempotency_key,
             request_fingerprint,
+            review_job_id,
         } => {
             insert_session_row(conn, session)?;
             if let (Some(idempotency_key), Some(request_fingerprint)) =
@@ -5091,7 +5314,35 @@ fn apply_store_mutation(
                     params![idempotency_key, session.id, request_fingerprint],
                 )?;
             }
+            if let Some(review_job_id) = review_job_id {
+                let updated = conn.execute(
+                    "UPDATE code_review_jobs SET session_id = ?2, thread_id = NULL
+                     WHERE id = ?1 AND status = 'running' AND session_id IS NULL",
+                    params![review_job_id, session.id],
+                )?;
+                anyhow::ensure!(
+                    updated == 1,
+                    "stale: review job {review_job_id} cannot own session {}",
+                    session.id
+                );
+            }
             insert_initial_checkpoint_row(conn, initial_checkpoint, timestamp)?;
+        }
+        StoreMutation::RegisterReviewWorkspace {
+            job_id,
+            workspace,
+            inherited_generation,
+        } => {
+            let registration = commit_review_workspace_registration_rows(
+                conn,
+                job_id,
+                workspace,
+                *inherited_generation,
+                timestamp,
+            )?;
+            if !registration.mutated {
+                return Ok(StoreMutationOutcome::CommitWithoutEvent);
+            }
         }
         StoreMutation::Update {
             id,
@@ -5953,12 +6204,27 @@ impl Store {
     }
 
     fn append_pending_events(&self, events: Vec<PendingEvent>) -> Result<Vec<EventEnvelope>> {
+        self.append_pending_events_with_isolation(events, false)
+    }
+
+    fn append_pending_events_isolated(
+        &self,
+        events: Vec<PendingEvent>,
+    ) -> Result<Vec<EventEnvelope>> {
+        self.append_pending_events_with_isolation(events, true)
+    }
+
+    fn append_pending_events_with_isolation(
+        &self,
+        events: Vec<PendingEvent>,
+        isolated: bool,
+    ) -> Result<Vec<EventEnvelope>> {
         let (reply, reply_rx) = std::sync::mpsc::sync_channel(1);
         self.append_tx
             .send(AppendRequest {
                 events,
                 code_review_outbox_ids: Vec::new(),
-                isolated: false,
+                isolated,
                 reply: AppendReply::Sync(reply),
                 queued_at: std::time::Instant::now(),
             })
@@ -6724,6 +6990,195 @@ impl Store {
         Ok(())
     }
 
+    /// Commit a review-owned workspace registration and its compensating
+    /// cleanup intent in one transaction. `inherited_generation` identifies
+    /// an already-open workspace that is still provisional for another
+    /// concurrent review; a stable open workspace is never owned by review
+    /// cleanup.
+    pub(crate) fn commit_review_workspace_registration(
+        &self,
+        job_id: &str,
+        workspace: &Workspace,
+        inherited_generation: Option<u64>,
+    ) -> Result<ReviewWorkspaceRegistrationResult> {
+        let pending = serialize_lifecycle_events(
+            vec![(
+                Scope::Server,
+                Event::WorkspaceRegistered {
+                    workspace_id: workspace.id.clone(),
+                    path: workspace.path.clone(),
+                },
+            )],
+            StoreMutation::RegisterReviewWorkspace {
+                job_id: job_id.to_owned(),
+                workspace: Box::new(workspace.clone()),
+                inherited_generation,
+            },
+        )?;
+        let mutated = !self.append_pending_events_isolated(pending)?.is_empty();
+        let cleanup_generation = self
+            .review_workspace_cleanup_intent(job_id)?
+            .map(|intent| intent.generation);
+        Ok(ReviewWorkspaceRegistrationResult {
+            mutated,
+            cleanup_generation,
+        })
+    }
+
+    /// Invalidate every provisional review registration for a workspace.
+    /// This is called while the engine's per-path registration lock is held
+    /// whenever a user/session adopts the workspace.
+    pub(crate) fn stabilize_workspace_registration(&self, workspace_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let tx = write_transaction(&conn)?;
+        let has_intents = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM code_review_workspace_cleanup_intents
+             WHERE workspace_id = ?1)",
+            params![workspace_id],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if has_intents {
+            tx.execute(
+                "UPDATE workspaces
+                 SET review_registration_generation = review_registration_generation + 1
+                 WHERE id = ?1",
+                params![workspace_id],
+            )?;
+            tx.execute(
+                "DELETE FROM code_review_workspace_cleanup_intents WHERE workspace_id = ?1",
+                params![workspace_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn review_workspace_cleanup_intent(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<ReviewWorkspaceCleanupIntent>> {
+        self.conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT job_id, workspace_id, generation, attempts
+                 FROM code_review_workspace_cleanup_intents WHERE job_id = ?1",
+                params![job_id],
+                |row| {
+                    let generation = row.get::<_, i64>(2)?;
+                    let attempts = row.get::<_, i64>(3)?;
+                    Ok(ReviewWorkspaceCleanupIntent {
+                        job_id: row.get(0)?,
+                        workspace_id: row.get(1)?,
+                        generation: generation.max(0) as u64,
+                        attempts: attempts.max(0) as u32,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn pending_review_workspace_cleanups(
+        &self,
+    ) -> Result<Vec<ReviewWorkspaceCleanupIntent>> {
+        let conn = self.conn.lock().unwrap();
+        let mut statement = conn.prepare(
+            "SELECT intents.job_id, intents.workspace_id, intents.generation, intents.attempts
+             FROM code_review_workspace_cleanup_intents AS intents
+             JOIN code_review_jobs AS jobs ON jobs.id = intents.job_id
+             WHERE jobs.status IN ('succeeded', 'failed', 'cancelled', 'stale')
+               AND (intents.next_attempt_at IS NULL OR intents.next_attempt_at <= ?1)
+             ORDER BY COALESCE(intents.next_attempt_at, intents.created_at), intents.job_id",
+        )?;
+        let rows = statement.query_map([chrono::Utc::now().to_rfc3339()], |row| {
+            let generation = row.get::<_, i64>(2)?;
+            let attempts = row.get::<_, i64>(3)?;
+            Ok(ReviewWorkspaceCleanupIntent {
+                job_id: row.get(0)?,
+                workspace_id: row.get(1)?,
+                generation: generation.max(0) as u64,
+                attempts: attempts.max(0) as u32,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Return whether this intent still owns the last provisional lease for
+    /// its exact workspace generation. The caller holds the per-path lock
+    /// while acting on this answer.
+    pub(crate) fn review_workspace_cleanup_should_close(
+        &self,
+        intent: &ReviewWorkspaceCleanupIntent,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let current_generation: Option<i64> = conn
+            .query_row(
+                "SELECT review_registration_generation FROM workspaces WHERE id = ?1",
+                params![intent.workspace_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if current_generation != Some(i64::try_from(intent.generation)?) {
+            return Ok(false);
+        }
+        let other = conn.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM code_review_workspace_cleanup_intents
+               WHERE workspace_id = ?1 AND generation = ?2 AND job_id != ?3
+             )",
+            params![
+                intent.workspace_id,
+                i64::try_from(intent.generation)?,
+                intent.job_id
+            ],
+            |row| row.get::<_, bool>(0),
+        )?;
+        Ok(!other)
+    }
+
+    pub(crate) fn complete_review_workspace_cleanup(
+        &self,
+        intent: &ReviewWorkspaceCleanupIntent,
+    ) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "DELETE FROM code_review_workspace_cleanup_intents
+             WHERE job_id = ?1 AND workspace_id = ?2 AND generation = ?3",
+            params![
+                intent.job_id,
+                intent.workspace_id,
+                i64::try_from(intent.generation)?
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn defer_review_workspace_cleanup(
+        &self,
+        intent: &ReviewWorkspaceCleanupIntent,
+    ) -> Result<()> {
+        let attempt = intent.attempts.saturating_add(1);
+        #[cfg(not(test))]
+        let delay_seconds = 1_i64 << attempt.min(8);
+        #[cfg(not(test))]
+        let next_attempt = chrono::Utc::now() + chrono::Duration::seconds(delay_seconds);
+        #[cfg(test)]
+        let next_attempt = chrono::Utc::now() + chrono::Duration::milliseconds(1);
+        self.conn.lock().unwrap().execute(
+            "UPDATE code_review_workspace_cleanup_intents
+             SET attempts = ?4, next_attempt_at = ?5
+             WHERE job_id = ?1 AND workspace_id = ?2 AND generation = ?3",
+            params![
+                intent.job_id,
+                intent.workspace_id,
+                i64::try_from(intent.generation)?,
+                i64::from(attempt),
+                next_attempt.to_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn set_workspace_closed(&self, id: &str, closed: bool) -> Result<bool> {
         let changed = self.conn.lock().unwrap().execute(
             "UPDATE workspaces SET closed = ?2 WHERE id = ?1 AND closed != ?2",
@@ -6812,6 +7267,7 @@ impl Store {
         session: &Session,
         initial_checkpoint: &CheckpointRow,
         idempotency: Option<(&str, &str)>,
+        review_job_id: Option<&str>,
         events: Vec<(Scope, Event)>,
     ) -> Result<Vec<EventEnvelope>> {
         self.append_pending_events(serialize_lifecycle_events(
@@ -6821,6 +7277,7 @@ impl Store {
                 initial_checkpoint: Box::new(initial_checkpoint.clone()),
                 idempotency_key: idempotency.map(|(key, _)| key.to_owned()),
                 request_fingerprint: idempotency.map(|(_, fingerprint)| fingerprint.to_owned()),
+                review_job_id: review_job_id.map(str::to_owned),
             },
         )?)
     }
@@ -6854,6 +7311,35 @@ impl Store {
         )
         .optional()
         .map_err(Into::into)
+    }
+
+    /// Associate a legacy idempotent review session with its running job.
+    /// The guarded update revalidates the durable request fingerprint and
+    /// rejects conflicting ownership in the same SQLite statement.
+    pub(crate) fn bind_review_job_to_idempotent_session(
+        &self,
+        job_id: &str,
+        key: &str,
+        request_fingerprint: &str,
+        session_id: &str,
+    ) -> Result<bool> {
+        let updated = self.conn.lock().unwrap().execute(
+            "UPDATE code_review_jobs
+             SET session_id = ?4,
+                 thread_id = CASE WHEN session_id IS NULL THEN NULL ELSE thread_id END
+             WHERE id = ?1 AND status = 'running'
+               AND (session_id IS NULL OR session_id = ?4)
+               AND EXISTS (
+                 SELECT 1
+                 FROM session_create_requests
+                 JOIN sessions ON sessions.id = session_create_requests.session_id
+                 WHERE session_create_requests.idempotency_key = ?2
+                   AND session_create_requests.request_fingerprint = ?3
+                   AND sessions.id = ?4
+               )",
+            params![job_id, key, request_fingerprint, session_id],
+        )?;
+        Ok(updated == 1)
     }
 
     pub fn list_sessions(&self, workspace_id: Option<&str>) -> Result<Vec<Session>> {
@@ -9454,6 +9940,15 @@ impl Store {
         Ok(updated > 0)
     }
 
+    pub(crate) fn clear_code_review_job_session(&self, id: &str, session_id: &str) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE code_review_jobs SET session_id = NULL, thread_id = NULL
+             WHERE id = ?1 AND session_id = ?2",
+            params![id, session_id],
+        )?;
+        Ok(())
+    }
+
     pub fn set_code_review_job_review_base(
         &self,
         id: &str,
@@ -11072,6 +11567,10 @@ impl Store {
                      WHEN status != 'open' AND ?2 IS NOT NULL AND collapse_pending = 0 THEN 0
                      ELSE collapse_attempts
                  END,
+                 collapse_terminal_attempts = CASE
+                     WHEN status != 'open' AND ?2 IS NOT NULL AND collapse_pending = 0 THEN 0
+                     ELSE collapse_terminal_attempts
+                 END,
                  collapse_next_attempt_at = CASE
                      WHEN status != 'open' AND ?2 IS NOT NULL AND collapse_pending = 0 THEN NULL
                      ELSE collapse_next_attempt_at
@@ -11187,6 +11686,10 @@ impl Store {
                      WHEN github_comment_id IS NOT NULL THEN 0
                      ELSE collapse_attempts
                  END,
+                 collapse_terminal_attempts = CASE
+                     WHEN github_comment_id IS NOT NULL THEN 0
+                     ELSE collapse_terminal_attempts
+                 END,
                  collapse_next_attempt_at = CASE
                      WHEN github_comment_id IS NOT NULL THEN NULL
                      ELSE collapse_next_attempt_at
@@ -11220,7 +11723,8 @@ impl Store {
     ) -> Result<()> {
         self.conn.lock().unwrap().execute(
             "UPDATE code_review_findings
-             SET collapse_pending = 0, collapse_attempts = 0, collapse_next_attempt_at = NULL,
+             SET collapse_pending = 0, collapse_attempts = 0,
+                 collapse_terminal_attempts = 0, collapse_next_attempt_at = NULL,
                  github_thread_id = CASE
                      WHEN ?3 IS NOT NULL THEN ?3 ELSE github_thread_id
                  END,
@@ -11271,37 +11775,43 @@ impl Store {
         Ok(())
     }
 
-    /// Pushes a pending collapse's next attempt out with bounded exponential
-    /// backoff (one minute doubling up to one hour), so a persistently
-    /// failing finding cannot consume API quota on every retry pass.
-    /// Records one failed collapse attempt with exponential backoff.
-    /// Returns `true` when the finding's collapse was abandoned instead:
-    /// past the attempt bound the thread is provably not collapsible from
-    /// here (deleted comments, closed pulls, permission loss), and leaving
-    /// it queued retries a deterministic failure every backoff interval
-    /// forever. Abandonment is cosmetic — the finding's ledger state is
-    /// already durable; only its GitHub thread stays un-collapsed.
-    pub fn defer_code_review_thread_collapse(&self, id: &str) -> Result<bool> {
+    /// Records one failed collapse attempt with bounded exponential backoff.
+    /// Only consecutive terminal failures count toward abandonment; transient
+    /// API, network, and token failures keep retrying and reset that counter.
+    /// Abandonment is cosmetic — the finding's ledger state is already
+    /// durable; only its GitHub thread stays un-collapsed.
+    pub fn defer_code_review_thread_collapse(
+        &self,
+        id: &str,
+        terminal_failure: bool,
+    ) -> Result<bool> {
         const THREAD_COLLAPSE_MAX_ATTEMPTS: i64 = 24;
         let conn = self.conn.lock().unwrap();
         let tx = write_transaction(&conn)?;
-        let attempts: i64 = tx
+        let (attempts, terminal_attempts): (i64, i64) = tx
             .query_row(
-                "SELECT collapse_attempts FROM code_review_findings WHERE id = ?1",
+                "SELECT collapse_attempts, collapse_terminal_attempts
+                 FROM code_review_findings WHERE id = ?1",
                 params![id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?
-            .unwrap_or(0);
-        let abandoned = attempts + 1 >= THREAD_COLLAPSE_MAX_ATTEMPTS;
+            .unwrap_or((0, 0));
+        let terminal_attempts = if terminal_failure {
+            terminal_attempts.saturating_add(1)
+        } else {
+            0
+        };
+        let abandoned = terminal_attempts >= THREAD_COLLAPSE_MAX_ATTEMPTS;
         if abandoned {
             tx.execute(
                 "UPDATE code_review_findings
                  SET collapse_pending = 0,
                      collapse_attempts = collapse_attempts + 1,
+                     collapse_terminal_attempts = ?2,
                      collapse_next_attempt_at = NULL
                  WHERE id = ?1",
-                params![id],
+                params![id, terminal_attempts],
             )?;
         } else {
             let delay_seconds = (60_i64 << attempts.clamp(0, 6)).min(3600);
@@ -11309,9 +11819,10 @@ impl Store {
             tx.execute(
                 "UPDATE code_review_findings
                  SET collapse_attempts = collapse_attempts + 1,
-                     collapse_next_attempt_at = ?2
+                     collapse_terminal_attempts = ?2,
+                     collapse_next_attempt_at = ?3
                  WHERE id = ?1",
-                params![id, next_attempt.to_rfc3339()],
+                params![id, terminal_attempts, next_attempt.to_rfc3339()],
             )?;
         }
         tx.commit()?;
@@ -11903,6 +12414,10 @@ impl Store {
                        WHEN ?5 AND status IN ('fixed', 'dismissed') THEN 0
                        ELSE collapse_attempts
                      END,
+                     collapse_terminal_attempts = CASE
+                       WHEN ?5 AND status IN ('fixed', 'dismissed') THEN 0
+                       ELSE collapse_terminal_attempts
+                     END,
                      collapse_next_attempt_at = CASE
                        WHEN ?5 AND status IN ('fixed', 'dismissed') THEN NULL
                        ELSE collapse_next_attempt_at
@@ -12188,6 +12703,196 @@ impl Store {
         };
         tx.commit()?;
         Ok((changed, projection_job))
+    }
+
+    /// Resolve (won't-fix) or unresolve one threadless finding through a
+    /// maintainer command. The prefix must uniquely identify a threadless
+    /// finding of this pull's published rounds; the command records the
+    /// maintainer's reason and attribution in `dismiss_reason`.
+    pub fn apply_threadless_resolve_command(
+        &self,
+        command: &PendingThreadlessCommand,
+        dismiss_reason: &str,
+        defer_not_applicable_within: Option<std::time::Duration>,
+    ) -> Result<(ThreadlessCommandOutcome, Option<String>)> {
+        let repository = command.repository.as_str();
+        let pull_number = command.pull_number;
+        let finding_prefix = command.finding_prefix.as_str();
+        let resolve = command.resolve;
+        let conn = self.conn.lock().unwrap();
+        let tx = write_transaction(&conn)?;
+        // Outcomes below are definitive (except an in-window NotApplicable,
+        // which re-inserts the row), so the durable command row is consumed
+        // in the same transaction as the state it decides.
+        if !command.trigger_key.is_empty() {
+            // Consumption must be exclusive: a processor whose snapshot lost
+            // the race deletes zero rows and must not evaluate or mutate
+            // anything, or a stale command could reverse a newer opposite
+            // decision.
+            let consumed = tx.execute(
+                "DELETE FROM code_review_pending_threadless_commands WHERE trigger_key = ?1",
+                params![command.trigger_key],
+            )?;
+            if consumed == 0 {
+                tx.commit()?;
+                return Ok((ThreadlessCommandOutcome::AlreadyConsumed, None));
+            }
+        }
+        let mut stmt = tx.prepare(
+            "SELECT f.id, f.status FROM code_review_findings f
+             JOIN code_review_jobs j ON j.id = f.job_id
+             WHERE j.repository = ?1 AND j.pull_number = ?2
+               AND j.review_published = 1
+               AND f.github_comment_id IS NULL
+               AND f.status IN ('open', 'dismissed')
+               AND f.id LIKE ?3 || '%' ESCAPE '\\'",
+        )?;
+        // The command parser only admits `rvf_` plus hex, but this is a
+        // public store method and the prefix is untrusted comment text:
+        // neutralize LIKE metacharacters so a prefix can never
+        // wildcard-match a finding the maintainer did not name.
+        let escaped_prefix = finding_prefix
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let matches = stmt
+            .query_map(
+                params![repository, pull_number as i64, escaped_prefix],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(stmt);
+        let (finding_id, status) = match matches.as_slice() {
+            [] => {
+                tx.commit()?;
+                return Ok((ThreadlessCommandOutcome::NotFound, None));
+            }
+            [only] => only.clone(),
+            many => {
+                let count = many.len();
+                tx.commit()?;
+                return Ok((
+                    ThreadlessCommandOutcome::AmbiguousPrefix { matches: count },
+                    None,
+                ));
+            }
+        };
+        let expected = if resolve { "open" } else { "dismissed" };
+        if status != expected {
+            // Deliveries can arrive out of order: an unresolve whose earlier
+            // resolve has not been delivered yet is inapplicable now but
+            // becomes applicable the moment the sibling lands (comment-id
+            // ordering then replays them in the order the maintainer wrote
+            // them). Retain such a command briefly instead of consuming it;
+            // past the window it is a genuine no-op and gets its reply.
+            if !command.trigger_key.is_empty()
+                && let Some(window) = defer_not_applicable_within
+                && chrono::DateTime::parse_from_rfc3339(&command.created_at)
+                    .ok()
+                    .map(|created| chrono::Utc::now().signed_duration_since(created))
+                    .and_then(|age| age.to_std().ok())
+                    .is_some_and(|age| age < window)
+            {
+                tx.execute(
+                    "INSERT OR IGNORE INTO code_review_pending_threadless_commands
+                            (trigger_key, repository, pull_number, comment_id, author, resolve,
+                             finding_prefix, reason, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    params![
+                        command.trigger_key,
+                        command.repository,
+                        command.pull_number as i64,
+                        command.comment_id as i64,
+                        command.author,
+                        command.resolve,
+                        command.finding_prefix,
+                        command.reason,
+                        command.created_at
+                    ],
+                )?;
+                tx.commit()?;
+                return Ok((ThreadlessCommandOutcome::NotApplicableDeferred, None));
+            }
+            tx.commit()?;
+            return Ok((
+                ThreadlessCommandOutcome::NotApplicable { finding_id, status },
+                None,
+            ));
+        }
+        let now = chrono::Utc::now().to_rfc3339();
+        if resolve {
+            tx.execute(
+                "UPDATE code_review_findings
+                 SET status = 'dismissed', dismiss_reason = ?2, resolved_at = ?3,
+                     resolved_head = '', resolved_by_job_id = '', collapse_pending = 0
+                 WHERE id = ?1",
+                params![finding_id, dismiss_reason, now],
+            )?;
+        } else {
+            tx.execute(
+                "UPDATE code_review_findings
+                 SET status = 'open', dismiss_reason = '', resolved_at = NULL,
+                     resolved_head = '', resolved_by_job_id = ''
+                 WHERE id = ?1",
+                params![finding_id],
+            )?;
+            // Mirror the thread-based reopen path: a theme resolved while
+            // this finding was dismissed is open again now that its
+            // manifestation is.
+            tx.execute(
+                "UPDATE code_review_themes
+                 SET status = 'open', resolved_head = '', updated_at = ?2
+                 WHERE id IN (
+                   SELECT theme_id FROM code_review_finding_themes
+                   WHERE finding_id = ?1
+                 )",
+                params![finding_id, now],
+            )?;
+        }
+        // Legacy checkbox snapshots and commands mutate the same threadless
+        // ledger. Advancing the checkbox watermark in this transaction makes
+        // the command the newer writer: a checkbox snapshot captured before
+        // the command but delivered after it is watermark-rejected instead
+        // of silently reverting the decision. The watermark is compared as
+        // a string in GitHub's second-granularity `Z` timestamp format, and
+        // equal timestamps apply, so the command claims its entire current
+        // second: a snapshot stamped in the same second compares older and
+        // is rejected, and only a strictly later-second checkbox edit
+        // supersedes the command. The column is NOT NULL DEFAULT '', so the
+        // strict comparison also advances initial rows.
+        let watermark = (chrono::Utc::now() + chrono::Duration::seconds(1))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        tx.execute(
+            "UPDATE code_review_pr_state
+             SET lifecycle_checkbox_edited_at = ?3
+             WHERE repository = ?1 AND pull_number = ?2
+               AND lifecycle_checkbox_edited_at < ?3",
+            params![repository, pull_number as i64, watermark],
+        )?;
+        let projection_job =
+            refresh_code_review_pull_projection_counts_in_tx(&tx, repository, pull_number)?;
+        // The GitHub projection (lifecycle comment, check run) runs only
+        // after this transaction commits; a crash in between would leave
+        // durable state and GitHub disagreeing with no pending row left to
+        // replay. Arming the durable projection-retry marker in the same
+        // commit hands the sync to the poll's projection-repair pass, and
+        // the in-process success path clears it immediately.
+        if let Some(job_id) = projection_job.as_deref() {
+            tx.execute(
+                "UPDATE code_review_jobs
+                 SET check_sync_error = 'threadless command applied; projection sync pending',
+                     projection_retry_at = NULL,
+                     projection_retryable = 1
+                 WHERE id = ?1",
+                params![job_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok((
+            ThreadlessCommandOutcome::Applied { finding_id },
+            projection_job,
+        ))
     }
 
     pub fn code_review_themes_for_pull(
@@ -13370,55 +14075,96 @@ impl Store {
         )? > 0)
     }
 
-    /// Whether a newer round of the same pull request has already published.
-    /// Publication order is assigned monotonically per pull at claim time,
-    /// so a published row with a higher order (or the same order and a later
-    /// rowid) means this job's round no longer represents the pull — its own
-    /// publication, delivered or not, is history.
-    pub fn code_review_publication_is_superseded(&self, id: &str) -> Result<bool> {
-        Ok(self.conn.lock().unwrap().query_row(
-            "SELECT EXISTS (
-               SELECT 1 FROM code_review_jobs AS newer
-               JOIN code_review_jobs AS current_job ON current_job.id = ?1
-               WHERE newer.repository = current_job.repository
-                 AND newer.pull_number = current_job.pull_number
-                 AND newer.rowid != current_job.rowid
-                 AND newer.review_published != 0
-                 AND (
-                   newer.publication_order > current_job.publication_order
-                   OR (
-                     newer.publication_order = current_job.publication_order
-                     AND newer.rowid > current_job.rowid
-                   )
-                 )
-             )",
-            params![id],
-            |row| row.get::<_, bool>(0),
-        )?)
+    /// Records one definitive marker absence and atomically decides whether
+    /// the dispatch remains pending, is superseded, or can be released.
+    ///
+    /// Supersession and release deliberately share this transaction: a newer
+    /// round cannot publish between the decision and the state transition.
+    pub fn resolve_code_review_publication_absence(
+        &self,
+        id: &str,
+        confirmation_threshold: u32,
+    ) -> Result<CodeReviewPublicationAbsenceOutcome> {
+        let conn = self.conn.lock().unwrap();
+        let tx = write_transaction(&conn)?;
+        let (accepted, dispatched, absence_count, superseded): (bool, bool, i64, bool) = tx
+            .query_row(
+                "SELECT current_job.publication_accepted,
+                        current_job.publication_dispatched,
+                        current_job.publication_marker_absence_count,
+                        EXISTS (
+                          SELECT 1 FROM code_review_jobs AS newer
+                          WHERE newer.repository = current_job.repository
+                            AND newer.pull_number = current_job.pull_number
+                            AND newer.rowid != current_job.rowid
+                            AND newer.review_published != 0
+                            AND (
+                              newer.publication_order > current_job.publication_order
+                              OR (
+                                newer.publication_order = current_job.publication_order
+                                AND newer.rowid > current_job.rowid
+                              )
+                            )
+                        )
+                 FROM code_review_jobs AS current_job
+                 WHERE current_job.id = ?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?;
+        let absence_count = u32::try_from(absence_count)
+            .unwrap_or(u32::MAX)
+            .saturating_add(1);
+        let outcome = if accepted {
+            tx.execute(
+                "UPDATE code_review_jobs
+                 SET publication_marker_absence_count = ?2
+                 WHERE id = ?1",
+                params![id, i64::from(absence_count)],
+            )?;
+            CodeReviewPublicationAbsenceOutcome::AcceptedPending
+        } else if superseded {
+            tx.execute(
+                "UPDATE code_review_jobs
+                 SET publication_marker_absence_count = ?2,
+                     check_sync_error =
+                       'review publication was never accepted by GitHub and a newer round has taken over this pull request; publication abandoned',
+                     projection_retry_count = projection_retry_count + 1,
+                     projection_retry_at = NULL,
+                     projection_retryable = 0
+                 WHERE id = ?1",
+                params![id, i64::from(absence_count)],
+            )?;
+            CodeReviewPublicationAbsenceOutcome::Superseded
+        } else if absence_count < confirmation_threshold || !dispatched {
+            tx.execute(
+                "UPDATE code_review_jobs
+                 SET publication_marker_absence_count = ?2
+                 WHERE id = ?1",
+                params![id, i64::from(absence_count)],
+            )?;
+            CodeReviewPublicationAbsenceOutcome::Pending
+        } else {
+            tx.execute(
+                "UPDATE code_review_jobs
+                 SET publication_claimed = 0,
+                     publication_dispatched = 0,
+                     publication_order = 0,
+                     publication_marker_absence_count = 0
+                 WHERE id = ?1 AND publication_accepted = 0
+                   AND publication_dispatched != 0",
+                params![id],
+            )?;
+            CodeReviewPublicationAbsenceOutcome::Released
+        };
+        tx.commit()?;
+        Ok(outcome)
     }
 
-    pub fn code_review_projection_retry_count(&self, id: &str) -> Result<u32> {
-        let attempts: i64 = self.conn.lock().unwrap().query_row(
-            "SELECT projection_retry_count FROM code_review_jobs WHERE id = ?1",
-            params![id],
-            |row| row.get(0),
-        )?;
-        Ok(u32::try_from(attempts).unwrap_or(u32::MAX))
-    }
-
-    /// Releases a dispatched-but-never-accepted publication so it can be
-    /// posted again. The dispatched flag is deliberately sticky — a request
-    /// that may have crossed the process boundary must reconcile by marker,
-    /// never re-post — and this is the one sanctioned exception: the caller
-    /// has exhaustively scanned the review listing and proven the marker
-    /// absent, so a fresh POST cannot double-publish.
-    pub fn abandon_unpublished_code_review_dispatch(&self, id: &str) -> Result<bool> {
+    pub fn reset_code_review_publication_marker_absences(&self, id: &str) -> Result<bool> {
         Ok(self.conn.lock().unwrap().execute(
             "UPDATE code_review_jobs
-             SET publication_claimed = 0, publication_dispatched = 0,
-                 publication_order = 0
-             WHERE id = ?1 AND publication_accepted = 0
-               AND publication_dispatched != 0",
+             SET publication_marker_absence_count = 0
+             WHERE id = ?1 AND publication_marker_absence_count != 0",
             params![id],
         )? > 0)
     }
@@ -13526,6 +14272,10 @@ impl Store {
                      collapse_attempts = CASE
                          WHEN github_comment_id IS NOT NULL THEN 0
                          ELSE collapse_attempts
+                     END,
+                     collapse_terminal_attempts = CASE
+                         WHEN github_comment_id IS NOT NULL THEN 0
+                         ELSE collapse_terminal_attempts
                      END,
                      collapse_next_attempt_at = CASE
                          WHEN github_comment_id IS NOT NULL THEN NULL
@@ -13934,6 +14684,10 @@ impl Store {
                          WHEN github_comment_id IS NOT NULL THEN 0
                          ELSE collapse_attempts
                      END,
+                     collapse_terminal_attempts = CASE
+                         WHEN github_comment_id IS NOT NULL THEN 0
+                         ELSE collapse_terminal_attempts
+                     END,
                      collapse_next_attempt_at = CASE
                          WHEN github_comment_id IS NOT NULL THEN NULL
                          ELSE collapse_next_attempt_at
@@ -14305,10 +15059,16 @@ impl Store {
     /// Claim one GitHub webhook delivery and, when present, durably record its
     /// manual review request in the same transaction. Duplicate delivery ids
     /// are ignored, which makes GitHub's at-least-once delivery safe to retry.
+    /// Claim a webhook delivery, persisting any durable payloads it carries
+    /// — a manual review request and/or a threadless resolve command — in
+    /// the same transaction, so a crash after the claim can never lose
+    /// either: both are retried from their tables until consumed. A comment
+    /// may legitimately carry both a review request and a resolve command.
     pub fn claim_github_webhook_delivery(
         &self,
         delivery_id: &str,
         manual_request: Option<(&str, u64, &str)>,
+        threadless_command: Option<&PendingThreadlessCommand>,
     ) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         let tx = write_transaction(&conn)?;
@@ -14317,23 +15077,73 @@ impl Store {
              VALUES (?1, ?2)",
             params![delivery_id, chrono::Utc::now().to_rfc3339()],
         )?;
-        if inserted > 0
-            && let Some((repository, pull_number, trigger_key)) = manual_request
-        {
-            tx.execute(
-                "INSERT OR IGNORE INTO code_review_manual_requests
-                        (repository, pull_number, trigger_key, created_at)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![
-                    repository,
-                    pull_number as i64,
-                    trigger_key,
-                    chrono::Utc::now().to_rfc3339()
-                ],
-            )?;
+        if inserted > 0 {
+            if let Some((repository, pull_number, trigger_key)) = manual_request {
+                tx.execute(
+                    "INSERT OR IGNORE INTO code_review_manual_requests
+                            (repository, pull_number, trigger_key, created_at)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        repository,
+                        pull_number as i64,
+                        trigger_key,
+                        chrono::Utc::now().to_rfc3339()
+                    ],
+                )?;
+            }
+            if let Some(command) = threadless_command {
+                tx.execute(
+                    "INSERT OR IGNORE INTO code_review_pending_threadless_commands
+                            (trigger_key, repository, pull_number, comment_id, author, resolve,
+                             finding_prefix, reason, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    params![
+                        command.trigger_key,
+                        command.repository,
+                        command.pull_number as i64,
+                        command.comment_id as i64,
+                        command.author,
+                        command.resolve,
+                        command.finding_prefix,
+                        command.reason,
+                        chrono::Utc::now().to_rfc3339()
+                    ],
+                )?;
+            }
         }
         tx.commit()?;
         Ok(inserted > 0)
+    }
+
+    /// Pending commands ordered by comment id — GitHub's monotonically
+    /// increasing comment ids give comment-creation order even when webhook
+    /// deliveries arrive out of order, so a resolve and its follow-up
+    /// unresolve always apply in the order the maintainer wrote them.
+    pub fn pending_threadless_commands(
+        &self,
+        repository: &str,
+    ) -> Result<Vec<PendingThreadlessCommand>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT trigger_key, repository, pull_number, comment_id, author, resolve,
+                    finding_prefix, reason, created_at
+             FROM code_review_pending_threadless_commands
+             WHERE repository = ?1 ORDER BY comment_id",
+        )?;
+        let rows = stmt.query_map(params![repository], |row| {
+            Ok(PendingThreadlessCommand {
+                trigger_key: row.get(0)?,
+                repository: row.get(1)?,
+                pull_number: row.get::<_, i64>(2)? as u64,
+                comment_id: row.get::<_, i64>(3)? as u64,
+                author: row.get(4)?,
+                resolve: row.get(5)?,
+                finding_prefix: row.get(6)?,
+                reason: row.get(7)?,
+                created_at: row.get(8)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     pub fn pending_code_review_manual_requests(
@@ -16962,6 +17772,11 @@ mod tests {
     #[test]
     fn lifecycle_mutation_rolls_back_when_its_event_transaction_fails() {
         let store = Store::open_in_memory().unwrap();
+        let review_job = store
+            .enqueue_code_review_job(&backoff_test_job_request())
+            .unwrap()
+            .unwrap();
+        store.claim_code_review_job().unwrap().unwrap();
         store
             .insert_workspace(&Workspace {
                 id: "ws_atomic".into(),
@@ -16994,7 +17809,8 @@ mod tests {
                 .insert_session_with_lifecycle(
                     &session,
                     &invalid_checkpoint,
-                    None,
+                    Some(("review-session-key", "review-session-fingerprint")),
+                    Some(&review_job.id),
                     vec![(
                         Scope::Server,
                         Event::SessionCreated {
@@ -17006,6 +17822,15 @@ mod tests {
                 .is_err()
         );
         assert!(store.session(&session.id).unwrap().is_none());
+        assert!(
+            store
+                .code_review_job(&review_job.id)
+                .unwrap()
+                .unwrap()
+                .job
+                .session_id
+                .is_none()
+        );
         assert!(store.events_after(&Scope::Server, 0).unwrap().is_empty());
         assert!(
             store
@@ -17014,6 +17839,159 @@ mod tests {
                 .summaries
                 .is_empty()
         );
+
+        let checkpoint = CheckpointRow {
+            session_id: session.id.clone(),
+            ..invalid_checkpoint
+        };
+        store
+            .insert_session_with_lifecycle(
+                &session,
+                &checkpoint,
+                Some(("review-session-key", "review-session-fingerprint")),
+                Some(&review_job.id),
+                vec![(
+                    Scope::Server,
+                    Event::SessionCreated {
+                        session_id: session.id.clone(),
+                        workspace_id: session.workspace_id.clone(),
+                    },
+                )],
+            )
+            .unwrap();
+        assert!(store.session(&session.id).unwrap().is_some());
+        assert_eq!(
+            store
+                .code_review_job(&review_job.id)
+                .unwrap()
+                .unwrap()
+                .job
+                .session_id
+                .as_deref(),
+            Some(session.id.as_str())
+        );
+        store
+            .clear_code_review_job_session(&review_job.id, &session.id)
+            .unwrap();
+        assert!(
+            !store
+                .bind_review_job_to_idempotent_session(
+                    &review_job.id,
+                    "review-session-key",
+                    "wrong-fingerprint",
+                    &session.id,
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .code_review_job(&review_job.id)
+                .unwrap()
+                .unwrap()
+                .job
+                .session_id
+                .is_none()
+        );
+        assert!(
+            store
+                .bind_review_job_to_idempotent_session(
+                    &review_job.id,
+                    "review-session-key",
+                    "review-session-fingerprint",
+                    &session.id,
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .code_review_job(&review_job.id)
+                .unwrap()
+                .unwrap()
+                .job
+                .session_id
+                .as_deref(),
+            Some(session.id.as_str())
+        );
+        assert!(
+            store
+                .set_code_review_job_session(&review_job.id, &session.id, "th_review_atomic")
+                .unwrap()
+        );
+        assert!(
+            store
+                .bind_review_job_to_idempotent_session(
+                    &review_job.id,
+                    "review-session-key",
+                    "review-session-fingerprint",
+                    &session.id,
+                )
+                .unwrap()
+        );
+        let rebound = store.code_review_job(&review_job.id).unwrap().unwrap();
+        assert_eq!(rebound.job.session_id.as_deref(), Some(session.id.as_str()));
+        assert_eq!(rebound.job.thread_id.as_deref(), Some("th_review_atomic"));
+        assert_eq!(store.list_sessions(None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn review_workspace_registration_rolls_back_with_its_lifecycle_event() {
+        let store = Store::open_in_memory().unwrap();
+        let review_job = store
+            .enqueue_code_review_job(&backoff_test_job_request())
+            .unwrap()
+            .unwrap();
+        store.claim_code_review_job().unwrap().unwrap();
+        let workspace = Workspace {
+            id: "ws_review_atomic".into(),
+            name: "atomic review".into(),
+            path: "/tmp/review-atomic".into(),
+        };
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_review_workspace_registration_event
+                 BEFORE INSERT ON events
+                 WHEN json_extract(NEW.payload, '$.type') = 'workspace.registered'
+                 BEGIN
+                   SELECT RAISE(ABORT, 'injected workspace event failure');
+                 END;",
+            )
+            .unwrap();
+
+        assert!(
+            store
+                .commit_review_workspace_registration(&review_job.id, &workspace, None)
+                .is_err()
+        );
+        assert!(store.workspace_by_path(&workspace.path).unwrap().is_none());
+        assert!(
+            store
+                .review_workspace_cleanup_intent(&review_job.id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(store.events_after(&Scope::Server, 0).unwrap().is_empty());
+
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_review_workspace_registration_event;")
+            .unwrap();
+        let registration = store
+            .commit_review_workspace_registration(&review_job.id, &workspace, None)
+            .unwrap();
+        assert!(registration.mutated);
+        assert_eq!(registration.cleanup_generation, Some(1));
+        let events = store.events_after(&Scope::Server, 0).unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0].event,
+            Event::WorkspaceRegistered { workspace_id, path }
+                if workspace_id == &workspace.id && path == &workspace.path
+        ));
     }
 
     #[test]
@@ -19261,6 +20239,7 @@ mod tests {
                 .claim_github_webhook_delivery(
                     "delivery-1",
                     Some(("acme/widgets", 42, "comment:100")),
+                    None,
                 )
                 .unwrap()
         );
@@ -19269,6 +20248,7 @@ mod tests {
                 .claim_github_webhook_delivery(
                     "delivery-1",
                     Some(("acme/widgets", 42, "comment:duplicate")),
+                    None,
                 )
                 .unwrap()
         );
@@ -19495,8 +20475,8 @@ mod tests {
         // Stale backoff accrued while the row had nothing to collapse (e.g.
         // a cleanup pass deferring on a listing failure) must not delay a
         // freshly armed collapse.
-        store.defer_code_review_thread_collapse(&id).unwrap();
-        store.defer_code_review_thread_collapse(&id).unwrap();
+        store.defer_code_review_thread_collapse(&id, false).unwrap();
+        store.defer_code_review_thread_collapse(&id, false).unwrap();
 
         // A comment published by a concurrent round after the close re-arms
         // the collapse with reset retry metadata: due immediately, not after
@@ -19583,7 +20563,7 @@ mod tests {
         };
 
         // First failure: due in one minute — not before, not much after.
-        store.defer_code_review_thread_collapse(&id).unwrap();
+        store.defer_code_review_thread_collapse(&id, false).unwrap();
         let first = next_attempt(&store);
         let elapsed = first - chrono::Utc::now();
         assert!(elapsed > chrono::Duration::seconds(55), "{elapsed}");
@@ -19591,14 +20571,14 @@ mod tests {
 
         // The delay doubles per failure and stops growing at one hour.
         for _ in 0..6 {
-            store.defer_code_review_thread_collapse(&id).unwrap();
+            store.defer_code_review_thread_collapse(&id, false).unwrap();
         }
         let capped = next_attempt(&store);
         let elapsed = capped - chrono::Utc::now();
         assert!(elapsed > chrono::Duration::minutes(59), "{elapsed}");
         assert!(elapsed <= chrono::Duration::minutes(61), "{elapsed}");
 
-        store.defer_code_review_thread_collapse(&id).unwrap();
+        store.defer_code_review_thread_collapse(&id, false).unwrap();
         let still_capped = next_attempt(&store) - chrono::Utc::now();
         assert!(
             still_capped <= chrono::Duration::minutes(61),
@@ -19612,19 +20592,25 @@ mod tests {
         let requeued = next_attempt(&store) - chrono::Utc::now();
         assert!(requeued > chrono::Duration::seconds(55), "{requeued}");
         assert!(requeued <= chrono::Duration::seconds(61), "{requeued}");
-        store.defer_code_review_thread_collapse(&id).unwrap();
+        store.defer_code_review_thread_collapse(&id, false).unwrap();
         let after_requeue = next_attempt(&store) - chrono::Utc::now();
         assert!(
             after_requeue > chrono::Duration::minutes(59),
             "{after_requeue}"
         );
 
-        // Past the attempt bound the collapse is abandoned instead of
+        // Transient failures can continue past the bound without abandoning
+        // the work; only their backoff remains capped.
+        for _ in 0..30 {
+            assert!(!store.defer_code_review_thread_collapse(&id, false).unwrap());
+        }
+
+        // Past the terminal-failure bound the collapse is abandoned instead of
         // retrying a deterministic failure hourly forever: pending clears
         // and the finding leaves the retry queue.
         let mut abandoned = false;
         for _ in 0..24 {
-            if store.defer_code_review_thread_collapse(&id).unwrap() {
+            if store.defer_code_review_thread_collapse(&id, true).unwrap() {
                 abandoned = true;
                 break;
             }
@@ -19641,6 +20627,280 @@ mod tests {
             )
             .unwrap();
         assert!(!pending, "an abandoned collapse must leave the queue");
+    }
+
+    #[test]
+    fn threadless_resolve_commands_apply_by_unique_prefix_with_reasons() {
+        let store = Store::open_in_memory().unwrap();
+        let finding_at = |path: &str| NewCodeReviewFinding {
+            path: path.into(),
+            line: 4,
+            side: "RIGHT".into(),
+            severity: "medium".into(),
+            confidence: "high".into(),
+            title: "Finding".into(),
+            body: format!("finding at {path}"),
+            prompt_for_agents: "fix".into(),
+            sources: Vec::new(),
+        };
+        let job = enqueue_backoff_test_job(&store);
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            job.id
+        );
+        let findings = store
+            .save_code_review_result(
+                &job.id,
+                "summary",
+                "prompt",
+                2,
+                &[finding_at("src/a.rs"), finding_at("src/b.rs")],
+                &[],
+            )
+            .unwrap();
+        assert!(store.claim_code_review_publication(&job.id).unwrap());
+        store
+            .record_code_review_publication(
+                &job.id,
+                &job.repository,
+                job.pull_number,
+                &job.base_ref,
+                &job.head_sha,
+                "https://example/review",
+                false,
+                &[],
+            )
+            .unwrap();
+        store
+            .finish_code_review_job(&job.id, "succeeded", "", "")
+            .unwrap();
+        let target = findings[0].id.clone();
+        let command = |prefix: &str, resolve: bool| PendingThreadlessCommand {
+            trigger_key: String::new(),
+            repository: "acme/widgets".into(),
+            pull_number: 42,
+            comment_id: 100,
+            author: "jim".into(),
+            resolve,
+            finding_prefix: prefix.into(),
+            reason: "because".into(),
+            created_at: String::new(),
+        };
+
+        // Every finding id shares the rvf_ prefix, so a bare prefix is
+        // ambiguous and applies nothing.
+        let (outcome, _) = store
+            .apply_threadless_resolve_command(&command("rvf_", true), "reason — @jim", None)
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            ThreadlessCommandOutcome::AmbiguousPrefix { matches: 2 }
+        ));
+
+        // An unknown prefix is reported as such.
+        let (outcome, _) = store
+            .apply_threadless_resolve_command(&command("rvf_000000", true), "reason — @jim", None)
+            .unwrap();
+        assert!(matches!(outcome, ThreadlessCommandOutcome::NotFound));
+
+        // The full id resolves the finding and records reason + attribution.
+        let (outcome, _) = store
+            .apply_threadless_resolve_command(
+                &command(&target, true),
+                "accepted limitation per ADR 0042 — resolved by @jim",
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            outcome,
+            ThreadlessCommandOutcome::Applied {
+                finding_id: target.clone()
+            }
+        );
+        let (listed, _) = store
+            .threadless_code_review_findings("acme/widgets", 42)
+            .unwrap();
+        let resolved = listed.iter().find(|finding| finding.id == target).unwrap();
+        assert_eq!(resolved.status, "dismissed");
+
+        // Resolving again is not applicable — fixed/dismissed states are
+        // reported instead of silently re-applied.
+        let (outcome, _) = store
+            .apply_threadless_resolve_command(&command(&target, true), "again — @jim", None)
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            ThreadlessCommandOutcome::NotApplicable { ref status, .. } if status == "dismissed"
+        ));
+
+        // Unresolve restores it.
+        let (outcome, _) = store
+            .apply_threadless_resolve_command(&command(&target, false), "", None)
+            .unwrap();
+        assert_eq!(
+            outcome,
+            ThreadlessCommandOutcome::Applied {
+                finding_id: target.clone()
+            }
+        );
+        let (listed, _) = store
+            .threadless_code_review_findings("acme/widgets", 42)
+            .unwrap();
+        assert_eq!(
+            listed
+                .iter()
+                .find(|finding| finding.id == target)
+                .unwrap()
+                .status,
+            "open"
+        );
+
+        // A command advances the shared checkbox watermark in its own
+        // transaction: a checkbox snapshot captured before the command but
+        // delivered after it is watermark-rejected instead of reverting the
+        // decision — including one stamped in the command's own second —
+        // while a genuinely newer edit still applies.
+        let command_second = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let (outcome, _) = store
+            .apply_threadless_resolve_command(&command(&target, true), "final — @jim", None)
+            .unwrap();
+        assert!(matches!(outcome, ThreadlessCommandOutcome::Applied { .. }));
+        let (changed, _) = store
+            .apply_lifecycle_dismissal_states(
+                "acme/widgets",
+                42,
+                "2020-01-01T00:00:00Z",
+                &[(target.clone(), false)],
+            )
+            .unwrap();
+        assert!(!changed, "a stale checkbox snapshot must not apply");
+        let (changed, _) = store
+            .apply_lifecycle_dismissal_states(
+                "acme/widgets",
+                42,
+                &command_second,
+                &[(target.clone(), false)],
+            )
+            .unwrap();
+        assert!(
+            !changed,
+            "a snapshot from the command's own second must not supersede it"
+        );
+        let (listed, _) = store
+            .threadless_code_review_findings("acme/widgets", 42)
+            .unwrap();
+        assert_eq!(
+            listed
+                .iter()
+                .find(|finding| finding.id == target)
+                .unwrap()
+                .status,
+            "dismissed"
+        );
+        let future = (chrono::Utc::now() + chrono::Duration::minutes(1))
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        let (changed, _) = store
+            .apply_lifecycle_dismissal_states(
+                "acme/widgets",
+                42,
+                &future,
+                &[(target.clone(), false)],
+            )
+            .unwrap();
+        assert!(changed, "a newer checkbox edit still applies");
+
+        // Out-of-order protection: a durable, recently claimed command that
+        // is not applicable yet is retained for replay instead of consumed —
+        // its out-of-order sibling may still land. Past the window it is a
+        // genuine no-op.
+        let mut durable = command(&target, false);
+        durable.trigger_key = "command:comment:100".into();
+        durable.created_at = chrono::Utc::now().to_rfc3339();
+        store
+            .claim_github_webhook_delivery("delivery-defer-1", None, Some(&durable))
+            .unwrap();
+        let fresh = store.pending_threadless_commands("acme/widgets").unwrap()[0].clone();
+        let (outcome, _) = store
+            .apply_threadless_resolve_command(&fresh, "", Some(std::time::Duration::from_secs(120)))
+            .unwrap();
+        assert_eq!(outcome, ThreadlessCommandOutcome::NotApplicableDeferred);
+        assert_eq!(
+            store
+                .pending_threadless_commands("acme/widgets")
+                .unwrap()
+                .len(),
+            1,
+            "the deferred command's row must survive for replay"
+        );
+        let mut expired = fresh.clone();
+        expired.created_at = "2020-01-01T00:00:00Z".into();
+        let (outcome, _) = store
+            .apply_threadless_resolve_command(
+                &expired,
+                "",
+                Some(std::time::Duration::from_secs(120)),
+            )
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            ThreadlessCommandOutcome::NotApplicable { ref status, .. } if status == "open"
+        ));
+        assert!(
+            store
+                .pending_threadless_commands("acme/widgets")
+                .unwrap()
+                .is_empty(),
+            "an expired no-op is consumed"
+        );
+
+        // LIKE metacharacters in the prefix are data, not wildcards: a
+        // prefix whose hex region holds `_` must not match the finding
+        // whose real id differs at that position.
+        let mut wildcard = target[..10].to_string();
+        wildcard.replace_range(6..7, "_");
+        let (outcome, _) = store
+            .apply_threadless_resolve_command(&command(&wildcard, true), "reason — @jim", None)
+            .unwrap();
+        assert!(matches!(outcome, ThreadlessCommandOutcome::NotFound));
+
+        // Exclusive consumption: a stale snapshot of an already-consumed
+        // command must not evaluate or reverse a newer opposite decision.
+        let mut durable = command(&target, true);
+        durable.trigger_key = "command:comment:200".into();
+        durable.created_at = chrono::Utc::now().to_rfc3339();
+        store
+            .claim_github_webhook_delivery("delivery-consumed-1", None, Some(&durable))
+            .unwrap();
+        let claimed = store
+            .pending_threadless_commands("acme/widgets")
+            .unwrap()
+            .into_iter()
+            .find(|pending| pending.trigger_key == durable.trigger_key)
+            .unwrap();
+        let (outcome, _) = store
+            .apply_threadless_resolve_command(&claimed, "first — @jim", None)
+            .unwrap();
+        assert!(matches!(outcome, ThreadlessCommandOutcome::Applied { .. }));
+        store
+            .apply_threadless_resolve_command(&command(&target, false), "", None)
+            .unwrap();
+        let (outcome, _) = store
+            .apply_threadless_resolve_command(&claimed, "replay — @jim", None)
+            .unwrap();
+        assert_eq!(outcome, ThreadlessCommandOutcome::AlreadyConsumed);
+        let (listed, _) = store
+            .threadless_code_review_findings("acme/widgets", 42)
+            .unwrap();
+        assert_eq!(
+            listed
+                .iter()
+                .find(|finding| finding.id == target)
+                .unwrap()
+                .status,
+            "open",
+            "a consumed command must not reverse the newer decision"
+        );
     }
 
     #[test]
@@ -20197,10 +21457,10 @@ mod tests {
         assert_eq!(resolved[0].is_resolved, Some(true));
         assert!(!resolved[0].recheck_pending);
         store
-            .defer_code_review_thread_collapse(&finding.id)
+            .defer_code_review_thread_collapse(&finding.id, false)
             .unwrap();
         store
-            .defer_code_review_thread_collapse(&finding.id)
+            .defer_code_review_thread_collapse(&finding.id, false)
             .unwrap();
 
         assert!(
@@ -22825,27 +24085,47 @@ mod tests {
         store
             .finish_code_review_job(&first.id, "failed", "GitHub API 500", "")
             .unwrap();
-        // No newer round has published yet: the dispatch is not superseded,
-        // and proving marker absence releases it for a genuine retry.
-        assert!(
-            !store
-                .code_review_publication_is_superseded(&first.id)
-                .unwrap()
-        );
-        assert!(
+        // No newer round has published yet: one required confirmation
+        // releases the unaccepted dispatch for a genuine retry.
+        assert_eq!(
             store
-                .abandon_unpublished_code_review_dispatch(&first.id)
-                .unwrap()
+                .resolve_code_review_publication_absence(&first.id, 1)
+                .unwrap(),
+            CodeReviewPublicationAbsenceOutcome::Released
         );
         let record = store.code_review_job(&first.id).unwrap().unwrap();
         assert!(!record.publication_claimed);
         assert!(!record.publication_dispatched);
-        // Idempotent: a released dispatch has nothing left to abandon.
+        assert_eq!(
+            store
+                .resolve_code_review_publication_absence(&first.id, 1)
+                .unwrap(),
+            CodeReviewPublicationAbsenceOutcome::Pending,
+            "a released dispatch has nothing left to release"
+        );
+
+        // A second dispatched round is overtaken while it is awaiting marker
+        // reconciliation.
+        let mut superseded_request = backoff_test_job_request();
+        superseded_request.dedupe_key = "acme/widgets#42:superseded".into();
+        superseded_request.head_sha = "2929292929292929292929292929292929292929".into();
+        let superseded = store
+            .enqueue_code_review_job(&superseded_request)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            superseded.id
+        );
+        assert!(store.claim_code_review_publication(&superseded.id).unwrap());
         assert!(
-            !store
-                .abandon_unpublished_code_review_dispatch(&first.id)
+            store
+                .mark_code_review_publication_dispatched(&superseded.id)
                 .unwrap()
         );
+        store
+            .finish_code_review_job(&superseded.id, "failed", "GitHub API 500", "")
+            .unwrap();
 
         // A newer round publishing for the pull supersedes the first job's
         // publication, delivered or not.
@@ -22866,15 +24146,18 @@ mod tests {
                 .reconcile_code_review_publication(&newer.id, "https://example/review", &[])
                 .unwrap()
         );
-        assert!(
+        assert_eq!(
             store
-                .code_review_publication_is_superseded(&first.id)
-                .unwrap()
+                .resolve_code_review_publication_absence(&superseded.id, 1)
+                .unwrap(),
+            CodeReviewPublicationAbsenceOutcome::Superseded
         );
-        assert!(
-            !store
-                .code_review_publication_is_superseded(&newer.id)
-                .unwrap()
+        assert_eq!(
+            store
+                .resolve_code_review_publication_absence(&newer.id, 1)
+                .unwrap(),
+            CodeReviewPublicationAbsenceOutcome::AcceptedPending,
+            "an accepted publication remains recoverable however long listing lags"
         );
     }
 

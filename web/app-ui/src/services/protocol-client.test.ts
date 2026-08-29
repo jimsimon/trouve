@@ -279,7 +279,13 @@ describe("ProtocolClient", () => {
   });
 
   it("loads generated workspace/thread models and validates both collections", async () => {
-    const workspace = { id: "ws_1", name: "trouve", path: "/src/trouve" };
+    const workspace = {
+      id: "ws_1",
+      name: "trouve",
+      path: "/src/trouve",
+      repository_key: "github.com/jimsimon/trouve",
+      repository_name: "trouve",
+    };
     const thread = {
       id: "th_1",
       session_id: "se_1",
@@ -302,6 +308,21 @@ describe("ProtocolClient", () => {
     expect(threadsInput instanceof Request ? threadsInput.url : String(threadsInput)).toContain(
       "session_id=se_1",
     );
+  });
+
+  it("rejects malformed optional workspace repository identity", async () => {
+    const client = new ProtocolClient("http://127.0.0.1:43127", {
+      fetch: vi.fn<typeof fetch>(async () => Response.json([{
+        id: "ws_1",
+        name: "trouve",
+        path: "/src/trouve",
+        repository_key: 42,
+      }])),
+    });
+
+    await expect(client.workspaces()).rejects.toMatchObject({
+      kind: "invalid-response",
+    });
   });
 
   it("loads a bounded folded thread view with its exact stream cursor", async () => {
@@ -1069,11 +1090,11 @@ describe("protocol compatibility", () => {
   });
 
   it("accepts the exact generated protocol version", () => {
-    expect(() => assertProtocolCompatibility("7.22")).not.toThrow();
+    expect(() => assertProtocolCompatibility("7.23")).not.toThrow();
   });
 
   it("rejects older, newer, other-major, and malformed servers", () => {
-    for (const version of ["4.0", "5.2", "6.1", "7.0", "7.1", "7.2", "7.3", "7.4", "7.5", "7.6", "7.7", "7.8", "7.9", "7.10", "7.11", "7.12", "7.13", "7.14", "7.15", "7.16", "7.17", "7.18", "7.19", "7.20", "7.21", "7.22.1", "unknown", ""]) {
+    for (const version of ["4.0", "5.2", "6.1", "7.0", "7.1", "7.2", "7.3", "7.4", "7.5", "7.6", "7.7", "7.8", "7.9", "7.10", "7.11", "7.12", "7.13", "7.14", "7.15", "7.16", "7.17", "7.18", "7.19", "7.20", "7.21", "7.22", "7.24", "7.23.1", "unknown", ""]) {
       expect(() => assertProtocolCompatibility(version)).toThrowError(
         expect.objectContaining({ kind: "incompatible-protocol" }),
       );

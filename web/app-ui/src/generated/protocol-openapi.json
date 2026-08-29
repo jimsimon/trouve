@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "7.22"
+    "version": "7.23"
   },
   "paths": {
     "/v1/approvals": {
@@ -4821,7 +4821,7 @@
                 "schema": {
                   "type": "array",
                   "items": {
-                    "$ref": "#/components/schemas/Workspace"
+                    "$ref": "#/components/schemas/WorkspaceListItem"
                   }
                 }
               }
@@ -4848,7 +4848,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Workspace"
+                  "$ref": "#/components/schemas/WorkspaceListItem"
                 }
               }
             }
@@ -14134,8 +14134,9 @@
           }
         }
       },
-      "Workspace": {
+      "WorkspaceListItem": {
         "type": "object",
+        "description": "Workspace presentation returned by the list and registration endpoints.\nSeparate checkouts and linked worktrees share repository_key when they\nresolve to the same configured remote or local Git common directory.",
         "required": [
           "id",
           "name",
@@ -14150,6 +14151,18 @@
           },
           "path": {
             "type": "string"
+          },
+          "repository_key": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "repository_name": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         }
       }
