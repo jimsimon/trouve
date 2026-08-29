@@ -514,6 +514,8 @@ CREATE TABLE IF NOT EXISTS code_review_carried_anchor_verifications (
   verified_at TEXT,
   line_present INTEGER,
   content TEXT,
+  presented_at TEXT,
+  presented_job_id TEXT REFERENCES code_review_jobs(id),
   PRIMARY KEY (repository, pull_number, head_sha, path, line)
 );
 CREATE INDEX IF NOT EXISTS code_review_carried_anchor_claims
@@ -925,6 +927,18 @@ const MIGRATIONS: &[&str] = &[
        ADD COLUMN last_retry_comment_id INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE code_review_threadless_command_cursors
        ADD COLUMN retry_next INTEGER NOT NULL DEFAULT 1",
+    "ALTER TABLE code_review_carried_anchor_verifications ADD COLUMN presented_at TEXT",
+    "ALTER TABLE code_review_carried_anchor_verifications ADD COLUMN presented_job_id TEXT",
+    "UPDATE code_review_carried_anchor_verifications
+       SET presented_at = verified_at
+       WHERE verified_at IS NOT NULL AND presented_at IS NULL",
+    "CREATE TABLE IF NOT EXISTS code_review_threadless_command_order (
+       repository TEXT NOT NULL,
+       pull_number INTEGER NOT NULL,
+       finding_id TEXT NOT NULL,
+       last_comment_id INTEGER NOT NULL,
+       PRIMARY KEY (repository, pull_number, finding_id)
+     )",
 ];
 
 /// Blocking-tier predicate for one findings row under the given SQL alias:
@@ -12585,38 +12599,45 @@ impl Store {
                )",
             [],
         )?;
+        tx.execute(
+            "UPDATE code_review_carried_anchor_verifications
+             SET presented_at = NULL, presented_job_id = NULL
+             WHERE presented_job_id IN (
+               SELECT id FROM code_review_jobs
+               WHERE status IN ('failed', 'cancelled', 'stale')
+                 AND review_published = 0
+             )",
+            [],
+        )?;
         if register_targets {
             for (path, line) in targets {
                 tx.execute(
-                    "INSERT OR IGNORE INTO code_review_carried_anchor_verifications
+                    "INSERT INTO code_review_carried_anchor_verifications
                             (repository, pull_number, head_sha, path, line)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                     VALUES (?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT(repository, pull_number, head_sha, path, line)
+                     DO UPDATE SET presented_at = NULL, presented_job_id = NULL
+                     WHERE verified_at IS NOT NULL",
                     params![repository, pull_number as i64, head_sha, path, *line as i64],
                 )?;
             }
         }
+        let target_json = serde_json::to_string(targets)?;
         let selected = {
             let mut stmt = tx.prepare(
-                "SELECT path, line
-                 FROM code_review_carried_anchor_verifications
-                 WHERE repository = ?1 AND pull_number = ?2 AND head_sha = ?3
-                   AND verified_at IS NULL AND claim_job_id IS NULL
-                 ORDER BY path, line
-                 LIMIT ?4",
-            )?;
-            stmt.query_map(
-                params![repository, pull_number as i64, head_sha, limit as i64],
-                |row| Ok((row.get(0)?, row.get::<_, i64>(1)? as u64)),
-            )?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-        };
-        let cached = {
-            let mut stmt = tx.prepare(
-                "SELECT path, line, line_present, content
-                 FROM code_review_carried_anchor_verifications
-                 WHERE repository = ?1 AND pull_number = ?2 AND head_sha = ?3
-                   AND verified_at IS NOT NULL
-                 ORDER BY path, line
+                "WITH active(path, line) AS (
+                   SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]')
+                   FROM json_each(?5)
+                 )
+                 SELECT verification.path, verification.line
+                 FROM code_review_carried_anchor_verifications AS verification
+                 JOIN active
+                   ON active.path = verification.path AND active.line = verification.line
+                 WHERE verification.repository = ?1 AND verification.pull_number = ?2
+                   AND verification.head_sha = ?3
+                   AND verification.verified_at IS NULL
+                   AND verification.claim_job_id IS NULL
+                 ORDER BY verification.path, verification.line
                  LIMIT ?4",
             )?;
             stmt.query_map(
@@ -12624,7 +12645,38 @@ impl Store {
                     repository,
                     pull_number as i64,
                     head_sha,
-                    limit.saturating_sub(selected.len()) as i64
+                    limit as i64,
+                    target_json
+                ],
+                |row| Ok((row.get(0)?, row.get::<_, i64>(1)? as u64)),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let cached = {
+            let mut stmt = tx.prepare(
+                "WITH active(path, line) AS (
+                   SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]')
+                   FROM json_each(?5)
+                 )
+                 SELECT verification.path, verification.line,
+                        verification.line_present, verification.content
+                 FROM code_review_carried_anchor_verifications AS verification
+                 JOIN active
+                   ON active.path = verification.path AND active.line = verification.line
+                 WHERE verification.repository = ?1 AND verification.pull_number = ?2
+                   AND verification.head_sha = ?3
+                   AND verification.verified_at IS NOT NULL
+                   AND verification.presented_at IS NULL
+                 ORDER BY verification.path, verification.line
+                 LIMIT ?4",
+            )?;
+            stmt.query_map(
+                params![
+                    repository,
+                    pull_number as i64,
+                    head_sha,
+                    limit.saturating_sub(selected.len()) as i64,
+                    target_json
                 ],
                 |row| {
                     let present: bool = row.get(2)?;
@@ -12637,6 +12689,7 @@ impl Store {
             )?
             .collect::<rusqlite::Result<Vec<_>>>()?
         };
+        let presented_at = chrono::Utc::now().to_rfc3339();
         for (path, line) in &selected {
             tx.execute(
                 "UPDATE code_review_carried_anchor_verifications
@@ -12654,13 +12707,44 @@ impl Store {
                 ],
             )?;
         }
+        for (path, line, _) in &cached {
+            tx.execute(
+                "UPDATE code_review_carried_anchor_verifications
+                 SET presented_at = ?6, presented_job_id = ?7
+                 WHERE repository = ?1 AND pull_number = ?2 AND head_sha = ?3
+                   AND path = ?4 AND line = ?5
+                   AND verified_at IS NOT NULL AND presented_at IS NULL",
+                params![
+                    repository,
+                    pull_number as i64,
+                    head_sha,
+                    path,
+                    *line as i64,
+                    presented_at,
+                    job_id
+                ],
+            )?;
+        }
         let has_more = tx.query_row(
-            "SELECT EXISTS(
-               SELECT 1 FROM code_review_carried_anchor_verifications
-               WHERE repository = ?1 AND pull_number = ?2 AND head_sha = ?3
-                 AND verified_at IS NULL AND claim_job_id IS NULL
+            "WITH active(path, line) AS (
+               SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]')
+               FROM json_each(?4)
+             )
+             SELECT EXISTS(
+               SELECT 1
+               FROM code_review_carried_anchor_verifications AS verification
+               JOIN active
+                 ON active.path = verification.path AND active.line = verification.line
+               WHERE verification.repository = ?1 AND verification.pull_number = ?2
+                 AND verification.head_sha = ?3
+                 AND (
+                   (verification.verified_at IS NULL
+                    AND verification.claim_job_id IS NULL)
+                   OR (verification.verified_at IS NOT NULL
+                       AND verification.presented_at IS NULL)
+                 )
              )",
-            params![repository, pull_number as i64, head_sha],
+            params![repository, pull_number as i64, head_sha, target_json],
             |row| row.get(0),
         )?;
         tx.commit()?;
@@ -12687,7 +12771,7 @@ impl Store {
         Ok(self.conn.lock().unwrap().execute(
             "UPDATE code_review_carried_anchor_verifications
              SET verified_at = ?7, line_present = ?8, content = ?9,
-                 claim_job_id = NULL
+                 claim_job_id = NULL, presented_at = ?7, presented_job_id = ?6
              WHERE repository = ?1 AND pull_number = ?2 AND head_sha = ?3
                AND path = ?4 AND line = ?5 AND claim_job_id = ?6
                AND verified_at IS NULL",
@@ -13011,6 +13095,24 @@ impl Store {
                 ));
             }
         };
+        if !command.trigger_key.is_empty() {
+            let last_comment_id = tx
+                .query_row(
+                    "SELECT last_comment_id FROM code_review_threadless_command_order
+                     WHERE repository = ?1 AND pull_number = ?2 AND finding_id = ?3",
+                    params![repository, pull_number as i64, finding_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?
+                .unwrap_or_default() as u64;
+            if command.comment_id <= last_comment_id {
+                tx.commit()?;
+                return Ok((
+                    ThreadlessCommandOutcome::NotApplicable { finding_id, status },
+                    None,
+                ));
+            }
+        }
         let expected = if resolve { "open" } else { "dismissed" };
         if status != expected {
             // Deliveries can arrive out of order: an unresolve whose earlier
@@ -13047,6 +13149,21 @@ impl Store {
                 tx.commit()?;
                 return Ok((ThreadlessCommandOutcome::NotApplicableDeferred, None));
             }
+            if !command.trigger_key.is_empty() {
+                tx.execute(
+                    "INSERT INTO code_review_threadless_command_order
+                            (repository, pull_number, finding_id, last_comment_id)
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(repository, pull_number, finding_id) DO UPDATE SET
+                       last_comment_id = max(last_comment_id, excluded.last_comment_id)",
+                    params![
+                        repository,
+                        pull_number as i64,
+                        finding_id,
+                        command.comment_id as i64
+                    ],
+                )?;
+            }
             tx.commit()?;
             return Ok((
                 ThreadlessCommandOutcome::NotApplicable { finding_id, status },
@@ -13081,6 +13198,21 @@ impl Store {
                    WHERE finding_id = ?1
                  )",
                 params![finding_id, now],
+            )?;
+        }
+        if !command.trigger_key.is_empty() {
+            tx.execute(
+                "INSERT INTO code_review_threadless_command_order
+                        (repository, pull_number, finding_id, last_comment_id)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(repository, pull_number, finding_id) DO UPDATE SET
+                   last_comment_id = max(last_comment_id, excluded.last_comment_id)",
+                params![
+                    repository,
+                    pull_number as i64,
+                    finding_id,
+                    command.comment_id as i64
+                ],
             )?;
         }
         // Legacy checkbox snapshots and commands mutate the same threadless
@@ -14003,13 +14135,22 @@ impl Store {
                      WHERE claim_job_id = ?1 AND verified_at IS NULL",
                     params![id],
                 )?;
+                tx.execute(
+                    "UPDATE code_review_carried_anchor_verifications
+                     SET presented_at = NULL, presented_job_id = NULL
+                     WHERE presented_job_id = ?1",
+                    params![id],
+                )?;
                 if let Some(request) = continuation {
                     let next_anchor: Option<(String, i64)> = tx
                         .query_row(
                             "SELECT path, line
                              FROM code_review_carried_anchor_verifications
                              WHERE repository = ?1 AND pull_number = ?2 AND head_sha = ?3
-                               AND verified_at IS NULL AND claim_job_id IS NULL
+                               AND (
+                                 (verified_at IS NULL AND claim_job_id IS NULL)
+                                 OR (verified_at IS NOT NULL AND presented_at IS NULL)
+                               )
                              ORDER BY path, line LIMIT 1",
                             params![
                                 record.job.repository,
@@ -15129,7 +15270,10 @@ impl Store {
                     "SELECT path, line
                      FROM code_review_carried_anchor_verifications
                      WHERE repository = ?1 AND pull_number = ?2 AND head_sha = ?3
-                       AND verified_at IS NULL AND claim_job_id IS NULL
+                       AND (
+                         (verified_at IS NULL AND claim_job_id IS NULL)
+                         OR (verified_at IS NOT NULL AND presented_at IS NULL)
+                       )
                      ORDER BY path, line
                      LIMIT 1",
                     params![repository, pull_number as i64, head_sha],
@@ -20938,7 +21082,7 @@ mod tests {
                 second.pull_number,
                 &second.head_sha,
                 std::slice::from_ref(&target),
-                false,
+                true,
                 1,
             )
             .unwrap();
@@ -21500,6 +21644,39 @@ mod tests {
             "an expired no-op is consumed"
         );
 
+        // Once a later command reaches a terminal outcome, a delayed earlier
+        // sibling cannot reverse the maintainer's final intent.
+        let mut delayed = command(&target, true);
+        delayed.trigger_key = "command:comment:99".into();
+        delayed.comment_id = 99;
+        store
+            .claim_github_webhook_delivery("delivery-delayed-99", None, Some(&delayed))
+            .unwrap();
+        let delayed = store
+            .pending_threadless_commands("acme/widgets", 1000)
+            .unwrap()
+            .into_iter()
+            .find(|pending| pending.trigger_key == delayed.trigger_key)
+            .unwrap();
+        let (outcome, _) = store
+            .apply_threadless_resolve_command(&delayed, "stale — @jim", None)
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            ThreadlessCommandOutcome::NotApplicable { ref status, .. } if status == "open"
+        ));
+        let (listed, _) = store
+            .threadless_code_review_findings("acme/widgets", 42)
+            .unwrap();
+        assert_eq!(
+            listed
+                .iter()
+                .find(|finding| finding.id == target)
+                .unwrap()
+                .status,
+            "open"
+        );
+
         // LIKE metacharacters in the prefix are data, not wildcards: a
         // prefix whose hex region holds `_` must not match the finding
         // whose real id differs at that position.
@@ -21514,6 +21691,7 @@ mod tests {
         // command must not evaluate or reverse a newer opposite decision.
         let mut durable = command(&target, true);
         durable.trigger_key = "command:comment:200".into();
+        durable.comment_id = 200;
         durable.created_at = chrono::Utc::now().to_rfc3339();
         store
             .claim_github_webhook_delivery("delivery-consumed-1", None, Some(&durable))
@@ -22284,7 +22462,10 @@ mod tests {
                 ("src/inserted.rs".to_owned(), 7)
             ]
         );
-        assert!(!third_page.has_more);
+        assert!(
+            third_page.has_more,
+            "a refreshed review epoch must continue through omitted cached evidence"
+        );
         let covered = first_page
             .targets
             .iter()
@@ -22523,6 +22704,91 @@ mod tests {
             next.targets.len() + next.cached.len(),
             3,
             "new reads and cached evidence share one bounded page"
+        );
+    }
+
+    #[test]
+    fn cached_carried_anchor_pages_are_target_scoped_bounded_and_finite() {
+        let store = Store::open_in_memory().unwrap();
+        let first = enqueue_backoff_test_job(&store);
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            first.id
+        );
+        let all_targets = (0..66)
+            .map(|index| (format!("src/cached_{index:02}.rs"), 1))
+            .collect::<Vec<_>>();
+        let initial = store
+            .claim_code_review_carried_anchor_page(
+                &first.id,
+                &first.repository,
+                first.pull_number,
+                &first.head_sha,
+                &all_targets,
+                true,
+                all_targets.len(),
+            )
+            .unwrap();
+        for (path, line) in initial.targets {
+            assert!(
+                store
+                    .complete_code_review_carried_anchor_read(
+                        &first.id,
+                        &first.repository,
+                        first.pull_number,
+                        &first.head_sha,
+                        &path,
+                        line,
+                        Some("cached line"),
+                    )
+                    .unwrap()
+            );
+        }
+        // Simulate an older overlapping epoch that left every cached row
+        // pending. The current review excludes the first target, so neither
+        // its page nor its continuation signal may observe that stale row.
+        store
+            .claim_code_review_carried_anchor_page(
+                &first.id,
+                &first.repository,
+                first.pull_number,
+                &first.head_sha,
+                &all_targets,
+                true,
+                0,
+            )
+            .unwrap();
+
+        let active_targets = all_targets[1..].to_vec();
+        let mut cached_pages = Vec::new();
+        for (index, expected_len) in [32, 32, 1].into_iter().enumerate() {
+            let mut request = backoff_test_job_request();
+            request.dedupe_key = format!("cached-page-{index}");
+            let job = store.enqueue_code_review_job(&request).unwrap().unwrap();
+            assert_eq!(
+                store.claim_code_review_job().unwrap().unwrap().job.id,
+                job.id
+            );
+            let page = store
+                .claim_code_review_carried_anchor_page(
+                    &job.id,
+                    &job.repository,
+                    job.pull_number,
+                    &job.head_sha,
+                    &active_targets,
+                    index == 0,
+                    32,
+                )
+                .unwrap();
+            assert!(page.targets.is_empty());
+            assert_eq!(page.cached.len(), expected_len);
+            assert_eq!(page.has_more, index < 2);
+            cached_pages.extend(page.cached.into_iter().map(|(path, line, _)| (path, line)));
+        }
+        assert_eq!(cached_pages, active_targets);
+        assert!(
+            !cached_pages.contains(&all_targets[0]),
+            "inactive cached evidence must not enter the active review"
         );
     }
 

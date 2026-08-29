@@ -1254,8 +1254,8 @@ struct ThreadlessResolveCommand {
 const THREADLESS_COMMAND_PASS_LIMIT: usize = 16;
 
 /// How long a not-yet-applicable command is retained for replay before it is
-/// consumed as a genuine no-op. Covers out-of-order webhook delivery of a
-/// resolve/unresolve pair; past this window the sibling is not coming.
+/// consumed as a no-op. The store records that terminal command's comment ID,
+/// so a delayed earlier sibling can never reverse the final intent.
 const THREADLESS_COMMAND_REPLAY_WINDOW: Duration = Duration::from_secs(120);
 
 /// How a commenter's effective-permission lookup concluded.
