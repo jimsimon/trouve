@@ -53,3 +53,4 @@ sequentially.
 | [0041](0041-evidence-backed-review-churn-controls.md) | Evidence-backed review churn controls | Accepted |
 | [0042](0042-cursor-sdk-bridge-transport.md) | Cursor SDK Bridge transport | Superseded by 0043 |
 | [0043](0043-shared-cursor-sdk-bridge-process.md) | One shared Cursor SDK Bridge per backend | Accepted |
+| [0044](0044-cursor-shared-store-transition-and-quarantine.md) | Cursor shared-store transition and callback quarantine | Accepted |

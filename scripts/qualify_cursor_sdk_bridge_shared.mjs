@@ -4,7 +4,8 @@
  *
  * The pinned Bridge exposes one process-wide custom-tool callback endpoint. This
  * probe proves that one process can safely host two concurrent local agents when
- * the adapter routes callbacks by the exact owning agent id. It exercises
+ * callbacks are routed by the exact owning agent id. Production-adapter route
+ * settlement and quarantine are covered by the Rust adapter tests. This exercises
  * per-agent workspaces and tool catalogs, concurrent sends, cancellation
  * isolation, warm close/resume, and cold resume after a Bridge restart.
  *
@@ -377,12 +378,19 @@ async function main() {
   ]);
   await access(REPOSITORY_ROOT, fsConstants.R_OK);
 
+  const expectedAgents = new Map();
+  const cancellationAStarted = deferred();
+  const cancelledProbeTeardown = deferred();
+  const survivalBStarted = deferred();
+  const survivalBRelease = deferred();
   let bridge;
   let callback;
   let cleanupPromise;
   const cleanup = () => {
     if (cleanupPromise !== undefined) return cleanupPromise;
     cleanupPromise = (async () => {
+      cancelledProbeTeardown.resolve();
+      survivalBRelease.resolve();
       const activeBridge = bridge;
       const activeCallback = callback;
       bridge = undefined;
@@ -412,11 +420,6 @@ async function main() {
     return cleanupPromise;
   };
 
-  const expectedAgents = new Map();
-  const cancellationAStarted = deferred();
-  const cancellationARelease = deferred();
-  const survivalBStarted = deferred();
-  const survivalBRelease = deferred();
   const handler = (slot, toolName, resultMarker) => async (argsValue, record) => {
     if (record.agentId !== expectedAgents.get(slot) || argsValue.token !== toolName) {
       throw new QualificationError(`${toolName}: callback crossed its agent route`);
@@ -433,11 +436,11 @@ async function main() {
         throw new QualificationError("cancel callback crossed its agent route");
       }
       cancellationAStarted.resolve(record);
-      // A shared callback listener cannot be shut down to cancel one agent.
-      // Model the production router's per-agent supervisor instead: Trouve
-      // explicitly settles this route after CancelRun while the other route
-      // remains active. Cursor does not reliably disconnect the callback.
-      await cancellationARelease.promise;
+      // Hold this direct-Bridge callback through cancellation so the probe can
+      // observe Cursor's transport behavior. The production adapter's route
+      // supervisor is exercised separately; this handler is released only for
+      // probe teardown after cancellation isolation has already been proven.
+      await cancelledProbeTeardown.promise;
       return { value: "cancelled" };
     }],
     [TOOLS.surviveB, async (argsValue, record) => {
@@ -584,13 +587,12 @@ async function main() {
       { runId: runIdA, agentId: agents.a },
       timeoutMilliseconds,
     );
-    cancellationARelease.resolve();
     survivalBRelease.resolve();
     const [cancelledOutcome, survivingOutcome] = await Promise.all([
       cancelledSend,
       survivingSend,
     ]);
-    await Promise.all([cancelledRecord.settled.promise, survivingRecord.settled.promise]);
+    await survivingRecord.settled.promise;
     if (cancelledOutcome.error !== null) throw cancelledOutcome.error;
     if (survivingOutcome.error !== null) throw survivingOutcome.error;
     const cancelledFrames = cancelledOutcome.frames;
@@ -612,17 +614,27 @@ async function main() {
     if (callbackFor(callback, TOOLS.cancelA).agentId !== agents.a) {
       throw new QualificationError("cancelled callback crossed its agent route");
     }
+    let cancelledCallbackSettledBeforeTeardown = false;
+    void cancelledRecord.settled.promise.then(() => {
+      cancelledCallbackSettledBeforeTeardown = true;
+    });
+    await Promise.resolve();
     const cancellation = {
       cancelled_run_id: runIdA,
       surviving_run_id: runIdB,
-      cancelled_route_settled_by_adapter: cancelledRecord.ok,
+      cancelled_callback_settled_by_bridge_before_probe_teardown:
+        cancelledCallbackSettledBeforeTeardown,
       bridge_disconnected_cancelled_callback: cancelledRecord.cancelledAtMs !== null,
       surviving_callback_completed: survivingRecord.ok,
       surviving_turn: survived,
+      adapter_route_settlement_covered_by:
+        "cursor_adapter_cancellation_settles_route_and_keeps_shared_bridge_usable",
     };
-    if (!cancellation.cancelled_route_settled_by_adapter || !cancellation.surviving_callback_completed) {
+    if (!cancellation.surviving_callback_completed) {
       throw new QualificationError("parallel cancellation did not isolate the surviving agent");
     }
+    cancelledProbeTeardown.resolve();
+    await cancelledRecord.settled.promise;
 
     await closeAgents(bridge, agents, timeoutMilliseconds);
     const warmRssBytes = await processRssBytes(bridge.child.pid);

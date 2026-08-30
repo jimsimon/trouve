@@ -21,8 +21,9 @@ use trouve_protocol::Scope;
 const LIVE_TIMEOUT: Duration = Duration::from_secs(300);
 const FILE_NAME: &str = "cursor-sdk-e2e.txt";
 const FILE_CONTENT: &str = "cursor-sdk-production-e2e";
-const PARALLEL_FILE_NAME: &str = "cursor-sdk-parallel-e2e.txt";
-const PARALLEL_FILE_CONTENT: &str = "cursor-sdk-parallel-worktree";
+const OVERLAP_FILE_NAME: &str = "cursor-sdk-overlap-e2e.txt";
+const RESUME_CONTENT: &str = "cursor-sdk-resume-worktree";
+const PARALLEL_CONTENT: &str = "cursor-sdk-parallel-worktree";
 const WRITE_MARKER: &str = "CURSOR_SDK_WRITE_OK";
 const RESUME_MARKER: &str = "CURSOR_SDK_RESUME_OK";
 const PARALLEL_MARKER: &str = "CURSOR_SDK_PARALLEL_OK";
@@ -595,15 +596,6 @@ async fn cursor_sdk_shipping_path_installs_tools_resumes_and_cleans_up() {
         .await
         .unwrap();
     let parallel_worktree = PathBuf::from(parallel_session["worktree_path"].as_str().unwrap());
-    std::fs::write(
-        parallel_worktree.join(PARALLEL_FILE_NAME),
-        PARALLEL_FILE_CONTENT,
-    )
-    .unwrap();
-    assert!(
-        !worktree.join(PARALLEL_FILE_NAME).exists(),
-        "parallel fixture leaked into the first session worktree"
-    );
     let parallel_thread: serde_json::Value = client
         .post(format!("{base}/threads"))
         .json(&serde_json::json!({
@@ -624,34 +616,120 @@ async fn cursor_sdk_shipping_path_installs_tools_resumes_and_cleans_up() {
     let parallel_thread_id = parallel_thread["id"].as_str().unwrap().to_string();
     let parallel_events_url = format!("{base}/threads/{parallel_thread_id}/events");
 
-    let second_send = client
-        .post(format!("{base}/threads/{thread_id}/messages"))
-        .json(&serde_json::json!({
-            "content": format!(
-                "Call read_file exactly once with {{\"path\":\"{FILE_NAME}\"}}. \
-                 If its complete content after removing one optional trailing newline is exactly \
-                 {FILE_CONTENT}, reply with exactly {RESUME_MARKER}. Do not call any other tool."
-            )
-        }))
-        .send()
-        .await
-        .unwrap();
+    let second_body = serde_json::json!({
+        "content": format!(
+            "Call write_file exactly once with \
+             {{\"path\":\"{OVERLAP_FILE_NAME}\",\"content\":\"{RESUME_CONTENT}\"}}. \
+             After it succeeds, reply with exactly {RESUME_MARKER}. Do not call any other tool."
+        )
+    });
+    let parallel_body = serde_json::json!({
+        "content": format!(
+            "Call write_file exactly once with \
+             {{\"path\":\"{OVERLAP_FILE_NAME}\",\"content\":\"{PARALLEL_CONTENT}\"}}. \
+             After it succeeds, reply with exactly {PARALLEL_MARKER}. Do not call any other tool."
+        )
+    });
+    let (second_send, parallel_send) = tokio::join!(
+        client
+            .post(format!("{base}/threads/{thread_id}/messages"))
+            .json(&second_body)
+            .send(),
+        client
+            .post(format!("{base}/threads/{parallel_thread_id}/messages"))
+            .json(&parallel_body)
+            .send(),
+    );
+    let second_send = second_send.unwrap();
     assert!(second_send.status().is_success(), "{second_send:?}");
-    let parallel_send = client
-        .post(format!(
-            "{base}/threads/{parallel_thread_id}/messages"
-        ))
-        .json(&serde_json::json!({
-            "content": format!(
-                "Call read_file exactly once with {{\"path\":\"{PARALLEL_FILE_NAME}\"}}. \
-                 If its complete content after removing one optional trailing newline is exactly \
-                 {PARALLEL_FILE_CONTENT}, reply with exactly {PARALLEL_MARKER}. Do not call any other tool."
-            )
-        }))
-        .send()
-        .await
-        .unwrap();
+    let parallel_send = parallel_send.unwrap();
     assert!(parallel_send.status().is_success(), "{parallel_send:?}");
+
+    // Neither approval is released until both requests are durably visible.
+    // Reaching this barrier proves that two agents have callbacks concurrently
+    // admitted through the one process-wide Bridge callback registration.
+    let (second_approval_events, parallel_approval_events) = tokio::join!(
+        wait_for_event(&client, &events_url, |event| {
+            (event["type"] == "approval.requested" && event["turn"] == 2)
+                || terminal_event(event, 2)
+        }),
+        wait_for_event(&client, &parallel_events_url, |event| {
+            (event["type"] == "approval.requested" && event["turn"] == 1)
+                || terminal_event(event, 1)
+        }),
+    );
+    let second_approval = second_approval_events
+        .iter()
+        .find(|event| event["type"] == "approval.requested" && event["turn"] == 2)
+        .unwrap_or_else(|| {
+            panic!("resume turn terminated before the overlap barrier: {second_approval_events:?}")
+        });
+    let parallel_approval = parallel_approval_events
+        .iter()
+        .find(|event| event["type"] == "approval.requested" && event["turn"] == 1)
+        .unwrap_or_else(|| {
+            panic!(
+                "parallel turn terminated before the overlap barrier: {parallel_approval_events:?}"
+            )
+        });
+    let second_call_id = second_approval["call_id"].as_str().unwrap();
+    let parallel_call_id = parallel_approval["call_id"].as_str().unwrap();
+    let second_requested = second_approval_events
+        .iter()
+        .find(|event| event["type"] == "tool.requested" && event["call_id"] == second_call_id)
+        .expect("resume approval has a durable tool request");
+    let parallel_requested = parallel_approval_events
+        .iter()
+        .find(|event| event["type"] == "tool.requested" && event["call_id"] == parallel_call_id)
+        .expect("parallel approval has a durable tool request");
+    assert_eq!(second_requested["tool"], "write_file", "{second_requested}");
+    assert_eq!(
+        second_requested["args"]["path"], OVERLAP_FILE_NAME,
+        "{second_requested}"
+    );
+    assert_eq!(
+        second_requested["args"]["content"], RESUME_CONTENT,
+        "{second_requested}"
+    );
+    assert_eq!(
+        parallel_requested["tool"], "write_file",
+        "{parallel_requested}"
+    );
+    assert_eq!(
+        parallel_requested["args"]["path"], OVERLAP_FILE_NAME,
+        "{parallel_requested}"
+    );
+    assert_eq!(
+        parallel_requested["args"]["content"], PARALLEL_CONTENT,
+        "{parallel_requested}"
+    );
+
+    let (second_approval_response, parallel_approval_response) = tokio::join!(
+        client
+            .post(format!("{base}/approvals"))
+            .json(&serde_json::json!({
+                "thread_id": thread_id,
+                "call_id": second_call_id,
+                "decision": "approve"
+            }))
+            .send(),
+        client
+            .post(format!("{base}/approvals"))
+            .json(&serde_json::json!({
+                "thread_id": parallel_thread_id,
+                "call_id": parallel_call_id,
+                "decision": "approve"
+            }))
+            .send(),
+    );
+    assert_eq!(
+        second_approval_response.unwrap().status(),
+        reqwest::StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        parallel_approval_response.unwrap().status(),
+        reqwest::StatusCode::NO_CONTENT
+    );
 
     tokio::join!(
         wait_for_event(&client, &events_url, |event| terminal_event(event, 2)),
@@ -675,12 +753,21 @@ async fn cursor_sdk_shipping_path_installs_tools_resumes_and_cleans_up() {
         1,
         "resume turn escaped its exact one-call tool policy: {requests:?}"
     );
-    assert_eq!(requests[0]["tool"], "read_file", "{:?}", requests[0]);
-    assert_eq!(requests[0]["args"]["path"], FILE_NAME, "{:?}", requests[0]);
-    let read_call_id = requests[0]["call_id"].as_str().unwrap();
+    assert_eq!(requests[0]["tool"], "write_file", "{:?}", requests[0]);
+    assert_eq!(
+        requests[0]["args"]["path"], OVERLAP_FILE_NAME,
+        "{:?}",
+        requests[0]
+    );
+    assert_eq!(
+        requests[0]["args"]["content"], RESUME_CONTENT,
+        "{:?}",
+        requests[0]
+    );
+    let overlap_call_id = requests[0]["call_id"].as_str().unwrap();
     assert!(second_events.iter().any(|event| {
         event["type"] == "tool.completed"
-            && event["call_id"] == read_call_id
+            && event["call_id"] == overlap_call_id
             && event["status"] == "ok"
     }));
     let parallel_events = persisted_thread_events(&engine, &parallel_thread_id);
@@ -699,11 +786,29 @@ async fn cursor_sdk_shipping_path_installs_tools_resumes_and_cleans_up() {
         1,
         "parallel turn escaped its exact one-call tool policy: {parallel_requests:?}"
     );
-    assert_eq!(parallel_requests[0]["tool"], "read_file");
+    assert_eq!(parallel_requests[0]["tool"], "write_file");
     assert_eq!(
-        parallel_requests[0]["args"]["path"], PARALLEL_FILE_NAME,
+        parallel_requests[0]["args"]["path"], OVERLAP_FILE_NAME,
         "parallel callback was routed to the wrong thread: {:?}",
         parallel_requests[0]
+    );
+    assert_eq!(
+        parallel_requests[0]["args"]["content"], PARALLEL_CONTENT,
+        "parallel callback was routed to the wrong thread: {:?}",
+        parallel_requests[0]
+    );
+    assert!(parallel_events.iter().any(|event| {
+        event["type"] == "tool.completed"
+            && event["call_id"] == parallel_call_id
+            && event["status"] == "ok"
+    }));
+    assert_eq!(
+        std::fs::read_to_string(worktree.join(OVERLAP_FILE_NAME)).unwrap(),
+        RESUME_CONTENT
+    );
+    assert_eq!(
+        std::fs::read_to_string(parallel_worktree.join(OVERLAP_FILE_NAME)).unwrap(),
+        PARALLEL_CONTENT
     );
     assert_eq!(
         engine
@@ -743,12 +848,18 @@ async fn cursor_sdk_shipping_path_installs_tools_resumes_and_cleans_up() {
         .await
         .unwrap();
     let items = view["items"].as_array().unwrap();
-    assert!(items.iter().any(|item| {
-        item["kind"] == "tool_call" && item["tool"] == "write_file" && item["status"] == "ok"
-    }));
-    assert!(items.iter().any(|item| {
-        item["kind"] == "tool_call" && item["tool"] == "read_file" && item["status"] == "ok"
-    }));
+    assert_eq!(
+        items
+            .iter()
+            .filter(|item| {
+                item["kind"] == "tool_call"
+                    && item["tool"] == "write_file"
+                    && item["status"] == "ok"
+            })
+            .count(),
+        2,
+        "the durable view omitted a completed Cursor write: {items:?}"
+    );
     // Scan the complete data directory while every managed-runtime generation
     // still exists. Teardown must not be able to erase the only place where a
     // leaked credential would otherwise have been found.
