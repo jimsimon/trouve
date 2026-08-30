@@ -399,13 +399,8 @@ export class TrouveCodeReviewConfiguration extends withSignalTracking(LitElement
             </label>
           </div>
 
-          <label>
-            Repository instructions
-            <textarea .value=${draft.prompt} ?disabled=${this.#busy !== ""} @input=${(event: Event) => this.#patchRepositoryDraft(key, { prompt: (event.currentTarget as HTMLTextAreaElement).value })} placeholder="Extra constraints or context for reviews in this repository"></textarea>
-          </label>
-
           <fieldset>
-            <legend>Persona routing</legend>
+            <legend>Semantic Persona Selection</legend>
             <div class="form-grid three">
               <label>
                 Selection mode
@@ -435,9 +430,14 @@ export class TrouveCodeReviewConfiguration extends withSignalTracking(LitElement
             </div>
             <label class="check-row">
               <input type="checkbox" .checked=${draft.semanticRouting} ?disabled=${this.#busy !== "" || draft.routingMode === "manual"} @change=${(event: Event) => this.#patchRepositoryDraft(key, { semanticRouting: (event.currentTarget as HTMLInputElement).checked })} />
-              Allow one read-only semantic routing pass per diff batch
+              Enabled
             </label>
           </fieldset>
+
+          <label>
+            Repository instructions
+            <textarea .value=${draft.prompt} ?disabled=${this.#busy !== ""} @input=${(event: Event) => this.#patchRepositoryDraft(key, { prompt: (event.currentTarget as HTMLTextAreaElement).value })} placeholder="Extra constraints or context for reviews in this repository"></textarea>
+          </label>
 
           ${draft.routingMode === "manual"
             ? this.#renderReviewerSelection(key, "reviewerIds", "Personas run for every requested review", "Select at least one persona while reviews are enabled.", draft.reviewerIds)
