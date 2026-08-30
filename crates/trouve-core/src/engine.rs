@@ -9857,30 +9857,24 @@ impl Engine {
         thread: &Thread,
         turn: u64,
         prompt: &trouve_protocol::QueuedPrompt,
-        tools_enabled: bool,
+        supports_steering: bool,
     ) -> Result<Vec<Event>, EngineError> {
         let mut model_options = self.store.thread_model_options(&thread.id)?;
-        let (selected_model, supports_steering) =
+        let selected_model =
             if let Some((_backend_id, backend, _model_name)) = self.backend_for(&thread.model) {
-                (
-                    backend
-                        .models()
-                        .into_iter()
-                        .find(|model| model.id == thread.model),
-                    self.turn_supports_steering(thread, tools_enabled),
-                )
+                backend
+                    .models()
+                    .into_iter()
+                    .find(|model| model.id == thread.model)
             } else {
-                (
-                    self.resolve_provider(&thread.model)
-                        .ok()
-                        .and_then(|(provider, _)| {
-                            provider
-                                .models()
-                                .into_iter()
-                                .find(|model| model.id == thread.model)
-                        }),
-                    self.turn_supports_steering(thread, tools_enabled),
-                )
+                self.resolve_provider(&thread.model)
+                    .ok()
+                    .and_then(|(provider, _)| {
+                        provider
+                            .models()
+                            .into_iter()
+                            .find(|model| model.id == thread.model)
+                    })
             };
         if selected_model.is_some() {
             normalize_thinking_option(&mut model_options, selected_model.as_ref());
@@ -10372,7 +10366,7 @@ impl Engine {
             self.register_turn_steerer(thread_id, turn);
         }
         let shell_events =
-            match self.turn_shell_events(&thread, turn, &started_prompt, started_tools_enabled) {
+            match self.turn_shell_events(&thread, turn, &started_prompt, turn_steering) {
                 Ok(events) => events,
                 Err(error) => {
                     if turn_steering {
@@ -11362,7 +11356,7 @@ impl Engine {
             self.store
                 .append_events_async(
                     Scope::Thread(thread.id.clone()),
-                    self.turn_shell_events(thread, turn, prompt, tools_enabled)?,
+                    self.turn_shell_events(thread, turn, prompt, turn_steering)?,
                 )
                 .await?;
             prompt_persisted.store(true, Ordering::Release);
