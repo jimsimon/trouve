@@ -2975,10 +2975,10 @@ where
     ensure_safe_ref(base_ref)?;
     let operation = GitOperation::new(Some(cancel));
     with_session_snapshot_index(worktree, &operation, |index| {
-        // Keep the ordinary session manifest's file/line budgets, but use one
-        // rename-aware patch for review orchestration. Per-path `--no-renames`
-        // patches cannot distinguish deletion from a surviving file move.
-        validate_session_diff_numstat(worktree, base_ref, index, &operation)?;
+        // Use one rename-aware patch for review orchestration. Per-path
+        // `--no-renames` patches cannot distinguish deletion from a surviving
+        // file move. Review batching enforces the model-derived prompt budget;
+        // only byte bounds apply while collecting the repository diff.
         let manifest = run_git_bounded(
             worktree,
             Some(index),
@@ -5068,7 +5068,7 @@ line three
     }
 
     #[test]
-    fn session_diff_rejects_changes_too_large_for_the_ui() {
+    fn aggregate_session_diff_rejects_large_line_count_but_review_accepts_it() {
         let tmp = tempfile::tempdir().unwrap();
         init_repo(tmp.path());
         let base = run(tmp.path(), &["rev-parse", "HEAD"]);
@@ -5078,23 +5078,22 @@ line three
         let error = session_diff(tmp.path(), &base).unwrap_err();
         assert!(error.downcast_ref::<SessionDiffTooLarge>().is_some());
         assert!(error.to_string().contains("too large to render"));
-        let review_error = session_diff_patches_cancellable(
+        let review_diff = session_diff_patches_cancellable(
             tmp.path(),
             &base,
             MAX_SESSION_DIFF_BYTES,
             &tokio_util::sync::CancellationToken::new(),
-            |_| false,
+            |_| true,
         )
-        .err()
         .unwrap();
-        assert!(review_error.downcast_ref::<SessionDiffTooLarge>().is_some());
+        assert_eq!(review_diff.len(), 1);
         let summary = session_diff_summary(tmp.path(), &base).unwrap();
         assert_eq!(summary.len(), 1);
         assert_eq!(summary[0].additions, MAX_SESSION_DIFF_CHANGED_LINES + 1);
     }
 
     #[test]
-    fn session_diff_rejects_too_many_changed_files() {
+    fn aggregate_session_diff_rejects_many_files_but_review_accepts_them() {
         let tmp = tempfile::tempdir().unwrap();
         init_repo(tmp.path());
         for index in 0..=MAX_SESSION_DIFF_FILES {
@@ -5110,16 +5109,15 @@ line three
         let error = session_diff(tmp.path(), &base).unwrap_err();
         assert!(error.downcast_ref::<SessionDiffTooLarge>().is_some());
         assert!(error.to_string().contains("too large to render"));
-        let review_error = session_diff_patches_cancellable(
+        let review_diff = session_diff_patches_cancellable(
             tmp.path(),
             &base,
             MAX_SESSION_DIFF_BYTES,
             &tokio_util::sync::CancellationToken::new(),
-            |_| false,
+            |_| true,
         )
-        .err()
         .unwrap();
-        assert!(review_error.downcast_ref::<SessionDiffTooLarge>().is_some());
+        assert_eq!(review_diff.len(), MAX_SESSION_DIFF_FILES + 1);
         let summary = session_diff_summary(tmp.path(), &base).unwrap();
         assert_eq!(summary.len(), MAX_SESSION_DIFF_FILES + 1);
     }
