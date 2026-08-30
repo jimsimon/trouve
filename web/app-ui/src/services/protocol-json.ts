@@ -44,10 +44,14 @@ const normalizedNumberToken = (raw: string): string => {
 export const jsonNumberValueToken = (value: number): string =>
   Object.is(value, -0) ? "-0" : JSON.stringify(value);
 
-/** Numbers outside the safe-integer subset, plus signed zero, require a
- * verified source token before they can be used as model option values. */
+/** Every decimal, unsafe integer, and signed zero requires its verified JSON
+ * source token before it can be used as a model option value. Keeping the
+ * decimal branch explicit prevents a rounded Number from being mistaken for
+ * the exact decimal advertised by a provider. */
 export const modelOptionNumberNeedsSourceProof = (value: number): boolean =>
-  !Number.isSafeInteger(value) || Object.is(value, -0);
+  !Number.isInteger(value)
+  || !Number.isSafeInteger(value)
+  || Object.is(value, -0);
 
 /** Whether parsing a JSON number token produced exactly the value that would
  * be serialized back onto the wire. Equivalent spellings such as `1e3` and
