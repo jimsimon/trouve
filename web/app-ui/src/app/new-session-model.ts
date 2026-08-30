@@ -7,6 +7,7 @@ import type {
 import {
   changeModelOption,
   isThinkingModelOption,
+  modelOptionChangeValue,
   sanitizeModelOptions,
   type ModelOptionChangeDetail,
   type ModelOptionValue,
@@ -529,14 +530,15 @@ export const applyNewSessionModelOptionChange = (input: {
 } => {
   const modelOptions = changeModelOption(input.modelOptions, input.change);
   const thinkingChange = isThinkingModelOption(input.change.key);
-  const resetThinking = thinkingChange && input.change.value === undefined;
+  const changeValue = modelOptionChangeValue(input.change);
+  const resetThinking = thinkingChange && changeValue === undefined;
   return {
     modelOptions,
     thinking: !thinkingChange
       ? input.thinking
       : resetThinking
         ? input.defaults.thinking
-        : String(input.change.value),
+        : String(changeValue),
     inheritedThinking: !thinkingChange
       ? input.inheritedThinking
       : resetThinking
@@ -782,8 +784,7 @@ export const createNewSessionThreadRequest = (
       if (budget !== undefined) {
         modelOptions = changeModelOption(modelOptions, {
           key: advertisedThinking.key,
-          value: budget.value,
-          numberSource: budget.source,
+          value: budget,
         });
       }
     }

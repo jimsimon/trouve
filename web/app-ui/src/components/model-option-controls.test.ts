@@ -57,7 +57,7 @@ describe("model option controls", () => {
       reasoning_effort: "xhigh",
       context: "1m",
       fast: false,
-    }, { key: "temperature", value: 0.8, numberSource: "0.8" }));
+    }, { key: "temperature", value: { value: 0.8, source: "0.8" } }));
 
     expect(controls).toEqual([
       {
@@ -359,12 +359,15 @@ describe("model option controls", () => {
   it("carries verified input tokens into protocol requests", () => {
     const exact = changeModelOption({}, {
       key: "temperature",
-      value: 0.1,
-      numberSource: "0.10000000000000000",
+      value: { value: 0.1, source: "0.10000000000000000" },
     });
     expect(stringifyProtocolJson({ model_options: exact })).toBe(
       '{"model_options":{"temperature":0.10000000000000000}}',
     );
+    expect(() => changeModelOption({}, {
+      key: "temperature",
+      value: { value: 0.1, source: "0.2" },
+    })).toThrow("model option number is missing exact source provenance");
 
     const unverified = updateProtocolModelOption(
       {},
@@ -404,7 +407,7 @@ describe("model option controls", () => {
     })).toEqual({ thinking_budget_tokens: 16384 });
     expect(changeModelOption(
       { thinking_level: "16384" },
-      { key: "thinking_budget_tokens", value: 8192, numberSource: "8192" },
+      { key: "thinking_budget_tokens", value: { value: 8192, source: "8192" } },
     )).toEqual({ thinking_budget_tokens: 8192 });
     expect(changeModelOption(
       { thinking_level: "high", effort: "low", reasoning: "medium", fast: true },

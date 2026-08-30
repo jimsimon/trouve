@@ -98,11 +98,15 @@ test("model-option choices preserve selected state and scalar value types", asyn
     editor.addEventListener("trouve-model-option-changed", (event) => {
       const detail = (event as CustomEvent<{ key: string; value: unknown }>).detail;
       changes.push(detail);
-      if (detail.key === "temperature" && detail.value === 1e20) {
+      const detailValue = typeof detail.value === "object" && detail.value !== null
+        && "value" in detail.value
+        ? (detail.value as { value: unknown }).value
+        : detail.value;
+      if (detail.key === "temperature" && detailValue === 1e20) {
         editor.controls = editor.controls.map((control) => {
           const option = control as Record<string, unknown>;
           return option["key"] === detail.key
-            ? { ...option, text: String(detail.value) }
+            ? { ...option, text: String(detailValue) }
             : control;
         });
       }
@@ -141,16 +145,24 @@ test("model-option choices preserve selected state and scalar value types", asyn
   }
   await expect.poll(() => page.evaluate(() => {
     const changes = (window as Window & { modelOptionChanges?: unknown[] })
-      .modelOptionChanges as { key: string; value: unknown; numberSource?: string }[];
+      .modelOptionChanges as { key: string; value: unknown }[];
     return changes.map((detail) => ({
       ...detail,
-      value: Object.is(detail.value, -0) ? "-0" : detail.value,
+      value: typeof detail.value === "object" && detail.value !== null
+          && "value" in detail.value
+        ? {
+            ...detail.value,
+            value: Object.is((detail.value as { value: unknown }).value, -0)
+              ? "-0"
+              : (detail.value as { value: unknown }).value,
+          }
+        : detail.value,
     }));
   })).toEqual([
-    { key: "temperature", value: 1, numberSource: "1.0" },
-    { key: "temperature", value: 1_000, numberSource: "1e3" },
-    { key: "temperature", value: "-0", numberSource: "-0" },
-    { key: "temperature", value: 1e20, numberSource: "1e20" },
+    { key: "temperature", value: { value: 1, source: "1.0" } },
+    { key: "temperature", value: { value: 1_000, source: "1e3" } },
+    { key: "temperature", value: { value: "-0", source: "-0" } },
+    { key: "temperature", value: { value: 1e20, source: "1e20" } },
   ]);
   await expect(temperature).toHaveValue("100000000000000000000");
   await page.evaluate(() => {
@@ -201,10 +213,10 @@ test("model-option choices preserve selected state and scalar value types", asyn
   await expect.poll(() => page.evaluate(() =>
     (window as Window & { modelOptionChanges?: unknown[] }).modelOptionChanges,
   )).toEqual([
-    { key: "context_window", value: 300_000, numberSource: "300000" },
+    { key: "context_window", value: { value: 300_000, source: "300000" } },
     { key: "fast", value: true },
-    { key: "thinking_budget_tokens", value: 12, numberSource: "12" },
-    { key: "temperature", value: 0.25, numberSource: "0.25" },
+    { key: "thinking_budget_tokens", value: { value: 12, source: "12" } },
+    { key: "temperature", value: { value: 0.25, source: "0.25" } },
     { key: "tone", value: "" },
     { key: "instructions", value: "" },
     { key: "instructions", value: "   " },
@@ -217,10 +229,10 @@ test("model-option choices preserve selected state and scalar value types", asyn
   await expect.poll(() => page.evaluate(() =>
     (window as Window & { modelOptionChanges?: unknown[] }).modelOptionChanges,
   )).toEqual([
-    { key: "context_window", value: 300_000, numberSource: "300000" },
+    { key: "context_window", value: { value: 300_000, source: "300000" } },
     { key: "fast", value: true },
-    { key: "thinking_budget_tokens", value: 12, numberSource: "12" },
-    { key: "temperature", value: 0.25, numberSource: "0.25" },
+    { key: "thinking_budget_tokens", value: { value: 12, source: "12" } },
+    { key: "temperature", value: { value: 0.25, source: "0.25" } },
     { key: "tone", value: "" },
     { key: "instructions", value: "" },
     { key: "instructions", value: "   " },

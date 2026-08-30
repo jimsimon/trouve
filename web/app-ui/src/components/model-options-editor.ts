@@ -150,8 +150,7 @@ export class TrouveModelOptionsEditor extends LitElement {
                     if (choice.numberSource === undefined) return;
                     this.#emit({
                       key: control.key,
-                      value: choice.value,
-                      numberSource: choice.numberSource,
+                      value: { value: choice.value, source: choice.numberSource },
                     });
                   } else {
                     this.#emit({ key: control.key, value: choice.value });
@@ -277,9 +276,7 @@ export class TrouveModelOptionsEditor extends LitElement {
       : String(parsed ?? "");
     if (this.#committedText.get(input) === committed) return;
     this.#committedText.set(input, committed);
-    this.#emit(typeof parsed === "object"
-      ? { key: control.key, value: parsed.value, numberSource: parsed.source }
-      : { key: control.key, value: parsed });
+    this.#emit({ key: control.key, value: parsed });
   }
 
   #emit(detail: ModelOptionChangeDetail): void {

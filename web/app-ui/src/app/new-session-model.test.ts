@@ -694,8 +694,7 @@ describe("new session model", () => {
       },
       modelOptions: changeModelOption({}, {
         key: "temperature",
-        value: 0.25,
-        numberSource: "0.25",
+        value: { value: 0.25, source: "0.25" },
       }),
       edits: createNewThreadOptionEdits(),
       modes: [mode(selectedModel.id)],
@@ -952,7 +951,7 @@ describe("new session model", () => {
     const reset = applyNewSessionModelOptionChange({
       modelOptions: changeModelOption(
         { effort: "low" },
-        { key: "temperature", value: 0.7, numberSource: "0.7" },
+        { key: "temperature", value: { value: 0.7, source: "0.7" } },
       ),
       thinking: "low",
       inheritedThinking: undefined,

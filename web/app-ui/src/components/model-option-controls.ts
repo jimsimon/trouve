@@ -49,19 +49,30 @@ export type ModelOptionControl =
   | BooleanModelOptionControl
   | TextModelOptionControl;
 
-export type ModelOptionChangeDetail =
-  | {
-      readonly key: string;
-      /** Undefined removes an explicit override and restores the model default. */
-      readonly value: string | boolean | undefined;
-      readonly numberSource?: never;
-    }
-  | {
-      readonly key: string;
-      readonly value: number;
-      /** Every numeric editor change carries its verified JSON token. */
-      readonly numberSource: string;
-    };
+export interface ModelOptionChangeDetail {
+  readonly key: string;
+  /** Undefined removes an explicit override and restores the model default.
+   * Numeric values remain inseparable from the exact JSON token that produced
+   * them until changeModelOption records both on the protocol option map. */
+  readonly value: string | boolean | ExactModelOptionNumber | undefined;
+}
+
+/** Unwrap a control change only after verifying that any numeric value still
+ * matches its exact JSON source token. */
+export const modelOptionChangeValue = (
+  change: ModelOptionChangeDetail,
+): ModelOptionValue | undefined => {
+  const value = change.value;
+  if (value === undefined || typeof value === "string" || typeof value === "boolean") {
+    return value;
+  }
+  if (
+    typeof value.value === "number"
+    && typeof value.source === "string"
+    && jsonNumberTokenIsExact(value.source, value.value)
+  ) return value.value;
+  throw new TypeError("model option number is missing exact source provenance");
+};
 
 const THINKING_KEYS = new Set([
   "thinking_level",
@@ -572,12 +583,13 @@ export const changeModelOption = <T>(
   const remove = THINKING_KEYS.has(change.key)
     ? [...THINKING_KEYS]
     : [change.key];
+  const value = modelOptionChangeValue(change);
   return updateProtocolModelOption(
     options,
     change.key,
-    change.value,
+    value,
     remove,
-    change.numberSource,
+    typeof change.value === "object" ? change.value.source : undefined,
   );
 };
 
