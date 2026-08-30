@@ -2570,6 +2570,11 @@ struct AutomationSnapshot {
     mutation_state: Arc<AutomationMutationState>,
 }
 
+enum AutomationModelOptionsCacheUpdate {
+    Preserve,
+    Replace(Option<trouve_protocol::ModelInfo>),
+}
+
 fn automation_definition_matches(
     left: &trouve_protocol::Automation,
     right: &trouve_protocol::Automation,
@@ -5104,15 +5109,24 @@ impl Engine {
                         &automation.model_options,
                         &current_model,
                     )?;
-                    self.commit_automation_model_options_validation(
-                        &snapshot,
-                        Some(current_model.clone()),
-                        options.clone(),
-                    )
-                    .await?;
-                    return Ok((Some(current_model.id), options));
+                    let model_id = current_model.id.clone();
+                    return self
+                        .complete_automation_model_options_for_fire(
+                            &snapshot,
+                            Some(model_id),
+                            options,
+                            AutomationModelOptionsCacheUpdate::Replace(Some(current_model)),
+                        )
+                        .await;
                 }
-                return Ok((Some(cached.model.id), cached.validated_options));
+                return self
+                    .complete_automation_model_options_for_fire(
+                        &snapshot,
+                        Some(cached.model.id),
+                        cached.validated_options,
+                        AutomationModelOptionsCacheUpdate::Preserve,
+                    )
+                    .await;
             }
         }
 
@@ -5128,13 +5142,14 @@ impl Engine {
             .await
         {
             Ok((model, options)) => {
-                self.commit_automation_model_options_validation(
+                let model_id = model.as_ref().map(|model| model.id.clone());
+                self.complete_automation_model_options_for_fire(
                     &snapshot,
-                    model.clone(),
-                    options.clone(),
+                    model_id,
+                    options,
+                    AutomationModelOptionsCacheUpdate::Replace(model),
                 )
-                .await?;
-                Ok((model.map(|model| model.id), options))
+                .await
             }
             Err(error) if automation.model_options.is_empty() => {
                 tracing::warn!(
@@ -5152,9 +5167,13 @@ impl Engine {
                         )])
                     })
                     .unwrap_or_default();
-                self.commit_automation_model_options_validation(&snapshot, None, options.clone())
-                    .await?;
-                Ok((None, options))
+                self.complete_automation_model_options_for_fire(
+                    &snapshot,
+                    None,
+                    options,
+                    AutomationModelOptionsCacheUpdate::Replace(None),
+                )
+                .await
             }
             Err(error) => Err(error),
         }
@@ -5238,12 +5257,13 @@ impl Engine {
         }
     }
 
-    async fn commit_automation_model_options_validation(
+    async fn complete_automation_model_options_for_fire(
         &self,
         snapshot: &AutomationSnapshot,
-        model: Option<trouve_protocol::ModelInfo>,
+        model_id: Option<String>,
         validated_options: serde_json::Map<String, serde_json::Value>,
-    ) -> Result<(), EngineError> {
+        cache_update: AutomationModelOptionsCacheUpdate,
+    ) -> Result<(Option<String>, serde_json::Map<String, serde_json::Value>), EngineError> {
         let version = snapshot.mutation_state.version.lock().await;
         if version.generation != snapshot.generation
             || !version
@@ -5256,14 +5276,16 @@ impl Engine {
                 snapshot.automation.id
             )));
         }
-        self.remember_automation_model_options_validation(
-            &snapshot.automation,
-            model,
-            validated_options,
-            snapshot.generation,
-            snapshot.mutation_state.clone(),
-        );
-        Ok(())
+        if let AutomationModelOptionsCacheUpdate::Replace(model) = cache_update {
+            self.remember_automation_model_options_validation(
+                &snapshot.automation,
+                model,
+                validated_options.clone(),
+                snapshot.generation,
+                snapshot.mutation_state.clone(),
+            );
+        }
+        Ok((model_id, validated_options))
     }
 
     async fn monitor_automation_turn(
@@ -26312,10 +26334,32 @@ default_permission_mode = "ask"
             .get(&automation.id)
             .unwrap()
             .generation;
+        let stale_snapshot = engine
+            .automation_snapshot_for_fire(&automation)
+            .await
+            .unwrap();
+        let stale_cached = engine
+            .automation_model_options_validations
+            .lock()
+            .unwrap()
+            .get(&automation.id)
+            .unwrap()
+            .clone();
         let paused = engine
             .set_automation_enabled(&automation.id, false)
             .await
             .unwrap();
+        let stale_error = engine
+            .complete_automation_model_options_for_fire(
+                &stale_snapshot,
+                Some(stale_cached.model.id),
+                stale_cached.validated_options,
+                AutomationModelOptionsCacheUpdate::Preserve,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(stale_error.contains("changed while its model options were validated"));
         let automation = engine
             .set_automation_enabled(&paused.id, true)
             .await
