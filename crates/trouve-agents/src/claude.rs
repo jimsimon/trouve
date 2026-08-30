@@ -850,43 +850,52 @@ impl AgentBackend for ClaudeBackend {
                 "content": content,
             }
         });
-        tokio::select! {
+        let mut input = tokio::select! {
             biased;
-            _ = steer.cancel.cancelled() => Err(BackendError::Cancelled),
-            result = async {
-                let mut input = proc_.input.lock().await;
-                if !proc_.active_turn.load(std::sync::atomic::Ordering::Acquire) {
-                    return Err(BackendError::Protocol(format!(
-                        "claude steer: session {} has no active turn",
-                        steer.session
-                    )));
-                }
-                if !input.prompt_sent {
-                    if input.pending_steers.len() >= PENDING_STEER_CAP {
-                        return Err(BackendError::Protocol(format!(
-                            "claude steer: session {} pending steering queue is full",
-                            steer.session
-                        )));
-                    }
-                    input.pending_steers.push(message);
-                    return Ok(());
-                }
-                let _turn_boundary = proc_.router.turn_boundary.lock().await;
-                if !proc_.router.can_accept_steer(input.attach_turn) {
-                    return Err(BackendError::Protocol(format!(
-                        "claude steer: session {} has no active turn",
-                        steer.session
-                    )));
-                }
-                input
-                    .stdin
-                    .write_all(message.to_string().as_bytes())
-                    .await
-                    .map_err(BackendError::Io)?;
-                input.stdin.write_all(b"\n").await.map_err(BackendError::Io)?;
-                input.stdin.flush().await.map_err(BackendError::Io)
-            } => result,
+            _ = steer.cancel.cancelled() => return Err(BackendError::Cancelled),
+            input = proc_.input.lock() => input,
+        };
+        if !proc_.active_turn.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(BackendError::Protocol(format!(
+                "claude steer: session {} has no active turn",
+                steer.session
+            )));
         }
+        if !input.prompt_sent {
+            if input.pending_steers.len() >= PENDING_STEER_CAP {
+                return Err(BackendError::Protocol(format!(
+                    "claude steer: session {} pending steering queue is full",
+                    steer.session
+                )));
+            }
+            input.pending_steers.push(message);
+            return Ok(());
+        }
+        let _turn_boundary = tokio::select! {
+            biased;
+            _ = steer.cancel.cancelled() => return Err(BackendError::Cancelled),
+            boundary = proc_.router.turn_boundary.lock() => boundary,
+        };
+        if !proc_.router.can_accept_steer(input.attach_turn) {
+            return Err(BackendError::Protocol(format!(
+                "claude steer: session {} has no active turn",
+                steer.session
+            )));
+        }
+        // Once this record starts, finish it even if request cancellation
+        // arrives. Dropping write_all between the JSON bytes and newline would
+        // corrupt the persistent stream-json transport for every later turn.
+        input
+            .stdin
+            .write_all(message.to_string().as_bytes())
+            .await
+            .map_err(BackendError::Io)?;
+        input
+            .stdin
+            .write_all(b"\n")
+            .await
+            .map_err(BackendError::Io)?;
+        input.stdin.flush().await.map_err(BackendError::Io)
     }
 
     async fn start_login(&self) -> Result<BackendLogin, BackendError> {
