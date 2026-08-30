@@ -329,7 +329,9 @@ pub use requests::*;
 // the review (additive).
 // 7.23: workspace list entries expose additive repository identity so clients
 // can distinguish repository grouping from workspace grouping.
-pub const PROTOCOL_VERSION: &str = "7.23";
+// 7.24: turns emit an additive provider-admission marker with explicit
+// cooldown wait telemetry; the former capacity marker remains replay-only.
+pub const PROTOCOL_VERSION: &str = "7.24";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";
 pub const ERROR_CODE_GITHUB_REAUTHENTICATION_REQUIRED: &str = "github_reauthentication_required";

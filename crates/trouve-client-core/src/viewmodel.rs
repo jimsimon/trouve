@@ -264,7 +264,7 @@ pub struct ThreadViewModel {
     /// Handles imported/replayed streams where capacity precedes the durable
     /// turn shell. Ordinary live streams transition the visible row directly.
     #[doc(hidden)]
-    pub capacity_acquired_before_start: HashSet<u64>,
+    pub admitted_before_start: HashSet<u64>,
     /// Call ids currently waiting for approval (newest last).
     pub pending_approvals: Vec<String>,
     /// Question request ids currently waiting for answers (newest last).
@@ -320,7 +320,7 @@ impl From<ThreadViewSnapshot> for ThreadViewModel {
             cursor: 0,
             tool_outputs: HashMap::new(),
             tool_started_at: HashMap::new(),
-            capacity_acquired_before_start: HashSet::new(),
+            admitted_before_start: HashSet::new(),
             pending_approvals: snapshot.pending_approvals,
             pending_questions: snapshot.pending_questions,
             last_usage,
@@ -600,31 +600,34 @@ impl ThreadViewModel {
         })
     }
 
+    fn apply_turn_admission(&mut self, turn: u64) -> Option<usize> {
+        if let Some(idx) = self.items.iter().rposition(|item| {
+            matches!(
+                item,
+                ChatItem::TurnStatus {
+                    turn: candidate,
+                    state: TurnState::WaitingForCapacity,
+                } if *candidate == turn
+            )
+        }) {
+            self.items[idx] = ChatItem::TurnStatus {
+                turn,
+                state: TurnState::Running,
+            };
+            Some(idx)
+        } else {
+            self.admitted_before_start.insert(turn);
+            None
+        }
+    }
+
     /// Apply one event. Returns the index of the item that changed (for
     /// minimal UI updates), or `None` when nothing visible changed.
     pub fn apply(&mut self, envelope: &EventEnvelope) -> Option<usize> {
         self.cursor = envelope.cursor;
         match &envelope.event {
-            Event::TurnCapacityAcquired { turn, .. } => {
-                if let Some(idx) = self.items.iter().rposition(|item| {
-                    matches!(
-                        item,
-                        ChatItem::TurnStatus {
-                            turn: candidate,
-                            state: TurnState::WaitingForCapacity,
-                        } if candidate == turn
-                    )
-                }) {
-                    self.items[idx] = ChatItem::TurnStatus {
-                        turn: *turn,
-                        state: TurnState::Running,
-                    };
-                    Some(idx)
-                } else {
-                    self.capacity_acquired_before_start.insert(*turn);
-                    None
-                }
-            }
+            Event::TurnAdmitted { turn, .. } => self.apply_turn_admission(*turn),
+            Event::TurnCapacityAcquired { turn, .. } => self.apply_turn_admission(*turn),
             Event::TurnStarted {
                 turn,
                 model,
@@ -642,7 +645,7 @@ impl ThreadViewModel {
                 }
                 self.turn_steerable.insert(*turn, *supports_steering);
                 self.turn_started_at.insert(*turn, envelope.ts);
-                let state = if self.capacity_acquired_before_start.remove(turn) {
+                let state = if self.admitted_before_start.remove(turn) {
                     TurnState::Running
                 } else {
                     TurnState::WaitingForCapacity
@@ -1072,7 +1075,7 @@ impl ThreadViewModel {
                 usage,
                 checkpoint_id,
             } => {
-                self.capacity_acquired_before_start.remove(turn);
+                self.admitted_before_start.remove(turn);
                 self.turn_running = false;
                 let usage = usage_with_live_context(usage.clone(), self.running_usage.as_ref());
                 self.running_usage = None;
@@ -1106,7 +1109,7 @@ impl ThreadViewModel {
                 idx.or(aborted_tool)
             }
             Event::TurnFailed { turn, error } => {
-                self.capacity_acquired_before_start.remove(turn);
+                self.admitted_before_start.remove(turn);
                 self.turn_running = false;
                 self.running_usage = None;
                 self.last_usage.clone_from(&self.completed_usage);
@@ -1137,7 +1140,7 @@ impl ThreadViewModel {
                 idx.or(aborted_tool)
             }
             Event::TurnCancelled { turn } => {
-                self.capacity_acquired_before_start.remove(turn);
+                self.admitted_before_start.remove(turn);
                 self.turn_running = false;
                 self.running_usage = None;
                 self.last_usage.clone_from(&self.completed_usage);
@@ -1311,7 +1314,7 @@ mod tests {
     }
 
     #[test]
-    fn turn_waits_until_capacity_is_acquired() {
+    fn turn_waits_until_provider_admission() {
         let mut vm = ThreadViewModel::new();
         vm.apply(&env(Event::TurnStarted {
             turn: 1,
@@ -1328,10 +1331,9 @@ mod tests {
             })
         ));
 
-        vm.apply(&env(Event::TurnCapacityAcquired {
+        vm.apply(&env(Event::TurnAdmitted {
             turn: 1,
-            wait_ms: 42,
-            background: false,
+            provider_wait_ms: 42,
         }));
         assert!(matches!(
             vm.items.last(),
@@ -1389,7 +1391,7 @@ mod tests {
     }
 
     #[test]
-    fn capacity_before_turn_start_replays_as_running() {
+    fn legacy_capacity_before_turn_start_replays_as_running() {
         let mut vm = ThreadViewModel::new();
         vm.apply(&env(Event::TurnCapacityAcquired {
             turn: 3,

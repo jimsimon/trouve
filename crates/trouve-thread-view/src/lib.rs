@@ -58,11 +58,11 @@ pub struct ThreadProjection {
     /// refresh still receives an accurate duration when it completes.
     #[serde(default)]
     tool_started_at: HashMap<String, chrono::DateTime<chrono::Utc>>,
-    /// Normally capacity follows turn.started. Retain an early capacity event
-    /// until its shell arrives so replay remains deterministic even when
-    /// importing historical streams with the opposite ordering.
-    #[serde(default)]
-    capacity_acquired_before_start: HashSet<u64>,
+    /// Normally admission follows turn.started. Retain an early admission
+    /// marker until its shell arrives so replay remains deterministic even
+    /// when importing historical streams with the opposite ordering.
+    #[serde(default, alias = "capacity_acquired_before_start")]
+    admitted_before_start: HashSet<u64>,
     #[serde(skip)]
     indexes: ProjectionIndexes,
 }
@@ -91,7 +91,7 @@ impl ThreadProjection {
         self.ensure_indexes();
         self.cursor = envelope.cursor;
         match &envelope.event {
-            Event::TurnCapacityAcquired { turn, .. } => {
+            Event::TurnAdmitted { turn, .. } | Event::TurnCapacityAcquired { turn, .. } => {
                 if let Some(&idx) = self.indexes.turns.get(turn) {
                     if matches!(
                         self.snapshot.items.get(idx),
@@ -106,7 +106,7 @@ impl ThreadProjection {
                         };
                     }
                 } else {
-                    self.capacity_acquired_before_start.insert(*turn);
+                    self.admitted_before_start.insert(*turn);
                 }
             }
             Event::TurnStarted {
@@ -129,7 +129,7 @@ impl ThreadProjection {
                     .turn_steerable
                     .insert(*turn, *supports_steering);
                 self.snapshot.turn_started_at.insert(*turn, envelope.ts);
-                let state = if self.capacity_acquired_before_start.remove(turn) {
+                let state = if self.admitted_before_start.remove(turn) {
                     ThreadTurnState::Running
                 } else {
                     ThreadTurnState::WaitingForCapacity
@@ -635,7 +635,7 @@ impl ThreadProjection {
     }
 
     fn finish_turn(&mut self, turn: u64, ended: chrono::DateTime<chrono::Utc>) {
-        self.capacity_acquired_before_start.remove(&turn);
+        self.admitted_before_start.remove(&turn);
         self.snapshot.turn_running = false;
         self.snapshot.turn_phase = None;
         self.fail_open_compaction(turn);
@@ -807,7 +807,7 @@ mod tests {
     }
 
     #[test]
-    fn turn_transitions_from_waiting_to_running_when_capacity_arrives() {
+    fn turn_transitions_from_waiting_to_running_when_provider_admission_arrives() {
         let mut projection = ThreadProjection::default();
         projection.apply(&envelope(
             1,
@@ -831,10 +831,9 @@ mod tests {
         projection.apply(&envelope(
             2,
             20,
-            Event::TurnCapacityAcquired {
+            Event::TurnAdmitted {
                 turn: 7,
-                wait_ms: 20,
-                background: false,
+                provider_wait_ms: 20,
             },
         ));
         assert!(matches!(
@@ -870,7 +869,7 @@ mod tests {
     }
 
     #[test]
-    fn capacity_before_start_replays_as_running() {
+    fn legacy_capacity_before_start_replays_as_running() {
         let mut projection = ThreadProjection::default();
         projection.apply(&envelope(
             1,
@@ -881,6 +880,45 @@ mod tests {
                 background: false,
             },
         ));
+        projection.apply(&envelope(
+            2,
+            1,
+            Event::TurnStarted {
+                turn: 9,
+                mode: "code".into(),
+                model: "m".into(),
+                thinking_level: None,
+                supports_steering: false,
+            },
+        ));
+        assert!(matches!(
+            projection.snapshot.items.last(),
+            Some(ThreadViewItem::TurnStatus {
+                turn: 9,
+                state: ThreadTurnState::Running,
+            })
+        ));
+    }
+
+    #[test]
+    fn legacy_cached_admission_key_replays_as_running() {
+        let mut projection = ThreadProjection::default();
+        projection.apply(&envelope(
+            1,
+            0,
+            Event::TurnCapacityAcquired {
+                turn: 9,
+                wait_ms: 0,
+                background: false,
+            },
+        ));
+        let mut cached = serde_json::to_value(projection).unwrap();
+        let cached = cached.as_object_mut().unwrap();
+        let admission = cached.remove("admitted_before_start").unwrap();
+        cached.insert("capacity_acquired_before_start".into(), admission);
+        let mut projection: ThreadProjection =
+            serde_json::from_value(cached.clone().into()).unwrap();
+
         projection.apply(&envelope(
             2,
             1,
@@ -1283,10 +1321,9 @@ mod tests {
         projection.apply(&envelope(
             2,
             10,
-            Event::TurnCapacityAcquired {
+            Event::TurnAdmitted {
                 turn: 7,
-                wait_ms: 10,
-                background: false,
+                provider_wait_ms: 10,
             },
         ));
         projection.apply(&envelope(

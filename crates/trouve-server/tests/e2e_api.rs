@@ -2135,11 +2135,7 @@ async fn code_turns_in_two_threads_of_one_session_enter_the_backend_concurrently
             |event| event["type"] == "turn.completed",
         )
         .await;
-        assert!(
-            events
-                .iter()
-                .any(|event| event["type"] == "turn.capacity_acquired")
-        );
+        assert!(events.iter().any(|event| event["type"] == "turn.admitted"));
     }
 }
 

@@ -24,7 +24,7 @@ sequentially.
 | [0012](0012-single-version-monorepo-release-train.md) | Single-version monorepo release train | Accepted |
 | [0013](0013-preact-review-dashboard.md) | Preact application for the review dashboard | Accepted |
 | [0014](0014-durable-code-review-job-artifacts.md) | Durable code-review job artifacts and event streams | Accepted |
-| [0015](0015-read-shared-turns-and-prioritized-capacity.md) | Read-shared turns and prioritized model capacity | Accepted |
+| [0015](0015-read-shared-turns-and-prioritized-capacity.md) | Read-shared turns and prioritized model capacity | Partially superseded by 0042 |
 | [0016](0016-catalog-backed-provider-transports.md) | Catalog-backed provider transports | Accepted |
 | [0017](0017-server-owned-session-title-model.md) | Server-owned session title model with heuristic fallback | Superseded by 0029 |
 | [0018](0018-bounded-coalesced-event-ingestion.md) | Bounded, coalesced event ingestion | Accepted |
@@ -43,7 +43,7 @@ sequentially.
 | [0031](0031-acknowledged-turn-cancellation.md) | Acknowledged turn cancellation | Accepted |
 | [0032](0032-single-local-server-owner.md) | Single local server owner per data directory | Accepted |
 | [0033](0033-materialized-pageable-thread-history.md) | Materialized pageable thread history | Accepted |
-| [0034](0034-concurrent-session-turns.md) | Concurrent turns in a shared session worktree | Accepted |
+| [0034](0034-concurrent-session-turns.md) | Concurrent turns in a shared session worktree | Partially superseded by 0042 |
 | [0035](0035-bounded-recursive-subagent-trees.md) | Bounded recursive subagent trees | Accepted |
 | [0036](0036-exact-protocol-version-compatibility.md) | Exact protocol version compatibility | Accepted |
 | [0037](0037-capability-scoped-external-read-roots.md) | Capability-scoped external read roots | Accepted |
@@ -51,3 +51,4 @@ sequentially.
 | [0039](0039-retire-servo-qualification-hosts.md) | Retire Servo qualification hosts | Accepted |
 | [0040](0040-durable-root-cause-history-for-code-review.md) | Durable root-cause history for code review | Accepted |
 | [0041](0041-evidence-backed-review-churn-controls.md) | Evidence-backed review churn controls | Accepted |
+| [0042](0042-provider-governed-turn-admission.md) | Provider-governed turn admission | Accepted |

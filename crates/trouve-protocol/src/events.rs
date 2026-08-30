@@ -213,14 +213,19 @@ pub enum TurnPhase {
 #[serde(tag = "type")]
 pub enum Event {
     // --- thread scope -----------------------------------------------------
-    /// Shared/provider capacity has been acquired for this turn. Interactive
-    /// turns use the foreground lane; unattended review tasks use background.
+    /// Legacy admission marker written before protocol 7.24. New
+    /// servers retain this variant only to replay existing durable event logs.
     #[serde(rename = "turn.capacity_acquired")]
     TurnCapacityAcquired {
         turn: u64,
         wait_ms: u64,
         background: bool,
     },
+    /// Provider admission is complete for this turn. `provider_wait_ms` is
+    /// time spent waiting for a shared throttling cooldown; zero means the
+    /// turn was admitted immediately.
+    #[serde(rename = "turn.admitted")]
+    TurnAdmitted { turn: u64, provider_wait_ms: u64 },
     #[serde(rename = "turn.started")]
     TurnStarted {
         turn: u64,
@@ -763,6 +768,35 @@ mod tests {
             event,
             Event::CodeReviewSettingsUpdated { settings }
                 if settings.max_parallel_reviews == 2
+        ));
+    }
+
+    #[test]
+    fn turn_admission_has_a_distinct_replay_compatible_contract() {
+        let value = serde_json::to_value(Event::TurnAdmitted {
+            turn: 3,
+            provider_wait_ms: 125,
+        })
+        .unwrap();
+        assert_eq!(value["type"], "turn.admitted");
+        assert_eq!(value["provider_wait_ms"], 125);
+        assert!(value.get("wait_ms").is_none());
+        assert!(value.get("background").is_none());
+
+        let legacy: Event = serde_json::from_value(serde_json::json!({
+            "type": "turn.capacity_acquired",
+            "turn": 3,
+            "wait_ms": 125,
+            "background": true
+        }))
+        .unwrap();
+        assert!(matches!(
+            legacy,
+            Event::TurnCapacityAcquired {
+                turn: 3,
+                wait_ms: 125,
+                background: true,
+            }
         ));
     }
 

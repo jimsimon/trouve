@@ -533,19 +533,16 @@ const CODEX_BRIDGE_METADATA_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
 const MAX_SUBAGENT_DEPTH: usize = 4;
 const MAX_CONCURRENT_CHILDREN: usize = 4;
 const MAX_ACTIVE_DESCENDANTS: usize = 16;
-
-const TURN_CONCURRENCY_ENV: &str = "TROUVE_TURN_CONCURRENCY";
-const DEFAULT_TURN_CONCURRENCY: usize = 26;
-const BACKGROUND_TURN_CONCURRENCY_ENV: &str = "TROUVE_BACKGROUND_TURN_CONCURRENCY";
-const DEFAULT_BACKGROUND_TURN_CONCURRENCY: usize = 24;
-const PROVIDER_TURN_CONCURRENCY_ENV: &str = "TROUVE_PROVIDER_TURN_CONCURRENCY";
-const DEFAULT_PROVIDER_TURN_CONCURRENCY: usize = 18;
-const PROVIDER_BACKGROUND_CONCURRENCY_ENV: &str = "TROUVE_PROVIDER_BACKGROUND_TURN_CONCURRENCY";
-const DEFAULT_PROVIDER_BACKGROUND_CONCURRENCY: usize = 16;
 /// Bounds durable task and thread setup bursts across planned review turns.
 /// Permits are released before model dispatch, so this does not cap active
 /// reviewer turns.
 const PLANNED_TURN_SETUP_CONCURRENCY: usize = 24;
+const REMOVED_TURN_CONCURRENCY_ENVS: [&str; 4] = [
+    "TROUVE_TURN_CONCURRENCY",
+    "TROUVE_BACKGROUND_TURN_CONCURRENCY",
+    "TROUVE_PROVIDER_TURN_CONCURRENCY",
+    "TROUVE_PROVIDER_BACKGROUND_TURN_CONCURRENCY",
+];
 
 fn session_branch_name(title: &str, session_id: &str, derive_from_session_title: bool) -> String {
     let id = session_id.strip_prefix("se_").unwrap_or(session_id);
@@ -555,14 +552,6 @@ fn session_branch_name(title: &str, session_id: &str, derive_from_session_title:
     } else {
         format!("trouve/{short_id}")
     }
-}
-
-fn positive_limit_from_env(name: &str, default: usize) -> usize {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(default)
 }
 
 async fn flush_backend_event_batch(
@@ -1163,57 +1152,40 @@ async fn flush_backend_collaborator_batches(
 
 #[derive(Clone)]
 struct ProviderTurnCapacity {
-    all: Arc<tokio::sync::Semaphore>,
-    background: Arc<tokio::sync::Semaphore>,
     backoff: Arc<Mutex<ProviderBackoff>>,
 }
 
 #[derive(Default)]
 struct ProviderBackoff {
-    until: Option<Instant>,
+    until: Option<tokio::time::Instant>,
     delay: std::time::Duration,
 }
 
-/// Capacity shared by interactive desktop turns, spawned agents, and
-/// background review personas. Background work has a smaller second gate, so
-/// it can never occupy all global/provider slots and starve the desktop.
+/// Provider throttle state shared by interactive desktop turns, spawned
+/// agents, and background review personas. Turns are otherwise admitted
+/// immediately: desktop engines rely on provider capacity, while the review
+/// service bounds work through its configurable job scheduler.
 struct TurnScheduler {
-    all: Arc<tokio::sync::Semaphore>,
-    background: Arc<tokio::sync::Semaphore>,
     planned_setups: Arc<tokio::sync::Semaphore>,
-    provider_all_limit: usize,
-    provider_background_limit: usize,
     providers: Mutex<HashMap<String, ProviderTurnCapacity>>,
 }
 
-struct TurnCapacityGuard {
-    _permits: Vec<tokio::sync::OwnedSemaphorePermit>,
-    wait_ms: u64,
+struct TurnAdmission {
+    provider_wait_ms: u64,
 }
 
 impl TurnScheduler {
     fn new() -> Self {
-        let all_limit = positive_limit_from_env(TURN_CONCURRENCY_ENV, DEFAULT_TURN_CONCURRENCY);
-        let background_limit = positive_limit_from_env(
-            BACKGROUND_TURN_CONCURRENCY_ENV,
-            DEFAULT_BACKGROUND_TURN_CONCURRENCY,
-        )
-        .min(all_limit.saturating_sub(1).max(1));
-        let provider_all_limit = positive_limit_from_env(
-            PROVIDER_TURN_CONCURRENCY_ENV,
-            DEFAULT_PROVIDER_TURN_CONCURRENCY,
-        );
-        let provider_background_limit = positive_limit_from_env(
-            PROVIDER_BACKGROUND_CONCURRENCY_ENV,
-            DEFAULT_PROVIDER_BACKGROUND_CONCURRENCY,
-        )
-        .min(provider_all_limit.saturating_sub(1).max(1));
+        for variable in
+            configured_removed_turn_concurrency_settings(|name| std::env::var_os(name).is_some())
+        {
+            tracing::warn!(
+                variable,
+                "removed turn-concurrency setting is ignored; engine turn admission is uncapped"
+            );
+        }
         Self {
-            all: Arc::new(tokio::sync::Semaphore::new(all_limit)),
-            background: Arc::new(tokio::sync::Semaphore::new(background_limit)),
             planned_setups: Arc::new(tokio::sync::Semaphore::new(PLANNED_TURN_SETUP_CONCURRENCY)),
-            provider_all_limit,
-            provider_background_limit,
             providers: Mutex::new(HashMap::new()),
         }
     }
@@ -1240,68 +1212,41 @@ impl TurnScheduler {
             .unwrap()
             .entry(provider.to_owned())
             .or_insert_with(|| ProviderTurnCapacity {
-                all: Arc::new(tokio::sync::Semaphore::new(self.provider_all_limit)),
-                background: Arc::new(tokio::sync::Semaphore::new(self.provider_background_limit)),
                 backoff: Arc::new(Mutex::new(ProviderBackoff::default())),
             })
             .clone()
     }
 
-    async fn acquire(
+    async fn admit(
         &self,
         model: &str,
-        background: bool,
         cancel: &tokio_util::sync::CancellationToken,
-    ) -> Result<TurnCapacityGuard> {
-        let started = Instant::now();
+    ) -> Result<TurnAdmission> {
+        let started = tokio::time::Instant::now();
         let provider = self.provider(model);
-        let cooldown = provider
-            .backoff
-            .lock()
-            .unwrap()
-            .until
-            .and_then(|until| until.checked_duration_since(Instant::now()));
-        if let Some(cooldown) = cooldown {
+        loop {
+            let now = tokio::time::Instant::now();
+            let cooldown = provider
+                .backoff
+                .lock()
+                .unwrap()
+                .until
+                .filter(|until| *until > now)
+                .map(|until| until - now);
+            let Some(cooldown) = cooldown else {
+                break;
+            };
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => bail!("turn cancelled"),
                 _ = tokio::time::sleep(cooldown) => {}
             }
         }
-        let mut permits = Vec::with_capacity(if background { 4 } else { 2 });
-        if background {
-            permits.push(tokio::select! {
-                biased;
-                _ = cancel.cancelled() => bail!("turn cancelled"),
-                permit = self.background.clone().acquire_owned() => {
-                    permit.map_err(|_| anyhow!("background turn scheduler closed"))?
-                }
-            });
-            permits.push(tokio::select! {
-                biased;
-                _ = cancel.cancelled() => bail!("turn cancelled"),
-                permit = provider.background.clone().acquire_owned() => {
-                    permit.map_err(|_| anyhow!("provider background scheduler closed"))?
-                }
-            });
+        if cancel.is_cancelled() {
+            bail!("turn cancelled");
         }
-        permits.push(tokio::select! {
-            biased;
-            _ = cancel.cancelled() => bail!("turn cancelled"),
-            permit = self.all.clone().acquire_owned() => {
-                permit.map_err(|_| anyhow!("turn scheduler closed"))?
-            }
-        });
-        permits.push(tokio::select! {
-            biased;
-            _ = cancel.cancelled() => bail!("turn cancelled"),
-            permit = provider.all.clone().acquire_owned() => {
-                permit.map_err(|_| anyhow!("provider turn scheduler closed"))?
-            }
-        });
-        Ok(TurnCapacityGuard {
-            _permits: permits,
-            wait_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+        Ok(TurnAdmission {
+            provider_wait_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
         })
     }
 
@@ -1327,12 +1272,25 @@ impl TurnScheduler {
             } else {
                 (backoff.delay * 2).min(std::time::Duration::from_secs(30))
             };
-            backoff.until = Some(Instant::now() + backoff.delay);
-        } else if error.is_none() && backoff.until.is_none_or(|until| Instant::now() >= until) {
+            backoff.until = Some(tokio::time::Instant::now() + backoff.delay);
+        } else if error.is_none()
+            && backoff
+                .until
+                .is_none_or(|until| tokio::time::Instant::now() >= until)
+        {
             backoff.delay /= 2;
             backoff.until = None;
         }
     }
+}
+
+fn configured_removed_turn_concurrency_settings(
+    mut is_set: impl FnMut(&str) -> bool,
+) -> Vec<&'static str> {
+    REMOVED_TURN_CONCURRENCY_ENVS
+        .into_iter()
+        .filter(|name| is_set(name))
+        .collect()
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -11154,29 +11112,23 @@ impl Engine {
             _ = cancel.cancelled() => bail!("turn cancelled"),
             guard = session_lifecycle.read() => guard,
         };
-        let turn_capacity = self
-            .turn_scheduler
-            .acquire(&thread.model, background, &cancel)
-            .await?;
+        let admission = self.turn_scheduler.admit(&thread.model, &cancel).await?;
         if background
             && let Some(progress) = self
                 .store
-                .set_code_review_task_provider_wait(&thread.id, turn_capacity.wait_ms)?
+                .set_code_review_task_provider_wait(&thread.id, admission.provider_wait_ms)?
         {
             self.emit_code_review_task_progress(progress).await?;
         }
         self.store
             .append_event_async(
                 scope.clone(),
-                Event::TurnCapacityAcquired {
+                Event::TurnAdmitted {
                     turn,
-                    wait_ms: turn_capacity.wait_ms,
-                    background,
+                    provider_wait_ms: admission.provider_wait_ms,
                 },
             )
             .await?;
-
-        let _turn_capacity = turn_capacity;
 
         // External agent backend? The vendor harness owns the loop; we
         // stream its events and bridge approvals. The shared lifecycle lease
@@ -12447,10 +12399,9 @@ impl Engine {
             .append_events_async(
                 Scope::Thread(collaborator.thread.id.clone()),
                 vec![
-                    Event::TurnCapacityAcquired {
+                    Event::TurnAdmitted {
                         turn: collaborator.turn,
-                        wait_ms: 0,
-                        background: false,
+                        provider_wait_ms: 0,
                     },
                     Event::TurnStarted {
                         turn: collaborator.turn,
@@ -17967,6 +17918,92 @@ mod tests {
         let _replacement = scheduler.acquire_planned_setup(&cancel).await.unwrap();
     }
 
+    #[test]
+    fn removed_turn_concurrency_settings_are_detected_for_migration_warnings() {
+        let configured = configured_removed_turn_concurrency_settings(|name| {
+            name == "TROUVE_TURN_CONCURRENCY"
+                || name == "TROUVE_PROVIDER_BACKGROUND_TURN_CONCURRENCY"
+        });
+
+        assert_eq!(
+            configured,
+            vec![
+                "TROUVE_TURN_CONCURRENCY",
+                "TROUVE_PROVIDER_BACKGROUND_TURN_CONCURRENCY"
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn provider_cooldown_wait_observes_extensions() {
+        let scheduler = Arc::new(TurnScheduler::new());
+        scheduler.record_outcome("provider/model", Some("429 rate limit"));
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let waiter = {
+            let scheduler = Arc::clone(&scheduler);
+            tokio::spawn(async move { scheduler.admit("provider/model", &cancel).await })
+        };
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(500)).await;
+        scheduler.record_outcome("provider/model", Some("429 rate limit"));
+        tokio::time::advance(Duration::from_millis(500)).await;
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+
+        tokio::time::advance(Duration::from_millis(1_500)).await;
+        tokio::task::yield_now().await;
+        assert!(waiter.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn provider_capacity_rejects_an_already_cancelled_turn() {
+        let scheduler = TurnScheduler::new();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+
+        let result = scheduler.admit("provider/model", &cancel).await;
+
+        assert_eq!(
+            result.err().map(|error| error.to_string()).as_deref(),
+            Some("turn cancelled")
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_admission_exceeds_the_former_global_and_provider_limits() {
+        const TURN_COUNT: usize = 27;
+        let scheduler = Arc::new(TurnScheduler::new());
+        let admitted = Arc::new(tokio::sync::Semaphore::new(0));
+        let provider_release = Arc::new(tokio::sync::Barrier::new(TURN_COUNT + 1));
+        let mut turns = Vec::with_capacity(TURN_COUNT);
+
+        for _ in 0..TURN_COUNT {
+            let scheduler = Arc::clone(&scheduler);
+            let admitted = Arc::clone(&admitted);
+            let provider_release = Arc::clone(&provider_release);
+            turns.push(tokio::spawn(async move {
+                let cancel = tokio_util::sync::CancellationToken::new();
+                scheduler.admit("provider/model", &cancel).await.unwrap();
+                admitted.add_permits(1);
+                provider_release.wait().await;
+            }));
+        }
+
+        let all_admitted = tokio::time::timeout(
+            Duration::from_secs(1),
+            admitted.acquire_many(TURN_COUNT.try_into().unwrap()),
+        )
+        .await
+        .expect("all turns should pass admission before provider work is released")
+        .unwrap();
+        drop(all_admitted);
+        provider_release.wait().await;
+        for turn in turns {
+            turn.await.unwrap();
+        }
+    }
+
     fn persona_request(display_name: &str) -> trouve_protocol::UpsertPersonaRequest {
         trouve_protocol::UpsertPersonaRequest {
             display_name: display_name.into(),
@@ -20699,27 +20736,26 @@ mod tests {
         let child_lifecycle = store
             .events_after(&Scope::Thread(child.id.clone()), 0)
             .unwrap();
-        let capacity_cursor = child_lifecycle
+        let admission_cursor = child_lifecycle
             .iter()
             .find_map(|event| {
                 matches!(
                     event.event,
-                    Event::TurnCapacityAcquired {
+                    Event::TurnAdmitted {
                         turn: 1,
-                        wait_ms: 0,
-                        background: false,
+                        provider_wait_ms: 0,
                     }
                 )
                 .then_some(event.cursor)
             })
-            .expect("native collaborator inherits the parent turn's capacity");
+            .expect("native collaborator inherits the parent turn's admission");
         let started_cursor = child_lifecycle
             .iter()
             .find_map(|event| {
                 matches!(event.event, Event::TurnStarted { turn: 1, .. }).then_some(event.cursor)
             })
             .expect("native collaborator turn starts");
-        assert!(capacity_cursor < started_cursor);
+        assert!(admission_cursor < started_cursor);
 
         // Child activity can create the projection before Codex emits its
         // formal collaborator-start notification. Publishing is tracked
@@ -21503,24 +21539,23 @@ default_permission_mode = "ask"
         let grandchild_events = store
             .events_after(&Scope::Thread(grandchild.id.clone()), 0)
             .unwrap();
-        let grandchild_capacity = grandchild_events
+        let grandchild_admission = grandchild_events
             .iter()
             .position(|event| {
                 matches!(
                     event.event,
-                    Event::TurnCapacityAcquired {
+                    Event::TurnAdmitted {
                         turn: 1,
-                        wait_ms: 0,
-                        background: false,
+                        provider_wait_ms: 0,
                     }
                 )
             })
-            .expect("nested collaborator inherits capacity");
+            .expect("nested collaborator inherits admission");
         let grandchild_started = grandchild_events
             .iter()
             .position(|event| matches!(event.event, Event::TurnStarted { turn: 1, .. }))
             .expect("nested collaborator starts");
-        assert!(grandchild_capacity < grandchild_started);
+        assert!(grandchild_admission < grandchild_started);
         engine
             .publish_backend_collaborator_spawn(&parent, 1, "vendor-grandchild", &mut collaborators)
             .await

@@ -257,7 +257,7 @@ export class ThreadViewModel {
   readonly turnSteerable = new Map<number, boolean>();
   readonly turnStartedAt = new Map<number, string>();
   readonly turnDurationMs = new Map<number, number>();
-  readonly #capacityAcquiredBeforeStart = new Set<number>();
+  readonly #admittedBeforeStart = new Set<number>();
   #queueRevision = 0;
   #completedUsage: Usage | undefined;
   #activeTurnUsage: { readonly turn: number; readonly usage: Usage } | undefined;
@@ -290,7 +290,7 @@ export class ThreadViewModel {
 
   /** Replace replay-built state with the server's current folded tail. */
   replaceSnapshot(cursor: number, snapshot: ProtocolThreadViewSnapshot): void {
-    this.#capacityAcquiredBeforeStart.clear();
+    this.#admittedBeforeStart.clear();
     const itemOffset = snapshot.item_offset ?? 0;
     this.items.splice(
       0,
@@ -567,6 +567,7 @@ export class ThreadViewModel {
   apply(envelope: ProtocolEventEnvelope): boolean {
     this.cursor = envelope.cursor;
     switch (envelope.type) {
+      case "turn.admitted":
       case "turn.capacity_acquired": {
         const waitingTurn = this.#findLast(
           (item) =>
@@ -582,10 +583,10 @@ export class ThreadViewModel {
           };
           return true;
         }
-        this.#capacityAcquiredBeforeStart.add(envelope.turn);
+        this.#admittedBeforeStart.add(envelope.turn);
         return false;
       }
-      case "turn.started":
+      case "turn.started": {
         this.turnRunning = true;
         this.#activeTurnUsage = undefined;
         this.turnPhase = "processing";
@@ -597,16 +598,17 @@ export class ThreadViewModel {
         }
         this.turnSteerable.set(envelope.turn, envelope.supports_steering ?? false);
         this.turnStartedAt.set(envelope.turn, envelope.ts);
-        const capacityAcquired = this.#capacityAcquiredBeforeStart.delete(envelope.turn);
+        const admitted = this.#admittedBeforeStart.delete(envelope.turn);
         this.appendItem({
           id: `turn:${envelope.turn}`,
           kind: "turn-status",
           turn: envelope.turn,
-          state: capacityAcquired
+          state: admitted
             ? { kind: "running", startedAt: envelope.ts }
             : { kind: "waiting-for-capacity", startedAt: envelope.ts },
         });
         return true;
+      }
       case "turn.phase_changed":
         this.turnPhase = envelope.phase;
         return true;
@@ -912,7 +914,7 @@ export class ThreadViewModel {
         return true;
       }
       case "turn.completed": {
-        this.#capacityAcquiredBeforeStart.delete(envelope.turn);
+        this.#admittedBeforeStart.delete(envelope.turn);
         this.turnRunning = false;
         this.turnPhase = undefined;
         this.failOpenCompaction(envelope.turn);
@@ -940,7 +942,7 @@ export class ThreadViewModel {
         }) || toolsChanged;
       }
       case "turn.failed": {
-        this.#capacityAcquiredBeforeStart.delete(envelope.turn);
+        this.#admittedBeforeStart.delete(envelope.turn);
         this.turnRunning = false;
         this.turnPhase = undefined;
         this.failOpenCompaction(envelope.turn);
@@ -958,7 +960,7 @@ export class ThreadViewModel {
         }) || toolsChanged;
       }
       case "turn.cancelled": {
-        this.#capacityAcquiredBeforeStart.delete(envelope.turn);
+        this.#admittedBeforeStart.delete(envelope.turn);
         this.turnRunning = false;
         this.turnPhase = undefined;
         this.failOpenCompaction(envelope.turn);

@@ -1263,10 +1263,9 @@ test("the Agent header shows live token usage and elapsed time", async ({ page }
       attachments: [],
     }),
     threadEvent(18, {
-      type: "turn.capacity_acquired",
+      type: "turn.admitted",
       turn: 8,
-      wait_ms: 0,
-      background: false,
+      provider_wait_ms: 0,
     }),
     threadEvent(19, {
       type: "assistant.thinking",
@@ -1417,7 +1416,7 @@ test("subscription status renders complete quota lines in the workspace usage pa
   await expect(tabPanel).toContainText("No completed usage yet.");
   await expect(subscription).toHaveCount(0);
 
-  const duplicateIds = await panel.evaluate((element) => {
+  const idState = await panel.evaluate((element) => {
     const second = document.createElement("trouve-session-usage-panel");
     second.setAttribute("session-id", "se_1");
     second.setAttribute("thread-id", "th_1");
@@ -1428,10 +1427,17 @@ test("subscription status renders complete quota lines in the workspace usage pa
         "trouve-session-usage-panel [id]",
       )].map(({ id }) => id);
       second.remove();
-      return ids.length - new Set(ids).size;
+      return {
+        ids,
+        duplicateCount: ids.length - new Set(ids).size,
+      };
     });
   });
-  expect(duplicateIds).toBe(0);
+  expect(idState.ids.filter((id) => id.endsWith("-tab-usage"))).toHaveLength(2);
+  expect(idState.ids.filter((id) => id.endsWith("-tab-thread"))).toHaveLength(2);
+  expect(idState.ids.filter((id) => id.endsWith("-tab-session"))).toHaveLength(2);
+  expect(idState.ids.filter((id) => id.endsWith("-panel"))).toHaveLength(2);
+  expect(idState.duplicateCount).toBe(0);
   await expect(page.locator(".composer .subscription-option")).toHaveCount(0);
   await expect(page.locator(".composer .model-health-pill")).toHaveCount(0);
 });
@@ -3363,10 +3369,9 @@ test("active tools join stable collapsed groups behind a transient tail", async 
       attachments: [],
     }),
     threadEvent(18, {
-      type: "turn.capacity_acquired",
+      type: "turn.admitted",
       turn: 8,
-      wait_ms: 0,
-      background: false,
+      provider_wait_ms: 0,
     }),
     threadEvent(19, {
       type: "tool.requested",
@@ -3508,10 +3513,9 @@ test("context compaction is an animated durable boundary between tool groups", a
       attachments: [],
     }),
     threadEvent(32, {
-      type: "turn.capacity_acquired",
+      type: "turn.admitted",
       turn: 10,
-      wait_ms: 0,
-      background: false,
+      provider_wait_ms: 0,
     }),
     threadEvent(33, {
       type: "tool.requested",
@@ -3920,10 +3924,9 @@ test("thought completion clears stale activity while standalone and grouped tool
       attachments: [],
     }),
     threadEvent(72, {
-      type: "turn.capacity_acquired",
+      type: "turn.admitted",
       turn: 14,
-      wait_ms: 0,
-      background: false,
+      provider_wait_ms: 0,
     }),
     threadEvent(73, {
       type: "assistant.thinking",
@@ -4044,10 +4047,9 @@ test("a progress stream uses its message icon while activity remains visible", a
       attachments: [],
     }),
     threadEvent(72, {
-      type: "turn.capacity_acquired",
+      type: "turn.admitted",
       turn: 14,
-      wait_ms: 0,
-      background: false,
+      provider_wait_ms: 0,
     }),
   ]);
 
@@ -5812,10 +5814,9 @@ test("a queued prompt can interrupt the active turn and run next", async ({ page
       model: "test/model",
     }),
     threadEvent(17, {
-      type: "turn.capacity_acquired",
+      type: "turn.admitted",
       turn: 8,
-      wait_ms: 0,
-      background: false,
+      provider_wait_ms: 0,
     }),
     threadEvent(18, {
       type: "assistant.delta",
@@ -6156,10 +6157,9 @@ test("a steerable running turn accepts guidance and renders it on the turn rail"
     attachments: [],
   }));
   await emit(page, threadEvent(18, {
-    type: "turn.capacity_acquired",
+    type: "turn.admitted",
     turn: 8,
-    wait_ms: 0,
-    background: false,
+    provider_wait_ms: 0,
   }));
 
   const composer = page.getByRole("textbox", { name: "Message", exact: true });
@@ -6262,10 +6262,9 @@ test("turn controls cover start, queue, cancel, and send-after-cancel races", as
     attachments: [],
   }));
   await emit(page, threadEvent(18, {
-    type: "turn.capacity_acquired",
+    type: "turn.admitted",
     turn: 8,
-    wait_ms: 0,
-    background: false,
+    provider_wait_ms: 0,
   }));
   await emit(page, threadEvent(19, {
     type: "assistant.message",
@@ -6379,10 +6378,9 @@ test("turn controls cover start, queue, cancel, and send-after-cancel races", as
     attachments: [],
   }));
   await emit(page, threadEvent(24, {
-    type: "turn.capacity_acquired",
+    type: "turn.admitted",
     turn: 9,
-    wait_ms: 0,
-    background: false,
+    provider_wait_ms: 0,
   }));
   await emit(page, threadEvent(25, {
     type: "assistant.thinking",
@@ -6399,7 +6397,7 @@ test("turn controls cover start, queue, cancel, and send-after-cancel races", as
   ]);
 });
 
-test("cancellation before capacity stays pending until the terminal event", async ({ page }) => {
+test("cancellation before provider admission stays pending until the terminal event", async ({ page }) => {
   const cancelledThreadIds: string[] = [];
   await installProtocolFixtures(page, { cancelledThreadIds });
   await page.goto("/");
@@ -6414,24 +6412,23 @@ test("cancellation before capacity stays pending until the terminal event", asyn
     threadEvent(17, {
       type: "user.message",
       turn: 8,
-      content: "Wait for capacity",
+      content: "Wait for provider admission",
       attachments: [],
     }),
   ]);
 
   const submit = page.locator("wa-button.composer-submit");
   await expect(page.locator(".turn-transient-activity"))
-    .toContainText("Waiting for model capacity…");
+    .toContainText("Waiting for provider admission…");
   await expect(submit).toHaveText("Cancel");
   await submit.click();
   await expect.poll(() => cancelledThreadIds).toEqual(["th_fixture"]);
   await expect(submit).toHaveText("Stopping…");
 
   await emit(page, threadEvent(18, {
-    type: "turn.capacity_acquired",
+    type: "turn.admitted",
     turn: 8,
-    wait_ms: 20,
-    background: false,
+    provider_wait_ms: 20,
   }));
   await expect(submit).toHaveText("Stopping…");
 
