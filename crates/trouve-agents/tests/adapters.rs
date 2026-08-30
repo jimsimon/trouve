@@ -253,6 +253,76 @@ printf '%s\n' '{"type":"result","subtype":"success","session_id":"sess-bg","usag
 }
 
 #[tokio::test]
+async fn claude_adapter_rejects_steering_for_a_completed_buffered_attach() {
+    let tmp = tempfile::tempdir().unwrap();
+    let stub = write_stub(
+        tmp.path(),
+        "claude-completed-background",
+        r#"#!/bin/bash
+IFS= read -r initial_prompt
+cat <<'EOF'
+{"type":"system","subtype":"init","session_id":"sess-buffered"}
+{"type":"result","subtype":"success","session_id":"sess-buffered","usage":{"input_tokens":1,"output_tokens":1}}
+EOF
+sleep 0.05
+printf '%s\n' '{"type":"result","subtype":"success","session_id":"sess-buffered","usage":{"input_tokens":2,"output_tokens":1}}'
+if IFS= read -r -t 1 unexpected; then
+    printf '%s\n' "$unexpected" > "$0.unexpected"
+fi
+sleep 2
+"#,
+    );
+    let backend = ClaudeBackend::new("claude-code", Some(stub.clone()));
+    let mut background_signals = backend
+        .take_background_turn_signals()
+        .expect("Claude exposes one background-turn signal receiver");
+
+    let mut initial = start_turn(&backend, || {
+        turn(tmp.path().to_path_buf(), None, BackendPermission::ReadOnly)
+    })
+    .await;
+    while let Some(event) = initial.next().await {
+        event.unwrap();
+    }
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(2), background_signals.recv())
+            .await
+            .expect("Claude should announce the completed autonomous turn")
+            .as_deref(),
+        Some("th_1")
+    );
+
+    let mut attached_turn = turn(
+        tmp.path().to_path_buf(),
+        Some("sess-buffered"),
+        BackendPermission::ReadOnly,
+    );
+    attached_turn.attach_background = true;
+    let mut attached = backend.run_turn(attached_turn).await.unwrap();
+    let error = backend
+        .steer_turn(BackendSteer {
+            cancel: Default::default(),
+            session: "sess-buffered".into(),
+            prompt: "Do not start unrelated work.".into(),
+            attachments: Vec::new(),
+        })
+        .await
+        .expect_err("completed buffered output is not a live steering target");
+    assert!(error.to_string().contains("no active turn"), "{error}");
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(
+        !PathBuf::from(format!("{stub}.unexpected")).exists(),
+        "steering must not be written to idle Claude stdin"
+    );
+
+    let mut completed = false;
+    while let Some(event) = attached.next().await {
+        completed |= matches!(event.unwrap(), BackendEvent::Completed { .. });
+    }
+    assert!(completed, "the buffered completed turn must still drain");
+}
+
+#[tokio::test]
 async fn claude_adapter_reaps_persistent_process_before_cancelled_stream_closes() {
     let tmp = tempfile::tempdir().unwrap();
     let stub = write_stub(

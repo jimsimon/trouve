@@ -543,7 +543,7 @@ async fn native_provider_turn_applies_steering_at_the_next_safe_boundary() {
     assert_eq!(started.status(), reqwest::StatusCode::ACCEPTED);
     assert!(
         engine.turn_accepts_steering(thread_id, 1),
-        "TurnStarted must not advertise steering before its receiver is installed"
+        "turn 1 steering receiver must be installed before messages POST returns"
     );
     let steer_client = client.clone();
     let steer_url = format!("{base}/threads/{thread_id}/steer");
@@ -566,12 +566,14 @@ async fn native_provider_turn_applies_steering_at_the_next_safe_boundary() {
         .as_ref()
         .unwrap()
         .add_permits(8);
-    provider
-        .first_stream_started
-        .acquire()
-        .await
-        .unwrap()
-        .forget();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        provider.first_stream_started.acquire(),
+    )
+    .await
+    .expect("provider never started its first stream")
+    .unwrap()
+    .forget();
     let before = wait_for_event(&client, &events_url, |event| {
         event["type"] == "assistant.delta"
     })
@@ -2804,7 +2806,7 @@ async fn active_backend_turn_can_be_steered_and_replays_on_its_timeline() {
     assert_eq!(started.status(), reqwest::StatusCode::ACCEPTED);
     assert!(
         engine.turn_accepts_steering(thread_id, 1),
-        "TurnStarted must not advertise steering before backend startup"
+        "turn 1 steering receiver must be installed before backend startup completes"
     );
     backend.model_discovery_gate.add_permits(8);
     let before = wait_for_event(&client, &events_url, |event| {

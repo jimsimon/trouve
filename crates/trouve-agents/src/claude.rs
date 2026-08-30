@@ -222,6 +222,9 @@ const BACKGROUND_BUFFER_MAX_BYTES: usize = 8 * 1024 * 1024;
 enum RouterRegistration {
     /// The consumer will receive lines (live or drained from the buffer).
     Streaming,
+    /// An attach consumer claimed a vendor-autonomous turn that is still
+    /// running, so Claude can accept steering for it.
+    StreamingLive,
     /// Attach-only registration found no background turn to attach to.
     NothingPending,
 }
@@ -280,6 +283,12 @@ impl StdoutRouter {
         state.turn.is_some() || state.background_in_flight
     }
 
+    /// True when writing an immediate steering message would target the
+    /// registered turn rather than start unrelated work on idle stdin.
+    fn has_live_background_turn(&self) -> bool {
+        self.state.lock().unwrap().background_in_flight
+    }
+
     /// True while completed autonomous turns sit buffered awaiting an attach
     /// consumer. Pool reaping and cap eviction must treat such processes as
     /// live: recycling one discards its buffered turns before the engine's
@@ -331,12 +340,17 @@ impl StdoutRouter {
             );
             state.dropped_background_lines = 0;
         }
+        let streaming_live = attach && state.background_in_flight;
         state.turn = Some(sender);
         state.turn_is_attach = attach;
         state.prompt_pending = !attach;
         drop(state);
         self.notify.notify_one();
-        Ok(RouterRegistration::Streaming)
+        Ok(if streaming_live {
+            RouterRegistration::StreamingLive
+        } else {
+            RouterRegistration::Streaming
+        })
     }
 
     fn buffer_background(state: &mut RouterState, line: String) {
@@ -544,6 +558,7 @@ struct ClaudeProc {
 struct ClaudeInputState {
     stdin: ChildStdin,
     prompt_sent: bool,
+    attach_turn: bool,
     pending_steers: Vec<Value>,
 }
 
@@ -576,6 +591,7 @@ impl ClaudeProc {
                 BackendError::Protocol("claude process already has an active turn".into())
             })?;
         input.prompt_sent = prompt_already_sent;
+        input.attach_turn = prompt_already_sent;
         input.pending_steers.clear();
         Ok(ClaudeTurnGuard {
             proc_: self.clone(),
@@ -795,6 +811,12 @@ impl AgentBackend for ClaudeBackend {
                         steer.session
                     )));
                 }
+                if input.attach_turn && !proc_.router.has_live_background_turn() {
+                    return Err(BackendError::Protocol(format!(
+                        "claude steer: session {} has no active turn",
+                        steer.session
+                    )));
+                }
                 if !input.prompt_sent {
                     if input.pending_steers.len() >= PENDING_STEER_CAP {
                         return Err(BackendError::Protocol(format!(
@@ -901,9 +923,29 @@ impl AgentBackend for ClaudeBackend {
             pool.terminate_and_remove(&thread_id, &proc_).await?;
             return Err(BackendError::Cancelled);
         }
-        // An attached autonomous turn is already running in Claude, so there
-        // is no initial trouve prompt that steering must wait behind.
-        let active_turn = proc_.begin_turn(turn.attach_background).await?;
+        let attach = turn.attach_background;
+        // Claim an attach target before advertising native steering. The
+        // router distinguishes a genuinely live vendor turn from a completed
+        // turn whose output is merely buffered; writing to Claude's stdin in
+        // the latter case would start unrelated background work.
+        let (attached_lines, active_turn) = if attach {
+            let (turn_tx, lines) = mpsc::channel::<String>(1024);
+            match proc_.router.register(turn_tx, true)? {
+                RouterRegistration::StreamingLive => {
+                    (Some(lines), Some(proc_.begin_turn(true).await?))
+                }
+                RouterRegistration::Streaming => (Some(lines), None),
+                RouterRegistration::NothingPending => {
+                    return Ok(Box::pin(futures::stream::once(async {
+                        Ok(BackendEvent::Completed {
+                            usage: Usage::default(),
+                        })
+                    })));
+                }
+            }
+        } else {
+            (None, Some(proc_.begin_turn(false).await?))
+        };
         let prompt = turn.prompt.clone();
         // Anthropic-style base64 image blocks, alongside the text block.
         let mut content = vec![json!({ "type": "text", "text": prompt })];
@@ -918,27 +960,27 @@ impl AgentBackend for ClaudeBackend {
             }));
         }
 
-        let attach = turn.attach_background;
         let stream = async_stream(move |tx| async move {
             let _active_turn = active_turn;
-            let (turn_tx, mut lines) = mpsc::channel::<String>(1024);
-            match proc_.router.register(turn_tx, attach) {
-                Ok(RouterRegistration::Streaming) => {}
-                Ok(RouterRegistration::NothingPending) => {
-                    // The background turn this attach was queued for is gone
-                    // (dropped buffer or consumed by process recycling).
-                    let _ = tx
-                        .send(Ok(BackendEvent::Completed {
-                            usage: Usage::default(),
-                        }))
-                        .await;
-                    return;
+            let mut lines = if let Some(lines) = attached_lines {
+                lines
+            } else {
+                let (turn_tx, lines) = mpsc::channel::<String>(1024);
+                match proc_.router.register(turn_tx, false) {
+                    Ok(RouterRegistration::Streaming) => {}
+                    Ok(RouterRegistration::StreamingLive) => unreachable!(
+                        "non-attach Claude registration cannot claim a live background turn"
+                    ),
+                    Ok(RouterRegistration::NothingPending) => {
+                        unreachable!("non-attach Claude registration always creates a consumer")
+                    }
+                    Err(error) => {
+                        let _ = tx.send(Err(error)).await;
+                        return;
+                    }
                 }
-                Err(error) => {
-                    let _ = tx.send(Err(error)).await;
-                    return;
-                }
-            }
+                lines
+            };
             proc_.touch();
 
             let msg = json!({
@@ -1500,6 +1542,7 @@ impl ClaudeBackend {
             input: Mutex::new(ClaudeInputState {
                 stdin,
                 prompt_sent: false,
+                attach_turn: false,
                 pending_steers: Vec::new(),
             }),
             router,
@@ -1881,7 +1924,7 @@ mod tests {
         let (attach_tx, mut attach_rx) = mpsc::channel(16);
         assert_eq!(
             router.register(attach_tx, true).unwrap(),
-            RouterRegistration::Streaming
+            RouterRegistration::StreamingLive
         );
         // Buffered prefix, then live continuation, ending at the result.
         assert_eq!(recv_line(&mut attach_rx).await.as_deref(), Some(BG_LINE));
