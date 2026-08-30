@@ -30,15 +30,26 @@ describe("session usage panel asynchronous lifecycle guards", () => {
       .toBeGreaterThan(guardAt);
   });
 
-  it("loads and renders active-thread and session usage scopes", () => {
+  it("loads and renders active-thread and session usage in separate tabs", () => {
     expect(source).toContain("services.protocol.threadUsage(this.threadId)");
     expect(source).toContain("services.protocol.sessionUsage(this.sessionId)");
     expect(source).toContain(
-      'this.#renderUsageScope("Active thread", this.#threadSummary)',
+      'if (this.#activeTab === "thread")',
     );
     expect(source).toContain(
-      'this.#renderUsageScope("Session", this.#sessionSummary)',
+      'return this.#renderUsageScope("Active thread", this.#threadSummary)',
     );
+    expect(source).toContain('if (this.#activeTab === "session")');
+    expect(source).toContain('return this.#renderUsageScope("Session", this.#sessionSummary)');
+  });
+
+  it("provides accessible automatic-activation navigation for all three tabs", () => {
+    expect(source).toContain('["usage", "Usage"]');
+    expect(source).toContain('["thread", "Thread"]');
+    expect(source).toContain('["session", "Session"]');
+    expect(source).toContain('role="tablist"');
+    expect(source).toContain('role="tabpanel"');
+    expect(source).toContain("nextHorizontalTabIndex(event.key, index, USAGE_PANEL_TABS.length)");
   });
 
   it("invalidates session totals when any thread in the session completes", () => {

@@ -24,6 +24,15 @@ import {
   usageBreakdownRows,
   usageThroughput,
 } from "./session-usage-model.js";
+import { nextHorizontalTabIndex, rovingTabIndex } from "./tab-navigation.js";
+
+type UsagePanelTab = "usage" | "thread" | "session";
+
+const USAGE_PANEL_TABS = [
+  ["usage", "Usage"],
+  ["thread", "Thread"],
+  ["session", "Session"],
+] as const satisfies readonly (readonly [UsagePanelTab, string])[];
 
 const formatCount = (value: number): string =>
   new Intl.NumberFormat(undefined, { maximumFractionDigits: 0 }).format(value);
@@ -68,6 +77,7 @@ export class TrouveSessionUsagePanel extends withSignalTracking(LitElement) {
   #sessionSummary: ProtocolUsageSummary | undefined;
   #threadSummary: ProtocolUsageSummary | undefined;
   #localStatus: ProtocolLocalStatus | undefined;
+  #activeTab: UsagePanelTab = "usage";
 
   protected override createRenderRoot(): HTMLElement {
     return this;
@@ -102,12 +112,11 @@ export class TrouveSessionUsagePanel extends withSignalTracking(LitElement) {
     });
     const placeholder = kind === "placeholder";
     return html`
-      <section class="session-usage-box" aria-labelledby="session-usage-title">
+      <section class="session-usage-box" aria-label="Usage details">
         <header class="session-usage-heading">
-          <strong id="session-usage-title">Usage</strong>
           ${placeholder
-            ? nothing
-            : html`<small>${this.model}</small>`}
+            ? html`<strong>Usage</strong>`
+            : html`${this.#renderTabs()}<small>${this.model}</small>`}
         </header>
         ${placeholder
           ? html`<p class="session-usage-placeholder">
@@ -120,7 +129,64 @@ export class TrouveSessionUsagePanel extends withSignalTracking(LitElement) {
 
   #renderActive(kind: Exclude<SessionUsagePanelKind, "placeholder">) {
     if (this.#loading) {
-      return html`<p class="session-usage-placeholder" role="status">Loading usage details…</p>`;
+      return html`<div
+        id="session-usage-panel"
+        class="session-usage-tab-panel"
+        role="tabpanel"
+        aria-labelledby=${`session-usage-tab-${this.#activeTab}`}
+      ><p class="session-usage-placeholder" role="status">Loading usage details…</p></div>`;
+    }
+    return html`<div
+      id="session-usage-panel"
+      class="session-usage-tab-panel"
+      role="tabpanel"
+      aria-labelledby=${`session-usage-tab-${this.#activeTab}`}
+    >${this.#renderActiveTab(kind)}</div>`;
+  }
+
+  #renderTabs() {
+    const selectedIndex = USAGE_PANEL_TABS.findIndex(([tab]) => tab === this.#activeTab);
+    return html`
+      <nav class="session-usage-tabs" role="tablist" aria-label="Usage views">
+        ${USAGE_PANEL_TABS.map(([tab, label], index) => html`
+          <button
+            id=${`session-usage-tab-${tab}`}
+            type="button"
+            role="tab"
+            aria-selected=${this.#activeTab === tab ? "true" : "false"}
+            aria-controls="session-usage-panel"
+            tabindex=${rovingTabIndex(index, selectedIndex, USAGE_PANEL_TABS.length)}
+            @keydown=${(event: KeyboardEvent) => this.#selectTabWithKeyboard(event, index)}
+            @click=${() => this.#selectTab(tab)}
+          >${label}</button>
+        `)}
+      </nav>
+    `;
+  }
+
+  #selectTabWithKeyboard(event: KeyboardEvent, index: number): void {
+    const target = nextHorizontalTabIndex(event.key, index, USAGE_PANEL_TABS.length);
+    if (target === undefined) return;
+    const tab = USAGE_PANEL_TABS[target];
+    if (tab === undefined) return;
+    event.preventDefault();
+    this.#selectTab(tab[0]);
+    void this.updateComplete.then(() => {
+      this.querySelectorAll<HTMLButtonElement>('.session-usage-tabs [role="tab"]')[target]?.focus();
+    });
+  }
+
+  #selectTab(tab: UsagePanelTab): void {
+    this.#activeTab = tab;
+    this.requestUpdate();
+  }
+
+  #renderActiveTab(kind: Exclude<SessionUsagePanelKind, "placeholder">) {
+    if (this.#activeTab === "thread") {
+      return this.#renderUsageScope("Active thread", this.#threadSummary);
+    }
+    if (this.#activeTab === "session") {
+      return this.#renderUsageScope("Session", this.#sessionSummary);
     }
     if (kind === "local") {
       if (
@@ -135,10 +201,12 @@ export class TrouveSessionUsagePanel extends withSignalTracking(LitElement) {
       return this.#renderLocal();
     }
     if (kind === "subscription" && this.#health !== undefined) {
-      return html`${this.#renderSubscription(this.#health)}${this.#renderUsageScopes()}`;
+      return this.#renderSubscription(this.#health);
     }
     if (kind === "api" && (this.#sessionSummary !== undefined || this.#threadSummary !== undefined)) {
-      return this.#renderUsageScopes();
+      return html`<p class="session-usage-placeholder">
+        Provider usage is unavailable for this model. Thread and session totals are available in their tabs.
+      </p>`;
     }
     return html`<p class="session-usage-placeholder" role="status">
       ${this.#error || "Usage details are not available yet."}
@@ -173,15 +241,6 @@ export class TrouveSessionUsagePanel extends withSignalTracking(LitElement) {
           })}
         </div>
       </article>
-    `;
-  }
-
-  #renderUsageScopes() {
-    return html`
-      <div class="session-usage-scopes" aria-label="Token and cost usage">
-        ${this.#renderUsageScope("Active thread", this.#threadSummary)}
-        ${this.#renderUsageScope("Session", this.#sessionSummary)}
-      </div>
     `;
   }
 
@@ -263,7 +322,6 @@ export class TrouveSessionUsagePanel extends withSignalTracking(LitElement) {
           <div><dt>Overall throughput</dt><dd>${throughput === undefined ? "Not available" : `${throughput.toFixed(1)} tok/s`}</dd></div>
           <div><dt>Last turn</dt><dd>${duration === undefined ? "Not available" : `${(duration / 1_000).toFixed(1)}s`}</dd></div>
         </dl>
-        ${this.#renderUsageScopes()}
       </article>
     `;
   }
