@@ -2933,12 +2933,14 @@ export interface components {
             /** @enum {string} */
             type: "assistant.progress_completed";
         } | {
+            id?: string | null;
             text: string;
             /** Format: int64 */
             turn: number;
             /** @enum {string} */
             type: "assistant.thinking";
         } | {
+            id?: string | null;
             /** Format: int64 */
             turn: number;
             /** @enum {string} */
@@ -4843,6 +4845,11 @@ export interface components {
          *     response and subscribe to the thread event stream after that cursor.
          */
         ThreadViewSnapshot: {
+            /**
+             * @description Provider-owned identity for the active thinking item. Absent for
+             *     snapshots reconstructed from legacy, boundary-inferred events.
+             */
+            active_thinking_id?: string | null;
             active_usage?: null | components["schemas"]["Usage"];
             commands?: components["schemas"]["CommandInfo"][];
             compacting?: boolean;

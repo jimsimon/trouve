@@ -465,7 +465,12 @@ describe("ThreadViewModel", () => {
 
   it("grows reasoning in place across tools and starts a new block after completion", () => {
     const view = new ThreadViewModel();
-    view.apply(envelope(1, { type: "assistant.thinking", turn: 2, text: "before " }));
+    view.apply(envelope(1, {
+      type: "assistant.thinking",
+      turn: 2,
+      id: "reasoning-a",
+      text: "before ",
+    }));
     view.apply(envelope(2, {
       type: "tool.requested",
       turn: 2,
@@ -474,7 +479,12 @@ describe("ThreadViewModel", () => {
       args: {},
       requires_approval: false,
     }));
-    view.apply(envelope(3, { type: "assistant.thinking", turn: 2, text: "and after" }));
+    view.apply(envelope(3, {
+      type: "assistant.thinking",
+      turn: 2,
+      id: "reasoning-a",
+      text: "and after",
+    }));
     view.apply(envelope(4, {
       type: "tool.requested",
       turn: 2,
@@ -483,13 +493,43 @@ describe("ThreadViewModel", () => {
       args: {},
       requires_approval: false,
     }));
-    view.apply(envelope(5, { type: "assistant.thinking_completed", turn: 2 }));
-    view.apply(envelope(6, { type: "assistant.thinking", turn: 2, text: "separate" }));
+    view.apply(envelope(5, {
+      type: "assistant.thinking_completed",
+      turn: 2,
+      id: "reasoning-a",
+    }));
+    view.apply(envelope(6, {
+      type: "assistant.thinking",
+      turn: 2,
+      id: "reasoning-b",
+      text: "separate",
+    }));
     expect(view.items).toEqual([
       expect.objectContaining({ kind: "thinking", content: "before and after", complete: true }),
       expect.objectContaining({ kind: "tool", callId: "read" }),
       expect.objectContaining({ kind: "tool", callId: "search" }),
       expect.objectContaining({ kind: "thinking", content: "separate", complete: false }),
+    ]);
+  });
+
+  it("keeps legacy unidentified reasoning split across tool requests", () => {
+    const view = new ThreadViewModel();
+    view.apply(envelope(1, { type: "assistant.thinking", turn: 2, text: "before" }));
+    view.apply(envelope(2, {
+      type: "tool.requested",
+      turn: 2,
+      call_id: "read",
+      tool: "read_file",
+      args: {},
+      requires_approval: false,
+    }));
+    view.apply(envelope(3, { type: "assistant.thinking", turn: 2, text: "after" }));
+    view.apply(envelope(4, { type: "assistant.thinking_completed", turn: 2 }));
+
+    expect(view.items).toEqual([
+      expect.objectContaining({ kind: "thinking", content: "before", complete: true }),
+      expect.objectContaining({ kind: "tool", callId: "read" }),
+      expect.objectContaining({ kind: "thinking", content: "after", complete: true }),
     ]);
   });
 
@@ -781,6 +821,7 @@ describe("ThreadViewModel", () => {
     vm.apply(envelope(1, {
       type: "assistant.thinking",
       turn: 2,
+      id: "reasoning-a",
       text: "The final overlap pass is still",
     }));
     vm.apply(envelope(2, {
@@ -794,11 +835,13 @@ describe("ThreadViewModel", () => {
     vm.apply(envelope(3, {
       type: "assistant.thinking",
       turn: 2,
+      id: "reasoning-a",
       text: " running.",
     }));
     vm.apply(envelope(4, {
       type: "assistant.thinking_completed",
       turn: 2,
+      id: "reasoning-a",
     }));
 
     expect(vm.items.filter((item) => item.kind === "thinking")).toMatchObject([

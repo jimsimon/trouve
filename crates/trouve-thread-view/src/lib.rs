@@ -263,10 +263,16 @@ impl ThreadProjection {
             Event::AssistantProgressCompleted { turn } => {
                 self.finish_progress(*turn);
             }
-            Event::AssistantThinking { turn, text } => {
+            Event::AssistantThinking { turn, id, text } => {
                 self.fail_open_compaction(*turn);
                 self.finish_progress(*turn);
+                if self.snapshot.thinking
+                    && self.snapshot.active_thinking_id.as_ref() != id.as_ref()
+                {
+                    self.finish_thinking();
+                }
                 self.snapshot.thinking = true;
+                self.snapshot.active_thinking_id = id.clone();
                 if let Some(&idx) = self.indexes.open_thinking.get(turn) {
                     if let ThreadViewItem::Thinking { content, .. } = &mut self.snapshot.items[idx]
                     {
@@ -282,8 +288,10 @@ impl ThreadProjection {
                     self.indexes.latest_thinking = Some(idx);
                 }
             }
-            Event::AssistantThinkingCompleted { .. } => {
-                self.finish_thinking();
+            Event::AssistantThinkingCompleted { id, .. } => {
+                if id.is_none() || self.snapshot.active_thinking_id.as_ref() == id.as_ref() {
+                    self.finish_thinking();
+                }
             }
             Event::AssistantDelta { turn, text } => {
                 self.fail_open_compaction(*turn);
@@ -331,6 +339,9 @@ impl ThreadProjection {
             } => {
                 self.fail_open_compaction(*turn);
                 self.finish_progress(*turn);
+                if self.snapshot.active_thinking_id.is_none() {
+                    self.finish_thinking();
+                }
                 let idx = self.push(ThreadViewItem::ToolCall {
                     call_id: call_id.clone(),
                     tool: tool.clone(),
@@ -613,6 +624,7 @@ impl ThreadProjection {
 
     fn finish_thinking(&mut self) {
         self.snapshot.thinking = false;
+        self.snapshot.active_thinking_id = None;
         if let Some(idx) = self.indexes.latest_thinking.take()
             && let Some(ThreadViewItem::Thinking { turn, complete, .. }) =
                 self.snapshot.items.get_mut(idx)
@@ -1277,6 +1289,7 @@ mod tests {
             0,
             Event::AssistantThinking {
                 turn: 7,
+                id: None,
                 text: "Delegating the review.".into(),
             },
         ));
@@ -1505,6 +1518,7 @@ mod tests {
             },
             Event::AssistantThinking {
                 turn: 7,
+                id: None,
                 text: "Before steering.".into(),
             },
             Event::TurnSteered {
@@ -1514,9 +1528,10 @@ mod tests {
             },
             Event::AssistantThinking {
                 turn: 7,
+                id: None,
                 text: "After steering.".into(),
             },
-            Event::AssistantThinkingCompleted { turn: 7 },
+            Event::AssistantThinkingCompleted { turn: 7, id: None },
         ]
         .into_iter()
         .enumerate()
@@ -1659,6 +1674,7 @@ mod tests {
             },
             Event::AssistantThinking {
                 turn: 2,
+                id: None,
                 text: "still ".into(),
             },
         ]
@@ -1686,6 +1702,7 @@ mod tests {
             6,
             Event::AssistantThinking {
                 turn: 2,
+                id: None,
                 text: "running".into(),
             },
         ));
@@ -1721,9 +1738,10 @@ mod tests {
             Event::AssistantProgressCompleted { turn: 4 },
             Event::AssistantThinking {
                 turn: 4,
+                id: None,
                 text: "The provider emits a separate reasoning stream.".into(),
             },
-            Event::AssistantThinkingCompleted { turn: 4 },
+            Event::AssistantThinkingCompleted { turn: 4, id: None },
         ]
         .into_iter()
         .enumerate()
@@ -1854,6 +1872,7 @@ mod tests {
             0,
             Event::AssistantThinking {
                 turn: 4,
+                id: Some("reasoning".into()),
                 text: "Waiting for the next event.".into(),
             },
         ));
@@ -1866,7 +1885,10 @@ mod tests {
         projection.apply(&envelope(
             2,
             25,
-            Event::AssistantThinkingCompleted { turn: 4 },
+            Event::AssistantThinkingCompleted {
+                turn: 4,
+                id: Some("reasoning".into()),
+            },
         ));
 
         assert!(!projection.snapshot.thinking);
@@ -1884,6 +1906,7 @@ mod tests {
             0,
             Event::AssistantThinking {
                 turn: 4,
+                id: Some("reasoning-a".into()),
                 text: "The final overlap pass is still".into(),
             },
         ));
@@ -1903,6 +1926,7 @@ mod tests {
             20,
             Event::AssistantThinking {
                 turn: 4,
+                id: Some("reasoning-a".into()),
                 text: " running.".into(),
             },
         ));
@@ -1920,13 +1944,17 @@ mod tests {
         projection.apply(&envelope(
             5,
             40,
-            Event::AssistantThinkingCompleted { turn: 4 },
+            Event::AssistantThinkingCompleted {
+                turn: 4,
+                id: Some("reasoning-a".into()),
+            },
         ));
         projection.apply(&envelope(
             6,
             50,
             Event::AssistantThinking {
                 turn: 4,
+                id: Some("reasoning-b".into()),
                 text: "A separate reasoning block.".into(),
             },
         ));
@@ -1947,6 +1975,56 @@ mod tests {
     }
 
     #[test]
+    fn legacy_tool_requests_split_unidentified_thinking_items() {
+        let mut projection = ThreadProjection::default();
+        for (cursor, event) in [
+            Event::AssistantThinking {
+                turn: 4,
+                id: None,
+                text: "Before the tool.".into(),
+            },
+            Event::ToolRequested {
+                turn: 4,
+                call_id: "read".into(),
+                tool: "read_file".into(),
+                args: serde_json::json!({ "path": "src/lib.rs" }),
+                requires_approval: false,
+            },
+            Event::AssistantThinking {
+                turn: 4,
+                id: None,
+                text: "After the tool.".into(),
+            },
+            Event::AssistantThinkingCompleted { turn: 4, id: None },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            projection.apply(&envelope(cursor as u64 + 1, cursor as i64, event));
+        }
+
+        assert!(matches!(
+            projection.snapshot.items.as_slice(),
+            [
+                ThreadViewItem::Thinking {
+                    content: before,
+                    complete: true,
+                    ..
+                },
+                ThreadViewItem::ToolCall { call_id, .. },
+                ThreadViewItem::Thinking {
+                    content: after,
+                    complete: true,
+                    ..
+                },
+            ] if before == "Before the tool."
+                && call_id == "read"
+                && after == "After the tool."
+        ));
+        assert!(!projection.snapshot.thinking);
+    }
+
+    #[test]
     fn normal_turn_output_closes_an_unfinished_compaction() {
         let mut projection = ThreadProjection::default();
         projection.apply(&envelope(1, 0, Event::CompactionStarted { turn: 3 }));
@@ -1955,6 +2033,7 @@ mod tests {
             10,
             Event::AssistantThinking {
                 turn: 3,
+                id: None,
                 text: "continuing".into(),
             },
         ));

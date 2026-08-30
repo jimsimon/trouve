@@ -529,7 +529,8 @@ impl ProviderThinkingState {
         if let Some((_, displayed)) = self.active.as_mut() {
             *displayed = true;
         }
-        events.push(Event::AssistantThinking { turn, text });
+        let id = self.active.as_ref().map(|(id, _)| id.clone());
+        events.push(Event::AssistantThinking { turn, id, text });
     }
 
     fn complete(&mut self, id: &str, turn: u64, events: &mut Vec<Event>) {
@@ -539,8 +540,10 @@ impl ProviderThinkingState {
     }
 
     fn finish(&mut self, turn: u64, events: &mut Vec<Event>) {
-        if self.active.take().is_some_and(|(_, displayed)| displayed) {
-            events.push(Event::AssistantThinkingCompleted { turn });
+        if let Some((id, displayed)) = self.active.take()
+            && displayed
+        {
+            events.push(Event::AssistantThinkingCompleted { turn, id: Some(id) });
         }
     }
 }
@@ -14575,13 +14578,20 @@ impl Engine {
                         content: std::mem::take(&mut collaborator.segment),
                     });
                 }
+                collaborator.persisted.push(Event::AssistantThinking {
+                    turn,
+                    id: Some("reasoning".into()),
+                    text: delta,
+                });
+            }
+            BackendCollaboratorEvent::ThinkingCompleted => {
                 collaborator
                     .persisted
-                    .push(Event::AssistantThinking { turn, text: delta });
+                    .push(Event::AssistantThinkingCompleted {
+                        turn,
+                        id: Some("reasoning".into()),
+                    })
             }
-            BackendCollaboratorEvent::ThinkingCompleted => collaborator
-                .persisted
-                .push(Event::AssistantThinkingCompleted { turn }),
             BackendCollaboratorEvent::ToolStarted {
                 call_id,
                 tool,
@@ -15414,10 +15424,17 @@ impl Engine {
                             content: std::mem::take(&mut segment),
                         });
                     }
-                    persisted.push(Event::AssistantThinking { turn, text: delta });
+                    persisted.push(Event::AssistantThinking {
+                        turn,
+                        id: Some("reasoning".into()),
+                        text: delta,
+                    });
                 }
                 BackendEvent::ThinkingCompleted => {
-                    persisted.push(Event::AssistantThinkingCompleted { turn });
+                    persisted.push(Event::AssistantThinkingCompleted {
+                        turn,
+                        id: Some("reasoning".into()),
+                    });
                 }
                 BackendEvent::ToolStarted {
                     call_id,
@@ -23086,7 +23103,7 @@ default_permission_mode = "ask"
         )));
         assert!(events.iter().any(|event| matches!(
             &event.event,
-            Event::AssistantThinking { turn: 1, text }
+            Event::AssistantThinking { turn: 1, text, .. }
                 if text == "Checking the suite."
         )));
         assert!(events.iter().any(|event| matches!(

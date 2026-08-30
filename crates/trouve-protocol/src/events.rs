@@ -355,13 +355,24 @@ pub enum Event {
     AssistantProgressCompleted { turn: u64 },
     /// Streamed model reasoning ("thinking") text, where the provider
     /// exposes it. Display-only: never part of the provider transcript.
+    /// The id is present for identity-aware streams whose reasoning may span
+    /// interleaved tool events; legacy persisted events omit it.
     #[serde(rename = "assistant.thinking")]
-    AssistantThinking { turn: u64, text: String },
+    AssistantThinking {
+        turn: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        text: String,
+    },
     /// The provider explicitly closed the current streamed thinking item.
     /// This boundary can arrive before the next visible assistant or tool
     /// event, so clients must not infer it from subsequent output alone.
     #[serde(rename = "assistant.thinking_completed")]
-    AssistantThinkingCompleted { turn: u64 },
+    AssistantThinkingCompleted {
+        turn: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+    },
     /// Folded final assistant text for the turn.
     #[serde(rename = "assistant.message")]
     AssistantMessage { turn: u64, content: String },

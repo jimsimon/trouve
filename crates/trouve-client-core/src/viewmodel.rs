@@ -286,6 +286,9 @@ pub struct ThreadViewModel {
     /// True while the model is streaming thinking and nothing has followed
     /// it yet (the "Thinking…" activity label takes priority over tools).
     pub thinking: bool,
+    /// Provider-owned identity for the active thinking item. Legacy replay
+    /// leaves this absent so tool requests retain their historical boundary.
+    active_thinking_id: Option<String>,
     /// Current transient startup activity for the running turn.
     pub turn_phase: Option<TurnPhase>,
     /// The model that ran each turn ("cursor/claude-fable-5"), from
@@ -330,6 +333,7 @@ impl From<ThreadViewSnapshot> for ThreadViewModel {
             compacting: snapshot.compacting,
             turn_running: snapshot.turn_running,
             thinking: snapshot.thinking,
+            active_thinking_id: snapshot.active_thinking_id,
             turn_phase: snapshot.turn_phase,
             turn_models: snapshot.turn_models.into_iter().collect(),
             turn_thinking_levels: snapshot.turn_thinking_levels.into_iter().collect(),
@@ -499,6 +503,7 @@ impl ThreadViewModel {
     /// it; a later thinking delta starts a fresh block).
     fn finish_thinking(&mut self) -> Option<usize> {
         self.thinking = false;
+        self.active_thinking_id = None;
         let idx = self.items.iter().rposition(|item| {
             matches!(
                 item,
@@ -822,10 +827,14 @@ impl ThreadViewModel {
                 }
             }
             Event::AssistantProgressCompleted { .. } => self.finish_progress(),
-            Event::AssistantThinking { turn, text } => {
+            Event::AssistantThinking { turn, id, text } => {
                 self.fail_open_compaction(*turn);
                 self.finish_progress();
+                if self.thinking && self.active_thinking_id.as_ref() != id.as_ref() {
+                    self.finish_thinking();
+                }
                 self.thinking = true;
+                self.active_thinking_id = id.clone();
                 // Grow the trailing open thinking item, or start one.
                 if let Some(idx) = self.items.iter().rposition(|i| {
                     matches!(i, ChatItem::Thinking { turn: t, complete: false, .. } if t == turn)
@@ -843,7 +852,13 @@ impl ThreadViewModel {
                     Some(self.items.len() - 1)
                 }
             }
-            Event::AssistantThinkingCompleted { .. } => self.finish_thinking(),
+            Event::AssistantThinkingCompleted { id, .. } => {
+                if id.is_none() || self.active_thinking_id.as_ref() == id.as_ref() {
+                    self.finish_thinking()
+                } else {
+                    None
+                }
+            }
             Event::AssistantDelta { turn, text } => {
                 self.fail_open_compaction(*turn);
                 self.finish_progress();
@@ -897,6 +912,9 @@ impl ThreadViewModel {
             } => {
                 self.fail_open_compaction(*turn);
                 self.finish_progress();
+                if self.active_thinking_id.is_none() {
+                    self.finish_thinking();
+                }
                 // Call ids are expected to be unique, but resetting here makes
                 // a reused id deterministic instead of inheriting stale output.
                 self.tool_outputs.remove(call_id);
@@ -2026,10 +2044,12 @@ mod tests {
         }));
         vm.apply(&env(Event::AssistantThinking {
             turn: 1,
+            id: None,
             text: "Let me ".into(),
         }));
         vm.apply(&env(Event::AssistantThinking {
             turn: 1,
+            id: None,
             text: "look.".into(),
         }));
         assert!(vm.thinking);
@@ -2052,6 +2072,7 @@ mod tests {
         // A later thinking delta starts a fresh block.
         vm.apply(&env(Event::AssistantThinking {
             turn: 1,
+            id: None,
             text: "More thought.".into(),
         }));
         let thinking_blocks = vm
@@ -2074,6 +2095,7 @@ mod tests {
         }));
         vm.apply(&env(Event::AssistantThinking {
             turn: 4,
+            id: None,
             text: "Original direction.".into(),
         }));
         vm.apply(&env(Event::TurnSteered {
@@ -2083,9 +2105,13 @@ mod tests {
         }));
         vm.apply(&env(Event::AssistantThinking {
             turn: 4,
+            id: None,
             text: " Continue with the revised direction.".into(),
         }));
-        vm.apply(&env(Event::AssistantThinkingCompleted { turn: 4 }));
+        vm.apply(&env(Event::AssistantThinkingCompleted {
+            turn: 4,
+            id: None,
+        }));
 
         assert_eq!(vm.turn_steerable.get(&4), Some(&true));
         assert!(!vm.thinking);
@@ -2108,11 +2134,15 @@ mod tests {
         let mut vm = ThreadViewModel::new();
         vm.apply(&env(Event::AssistantThinking {
             turn: 1,
+            id: Some("reasoning".into()),
             text: "Waiting.".into(),
         }));
         assert!(vm.thinking);
 
-        let changed = vm.apply(&env(Event::AssistantThinkingCompleted { turn: 1 }));
+        let changed = vm.apply(&env(Event::AssistantThinkingCompleted {
+            turn: 1,
+            id: Some("reasoning".into()),
+        }));
         assert_eq!(changed, Some(0));
         assert!(!vm.thinking);
         assert!(matches!(
@@ -2126,6 +2156,7 @@ mod tests {
         let mut vm = ThreadViewModel::new();
         vm.apply(&env(Event::AssistantThinking {
             turn: 1,
+            id: Some("reasoning-a".into()),
             text: "The final overlap pass is still".into(),
         }));
         vm.apply(&env(Event::ToolRequested {
@@ -2137,6 +2168,7 @@ mod tests {
         }));
         vm.apply(&env(Event::AssistantThinking {
             turn: 1,
+            id: Some("reasoning-a".into()),
             text: " running.".into(),
         }));
         vm.apply(&env(Event::ToolRequested {
@@ -2146,9 +2178,13 @@ mod tests {
             args: serde_json::json!({ "path": "src/lib.rs" }),
             requires_approval: false,
         }));
-        vm.apply(&env(Event::AssistantThinkingCompleted { turn: 1 }));
+        vm.apply(&env(Event::AssistantThinkingCompleted {
+            turn: 1,
+            id: Some("reasoning-a".into()),
+        }));
         vm.apply(&env(Event::AssistantThinking {
             turn: 1,
+            id: Some("reasoning-b".into()),
             text: "A separate reasoning block.".into(),
         }));
 
@@ -2165,6 +2201,52 @@ mod tests {
                 && separate == "A separate reasoning block."
         ));
         assert!(vm.thinking);
+    }
+
+    #[test]
+    fn legacy_tool_requests_split_unidentified_thinking_items() {
+        let mut vm = ThreadViewModel::new();
+        vm.apply(&env(Event::AssistantThinking {
+            turn: 1,
+            id: None,
+            text: "Before the tool.".into(),
+        }));
+        vm.apply(&env(Event::ToolRequested {
+            turn: 1,
+            call_id: "read".into(),
+            tool: "read_file".into(),
+            args: serde_json::json!({ "path": "src/lib.rs" }),
+            requires_approval: false,
+        }));
+        vm.apply(&env(Event::AssistantThinking {
+            turn: 1,
+            id: None,
+            text: "After the tool.".into(),
+        }));
+        vm.apply(&env(Event::AssistantThinkingCompleted {
+            turn: 1,
+            id: None,
+        }));
+
+        assert!(matches!(
+            vm.items.as_slice(),
+            [
+                ChatItem::Thinking {
+                    content: before,
+                    complete: true,
+                    ..
+                },
+                ChatItem::ToolCall { call_id, .. },
+                ChatItem::Thinking {
+                    content: after,
+                    complete: true,
+                    ..
+                },
+            ] if before == "Before the tool."
+                && call_id == "read"
+                && after == "After the tool."
+        ));
+        assert!(!vm.thinking);
     }
 
     #[test]
@@ -2293,6 +2375,7 @@ mod tests {
             },
             Event::AssistantThinking {
                 turn: 1,
+                id: None,
                 text: "hmm".into(),
             },
             Event::AssistantDelta {

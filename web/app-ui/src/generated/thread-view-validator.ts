@@ -3,7 +3,7 @@
 "use strict";
 export const threadView = validate52;
 const schema19 = {"$id":"urn:trouve:thread-view-validator:threadView","$ref":"urn:trouve:thread-view-openapi#/components/schemas/ThreadViewSnapshot"};
-const schema21 = {"type":"object","description":"Folded current thread state and one transcript item page at the cursor\nreturned in `x-trouve-event-cursor`. Clients seed their view from this\nresponse and subscribe to the thread event stream after that cursor.","required":["items"],"properties":{"active_usage":{"oneOf":[{"type":"null"},{"$ref":"#/components/schemas/Usage","description":"Cumulative usage for the active turn. Billing counters sum its model\nrequests while context fields describe the latest request."}]},"commands":{"type":"array","items":{"$ref":"#/components/schemas/CommandInfo"}},"compacting":{"type":"boolean"},"has_older":{"type":"boolean","description":"Whether another page exists before `item_offset`."},"item_offset":{"type":"integer","format":"int64","description":"Zero-based index of `items[0]` in the complete folded transcript.","minimum":0},"items":{"type":"array","items":{"$ref":"#/components/schemas/ThreadViewItem"}},"last_usage":{"oneOf":[{"type":"null"},{"$ref":"#/components/schemas/Usage","description":"Aggregate usage for the most recently completed turn. Running-turn\nusage is reported separately in `active_usage`."}]},"pending_approvals":{"type":"array","items":{"type":"string"}},"pending_questions":{"type":"array","items":{"type":"string"}},"queue":{"type":"array","items":{"$ref":"#/components/schemas/QueuedPrompt"}},"thinking":{"type":"boolean"},"todos":{"type":"array","items":{"$ref":"#/components/schemas/TodoItem"}},"total_items":{"type":"integer","format":"int64","description":"Number of folded items in the complete transcript at this snapshot.","minimum":0},"turn_duration_ms":{"type":"object","additionalProperties":{"type":"integer","format":"int64","minimum":0},"propertyNames":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"}},"turn_models":{"type":"object","additionalProperties":{"type":"string"},"propertyNames":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"}},"turn_phase":{"oneOf":[{"type":"null"},{"$ref":"#/components/schemas/TurnPhase","description":"Current transient activity for the running turn."}]},"turn_running":{"type":"boolean"},"turn_started_at":{"type":"object","additionalProperties":{"type":"string","format":"date-time"},"propertyNames":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"}},"turn_steerable":{"type":"object","description":"Per-turn native steering capability. False/absent is authoritative;\nclients must not infer capability from provider or model names.","additionalProperties":{"type":"boolean"},"propertyNames":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"}},"turn_thinking_levels":{"type":"object","additionalProperties":{"type":"string"},"propertyNames":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"}}}};
+const schema21 = {"type":"object","description":"Folded current thread state and one transcript item page at the cursor\nreturned in `x-trouve-event-cursor`. Clients seed their view from this\nresponse and subscribe to the thread event stream after that cursor.","required":["items"],"properties":{"active_thinking_id":{"type":["string","null"],"description":"Provider-owned identity for the active thinking item. Absent for\nsnapshots reconstructed from legacy, boundary-inferred events."},"active_usage":{"oneOf":[{"type":"null"},{"$ref":"#/components/schemas/Usage","description":"Cumulative usage for the active turn. Billing counters sum its model\nrequests while context fields describe the latest request."}]},"commands":{"type":"array","items":{"$ref":"#/components/schemas/CommandInfo"}},"compacting":{"type":"boolean"},"has_older":{"type":"boolean","description":"Whether another page exists before `item_offset`."},"item_offset":{"type":"integer","format":"int64","description":"Zero-based index of `items[0]` in the complete folded transcript.","minimum":0},"items":{"type":"array","items":{"$ref":"#/components/schemas/ThreadViewItem"}},"last_usage":{"oneOf":[{"type":"null"},{"$ref":"#/components/schemas/Usage","description":"Aggregate usage for the most recently completed turn. Running-turn\nusage is reported separately in `active_usage`."}]},"pending_approvals":{"type":"array","items":{"type":"string"}},"pending_questions":{"type":"array","items":{"type":"string"}},"queue":{"type":"array","items":{"$ref":"#/components/schemas/QueuedPrompt"}},"thinking":{"type":"boolean"},"todos":{"type":"array","items":{"$ref":"#/components/schemas/TodoItem"}},"total_items":{"type":"integer","format":"int64","description":"Number of folded items in the complete transcript at this snapshot.","minimum":0},"turn_duration_ms":{"type":"object","additionalProperties":{"type":"integer","format":"int64","minimum":0},"propertyNames":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"}},"turn_models":{"type":"object","additionalProperties":{"type":"string"},"propertyNames":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"}},"turn_phase":{"oneOf":[{"type":"null"},{"$ref":"#/components/schemas/TurnPhase","description":"Current transient activity for the running turn."}]},"turn_running":{"type":"boolean"},"turn_started_at":{"type":"object","additionalProperties":{"type":"string","format":"date-time"},"propertyNames":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"}},"turn_steerable":{"type":"object","description":"Per-turn native steering capability. False/absent is authoritative;\nclients must not infer capability from provider or model names.","additionalProperties":{"type":"boolean"},"propertyNames":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"}},"turn_thinking_levels":{"type":"object","additionalProperties":{"type":"string"},"propertyNames":{"type":"string","pattern":"^(0|[1-9][0-9]*)$"}}}};
 const schema22 = {"type":"object","description":"Token/cost usage for a turn.","required":["input_tokens","output_tokens"],"properties":{"cached_input_tokens":{"type":"integer","format":"int64","description":"Cached/read tokens where the provider reports them.","minimum":0},"context_input_tokens":{"type":["integer","null"],"format":"int64","description":"Provider-authoritative model-visible tokens for the most recent\nrequest. Unlike the aggregate turn counters above, this is the current\ncontext-size measurement used for context-window presentation and\ncompaction decisions.","minimum":0},"context_window":{"type":["integer","null"],"format":"int64","description":"The model's context window as reported live by the provider during\nthe turn. Authoritative over any static catalog value.","minimum":0},"cost_usd":{"type":["number","null"],"format":"double","description":"Estimated cost in USD, when list pricing for the model is known."},"input_tokens":{"type":"integer","format":"int64","description":"Non-cached input tokens. This counter is mutually exclusive with\n`cached_input_tokens`, even when the upstream provider reports an\ninclusive input total.","minimum":0},"output_tokens":{"type":"integer","format":"int64","minimum":0}}};
 
 function validate55(data, {instancePath="", parentData, parentDataProperty, rootData=data, dynamicAnchors={}}={}){
@@ -3445,14 +3445,27 @@ validate54.errors = [{instancePath,schemaPath:"#/required",keyword:"required",pa
 return false;
 }
 else {
-if(data.active_usage !== undefined){
-let data0 = data.active_usage;
+if(data.active_thinking_id !== undefined){
+let data0 = data.active_thinking_id;
 const _errs1 = errors;
-const _errs2 = errors;
+if((typeof data0 !== "string") && (data0 !== null)){
+validate54.errors = [{instancePath:instancePath+"/active_thinking_id",schemaPath:"#/properties/active_thinking_id/type",keyword:"type",params:{type: schema21.properties.active_thinking_id.type},message:"must be string,null"}];
+return false;
+}
+var valid0 = _errs1 === errors;
+}
+else {
+var valid0 = true;
+}
+if(valid0){
+if(data.active_usage !== undefined){
+let data1 = data.active_usage;
+const _errs3 = errors;
+const _errs4 = errors;
 let valid1 = false;
 let passing0 = null;
-const _errs3 = errors;
-if(data0 !== null){
+const _errs5 = errors;
+if(data1 !== null){
 const err0 = {instancePath:instancePath+"/active_usage",schemaPath:"#/properties/active_usage/oneOf/0/type",keyword:"type",params:{type: "null"},message:"must be null"};
 if(vErrors === null){
 vErrors = [err0];
@@ -3462,17 +3475,17 @@ vErrors.push(err0);
 }
 errors++;
 }
-var _valid0 = _errs3 === errors;
+var _valid0 = _errs5 === errors;
 if(_valid0){
 valid1 = true;
 passing0 = 0;
 }
-const _errs5 = errors;
-if(!(validate55(data0, {instancePath:instancePath+"/active_usage",parentData:data,parentDataProperty:"active_usage",rootData,dynamicAnchors}))){
+const _errs7 = errors;
+if(!(validate55(data1, {instancePath:instancePath+"/active_usage",parentData:data,parentDataProperty:"active_usage",rootData,dynamicAnchors}))){
 vErrors = vErrors === null ? validate55.errors : vErrors.concat(validate55.errors);
 errors = vErrors.length;
 }
-var _valid0 = _errs5 === errors;
+var _valid0 = _errs7 === errors;
 if(_valid0 && valid1){
 valid1 = false;
 passing0 = [passing0, 1];
@@ -3503,36 +3516,36 @@ validate54.errors = vErrors;
 return false;
 }
 else {
-errors = _errs2;
+errors = _errs4;
 if(vErrors !== null){
-if(_errs2){
-vErrors.length = _errs2;
+if(_errs4){
+vErrors.length = _errs4;
 }
 else {
 vErrors = null;
 }
 }
 }
-var valid0 = _errs1 === errors;
+var valid0 = _errs3 === errors;
 }
 else {
 var valid0 = true;
 }
 if(valid0){
 if(data.commands !== undefined){
-let data1 = data.commands;
-const _errs6 = errors;
-if(errors === _errs6){
-if(Array.isArray(data1)){
-var valid2 = true;
-const len0 = data1.length;
-for(let i0=0; i0<len0; i0++){
+let data2 = data.commands;
 const _errs8 = errors;
-if(!(validate57(data1[i0], {instancePath:instancePath+"/commands/" + i0,parentData:data1,parentDataProperty:i0,rootData,dynamicAnchors}))){
+if(errors === _errs8){
+if(Array.isArray(data2)){
+var valid2 = true;
+const len0 = data2.length;
+for(let i0=0; i0<len0; i0++){
+const _errs10 = errors;
+if(!(validate57(data2[i0], {instancePath:instancePath+"/commands/" + i0,parentData:data2,parentDataProperty:i0,rootData,dynamicAnchors}))){
 vErrors = vErrors === null ? validate57.errors : vErrors.concat(validate57.errors);
 errors = vErrors.length;
 }
-var valid2 = _errs8 === errors;
+var valid2 = _errs10 === errors;
 if(!valid2){
 break;
 }
@@ -3543,28 +3556,16 @@ validate54.errors = [{instancePath:instancePath+"/commands",schemaPath:"#/proper
 return false;
 }
 }
-var valid0 = _errs6 === errors;
+var valid0 = _errs8 === errors;
 }
 else {
 var valid0 = true;
 }
 if(valid0){
 if(data.compacting !== undefined){
-const _errs9 = errors;
+const _errs11 = errors;
 if(typeof data.compacting !== "boolean"){
 validate54.errors = [{instancePath:instancePath+"/compacting",schemaPath:"#/properties/compacting/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
-return false;
-}
-var valid0 = _errs9 === errors;
-}
-else {
-var valid0 = true;
-}
-if(valid0){
-if(data.has_older !== undefined){
-const _errs11 = errors;
-if(typeof data.has_older !== "boolean"){
-validate54.errors = [{instancePath:instancePath+"/has_older",schemaPath:"#/properties/has_older/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
 return false;
 }
 var valid0 = _errs11 === errors;
@@ -3573,20 +3574,11 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.item_offset !== undefined){
-let data5 = data.item_offset;
+if(data.has_older !== undefined){
 const _errs13 = errors;
-if(!((typeof data5 == "number") && (!(data5 % 1) && !isNaN(data5)))){
-validate54.errors = [{instancePath:instancePath+"/item_offset",schemaPath:"#/properties/item_offset/type",keyword:"type",params:{type: "integer"},message:"must be integer"}];
+if(typeof data.has_older !== "boolean"){
+validate54.errors = [{instancePath:instancePath+"/has_older",schemaPath:"#/properties/has_older/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
 return false;
-}
-if(errors === _errs13){
-if(typeof data5 == "number"){
-if(data5 < 0 || isNaN(data5)){
-validate54.errors = [{instancePath:instancePath+"/item_offset",schemaPath:"#/properties/item_offset/minimum",keyword:"minimum",params:{comparison: ">=", limit: 0},message:"must be >= 0"}];
-return false;
-}
-}
 }
 var valid0 = _errs13 === errors;
 }
@@ -3594,20 +3586,41 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.items !== undefined){
-let data6 = data.items;
+if(data.item_offset !== undefined){
+let data6 = data.item_offset;
 const _errs15 = errors;
+if(!((typeof data6 == "number") && (!(data6 % 1) && !isNaN(data6)))){
+validate54.errors = [{instancePath:instancePath+"/item_offset",schemaPath:"#/properties/item_offset/type",keyword:"type",params:{type: "integer"},message:"must be integer"}];
+return false;
+}
 if(errors === _errs15){
-if(Array.isArray(data6)){
-var valid3 = true;
-const len1 = data6.length;
-for(let i1=0; i1<len1; i1++){
+if(typeof data6 == "number"){
+if(data6 < 0 || isNaN(data6)){
+validate54.errors = [{instancePath:instancePath+"/item_offset",schemaPath:"#/properties/item_offset/minimum",keyword:"minimum",params:{comparison: ">=", limit: 0},message:"must be >= 0"}];
+return false;
+}
+}
+}
+var valid0 = _errs15 === errors;
+}
+else {
+var valid0 = true;
+}
+if(valid0){
+if(data.items !== undefined){
+let data7 = data.items;
 const _errs17 = errors;
-if(!(validate59(data6[i1], {instancePath:instancePath+"/items/" + i1,parentData:data6,parentDataProperty:i1,rootData,dynamicAnchors}))){
+if(errors === _errs17){
+if(Array.isArray(data7)){
+var valid3 = true;
+const len1 = data7.length;
+for(let i1=0; i1<len1; i1++){
+const _errs19 = errors;
+if(!(validate59(data7[i1], {instancePath:instancePath+"/items/" + i1,parentData:data7,parentDataProperty:i1,rootData,dynamicAnchors}))){
 vErrors = vErrors === null ? validate59.errors : vErrors.concat(validate59.errors);
 errors = vErrors.length;
 }
-var valid3 = _errs17 === errors;
+var valid3 = _errs19 === errors;
 if(!valid3){
 break;
 }
@@ -3618,20 +3631,20 @@ validate54.errors = [{instancePath:instancePath+"/items",schemaPath:"#/propertie
 return false;
 }
 }
-var valid0 = _errs15 === errors;
+var valid0 = _errs17 === errors;
 }
 else {
 var valid0 = true;
 }
 if(valid0){
 if(data.last_usage !== undefined){
-let data8 = data.last_usage;
-const _errs18 = errors;
-const _errs19 = errors;
+let data9 = data.last_usage;
+const _errs20 = errors;
+const _errs21 = errors;
 let valid4 = false;
 let passing1 = null;
-const _errs20 = errors;
-if(data8 !== null){
+const _errs22 = errors;
+if(data9 !== null){
 const err2 = {instancePath:instancePath+"/last_usage",schemaPath:"#/properties/last_usage/oneOf/0/type",keyword:"type",params:{type: "null"},message:"must be null"};
 if(vErrors === null){
 vErrors = [err2];
@@ -3641,17 +3654,17 @@ vErrors.push(err2);
 }
 errors++;
 }
-var _valid1 = _errs20 === errors;
+var _valid1 = _errs22 === errors;
 if(_valid1){
 valid4 = true;
 passing1 = 0;
 }
-const _errs22 = errors;
-if(!(validate55(data8, {instancePath:instancePath+"/last_usage",parentData:data,parentDataProperty:"last_usage",rootData,dynamicAnchors}))){
+const _errs24 = errors;
+if(!(validate55(data9, {instancePath:instancePath+"/last_usage",parentData:data,parentDataProperty:"last_usage",rootData,dynamicAnchors}))){
 vErrors = vErrors === null ? validate55.errors : vErrors.concat(validate55.errors);
 errors = vErrors.length;
 }
-var _valid1 = _errs22 === errors;
+var _valid1 = _errs24 === errors;
 if(_valid1 && valid4){
 valid4 = false;
 passing1 = [passing1, 1];
@@ -3682,36 +3695,36 @@ validate54.errors = vErrors;
 return false;
 }
 else {
-errors = _errs19;
+errors = _errs21;
 if(vErrors !== null){
-if(_errs19){
-vErrors.length = _errs19;
+if(_errs21){
+vErrors.length = _errs21;
 }
 else {
 vErrors = null;
 }
 }
 }
-var valid0 = _errs18 === errors;
+var valid0 = _errs20 === errors;
 }
 else {
 var valid0 = true;
 }
 if(valid0){
 if(data.pending_approvals !== undefined){
-let data9 = data.pending_approvals;
-const _errs23 = errors;
-if(errors === _errs23){
-if(Array.isArray(data9)){
-var valid5 = true;
-const len2 = data9.length;
-for(let i2=0; i2<len2; i2++){
+let data10 = data.pending_approvals;
 const _errs25 = errors;
-if(typeof data9[i2] !== "string"){
+if(errors === _errs25){
+if(Array.isArray(data10)){
+var valid5 = true;
+const len2 = data10.length;
+for(let i2=0; i2<len2; i2++){
+const _errs27 = errors;
+if(typeof data10[i2] !== "string"){
 validate54.errors = [{instancePath:instancePath+"/pending_approvals/" + i2,schemaPath:"#/properties/pending_approvals/items/type",keyword:"type",params:{type: "string"},message:"must be string"}];
 return false;
 }
-var valid5 = _errs25 === errors;
+var valid5 = _errs27 === errors;
 if(!valid5){
 break;
 }
@@ -3722,26 +3735,26 @@ validate54.errors = [{instancePath:instancePath+"/pending_approvals",schemaPath:
 return false;
 }
 }
-var valid0 = _errs23 === errors;
+var valid0 = _errs25 === errors;
 }
 else {
 var valid0 = true;
 }
 if(valid0){
 if(data.pending_questions !== undefined){
-let data11 = data.pending_questions;
-const _errs27 = errors;
-if(errors === _errs27){
-if(Array.isArray(data11)){
-var valid6 = true;
-const len3 = data11.length;
-for(let i3=0; i3<len3; i3++){
+let data12 = data.pending_questions;
 const _errs29 = errors;
-if(typeof data11[i3] !== "string"){
+if(errors === _errs29){
+if(Array.isArray(data12)){
+var valid6 = true;
+const len3 = data12.length;
+for(let i3=0; i3<len3; i3++){
+const _errs31 = errors;
+if(typeof data12[i3] !== "string"){
 validate54.errors = [{instancePath:instancePath+"/pending_questions/" + i3,schemaPath:"#/properties/pending_questions/items/type",keyword:"type",params:{type: "string"},message:"must be string"}];
 return false;
 }
-var valid6 = _errs29 === errors;
+var valid6 = _errs31 === errors;
 if(!valid6){
 break;
 }
@@ -3752,26 +3765,26 @@ validate54.errors = [{instancePath:instancePath+"/pending_questions",schemaPath:
 return false;
 }
 }
-var valid0 = _errs27 === errors;
+var valid0 = _errs29 === errors;
 }
 else {
 var valid0 = true;
 }
 if(valid0){
 if(data.queue !== undefined){
-let data13 = data.queue;
-const _errs31 = errors;
-if(errors === _errs31){
-if(Array.isArray(data13)){
-var valid7 = true;
-const len4 = data13.length;
-for(let i4=0; i4<len4; i4++){
+let data14 = data.queue;
 const _errs33 = errors;
-if(!(validate85(data13[i4], {instancePath:instancePath+"/queue/" + i4,parentData:data13,parentDataProperty:i4,rootData,dynamicAnchors}))){
+if(errors === _errs33){
+if(Array.isArray(data14)){
+var valid7 = true;
+const len4 = data14.length;
+for(let i4=0; i4<len4; i4++){
+const _errs35 = errors;
+if(!(validate85(data14[i4], {instancePath:instancePath+"/queue/" + i4,parentData:data14,parentDataProperty:i4,rootData,dynamicAnchors}))){
 vErrors = vErrors === null ? validate85.errors : vErrors.concat(validate85.errors);
 errors = vErrors.length;
 }
-var valid7 = _errs33 === errors;
+var valid7 = _errs35 === errors;
 if(!valid7){
 break;
 }
@@ -3782,38 +3795,38 @@ validate54.errors = [{instancePath:instancePath+"/queue",schemaPath:"#/propertie
 return false;
 }
 }
-var valid0 = _errs31 === errors;
+var valid0 = _errs33 === errors;
 }
 else {
 var valid0 = true;
 }
 if(valid0){
 if(data.thinking !== undefined){
-const _errs34 = errors;
+const _errs36 = errors;
 if(typeof data.thinking !== "boolean"){
 validate54.errors = [{instancePath:instancePath+"/thinking",schemaPath:"#/properties/thinking/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
 return false;
 }
-var valid0 = _errs34 === errors;
+var valid0 = _errs36 === errors;
 }
 else {
 var valid0 = true;
 }
 if(valid0){
 if(data.todos !== undefined){
-let data16 = data.todos;
-const _errs36 = errors;
-if(errors === _errs36){
-if(Array.isArray(data16)){
-var valid8 = true;
-const len5 = data16.length;
-for(let i5=0; i5<len5; i5++){
+let data17 = data.todos;
 const _errs38 = errors;
-if(!(validate89(data16[i5], {instancePath:instancePath+"/todos/" + i5,parentData:data16,parentDataProperty:i5,rootData,dynamicAnchors}))){
+if(errors === _errs38){
+if(Array.isArray(data17)){
+var valid8 = true;
+const len5 = data17.length;
+for(let i5=0; i5<len5; i5++){
+const _errs40 = errors;
+if(!(validate89(data17[i5], {instancePath:instancePath+"/todos/" + i5,parentData:data17,parentDataProperty:i5,rootData,dynamicAnchors}))){
 vErrors = vErrors === null ? validate89.errors : vErrors.concat(validate89.errors);
 errors = vErrors.length;
 }
-var valid8 = _errs38 === errors;
+var valid8 = _errs40 === errors;
 if(!valid8){
 break;
 }
@@ -3824,41 +3837,41 @@ validate54.errors = [{instancePath:instancePath+"/todos",schemaPath:"#/propertie
 return false;
 }
 }
-var valid0 = _errs36 === errors;
+var valid0 = _errs38 === errors;
 }
 else {
 var valid0 = true;
 }
 if(valid0){
 if(data.total_items !== undefined){
-let data18 = data.total_items;
-const _errs39 = errors;
-if(!((typeof data18 == "number") && (!(data18 % 1) && !isNaN(data18)))){
+let data19 = data.total_items;
+const _errs41 = errors;
+if(!((typeof data19 == "number") && (!(data19 % 1) && !isNaN(data19)))){
 validate54.errors = [{instancePath:instancePath+"/total_items",schemaPath:"#/properties/total_items/type",keyword:"type",params:{type: "integer"},message:"must be integer"}];
 return false;
 }
-if(errors === _errs39){
-if(typeof data18 == "number"){
-if(data18 < 0 || isNaN(data18)){
+if(errors === _errs41){
+if(typeof data19 == "number"){
+if(data19 < 0 || isNaN(data19)){
 validate54.errors = [{instancePath:instancePath+"/total_items",schemaPath:"#/properties/total_items/minimum",keyword:"minimum",params:{comparison: ">=", limit: 0},message:"must be >= 0"}];
 return false;
 }
 }
 }
-var valid0 = _errs39 === errors;
+var valid0 = _errs41 === errors;
 }
 else {
 var valid0 = true;
 }
 if(valid0){
 if(data.turn_duration_ms !== undefined){
-let data19 = data.turn_duration_ms;
-const _errs41 = errors;
-if(errors === _errs41){
-if(data19 && typeof data19 == "object" && !Array.isArray(data19)){
-for(const key0 in data19){
+let data20 = data.turn_duration_ms;
 const _errs43 = errors;
 if(errors === _errs43){
+if(data20 && typeof data20 == "object" && !Array.isArray(data20)){
+for(const key0 in data20){
+const _errs45 = errors;
+if(errors === _errs45){
 if(typeof key0 === "string"){
 if(!pattern3.test(key0)){
 const err4 = {instancePath:instancePath+"/turn_duration_ms",schemaPath:"#/properties/turn_duration_ms/propertyNames/pattern",keyword:"pattern",params:{pattern: "^(0|[1-9][0-9]*)$"},message:"must match pattern \""+"^(0|[1-9][0-9]*)$"+"\"",propertyName:key0};
@@ -3882,7 +3895,7 @@ vErrors.push(err5);
 errors++;
 }
 }
-var valid9 = _errs43 === errors;
+var valid9 = _errs45 === errors;
 if(!valid9){
 const err6 = {instancePath:instancePath+"/turn_duration_ms",schemaPath:"#/properties/turn_duration_ms/propertyNames",keyword:"propertyNames",params:{propertyName: key0},message:"property name must be valid"};
 if(vErrors === null){
@@ -3898,22 +3911,22 @@ break;
 }
 }
 if(valid9){
-for(const key1 in data19){
-let data20 = data19[key1];
-const _errs46 = errors;
-if(!((typeof data20 == "number") && (!(data20 % 1) && !isNaN(data20)))){
+for(const key1 in data20){
+let data21 = data20[key1];
+const _errs48 = errors;
+if(!((typeof data21 == "number") && (!(data21 % 1) && !isNaN(data21)))){
 validate54.errors = [{instancePath:instancePath+"/turn_duration_ms/" + key1.replace(/~/g, "~0").replace(/\//g, "~1"),schemaPath:"#/properties/turn_duration_ms/additionalProperties/type",keyword:"type",params:{type: "integer"},message:"must be integer"}];
 return false;
 }
-if(errors === _errs46){
-if(typeof data20 == "number"){
-if(data20 < 0 || isNaN(data20)){
+if(errors === _errs48){
+if(typeof data21 == "number"){
+if(data21 < 0 || isNaN(data21)){
 validate54.errors = [{instancePath:instancePath+"/turn_duration_ms/" + key1.replace(/~/g, "~0").replace(/\//g, "~1"),schemaPath:"#/properties/turn_duration_ms/additionalProperties/minimum",keyword:"minimum",params:{comparison: ">=", limit: 0},message:"must be >= 0"}];
 return false;
 }
 }
 }
-var valid10 = _errs46 === errors;
+var valid10 = _errs48 === errors;
 if(!valid10){
 break;
 }
@@ -3925,20 +3938,20 @@ validate54.errors = [{instancePath:instancePath+"/turn_duration_ms",schemaPath:"
 return false;
 }
 }
-var valid0 = _errs41 === errors;
+var valid0 = _errs43 === errors;
 }
 else {
 var valid0 = true;
 }
 if(valid0){
 if(data.turn_models !== undefined){
-let data21 = data.turn_models;
-const _errs48 = errors;
-if(errors === _errs48){
-if(data21 && typeof data21 == "object" && !Array.isArray(data21)){
-for(const key2 in data21){
+let data22 = data.turn_models;
 const _errs50 = errors;
 if(errors === _errs50){
+if(data22 && typeof data22 == "object" && !Array.isArray(data22)){
+for(const key2 in data22){
+const _errs52 = errors;
+if(errors === _errs52){
 if(typeof key2 === "string"){
 if(!pattern3.test(key2)){
 const err7 = {instancePath:instancePath+"/turn_models",schemaPath:"#/properties/turn_models/propertyNames/pattern",keyword:"pattern",params:{pattern: "^(0|[1-9][0-9]*)$"},message:"must match pattern \""+"^(0|[1-9][0-9]*)$"+"\"",propertyName:key2};
@@ -3962,7 +3975,7 @@ vErrors.push(err8);
 errors++;
 }
 }
-var valid11 = _errs50 === errors;
+var valid11 = _errs52 === errors;
 if(!valid11){
 const err9 = {instancePath:instancePath+"/turn_models",schemaPath:"#/properties/turn_models/propertyNames",keyword:"propertyNames",params:{propertyName: key2},message:"property name must be valid"};
 if(vErrors === null){
@@ -3978,13 +3991,13 @@ break;
 }
 }
 if(valid11){
-for(const key3 in data21){
-const _errs53 = errors;
-if(typeof data21[key3] !== "string"){
+for(const key3 in data22){
+const _errs55 = errors;
+if(typeof data22[key3] !== "string"){
 validate54.errors = [{instancePath:instancePath+"/turn_models/" + key3.replace(/~/g, "~0").replace(/\//g, "~1"),schemaPath:"#/properties/turn_models/additionalProperties/type",keyword:"type",params:{type: "string"},message:"must be string"}];
 return false;
 }
-var valid12 = _errs53 === errors;
+var valid12 = _errs55 === errors;
 if(!valid12){
 break;
 }
@@ -3996,20 +4009,20 @@ validate54.errors = [{instancePath:instancePath+"/turn_models",schemaPath:"#/pro
 return false;
 }
 }
-var valid0 = _errs48 === errors;
+var valid0 = _errs50 === errors;
 }
 else {
 var valid0 = true;
 }
 if(valid0){
 if(data.turn_phase !== undefined){
-let data23 = data.turn_phase;
-const _errs55 = errors;
-const _errs56 = errors;
+let data24 = data.turn_phase;
+const _errs57 = errors;
+const _errs58 = errors;
 let valid13 = false;
 let passing2 = null;
-const _errs57 = errors;
-if(data23 !== null){
+const _errs59 = errors;
+if(data24 !== null){
 const err10 = {instancePath:instancePath+"/turn_phase",schemaPath:"#/properties/turn_phase/oneOf/0/type",keyword:"type",params:{type: "null"},message:"must be null"};
 if(vErrors === null){
 vErrors = [err10];
@@ -4019,17 +4032,17 @@ vErrors.push(err10);
 }
 errors++;
 }
-var _valid2 = _errs57 === errors;
+var _valid2 = _errs59 === errors;
 if(_valid2){
 valid13 = true;
 passing2 = 0;
 }
-const _errs59 = errors;
-if(!(validate93(data23, {instancePath:instancePath+"/turn_phase",parentData:data,parentDataProperty:"turn_phase",rootData,dynamicAnchors}))){
+const _errs61 = errors;
+if(!(validate93(data24, {instancePath:instancePath+"/turn_phase",parentData:data,parentDataProperty:"turn_phase",rootData,dynamicAnchors}))){
 vErrors = vErrors === null ? validate93.errors : vErrors.concat(validate93.errors);
 errors = vErrors.length;
 }
-var _valid2 = _errs59 === errors;
+var _valid2 = _errs61 === errors;
 if(_valid2 && valid13){
 valid13 = false;
 passing2 = [passing2, 1];
@@ -4053,42 +4066,42 @@ validate54.errors = vErrors;
 return false;
 }
 else {
-errors = _errs56;
+errors = _errs58;
 if(vErrors !== null){
-if(_errs56){
-vErrors.length = _errs56;
+if(_errs58){
+vErrors.length = _errs58;
 }
 else {
 vErrors = null;
 }
 }
 }
-var valid0 = _errs55 === errors;
+var valid0 = _errs57 === errors;
 }
 else {
 var valid0 = true;
 }
 if(valid0){
 if(data.turn_running !== undefined){
-const _errs60 = errors;
+const _errs62 = errors;
 if(typeof data.turn_running !== "boolean"){
 validate54.errors = [{instancePath:instancePath+"/turn_running",schemaPath:"#/properties/turn_running/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
 return false;
 }
-var valid0 = _errs60 === errors;
+var valid0 = _errs62 === errors;
 }
 else {
 var valid0 = true;
 }
 if(valid0){
 if(data.turn_started_at !== undefined){
-let data25 = data.turn_started_at;
-const _errs62 = errors;
-if(errors === _errs62){
-if(data25 && typeof data25 == "object" && !Array.isArray(data25)){
-for(const key4 in data25){
+let data26 = data.turn_started_at;
 const _errs64 = errors;
 if(errors === _errs64){
+if(data26 && typeof data26 == "object" && !Array.isArray(data26)){
+for(const key4 in data26){
+const _errs66 = errors;
+if(errors === _errs66){
 if(typeof key4 === "string"){
 if(!pattern3.test(key4)){
 const err12 = {instancePath:instancePath+"/turn_started_at",schemaPath:"#/properties/turn_started_at/propertyNames/pattern",keyword:"pattern",params:{pattern: "^(0|[1-9][0-9]*)$"},message:"must match pattern \""+"^(0|[1-9][0-9]*)$"+"\"",propertyName:key4};
@@ -4112,7 +4125,7 @@ vErrors.push(err13);
 errors++;
 }
 }
-var valid14 = _errs64 === errors;
+var valid14 = _errs66 === errors;
 if(!valid14){
 const err14 = {instancePath:instancePath+"/turn_started_at",schemaPath:"#/properties/turn_started_at/propertyNames",keyword:"propertyNames",params:{propertyName: key4},message:"property name must be valid"};
 if(vErrors === null){
@@ -4128,17 +4141,17 @@ break;
 }
 }
 if(valid14){
-for(const key5 in data25){
-const _errs67 = errors;
-if(errors === _errs67){
-if(errors === _errs67){
-if(!(typeof data25[key5] === "string")){
+for(const key5 in data26){
+const _errs69 = errors;
+if(errors === _errs69){
+if(errors === _errs69){
+if(!(typeof data26[key5] === "string")){
 validate54.errors = [{instancePath:instancePath+"/turn_started_at/" + key5.replace(/~/g, "~0").replace(/\//g, "~1"),schemaPath:"#/properties/turn_started_at/additionalProperties/type",keyword:"type",params:{type: "string"},message:"must be string"}];
 return false;
 }
 }
 }
-var valid15 = _errs67 === errors;
+var valid15 = _errs69 === errors;
 if(!valid15){
 break;
 }
@@ -4150,20 +4163,20 @@ validate54.errors = [{instancePath:instancePath+"/turn_started_at",schemaPath:"#
 return false;
 }
 }
-var valid0 = _errs62 === errors;
+var valid0 = _errs64 === errors;
 }
 else {
 var valid0 = true;
 }
 if(valid0){
 if(data.turn_steerable !== undefined){
-let data27 = data.turn_steerable;
-const _errs69 = errors;
-if(errors === _errs69){
-if(data27 && typeof data27 == "object" && !Array.isArray(data27)){
-for(const key6 in data27){
+let data28 = data.turn_steerable;
 const _errs71 = errors;
 if(errors === _errs71){
+if(data28 && typeof data28 == "object" && !Array.isArray(data28)){
+for(const key6 in data28){
+const _errs73 = errors;
+if(errors === _errs73){
 if(typeof key6 === "string"){
 if(!pattern3.test(key6)){
 const err15 = {instancePath:instancePath+"/turn_steerable",schemaPath:"#/properties/turn_steerable/propertyNames/pattern",keyword:"pattern",params:{pattern: "^(0|[1-9][0-9]*)$"},message:"must match pattern \""+"^(0|[1-9][0-9]*)$"+"\"",propertyName:key6};
@@ -4187,7 +4200,7 @@ vErrors.push(err16);
 errors++;
 }
 }
-var valid16 = _errs71 === errors;
+var valid16 = _errs73 === errors;
 if(!valid16){
 const err17 = {instancePath:instancePath+"/turn_steerable",schemaPath:"#/properties/turn_steerable/propertyNames",keyword:"propertyNames",params:{propertyName: key6},message:"property name must be valid"};
 if(vErrors === null){
@@ -4203,13 +4216,13 @@ break;
 }
 }
 if(valid16){
-for(const key7 in data27){
-const _errs74 = errors;
-if(typeof data27[key7] !== "boolean"){
+for(const key7 in data28){
+const _errs76 = errors;
+if(typeof data28[key7] !== "boolean"){
 validate54.errors = [{instancePath:instancePath+"/turn_steerable/" + key7.replace(/~/g, "~0").replace(/\//g, "~1"),schemaPath:"#/properties/turn_steerable/additionalProperties/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
 return false;
 }
-var valid17 = _errs74 === errors;
+var valid17 = _errs76 === errors;
 if(!valid17){
 break;
 }
@@ -4221,20 +4234,20 @@ validate54.errors = [{instancePath:instancePath+"/turn_steerable",schemaPath:"#/
 return false;
 }
 }
-var valid0 = _errs69 === errors;
+var valid0 = _errs71 === errors;
 }
 else {
 var valid0 = true;
 }
 if(valid0){
 if(data.turn_thinking_levels !== undefined){
-let data29 = data.turn_thinking_levels;
-const _errs76 = errors;
-if(errors === _errs76){
-if(data29 && typeof data29 == "object" && !Array.isArray(data29)){
-for(const key8 in data29){
+let data30 = data.turn_thinking_levels;
 const _errs78 = errors;
 if(errors === _errs78){
+if(data30 && typeof data30 == "object" && !Array.isArray(data30)){
+for(const key8 in data30){
+const _errs80 = errors;
+if(errors === _errs80){
 if(typeof key8 === "string"){
 if(!pattern3.test(key8)){
 const err18 = {instancePath:instancePath+"/turn_thinking_levels",schemaPath:"#/properties/turn_thinking_levels/propertyNames/pattern",keyword:"pattern",params:{pattern: "^(0|[1-9][0-9]*)$"},message:"must match pattern \""+"^(0|[1-9][0-9]*)$"+"\"",propertyName:key8};
@@ -4258,7 +4271,7 @@ vErrors.push(err19);
 errors++;
 }
 }
-var valid18 = _errs78 === errors;
+var valid18 = _errs80 === errors;
 if(!valid18){
 const err20 = {instancePath:instancePath+"/turn_thinking_levels",schemaPath:"#/properties/turn_thinking_levels/propertyNames",keyword:"propertyNames",params:{propertyName: key8},message:"property name must be valid"};
 if(vErrors === null){
@@ -4274,13 +4287,13 @@ break;
 }
 }
 if(valid18){
-for(const key9 in data29){
-const _errs81 = errors;
-if(typeof data29[key9] !== "string"){
+for(const key9 in data30){
+const _errs83 = errors;
+if(typeof data30[key9] !== "string"){
 validate54.errors = [{instancePath:instancePath+"/turn_thinking_levels/" + key9.replace(/~/g, "~0").replace(/\//g, "~1"),schemaPath:"#/properties/turn_thinking_levels/additionalProperties/type",keyword:"type",params:{type: "string"},message:"must be string"}];
 return false;
 }
-var valid19 = _errs81 === errors;
+var valid19 = _errs83 === errors;
 if(!valid19){
 break;
 }
@@ -4292,10 +4305,11 @@ validate54.errors = [{instancePath:instancePath+"/turn_thinking_levels",schemaPa
 return false;
 }
 }
-var valid0 = _errs76 === errors;
+var valid0 = _errs78 === errors;
 }
 else {
 var valid0 = true;
+}
 }
 }
 }
@@ -4326,7 +4340,7 @@ return false;
 validate54.errors = vErrors;
 return errors === 0;
 }
-validate54.evaluated = {"props":{"active_usage":true,"commands":true,"compacting":true,"has_older":true,"item_offset":true,"items":true,"last_usage":true,"pending_approvals":true,"pending_questions":true,"queue":true,"thinking":true,"todos":true,"total_items":true,"turn_duration_ms":true,"turn_models":true,"turn_phase":true,"turn_running":true,"turn_started_at":true,"turn_steerable":true,"turn_thinking_levels":true},"dynamicProps":false,"dynamicItems":false};
+validate54.evaluated = {"props":{"active_thinking_id":true,"active_usage":true,"commands":true,"compacting":true,"has_older":true,"item_offset":true,"items":true,"last_usage":true,"pending_approvals":true,"pending_questions":true,"queue":true,"thinking":true,"todos":true,"total_items":true,"turn_duration_ms":true,"turn_models":true,"turn_phase":true,"turn_running":true,"turn_started_at":true,"turn_steerable":true,"turn_thinking_levels":true},"dynamicProps":false,"dynamicItems":false};
 
 
 function validate52(data, {instancePath="", parentData, parentDataProperty, rootData=data, dynamicAnchors={}}={}){
@@ -4347,4 +4361,4 @@ errors = vErrors.length;
 validate52.errors = vErrors;
 return errors === 0;
 }
-validate52.evaluated = {"props":{"active_usage":true,"commands":true,"compacting":true,"has_older":true,"item_offset":true,"items":true,"last_usage":true,"pending_approvals":true,"pending_questions":true,"queue":true,"thinking":true,"todos":true,"total_items":true,"turn_duration_ms":true,"turn_models":true,"turn_phase":true,"turn_running":true,"turn_started_at":true,"turn_steerable":true,"turn_thinking_levels":true},"dynamicProps":false,"dynamicItems":false};
+validate52.evaluated = {"props":{"active_thinking_id":true,"active_usage":true,"commands":true,"compacting":true,"has_older":true,"item_offset":true,"items":true,"last_usage":true,"pending_approvals":true,"pending_questions":true,"queue":true,"thinking":true,"todos":true,"total_items":true,"turn_duration_ms":true,"turn_models":true,"turn_phase":true,"turn_running":true,"turn_started_at":true,"turn_steerable":true,"turn_thinking_levels":true},"dynamicProps":false,"dynamicItems":false};

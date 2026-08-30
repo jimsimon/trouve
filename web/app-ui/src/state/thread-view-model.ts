@@ -261,6 +261,7 @@ export class ThreadViewModel {
   #queueRevision = 0;
   #completedUsage: Usage | undefined;
   #activeTurnUsage: { readonly turn: number; readonly usage: Usage } | undefined;
+  #activeThinkingId: string | undefined;
 
   cursor = 0;
   /** Absolute folded-item position of `items[0]`. */
@@ -359,6 +360,7 @@ export class ThreadViewModel {
       }
     }
     this.thinking = snapshot.thinking ?? false;
+    this.#activeThinkingId = snapshot.active_thinking_id ?? undefined;
     this.commands = [...(snapshot.commands ?? [])];
     this.replaceQueue(snapshot.queue ?? []);
     // Protocol 3.1 snapshots predate the todo projection. Preserve any live
@@ -750,7 +752,12 @@ export class ThreadViewModel {
       case "assistant.thinking": {
         this.failOpenCompaction(envelope.turn);
         this.finishProgress();
+        const id = envelope.id ?? undefined;
+        if (this.thinking && this.#activeThinkingId !== id) {
+          this.finishThinking();
+        }
         this.thinking = true;
+        this.#activeThinkingId = id;
         const current = this.findTrailingOpen("thinking", envelope.turn);
         if (current?.kind === "thinking") current.content += envelope.text;
         else {
@@ -764,8 +771,12 @@ export class ThreadViewModel {
         }
         return true;
       }
-      case "assistant.thinking_completed":
-        return this.finishThinking();
+      case "assistant.thinking_completed": {
+        const id = envelope.id ?? undefined;
+        return id === undefined || this.#activeThinkingId === id
+          ? this.finishThinking()
+          : false;
+      }
       case "assistant.delta": {
         this.failOpenCompaction(envelope.turn);
         this.finishProgress();
@@ -805,6 +816,7 @@ export class ThreadViewModel {
       case "tool.requested":
         this.failOpenCompaction(envelope.turn);
         this.finishProgress();
+        if (this.#activeThinkingId === undefined) this.finishThinking();
         this.appendItem({
           id: `tool:${envelope.call_id}`,
           kind: "tool",
@@ -1086,6 +1098,7 @@ export class ThreadViewModel {
   private finishThinking(): boolean {
     const wasThinking = this.thinking;
     this.thinking = false;
+    this.#activeThinkingId = undefined;
     const item = this.#findLast(
       (candidate) => candidate.kind === "thinking" && !candidate.complete,
     );
