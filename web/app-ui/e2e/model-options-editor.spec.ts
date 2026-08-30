@@ -141,9 +141,17 @@ test("model-option choices preserve selected state and scalar value types", asyn
   }
   await expect.poll(() => page.evaluate(() => {
     const changes = (window as Window & { modelOptionChanges?: unknown[] })
-      .modelOptionChanges as { value: unknown }[];
-    return changes.map(({ value }) => Object.is(value, -0) ? "-0" : value);
-  })).toEqual([1, 1_000, "-0", 1e20]);
+      .modelOptionChanges as { key: string; value: unknown; numberSource?: string }[];
+    return changes.map((detail) => ({
+      ...detail,
+      value: Object.is(detail.value, -0) ? "-0" : detail.value,
+    }));
+  })).toEqual([
+    { key: "temperature", value: 1, numberSource: "1.0" },
+    { key: "temperature", value: 1_000, numberSource: "1e3" },
+    { key: "temperature", value: "-0", numberSource: "-0" },
+    { key: "temperature", value: 1e20, numberSource: "1e20" },
+  ]);
   await expect(temperature).toHaveValue("100000000000000000000");
   await page.evaluate(() => {
     (window as Window & { modelOptionChanges?: unknown[] }).modelOptionChanges?.splice(0);
@@ -195,8 +203,8 @@ test("model-option choices preserve selected state and scalar value types", asyn
   )).toEqual([
     { key: "context_window", value: 300_000 },
     { key: "fast", value: true },
-    { key: "thinking_budget_tokens", value: 12 },
-    { key: "temperature", value: 0.25 },
+    { key: "thinking_budget_tokens", value: 12, numberSource: "12" },
+    { key: "temperature", value: 0.25, numberSource: "0.25" },
     { key: "tone", value: "" },
     { key: "instructions", value: "" },
     { key: "instructions", value: "   " },
@@ -211,8 +219,8 @@ test("model-option choices preserve selected state and scalar value types", asyn
   )).toEqual([
     { key: "context_window", value: 300_000 },
     { key: "fast", value: true },
-    { key: "thinking_budget_tokens", value: 12 },
-    { key: "temperature", value: 0.25 },
+    { key: "thinking_budget_tokens", value: 12, numberSource: "12" },
+    { key: "temperature", value: 0.25, numberSource: "0.25" },
     { key: "tone", value: "" },
     { key: "instructions", value: "" },
     { key: "instructions", value: "   " },

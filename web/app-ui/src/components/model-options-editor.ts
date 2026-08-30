@@ -1,6 +1,7 @@
 import { css, html, LitElement, nothing } from "lit";
 import { live } from "lit/directives/live.js";
 
+import { jsonNumberValueToken } from "../services/protocol-json.js";
 import {
   type ModelOptionChangeDetail,
   type ModelOptionControl,
@@ -264,7 +265,9 @@ export class TrouveModelOptionsEditor extends LitElement {
     }
     input.setCustomValidity("");
     const numberSource = typeof value === "number" ? raw : undefined;
-    const committed = numberSource ?? String(value ?? "");
+    const committed = typeof value === "number"
+      ? jsonNumberValueToken(value)
+      : String(value ?? "");
     if (this.#committedText.get(input) === committed) return;
     this.#committedText.set(input, committed);
     this.#emit(control.key, value, numberSource);

@@ -284,6 +284,29 @@ describe("model option controls", () => {
     }), {})).toEqual([]);
   });
 
+  it("hides controls whose advertised numbers would be rounded by JavaScript", () => {
+    const advertised = parseProtocolJson(`{
+      "id": "provider/model",
+      "display_name": "Model",
+      "context_window": 128000,
+      "supports_tools": true,
+      "options_schema": {
+        "type": "object",
+        "properties": {
+          "rounded_default": { "type": "number", "default": 9007199254740993 },
+          "rounded_minimum": { "type": "number", "minimum": 0.1234567890123456789 },
+          "rounded_choice": {
+            "type": "number",
+            "enum": [0.25, 0.1234567890123456789]
+          },
+          "fast": { "type": "boolean" }
+        }
+      }
+    }`) as ProtocolModelInfo;
+
+    expect(modelOptionControls(advertised, {}).map(({ key }) => key)).toEqual(["fast"]);
+  });
+
   it("accepts equivalent number spellings without silently rounding them", () => {
     const [control] = modelOptionControls(model({
       temperature: { type: "number" },
