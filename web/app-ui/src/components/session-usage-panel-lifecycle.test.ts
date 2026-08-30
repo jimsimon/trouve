@@ -19,15 +19,29 @@ describe("session usage panel asynchronous lifecycle guards", () => {
       "if (generation !== this.#generation) return;",
       awaitedAt,
     );
-    const publishAt = branch.indexOf("this.#localStatus = localStatus;", guardAt);
+    const publishAt = branch.indexOf(
+      "this.#localStatus = localStatusResult.value;",
+      guardAt,
+    );
     expect(awaitedAt).toBeGreaterThanOrEqual(0);
     expect(guardAt).toBeGreaterThan(awaitedAt);
     expect(publishAt).toBeGreaterThan(guardAt);
     expect(branch).not.toContain("this.#localStatus = await");
-    expect(branch.indexOf("this.#sessionSummary = sessionSummary;", guardAt))
+    expect(branch.indexOf("this.#sessionSummary = sessionResult.value;", guardAt))
       .toBeGreaterThan(guardAt);
-    expect(branch.indexOf("this.#threadSummary = threadSummary;", guardAt))
+    expect(branch.indexOf("this.#threadSummary = threadResult.value;", guardAt))
       .toBeGreaterThan(guardAt);
+  });
+
+  it("retains prior data while disclosing a fully failed refresh", () => {
+    expect(source).toContain("if (dataKey !== this.#dataKey)");
+    expect(source).toContain("Usage refresh failed.");
+    expect(source).toContain(
+      "[localStatusResult, sessionResult, threadResult].every(",
+    );
+    expect(source).toContain(
+      "[healthResult, sessionResult, threadResult].every(",
+    );
   });
 
   it("loads and renders active-thread and session usage in separate tabs", () => {
