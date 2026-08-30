@@ -16849,6 +16849,7 @@ fn diff_range_start(range: &str, prefix: char) -> Option<u64> {
 fn diff_line_contents(files: &[ReviewDiffFile]) -> HashMap<(String, u64, bool), String> {
     let mut contents = HashMap::new();
     for file in files {
+        let old_path = review_diff_renamed_from(file).unwrap_or_else(|| file.path.clone());
         let mut old_line = 0;
         let mut new_line = 0;
         let mut in_hunk = false;
@@ -16876,11 +16877,11 @@ fn diff_line_contents(files: &[ReviewDiffFile]) -> HashMap<(String, u64, bool), 
                     new_line += 1;
                 }
                 Some(b'-') => {
-                    contents.insert((file.path.clone(), old_line, true), line[1..].to_owned());
+                    contents.insert((old_path.clone(), old_line, true), line[1..].to_owned());
                     old_line += 1;
                 }
                 Some(b' ') => {
-                    contents.insert((file.path.clone(), old_line, true), line[1..].to_owned());
+                    contents.insert((old_path.clone(), old_line, true), line[1..].to_owned());
                     contents.insert((file.path.clone(), new_line, false), line[1..].to_owned());
                     old_line += 1;
                     new_line += 1;
@@ -16890,6 +16891,55 @@ fn diff_line_contents(files: &[ReviewDiffFile]) -> HashMap<(String, u64, bool), 
         }
     }
     contents
+}
+
+/// Decode the source path carried by a rename-aware Git patch. Git quotes
+/// unusual paths with C escapes; decoding them keeps historical anchor
+/// identity exact without trusting a whitespace-delimited diff header.
+fn review_diff_renamed_from(file: &ReviewDiffFile) -> Option<String> {
+    let encoded = file
+        .diff
+        .lines()
+        .find_map(|line| line.strip_prefix("rename from "))?;
+    if !encoded.starts_with('"') {
+        return Some(encoded.to_owned());
+    }
+    let encoded = encoded.strip_prefix('"')?.strip_suffix('"')?.as_bytes();
+    let mut decoded = Vec::with_capacity(encoded.len());
+    let mut index = 0;
+    while index < encoded.len() {
+        if encoded[index] != b'\\' {
+            decoded.push(encoded[index]);
+            index += 1;
+            continue;
+        }
+        index += 1;
+        let escaped = *encoded.get(index)?;
+        index += 1;
+        match escaped {
+            b'"' | b'\\' => decoded.push(escaped),
+            b'a' => decoded.push(0x07),
+            b'b' => decoded.push(0x08),
+            b't' => decoded.push(b'\t'),
+            b'n' => decoded.push(b'\n'),
+            b'v' => decoded.push(0x0b),
+            b'f' => decoded.push(0x0c),
+            b'r' => decoded.push(b'\r'),
+            b'0'..=b'7' => {
+                let mut value = escaped - b'0';
+                for _ in 0..2 {
+                    let Some(next @ b'0'..=b'7') = encoded.get(index).copied() else {
+                        break;
+                    };
+                    value = value.saturating_mul(8).saturating_add(next - b'0');
+                    index += 1;
+                }
+                decoded.push(value);
+            }
+            _ => return None,
+        }
+    }
+    String::from_utf8(decoded).ok()
 }
 
 /// The source line a finding anchors to: from the diff when the anchor is a
@@ -17227,7 +17277,12 @@ fn historical_anchor_location(
     if line == CARRIED_ANCHOR_ABSENT_LINE {
         return HistoricalAnchorLocation::Absent { path };
     }
-    let file = mapping.files.iter().find(|file| file.path == path);
+    let renamed_file = mapping
+        .files
+        .iter()
+        .find(|file| review_diff_renamed_from(file).as_deref() == Some(path.as_str()));
+    let file = renamed_file.or_else(|| mapping.files.iter().find(|file| file.path == path));
+    let head_path = renamed_file.map_or_else(|| path.clone(), |file| file.path.clone());
     if mapping
         .diff_contents
         .contains_key(&(path.clone(), line, true))
@@ -17235,7 +17290,7 @@ fn historical_anchor_location(
         return HistoricalAnchorLocation::InDiff {
             head: file
                 .and_then(|file| in_diff_head_line(file, line))
-                .map(|line| (path, line)),
+                .map(|line| (head_path, line)),
         };
     }
     let Some(file) = file else {
@@ -17268,14 +17323,22 @@ fn historical_anchor_location(
         }
     }
     if !saw_hunk {
-        return HistoricalAnchorLocation::Unverifiable;
+        return if renamed_file.is_some() {
+            HistoricalAnchorLocation::HeadLine {
+                path: head_path,
+                line,
+            }
+        } else {
+            HistoricalAnchorLocation::Unverifiable
+        };
     }
-    u64::try_from(mapped)
-        .ok()
-        .filter(|line| *line > 0)
-        .map_or(HistoricalAnchorLocation::Unverifiable, |line| {
-            HistoricalAnchorLocation::HeadLine { path, line }
-        })
+    u64::try_from(mapped).ok().filter(|line| *line > 0).map_or(
+        HistoricalAnchorLocation::Unverifiable,
+        |line| HistoricalAnchorLocation::HeadLine {
+            path: head_path,
+            line,
+        },
+    )
 }
 
 fn finding_requires_head_verification(
@@ -20353,6 +20416,69 @@ mod tests {
             }]
         );
         assert!(carried_anchor_targets(&[finding], &mapping).is_empty());
+    }
+
+    #[test]
+    fn renamed_files_advance_carried_anchors_to_the_destination_path() {
+        let finding = open_history_finding("rvf_renamed", "src/old.rs", 10, "high");
+        let files = vec![ReviewDiffFile {
+            path: "src/new.rs".into(),
+            diff: "diff --git a/src/old.rs b/src/new.rs
+similarity index 100%
+rename from src/old.rs
+rename to src/new.rs
+"
+            .into(),
+            generated_header: None,
+        }];
+        let diff_contents = diff_line_contents(&files);
+        let base_anchors = CarriedFindingAnchorMap::new();
+        let mapping = CarriedAnchorMappingContext {
+            files: &files,
+            diff_contents: &diff_contents,
+            review_base_sha: "base",
+            base_anchors: &base_anchors,
+        };
+
+        assert_eq!(
+            carried_anchor_positions(std::slice::from_ref(&finding), &mapping),
+            vec![CarriedAnchorPosition {
+                finding_id: finding.id.clone(),
+                path: "src/new.rs".to_owned(),
+                line: 10,
+                requires_read: true,
+            }]
+        );
+        assert_eq!(
+            carried_anchor_targets(std::slice::from_ref(&finding), &mapping),
+            vec![("src/new.rs".to_owned(), 10)]
+        );
+        let current_lines = HashMap::from([(
+            ("src/new.rs".to_owned(), 10),
+            Some("still_broken();".to_owned()),
+        )]);
+        let absent = ResolvedFindingClaim {
+            finding_id: finding.id.clone(),
+            current_anchor_quote: String::new(),
+        };
+        assert!(
+            verified_resolution_ids(
+                Vec::new(),
+                &[absent],
+                std::slice::from_ref(&finding),
+                &mapping,
+                &current_lines,
+            )
+            .is_empty()
+        );
+        let matched = ResolvedFindingClaim {
+            finding_id: finding.id.clone(),
+            current_anchor_quote: "still_broken();".into(),
+        };
+        assert_eq!(
+            verified_resolution_ids(Vec::new(), &[matched], &[finding], &mapping, &current_lines,),
+            vec!["rvf_renamed".to_owned()]
+        );
     }
 
     #[test]

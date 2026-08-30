@@ -2975,26 +2975,118 @@ where
     ensure_safe_ref(base_ref)?;
     let operation = GitOperation::new(Some(cancel));
     with_session_snapshot_index(worktree, &operation, |index| {
-        let summary = session_diff_summary_with_index(worktree, base_ref, index, &operation)?;
-        let mut total_bytes = 0_usize;
-        let mut patches = Vec::with_capacity(summary.len());
-        for file in summary {
-            operation.check()?;
-            let diff =
-                bounded_session_diff_path(worktree, base_ref, &file.path, index, &operation)?;
-            total_bytes = total_bytes
-                .checked_add(diff.len())
-                .context("review diff byte count overflow")?;
-            if total_bytes > max_total_bytes {
-                return Err(session_diff_too_large(format!(
-                    "review diff is too large (more than {max_total_bytes} bytes)"
-                )));
+        // Keep the ordinary session manifest's file/line budgets, but use one
+        // rename-aware patch for review orchestration. Per-path `--no-renames`
+        // patches cannot distinguish deletion from a surviving file move.
+        let _summary = session_diff_summary_with_index(worktree, base_ref, index, &operation)?;
+        let manifest = run_git_bounded(
+            worktree,
+            Some(index),
+            &[
+                "--glob-pathspecs",
+                "diff",
+                "--cached",
+                "--submodule=short",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--find-renames",
+                "--name-status",
+                "-z",
+                "--end-of-options",
+                base_ref,
+                "--",
+                ".",
+                ":(exclude,top).trouve/attachments/**",
+            ],
+            None,
+            max_total_bytes,
+            &operation,
+        )?;
+        if manifest.truncated {
+            return Err(session_diff_too_large(format!(
+                "review diff path manifest is too large (more than {max_total_bytes} bytes)"
+            )));
+        }
+        let mut fields = manifest.bytes.split(|byte| *byte == 0);
+        let mut paths = Vec::new();
+        while let Some(status) = fields.next().filter(|field| !field.is_empty()) {
+            let status = std::str::from_utf8(status)
+                .context("git diff --name-status returned a non-UTF-8 status")?;
+            let source_or_path = fields
+                .next()
+                .context("git diff --name-status omitted a path")?;
+            let path = if status.starts_with('R') || status.starts_with('C') {
+                fields
+                    .next()
+                    .context("git diff --name-status omitted a destination path")?
+            } else {
+                source_or_path
+            };
+            let path = String::from_utf8(path.to_vec())
+                .context("git diff --name-status returned a non-UTF-8 path")?;
+            // Git renders a type change as adjacent deletion/addition patch
+            // segments even though name-status reports one `T` record.
+            if status == "T" {
+                paths.push(path.clone());
             }
-            patches.push(SessionReviewDiffFile {
-                path: file.path,
-                diff,
-                generated_header: None,
-            });
+            paths.push(path);
+        }
+        let output = run_git_bounded(
+            worktree,
+            Some(index),
+            &[
+                "--glob-pathspecs",
+                "diff",
+                "--cached",
+                "--submodule=short",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--find-renames",
+                "--end-of-options",
+                base_ref,
+                "--",
+                ".",
+                ":(exclude,top).trouve/attachments/**",
+            ],
+            None,
+            max_total_bytes,
+            &operation,
+        )?;
+        if output.truncated {
+            return Err(session_diff_too_large(format!(
+                "review diff is too large (more than {max_total_bytes} bytes)"
+            )));
+        }
+        let diff = String::from_utf8_lossy(&output.bytes).into_owned();
+        if paths.is_empty() != diff.is_empty() {
+            bail!("review diff path manifest did not match patch content");
+        }
+        let mut starts = if diff.is_empty() { Vec::new() } else { vec![0] };
+        starts.extend(
+            diff.match_indices("\ndiff --git ")
+                .map(|(offset, _)| offset + 1),
+        );
+        if starts.len() != paths.len() {
+            bail!(
+                "review diff returned {} file segments for {} changed paths",
+                starts.len(),
+                paths.len()
+            );
+        }
+        starts.push(diff.len());
+        let mut patches = Vec::<SessionReviewDiffFile>::new();
+        for (path, range) in paths.into_iter().zip(starts.windows(2)) {
+            if let Some(previous) = patches.last_mut()
+                && previous.path == path
+            {
+                previous.diff.push_str(&diff[range[0]..range[1]]);
+            } else {
+                patches.push(SessionReviewDiffFile {
+                    path,
+                    diff: diff[range[0]..range[1]].to_owned(),
+                    generated_header: None,
+                });
+            }
         }
         let current = patches
             .iter()
@@ -4477,6 +4569,33 @@ line three
         );
         assert!(deleted.generated_header.is_none());
         assert!(deleted.diff.contains("Generated by"));
+    }
+
+    #[test]
+    fn review_diff_preserves_rename_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo(tmp.path());
+        let old_path = tmp.path().join("old.rs");
+        let new_path = tmp.path().join("new.rs");
+        std::fs::write(&old_path, "fn still_broken() {}\n").unwrap();
+        run(tmp.path(), &["add", "old.rs"]);
+        run(tmp.path(), &["commit", "-m", "add source"]);
+        let base = run(tmp.path(), &["rev-parse", "HEAD"]);
+        std::fs::rename(old_path, new_path).unwrap();
+
+        let files = session_diff_patches_cancellable(
+            tmp.path(),
+            &base,
+            1024 * 1024,
+            &tokio_util::sync::CancellationToken::new(),
+            |_| false,
+        )
+        .unwrap();
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "new.rs");
+        assert!(files[0].diff.contains("rename from old.rs"));
+        assert!(files[0].diff.contains("rename to new.rs"));
     }
 
     #[test]

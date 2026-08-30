@@ -1091,6 +1091,12 @@ fn backfill_code_review_carried_anchor_targets(conn: &Connection) -> Result<()> 
         "UPDATE code_review_jobs
          SET carried_anchor_targets_legacy = 1
          WHERE status IN ('queued', 'running');
+         UPDATE code_review_carried_anchor_verifications
+         SET claim_job_id = NULL
+         WHERE verified_at IS NULL
+           AND claim_job_id IN (
+             SELECT id FROM code_review_jobs WHERE status IN ('queued', 'running')
+           );
          DELETE FROM code_review_carried_anchor_targets
          WHERE job_id IN (
            SELECT id FROM code_review_jobs WHERE status IN ('queued', 'running')
@@ -21419,7 +21425,7 @@ mod tests {
             ("src/ordinary.rs".to_owned(), 9),
             ("src/unowned.rs".to_owned(), 9),
         ];
-        store
+        let rebuilt = store
             .claim_code_review_carried_anchor_page(
                 &ordinary.id,
                 &ordinary.repository,
@@ -21427,9 +21433,11 @@ mod tests {
                 &ordinary.head_sha,
                 &exact_ordinary_targets,
                 false,
-                0,
+                2,
             )
             .unwrap();
+        assert_eq!(rebuilt.targets, exact_ordinary_targets);
+        assert!(rebuilt.cached.is_empty());
         let conn = store.conn.lock().unwrap();
         let rebuilt_targets = conn
             .query_row(
@@ -21452,6 +21460,19 @@ mod tests {
         assert!(
             !legacy,
             "the exact lazy rebuild must consume its compatibility flag"
+        );
+        let second_claim_released: bool = conn
+            .query_row(
+                "SELECT claim_job_id IS NULL
+                 FROM code_review_carried_anchor_verifications
+                 WHERE path = 'src/second.rs'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            second_claim_released,
+            "migration must release every invalidated active epoch claim"
         );
     }
 
