@@ -213,7 +213,7 @@ pub enum TurnPhase {
 #[serde(tag = "type")]
 pub enum Event {
     // --- thread scope -----------------------------------------------------
-    /// Legacy admission marker written by protocol 7.15 and earlier. New
+    /// Legacy admission marker written before protocol 7.24. New
     /// servers retain this variant only to replay existing durable event logs.
     #[serde(rename = "turn.capacity_acquired")]
     TurnCapacityAcquired {

@@ -1416,7 +1416,7 @@ test("subscription status renders complete quota lines in the workspace usage pa
   await expect(tabPanel).toContainText("No completed usage yet.");
   await expect(subscription).toHaveCount(0);
 
-  const duplicateIds = await panel.evaluate((element) => {
+  const idState = await panel.evaluate((element) => {
     const second = document.createElement("trouve-session-usage-panel");
     second.setAttribute("session-id", "se_1");
     second.setAttribute("thread-id", "th_1");
@@ -1427,10 +1427,17 @@ test("subscription status renders complete quota lines in the workspace usage pa
         "trouve-session-usage-panel [id]",
       )].map(({ id }) => id);
       second.remove();
-      return ids.length - new Set(ids).size;
+      return {
+        ids,
+        duplicateCount: ids.length - new Set(ids).size,
+      };
     });
   });
-  expect(duplicateIds).toBe(0);
+  expect(idState.ids.filter((id) => id.endsWith("-tab-usage"))).toHaveLength(2);
+  expect(idState.ids.filter((id) => id.endsWith("-tab-thread"))).toHaveLength(2);
+  expect(idState.ids.filter((id) => id.endsWith("-tab-session"))).toHaveLength(2);
+  expect(idState.ids.filter((id) => id.endsWith("-panel"))).toHaveLength(2);
+  expect(idState.duplicateCount).toBe(0);
   await expect(page.locator(".composer .subscription-option")).toHaveCount(0);
   await expect(page.locator(".composer .model-health-pill")).toHaveCount(0);
 });

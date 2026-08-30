@@ -586,7 +586,7 @@ export class ThreadViewModel {
         this.#admittedBeforeStart.add(envelope.turn);
         return false;
       }
-      case "turn.started":
+      case "turn.started": {
         this.turnRunning = true;
         this.#activeTurnUsage = undefined;
         this.turnPhase = "processing";
@@ -608,6 +608,7 @@ export class ThreadViewModel {
             : { kind: "waiting-for-capacity", startedAt: envelope.ts },
         });
         return true;
+      }
       case "turn.phase_changed":
         this.turnPhase = envelope.phase;
         return true;
