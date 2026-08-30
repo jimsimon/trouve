@@ -122,11 +122,14 @@ const hasUnsupportedConstraints = (
   && (typeof property[key] !== "number" || !Number.isFinite(property[key]))
 );
 
-/** Numeric values outside the safe-integer subset require verified source
- * provenance so downstream state cannot mistake a rounded Number for the
- * original JSON/input token. */
-const optionNumberIsSafe = (value: number, sourceVerified: boolean): boolean =>
-  Number.isFinite(value) && (!modelOptionNumberNeedsSourceProof(value) || sourceVerified);
+/** Decimal values always require verified source provenance. Integers may
+ * proceed without it only inside JavaScript's safe-integer range; signed zero
+ * also requires provenance so its sign cannot be erased. */
+const optionNumberIsSafe = (value: number, sourceVerified: boolean): boolean => {
+  if (!Number.isFinite(value)) return false;
+  if (!Number.isInteger(value)) return sourceVerified;
+  return !modelOptionNumberNeedsSourceProof(value) || sourceVerified;
+};
 
 /** Require parser provenance for every advertised number: lossy input can
  * round to an apparently safe integer before this control layer sees it. */
@@ -137,6 +140,11 @@ const containsNumericMetadata = (value: unknown): boolean =>
       ? value.some(containsNumericMetadata)
       : typeof value === "object" && value !== null
         && Object.values(value).some(containsNumericMetadata);
+
+/** Parsed number and integer schemas are editable only when every advertised
+ * numeric token survived protocol parsing without IEEE-754 rounding. */
+const advertisedNumbersAreExact = (property: Readonly<Record<string, unknown>>): boolean =>
+  !containsNumericMetadata(property) || protocolOptionSchemaNumbersAreExact(property);
 
 const matchesScalarType = (type: AdvertisedScalarType, value: unknown): boolean =>
   type === "string"
@@ -355,8 +363,7 @@ export const modelOptionControls = (
       || (Array.isArray(property["enum"]) && property["enum"].length <= 1)
       || advertisedType === null
       || hasUnsupportedConstraints(property)
-      || containsNumericMetadata(property)
-        && !protocolOptionSchemaNumbersAreExact(property)
+      || !advertisedNumbersAreExact(property)
     ) continue;
     const label = typeof property["title"] === "string"
       ? property["title"]

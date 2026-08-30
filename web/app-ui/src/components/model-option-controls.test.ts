@@ -210,7 +210,7 @@ describe("model option controls", () => {
     })).toEqual({ fast: true });
   });
 
-  it("uses verified source tokens for numbers outside the safe-integer subset", () => {
+  it("requires verified source tokens for every decimal and unsafe integer", () => {
     const advertised = parseProtocolJson(`{
       "id": "provider/model",
       "display_name": "Model",
