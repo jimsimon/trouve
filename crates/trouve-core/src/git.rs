@@ -2978,7 +2978,7 @@ where
         // Keep the ordinary session manifest's file/line budgets, but use one
         // rename-aware patch for review orchestration. Per-path `--no-renames`
         // patches cannot distinguish deletion from a surviving file move.
-        let _summary = session_diff_summary_with_index(worktree, base_ref, index, &operation)?;
+        validate_session_diff_numstat(worktree, base_ref, index, &operation)?;
         let manifest = run_git_bounded(
             worktree,
             Some(index),
@@ -5078,6 +5078,16 @@ line three
         let error = session_diff(tmp.path(), &base).unwrap_err();
         assert!(error.downcast_ref::<SessionDiffTooLarge>().is_some());
         assert!(error.to_string().contains("too large to render"));
+        let review_error = session_diff_patches_cancellable(
+            tmp.path(),
+            &base,
+            MAX_SESSION_DIFF_BYTES,
+            &tokio_util::sync::CancellationToken::new(),
+            |_| false,
+        )
+        .err()
+        .unwrap();
+        assert!(review_error.downcast_ref::<SessionDiffTooLarge>().is_some());
         let summary = session_diff_summary(tmp.path(), &base).unwrap();
         assert_eq!(summary.len(), 1);
         assert_eq!(summary[0].additions, MAX_SESSION_DIFF_CHANGED_LINES + 1);
@@ -5100,6 +5110,16 @@ line three
         let error = session_diff(tmp.path(), &base).unwrap_err();
         assert!(error.downcast_ref::<SessionDiffTooLarge>().is_some());
         assert!(error.to_string().contains("too large to render"));
+        let review_error = session_diff_patches_cancellable(
+            tmp.path(),
+            &base,
+            MAX_SESSION_DIFF_BYTES,
+            &tokio_util::sync::CancellationToken::new(),
+            |_| false,
+        )
+        .err()
+        .unwrap();
+        assert!(review_error.downcast_ref::<SessionDiffTooLarge>().is_some());
         let summary = session_diff_summary(tmp.path(), &base).unwrap();
         assert_eq!(summary.len(), MAX_SESSION_DIFF_FILES + 1);
     }
