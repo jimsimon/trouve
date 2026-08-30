@@ -238,13 +238,16 @@ describe("automation form model", () => {
       "enabled": true,
       "created_at": "2026-08-02T12:00:00Z"
     }`) as ProtocolAutomation;
-    const request = automationRequestFromDraft(automationDraftFrom(automation), {
-      ...model,
-      options_schema: {
-        type: "object",
-        properties: { temperature: { type: "number" } },
-      },
-    });
+    const request = automationRequestFromDraft(
+      automationDraftFrom(automation),
+      protocolModel({
+        ...model,
+        options_schema: {
+          type: "object",
+          properties: { temperature: { type: "number" } },
+        },
+      }),
+    );
 
     expect(stringifyProtocolJson(request)).toContain(
       '"model_options":{"temperature":0.10000000000000000}',

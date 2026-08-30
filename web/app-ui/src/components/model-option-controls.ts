@@ -141,10 +141,14 @@ const containsNumericMetadata = (value: unknown): boolean =>
       : typeof value === "object" && value !== null
         && Object.values(value).some(containsNumericMetadata);
 
-/** Parsed number and integer schemas are editable only when every advertised
- * numeric token survived protocol parsing without IEEE-754 rounding. */
-const advertisedNumbersAreExact = (property: Readonly<Record<string, unknown>>): boolean =>
-  !containsNumericMetadata(property) || protocolOptionSchemaNumbersAreExact(property);
+/** Every number and integer control must come through the exact-token protocol
+ * parser, including input-only schemas without defaults or bounds. Other
+ * scalar controls need parser provenance whenever they advertise numbers. */
+const advertisedNumbersAreExact = (
+  property: Readonly<Record<string, unknown>>,
+  type: AdvertisedScalarType | undefined,
+): boolean => protocolOptionSchemaNumbersAreExact(property)
+  || type !== "number" && type !== "integer" && !containsNumericMetadata(property);
 
 const matchesScalarType = (type: AdvertisedScalarType, value: unknown): boolean =>
   type === "string"
@@ -363,7 +367,7 @@ export const modelOptionControls = (
       || (Array.isArray(property["enum"]) && property["enum"].length <= 1)
       || advertisedType === null
       || hasUnsupportedConstraints(property)
-      || !advertisedNumbersAreExact(property)
+      || !advertisedNumbersAreExact(property, advertisedType)
     ) continue;
     const label = typeof property["title"] === "string"
       ? property["title"]

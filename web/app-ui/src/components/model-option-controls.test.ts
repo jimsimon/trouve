@@ -290,7 +290,15 @@ describe("model option controls", () => {
         default: 0.12345678901234568,
       },
       input_only: { type: "number" },
-    }), {}).map(({ key }) => key)).toEqual(["input_only"]);
+    }), {}).map(({ key }) => key)).toEqual([]);
+  });
+
+  it("fails closed when a numeric schema bypasses exact protocol parsing", () => {
+    expect(modelOptionControls(rawModel({
+      decimal: { type: "number" },
+      integer: { type: "integer" },
+      label: { type: "string" },
+    }), {}).map(({ key }) => key)).toEqual(["label"]);
   });
 
   it("hides controls whose advertised numbers would be rounded by JavaScript", () => {
