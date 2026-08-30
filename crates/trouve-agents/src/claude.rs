@@ -246,6 +246,9 @@ struct RouterState {
     /// but the router has not attributed that line yet. Steering must close
     /// at receipt rather than after this channel handoff.
     terminal_pending: bool,
+    /// A steering record passed its final liveness check and owns the writer
+    /// boundary until the complete newline-terminated record is flushed.
+    steer_write_reserved: bool,
     /// Complete, in-order lines of vendor-autonomous turns awaiting an
     /// attach consumer. May span multiple turns; `result` lines delimit.
     background: std::collections::VecDeque<String>,
@@ -284,6 +287,16 @@ struct RouterRegistrationGuard {
     sender: mpsc::WeakSender<String>,
 }
 
+struct SteerWriteReservation {
+    router: Arc<StdoutRouter>,
+}
+
+impl Drop for SteerWriteReservation {
+    fn drop(&mut self) {
+        self.router.state.lock().unwrap().steer_write_reserved = false;
+    }
+}
+
 impl Drop for RouterRegistrationGuard {
     fn drop(&mut self) {
         if let Some(sender) = self.sender.upgrade() {
@@ -316,15 +329,24 @@ impl StdoutRouter {
         !self.state.lock().unwrap().background.is_empty()
     }
 
-    /// Called immediately before a steering record write while holding
-    /// `turn_boundary`. The stdout pump may close terminal admission without
-    /// that boundary so it can never stop draining the vendor pipe.
-    fn can_accept_steer(&self, attach_turn: bool) -> bool {
-        let state = self.state.lock().unwrap();
-        state.turn.is_some()
+    /// Atomically turn the final liveness check into ownership of one whole
+    /// stdin record. Terminal receipt can still close future admission while
+    /// this reservation writes; the router attribution boundary keeps the
+    /// already-admitted record attached to the preceding turn.
+    fn reserve_steer_write(self: &Arc<Self>, attach_turn: bool) -> Option<SteerWriteReservation> {
+        let mut state = self.state.lock().unwrap();
+        let accepted = state.turn.is_some()
             && state.turn_is_attach == attach_turn
             && (!attach_turn || state.background_in_flight)
             && !state.terminal_pending
+            && !state.steer_write_reserved;
+        if !accepted {
+            return None;
+        }
+        state.steer_write_reserved = true;
+        Some(SteerWriteReservation {
+            router: Arc::clone(self),
+        })
     }
 
     /// Close steering admission as soon as stdout yields a terminal record,
@@ -899,24 +921,27 @@ impl AgentBackend for ClaudeBackend {
             _ = steer.cancel.cancelled() => return Err(BackendError::Cancelled),
             boundary = proc_.router.turn_boundary.lock() => boundary,
         };
-        if !proc_.router.can_accept_steer(input.attach_turn) {
+        let _write_reservation = proc_
+            .router
+            .reserve_steer_write(input.attach_turn)
+            .ok_or_else(|| {
+                BackendError::Protocol(format!(
+                    "claude steer: session {} has no active turn",
+                    steer.session
+                ))
+            })?;
+        if !proc_.active_turn.load(std::sync::atomic::Ordering::Acquire) {
             return Err(BackendError::Protocol(format!(
                 "claude steer: session {} has no active turn",
                 steer.session
             )));
         }
-        // Build one complete record before the final terminal-state check.
+        // Build and write one complete record after the atomic reservation.
         // Once this write starts, finish it even if request cancellation or a
         // terminal stdout record arrives; a partial JSON line would corrupt
         // the persistent stream-json transport for every later turn.
         let mut record = message.to_string().into_bytes();
         record.push(b'\n');
-        if !proc_.router.can_accept_steer(input.attach_turn) {
-            return Err(BackendError::Protocol(format!(
-                "claude steer: session {} has no active turn",
-                steer.session
-            )));
-        }
         input
             .stdin
             .write_all(&record)
@@ -2037,13 +2062,16 @@ mod tests {
             RouterRegistration::Streaming
         );
         router.prompt_delivered();
-        assert!(router.can_accept_steer(false));
 
         let _turn_boundary = router.turn_boundary.lock().await;
+        let reservation = Arc::clone(&router)
+            .reserve_steer_write(false)
+            .expect("the live turn should reserve one complete steering record");
         router.line_received(BG_RESULT);
 
+        drop(reservation);
         assert!(
-            !router.can_accept_steer(false),
+            Arc::clone(&router).reserve_steer_write(false).is_none(),
             "stdout receipt must close steering without waiting for a writer boundary"
         );
         assert!(
