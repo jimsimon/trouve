@@ -21,7 +21,8 @@ describe("protocol JSON number preservation", () => {
       "options_schema": {
         "type": "object",
         "properties": {
-          "safe": {"type": "number", "default": 1e20},
+          "safe": {"type": "number", "default": 0.25},
+          "unsafe_exact_integer": {"type": "number", "default": 1e20},
           "unsafe_integer": {"type": "number", "default": 9007199254740993},
           "unsafe_decimal": {"type": "number", "minimum": 0.1234567890123456789}
         }
@@ -31,7 +32,7 @@ describe("protocol JSON number preservation", () => {
       options_schema: {
         type: "object",
         properties: {
-          safe: { type: "number", default: 1e20 },
+          safe: { type: "number", default: 0.25 },
         },
       },
     });
@@ -40,6 +41,9 @@ describe("protocol JSON number preservation", () => {
   it("rejects lossy persisted options instead of deleting them from later saves", () => {
     expect(() => parseProtocolJson(
       '{"model_options":{"temperature":0.1234567890123456789}}',
+    )).toThrow(UnsupportedModelOptionNumberError);
+    expect(() => parseProtocolJson(
+      '{"model_options":{"exact_but_unsafe_integer":1e20}}',
     )).toThrow(UnsupportedModelOptionNumberError);
 
     const nativeParse = JSON.parse.bind(JSON);

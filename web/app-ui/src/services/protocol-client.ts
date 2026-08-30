@@ -495,7 +495,7 @@ export class ProtocolClient {
       if (error instanceof UnsupportedModelOptionNumberError) {
         throw new ProtocolClientError(
           "invalid-response",
-          "server returned model option numbers this browser cannot preserve exactly",
+          "server returned model option numbers outside this browser's safe editing range",
         );
       }
       throw new ProtocolClientError("invalid-response", `server returned invalid ${schemaName}`);

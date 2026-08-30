@@ -116,6 +116,22 @@ const hasUnsupportedConstraints = (
   && (typeof property[key] !== "number" || !Number.isFinite(property[key]))
 );
 
+/** Preserve value identity after the original JSON/input token is gone. A
+ * decimal is admitted only after token verification at its boundary; an
+ * integer-valued Number must remain in the safe range because adjacent wire
+ * integers otherwise collapse to the same runtime value. */
+const optionNumberIsSafe = (value: number): boolean =>
+  Number.isFinite(value)
+  && (!Number.isInteger(value) || Number.isSafeInteger(value));
+
+const containsUnsafeIntegerNumber = (value: unknown): boolean =>
+  typeof value === "number"
+    ? Number.isInteger(value) && !Number.isSafeInteger(value)
+    : Array.isArray(value)
+      ? value.some(containsUnsafeIntegerNumber)
+      : typeof value === "object" && value !== null
+        && Object.values(value).some(containsUnsafeIntegerNumber);
+
 const numericMetadataNeedsSourceProof = (value: unknown): boolean =>
   typeof value === "number"
     ? !Number.isSafeInteger(value)
@@ -130,7 +146,7 @@ const matchesScalarType = (type: AdvertisedScalarType, value: unknown): boolean 
     : type === "boolean"
       ? typeof value === "boolean"
       : typeof value === "number"
-        && Number.isFinite(value)
+        && optionNumberIsSafe(value)
         && (type !== "integer" || Number.isSafeInteger(value));
 
 const humanize = (token: string): string => {
@@ -277,7 +293,7 @@ const validTextValue = (
   maximum: number | undefined,
 ): boolean => {
   if (type === "string") return typeof value === "string";
-  if (typeof value !== "number" || !Number.isFinite(value)) return false;
+  if (typeof value !== "number" || !optionNumberIsSafe(value)) return false;
   if (type === "integer" && !Number.isSafeInteger(value)) return false;
   return (minimum === undefined || value >= minimum)
     && (maximum === undefined || value <= maximum);
@@ -307,6 +323,7 @@ export const modelOptionControls = (
       || (Array.isArray(property["enum"]) && property["enum"].length <= 1)
       || advertisedType === null
       || hasUnsupportedConstraints(property)
+      || containsUnsafeIntegerNumber(property)
       || numericMetadataNeedsSourceProof(property)
         && !protocolOptionSchemaNumbersAreExact(property)
     ) continue;

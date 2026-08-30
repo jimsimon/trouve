@@ -239,13 +239,12 @@ describe("model option controls", () => {
     })).toEqual({});
     expect(sanitizeModelOptions(model({
       large_number: { type: "number" },
-    }), { large_number: 1e20 })).toEqual({ large_number: 1e20 });
+    }), { large_number: 1e20 })).toEqual({});
     expect(modelOptionControls(model({
       explicit_number: { type: "number" },
       default_number: { type: "number", default: 1e20 },
     }), { explicit_number: 1e20 })).toMatchObject([
-      { key: "explicit_number", overridden: true, text: "100000000000000000000" },
-      { key: "default_number", overridden: false, text: "100000000000000000000" },
+      { key: "explicit_number", overridden: false, text: "" },
     ]);
     expect(modelOptionControls(rawModel({
       unverified_integer_number: {
@@ -270,13 +269,14 @@ describe("model option controls", () => {
       "1.0",
       "1e3",
       "-0",
-      "1e20",
+      "0.25",
       "0.10000000000000000",
       "5e-324",
     ]) expect(modelOptionTextValue(control, raw)).not.toBeNull();
     for (const raw of [
       "0.1234567890123456789",
       "9007199254740993",
+      "1e20",
       "1e-324",
       "3e-324",
     ]) expect(modelOptionTextValue(control, raw)).toBeNull();

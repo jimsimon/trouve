@@ -53,7 +53,7 @@ describe("ProtocolClient", () => {
     const fakeFetch = vi.fn<typeof fetch>(async (input, init) => {
       const request = input instanceof Request ? input : new Request(input, init);
       if (new URL(request.url).pathname === "/v1/models") {
-        return new Response(`[{"id":"provider/model","display_name":"Model","context_window":128000,"supports_tools":true,"options_schema":{"type":"object","properties":{"safe":{"type":"number","maximum":1e20},"unsafe":{"type":"integer","maximum":9007199254740993}}}}]`);
+        return new Response(`[{"id":"provider/model","display_name":"Model","context_window":128000,"supports_tools":true,"options_schema":{"type":"object","properties":{"safe":{"type":"number","maximum":0.25},"unsafe_exact":{"type":"number","maximum":1e20},"unsafe":{"type":"integer","maximum":9007199254740993}}}}]`);
       }
       return new Response(`[{"id":"th_1","session_id":"se_1","mode":"code","model":"provider/model","permission_mode":"ask","model_options":{"safe":1e20,"unsafe":9007199254740993},"created_at":"2026-08-01T12:00:00Z"}]`);
     });
@@ -62,11 +62,11 @@ describe("ProtocolClient", () => {
     const models = await client.models();
     expect(models[0]?.options_schema).toEqual({
       type: "object",
-      properties: { safe: { type: "number", maximum: 1e20 } },
+      properties: { safe: { type: "number", maximum: 0.25 } },
     });
     await expect(client.threads("se_1")).rejects.toMatchObject({
       kind: "invalid-response",
-      message: "server returned model option numbers this browser cannot preserve exactly",
+      message: "server returned model option numbers outside this browser's safe editing range",
     });
   });
 

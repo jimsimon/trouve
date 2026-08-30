@@ -13,7 +13,7 @@ interface JsonReviverContext {
 /** Persisted option numbers must never be rounded or silently removed. */
 export class UnsupportedModelOptionNumberError extends TypeError {
   constructor() {
-    super("model options contain a number this JavaScript runtime cannot preserve exactly");
+    super("model options contain a number this JavaScript runtime cannot edit safely");
     this.name = "UnsupportedModelOptionNumberError";
   }
 }
@@ -50,11 +50,16 @@ const isLossyNumber = (value: unknown): value is LossyNumber =>
   && value !== null
   && (value as Partial<LossyNumber>)[LOSSY_NUMBER] === true;
 
-const containsLossyNumber = (value: unknown): boolean =>
+/** Integer-valued numbers outside the safe range cannot retain provenance once
+ * they enter ordinary application state: an adjacent token may collapse onto
+ * the same Number. Treat them as unsupported even when one spelling happens
+ * to round-trip. */
+const containsUnsafeOptionNumber = (value: unknown): boolean =>
   isLossyNumber(value)
-  || Array.isArray(value) && value.some(containsLossyNumber)
+  || typeof value === "number" && Number.isInteger(value) && !Number.isSafeInteger(value)
+  || Array.isArray(value) && value.some(containsUnsafeOptionNumber)
   || typeof value === "object" && value !== null
-    && Object.values(value).some(containsLossyNumber);
+    && Object.values(value).some(containsUnsafeOptionNumber);
 
 const restoreOrdinaryNumbers = (value: unknown): unknown => {
   if (isLossyNumber(value)) return value.rounded;
@@ -78,7 +83,7 @@ const sanitizeOptionsSchema = (value: unknown): unknown => {
     }
     sanitized[key] = Object.fromEntries(
       Object.entries(child).flatMap(([property, schema]) =>
-        containsLossyNumber(schema)
+        containsUnsafeOptionNumber(schema)
           ? []
           : [[property, sanitizeOptionsSchema(schema)] as const]
       ),
@@ -94,7 +99,7 @@ const sanitizeModelOptions = (value: unknown): unknown => {
   }
   const restored: Record<string, unknown> = {};
   for (const [key, child] of Object.entries(value)) {
-    if (containsLossyNumber(child)) throw new UnsupportedModelOptionNumberError();
+    if (containsUnsafeOptionNumber(child)) throw new UnsupportedModelOptionNumberError();
     restored[key] = restoreOrdinaryNumbers(child);
   }
   return restored;
@@ -115,9 +120,9 @@ const restoreProtocolValue = (value: unknown): unknown => {
 };
 
 /** Parse protocol JSON without allowing JavaScript number rounding to mutate
- * model-specific controls or persisted option values. Lossy schema properties
- * are hidden; a lossy persisted option rejects the response so a later
- * replacement update cannot erase it. Runtimes without reviver source tokens
+ * model-specific controls or persisted option values. Unsafe schema properties
+ * are hidden; unsupported persisted numbers reject the response so a later
+ * replacement update cannot erase them. Runtimes without reviver source tokens
  * therefore reject responses that contain numeric model options. */
 export const parseProtocolJson = (text: string): unknown => {
   const parsed = JSON.parse(text, ((
