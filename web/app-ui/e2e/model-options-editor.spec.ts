@@ -18,8 +18,8 @@ test("model-option choices preserve selected state and scalar value types", asyn
         description: "Maximum input context.",
         overridden: true,
         choices: [
-          { label: "300K", value: 300_000 },
-          { label: "1M", value: 1_000_000 },
+          { label: "300K", value: 300_000, numberSource: "300000" },
+          { label: "1M", value: 1_000_000, numberSource: "1000000" },
         ],
         selectedIndex: 1,
       },
@@ -201,7 +201,7 @@ test("model-option choices preserve selected state and scalar value types", asyn
   await expect.poll(() => page.evaluate(() =>
     (window as Window & { modelOptionChanges?: unknown[] }).modelOptionChanges,
   )).toEqual([
-    { key: "context_window", value: 300_000 },
+    { key: "context_window", value: 300_000, numberSource: "300000" },
     { key: "fast", value: true },
     { key: "thinking_budget_tokens", value: 12, numberSource: "12" },
     { key: "temperature", value: 0.25, numberSource: "0.25" },
@@ -217,7 +217,7 @@ test("model-option choices preserve selected state and scalar value types", asyn
   await expect.poll(() => page.evaluate(() =>
     (window as Window & { modelOptionChanges?: unknown[] }).modelOptionChanges,
   )).toEqual([
-    { key: "context_window", value: 300_000 },
+    { key: "context_window", value: 300_000, numberSource: "300000" },
     { key: "fast", value: true },
     { key: "thinking_budget_tokens", value: 12, numberSource: "12" },
     { key: "temperature", value: 0.25, numberSource: "0.25" },

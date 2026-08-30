@@ -2551,6 +2551,23 @@ struct AutomationModelOptionsValidation {
     model: trouve_protocol::ModelInfo,
     source_options: serde_json::Map<String, serde_json::Value>,
     validated_options: serde_json::Map<String, serde_json::Value>,
+    generation: u64,
+    mutation_state: Arc<AutomationMutationState>,
+}
+
+struct AutomationMutationVersion {
+    generation: u64,
+    definition: Option<trouve_protocol::Automation>,
+}
+
+struct AutomationMutationState {
+    version: tokio::sync::Mutex<AutomationMutationVersion>,
+}
+
+struct AutomationSnapshot {
+    automation: trouve_protocol::Automation,
+    generation: u64,
+    mutation_state: Arc<AutomationMutationState>,
 }
 
 fn automation_definition_matches(
@@ -2622,10 +2639,11 @@ pub struct Engine {
     /// Serializes retries for one client-generated session-create key before
     /// any worktree mutation or event-writer batch is started.
     session_create_locks: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
-    /// Short compare-and-commit lanes for automation mutations and validation
-    /// cache publication. Provider I/O stays outside these locks; an older
-    /// request must still match the latest definition before it can commit.
-    automation_mutation_locks: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
+    /// Versioned compare-and-commit state for automation definitions. Provider
+    /// I/O stays outside the short per-automation gate, and cache hits compare
+    /// generations without rereading the durable row. Cached validations and
+    /// in-flight work retain the state through weak-map cleanup.
+    automation_mutation_states: Mutex<HashMap<String, Weak<AutomationMutationState>>>,
     /// Successful model-option validation for persisted automations. The map
     /// is bounded by automation ids and entries are retired with deletions.
     /// Fires reuse the exact validated schema unless the effective model or
@@ -3073,7 +3091,7 @@ impl Engine {
             automated_review_tool_budgets: Arc::new(AutomatedReviewToolBudgets::default()),
             session_locks: Mutex::new(HashMap::new()),
             session_create_locks: Mutex::new(HashMap::new()),
-            automation_mutation_locks: Mutex::new(HashMap::new()),
+            automation_mutation_states: Mutex::new(HashMap::new()),
             automation_model_options_validations: Mutex::new(HashMap::new()),
             tool_execution_locks: Mutex::new(HashMap::new()),
             session_pr_verification_locks: Mutex::new(HashMap::new()),
@@ -4563,11 +4581,17 @@ impl Engine {
             last_error: String::new(),
             created_at: chrono::Utc::now().to_rfc3339(),
         };
+        let mutation_state = self.automation_mutation_state(&automation.id);
+        let mut version = mutation_state.version.lock().await;
         self.store.insert_automation(&automation)?;
+        version.generation = version.generation.saturating_add(1);
+        version.definition = Some(automation.clone());
         self.remember_automation_model_options_validation(
             &automation,
             validated_model,
             automation.model_options.clone(),
+            version.generation,
+            mutation_state.clone(),
         );
         Ok(automation)
     }
@@ -4577,10 +4601,8 @@ impl Engine {
         id: &str,
         req: trouve_protocol::UpsertAutomationRequest,
     ) -> Result<trouve_protocol::Automation, EngineError> {
-        let expected = self
-            .store
-            .automation(id)?
-            .ok_or_else(|| EngineError::NotFound(format!("automation {id}")))?;
+        let snapshot = self.automation_snapshot(id).await?;
+        let expected = &snapshot.automation;
         let pausing_only = expected.enabled
             && !req.enabled
             && expected.name == req.name
@@ -4600,13 +4622,22 @@ impl Engine {
         let model_options = validation
             .as_ref()
             .map_or_else(|| req.model_options.clone(), |(_, options)| options.clone());
-        let mutation_lock = self.automation_mutation_lock(id);
-        let _mutation_guard = mutation_lock.lock().await;
+        let mut version = snapshot.mutation_state.version.lock().await;
+        if version.generation != snapshot.generation
+            || !version
+                .definition
+                .as_ref()
+                .is_some_and(|current| automation_definition_matches(current, expected))
+        {
+            return Err(EngineError::Conflict(format!(
+                "automation {id} changed while its model options were validated; reload and retry"
+            )));
+        }
         let mut automation = self
             .store
             .automation(id)?
             .ok_or_else(|| EngineError::NotFound(format!("automation {id}")))?;
-        if !automation_definition_matches(&automation, &expected) {
+        if !automation_definition_matches(&automation, expected) {
             return Err(EngineError::Conflict(format!(
                 "automation {id} changed while its model options were validated; reload and retry"
             )));
@@ -4627,31 +4658,50 @@ impl Engine {
         } else {
             None
         };
-        self.store.update_automation(&automation)?;
+        if !self.store.update_automation(&automation)? {
+            return Err(EngineError::NotFound(format!("automation {id}")));
+        }
+        version.generation = version.generation.saturating_add(1);
+        version.definition = Some(automation.clone());
         if let Some((validated_model, validated_options)) = validation {
             self.remember_automation_model_options_validation(
                 &automation,
                 validated_model,
                 validated_options,
+                version.generation,
+                snapshot.mutation_state.clone(),
+            );
+        } else {
+            self.advance_automation_model_options_validation(
+                &automation,
+                version.generation,
+                &snapshot.mutation_state,
             );
         }
         Ok(automation)
     }
 
-    /// Change scheduling state against the latest stored definition. The
-    /// per-automation lock makes an in-flight full edit publish first, then
-    /// this mutation preserves every field from that completed edit.
+    /// Change scheduling state against the latest stored definition. The short
+    /// generation gate lets this narrow mutation commit without waiting for
+    /// provider I/O; any older full edit then fails its stale-generation check.
     pub async fn set_automation_enabled(
         &self,
         id: &str,
         enabled: bool,
     ) -> Result<trouve_protocol::Automation, EngineError> {
-        let mutation_lock = self.automation_mutation_lock(id);
-        let _mutation_guard = mutation_lock.lock().await;
+        let mutation_state = self.automation_mutation_state(id);
+        let mut version = mutation_state.version.lock().await;
         let mut automation = self
             .store
             .automation(id)?
             .ok_or_else(|| EngineError::NotFound(format!("automation {id}")))?;
+        if version
+            .definition
+            .as_ref()
+            .is_some_and(|current| !automation_definition_matches(current, &automation))
+        {
+            version.generation = version.generation.saturating_add(1);
+        }
         automation.enabled = enabled;
         automation.next_run_at = if enabled {
             crate::automations::next_run(&automation.schedule, chrono::Local::now())
@@ -4659,31 +4709,110 @@ impl Engine {
         } else {
             None
         };
-        self.store.update_automation(&automation)?;
+        if !self.store.update_automation(&automation)? {
+            return Err(EngineError::NotFound(format!("automation {id}")));
+        }
+        version.generation = version.generation.saturating_add(1);
+        version.definition = Some(automation.clone());
+        self.advance_automation_model_options_validation(
+            &automation,
+            version.generation,
+            &mutation_state,
+        );
         Ok(automation)
     }
 
-    fn automation_mutation_lock(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
-        let mut locks = self.automation_mutation_locks.lock().unwrap();
-        locks.retain(|_, lock| lock.strong_count() > 0);
-        if let Some(lock) = locks.get(id).and_then(Weak::upgrade) {
-            return lock;
+    fn automation_mutation_state(&self, id: &str) -> Arc<AutomationMutationState> {
+        let mut states = self.automation_mutation_states.lock().unwrap();
+        states.retain(|_, state| state.strong_count() > 0);
+        if let Some(state) = states.get(id).and_then(Weak::upgrade) {
+            return state;
         }
-        let lock = Arc::new(tokio::sync::Mutex::new(()));
-        locks.insert(id.to_owned(), Arc::downgrade(&lock));
-        lock
+        let state = Arc::new(AutomationMutationState {
+            version: tokio::sync::Mutex::new(AutomationMutationVersion {
+                generation: 0,
+                definition: None,
+            }),
+        });
+        states.insert(id.to_owned(), Arc::downgrade(&state));
+        state
+    }
+
+    async fn automation_snapshot(&self, id: &str) -> Result<AutomationSnapshot, EngineError> {
+        let mutation_state = self.automation_mutation_state(id);
+        let mut version = mutation_state.version.lock().await;
+        let automation = self
+            .store
+            .automation(id)?
+            .ok_or_else(|| EngineError::NotFound(format!("automation {id}")))?;
+        if version
+            .definition
+            .as_ref()
+            .is_some_and(|current| !automation_definition_matches(current, &automation))
+        {
+            version.generation = version.generation.saturating_add(1);
+        }
+        version.definition = Some(automation.clone());
+        Ok(AutomationSnapshot {
+            automation,
+            generation: version.generation,
+            mutation_state: mutation_state.clone(),
+        })
+    }
+
+    async fn automation_snapshot_for_fire(
+        &self,
+        candidate: &trouve_protocol::Automation,
+    ) -> Result<AutomationSnapshot, EngineError> {
+        let mutation_state = self.automation_mutation_state(&candidate.id);
+        let mut version = mutation_state.version.lock().await;
+        if let Some(current) = &version.definition {
+            if !automation_definition_matches(current, candidate) {
+                return Err(EngineError::Conflict(format!(
+                    "automation {} changed before it could run; retry the run",
+                    candidate.id
+                )));
+            }
+        } else {
+            let current = self
+                .store
+                .automation(&candidate.id)?
+                .ok_or_else(|| EngineError::NotFound(format!("automation {}", candidate.id)))?;
+            if !automation_definition_matches(&current, candidate) {
+                return Err(EngineError::Conflict(format!(
+                    "automation {} changed before it could run; retry the run",
+                    candidate.id
+                )));
+            }
+            version.definition = Some(current);
+        }
+        Ok(AutomationSnapshot {
+            automation: candidate.clone(),
+            generation: version.generation,
+            mutation_state: mutation_state.clone(),
+        })
     }
 
     pub async fn delete_automation(&self, id: &str) -> Result<(), EngineError> {
-        let mutation_lock = self.automation_mutation_lock(id);
-        let _mutation_guard = mutation_lock.lock().await;
+        let mutation_state = self.automation_mutation_state(id);
+        let mut version = mutation_state.version.lock().await;
         if !self.store.delete_automation(id)? {
             return Err(EngineError::NotFound(format!("automation {id}")));
         }
+        version.generation = version.generation.saturating_add(1);
+        version.definition = None;
         self.automation_model_options_validations
             .lock()
             .unwrap()
             .remove(id);
+        let mut states = self.automation_mutation_states.lock().unwrap();
+        if states
+            .get(id)
+            .and_then(Weak::upgrade)
+            .is_some_and(|current| Arc::ptr_eq(&current, &mutation_state))
+        {
+            states.remove(id);
+        }
         Ok(())
     }
 
@@ -4946,6 +5075,8 @@ impl Engine {
         workspace: &trouve_protocol::Workspace,
         automation: &trouve_protocol::Automation,
     ) -> Result<(Option<String>, serde_json::Map<String, serde_json::Value>), EngineError> {
+        let snapshot = self.automation_snapshot_for_fire(automation).await?;
+        let automation = &snapshot.automation;
         if !automation.model_options.is_empty() {
             let effective_model = self.automation_effective_model_id(
                 workspace,
@@ -4958,7 +5089,9 @@ impl Engine {
                 .unwrap()
                 .get(&automation.id)
                 .filter(|cached| {
-                    cached.model.id == effective_model
+                    cached.generation == snapshot.generation
+                        && Arc::ptr_eq(&cached.mutation_state, &snapshot.mutation_state)
+                        && cached.model.id == effective_model
                         && cached.source_options == automation.model_options
                 })
                 .cloned();
@@ -4972,22 +5105,14 @@ impl Engine {
                         &current_model,
                     )?;
                     self.commit_automation_model_options_validation(
-                        automation,
+                        &snapshot,
                         Some(current_model.clone()),
                         options.clone(),
                     )
                     .await?;
                     return Ok((Some(current_model.id), options));
                 }
-                let model_id = cached.model.id.clone();
-                let options = cached.validated_options.clone();
-                self.commit_automation_model_options_validation(
-                    automation,
-                    Some(cached.model),
-                    options.clone(),
-                )
-                .await?;
-                return Ok((Some(model_id), options));
+                return Ok((Some(cached.model.id), cached.validated_options));
             }
         }
 
@@ -5004,7 +5129,7 @@ impl Engine {
         {
             Ok((model, options)) => {
                 self.commit_automation_model_options_validation(
-                    automation,
+                    &snapshot,
                     model.clone(),
                     options.clone(),
                 )
@@ -5027,7 +5152,7 @@ impl Engine {
                         )])
                     })
                     .unwrap_or_default();
-                self.commit_automation_model_options_validation(automation, None, options.clone())
+                self.commit_automation_model_options_validation(&snapshot, None, options.clone())
                     .await?;
                 Ok((None, options))
             }
@@ -5071,6 +5196,8 @@ impl Engine {
         automation: &trouve_protocol::Automation,
         model: Option<trouve_protocol::ModelInfo>,
         validated_options: serde_json::Map<String, serde_json::Value>,
+        generation: u64,
+        mutation_state: Arc<AutomationMutationState>,
     ) {
         let mut validations = self.automation_model_options_validations.lock().unwrap();
         if let Some(model) = model {
@@ -5080,6 +5207,8 @@ impl Engine {
                     model,
                     source_options: automation.model_options.clone(),
                     validated_options,
+                    generation,
+                    mutation_state,
                 },
             );
         } else {
@@ -5087,25 +5216,53 @@ impl Engine {
         }
     }
 
+    fn advance_automation_model_options_validation(
+        &self,
+        automation: &trouve_protocol::Automation,
+        generation: u64,
+        mutation_state: &Arc<AutomationMutationState>,
+    ) {
+        let mut validations = self.automation_model_options_validations.lock().unwrap();
+        let keep = validations.get_mut(&automation.id).is_some_and(|cached| {
+            if Arc::ptr_eq(&cached.mutation_state, mutation_state)
+                && cached.source_options == automation.model_options
+            {
+                cached.generation = generation;
+                true
+            } else {
+                false
+            }
+        });
+        if !keep {
+            validations.remove(&automation.id);
+        }
+    }
+
     async fn commit_automation_model_options_validation(
         &self,
-        expected: &trouve_protocol::Automation,
+        snapshot: &AutomationSnapshot,
         model: Option<trouve_protocol::ModelInfo>,
         validated_options: serde_json::Map<String, serde_json::Value>,
     ) -> Result<(), EngineError> {
-        let mutation_lock = self.automation_mutation_lock(&expected.id);
-        let _mutation_guard = mutation_lock.lock().await;
-        let current = self
-            .store
-            .automation(&expected.id)?
-            .ok_or_else(|| EngineError::NotFound(format!("automation {}", expected.id)))?;
-        if !automation_definition_matches(&current, expected) {
+        let version = snapshot.mutation_state.version.lock().await;
+        if version.generation != snapshot.generation
+            || !version
+                .definition
+                .as_ref()
+                .is_some_and(|current| automation_definition_matches(current, &snapshot.automation))
+        {
             return Err(EngineError::Conflict(format!(
                 "automation {} changed while its model options were validated; retry the run",
-                expected.id
+                snapshot.automation.id
             )));
         }
-        self.remember_automation_model_options_validation(expected, model, validated_options);
+        self.remember_automation_model_options_validation(
+            &snapshot.automation,
+            model,
+            validated_options,
+            snapshot.generation,
+            snapshot.mutation_state.clone(),
+        );
         Ok(())
     }
 
@@ -26147,6 +26304,30 @@ default_permission_mode = "ask"
             .await
             .unwrap();
         assert_eq!(live_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let initial_generation = engine
+            .automation_model_options_validations
+            .lock()
+            .unwrap()
+            .get(&automation.id)
+            .unwrap()
+            .generation;
+        let paused = engine
+            .set_automation_enabled(&automation.id, false)
+            .await
+            .unwrap();
+        let automation = engine
+            .set_automation_enabled(&paused.id, true)
+            .await
+            .unwrap();
+        let current_generation = engine
+            .automation_model_options_validations
+            .lock()
+            .unwrap()
+            .get(&automation.id)
+            .unwrap()
+            .generation;
+        assert!(current_generation > initial_generation);
 
         live_queries_allowed.store(false, std::sync::atomic::Ordering::SeqCst);
         for _ in 0..2 {

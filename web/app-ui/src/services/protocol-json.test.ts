@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   jsonNumberTokenIsExact,
   modelOptionNumberNeedsSourceProof,
+  parseExactModelOptionNumber,
   parseProtocolJson,
   stringifyProtocolJson,
   UnsupportedModelOptionNumberError,
@@ -27,6 +28,16 @@ describe("protocol JSON number preservation", () => {
     expect(modelOptionNumberNeedsSourceProof(0.12345678901234568)).toBe(true);
     expect(modelOptionNumberNeedsSourceProof(Number.MAX_SAFE_INTEGER + 1)).toBe(true);
     expect(modelOptionNumberNeedsSourceProof(-0)).toBe(true);
+  });
+
+  it("keeps editable numbers paired with the exact token that proved them", () => {
+    expect(parseExactModelOptionNumber("0.10000000000000000")).toEqual({
+      value: 0.1,
+      source: "0.10000000000000000",
+    });
+    expect(parseExactModelOptionNumber("1e20")).toEqual({ value: 1e20, source: "1e20" });
+    expect(parseExactModelOptionNumber("9007199254740993")).toBeUndefined();
+    expect(parseExactModelOptionNumber("0.1234567890123456789")).toBeUndefined();
   });
 
   it("hides lossy schema properties without rounding ordinary protocol numbers", () => {

@@ -5,7 +5,6 @@ import { jsonNumberValueToken } from "../services/protocol-json.js";
 import {
   type ModelOptionChangeDetail,
   type ModelOptionControl,
-  type ModelOptionValue,
   modelOptionTextValue,
   type TextModelOptionControl,
 } from "./model-option-controls.js";
@@ -139,7 +138,7 @@ export class TrouveModelOptionsEditor extends LitElement {
                 const select = event.currentTarget as HTMLSelectElement;
                 const selected = select.selectedOptions[0];
                 if (selected?.dataset["modelDefault"] === "true") {
-                  this.#emit(control.key, undefined);
+                  this.#emit({ key: control.key, value: undefined });
                   return;
                 }
                 const choiceIndex = Number(selected?.dataset["choiceIndex"]);
@@ -147,7 +146,16 @@ export class TrouveModelOptionsEditor extends LitElement {
                   ? control.choices[choiceIndex]
                   : undefined;
                 if (choice !== undefined) {
-                  this.#emit(control.key, choice.value, choice.numberSource);
+                  if (typeof choice.value === "number") {
+                    if (choice.numberSource === undefined) return;
+                    this.#emit({
+                      key: control.key,
+                      value: choice.value,
+                      numberSource: choice.numberSource,
+                    });
+                  } else {
+                    this.#emit({ key: control.key, value: choice.value });
+                  }
                 }
               }}
             >
@@ -186,10 +194,10 @@ export class TrouveModelOptionsEditor extends LitElement {
               ?disabled=${this.disabled}
               @change=${(event: Event) => {
                 const select = event.currentTarget as HTMLSelectElement;
-                this.#emit(
-                  control.key,
-                  select.value === "" ? undefined : select.value === "true",
-                );
+                this.#emit({
+                  key: control.key,
+                  value: select.value === "" ? undefined : select.value === "true",
+                });
               }}
             >
               <option value="" data-model-default="true">
@@ -242,7 +250,7 @@ export class TrouveModelOptionsEditor extends LitElement {
                   @click=${(event: Event) => {
                     ((event.target as HTMLElement)
                       .previousElementSibling as HTMLInputElement).focus();
-                    this.#emit(control.key, undefined);
+                    this.#emit({ key: control.key, value: undefined });
                   }}
                 >↺</button>`
               : nothing}
@@ -257,31 +265,28 @@ export class TrouveModelOptionsEditor extends LitElement {
 
   #commitText(control: TextModelOptionControl, input: HTMLInputElement): void {
     const raw = control.scalarType === "string" ? input.value : input.value.trim();
-    const value = modelOptionTextValue(control, raw);
-    if (value === null) {
+    const parsed = modelOptionTextValue(control, raw);
+    if (parsed === null) {
       input.setCustomValidity(`Enter a valid ${control.scalarType} ${control.hint}.`);
       input.reportValidity();
       return;
     }
     input.setCustomValidity("");
-    const numberSource = typeof value === "number" ? raw : undefined;
-    const committed = typeof value === "number"
-      ? jsonNumberValueToken(value)
-      : String(value ?? "");
+    const committed = typeof parsed === "object"
+      ? jsonNumberValueToken(parsed.value)
+      : String(parsed ?? "");
     if (this.#committedText.get(input) === committed) return;
     this.#committedText.set(input, committed);
-    this.#emit(control.key, value, numberSource);
+    this.#emit(typeof parsed === "object"
+      ? { key: control.key, value: parsed.value, numberSource: parsed.source }
+      : { key: control.key, value: parsed });
   }
 
-  #emit(key: string, value: ModelOptionValue | undefined, numberSource?: string): void {
+  #emit(detail: ModelOptionChangeDetail): void {
     this.dispatchEvent(new CustomEvent<ModelOptionChangeDetail>(
       MODEL_OPTION_CHANGED_EVENT,
       {
-        detail: {
-          key,
-          value,
-          ...(numberSource === undefined ? {} : { numberSource }),
-        },
+        detail,
         bubbles: true,
         composed: true,
       },

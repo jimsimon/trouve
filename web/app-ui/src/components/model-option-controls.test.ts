@@ -5,6 +5,7 @@ import {
   parseProtocolJson,
   stringifyProtocolJson,
   UnsupportedModelOptionNumberError,
+  updateProtocolModelOption,
 } from "../services/protocol-json.js";
 import {
   changeModelOption,
@@ -192,7 +193,7 @@ describe("model option controls", () => {
       overridden: false,
       choices: [
         { label: "300K", value: "300k" },
-        { label: "1", value: 1 },
+        { label: "1", value: 1, numberSource: "1" },
       ],
       selectedIndex: -1,
     }]);
@@ -339,6 +340,14 @@ describe("model option controls", () => {
       "0.10000000000000000",
       "5e-324",
     ]) expect(modelOptionTextValue(control, raw)).not.toBeNull();
+    expect(modelOptionTextValue(control, "0.10000000000000000")).toEqual({
+      value: 0.1,
+      source: "0.10000000000000000",
+    });
+    expect(modelOptionTextValue(control, "1e20")).toEqual({
+      value: 1e20,
+      source: "1e20",
+    });
     for (const raw of [
       "0.1234567890123456789",
       "9007199254740993",
@@ -357,10 +366,11 @@ describe("model option controls", () => {
       '{"model_options":{"temperature":0.10000000000000000}}',
     );
 
-    const unverified = changeModelOption({}, {
-      key: "temperature",
-      value: 0.12345678901234568,
-    });
+    const unverified = updateProtocolModelOption(
+      {},
+      "temperature",
+      0.12345678901234568,
+    );
     expect(() => stringifyProtocolJson({ model_options: unverified }))
       .toThrow(UnsupportedModelOptionNumberError);
   });
@@ -394,7 +404,7 @@ describe("model option controls", () => {
     })).toEqual({ thinking_budget_tokens: 16384 });
     expect(changeModelOption(
       { thinking_level: "16384" },
-      { key: "thinking_budget_tokens", value: 8192 },
+      { key: "thinking_budget_tokens", value: 8192, numberSource: "8192" },
     )).toEqual({ thinking_budget_tokens: 8192 });
     expect(changeModelOption(
       { thinking_level: "high", effort: "low", reasoning: "medium", fast: true },

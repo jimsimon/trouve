@@ -11,6 +11,7 @@ import {
   type ModelOptionChangeDetail,
   type ModelOptionValue,
 } from "../components/model-option-controls.js";
+import { parseExactModelOptionNumber } from "../services/protocol-json.js";
 
 export const NEW_SESSION_TITLE_MAX_LENGTH = 48;
 export const NEW_SESSION_TITLE_FALLBACK = "New session";
@@ -771,10 +772,21 @@ export const createNewSessionThreadRequest = (
     && thinkingSelectionIsValid(advertisedThinking, thinking)
     && modelOptions[advertisedThinking.key] === undefined
   ) {
-    modelOptions = changeModelOption(modelOptions, {
-      key: advertisedThinking.key,
-      value: advertisedThinking.budget === undefined ? thinking : Number(thinking),
-    });
+    if (advertisedThinking.budget === undefined) {
+      modelOptions = changeModelOption(modelOptions, {
+        key: advertisedThinking.key,
+        value: thinking,
+      });
+    } else {
+      const budget = parseExactModelOptionNumber(thinking);
+      if (budget !== undefined) {
+        modelOptions = changeModelOption(modelOptions, {
+          key: advertisedThinking.key,
+          value: budget.value,
+          numberSource: budget.source,
+        });
+      }
+    }
   }
 
   return {

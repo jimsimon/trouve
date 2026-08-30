@@ -282,6 +282,35 @@ export const parseProtocolJson = (text: string): unknown => {
   );
 };
 
+/** A model-option number paired with the exact JSON token that produced it.
+ * Keeping these values together prevents editor code from accepting a rounded
+ * Number and later attaching unrelated provenance. */
+export interface ExactModelOptionNumber {
+  readonly value: number;
+  readonly source: string;
+}
+
+/** Parse one editable model-option number through the same exact-token path as
+ * protocol responses. Lossy integers, high-precision decimals, underflow, and
+ * overflow are rejected before the value can enter editor state. */
+export const parseExactModelOptionNumber = (
+  source: string,
+): ExactModelOptionNumber | undefined => {
+  if (!JSON_NUMBER_TOKEN.test(source)) return undefined;
+  try {
+    const parsed = parseProtocolJson(
+      `{"model_options":{"value":${source}}}`,
+    ) as { readonly model_options?: Readonly<Record<string, unknown>> };
+    const options = parsed.model_options;
+    const value = options?.["value"];
+    if (options === undefined || typeof value !== "number") return undefined;
+    const preservedSource = protocolModelOptionNumberSource(options, "value", value);
+    return preservedSource === source ? { value, source } : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
 const serializeProtocolValue = (
   value: unknown,
   parent: object | undefined,

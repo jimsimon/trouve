@@ -1,8 +1,10 @@
 import type { ProtocolModelInfo } from "../services/protocol-client.js";
 import {
+  type ExactModelOptionNumber,
   jsonNumberTokenIsExact,
   jsonNumberValueToken,
   modelOptionNumberNeedsSourceProof,
+  parseExactModelOptionNumber,
   protocolModelOptionNumberSource,
   protocolOptionSchemaNumbersAreExact,
   updateProtocolModelOption,
@@ -47,13 +49,19 @@ export type ModelOptionControl =
   | BooleanModelOptionControl
   | TextModelOptionControl;
 
-export interface ModelOptionChangeDetail {
-  readonly key: string;
-  /** Undefined removes an explicit override and restores the model default. */
-  readonly value: ModelOptionValue | undefined;
-  /** Original verified JSON token for a numeric value. */
-  readonly numberSource?: string;
-}
+export type ModelOptionChangeDetail =
+  | {
+      readonly key: string;
+      /** Undefined removes an explicit override and restores the model default. */
+      readonly value: string | boolean | undefined;
+      readonly numberSource?: never;
+    }
+  | {
+      readonly key: string;
+      readonly value: number;
+      /** Every numeric editor change carries its verified JSON token. */
+      readonly numberSource: string;
+    };
 
 const THINKING_KEYS = new Set([
   "thinking_level",
@@ -232,7 +240,6 @@ const choiceValues = (
       value,
       label: labels?.[index] ?? valueLabel(value),
       ...(typeof value === "number"
-          && modelOptionNumberNeedsSourceProof(value)
           && protocolOptionSchemaNumbersAreExact(property)
         ? { numberSource: jsonNumberValueToken(value) }
         : {}),
@@ -267,10 +274,8 @@ const choiceValues = (
       label: typeof entry["title"] === "string"
         ? entry["title"]
         : valueLabel(value),
-      ...(typeof value === "number"
-          && modelOptionNumberNeedsSourceProof(value)
-          && protocolOptionSchemaNumbersAreExact(property)
-        ? { numberSource: jsonNumberValueToken(value) }
+      ...(typeof value === "number" && numberSource !== undefined
+        ? { numberSource }
         : {}),
     });
   }
@@ -517,12 +522,13 @@ export const modelOptionValueIsValid = (
 export const modelOptionTextValue = (
   control: TextModelOptionControl,
   raw: string,
-): ModelOptionValue | undefined | null => {
+): string | ExactModelOptionNumber | undefined | null => {
   if (control.scalarType === "string") return raw;
   if (raw === "") return undefined;
-  const value = Number(raw);
-  return modelOptionValueIsValid(control, value, raw)
-    ? value
+  const parsed = parseExactModelOptionNumber(raw);
+  return parsed !== undefined
+      && modelOptionValueIsValid(control, parsed.value, parsed.source)
+    ? parsed
     : null;
 };
 
