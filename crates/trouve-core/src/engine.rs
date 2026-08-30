@@ -1767,18 +1767,44 @@ impl GithubPrDetailCache {
     }
 }
 
+const TURN_STEER_PENDING_CAPACITY: usize = 8;
+
+struct SteerResponse {
+    sender: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
+}
+
+impl SteerResponse {
+    fn send(mut self, result: Result<(), String>) {
+        if let Some(sender) = self.sender.take() {
+            let _ = sender.send(result);
+        }
+    }
+}
+
+impl Drop for SteerResponse {
+    fn drop(&mut self) {
+        if let Some(sender) = self.sender.take() {
+            let _ = sender.send(Err(
+                "turn ended before steering was acknowledged".to_string()
+            ));
+        }
+    }
+}
+
 struct SteerTurnCommand {
     content: String,
     attachments: Vec<trouve_protocol::Attachment>,
     attachment_rows: Vec<(trouve_protocol::Attachment, String)>,
     attachment_cleanup: PreparedAttachmentCleanup,
-    response: tokio::sync::oneshot::Sender<Result<(), String>>,
+    response: SteerResponse,
+    _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
 #[derive(Clone)]
 struct ActiveTurnSteerer {
     turn: u64,
     sender: tokio::sync::mpsc::Sender<SteerTurnCommand>,
+    permits: Arc<tokio::sync::Semaphore>,
     mutation_lane_state: tokio::sync::watch::Sender<SteerMutationLaneState>,
 }
 
@@ -1850,7 +1876,24 @@ fn reserve_ready_steer_after_event_budget<T>(
 
 fn reject_pending_steer(pending: &mut Option<SteerTurnCommand>, reason: &str) {
     if let Some(SteerTurnCommand { response, .. }) = pending.take() {
-        let _ = response.send(Err(reason.into()));
+        response.send(Err(reason.into()));
+    }
+}
+
+fn reject_steer_commands(
+    receiver: &mut Option<tokio::sync::mpsc::Receiver<SteerTurnCommand>>,
+    pending: &mut Option<SteerTurnCommand>,
+    deferred: &mut Vec<SteerTurnCommand>,
+    reason: &str,
+) {
+    reject_pending_steer(pending, reason);
+    for SteerTurnCommand { response, .. } in deferred.drain(..) {
+        response.send(Err(reason.into()));
+    }
+    if let Some(receiver) = receiver {
+        while let Ok(SteerTurnCommand { response, .. }) = receiver.try_recv() {
+            response.send(Err(reason.into()));
+        }
     }
 }
 
@@ -9898,7 +9941,8 @@ impl Engine {
     }
 
     fn register_turn_steerer(&self, thread_id: &str, turn: u64) {
-        let (sender, receiver) = tokio::sync::mpsc::channel(8);
+        let (sender, receiver) = tokio::sync::mpsc::channel(TURN_STEER_PENDING_CAPACITY);
+        let permits = Arc::new(tokio::sync::Semaphore::new(TURN_STEER_PENDING_CAPACITY));
         let (mutation_lane_state, _) = tokio::sync::watch::channel(SteerMutationLaneState::Idle);
         let pending = PendingTurnSteerer {
             turn,
@@ -9920,6 +9964,7 @@ impl Engine {
             ActiveTurnSteerer {
                 turn,
                 sender,
+                permits,
                 mutation_lane_state,
             },
         ) {
@@ -10017,6 +10062,9 @@ impl Engine {
             .ok_or_else(|| {
                 EngineError::Conflict(format!("thread {thread_id} has no steerable turn ready"))
             })?;
+        let permit = active.permits.clone().try_acquire_owned().map_err(|_| {
+            EngineError::Conflict(format!("turn {} steering queue is full", active.turn))
+        })?;
         let (prepared, attachment_cleanup) = self.prepare_attachments(uploads)?;
         let attachments = prepared
             .iter()
@@ -10034,7 +10082,10 @@ impl Engine {
                 attachments,
                 attachment_rows,
                 attachment_cleanup,
-                response,
+                response: SteerResponse {
+                    sender: Some(response),
+                },
+                _permit: permit,
             })
             .await
             .is_err()
@@ -10078,9 +10129,10 @@ impl Engine {
             attachment_rows,
             mut attachment_cleanup,
             response,
+            _permit,
         } = command;
         if cancel.is_cancelled() {
-            let _ = response.send(Err("turn cancelled".into()));
+            response.send(Err("turn cancelled".into()));
             return Ok(());
         }
 
@@ -10104,7 +10156,7 @@ impl Engine {
                         biased;
                         _ = cancel.cancelled() => {
                             mutation_lane_state.send_replace(SteerMutationLaneState::Idle);
-                            let _ = response.send(Err("turn cancelled".into()));
+                            response.send(Err("turn cancelled".into()));
                             return Ok(());
                         }
                         permit = lane.write_owned() => permit,
@@ -10127,7 +10179,7 @@ impl Engine {
             match result {
                 Ok(materialized) => materialized,
                 Err(error) => {
-                    let _ = response.send(Err(error.clone()));
+                    response.send(Err(error.clone()));
                     bail!("steering attachment materialization failed: {error}");
                 }
             }
@@ -10149,7 +10201,7 @@ impl Engine {
                     ));
                 }
                 let error = anyhow!(message);
-                let _ = response.send(Err(error.to_string()));
+                response.send(Err(error.to_string()));
                 return Err(error);
             }
         };
@@ -10171,11 +10223,11 @@ impl Engine {
                     "; materialized attachment rollback failed: {cleanup}"
                 ));
             }
-            let _ = response.send(Err(message));
+            response.send(Err(message));
             return Err(error);
         }
         attachment_cleanup.disarm();
-        let _ = response.send(Ok(()));
+        response.send(Ok(()));
         Ok(())
     }
 
@@ -11738,6 +11790,7 @@ impl Engine {
             // drop the (unexecuted) tool calls so we don't strand tool_use
             // without results, and stop the turn.
             if cancel.is_cancelled() {
+                reject_pending_steer(&mut pending_native_steer, "turn cancelled");
                 if !text.is_empty() {
                     self.store
                         .append_event_async(
@@ -11757,6 +11810,12 @@ impl Engine {
                         })?,
                     )?;
                 }
+                reject_steer_commands(
+                    &mut turn_steer_rx,
+                    &mut pending_native_steer,
+                    &mut boundary_steers,
+                    "turn cancelled",
+                );
                 hit_iteration_limit = false;
                 break;
             }
@@ -11796,21 +11855,22 @@ impl Engine {
                 )?;
             }
 
+            let had_boundary_steers = !boundary_steers.is_empty();
+            for command in boundary_steers.drain(..) {
+                self.accept_native_steer_command(
+                    &session,
+                    thread,
+                    turn,
+                    &cancel,
+                    &turn_steer_mutation_lane_state,
+                    command,
+                )
+                .await?;
+            }
             if tool_calls.is_empty() {
-                if boundary_steers.is_empty() {
+                if !had_boundary_steers {
                     hit_iteration_limit = false;
                     break;
-                }
-                for command in boundary_steers {
-                    self.accept_native_steer_command(
-                        &session,
-                        thread,
-                        turn,
-                        &cancel,
-                        &turn_steer_mutation_lane_state,
-                        command,
-                    )
-                    .await?;
                 }
                 continue;
             }
@@ -11820,11 +11880,42 @@ impl Engine {
             // transcript remains valid for APIs that require ordered
             // tool-result blocks. Tool events retain their real start and
             // completion ordering through the durable event log.
-            let results = self
-                .handle_tool_calls_parallel(
-                    &session, thread, turn, &mode, &ctx, tool_calls, &cancel,
-                )
-                .await;
+            let tool_batch = self.handle_tool_calls_parallel(
+                &session, thread, turn, &mode, &ctx, tool_calls, &cancel,
+            );
+            tokio::pin!(tool_batch);
+            let results = loop {
+                tokio::select! {
+                    biased;
+                    results = &mut tool_batch => break results,
+                    steer = receive_steer_command(
+                        &mut turn_steer_rx,
+                        &mut pending_native_steer,
+                        true,
+                    ), if !cancel.is_cancelled() => {
+                        let Some(command) = steer else {
+                            turn_steer_rx = None;
+                            continue;
+                        };
+                        if command.attachment_rows.is_empty() {
+                            self.accept_native_steer_command(
+                                &session,
+                                thread,
+                                turn,
+                                &cancel,
+                                &turn_steer_mutation_lane_state,
+                                command,
+                            )
+                            .await?;
+                        } else {
+                            command.response.send(Err(
+                                "attachment steering is unavailable while tools are running"
+                                    .into(),
+                            ));
+                        }
+                    }
+                }
+            };
             for (call_id, result) in results {
                 let (result_content, images) = result?;
                 self.store.append_message(
@@ -11836,17 +11927,17 @@ impl Engine {
                     })?,
                 )?;
             }
-            for command in boundary_steers {
-                self.accept_native_steer_command(
-                    &session,
-                    thread,
-                    turn,
-                    &cancel,
-                    &turn_steer_mutation_lane_state,
-                    command,
-                )
-                .await?;
-            }
+        }
+
+        if cancel.is_cancelled() {
+            let mut no_pending = None;
+            let mut deferred = Vec::new();
+            reject_steer_commands(
+                &mut turn_steer_rx,
+                &mut no_pending,
+                &mut deferred,
+                "turn cancelled",
+            );
         }
 
         // The bounded final-report pass is not an agent loop and cannot apply
@@ -13835,12 +13926,13 @@ impl Engine {
                         attachment_rows,
                         mut attachment_cleanup,
                         response,
+                        _permit,
                     } = command;
                     // Cancellation can arrive while the selected steer command
                     // flushes pending backend events. Reject it before either
                     // persisting the user message or calling the backend.
                     if cancel.is_cancelled() {
-                        let _ = response.send(Err("turn cancelled".into()));
+                        response.send(Err("turn cancelled".into()));
                         continue;
                     }
                     let staged = attachment_rows
@@ -13869,7 +13961,7 @@ impl Engine {
                         ).await {
                             Ok(materialized) => materialized,
                             Err(error) => {
-                                let _ = response.send(Err(error.clone()));
+                                response.send(Err(error.clone()));
                                 bail!("steering attachment materialization failed: {error}");
                             }
                         }
@@ -13908,7 +14000,7 @@ impl Engine {
                                 ));
                             }
                             let error = anyhow!(message);
-                            let _ = response.send(Err(error.to_string()));
+                            response.send(Err(error.to_string()));
                             return Err(error);
                         }
                     };
@@ -13933,7 +14025,7 @@ impl Engine {
                                 "; materialized attachment rollback failed: {cleanup}"
                             ));
                         }
-                        let _ = response.send(Err(message));
+                        response.send(Err(message));
                         return Err(error);
                     }
                     attachment_cleanup.disarm();
@@ -13952,10 +14044,10 @@ impl Engine {
                         .await;
                     if let Err(error) = backend_result {
                         let message = error.to_string();
-                        let _ = response.send(Err(message.clone()));
+                        response.send(Err(message.clone()));
                         bail!("backend rejected durable steering input: {message}");
                     }
-                    let _ = response.send(Ok(()));
+                    response.send(Ok(()));
                     consecutive_backend_events = 0;
                     continue;
                 }
@@ -17559,22 +17651,35 @@ fn sanitize_transcript(messages: Vec<Message>) -> Vec<Message> {
                 if ids.is_empty() {
                     continue;
                 }
-                // Absorb the contiguous run of results that follow, tracking
-                // which call ids they answer.
+                // Steering can be durably accepted while this tool batch is
+                // still executing, so its user message may be stored before
+                // the results. Defer intervening non-assistant messages until
+                // every available result has been paired with this call set.
                 let mut answered = std::collections::HashSet::new();
-                while matches!(iter.peek(), Some(Message::ToolResult { .. })) {
-                    if let Some(Message::ToolResult {
-                        call_id,
-                        content,
-                        images,
-                    }) = iter.next()
-                    {
-                        answered.insert(call_id.clone());
-                        out.push(Message::ToolResult {
-                            call_id,
-                            content,
-                            images,
-                        });
+                let mut deferred = Vec::new();
+                while answered.len() < ids.len() {
+                    match iter.peek() {
+                        Some(Message::ToolResult { .. }) => {
+                            if let Some(Message::ToolResult {
+                                call_id,
+                                content,
+                                images,
+                            }) = iter.next()
+                            {
+                                if ids.contains(&call_id) {
+                                    answered.insert(call_id.clone());
+                                }
+                                out.push(Message::ToolResult {
+                                    call_id,
+                                    content,
+                                    images,
+                                });
+                            }
+                        }
+                        Some(Message::Assistant { .. }) | None => break,
+                        Some(_) => {
+                            deferred.push(iter.next().expect("peeked message"));
+                        }
                     }
                 }
                 for id in ids {
@@ -17586,6 +17691,7 @@ fn sanitize_transcript(messages: Vec<Message>) -> Vec<Message> {
                         });
                     }
                 }
+                out.extend(deferred);
             }
             other => out.push(other),
         }
@@ -19053,13 +19159,32 @@ mod tests {
                 Vec::new(),
                 None,
             ),
-            response,
+            response: SteerResponse {
+                sender: Some(response),
+            },
+            _permit: Arc::new(tokio::sync::Semaphore::new(1))
+                .try_acquire_owned()
+                .unwrap(),
         });
 
         reject_pending_steer(&mut pending, "turn cancelled");
 
         assert_eq!(received.await.unwrap().unwrap_err(), "turn cancelled");
         assert!(pending.is_none());
+    }
+
+    #[test]
+    fn steering_permits_bound_channel_and_deferred_storage_together() {
+        let permits = Arc::new(tokio::sync::Semaphore::new(TURN_STEER_PENDING_CAPACITY));
+        let held = (0..TURN_STEER_PENDING_CAPACITY)
+            .map(|_| permits.clone().try_acquire_owned().unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            permits.clone().try_acquire_owned().is_err(),
+            "draining commands from the receiver must not create new capacity"
+        );
+        drop(held);
+        assert!(permits.try_acquire_owned().is_ok());
     }
 
     fn init_engine_test_repo(path: &Path) {
@@ -25065,6 +25190,27 @@ default_permission_mode = "ask"
             other => panic!("expected synthesized result b, got {other:?}"),
         }
         assert!(matches!(&out[4], Message::User(u) if u == "next"));
+
+        // A steer persisted while a tool is running is presented to the next
+        // model invocation only after the matching tool result.
+        let out = sanitize_transcript(vec![
+            Message::Assistant {
+                content: String::new(),
+                tool_calls: vec![call("steered")],
+                reasoning: vec![],
+            },
+            Message::User("change direction".into()),
+            Message::ToolResult {
+                call_id: "steered".into(),
+                content: "done".into(),
+                images: vec![],
+            },
+        ]);
+        assert!(matches!(
+            &out[1],
+            Message::ToolResult { call_id, .. } if call_id == "steered"
+        ));
+        assert!(matches!(&out[2], Message::User(u) if u == "change direction"));
 
         // An empty assistant message is dropped entirely.
         let out = sanitize_transcript(vec![
