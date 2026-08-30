@@ -242,6 +242,10 @@ struct RouterState {
     /// The process is inside a vendor-autonomous turn whose `result` has not
     /// arrived yet.
     background_in_flight: bool,
+    /// The stdout pump has read a result belonging to the registered turn,
+    /// but the router has not attributed that line yet. Steering must close
+    /// at receipt rather than after this channel handoff.
+    terminal_pending: bool,
     /// Complete, in-order lines of vendor-autonomous turns awaiting an
     /// attach consumer. May span multiple turns; `result` lines delimit.
     background: std::collections::VecDeque<String>,
@@ -320,6 +324,23 @@ impl StdoutRouter {
         state.turn.is_some()
             && state.turn_is_attach == attach_turn
             && (!attach_turn || state.background_in_flight)
+            && !state.terminal_pending
+    }
+
+    /// Close steering admission as soon as stdout yields a terminal record,
+    /// before that record can wait in the pump-to-router channel.
+    async fn line_received(&self, line: &str) {
+        if !line_is_result(line) {
+            return;
+        }
+        let _turn_boundary = self.turn_boundary.lock().await;
+        let mut state = self.state.lock().unwrap();
+        state.terminal_pending = state.turn.is_some()
+            && if state.turn_is_attach {
+                state.background_in_flight
+            } else {
+                !state.prompt_pending && !state.background_in_flight
+            };
     }
 
     /// The registered non-attach turn's prompt reached the vendor; lines
@@ -496,6 +517,9 @@ impl StdoutRouter {
             // Decide the destination under the lock, send outside it.
             let (destination, attach_completed) = {
                 let mut state = self.state.lock().unwrap();
+                if is_result {
+                    state.terminal_pending = false;
+                }
                 let turn = state.turn.clone();
                 let is_attach = state.turn_is_attach;
                 let prompt_pending = state.prompt_pending;
@@ -1563,17 +1587,6 @@ impl ClaudeBackend {
         let stdout = child.take_stdout().expect("stdout piped");
         let stderr = child.take_stderr().expect("stderr piped");
 
-        // Stdout pump: lines flow into the channel the router owns for the
-        // process's whole life, so the pipe is always being read.
-        let (line_tx, line_rx) = mpsc::channel::<String>(256);
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(stdout).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                if line_tx.send(line).await.is_err() {
-                    break;
-                }
-            }
-        });
         let thread_id = turn.thread_id.clone();
         let signal = self.background_turns.clone();
         let router = Arc::new(StdoutRouter::new(move || {
@@ -1584,6 +1597,20 @@ impl ClaudeBackend {
                 );
             }
         }));
+        // Stdout pump: lines flow into the channel the router owns for the
+        // process's whole life, so the pipe is always being read. Terminal
+        // admission closes before the line enters this bounded channel.
+        let (line_tx, line_rx) = mpsc::channel::<String>(256);
+        let pump_router = Arc::clone(&router);
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                pump_router.line_received(&line).await;
+                if line_tx.send(line).await.is_err() {
+                    break;
+                }
+            }
+        });
         tokio::spawn(Arc::clone(&router).run(line_rx));
 
         // Stderr pump: keep a bounded tail for error reporting.
@@ -1996,6 +2023,30 @@ mod tests {
         assert_eq!(recv_line(&mut attach_rx).await.as_deref(), Some(BG_RESULT));
         assert!(recv_line(&mut attach_rx).await.is_none());
         wait_for(|| !router.is_busy()).await;
+    }
+
+    #[tokio::test]
+    async fn terminal_receipt_closes_steering_before_router_attribution() {
+        let router = Arc::new(StdoutRouter::new(|| {}));
+        let (turn_tx, _turn_rx) = mpsc::channel(16);
+        assert_eq!(
+            router.register(turn_tx, false).unwrap(),
+            RouterRegistration::Streaming
+        );
+        router.prompt_delivered();
+        assert!(router.can_accept_steer(false));
+
+        router.line_received(BG_RESULT).await;
+
+        let _turn_boundary = router.turn_boundary.lock().await;
+        assert!(
+            !router.can_accept_steer(false),
+            "a result read from stdout must close steering before routing"
+        );
+        assert!(
+            router.is_busy(),
+            "terminal receipt must not bypass normal router attribution"
+        );
     }
 
     #[tokio::test]
