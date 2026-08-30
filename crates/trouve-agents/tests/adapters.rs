@@ -236,17 +236,14 @@ printf '%s\n' '{"type":"result","subtype":"success","session_id":"sess-bg","usag
 
     let steer_path = PathBuf::from(format!("{stub}.steer"));
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        while !steer_path.exists() {
+        while !std::fs::read_to_string(&steer_path)
+            .is_ok_and(|steer| steer.contains("Refine the background work."))
+        {
             tokio::task::yield_now().await;
         }
     })
     .await
     .expect("steering should be written before the attach stream is polled");
-    assert!(
-        std::fs::read_to_string(steer_path)
-            .unwrap()
-            .contains("Refine the background work.")
-    );
     while let Some(event) = attached.next().await {
         event.unwrap();
     }
@@ -298,7 +295,7 @@ sleep 2
         BackendPermission::ReadOnly,
     );
     attached_turn.attach_background = true;
-    let mut attached = backend.run_turn(attached_turn).await.unwrap();
+    let attached = backend.run_turn(attached_turn).await.unwrap();
     let error = backend
         .steer_turn(BackendSteer {
             cancel: Default::default(),
@@ -314,6 +311,17 @@ sleep 2
         !PathBuf::from(format!("{stub}.unexpected")).exists(),
         "steering must not be written to idle Claude stdin"
     );
+
+    // Cancelling before the lazy attach stream is first polled must release
+    // its eager router claim so the buffered turn remains attachable.
+    drop(attached);
+    let mut retry_turn = turn(
+        tmp.path().to_path_buf(),
+        Some("sess-buffered"),
+        BackendPermission::ReadOnly,
+    );
+    retry_turn.attach_background = true;
+    let mut attached = backend.run_turn(retry_turn).await.unwrap();
 
     let mut completed = false;
     while let Some(event) = attached.next().await {

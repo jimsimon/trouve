@@ -268,6 +268,20 @@ struct StdoutRouter {
     signal: Box<dyn Fn() + Send + Sync>,
 }
 
+/// Owns an eager router registration until its returned stream is dropped.
+/// Cleanup is exact-channel scoped, so an obsolete guard cannot clear a
+/// replacement consumer.
+struct RouterRegistrationGuard {
+    router: Arc<StdoutRouter>,
+    sender: mpsc::Sender<String>,
+}
+
+impl Drop for RouterRegistrationGuard {
+    fn drop(&mut self) {
+        self.router.consumer_lost(&self.sender, None);
+    }
+}
+
 impl StdoutRouter {
     fn new(signal: impl Fn() + Send + Sync + 'static) -> Self {
         Self {
@@ -351,6 +365,25 @@ impl StdoutRouter {
         } else {
             RouterRegistration::Streaming
         })
+    }
+
+    /// Register an eagerly claimed consumer whose ownership is released even
+    /// when the lazy event stream is dropped before its first poll.
+    fn register_owned(
+        self: &Arc<Self>,
+        sender: mpsc::Sender<String>,
+        attach: bool,
+    ) -> Result<(RouterRegistration, Option<RouterRegistrationGuard>), BackendError> {
+        let registration = self.register(sender.clone(), attach)?;
+        let guard = matches!(
+            registration,
+            RouterRegistration::Streaming | RouterRegistration::StreamingLive
+        )
+        .then(|| RouterRegistrationGuard {
+            router: self.clone(),
+            sender,
+        });
+        Ok((registration, guard))
     }
 
     fn buffer_background(state: &mut RouterState, line: String) {
@@ -928,13 +961,16 @@ impl AgentBackend for ClaudeBackend {
         // router distinguishes a genuinely live vendor turn from a completed
         // turn whose output is merely buffered; writing to Claude's stdin in
         // the latter case would start unrelated background work.
-        let (attached_lines, active_turn) = if attach {
+        let (attached_lines, attach_registration, active_turn) = if attach {
             let (turn_tx, lines) = mpsc::channel::<String>(1024);
-            match proc_.router.register(turn_tx, true)? {
-                RouterRegistration::StreamingLive => {
-                    (Some(lines), Some(proc_.begin_turn(true).await?))
-                }
-                RouterRegistration::Streaming => (Some(lines), None),
+            let (registration, registration_guard) = proc_.router.register_owned(turn_tx, true)?;
+            match registration {
+                RouterRegistration::StreamingLive => (
+                    Some(lines),
+                    registration_guard,
+                    Some(proc_.begin_turn(true).await?),
+                ),
+                RouterRegistration::Streaming => (Some(lines), registration_guard, None),
                 RouterRegistration::NothingPending => {
                     return Ok(Box::pin(futures::stream::once(async {
                         Ok(BackendEvent::Completed {
@@ -944,7 +980,7 @@ impl AgentBackend for ClaudeBackend {
                 }
             }
         } else {
-            (None, Some(proc_.begin_turn(false).await?))
+            (None, None, Some(proc_.begin_turn(false).await?))
         };
         let prompt = turn.prompt.clone();
         // Anthropic-style base64 image blocks, alongside the text block.
@@ -962,6 +998,7 @@ impl AgentBackend for ClaudeBackend {
 
         let stream = async_stream(move |tx| async move {
             let _active_turn = active_turn;
+            let _attach_registration = attach_registration;
             let mut lines = if let Some(lines) = attached_lines {
                 lines
             } else {
@@ -1996,6 +2033,41 @@ mod tests {
         );
         // The failed drain reinserts the line and re-announces the turn.
         wait_for(|| signals.load(std::sync::atomic::Ordering::SeqCst) == 2).await;
+        let (retry_tx, mut retry_rx) = mpsc::channel(16);
+        assert_eq!(
+            router.register(retry_tx, true).unwrap(),
+            RouterRegistration::Streaming
+        );
+        assert_eq!(recv_line(&mut retry_rx).await.as_deref(), Some(BG_LINE));
+        assert_eq!(recv_line(&mut retry_rx).await.as_deref(), Some(BG_RESULT));
+    }
+
+    #[tokio::test]
+    async fn owned_attach_registration_clears_when_dropped_before_polling() {
+        let signals = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let observed = signals.clone();
+        let router = Arc::new(StdoutRouter::new(move || {
+            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }));
+        let (line_tx, line_rx) = mpsc::channel(16);
+        let _task = tokio::spawn(Arc::clone(&router).run(line_rx));
+
+        line_tx.send(BG_LINE.to_string()).await.unwrap();
+        line_tx.send(BG_RESULT.to_string()).await.unwrap();
+        wait_for(|| signals.load(std::sync::atomic::Ordering::SeqCst) == 1).await;
+
+        let (attach_tx, _attach_rx) = mpsc::channel::<String>(16);
+        let (registration, guard) = router.register_owned(attach_tx, true).unwrap();
+        assert_eq!(registration, RouterRegistration::Streaming);
+        assert!(router.is_busy(), "the eager registration owns the router");
+        drop(guard);
+        assert!(
+            !router.is_busy(),
+            "dropping an unpolled registration must release the router"
+        );
+        assert!(router.has_pending_background());
+        assert_eq!(signals.load(std::sync::atomic::Ordering::SeqCst), 2);
+
         let (retry_tx, mut retry_rx) = mpsc::channel(16);
         assert_eq!(
             router.register(retry_tx, true).unwrap(),
