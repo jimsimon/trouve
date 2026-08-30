@@ -170,9 +170,15 @@ impl Provider for SteerableNativeProvider {
                 }))
                 .chain(futures::stream::iter(vec![
                     Ok(ProviderEvent::ToolCall(ToolCallRequest {
-                        id: "boundary-read".into(),
-                        name: "read_file".into(),
-                        arguments: serde_json::json!({"path": "README.md"}),
+                        id: "boundary-question".into(),
+                        name: "ask_question".into(),
+                        arguments: serde_json::json!({
+                            "title": "Safe boundary",
+                            "questions": [{
+                                "prompt": "Continue?",
+                                "options": ["Yes", "No"],
+                            }],
+                        }),
                     })),
                     Ok(ProviderEvent::Completed {
                         usage: Usage::default(),
@@ -594,6 +600,61 @@ async fn native_provider_turn_applies_steering_at_the_next_safe_boundary() {
         1
     );
 
+    // Hold the tool batch open, then admit attachment-bearing steering. The
+    // request must retain its bounded queue permit until the question result
+    // is recorded and attachment materialization can use the safe mutation
+    // boundary.
+    let during_tool = wait_for_event(&client, &events_url, |event| {
+        event["type"] == "question.requested"
+    })
+    .await;
+    let question = during_tool
+        .iter()
+        .find(|event| event["type"] == "question.requested")
+        .unwrap();
+    let request_id = question["request_id"].as_str().unwrap().to_string();
+    let attachment_client = client.clone();
+    let attachment_url = format!("{base}/threads/{thread_id}/steer");
+    let pending_attachment_steer = tokio::spawn(async move {
+        attachment_client
+            .post(attachment_url)
+            .json(&serde_json::json!({
+                "content": "Use this attached guidance.",
+                "attachments": [{
+                    "name": "guidance.txt",
+                    "mime": "text/plain",
+                    "data": "YXR0YWNobWVudA==",
+                }],
+            }))
+            .send()
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while engine.pending_turn_steers(thread_id, 1) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("attachment steering was not retained during tool execution");
+    let answered = client
+        .post(format!("{base}/questions"))
+        .json(&serde_json::json!({
+            "thread_id": thread_id,
+            "request_id": request_id,
+            "answers": [{"question_id": "q1", "selected_option_ids": ["opt1"]}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(answered.status(), reqwest::StatusCode::NO_CONTENT);
+    let attachment_steered =
+        tokio::time::timeout(Duration::from_secs(10), pending_attachment_steer)
+            .await
+            .expect("attachment steering did not resume after the tool boundary")
+            .unwrap()
+            .unwrap();
+    assert_eq!(attachment_steered.status(), reqwest::StatusCode::ACCEPTED);
+
     let events = wait_for_event(&client, &events_url, |event| {
         event["type"] == "turn.completed"
     })
@@ -624,11 +685,22 @@ async fn native_provider_turn_applies_steering_at_the_next_safe_boundary() {
         .iter()
         .position(|event| event["type"] == "turn.steered")
         .unwrap();
-    let tool_completed_index = events
+    let tool_result_index = events
         .iter()
-        .position(|event| event["type"] == "tool.completed" && event["call_id"] == "boundary-read")
+        .position(|event| event["type"] == "question.resolved")
         .unwrap();
-    assert!(steering_index < boundary_index && boundary_index < tool_completed_index);
+    assert!(steering_index < boundary_index && boundary_index < tool_result_index);
+    let attachment_steering_index = events
+        .iter()
+        .position(|event| {
+            event["type"] == "turn.steered" && event["content"] == "Use this attached guidance."
+        })
+        .unwrap();
+    assert!(tool_result_index < attachment_steering_index);
+    assert_eq!(
+        events[attachment_steering_index]["attachments"][0]["name"],
+        "guidance.txt"
+    );
     assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
 
     let messages_seen = provider.messages_seen.lock().unwrap();
@@ -642,6 +714,19 @@ async fn native_provider_turn_applies_steering_at_the_next_safe_boundary() {
     assert!(resumed.iter().any(|message| {
         matches!(message, Message::Assistant { content, .. } if content == "Initial direction. Boundary completion.")
     }));
+    let tool_result = resumed
+        .iter()
+        .position(|message| {
+            matches!(message, Message::ToolResult { call_id, .. } if call_id == "boundary-question")
+        })
+        .unwrap();
+    let attachment_guidance = resumed
+        .iter()
+        .position(|message| {
+            matches!(message, Message::User(content) if content.contains("Use this attached guidance.") && content.contains("guidance.txt"))
+        })
+        .unwrap();
+    assert!(tool_result < attachment_guidance);
 }
 
 #[tokio::test]

@@ -10013,10 +10013,10 @@ impl Engine {
             .is_some_and(|steerer| steerer.turn == turn)
     }
 
-    /// Returns the number of steering commands queued at the receiver for an
-    /// exact turn. Integration tests use this instead of a scheduling delay
-    /// when they need to hold provider startup behind an already-arrived HTTP
-    /// steering request.
+    /// Returns the number of steering commands admitted but not yet
+    /// acknowledged for an exact turn. Integration tests use this instead of
+    /// a scheduling delay when they need to observe bounded queued or
+    /// boundary-deferred work.
     #[doc(hidden)]
     pub fn pending_turn_steers(&self, thread_id: &str, turn: u64) -> usize {
         self.turn_steerers
@@ -10025,7 +10025,7 @@ impl Engine {
             .get(thread_id)
             .filter(|steerer| steerer.turn == turn)
             .map_or(0, |steerer| {
-                steerer.sender.max_capacity() - steerer.sender.capacity()
+                TURN_STEER_PENDING_CAPACITY - steerer.permits.available_permits()
             })
     }
 
@@ -11908,14 +11908,24 @@ impl Engine {
                             )
                             .await?;
                         } else {
-                            command.response.send(Err(
-                                "attachment steering is unavailable while tools are running"
-                                    .into(),
-                            ));
+                            // Attachment materialization uses the session
+                            // mutation lane held by mutating tools. Keep the
+                            // bounded command (and its queue permit) until the
+                            // whole tool batch has durably recorded its
+                            // results, then accept it at that safe boundary.
+                            boundary_steers.push(command);
                         }
                     }
                 }
             };
+            if cancel.is_cancelled() {
+                reject_steer_commands(
+                    &mut turn_steer_rx,
+                    &mut pending_native_steer,
+                    &mut boundary_steers,
+                    "turn cancelled",
+                );
+            }
             for (call_id, result) in results {
                 let (result_content, images) = result?;
                 self.store.append_message(
@@ -11926,6 +11936,17 @@ impl Engine {
                         images,
                     })?,
                 )?;
+            }
+            for command in boundary_steers.drain(..) {
+                self.accept_native_steer_command(
+                    &session,
+                    thread,
+                    turn,
+                    &cancel,
+                    &turn_steer_mutation_lane_state,
+                    command,
+                )
+                .await?;
             }
         }
 
