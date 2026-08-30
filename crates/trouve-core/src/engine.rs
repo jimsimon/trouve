@@ -2555,19 +2555,29 @@ struct AutomationModelOptionsValidation {
     mutation_state: Arc<AutomationMutationState>,
 }
 
+#[derive(Debug)]
 struct AutomationMutationVersion {
     generation: u64,
     definition: Option<trouve_protocol::Automation>,
 }
 
+#[derive(Debug)]
 struct AutomationMutationState {
     version: tokio::sync::Mutex<AutomationMutationVersion>,
 }
 
+#[derive(Clone, Debug)]
 struct AutomationSnapshot {
     automation: trouve_protocol::Automation,
     generation: u64,
     mutation_state: Arc<AutomationMutationState>,
+}
+
+#[derive(Debug)]
+struct AutomationDispatchPlan {
+    snapshot: AutomationSnapshot,
+    validated_model: Option<String>,
+    model_options: serde_json::Map<String, serde_json::Value>,
 }
 
 enum AutomationModelOptionsCacheUpdate {
@@ -5035,9 +5045,37 @@ impl Engine {
             .ok_or_else(|| {
                 EngineError::NotFound(format!("workspace {}", automation.workspace_id))
             })?;
-        let (validated_model, model_options) = self
+        let plan = self
             .automation_model_options_for_fire(&workspace, automation)
             .await?;
+        self.dispatch_automation_plan(plan).await
+    }
+
+    /// Claim the validated automation generation through the irreversible run
+    /// dispatch. Lifecycle mutations serialize behind this claim; a mutation
+    /// that committed after validation is rejected before a session exists.
+    async fn dispatch_automation_plan(
+        self: &Arc<Self>,
+        plan: AutomationDispatchPlan,
+    ) -> Result<(String, String, u64), EngineError> {
+        let AutomationDispatchPlan {
+            snapshot,
+            validated_model,
+            model_options,
+        } = plan;
+        let version = snapshot.mutation_state.version.lock().await;
+        if version.generation != snapshot.generation
+            || !version
+                .definition
+                .as_ref()
+                .is_some_and(|current| automation_definition_matches(current, &snapshot.automation))
+        {
+            return Err(EngineError::Conflict(format!(
+                "automation {} changed before its validated run could dispatch; retry the run",
+                snapshot.automation.id
+            )));
+        }
+        let automation = &snapshot.automation;
         let session = self
             .create_session(trouve_protocol::CreateSessionRequest {
                 workspace_id: automation.workspace_id.clone(),
@@ -5072,6 +5110,7 @@ impl Engine {
                 thread.id
             )));
         }
+        drop(version);
         Ok((session.id, thread.id, accepted.turn))
     }
 
@@ -5079,7 +5118,7 @@ impl Engine {
         &self,
         workspace: &trouve_protocol::Workspace,
         automation: &trouve_protocol::Automation,
-    ) -> Result<(Option<String>, serde_json::Map<String, serde_json::Value>), EngineError> {
+    ) -> Result<AutomationDispatchPlan, EngineError> {
         let snapshot = self.automation_snapshot_for_fire(automation).await?;
         let automation = &snapshot.automation;
         if !automation.model_options.is_empty() {
@@ -5263,7 +5302,7 @@ impl Engine {
         model_id: Option<String>,
         validated_options: serde_json::Map<String, serde_json::Value>,
         cache_update: AutomationModelOptionsCacheUpdate,
-    ) -> Result<(Option<String>, serde_json::Map<String, serde_json::Value>), EngineError> {
+    ) -> Result<AutomationDispatchPlan, EngineError> {
         let version = snapshot.mutation_state.version.lock().await;
         if version.generation != snapshot.generation
             || !version
@@ -5285,7 +5324,11 @@ impl Engine {
                 snapshot.mutation_state.clone(),
             );
         }
-        Ok((model_id, validated_options))
+        Ok(AutomationDispatchPlan {
+            snapshot: snapshot.clone(),
+            validated_model: model_id,
+            model_options: validated_options,
+        })
     }
 
     async fn monitor_automation_turn(
@@ -26375,12 +26418,12 @@ default_permission_mode = "ask"
 
         live_queries_allowed.store(false, std::sync::atomic::Ordering::SeqCst);
         for _ in 0..2 {
-            let (model, options) = engine
+            let plan = engine
                 .automation_model_options_for_fire(&workspace, &automation)
                 .await
                 .unwrap();
-            assert_eq!(model.as_deref(), Some("catalog-test/static"));
-            assert_eq!(options, automation.model_options);
+            assert_eq!(plan.validated_model.as_deref(), Some("catalog-test/static"));
+            assert_eq!(plan.model_options, automation.model_options);
         }
         assert_eq!(
             live_calls.load(std::sync::atomic::Ordering::SeqCst),
@@ -26548,15 +26591,14 @@ default_permission_mode = "ask"
         };
         store.insert_automation(&automation).unwrap();
 
+        let plan = engine
+            .automation_model_options_for_fire(&workspace, &automation)
+            .await
+            .unwrap();
+        assert_eq!(plan.validated_model, None);
         assert_eq!(
-            engine
-                .automation_model_options_for_fire(&workspace, &automation)
-                .await
-                .unwrap(),
-            (
-                None,
-                serde_json::Map::from_iter([("thinking_level".into(), serde_json::json!("high"))])
-            )
+            plan.model_options,
+            serde_json::Map::from_iter([("thinking_level".into(), serde_json::json!("high"))])
         );
 
         automation
@@ -26568,6 +26610,113 @@ default_permission_mode = "ask"
                 .await
                 .is_err(),
             "explicit persisted options must remain strict when model metadata is unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_automation_validation_cannot_dispatch_after_lifecycle_mutations() {
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let workspace = trouve_protocol::Workspace {
+            id: "ws_stale_dispatch".into(),
+            name: "stale dispatch".into(),
+            path: data.path().display().to_string(),
+        };
+        store.insert_workspace(&workspace).unwrap();
+        let engine = Arc::new(
+            Engine::new(store, data.path().to_path_buf(), &Config::default())
+                .with_config_dir(None)
+                .with_provider(
+                    "catalog-test",
+                    Arc::new(CatalogTestProvider::new(Arc::new(
+                        std::sync::atomic::AtomicUsize::new(0),
+                    ))),
+                )
+                .with_default_model("catalog-test/static"),
+        );
+        let automation = trouve_protocol::Automation {
+            id: "auto_stale_dispatch".into(),
+            name: "Stale dispatch".into(),
+            prompt: "Run later".into(),
+            workspace_id: workspace.id.clone(),
+            mode: None,
+            model: Some("catalog-test/static".into()),
+            thinking_level: None,
+            model_options: serde_json::Map::from_iter([("fast".into(), serde_json::json!(true))]),
+            permission_mode: trouve_protocol::PermissionMode::Ask,
+            schedule: trouve_protocol::AutomationSchedule {
+                kind: "daily".into(),
+                minute: 0,
+                time: "09:00".into(),
+                days: Vec::new(),
+            },
+            enabled: true,
+            next_run_at: None,
+            last_run_at: None,
+            last_session_id: None,
+            last_error: String::new(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+        engine.store.insert_automation(&automation).unwrap();
+
+        let plan = engine
+            .automation_model_options_for_fire(&workspace, &automation)
+            .await
+            .unwrap();
+        let paused = engine
+            .set_automation_enabled(&automation.id, false)
+            .await
+            .unwrap();
+        let current = engine
+            .set_automation_enabled(&paused.id, true)
+            .await
+            .unwrap();
+        assert!(
+            engine.dispatch_automation_plan(plan).await.is_err(),
+            "a pause must invalidate validation even when the automation is re-enabled"
+        );
+
+        let plan = engine
+            .automation_model_options_for_fire(&workspace, &current)
+            .await
+            .unwrap();
+        let mut request = trouve_protocol::UpsertAutomationRequest {
+            name: current.name.clone(),
+            prompt: current.prompt.clone(),
+            workspace_id: current.workspace_id.clone(),
+            mode: current.mode.clone(),
+            model: current.model.clone(),
+            thinking_level: current.thinking_level.clone(),
+            model_options: current.model_options.clone(),
+            permission_mode: current.permission_mode,
+            schedule: current.schedule.clone(),
+            enabled: current.enabled,
+        };
+        request.prompt = "Edited after validation".into();
+        let updated = engine
+            .update_automation(&current.id, request)
+            .await
+            .unwrap();
+        assert!(
+            engine.dispatch_automation_plan(plan).await.is_err(),
+            "an edit committed after validation must cancel dispatch"
+        );
+
+        let plan = engine
+            .automation_model_options_for_fire(&workspace, &updated)
+            .await
+            .unwrap();
+        engine.delete_automation(&updated.id).await.unwrap();
+        assert!(
+            engine.dispatch_automation_plan(plan).await.is_err(),
+            "a deletion committed after validation must cancel dispatch"
+        );
+        assert!(
+            engine
+                .list_sessions(Some(&workspace.id))
+                .unwrap()
+                .is_empty(),
+            "stale dispatch attempts must not create sessions"
         );
     }
 
