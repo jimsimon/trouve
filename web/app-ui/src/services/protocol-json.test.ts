@@ -49,6 +49,9 @@ describe("protocol JSON number preservation", () => {
     expect(stringifyProtocolJson(exact)).toBe(
       '{"model_options":{"temperature":0.10000000000000000,"large":1e20}}',
     );
+    expect(() => stringifyProtocolJson({
+      model_options: { temperature: 0.12345678901234568 },
+    })).toThrow(UnsupportedModelOptionNumberError);
 
     const nativeParse = JSON.parse.bind(JSON);
     const parseWithoutSource = vi.spyOn(JSON, "parse").mockImplementation((text, reviver) =>

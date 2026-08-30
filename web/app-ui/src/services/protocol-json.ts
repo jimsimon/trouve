@@ -214,12 +214,16 @@ const serializeProtocolValue = (
   parent: object | undefined,
   key: string,
   ancestors: Set<object>,
+  modelOptionMap = false,
 ): string | undefined => {
   if (value === null) return "null";
   if (typeof value === "number") {
     const source = parent === undefined
       ? undefined
       : EXACT_MODEL_OPTION_NUMBER_TOKENS.get(parent)?.get(key);
+    if (modelOptionMap && !Number.isSafeInteger(value) && source === undefined) {
+      throw new UnsupportedModelOptionNumberError();
+    }
     return source !== undefined && jsonNumberTokenIsExact(source, value)
       ? source
       : JSON.stringify(value);
@@ -231,11 +235,17 @@ const serializeProtocolValue = (
   let encoded: string;
   if (Array.isArray(value)) {
     encoded = `[${value.map((child, index) =>
-      serializeProtocolValue(child, value, String(index), ancestors) ?? "null"
+      serializeProtocolValue(child, value, String(index), ancestors, modelOptionMap) ?? "null"
     ).join(",")}]`;
   } else {
     encoded = `{${Object.entries(value).flatMap(([childKey, child]) => {
-      const serialized = serializeProtocolValue(child, value, childKey, ancestors);
+      const serialized = serializeProtocolValue(
+        child,
+        value,
+        childKey,
+        ancestors,
+        modelOptionMap || childKey === "model_options",
+      );
       return serialized === undefined
         ? []
         : [`${JSON.stringify(childKey)}:${serialized}`];
