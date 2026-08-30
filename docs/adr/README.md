@@ -54,3 +54,4 @@ sequentially.
 | [0042](0042-provider-governed-turn-admission.md) | Provider-governed turn admission | Accepted |
 | [0043](0043-cursor-sdk-bridge-transport.md) | Cursor SDK Bridge transport | Superseded by 0044 |
 | [0044](0044-shared-cursor-sdk-bridge-process.md) | One shared Cursor SDK Bridge per backend | Accepted |
+| [0045](0045-cursor-shared-store-transition-and-quarantine.md) | Cursor shared-store transition and callback quarantine | Accepted |

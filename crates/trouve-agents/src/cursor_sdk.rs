@@ -62,6 +62,7 @@ const MAX_CALLBACK_REPLAY_RECORDS: usize = 64;
 const MAX_CALLBACK_REPLAY_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CALLBACK_CONCURRENCY: usize = 8;
 const MAX_CALLBACK_HTTP_CONCURRENCY: usize = 16;
+const MAX_LEGACY_SESSION_MARKER_BYTES: u64 = 4 * 1024;
 const READY_PREFIX: &str = "cursor-sdk-bridge ready ";
 const CALLBACK_PATH: &str = "/sdk.v1.SdkCustomToolCallbackService/CallCustomTool";
 /// Cursor-native tool vocabulary in the pinned Agent SDK (1.0.28), excluding
@@ -980,6 +981,13 @@ async fn run_sdk_turn(
     }
     let allowed_tools = custom_tools.keys().cloned().collect::<HashSet<_>>();
     let state_dir = backend_state_dir(state_root, provider_id);
+    let session = select_backend_session(
+        state_root,
+        provider_id,
+        &turn.thread_id,
+        turn.session.as_deref(),
+    )
+    .await?;
     let process = match pool
         .process_for(
             thread_admission,
@@ -1008,7 +1016,7 @@ async fn run_sdk_turn(
         _ = pool.closing.cancelled() => Err(BridgePool::closed_error()),
         _ = turn.cancel.cancelled() => Err(BackendError::Cancelled),
         _ = events.closed() => Err(BackendError::Cancelled),
-        setup = create_or_resume_agent(&client, turn.session.as_deref(), &options) => setup,
+        setup = create_or_resume_agent(&client, session.resume.as_deref(), &options) => setup,
     };
     let (agent_id, fresh) = match setup {
         Ok(value) => value,
@@ -1031,6 +1039,14 @@ async fn run_sdk_turn(
             return Err(error);
         }
     };
+    if let Some(marker) = session.legacy_marker.as_ref()
+        && marker.recorded_agent_id.as_deref() != Some(agent_id.as_str())
+        && let Err(error) = record_legacy_session_marker(marker, &agent_id).await
+    {
+        pool.quarantine(process.pooled()).await;
+        let release = close_agent(&client, &agent_id).await;
+        return finish_shared_turn(Err(error), release);
+    }
     let mut route = match process
         .callback
         .register(
@@ -1051,7 +1067,7 @@ async fn run_sdk_turn(
         }
     };
 
-    if fresh
+    if (fresh || turn.session.as_deref() != Some(agent_id.as_str()))
         && events
             .send(Ok(BackendEvent::SessionStarted {
                 session_id: agent_id.clone(),
@@ -1081,18 +1097,24 @@ async fn run_sdk_turn(
             &route.supervisor.cancel,
         ) => outcome,
     };
-    if matches!(
+    let callbacks_settled = if matches!(
         &outcome,
         Ok(TurnTerminal::Cancelled | TurnTerminal::ConsumerClosed)
     ) || pool.closing.is_cancelled()
     {
         let deadline = tokio::time::Instant::now() + INTERRUPTED_CALLBACK_SHUTDOWN_TIMEOUT;
-        route.stop_until(deadline).await;
+        route.stop_until(deadline).await
     } else {
         route.stop().await;
-    }
+        true
+    };
     let release = close_agent(&client, &agent_id).await;
-    if outcome.is_err() || release.is_err() {
+    if !callbacks_settled {
+        tracing::warn!(
+            "cursor: callback route for agent {agent_id} did not settle; quarantining shared Bridge"
+        );
+    }
+    if outcome.is_err() || release.is_err() || !callbacks_settled {
         pool.quarantine(process.pooled()).await;
     } else {
         process.touch();
@@ -1180,6 +1202,134 @@ fn backend_state_dir(root: &Path, provider_id: &str) -> PathBuf {
     hasher.update(provider_id.as_bytes());
     let key = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hasher.finalize());
     root.join(key)
+}
+
+fn legacy_thread_state_key(provider_id: &str, thread_id: &str) -> String {
+    use base64::Engine as _;
+    let mut hasher = Sha256::new();
+    hasher.update(provider_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(thread_id.as_bytes());
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hasher.finalize())
+}
+
+fn legacy_thread_state_dir(root: &Path, provider_id: &str, thread_id: &str) -> PathBuf {
+    root.join(legacy_thread_state_key(provider_id, thread_id))
+}
+
+fn legacy_session_marker_path(root: &Path, provider_id: &str, thread_id: &str) -> PathBuf {
+    backend_state_dir(root, provider_id)
+        .join(".trouve-legacy-sessions")
+        .join(legacy_thread_state_key(provider_id, thread_id))
+}
+
+struct BackendSessionSelection {
+    resume: Option<String>,
+    legacy_marker: Option<LegacySessionMarker>,
+}
+
+struct LegacySessionMarker {
+    path: PathBuf,
+    recorded_agent_id: Option<String>,
+}
+
+async fn select_backend_session(
+    root: &Path,
+    provider_id: &str,
+    thread_id: &str,
+    persisted_agent_id: Option<&str>,
+) -> Result<BackendSessionSelection, BackendError> {
+    let marker_path = legacy_session_marker_path(root, provider_id, thread_id);
+    match tokio::fs::metadata(&marker_path).await {
+        Ok(metadata) => {
+            if !metadata.is_file() || metadata.len() > MAX_LEGACY_SESSION_MARKER_BYTES {
+                return Err(BackendError::Protocol(format!(
+                    "Cursor legacy session marker is invalid: {}",
+                    marker_path.display()
+                )));
+            }
+            let agent_id = tokio::fs::read_to_string(&marker_path)
+                .await
+                .map_err(BackendError::Io)?;
+            if agent_id.is_empty() {
+                return Err(BackendError::Protocol(format!(
+                    "Cursor legacy session marker is empty: {}",
+                    marker_path.display()
+                )));
+            }
+            return Ok(BackendSessionSelection {
+                resume: Some(agent_id.clone()),
+                legacy_marker: Some(LegacySessionMarker {
+                    path: marker_path,
+                    recorded_agent_id: Some(agent_id),
+                }),
+            });
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(BackendError::Io(error)),
+    }
+
+    let legacy_state = legacy_thread_state_dir(root, provider_id, thread_id);
+    match tokio::fs::metadata(&legacy_state).await {
+        Ok(metadata) => {
+            if !metadata.is_dir() {
+                return Err(BackendError::Protocol(format!(
+                    "Cursor legacy thread state is not a directory: {}",
+                    legacy_state.display()
+                )));
+            }
+            tracing::info!(
+                "cursor: resetting legacy per-thread SDK session into the shared backend store"
+            );
+            Ok(BackendSessionSelection {
+                resume: None,
+                legacy_marker: Some(LegacySessionMarker {
+                    path: marker_path,
+                    recorded_agent_id: None,
+                }),
+            })
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(BackendSessionSelection {
+            resume: persisted_agent_id.map(str::to_string),
+            legacy_marker: None,
+        }),
+        Err(error) => Err(BackendError::Io(error)),
+    }
+}
+
+async fn record_legacy_session_marker(
+    marker: &LegacySessionMarker,
+    agent_id: &str,
+) -> Result<(), BackendError> {
+    if agent_id.is_empty() || agent_id.len() as u64 > MAX_LEGACY_SESSION_MARKER_BYTES {
+        return Err(BackendError::Protocol(
+            "Cursor agent id cannot be recorded in the legacy session marker".into(),
+        ));
+    }
+    let parent = marker.path.parent().ok_or_else(|| {
+        BackendError::Protocol("Cursor legacy session marker has no parent directory".into())
+    })?;
+    tokio::fs::create_dir_all(parent)
+        .await
+        .map_err(BackendError::Io)?;
+    let temporary = marker
+        .path
+        .with_extension(format!("tmp-{}", uuid::Uuid::new_v4().simple()));
+    if let Err(error) = tokio::fs::write(&temporary, agent_id).await {
+        return Err(BackendError::Io(error));
+    }
+    if marker.recorded_agent_id.is_some()
+        && let Err(error) = tokio::fs::remove_file(&marker.path).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        let _ = tokio::fs::remove_file(&temporary).await;
+        return Err(BackendError::Io(error));
+    }
+    if let Err(error) = tokio::fs::rename(&temporary, &marker.path).await {
+        let _ = tokio::fs::remove_file(&temporary).await;
+        return Err(BackendError::Io(error));
+    }
+    Ok(())
 }
 
 fn agent_options(turn: &BackendTurn, api_key: &str, custom_tools: Map<String, Value>) -> Value {
@@ -1724,10 +1874,12 @@ impl CallbackRouteLease {
         self.supervisor.stop().await;
     }
 
-    async fn stop_until(&mut self, deadline: tokio::time::Instant) {
+    async fn stop_until(&mut self, deadline: tokio::time::Instant) -> bool {
         self.detach();
         self.supervisor.cancel.cancel();
-        let _ = tokio::time::timeout_at(deadline, self.supervisor.stop()).await;
+        tokio::time::timeout_at(deadline, self.supervisor.stop())
+            .await
+            .is_ok()
     }
 
     fn detach(&mut self) {
@@ -4010,6 +4162,31 @@ mod tests {
         assert!(supervisor.tasks.lock().await.is_empty());
     }
 
+    #[tokio::test]
+    async fn callback_route_timeout_is_reported_for_bridge_quarantine() {
+        let callback = CallbackRouter::start(local_http_client().unwrap())
+            .await
+            .unwrap();
+        let mut route = callback
+            .register(
+                "agent-timeout".into(),
+                None,
+                HashSet::new(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let supervisor = route.supervisor.clone();
+        let tasks = supervisor.tasks.lock().await;
+        let settled = route
+            .stop_until(tokio::time::Instant::now() + Duration::from_millis(10))
+            .await;
+        assert!(!settled, "a timed-out callback route reported clean reuse");
+        drop(tasks);
+        supervisor.stop().await;
+        callback.stop().await.unwrap();
+    }
+
     #[test]
     fn cursor_terminal_statuses_require_exact_sdk_values() {
         for status in [json!(3), json!("3"), json!("RUN_LIFECYCLE_STATUS_FINISHED")] {
@@ -4102,5 +4279,65 @@ mod tests {
         let path = backend_state_dir(Path::new("/state"), "../provider");
         assert_eq!(path.parent(), Some(Path::new("/state")));
         assert!(!path.to_string_lossy().contains("provider"));
+    }
+
+    #[tokio::test]
+    async fn legacy_per_thread_session_is_reset_once_into_the_shared_store() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        let provider_id = "cursor-provider";
+        let thread_id = "thread-from-per-thread-store";
+        let legacy = legacy_thread_state_dir(root, provider_id, thread_id);
+        assert_eq!(
+            legacy.file_name().and_then(|name| name.to_str()),
+            Some("3X4zI2VSLSnWs8ezqXYPa9LDLz12HET6AyHGPWtrMaM"),
+            "legacy detection must preserve the pre-shared-store hash layout"
+        );
+        tokio::fs::create_dir_all(&legacy).await.unwrap();
+
+        let first = select_backend_session(root, provider_id, thread_id, Some("legacy-agent"))
+            .await
+            .unwrap();
+        assert_eq!(
+            first.resume, None,
+            "legacy agent cannot resume in shared SQLite"
+        );
+        let marker = first
+            .legacy_marker
+            .as_ref()
+            .expect("legacy state requires a transition marker");
+        assert_eq!(marker.recorded_agent_id, None);
+        record_legacy_session_marker(marker, "shared-agent")
+            .await
+            .unwrap();
+
+        let recover = select_backend_session(root, provider_id, thread_id, Some("legacy-agent"))
+            .await
+            .unwrap();
+        assert_eq!(recover.resume.as_deref(), Some("shared-agent"));
+        assert_eq!(
+            recover
+                .legacy_marker
+                .as_ref()
+                .and_then(|marker| marker.recorded_agent_id.as_deref()),
+            Some("shared-agent")
+        );
+        let settled = select_backend_session(root, provider_id, thread_id, Some("shared-agent"))
+            .await
+            .unwrap();
+        assert_eq!(settled.resume.as_deref(), Some("shared-agent"));
+        let marker = settled.legacy_marker.as_ref().unwrap();
+        record_legacy_session_marker(marker, "replacement-agent")
+            .await
+            .unwrap();
+        let replaced =
+            select_backend_session(root, provider_id, thread_id, Some("replacement-agent"))
+                .await
+                .unwrap();
+        assert_eq!(replaced.resume.as_deref(), Some("replacement-agent"));
+        assert!(
+            legacy.is_dir(),
+            "safe reset must retain the legacy state for recovery"
+        );
     }
 }

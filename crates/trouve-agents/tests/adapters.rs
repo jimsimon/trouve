@@ -442,6 +442,8 @@ async fn cursor_health_requires_a_configured_api_key() {
 #[derive(Clone)]
 struct CursorSdkMcpState {
     calls: std::sync::Arc<tokio::sync::Mutex<Vec<serde_json::Value>>>,
+    blocked_started: Option<std::sync::Arc<tokio::sync::Semaphore>>,
+    blocked_release: Option<std::sync::Arc<tokio::sync::Notify>>,
 }
 
 async fn cursor_sdk_mcp(
@@ -464,11 +466,11 @@ async fn cursor_sdk_mcp(
         }),
         "tools/call" => {
             let params = request["params"].clone();
-            let expected = serde_json::json!({
-                "name": "trouve_test_echo",
-                "arguments": { "token": "from-sdk" }
-            });
-            if params != expected {
+            let token = params["arguments"]["token"].as_str();
+            let blocked = token == Some("block-until-cancelled")
+                && state.blocked_started.is_some()
+                && state.blocked_release.is_some();
+            if token != Some("from-sdk") && !blocked {
                 return axum::Json(serde_json::json!({
                     "jsonrpc": "2.0",
                     "id": id,
@@ -479,7 +481,12 @@ async fn cursor_sdk_mcp(
                 }));
             }
             state.calls.lock().await.push(params);
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if blocked {
+                state.blocked_started.as_ref().unwrap().add_permits(1);
+                state.blocked_release.as_ref().unwrap().notified().await;
+            } else {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
             serde_json::json!({
                 "content": [{ "type": "text", "text": "tool-ok" }],
                 "structuredContent": { "value": "tool-ok" },
@@ -596,6 +603,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_response(200)
                 self.send_header("Content-Type", "application/connect+json")
                 self.send_header("Transfer-Encoding", "chunked")
+                # The production Bridge opens independent RPC connections while
+                # Send is active. Closing this synthetic streaming connection at
+                # its terminal frame prevents BaseHTTPRequestHandler from
+                # advertising it as reusable after the client cancels the body.
+                self.send_header("Connection", "close")
                 self.end_headers()
                 self.wfile.write(format(len(first), "x").encode("ascii") + b"\r\n")
                 self.wfile.write(first + b"\r\n")
@@ -620,6 +632,42 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(format(len(identity), "x").encode("ascii") + b"\r\n")
                 self.wfile.write(identity + b"\r\n")
                 self.wfile.flush()
+                if active_options.get("tools", {}).get("names", []) == ["mcp"]:
+                    cancel_callback = {
+                        "toolName": "trouve_test_echo",
+                        "toolCallId": "sdk-call-cancel",
+                        "agentId": agent_id,
+                        "args": {"token": "block-until-cancelled"}
+                    }
+                    def call_cancel_tool():
+                        callback_parts = urllib.parse.urlsplit(callback_url)
+                        connection = http.client.HTTPConnection(
+                            callback_parts.hostname, callback_parts.port, timeout=10
+                        )
+                        try:
+                            connection.request(
+                                "POST",
+                                "/sdk.v1.SdkCustomToolCallbackService/CallCustomTool",
+                                body=json.dumps(cancel_callback).encode("utf-8"),
+                                headers={
+                                    "Authorization": "Bearer " + callback_token,
+                                    "Content-Type": "application/json"
+                                }
+                            )
+                            response = connection.getresponse()
+                            body = response.read().decode("utf-8", errors="replace")
+                            write_json(
+                                binary + ".cancel-callback.json",
+                                {"status": response.status, "body": body}
+                            )
+                        except Exception as error:
+                            write_json(
+                                binary + ".cancel-callback.json",
+                                {"error": str(error)}
+                            )
+                        finally:
+                            connection.close()
+                    threading.Thread(target=call_cancel_tool, daemon=True).start()
                 if not cancel_received.wait(10):
                     self.wfile.write(b"0\r\n\r\n")
                     self.wfile.flush()
@@ -827,6 +875,8 @@ async fn cursor_adapter_uses_sdk_bridge_and_trouve_owned_tools() {
                 .route("/mcp", post(cursor_sdk_mcp))
                 .with_state(CursorSdkMcpState {
                     calls: server_calls,
+                    blocked_started: None,
+                    blocked_release: None,
                 }),
         )
         .await
@@ -1005,8 +1055,40 @@ async fn cursor_adapter_uses_sdk_bridge_and_trouve_owned_tools() {
 }
 
 #[tokio::test]
-async fn cursor_adapter_cancellation_acknowledges_cancel_run_and_keeps_shared_bridge() {
+async fn cursor_adapter_cancellation_settles_route_and_keeps_shared_bridge_usable() {
+    use axum::routing::post;
+
     let tmp = tempfile::tempdir().unwrap();
+    let calls = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let blocked_started = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    let blocked_release = std::sync::Arc::new(tokio::sync::Notify::new());
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let mcp_task = tokio::spawn({
+        let calls = calls.clone();
+        let blocked_started = blocked_started.clone();
+        let blocked_release = blocked_release.clone();
+        async move {
+            axum::serve(
+                listener,
+                axum::Router::new()
+                    .route("/mcp", post(cursor_sdk_mcp))
+                    .with_state(CursorSdkMcpState {
+                        calls,
+                        blocked_started: Some(blocked_started),
+                        blocked_release: Some(blocked_release),
+                    }),
+            )
+            .await
+        }
+    });
+    let mcp_bridge = trouve_agents::McpBridgeConfig {
+        url: format!("http://{address}/mcp"),
+        bridge_tools: true,
+        disallowed_tools: Vec::new(),
+    };
     let stub = cursor_sdk_bridge_stub(tmp.path());
     let backend = CursorBackend::new(
         "cursor",
@@ -1018,7 +1100,7 @@ async fn cursor_adapter_cancellation_acknowledges_cancel_run_and_keeps_shared_br
     let mut stream = start_turn(&backend, || {
         let mut next = turn(tmp.path().to_path_buf(), None, BackendPermission::ReadOnly);
         next.prompt = "STALL_FOR_CANCELLATION".into();
-        next.tool_free = true;
+        next.mcp_bridge = Some(mcp_bridge.clone());
         next.cancel = cancel.clone();
         next
     })
@@ -1027,9 +1109,7 @@ async fn cursor_adapter_cancellation_acknowledges_cancel_run_and_keeps_shared_br
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             match stream.next().await {
-                Some(Ok(BackendEvent::TextDelta(text))) if text == "RUN_READY" => {
-                    break;
-                }
+                Some(Ok(BackendEvent::TextDelta(text))) if text == "RUN_READY" => break,
                 Some(Ok(_)) => {}
                 Some(Err(error)) => panic!("Cursor Send failed before cancellation: {error}"),
                 None => panic!("Cursor Send ended before publishing cancellation readiness"),
@@ -1044,8 +1124,13 @@ async fn cursor_adapter_cancellation_acknowledges_cancel_run_and_keeps_shared_br
         .trim()
         .parse()
         .unwrap();
-    cancel.cancel();
     std::fs::write(format!("{stub}.release-run-id"), "").unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), blocked_started.acquire())
+        .await
+        .expect("cancelled turn never entered its production callback route")
+        .unwrap()
+        .forget();
+    cancel.cancel();
 
     let mut saw_cancelled = false;
     let mut observed = Vec::new();
@@ -1070,6 +1155,63 @@ async fn cursor_adapter_cancellation_acknowledges_cancel_run_and_keeps_shared_br
             .trim(),
         "sdk-run-cancel"
     );
+    let callback_result_path = format!("{stub}.cancel-callback.json");
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !std::path::Path::new(&callback_result_path).exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("adapter cancellation did not settle the held callback route");
+    let callback_result: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&callback_result_path).unwrap()).unwrap();
+    assert_eq!(
+        callback_result["status"], 502,
+        "held callback did not receive adapter-driven cancellation: {callback_result}"
+    );
+    blocked_release.notify_waiters();
+
+    let mut recovered = start_turn(&backend, || {
+        let mut next = turn(tmp.path().to_path_buf(), None, BackendPermission::ReadOnly);
+        next.mcp_bridge = Some(mcp_bridge.clone());
+        next
+    })
+    .await;
+    let recovered_events = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut events = Vec::new();
+        while let Some(event) = recovered.next().await {
+            events.push(event.unwrap());
+        }
+        events
+    })
+    .await
+    .expect("shared Cursor Bridge was not usable after cancellation");
+    assert!(
+        recovered_events
+            .iter()
+            .any(|event| matches!(event, BackendEvent::Completed { .. }))
+    );
+    assert!(
+        recovered_events
+            .iter()
+            .any(|event| matches!(event, BackendEvent::TextDelta(text) if text == "SDK done"))
+    );
+    assert!(
+        calls
+            .lock()
+            .await
+            .iter()
+            .any(|params| { params["arguments"]["token"] == "from-sdk" }),
+        "recovery turn never completed a real callback"
+    );
+    assert_eq!(
+        std::fs::read_to_string(format!("{stub}.spawns"))
+            .unwrap()
+            .trim(),
+        "1",
+        "clean cancellation should keep the same shared Bridge usable"
+    );
+
     let port: u16 = std::fs::read_to_string(format!("{stub}.port"))
         .unwrap()
         .trim()
@@ -1084,7 +1226,7 @@ async fn cursor_adapter_cancellation_acknowledges_cancel_run_and_keeps_shared_br
     #[cfg(target_os = "linux")]
     assert!(
         std::path::Path::new(&format!("/proc/{pid}")).exists(),
-        "cancelling one agent reaped the shared Cursor Bridge process"
+        "clean cancellation unexpectedly reaped the shared Cursor Bridge process"
     );
     backend.shutdown().await.unwrap();
     #[cfg(target_os = "linux")]
@@ -1092,6 +1234,7 @@ async fn cursor_adapter_cancellation_acknowledges_cancel_run_and_keeps_shared_br
         !std::path::Path::new(&format!("/proc/{pid}")).exists(),
         "backend shutdown did not reap the shared Cursor Bridge process"
     );
+    mcp_task.abort();
 }
 
 #[tokio::test]
