@@ -269,16 +269,18 @@ struct StdoutRouter {
 }
 
 /// Owns an eager router registration until its returned stream is dropped.
-/// Cleanup is exact-channel scoped, so an obsolete guard cannot clear a
-/// replacement consumer.
+/// Its weak sender preserves exact-channel cleanup without keeping the
+/// receiver open after the router releases its sender at a turn boundary.
 struct RouterRegistrationGuard {
     router: Arc<StdoutRouter>,
-    sender: mpsc::Sender<String>,
+    sender: mpsc::WeakSender<String>,
 }
 
 impl Drop for RouterRegistrationGuard {
     fn drop(&mut self) {
-        self.router.consumer_lost(&self.sender, None);
+        if let Some(sender) = self.sender.upgrade() {
+            self.router.consumer_lost(&sender, None);
+        }
     }
 }
 
@@ -374,14 +376,15 @@ impl StdoutRouter {
         sender: mpsc::Sender<String>,
         attach: bool,
     ) -> Result<(RouterRegistration, Option<RouterRegistrationGuard>), BackendError> {
-        let registration = self.register(sender.clone(), attach)?;
+        let weak_sender = sender.downgrade();
+        let registration = self.register(sender, attach)?;
         let guard = matches!(
             registration,
             RouterRegistration::Streaming | RouterRegistration::StreamingLive
         )
         .then(|| RouterRegistrationGuard {
             router: self.clone(),
-            sender,
+            sender: weak_sender,
         });
         Ok((registration, guard))
     }
@@ -1959,10 +1962,8 @@ mod tests {
         line_tx.send(BG_LINE.to_string()).await.unwrap();
         wait_for(|| router.is_busy()).await;
         let (attach_tx, mut attach_rx) = mpsc::channel(16);
-        assert_eq!(
-            router.register(attach_tx, true).unwrap(),
-            RouterRegistration::StreamingLive
-        );
+        let (registration, _guard) = router.register_owned(attach_tx, true).unwrap();
+        assert_eq!(registration, RouterRegistration::StreamingLive);
         // Buffered prefix, then live continuation, ending at the result.
         assert_eq!(recv_line(&mut attach_rx).await.as_deref(), Some(BG_LINE));
         line_tx.send(USER_LINE.to_string()).await.unwrap();
@@ -2034,12 +2035,11 @@ mod tests {
         // The failed drain reinserts the line and re-announces the turn.
         wait_for(|| signals.load(std::sync::atomic::Ordering::SeqCst) == 2).await;
         let (retry_tx, mut retry_rx) = mpsc::channel(16);
-        assert_eq!(
-            router.register(retry_tx, true).unwrap(),
-            RouterRegistration::Streaming
-        );
+        let (registration, _retry_guard) = router.register_owned(retry_tx, true).unwrap();
+        assert_eq!(registration, RouterRegistration::Streaming);
         assert_eq!(recv_line(&mut retry_rx).await.as_deref(), Some(BG_LINE));
         assert_eq!(recv_line(&mut retry_rx).await.as_deref(), Some(BG_RESULT));
+        assert!(recv_line(&mut retry_rx).await.is_none());
     }
 
     #[tokio::test]
