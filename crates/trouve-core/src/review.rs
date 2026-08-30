@@ -7718,11 +7718,14 @@ impl Engine {
             after = envelope.cursor;
             let mut model_timing = CodeReviewModelTiming::Preserve;
             match envelope.event {
-                Event::TurnCapacityAcquired {
+                Event::TurnAdmitted {
+                    turn: event_turn, ..
+                }
+                | Event::TurnCapacityAcquired {
                     turn: event_turn, ..
                 } if event_turn == turn => {
                     // The engine has already persisted provider wait and the
-                    // post-capacity stage before publishing this thread event.
+                    // post-admission stage before publishing this thread event.
                     lifecycle_stage = initial_stage;
                     observed_stage = initial_stage;
                     coalesce_observed_stage = false;
@@ -18574,13 +18577,7 @@ mod tests {
                 .events_after(&Scope::Thread(thread.id.clone()), 0)
                 .unwrap()
                 .into_iter()
-                .any(|envelope| matches!(
-                    envelope.event,
-                    Event::TurnCapacityAcquired {
-                        background: true,
-                        ..
-                    }
-                ))
+                .any(|envelope| matches!(envelope.event, Event::TurnAdmitted { .. }))
         );
         assert_eq!(
             store

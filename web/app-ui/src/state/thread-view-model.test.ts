@@ -43,7 +43,7 @@ describe("ThreadViewModel", () => {
     expect(vm.turnPhase).toBeUndefined();
   });
 
-  it("distinguishes scheduler waiting from an actively running provider turn", () => {
+  it("distinguishes provider waiting from an actively running turn", () => {
     const vm = new ThreadViewModel();
     vm.apply(envelope(1, {
       type: "turn.started",
@@ -60,10 +60,9 @@ describe("ThreadViewModel", () => {
     });
 
     vm.apply(envelope(2, {
-      type: "turn.capacity_acquired",
+      type: "turn.admitted",
       turn: 4,
-      wait_ms: 125,
-      background: false,
+      provider_wait_ms: 125,
     }));
     expect(vm.items.at(-1)).toMatchObject({
       kind: "turn-status",
@@ -72,7 +71,7 @@ describe("ThreadViewModel", () => {
     });
   });
 
-  it("replays an early capacity event without regressing the visible state", () => {
+  it("replays a legacy early capacity event without regressing visible state", () => {
     const vm = new ThreadViewModel();
     vm.apply(envelope(1, {
       type: "turn.capacity_acquired",
@@ -804,10 +803,9 @@ describe("ThreadViewModel", () => {
       model: "codex/gpt-5.6-sol",
     }));
     vm.apply(envelope(2, {
-      type: "turn.capacity_acquired",
+      type: "turn.admitted",
       turn: 1,
-      wait_ms: 0,
-      background: false,
+      provider_wait_ms: 0,
     }));
     vm.apply(envelope(3, {
       type: "turn.usage_updated",
@@ -889,10 +887,9 @@ describe("ThreadViewModel", () => {
       model: "codex/gpt-5.6-sol",
     }));
     vm.apply(envelope(7, {
-      type: "turn.capacity_acquired",
+      type: "turn.admitted",
       turn: 2,
-      wait_ms: 0,
-      background: false,
+      provider_wait_ms: 0,
     }));
     expect(vm.lastUsage).toMatchObject({
       input_tokens: 12_000,
@@ -963,10 +960,9 @@ describe("ThreadViewModel", () => {
       model: "codex/gpt-5.6-sol",
     }));
     vm.apply(envelope(11, {
-      type: "turn.capacity_acquired",
+      type: "turn.admitted",
       turn: 3,
-      wait_ms: 0,
-      background: false,
+      provider_wait_ms: 0,
     }));
     vm.apply(envelope(12, {
       type: "turn.usage_updated",
@@ -1069,10 +1065,9 @@ describe("ThreadViewModel", () => {
       model: "codex/gpt-5.6-sol",
     }));
     vm.apply(envelope(2, {
-      type: "turn.capacity_acquired",
+      type: "turn.admitted",
       turn: 3,
-      wait_ms: 0,
-      background: true,
+      provider_wait_ms: 0,
     }));
     vm.apply(envelope(3, {
       type: "turn.usage_updated",

@@ -1,6 +1,6 @@
 # Read-shared turns and prioritized model capacity
 
-Status: Accepted (2026-07)
+Status: Partially superseded by 0042 (2026-08)
 
 ## Context
 
