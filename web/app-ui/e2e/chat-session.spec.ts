@@ -1394,6 +1394,12 @@ test("subscription status renders complete quota lines in the workspace usage pa
 
   const panel = page.locator("trouve-session-usage-panel");
   await expect(panel).toBeVisible();
+  const usageTab = panel.getByRole("tab", { name: "Usage", exact: true });
+  const threadTab = panel.getByRole("tab", { name: "Thread", exact: true });
+  const sessionTab = panel.getByRole("tab", { name: "Session", exact: true });
+  const tabPanel = panel.getByRole("tabpanel");
+  await expect(usageTab).toHaveAttribute("aria-selected", "true");
+  await expect(tabPanel).toHaveAttribute("aria-labelledby", await usageTab.getAttribute("id") ?? "");
   const subscription = panel.locator('[aria-label="test subscription usage"]');
   await expect(subscription).toContainText("pro plan");
   await expect(subscription).toContainText("Weekly");
@@ -1401,6 +1407,31 @@ test("subscription status renders complete quota lines in the workspace usage pa
   await expect(
     subscription.getByRole("progressbar", { name: "Weekly" }),
   ).toHaveAttribute("aria-valuenow", "57");
+
+  await threadTab.focus();
+  await threadTab.press("ArrowRight");
+  await expect(sessionTab).toBeFocused();
+  await expect(sessionTab).toHaveAttribute("aria-selected", "true");
+  await expect(tabPanel).toHaveAttribute("aria-labelledby", await sessionTab.getAttribute("id") ?? "");
+  await expect(tabPanel).toContainText("1 turn");
+  await expect(tabPanel).toContainText("No completed usage yet.");
+  await expect(subscription).toHaveCount(0);
+
+  const duplicateIds = await panel.evaluate((element) => {
+    const second = document.createElement("trouve-session-usage-panel");
+    second.setAttribute("session-id", "se_1");
+    second.setAttribute("thread-id", "th_1");
+    second.setAttribute("model", "test/model");
+    element.after(second);
+    return second.updateComplete.then(() => {
+      const ids = [...document.querySelectorAll<HTMLElement>(
+        "trouve-session-usage-panel [id]",
+      )].map(({ id }) => id);
+      second.remove();
+      return ids.length - new Set(ids).size;
+    });
+  });
+  expect(duplicateIds).toBe(0);
   await expect(page.locator(".composer .subscription-option")).toHaveCount(0);
   await expect(page.locator(".composer .model-health-pill")).toHaveCount(0);
 });

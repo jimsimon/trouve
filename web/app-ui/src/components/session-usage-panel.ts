@@ -34,6 +34,8 @@ const USAGE_PANEL_TABS = [
   ["session", "Session"],
 ] as const satisfies readonly (readonly [UsagePanelTab, string])[];
 
+let nextSessionUsagePanelId = 0;
+
 const formatCount = (value: number): string =>
   new Intl.NumberFormat(undefined, { maximumFractionDigits: 0 }).format(value);
 
@@ -78,6 +80,7 @@ export class TrouveSessionUsagePanel extends withSignalTracking(LitElement) {
   #threadSummary: ProtocolUsageSummary | undefined;
   #localStatus: ProtocolLocalStatus | undefined;
   #activeTab: UsagePanelTab = "usage";
+  readonly #idPrefix = `session-usage-${nextSessionUsagePanelId += 1}`;
 
   protected override createRenderRoot(): HTMLElement {
     return this;
@@ -130,17 +133,17 @@ export class TrouveSessionUsagePanel extends withSignalTracking(LitElement) {
   #renderActive(kind: Exclude<SessionUsagePanelKind, "placeholder">) {
     if (this.#loading) {
       return html`<div
-        id="session-usage-panel"
+        id=${`${this.#idPrefix}-panel`}
         class="session-usage-tab-panel"
         role="tabpanel"
-        aria-labelledby=${`session-usage-tab-${this.#activeTab}`}
+        aria-labelledby=${`${this.#idPrefix}-tab-${this.#activeTab}`}
       ><p class="session-usage-placeholder" role="status">Loading usage details…</p></div>`;
     }
     return html`<div
-      id="session-usage-panel"
+      id=${`${this.#idPrefix}-panel`}
       class="session-usage-tab-panel"
       role="tabpanel"
-      aria-labelledby=${`session-usage-tab-${this.#activeTab}`}
+      aria-labelledby=${`${this.#idPrefix}-tab-${this.#activeTab}`}
     >${this.#renderActiveTab(kind)}</div>`;
   }
 
@@ -150,11 +153,11 @@ export class TrouveSessionUsagePanel extends withSignalTracking(LitElement) {
       <nav class="session-usage-tabs" role="tablist" aria-label="Usage views">
         ${USAGE_PANEL_TABS.map(([tab, label], index) => html`
           <button
-            id=${`session-usage-tab-${tab}`}
+            id=${`${this.#idPrefix}-tab-${tab}`}
             type="button"
             role="tab"
             aria-selected=${this.#activeTab === tab ? "true" : "false"}
-            aria-controls="session-usage-panel"
+            aria-controls=${`${this.#idPrefix}-panel`}
             tabindex=${rovingTabIndex(index, selectedIndex, USAGE_PANEL_TABS.length)}
             @keydown=${(event: KeyboardEvent) => this.#selectTabWithKeyboard(event, index)}
             @click=${() => this.#selectTab(tab)}
