@@ -323,10 +323,15 @@ sleep 2
     retry_turn.attach_background = true;
     let mut attached = backend.run_turn(retry_turn).await.unwrap();
 
-    let mut completed = false;
-    while let Some(event) = attached.next().await {
-        completed |= matches!(event.unwrap(), BackendEvent::Completed { .. });
-    }
+    let completed = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let mut completed = false;
+        while let Some(event) = attached.next().await {
+            completed |= matches!(event.unwrap(), BackendEvent::Completed { .. });
+        }
+        completed
+    })
+    .await
+    .expect("re-attached buffered stream never ended");
     assert!(completed, "the buffered completed turn must still drain");
 }
 

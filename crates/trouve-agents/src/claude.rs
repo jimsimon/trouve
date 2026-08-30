@@ -316,9 +316,9 @@ impl StdoutRouter {
         !self.state.lock().unwrap().background.is_empty()
     }
 
-    /// Must be called while holding `turn_boundary`, which makes this
-    /// synchronized liveness check atomic with the caller's stdin write and
-    /// the router's terminal-result transition.
+    /// Called immediately before a steering record write while holding
+    /// `turn_boundary`. The stdout pump may close terminal admission without
+    /// that boundary so it can never stop draining the vendor pipe.
     fn can_accept_steer(&self, attach_turn: bool) -> bool {
         let state = self.state.lock().unwrap();
         state.turn.is_some()
@@ -329,11 +329,10 @@ impl StdoutRouter {
 
     /// Close steering admission as soon as stdout yields a terminal record,
     /// before that record can wait in the pump-to-router channel.
-    async fn line_received(&self, line: &str) {
+    fn line_received(&self, line: &str) {
         if !line_is_result(line) {
             return;
         }
-        let _turn_boundary = self.turn_boundary.lock().await;
         let mut state = self.state.lock().unwrap();
         state.terminal_pending = state.turn.is_some()
             && if state.turn_is_attach {
@@ -906,17 +905,21 @@ impl AgentBackend for ClaudeBackend {
                 steer.session
             )));
         }
-        // Once this record starts, finish it even if request cancellation
-        // arrives. Dropping write_all between the JSON bytes and newline would
-        // corrupt the persistent stream-json transport for every later turn.
+        // Build one complete record before the final terminal-state check.
+        // Once this write starts, finish it even if request cancellation or a
+        // terminal stdout record arrives; a partial JSON line would corrupt
+        // the persistent stream-json transport for every later turn.
+        let mut record = message.to_string().into_bytes();
+        record.push(b'\n');
+        if !proc_.router.can_accept_steer(input.attach_turn) {
+            return Err(BackendError::Protocol(format!(
+                "claude steer: session {} has no active turn",
+                steer.session
+            )));
+        }
         input
             .stdin
-            .write_all(message.to_string().as_bytes())
-            .await
-            .map_err(BackendError::Io)?;
-        input
-            .stdin
-            .write_all(b"\n")
+            .write_all(&record)
             .await
             .map_err(BackendError::Io)?;
         input.stdin.flush().await.map_err(BackendError::Io)
@@ -1605,7 +1608,7 @@ impl ClaudeBackend {
         tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                pump_router.line_received(&line).await;
+                pump_router.line_received(&line);
                 if line_tx.send(line).await.is_err() {
                     break;
                 }
@@ -2036,12 +2039,12 @@ mod tests {
         router.prompt_delivered();
         assert!(router.can_accept_steer(false));
 
-        router.line_received(BG_RESULT).await;
-
         let _turn_boundary = router.turn_boundary.lock().await;
+        router.line_received(BG_RESULT);
+
         assert!(
             !router.can_accept_steer(false),
-            "a result read from stdout must close steering before routing"
+            "stdout receipt must close steering without waiting for a writer boundary"
         );
         assert!(
             router.is_busy(),
