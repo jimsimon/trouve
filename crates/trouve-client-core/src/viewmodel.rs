@@ -499,8 +499,19 @@ impl ThreadViewModel {
             .find(|i| matches!(i, ChatItem::ToolCall { call_id: c, .. } if c == call_id))
     }
 
-    /// Close the trailing open thinking block (any non-thinking output ends
-    /// it; a later thinking delta starts a fresh block).
+    /// Return the turn that owns the currently open thinking block.
+    fn active_thinking_turn(&self) -> Option<u64> {
+        self.items.iter().rev().find_map(|item| match item {
+            ChatItem::Thinking {
+                turn,
+                complete: false,
+                ..
+            } => Some(*turn),
+            _ => None,
+        })
+    }
+
+    /// Close the currently open thinking block.
     fn finish_thinking(&mut self) -> Option<usize> {
         self.thinking = false;
         self.active_thinking_id = None;
@@ -830,7 +841,10 @@ impl ThreadViewModel {
             Event::AssistantThinking { turn, id, text } => {
                 self.fail_open_compaction(*turn);
                 self.finish_progress();
-                if self.thinking && self.active_thinking_id.as_ref() != id.as_ref() {
+                if self.thinking
+                    && (self.active_thinking_id.as_ref() != id.as_ref()
+                        || self.active_thinking_turn() != Some(*turn))
+                {
                     self.finish_thinking();
                 }
                 self.thinking = true;
@@ -852,8 +866,10 @@ impl ThreadViewModel {
                     Some(self.items.len() - 1)
                 }
             }
-            Event::AssistantThinkingCompleted { id, .. } => {
-                if self.active_thinking_id.as_ref() == id.as_ref() {
+            Event::AssistantThinkingCompleted { turn, id } => {
+                if self.active_thinking_id.as_ref() == id.as_ref()
+                    && self.active_thinking_turn() == Some(*turn)
+                {
                     self.finish_thinking()
                 } else {
                     None
@@ -2130,13 +2146,20 @@ mod tests {
     }
 
     #[test]
-    fn thinking_completion_only_closes_the_matching_identity() {
+    fn thinking_lifecycle_matches_identity_and_turn() {
         let mut vm = ThreadViewModel::new();
         vm.apply(&env(Event::AssistantThinking {
             turn: 1,
             id: Some("reasoning".into()),
             text: "Waiting.".into(),
         }));
+        assert!(vm.thinking);
+
+        let changed = vm.apply(&env(Event::AssistantThinkingCompleted {
+            turn: 2,
+            id: Some("reasoning".into()),
+        }));
+        assert_eq!(changed, None);
         assert!(vm.thinking);
 
         let changed = vm.apply(&env(Event::AssistantThinkingCompleted {
@@ -2151,16 +2174,36 @@ mod tests {
             id: Some("reasoning".into()),
             text: " Still waiting.".into(),
         }));
+        vm.apply(&env(Event::AssistantThinking {
+            turn: 2,
+            id: Some("reasoning".into()),
+            text: "Next turn.".into(),
+        }));
+        assert!(matches!(
+            vm.items.as_slice(),
+            [
+                ChatItem::Thinking { content: first, complete: true, .. },
+                ChatItem::Thinking { content: second, complete: false, .. },
+            ] if first == "Waiting. Still waiting." && second == "Next turn."
+        ));
+
         let changed = vm.apply(&env(Event::AssistantThinkingCompleted {
             turn: 1,
             id: Some("reasoning".into()),
         }));
-        assert_eq!(changed, Some(0));
+        assert_eq!(changed, None);
+        assert!(vm.thinking);
+
+        let changed = vm.apply(&env(Event::AssistantThinkingCompleted {
+            turn: 2,
+            id: Some("reasoning".into()),
+        }));
+        assert_eq!(changed, Some(1));
         assert!(!vm.thinking);
         assert!(matches!(
-            vm.items.first(),
+            vm.items.last(),
             Some(ChatItem::Thinking { content, complete: true, .. })
-                if content == "Waiting. Still waiting."
+                if content == "Next turn."
         ));
     }
 

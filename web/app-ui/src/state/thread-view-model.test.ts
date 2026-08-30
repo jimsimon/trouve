@@ -512,7 +512,7 @@ describe("ThreadViewModel", () => {
     ]);
   });
 
-  it("ignores an unidentified completion for identified reasoning", () => {
+  it("matches reasoning completions by identity and turn", () => {
     const view = new ThreadViewModel();
     view.apply(envelope(1, {
       type: "assistant.thinking",
@@ -522,13 +522,29 @@ describe("ThreadViewModel", () => {
     }));
     view.apply(envelope(2, {
       type: "assistant.thinking_completed",
-      turn: 2,
+      turn: 3,
+      id: "reasoning-a",
     }));
     view.apply(envelope(3, {
+      type: "assistant.thinking_completed",
+      turn: 2,
+    }));
+    view.apply(envelope(4, {
       type: "assistant.thinking",
       turn: 2,
       id: "reasoning-a",
       text: "and after",
+    }));
+    view.apply(envelope(5, {
+      type: "assistant.thinking",
+      turn: 3,
+      id: "reasoning-a",
+      text: "next turn",
+    }));
+    view.apply(envelope(6, {
+      type: "assistant.thinking_completed",
+      turn: 2,
+      id: "reasoning-a",
     }));
 
     expect(view.thinking).toBe(true);
@@ -536,9 +552,26 @@ describe("ThreadViewModel", () => {
       expect.objectContaining({
         kind: "thinking",
         content: "before and after",
+        complete: true,
+      }),
+      expect.objectContaining({
+        kind: "thinking",
+        content: "next turn",
         complete: false,
       }),
     ]);
+
+    view.apply(envelope(7, {
+      type: "assistant.thinking_completed",
+      turn: 3,
+      id: "reasoning-a",
+    }));
+    expect(view.thinking).toBe(false);
+    expect(view.items.at(-1)).toEqual(expect.objectContaining({
+      kind: "thinking",
+      content: "next turn",
+      complete: true,
+    }));
   });
 
   it("keeps legacy unidentified reasoning split across tool requests", () => {

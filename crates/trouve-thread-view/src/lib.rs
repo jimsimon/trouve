@@ -267,7 +267,8 @@ impl ThreadProjection {
                 self.fail_open_compaction(*turn);
                 self.finish_progress(*turn);
                 if self.snapshot.thinking
-                    && self.snapshot.active_thinking_id.as_ref() != id.as_ref()
+                    && (self.snapshot.active_thinking_id.as_ref() != id.as_ref()
+                        || self.active_thinking_turn() != Some(*turn))
                 {
                     self.finish_thinking();
                 }
@@ -288,8 +289,10 @@ impl ThreadProjection {
                     self.indexes.latest_thinking = Some(idx);
                 }
             }
-            Event::AssistantThinkingCompleted { id, .. } => {
-                if self.snapshot.active_thinking_id.as_ref() == id.as_ref() {
+            Event::AssistantThinkingCompleted { turn, id } => {
+                if self.snapshot.active_thinking_id.as_ref() == id.as_ref()
+                    && self.active_thinking_turn() == Some(*turn)
+                {
                     self.finish_thinking();
                 }
             }
@@ -620,6 +623,18 @@ impl ThreadProjection {
     fn tool_mut(&mut self, call_id: &str) -> Option<&mut ThreadViewItem> {
         let idx = *self.indexes.tools.get(call_id)?;
         self.snapshot.items.get_mut(idx)
+    }
+
+    fn active_thinking_turn(&self) -> Option<u64> {
+        let idx = self.indexes.latest_thinking?;
+        match self.snapshot.items.get(idx) {
+            Some(ThreadViewItem::Thinking {
+                turn,
+                complete: false,
+                ..
+            }) => Some(*turn),
+            _ => None,
+        }
     }
 
     fn finish_thinking(&mut self) {
@@ -1865,7 +1880,7 @@ mod tests {
     }
 
     #[test]
-    fn thinking_completion_only_closes_the_matching_identity() {
+    fn thinking_lifecycle_matches_identity_and_turn() {
         let mut projection = ThreadProjection::default();
         projection.apply(&envelope(
             1,
@@ -1885,13 +1900,23 @@ mod tests {
         projection.apply(&envelope(
             2,
             25,
-            Event::AssistantThinkingCompleted { turn: 4, id: None },
+            Event::AssistantThinkingCompleted {
+                turn: 5,
+                id: Some("reasoning".into()),
+            },
         ));
         assert!(projection.snapshot.thinking);
 
         projection.apply(&envelope(
             3,
             50,
+            Event::AssistantThinkingCompleted { turn: 4, id: None },
+        ));
+        assert!(projection.snapshot.thinking);
+
+        projection.apply(&envelope(
+            4,
+            75,
             Event::AssistantThinking {
                 turn: 4,
                 id: Some("reasoning".into()),
@@ -1899,10 +1924,38 @@ mod tests {
             },
         ));
         projection.apply(&envelope(
-            4,
-            75,
+            5,
+            100,
+            Event::AssistantThinking {
+                turn: 5,
+                id: Some("reasoning".into()),
+                text: "Next turn.".into(),
+            },
+        ));
+        assert!(matches!(
+            projection.snapshot.items.as_slice(),
+            [
+                ThreadViewItem::Thinking { content: first, complete: true, .. },
+                ThreadViewItem::Thinking { content: second, complete: false, .. },
+            ] if first == "Waiting for the next event. Still waiting."
+                && second == "Next turn."
+        ));
+
+        projection.apply(&envelope(
+            6,
+            125,
             Event::AssistantThinkingCompleted {
                 turn: 4,
+                id: Some("reasoning".into()),
+            },
+        ));
+        assert!(projection.snapshot.thinking);
+
+        projection.apply(&envelope(
+            7,
+            150,
+            Event::AssistantThinkingCompleted {
+                turn: 5,
                 id: Some("reasoning".into()),
             },
         ));
@@ -1911,7 +1964,7 @@ mod tests {
         assert!(matches!(
             projection.snapshot.items.last(),
             Some(ThreadViewItem::Thinking { content, complete: true, .. })
-                if content == "Waiting for the next event. Still waiting."
+                if content == "Next turn."
         ));
     }
 

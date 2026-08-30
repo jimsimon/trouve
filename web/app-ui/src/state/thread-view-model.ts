@@ -753,7 +753,10 @@ export class ThreadViewModel {
         this.failOpenCompaction(envelope.turn);
         this.finishProgress();
         const id = envelope.id ?? undefined;
-        if (this.thinking && this.#activeThinkingId !== id) {
+        if (
+          this.thinking
+          && (this.#activeThinkingId !== id || this.activeThinkingTurn() !== envelope.turn)
+        ) {
           this.finishThinking();
         }
         this.thinking = true;
@@ -773,7 +776,7 @@ export class ThreadViewModel {
       }
       case "assistant.thinking_completed": {
         const id = envelope.id ?? undefined;
-        return this.#activeThinkingId === id
+        return this.#activeThinkingId === id && this.activeThinkingTurn() === envelope.turn
           ? this.finishThinking()
           : false;
       }
@@ -1093,6 +1096,13 @@ export class ThreadViewModel {
     return this.#findLast(
       (item) => item.kind === kind && item.turn === turn && !item.complete,
     );
+  }
+
+  private activeThinkingTurn(): number | undefined {
+    const item = this.#findLast(
+      (candidate) => candidate.kind === "thinking" && !candidate.complete,
+    );
+    return item?.kind === "thinking" ? item.turn : undefined;
   }
 
   private finishThinking(): boolean {
