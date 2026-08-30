@@ -145,7 +145,9 @@ export class TrouveModelOptionsEditor extends LitElement {
                 const choice = Number.isInteger(choiceIndex)
                   ? control.choices[choiceIndex]
                   : undefined;
-                if (choice !== undefined) this.#emit(control.key, choice.value);
+                if (choice !== undefined) {
+                  this.#emit(control.key, choice.value, choice.numberSource);
+                }
               }}
             >
               <option
@@ -261,17 +263,22 @@ export class TrouveModelOptionsEditor extends LitElement {
       return;
     }
     input.setCustomValidity("");
-    const committed = String(value ?? "");
+    const numberSource = typeof value === "number" ? raw : undefined;
+    const committed = numberSource ?? String(value ?? "");
     if (this.#committedText.get(input) === committed) return;
     this.#committedText.set(input, committed);
-    this.#emit(control.key, value);
+    this.#emit(control.key, value, numberSource);
   }
 
-  #emit(key: string, value: ModelOptionValue | undefined): void {
+  #emit(key: string, value: ModelOptionValue | undefined, numberSource?: string): void {
     this.dispatchEvent(new CustomEvent<ModelOptionChangeDetail>(
       MODEL_OPTION_CHANGED_EVENT,
       {
-        detail: { key, value },
+        detail: {
+          key,
+          value,
+          ...(numberSource === undefined ? {} : { numberSource }),
+        },
         bubbles: true,
         composed: true,
       },

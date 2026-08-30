@@ -1,6 +1,7 @@
 const LOSSY_NUMBER = Symbol("trouve-lossy-json-number");
 const EXACT_OPTION_SCHEMA_NODES = new WeakSet<object>();
 const EXACT_MODEL_OPTION_NUMBER_TOKENS = new WeakMap<object, ReadonlyMap<string, string>>();
+const JSON_NUMBER_TOKEN = /^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$/u;
 
 interface ParsedNumber {
   readonly [LOSSY_NUMBER]: true;
@@ -30,33 +31,40 @@ const normalizedNumberToken = (raw: string): string => {
   const [coefficient, exponent = "0"] = raw.split(/[eE]/u);
   const [integer, fraction = ""] = coefficient!.split(".");
   const digits = `${integer}${fraction}`.replace(/^[+-]?0*/u, "");
-  if (digits === "") return "0";
+  if (digits === "") return `${sign}0`;
   const trimmed = digits.replace(/0+$/u, "");
   return `${sign}${trimmed}e${
     Number(exponent) - fraction.length + digits.length - trimmed.length
   }`;
 };
 
+/** The JSON token this runtime emits for a number. Preserve signed zero,
+ * which native JSON.stringify otherwise changes to positive zero. */
+export const jsonNumberValueToken = (value: number): string =>
+  Object.is(value, -0) ? "-0" : JSON.stringify(value);
+
+/** Numbers outside the safe-integer subset, plus signed zero, require a
+ * verified source token before they can be used as model option values. */
+export const modelOptionNumberNeedsSourceProof = (value: number): boolean =>
+  !Number.isSafeInteger(value) || Object.is(value, -0);
+
 /** Whether parsing a JSON number token produced exactly the value that would
  * be serialized back onto the wire. Equivalent spellings such as `1e3` and
  * `1000` compare equal; rounded integers and high-precision decimals do not. */
 export const jsonNumberTokenIsExact = (raw: string, value: number): boolean => {
-  if (!Number.isFinite(value)) return false;
-  const serialized = JSON.stringify(value);
-  return serialized !== undefined
-    && normalizedNumberToken(raw) === normalizedNumberToken(serialized);
+  if (!Number.isFinite(value) || !JSON_NUMBER_TOKEN.test(raw)) return false;
+  return normalizedNumberToken(raw) === normalizedNumberToken(jsonNumberValueToken(value));
 };
 
-/** Whether a model-option number still has a verified source token. Safe
- * integers do not require provenance; every other Number does. */
-export const protocolModelOptionNumberIsExact = (
+/** Return a still-valid source token for one model-option number. */
+export const protocolModelOptionNumberSource = (
   options: object,
   key: string,
   value: unknown,
-): boolean => {
-  if (typeof value !== "number" || Number.isSafeInteger(value)) return true;
+): string | undefined => {
+  if (typeof value !== "number") return undefined;
   const source = EXACT_MODEL_OPTION_NUMBER_TOKENS.get(options)?.get(key);
-  return source !== undefined && jsonNumberTokenIsExact(source, value);
+  return source !== undefined && jsonNumberTokenIsExact(source, value) ? source : undefined;
 };
 
 /** Clone an option map without discarding verified number-token provenance. */
@@ -78,10 +86,7 @@ export const updateProtocolModelOption = <Existing, Value>(
   key: string,
   value: Value | undefined,
   remove: readonly string[] = [],
-  numberSource?: {
-    readonly options: object;
-    readonly key: string;
-  },
+  numberSource?: string,
 ): Record<string, Existing | Value> => {
   const next: Record<string, Existing | Value> = copyProtocolModelOptions(options);
   const tokens = new Map(EXACT_MODEL_OPTION_NUMBER_TOKENS.get(next) ?? []);
@@ -94,22 +99,18 @@ export const updateProtocolModelOption = <Existing, Value>(
     tokens.delete(key);
   } else {
     next[key] = value;
+    tokens.delete(key);
     if (typeof value === "number") {
-      const retainedSource = numberSource === undefined
-        ? undefined
-        : EXACT_MODEL_OPTION_NUMBER_TOKENS.get(numberSource.options)?.get(numberSource.key);
-      const source = retainedSource !== undefined
-          && jsonNumberTokenIsExact(retainedSource, value)
-        ? retainedSource
-        : JSON.stringify(value);
-      if (source !== undefined && jsonNumberTokenIsExact(source, value)) {
-        tokens.set(key, source);
+      if (numberSource !== undefined && jsonNumberTokenIsExact(numberSource, value)) {
+        tokens.set(key, numberSource);
       }
-    } else {
-      tokens.delete(key);
     }
   }
-  if (tokens.size > 0) EXACT_MODEL_OPTION_NUMBER_TOKENS.set(next, tokens);
+  if (tokens.size > 0) {
+    EXACT_MODEL_OPTION_NUMBER_TOKENS.set(next, tokens);
+  } else {
+    EXACT_MODEL_OPTION_NUMBER_TOKENS.delete(next);
+  }
   return next;
 };
 
@@ -220,13 +221,11 @@ const serializeProtocolValue = (
   if (typeof value === "number") {
     const source = parent === undefined
       ? undefined
-      : EXACT_MODEL_OPTION_NUMBER_TOKENS.get(parent)?.get(key);
-    if (modelOptionMap && !Number.isSafeInteger(value) && source === undefined) {
+      : protocolModelOptionNumberSource(parent, key, value);
+    if (modelOptionMap && modelOptionNumberNeedsSourceProof(value) && source === undefined) {
       throw new UnsupportedModelOptionNumberError();
     }
-    return source !== undefined && jsonNumberTokenIsExact(source, value)
-      ? source
-      : JSON.stringify(value);
+    return source ?? jsonNumberValueToken(value);
   }
   if (typeof value === "string" || typeof value === "boolean") return JSON.stringify(value);
   if (typeof value !== "object") return undefined;

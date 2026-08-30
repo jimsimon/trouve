@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vitest";
 
 import type { ProtocolModelInfo } from "../services/protocol-client.js";
-import { parseProtocolJson } from "../services/protocol-json.js";
+import {
+  parseProtocolJson,
+  stringifyProtocolJson,
+  UnsupportedModelOptionNumberError,
+} from "../services/protocol-json.js";
 import {
   changeModelOption,
   modelOptionControls,
@@ -52,7 +56,7 @@ describe("model option controls", () => {
       reasoning_effort: "xhigh",
       context: "1m",
       fast: false,
-    }, { key: "temperature", value: 0.8 }));
+    }, { key: "temperature", value: 0.8, numberSource: "0.8" }));
 
     expect(controls).toEqual([
       {
@@ -265,7 +269,7 @@ describe("model option controls", () => {
       explicit_number: { type: "number" },
       default_number: { type: "number", default: 1e20 },
     }), exactLargeOptions)).toMatchObject([
-      { key: "explicit_number", overridden: true, text: "100000000000000000000" },
+      { key: "explicit_number", overridden: true, text: "1e20" },
       { key: "default_number", overridden: false, text: "100000000000000000000" },
     ]);
     expect(modelOptionControls(rawModel({
@@ -301,6 +305,24 @@ describe("model option controls", () => {
       "1e-324",
       "3e-324",
     ]) expect(modelOptionTextValue(control, raw)).toBeNull();
+  });
+
+  it("carries verified input tokens into protocol requests", () => {
+    const exact = changeModelOption({}, {
+      key: "temperature",
+      value: 0.1,
+      numberSource: "0.10000000000000000",
+    });
+    expect(stringifyProtocolJson({ model_options: exact })).toBe(
+      '{"model_options":{"temperature":0.10000000000000000}}',
+    );
+
+    const unverified = changeModelOption({}, {
+      key: "temperature",
+      value: 0.12345678901234568,
+    });
+    expect(() => stringifyProtocolJson({ model_options: unverified }))
+      .toThrow(UnsupportedModelOptionNumberError);
   });
 
   it("applies and removes overrides without retaining a duplicate legacy key", () => {

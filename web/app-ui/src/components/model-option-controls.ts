@@ -1,7 +1,9 @@
 import type { ProtocolModelInfo } from "../services/protocol-client.js";
 import {
   jsonNumberTokenIsExact,
-  protocolModelOptionNumberIsExact,
+  jsonNumberValueToken,
+  modelOptionNumberNeedsSourceProof,
+  protocolModelOptionNumberSource,
   protocolOptionSchemaNumbersAreExact,
   updateProtocolModelOption,
 } from "../services/protocol-json.js";
@@ -21,6 +23,7 @@ export interface ChoiceModelOptionControl extends ModelOptionControlBase {
   readonly choices: readonly {
     readonly label: string;
     readonly value: ModelOptionValue;
+    readonly numberSource?: string;
   }[];
   readonly selectedIndex: number;
 }
@@ -48,6 +51,8 @@ export interface ModelOptionChangeDetail {
   readonly key: string;
   /** Undefined removes an explicit override and restores the model default. */
   readonly value: ModelOptionValue | undefined;
+  /** Original verified JSON token for a numeric value. */
+  readonly numberSource?: string;
 }
 
 const THINKING_KEYS = new Set([
@@ -121,11 +126,11 @@ const hasUnsupportedConstraints = (
  * provenance so downstream state cannot mistake a rounded Number for the
  * original JSON/input token. */
 const optionNumberIsSafe = (value: number, sourceVerified: boolean): boolean =>
-  Number.isFinite(value) && (Number.isSafeInteger(value) || sourceVerified);
+  Number.isFinite(value) && (!modelOptionNumberNeedsSourceProof(value) || sourceVerified);
 
 const numericMetadataNeedsSourceProof = (value: unknown): boolean =>
   typeof value === "number"
-    ? !Number.isSafeInteger(value)
+    ? modelOptionNumberNeedsSourceProof(value)
     : Array.isArray(value)
       ? value.some(numericMetadataNeedsSourceProof)
       : typeof value === "object" && value !== null
@@ -172,7 +177,7 @@ const optionLabel = (key: string): string => {
 const valueLabel = (value: ModelOptionValue): string => {
   if (value === true) return "On";
   if (value === false) return "Off";
-  if (typeof value === "number") return String(value);
+  if (typeof value === "number") return jsonNumberValueToken(value);
   if (/^[+-]?(?:\d+(?:\.\d+)?|\.\d+)[km]$/iu.test(value)) {
     return value.toUpperCase();
   }
@@ -201,6 +206,11 @@ const choiceValues = (
     return advertised.map((value, index) => ({
       value,
       label: labels?.[index] ?? valueLabel(value),
+      ...(typeof value === "number"
+          && modelOptionNumberNeedsSourceProof(value)
+          && protocolOptionSchemaNumbersAreExact(property)
+        ? { numberSource: jsonNumberValueToken(value) }
+        : {}),
     }));
   }
 
@@ -227,6 +237,11 @@ const choiceValues = (
       label: typeof entry["title"] === "string"
         ? entry["title"]
         : valueLabel(value),
+      ...(typeof value === "number"
+          && modelOptionNumberNeedsSourceProof(value)
+          && protocolOptionSchemaNumbersAreExact(property)
+        ? { numberSource: jsonNumberValueToken(value) }
+        : {}),
     });
   }
   return new Set(choices.map(({ value }) => `${typeof value}:${String(value)}`)).size
@@ -235,8 +250,13 @@ const choiceValues = (
     : undefined;
 };
 
-const optionText = (value: unknown, type?: ModelOptionScalarType): string =>
-  type === "number" && Number.isFinite(value as number)
+const optionText = (
+  value: unknown,
+  type?: ModelOptionScalarType,
+  numberSource?: string,
+): string => typeof value === "number" && Number.isFinite(value)
+  ? numberSource ?? jsonNumberValueToken(value)
+  : type === "number" && Number.isFinite(value as number)
     || scalar(value) ? String(value) : "";
 
 const optionHint = (property: Readonly<Record<string, unknown>>): string => {
@@ -253,7 +273,7 @@ const optionHint = (property: Readonly<Record<string, unknown>>): string => {
 interface StoredOptionValue {
   readonly value: unknown;
   readonly numberSourceVerified: boolean;
-  readonly sourceKey: string;
+  readonly numberSource?: string;
 }
 
 const storedValues = (
@@ -280,13 +300,17 @@ const storedValues = (
           && stored.trim() !== ""
         ? Number(stored)
         : stored;
+      const numberSource = typeof value !== "number"
+        ? undefined
+        : typeof stored === "string" && jsonNumberTokenIsExact(stored, value)
+          ? stored
+          : protocolModelOptionNumberSource(options, candidate, stored);
       return {
         value,
-        sourceKey: candidate,
+        ...(numberSource === undefined ? {} : { numberSource }),
         numberSourceVerified: typeof value !== "number"
-          || typeof stored === "string"
-            && jsonNumberTokenIsExact(stored, value)
-          || protocolModelOptionNumberIsExact(options, candidate, stored),
+          || !modelOptionNumberNeedsSourceProof(value)
+          || numberSource !== undefined,
       };
     });
 };
@@ -429,7 +453,7 @@ export const modelOptionControls = (
       description,
       overridden: explicitValue !== undefined,
       scalarType: type,
-      text: optionText(value, type),
+      text: optionText(value, type, selected?.numberSource),
       hint: optionHint(property),
       ...(minimum === undefined ? {} : { minimum }),
       ...(maximum === undefined ? {} : { maximum }),
@@ -500,7 +524,7 @@ export const sanitizeModelOptions = (
         control.key,
         candidate.value,
         [],
-        { options, key: candidate.sourceKey },
+        candidate.numberSource,
       );
     }
   }
@@ -519,6 +543,7 @@ export const changeModelOption = <T>(
     change.key,
     change.value,
     remove,
+    change.numberSource,
   );
 };
 

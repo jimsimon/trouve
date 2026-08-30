@@ -14,6 +14,9 @@ describe("protocol JSON number preservation", () => {
     expect(jsonNumberTokenIsExact("9007199254740993", 9_007_199_254_740_992)).toBe(false);
     expect(jsonNumberTokenIsExact("0.1234567890123456789", 0.12345678901234568))
       .toBe(false);
+    expect(jsonNumberTokenIsExact("-0", -0)).toBe(true);
+    expect(jsonNumberTokenIsExact("-0", 0)).toBe(false);
+    expect(jsonNumberTokenIsExact("01", 1)).toBe(false);
   });
 
   it("hides lossy schema properties without rounding ordinary protocol numbers", () => {
@@ -43,15 +46,21 @@ describe("protocol JSON number preservation", () => {
       '{"model_options":{"temperature":0.1234567890123456789}}',
     )).toThrow(UnsupportedModelOptionNumberError);
     const exact = parseProtocolJson(
-      '{"model_options":{"temperature":0.10000000000000000,"large":1e20}}',
+      '{"model_options":{"temperature":0.10000000000000000,"large":1e20,"zero":-0}}',
     );
-    expect(exact).toEqual({ model_options: { temperature: 0.1, large: 1e20 } });
+    expect(exact).toEqual({ model_options: { temperature: 0.1, large: 1e20, zero: -0 } });
     expect(stringifyProtocolJson(exact)).toBe(
-      '{"model_options":{"temperature":0.10000000000000000,"large":1e20}}',
+      '{"model_options":{"temperature":0.10000000000000000,"large":1e20,"zero":-0}}',
     );
     expect(() => stringifyProtocolJson({
       model_options: { temperature: 0.12345678901234568 },
     })).toThrow(UnsupportedModelOptionNumberError);
+
+    const stale = parseProtocolJson(
+      '{"model_options":{"temperature":0.10000000000000000}}',
+    ) as { model_options: { temperature: number } };
+    stale.model_options.temperature = 0.12345678901234568;
+    expect(() => stringifyProtocolJson(stale)).toThrow(UnsupportedModelOptionNumberError);
 
     const nativeParse = JSON.parse.bind(JSON);
     const parseWithoutSource = vi.spyOn(JSON, "parse").mockImplementation((text, reviver) =>
