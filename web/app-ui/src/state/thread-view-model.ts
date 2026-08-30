@@ -750,12 +750,16 @@ export class ThreadViewModel {
       case "assistant.progress_completed":
         return this.finishProgress();
       case "assistant.thinking": {
+        const activeTurn = this.activeThinkingTurn();
+        if (this.thinking && activeTurn !== undefined && envelope.turn < activeTurn) {
+          return false;
+        }
         this.failOpenCompaction(envelope.turn);
         this.finishProgress();
         const id = envelope.id ?? undefined;
         if (
           this.thinking
-          && (this.#activeThinkingId !== id || this.activeThinkingTurn() !== envelope.turn)
+          && (this.#activeThinkingId !== id || activeTurn !== envelope.turn)
         ) {
           this.finishThinking();
         }

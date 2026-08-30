@@ -542,6 +542,12 @@ describe("ThreadViewModel", () => {
       text: "next turn",
     }));
     view.apply(envelope(6, {
+      type: "assistant.thinking",
+      turn: 2,
+      id: "reasoning-a",
+      text: " late",
+    }));
+    view.apply(envelope(7, {
       type: "assistant.thinking_completed",
       turn: 2,
       id: "reasoning-a",
@@ -561,7 +567,7 @@ describe("ThreadViewModel", () => {
       }),
     ]);
 
-    view.apply(envelope(7, {
+    view.apply(envelope(8, {
       type: "assistant.thinking_completed",
       turn: 3,
       id: "reasoning-a",

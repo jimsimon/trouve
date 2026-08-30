@@ -839,11 +839,15 @@ impl ThreadViewModel {
             }
             Event::AssistantProgressCompleted { .. } => self.finish_progress(),
             Event::AssistantThinking { turn, id, text } => {
+                let active_turn = self.active_thinking_turn();
+                if self.thinking && active_turn.is_some_and(|active| *turn < active) {
+                    return None;
+                }
                 self.fail_open_compaction(*turn);
                 self.finish_progress();
                 if self.thinking
                     && (self.active_thinking_id.as_ref() != id.as_ref()
-                        || self.active_thinking_turn() != Some(*turn))
+                        || active_turn != Some(*turn))
                 {
                     self.finish_thinking();
                 }
@@ -2179,6 +2183,20 @@ mod tests {
             id: Some("reasoning".into()),
             text: "Next turn.".into(),
         }));
+        assert!(matches!(
+            vm.items.as_slice(),
+            [
+                ChatItem::Thinking { content: first, complete: true, .. },
+                ChatItem::Thinking { content: second, complete: false, .. },
+            ] if first == "Waiting. Still waiting." && second == "Next turn."
+        ));
+
+        let changed = vm.apply(&env(Event::AssistantThinking {
+            turn: 1,
+            id: Some("reasoning".into()),
+            text: " Late.".into(),
+        }));
+        assert_eq!(changed, None);
         assert!(matches!(
             vm.items.as_slice(),
             [

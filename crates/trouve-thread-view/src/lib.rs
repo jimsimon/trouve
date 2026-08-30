@@ -264,29 +264,33 @@ impl ThreadProjection {
                 self.finish_progress(*turn);
             }
             Event::AssistantThinking { turn, id, text } => {
-                self.fail_open_compaction(*turn);
-                self.finish_progress(*turn);
-                if self.snapshot.thinking
-                    && (self.snapshot.active_thinking_id.as_ref() != id.as_ref()
-                        || self.active_thinking_turn() != Some(*turn))
-                {
-                    self.finish_thinking();
-                }
-                self.snapshot.thinking = true;
-                self.snapshot.active_thinking_id = id.clone();
-                if let Some(&idx) = self.indexes.open_thinking.get(turn) {
-                    if let ThreadViewItem::Thinking { content, .. } = &mut self.snapshot.items[idx]
+                let active_turn = self.active_thinking_turn();
+                if !self.snapshot.thinking || active_turn.is_none_or(|active| *turn >= active) {
+                    self.fail_open_compaction(*turn);
+                    self.finish_progress(*turn);
+                    if self.snapshot.thinking
+                        && (self.snapshot.active_thinking_id.as_ref() != id.as_ref()
+                            || active_turn != Some(*turn))
                     {
-                        content.push_str(text);
+                        self.finish_thinking();
                     }
-                } else {
-                    let idx = self.push(ThreadViewItem::Thinking {
-                        turn: *turn,
-                        content: text.clone(),
-                        complete: false,
-                    });
-                    self.indexes.open_thinking.insert(*turn, idx);
-                    self.indexes.latest_thinking = Some(idx);
+                    self.snapshot.thinking = true;
+                    self.snapshot.active_thinking_id = id.clone();
+                    if let Some(&idx) = self.indexes.open_thinking.get(turn) {
+                        if let ThreadViewItem::Thinking { content, .. } =
+                            &mut self.snapshot.items[idx]
+                        {
+                            content.push_str(text);
+                        }
+                    } else {
+                        let idx = self.push(ThreadViewItem::Thinking {
+                            turn: *turn,
+                            content: text.clone(),
+                            complete: false,
+                        });
+                        self.indexes.open_thinking.insert(*turn, idx);
+                        self.indexes.latest_thinking = Some(idx);
+                    }
                 }
             }
             Event::AssistantThinkingCompleted { turn, id } => {
@@ -1944,6 +1948,24 @@ mod tests {
         projection.apply(&envelope(
             6,
             125,
+            Event::AssistantThinking {
+                turn: 4,
+                id: Some("reasoning".into()),
+                text: " Late.".into(),
+            },
+        ));
+        assert!(matches!(
+            projection.snapshot.items.as_slice(),
+            [
+                ThreadViewItem::Thinking { content: first, complete: true, .. },
+                ThreadViewItem::Thinking { content: second, complete: false, .. },
+            ] if first == "Waiting for the next event. Still waiting."
+                && second == "Next turn."
+        ));
+
+        projection.apply(&envelope(
+            7,
+            150,
             Event::AssistantThinkingCompleted {
                 turn: 4,
                 id: Some("reasoning".into()),
@@ -1952,8 +1974,8 @@ mod tests {
         assert!(projection.snapshot.thinking);
 
         projection.apply(&envelope(
-            7,
-            150,
+            8,
+            175,
             Event::AssistantThinkingCompleted {
                 turn: 5,
                 id: Some("reasoning".into()),
