@@ -128,13 +128,15 @@ const hasUnsupportedConstraints = (
 const optionNumberIsSafe = (value: number, sourceVerified: boolean): boolean =>
   Number.isFinite(value) && (!modelOptionNumberNeedsSourceProof(value) || sourceVerified);
 
-const numericMetadataNeedsSourceProof = (value: unknown): boolean =>
+/** Require parser provenance for every advertised number: lossy input can
+ * round to an apparently safe integer before this control layer sees it. */
+const containsNumericMetadata = (value: unknown): boolean =>
   typeof value === "number"
-    ? modelOptionNumberNeedsSourceProof(value)
+    ? true
     : Array.isArray(value)
-      ? value.some(numericMetadataNeedsSourceProof)
+      ? value.some(containsNumericMetadata)
       : typeof value === "object" && value !== null
-        && Object.values(value).some(numericMetadataNeedsSourceProof);
+        && Object.values(value).some(containsNumericMetadata);
 
 const matchesScalarType = (type: AdvertisedScalarType, value: unknown): boolean =>
   type === "string"
@@ -353,7 +355,7 @@ export const modelOptionControls = (
       || (Array.isArray(property["enum"]) && property["enum"].length <= 1)
       || advertisedType === null
       || hasUnsupportedConstraints(property)
-      || numericMetadataNeedsSourceProof(property)
+      || containsNumericMetadata(property)
         && !protocolOptionSchemaNumbersAreExact(property)
     ) continue;
     const label = typeof property["title"] === "string"

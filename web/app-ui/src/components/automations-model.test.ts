@@ -19,8 +19,11 @@ import {
   validateAutomationDraft,
 } from "./automations-model.js";
 
+const protocolModel = (value: ProtocolModelInfo): ProtocolModelInfo =>
+  parseProtocolJson(JSON.stringify(value)) as ProtocolModelInfo;
+
 describe("automation form model", () => {
-  const model: ProtocolModelInfo = {
+  const model = protocolModel({
     id: "provider/model",
     display_name: "Model",
     context_window: 128_000,
@@ -34,7 +37,7 @@ describe("automation form model", () => {
         },
       },
     },
-  };
+  });
   it("normalizes optional schedule and permission fields from older responses", () => {
     const draft = automationDraftFrom({
       id: "auto_1",
@@ -195,7 +198,7 @@ describe("automation form model", () => {
       thinking_budget_tokens: 8192,
       thinking_level: "16384",
     });
-    expect(automationRequestFromDraft(draft, {
+    expect(automationRequestFromDraft(draft, protocolModel({
       ...model,
       options_schema: {
         type: "object",
@@ -203,7 +206,7 @@ describe("automation form model", () => {
           thinking_budget_tokens: { type: "integer", minimum: 1024 },
         },
       },
-    }).model_options).toEqual({ thinking_budget_tokens: 8192 });
+    })).model_options).toEqual({ thinking_budget_tokens: 8192 });
 
     const staleAlias = automationDraftFrom({
       id: "auto_stale",

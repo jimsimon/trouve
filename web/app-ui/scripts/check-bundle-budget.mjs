@@ -36,7 +36,7 @@ const entryLimit = mode === "desktop" ? 856_000 : 850_000;
 // panel with its generated per-model usage schema and scope breakdowns, and
 // the scope-verdict causal-waypoint evidence schema and schema-driven model-
 // option editors and exact model-option number preservation. The combined
-// graphs emit 3,268,235 B for desktop and 3,253,380 B for PWA; preserve less
+// graphs emit 3,268,232 B for desktop and 3,253,377 B for PWA; preserve less
 // than 2 kB of headroom for each. Entry,
 // worker, and largest-chunk budgets below still prevent one bundle from hiding
 // in the aggregate.

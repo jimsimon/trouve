@@ -5,6 +5,7 @@ import type {
   ProtocolModelInfo,
   ProtocolProvidersResponse,
 } from "../services/protocol-client.js";
+import { parseProtocolJson } from "../services/protocol-json.js";
 import { changeModelOption } from "../components/model-option-controls.js";
 import {
   applyNewSessionModelOptionChange,
@@ -48,13 +49,13 @@ import {
 const model = (
   optionsSchema: unknown,
   id = "provider/model",
-): ProtocolModelInfo => ({
+): ProtocolModelInfo => parseProtocolJson(JSON.stringify({
   id,
   display_name: "Model",
   context_window: 128_000,
   supports_tools: true,
   options_schema: optionsSchema,
-});
+})) as ProtocolModelInfo;
 
 const mode = (defaultModel?: string | null): ProtocolAgentPersona => ({
   id: "code",

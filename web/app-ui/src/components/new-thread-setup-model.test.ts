@@ -11,6 +11,7 @@ import type {
   ProtocolModelInfo,
   ProtocolProvidersResponse,
 } from "../services/protocol-client.js";
+import { parseProtocolJson } from "../services/protocol-json.js";
 import {
   appendNewThreadAttachment,
   createInitialNewThreadDraft,
@@ -37,12 +38,15 @@ const mode = (
   ...(defaultModel === undefined ? {} : { default_model: defaultModel }),
 });
 
+const protocolModel = (value: ProtocolModelInfo): ProtocolModelInfo =>
+  parseProtocolJson(JSON.stringify(value)) as ProtocolModelInfo;
+
 const model = (
   id: string,
   option = "thinking_level",
   values: readonly string[] = ["low", "medium", "high"],
   defaultValue = "medium",
-): ProtocolModelInfo => ({
+): ProtocolModelInfo => protocolModel({
   id,
   display_name: id,
   context_window: 128_000,
@@ -106,7 +110,7 @@ describe("new thread setup model", () => {
   });
 
   it("applies global fixed thinking budgets and emits numeric thread options", () => {
-    const fixedModel: ProtocolModelInfo = {
+    const fixedModel = protocolModel({
       id: "provider/fixed",
       display_name: "Fixed",
       context_window: 128_000,
@@ -122,7 +126,7 @@ describe("new thread setup model", () => {
           },
         },
       },
-    };
+    });
     const fixedCatalog: NewThreadSetupCatalog = {
       modes: [mode("code")],
       models: [fixedModel],

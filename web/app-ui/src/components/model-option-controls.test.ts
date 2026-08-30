@@ -273,6 +273,14 @@ describe("model option controls", () => {
       { key: "default_number", overridden: false, text: "100000000000000000000" },
     ]);
     expect(modelOptionControls(rawModel({
+      unverified_safe_integer: {
+        type: "number",
+        default: 1,
+      },
+      unverified_safe_decimal: {
+        type: "number",
+        maximum: 0.5,
+      },
       unverified_integer_number: {
         type: "number",
         default: 9_007_199_254_740_992,
@@ -281,7 +289,8 @@ describe("model option controls", () => {
         type: "number",
         default: 0.12345678901234568,
       },
-    }), {})).toEqual([]);
+      input_only: { type: "number" },
+    }), {}).map(({ key }) => key)).toEqual(["input_only"]);
   });
 
   it("hides controls whose advertised numbers would be rounded by JavaScript", () => {
