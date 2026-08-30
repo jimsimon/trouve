@@ -1782,7 +1782,7 @@ struct ActiveTurnSteerer {
     mutation_lane_state: tokio::sync::watch::Sender<SteerMutationLaneState>,
 }
 
-struct PendingNativeTurnSteerer {
+struct PendingTurnSteerer {
     turn: u64,
     receiver: tokio::sync::mpsc::Receiver<SteerTurnCommand>,
     mutation_lane_state: tokio::sync::watch::Sender<SteerMutationLaneState>,
@@ -2163,10 +2163,10 @@ pub struct Engine {
     /// additional user input during an active turn. The turn number protects
     /// cleanup from removing a newer registration for the same thread.
     turn_steerers: Mutex<HashMap<String, ActiveTurnSteerer>>,
-    /// Native-provider receivers installed before their steerable
+    /// Provider/backend receivers installed before their steerable
     /// `turn.started` event becomes visible. `run_turn` claims the receiver;
     /// the public sender is already ready when clients observe the event.
-    pending_native_steerers: Mutex<HashMap<String, PendingNativeTurnSteerer>>,
+    pending_turn_steerers: Mutex<HashMap<String, PendingTurnSteerer>>,
     /// Threads where a new prompt arrived after cancellation was requested.
     /// The cancelling dispatcher consumes this marker and resumes the queue
     /// instead of leaving that explicitly submitted follow-up paused.
@@ -2581,7 +2581,7 @@ impl Engine {
             deleting_sessions: Mutex::new(std::collections::HashSet::new()),
             turn_cancels: Mutex::new(std::collections::HashMap::new()),
             turn_steerers: Mutex::new(HashMap::new()),
-            pending_native_steerers: Mutex::new(HashMap::new()),
+            pending_turn_steerers: Mutex::new(HashMap::new()),
             resume_after_cancel: Mutex::new(HashSet::new()),
             github_dashboard_caches: Mutex::new(HashMap::new()),
             github_pr_detail_cache: Mutex::new(GithubPrDetailCache::default()),
@@ -9845,6 +9845,13 @@ impl Engine {
         self.send_message_with_tools(thread_id, content, Vec::new(), false, false)
     }
 
+    fn turn_supports_steering(&self, thread: &Thread, tools_enabled: bool) -> bool {
+        tools_enabled
+            && self
+                .backend_for(&thread.model)
+                .is_none_or(|(_, backend, _)| backend.supports_steering())
+    }
+
     fn turn_shell_events(
         &self,
         thread: &Thread,
@@ -9860,7 +9867,7 @@ impl Engine {
                         .models()
                         .into_iter()
                         .find(|model| model.id == thread.model),
-                    tools_enabled && backend.supports_steering(),
+                    self.turn_supports_steering(thread, tools_enabled),
                 )
             } else {
                 (
@@ -9872,7 +9879,7 @@ impl Engine {
                                 .into_iter()
                                 .find(|model| model.id == thread.model)
                         }),
-                    tools_enabled,
+                    self.turn_supports_steering(thread, tools_enabled),
                 )
             };
         if selected_model.is_some() {
@@ -9896,16 +9903,16 @@ impl Engine {
         ])
     }
 
-    fn register_native_turn_steerer(&self, thread_id: &str, turn: u64) {
+    fn register_turn_steerer(&self, thread_id: &str, turn: u64) {
         let (sender, receiver) = tokio::sync::mpsc::channel(8);
         let (mutation_lane_state, _) = tokio::sync::watch::channel(SteerMutationLaneState::Idle);
-        let pending = PendingNativeTurnSteerer {
+        let pending = PendingTurnSteerer {
             turn,
             receiver,
             mutation_lane_state: mutation_lane_state.clone(),
         };
         if let Some(replaced) = self
-            .pending_native_steerers
+            .pending_turn_steerers
             .lock()
             .unwrap()
             .insert(thread_id.to_string(), pending)
@@ -9928,20 +9935,16 @@ impl Engine {
         }
     }
 
-    fn take_native_turn_steerer(
-        &self,
-        thread_id: &str,
-        turn: u64,
-    ) -> Option<PendingNativeTurnSteerer> {
-        let mut pending = self.pending_native_steerers.lock().unwrap();
+    fn take_turn_steerer(&self, thread_id: &str, turn: u64) -> Option<PendingTurnSteerer> {
+        let mut pending = self.pending_turn_steerers.lock().unwrap();
         pending
             .get(thread_id)
             .is_some_and(|entry| entry.turn == turn)
             .then(|| pending.remove(thread_id).expect("matching pending steerer"))
     }
 
-    fn unregister_native_turn_steerer(&self, thread_id: &str, turn: u64) {
-        if let Some(pending) = self.take_native_turn_steerer(thread_id, turn) {
+    fn unregister_turn_steerer(&self, thread_id: &str, turn: u64) {
+        if let Some(pending) = self.take_turn_steerer(thread_id, turn) {
             pending
                 .mutation_lane_state
                 .send_replace(SteerMutationLaneState::Ended);
@@ -9956,6 +9959,35 @@ impl Engine {
                 .mutation_lane_state
                 .send_replace(SteerMutationLaneState::Ended);
         }
+    }
+
+    /// Returns whether the exact turn has installed its steering receiver.
+    /// This is a narrow lifecycle diagnostic used by integration tests to
+    /// verify that the advertised capability and receiver become visible at
+    /// the same commit boundary.
+    #[doc(hidden)]
+    pub fn turn_accepts_steering(&self, thread_id: &str, turn: u64) -> bool {
+        self.turn_steerers
+            .lock()
+            .unwrap()
+            .get(thread_id)
+            .is_some_and(|steerer| steerer.turn == turn)
+    }
+
+    /// Returns the number of steering commands queued at the receiver for an
+    /// exact turn. Integration tests use this instead of a scheduling delay
+    /// when they need to hold provider startup behind an already-arrived HTTP
+    /// steering request.
+    #[doc(hidden)]
+    pub fn pending_turn_steers(&self, thread_id: &str, turn: u64) -> usize {
+        self.turn_steerers
+            .lock()
+            .unwrap()
+            .get(thread_id)
+            .filter(|steerer| steerer.turn == turn)
+            .map_or(0, |steerer| {
+                steerer.sender.max_capacity() - steerer.sender.capacity()
+            })
     }
 
     /// Append user guidance to the exact backend turn currently running on a
@@ -10339,12 +10371,13 @@ impl Engine {
 
         active.insert(thread_id.to_string(), thread.session_id.clone());
         let cancel = self.register_cancel(thread_id);
-        let native_steering = started_tools_enabled && self.backend_for(&thread.model).is_none();
-        if native_steering {
+        let turn_steering = self.turn_supports_steering(&thread, started_tools_enabled);
+        if turn_steering {
             // Install the receiver before committing TurnStarted. Once that
             // event is visible, an immediate steering request must have a
-            // live destination even if the provider task has not been polled.
-            self.register_native_turn_steerer(thread_id, turn);
+            // live destination even if provider/backend startup has not been
+            // polled.
+            self.register_turn_steerer(thread_id, turn);
         }
         let accepted = self.store.accept_prompt_with_events(
             PromptAcceptance {
@@ -10358,8 +10391,8 @@ impl Engine {
             events,
         );
         if let Err(error) = accepted {
-            if native_steering {
-                self.unregister_native_turn_steerer(thread_id, turn);
+            if turn_steering {
+                self.unregister_turn_steerer(thread_id, turn);
             }
             active.remove(thread_id);
             self.clear_cancel(thread_id);
@@ -11285,32 +11318,32 @@ impl Engine {
         let content = prompt.content.clone();
         let attachments = prompt.attachments.clone();
         let tools_enabled = self.store.queued_prompt_tools_enabled(&prompt.id)?;
-        let native_steering = tools_enabled && self.backend_for(&thread.model).is_none();
-        if native_steering && !prompt_persisted.load(Ordering::Acquire) {
+        let turn_steering = self.turn_supports_steering(thread, tools_enabled);
+        if turn_steering && !prompt_persisted.load(Ordering::Acquire) {
             // Queued prompts publish their shell only when claimed. Register
             // before that publication for the same readiness guarantee as an
             // immediately-started prompt.
-            self.register_native_turn_steerer(&thread.id, turn);
+            self.register_turn_steerer(&thread.id, turn);
         }
-        let pending_native_steerer = if native_steering {
-            self.take_native_turn_steerer(&thread.id, turn).or_else(|| {
+        let pending_turn_steerer = if turn_steering {
+            self.take_turn_steerer(&thread.id, turn).or_else(|| {
                 // Defensive recovery for a process-local registry loss: keep
                 // the active turn steerable, though ordinary sends always
                 // install this before TurnStarted is committed.
-                self.register_native_turn_steerer(&thread.id, turn);
-                self.take_native_turn_steerer(&thread.id, turn)
+                self.register_turn_steerer(&thread.id, turn);
+                self.take_turn_steerer(&thread.id, turn)
             })
         } else {
             None
         };
-        let (mut native_steer_rx, native_steer_mutation_lane_state) =
-            if let Some(pending) = pending_native_steerer {
+        let (mut turn_steer_rx, turn_steer_mutation_lane_state) =
+            if let Some(pending) = pending_turn_steerer {
                 (Some(pending.receiver), pending.mutation_lane_state)
             } else {
                 let (state, _) = tokio::sync::watch::channel(SteerMutationLaneState::Idle);
                 (None, state)
             };
-        let native_steerer_guard = native_steering.then(|| ActiveTurnSteererGuard {
+        let turn_steerer_guard = turn_steering.then(|| ActiveTurnSteererGuard {
             registry: &self.turn_steerers,
             thread_id: thread.id.clone(),
             turn,
@@ -11408,6 +11441,8 @@ impl Engine {
                     &prompt.id,
                     tools_enabled,
                     prompt.background,
+                    turn_steer_rx,
+                    turn_steer_mutation_lane_state,
                 )
                 .await;
         }
@@ -11552,10 +11587,10 @@ impl Engine {
             // next model invocation. Drain every already-accepted message so
             // the rebuilt transcript presents them in arrival order.
             loop {
-                let command = match native_steer_rx.as_mut().map(|rx| rx.try_recv()) {
+                let command = match turn_steer_rx.as_mut().map(|rx| rx.try_recv()) {
                     Some(Ok(command)) => command,
                     Some(Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)) => {
-                        native_steer_rx = None;
+                        turn_steer_rx = None;
                         break;
                     }
                     Some(Err(tokio::sync::mpsc::error::TryRecvError::Empty)) | None => break,
@@ -11565,7 +11600,7 @@ impl Engine {
                     thread,
                     turn,
                     &cancel,
-                    &native_steer_mutation_lane_state,
+                    &turn_steer_mutation_lane_state,
                     command,
                 )
                 .await?;
@@ -11609,7 +11644,7 @@ impl Engine {
                 let flush_at = persist_deadline.unwrap_or_else(Instant::now);
                 let steer_reserved = !cancel.is_cancelled()
                     && reserve_ready_steer_after_event_budget(
-                        &mut native_steer_rx,
+                        &mut turn_steer_rx,
                         &mut pending_native_steer,
                         &mut consecutive_provider_events,
                     );
@@ -11623,13 +11658,13 @@ impl Engine {
                         continue;
                     }
                     steer = receive_steer_command(
-                        &mut native_steer_rx,
+                        &mut turn_steer_rx,
                         &mut pending_native_steer,
                         true,
                     ), if !cancel.is_cancelled() => {
                         match steer {
                             Some(command) => boundary_steers.push(command),
-                            None => native_steer_rx = None,
+                            None => turn_steer_rx = None,
                         }
                         continue;
                     }
@@ -11684,10 +11719,10 @@ impl Engine {
             // batch, has settled.
             if !cancel.is_cancelled() {
                 loop {
-                    match native_steer_rx.as_mut().map(|rx| rx.try_recv()) {
+                    match turn_steer_rx.as_mut().map(|rx| rx.try_recv()) {
                         Some(Ok(command)) => boundary_steers.push(command),
                         Some(Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)) => {
-                            native_steer_rx = None;
+                            turn_steer_rx = None;
                             break;
                         }
                         Some(Err(tokio::sync::mpsc::error::TryRecvError::Empty)) | None => break,
@@ -11768,7 +11803,7 @@ impl Engine {
                         thread,
                         turn,
                         &cancel,
-                        &native_steer_mutation_lane_state,
+                        &turn_steer_mutation_lane_state,
                         command,
                     )
                     .await?;
@@ -11803,7 +11838,7 @@ impl Engine {
                     thread,
                     turn,
                     &cancel,
-                    &native_steer_mutation_lane_state,
+                    &turn_steer_mutation_lane_state,
                     command,
                 )
                 .await?;
@@ -11813,7 +11848,7 @@ impl Engine {
         // The bounded final-report pass is not an agent loop and cannot apply
         // further guidance. Close the capability before entering it so a late
         // request fails instead of waiting behind a response-only call.
-        drop(native_steerer_guard);
+        drop(turn_steerer_guard);
 
         // Truncated mid-work at the iteration budget: make one final
         // tool-free provider pass over the last tool results so the user gets
@@ -13432,6 +13467,8 @@ impl Engine {
         queued_prompt_id: &str,
         tools_enabled: bool,
         attach_background: bool,
+        mut steer_rx: Option<tokio::sync::mpsc::Receiver<SteerTurnCommand>>,
+        steer_mutation_lane_state: tokio::sync::watch::Sender<SteerMutationLaneState>,
     ) -> Result<()> {
         let startup_started = Instant::now();
         let scope = Scope::Thread(thread.id.clone());
@@ -13451,7 +13488,6 @@ impl Engine {
         );
         let selected_model = model_catalog.iter().find(|m| m.id == thread.model);
         normalize_thinking_option(&mut model_options, selected_model);
-        let supports_steering = tools_enabled && backend.supports_steering();
         // Some vendor protocols cannot remove their built-in read/search
         // tools. Keep those turns restricted (no mounted MCP tools and
         // read-only permission), but reserve strict tool-use rejection for
@@ -13634,34 +13670,6 @@ impl Engine {
             since_turn_started_ms = startup_started.elapsed().as_millis(),
             "agent startup timing: vendor turn accepted"
         );
-
-        let mut steer_rx = None;
-        let (steer_mutation_lane_state, _) =
-            tokio::sync::watch::channel(SteerMutationLaneState::Idle);
-        let _steerer_guard = if supports_steering {
-            let (sender, receiver) = tokio::sync::mpsc::channel(8);
-            let replaced = self.turn_steerers.lock().unwrap().insert(
-                thread.id.clone(),
-                ActiveTurnSteerer {
-                    turn,
-                    sender,
-                    mutation_lane_state: steer_mutation_lane_state.clone(),
-                },
-            );
-            if let Some(replaced) = replaced {
-                replaced
-                    .mutation_lane_state
-                    .send_replace(SteerMutationLaneState::Ended);
-            }
-            steer_rx = Some(receiver);
-            Some(ActiveTurnSteererGuard {
-                registry: &self.turn_steerers,
-                thread_id: thread.id.clone(),
-                turn,
-            })
-        } else {
-            None
-        };
 
         // `text` records the whole turn for the transcript; `segment` is the
         // current streamed block, flushed (finalized) at each tool boundary

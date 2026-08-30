@@ -556,7 +556,10 @@ impl Drop for ClaudeTurnGuard {
 }
 
 impl ClaudeProc {
-    async fn begin_turn(self: &Arc<Self>) -> Result<ClaudeTurnGuard, BackendError> {
+    async fn begin_turn(
+        self: &Arc<Self>,
+        prompt_already_sent: bool,
+    ) -> Result<ClaudeTurnGuard, BackendError> {
         let mut input = self.input.lock().await;
         self.active_turn
             .compare_exchange(
@@ -568,7 +571,7 @@ impl ClaudeProc {
             .map_err(|_| {
                 BackendError::Protocol("claude process already has an active turn".into())
             })?;
-        input.prompt_sent = false;
+        input.prompt_sent = prompt_already_sent;
         input.pending_steers.clear();
         Ok(ClaudeTurnGuard {
             proc_: self.clone(),
@@ -884,7 +887,9 @@ impl AgentBackend for ClaudeBackend {
             pool.terminate_and_remove(&thread_id, &proc_).await?;
             return Err(BackendError::Cancelled);
         }
-        let active_turn = proc_.begin_turn().await?;
+        // An attached autonomous turn is already running in Claude, so there
+        // is no initial trouve prompt that steering must wait behind.
+        let active_turn = proc_.begin_turn(turn.attach_background).await?;
         let prompt = turn.prompt.clone();
         // Anthropic-style base64 image blocks, alongside the text block.
         let mut content = vec![json!({ "type": "text", "text": prompt })];

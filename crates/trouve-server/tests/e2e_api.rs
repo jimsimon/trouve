@@ -496,7 +496,7 @@ async fn native_provider_turn_applies_steering_at_the_next_safe_boundary() {
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let router = trouve_server::build_router(engine);
+    let router = trouve_server::build_router(engine.clone());
     tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
     let base = format!("http://{addr}/v1");
     let client = reqwest::Client::new();
@@ -541,6 +541,10 @@ async fn native_provider_turn_applies_steering_at_the_next_safe_boundary() {
         .await
         .unwrap();
     assert_eq!(started.status(), reqwest::StatusCode::ACCEPTED);
+    assert!(
+        engine.turn_accepts_steering(thread_id, 1),
+        "TurnStarted must not advertise steering before its receiver is installed"
+    );
     let steer_client = client.clone();
     let steer_url = format!("{base}/threads/{thread_id}/steer");
     let pending_steer = tokio::spawn(async move {
@@ -550,11 +554,13 @@ async fn native_provider_turn_applies_steering_at_the_next_safe_boundary() {
             .send()
             .await
     });
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert!(
-        !pending_steer.is_finished(),
-        "steering was rejected after TurnStarted but before provider startup"
-    );
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while engine.pending_turn_steers(thread_id, 1) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("HTTP steering request should reach the installed receiver");
     provider
         .model_discovery_gate
         .as_ref()
@@ -2536,6 +2542,7 @@ async fn model_swap_hands_off_history_and_keeps_vendor_sessions() {
 /// backend capability, durable event ordering, and folded thread view.
 struct SteerableBackend {
     steers: std::sync::Mutex<Vec<(String, String, Vec<String>)>>,
+    model_discovery_gate: Arc<tokio::sync::Semaphore>,
     release: tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     tool_release: tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
@@ -2544,6 +2551,7 @@ impl SteerableBackend {
     fn new() -> Self {
         Self {
             steers: std::sync::Mutex::new(Vec::new()),
+            model_discovery_gate: Arc::new(tokio::sync::Semaphore::new(0)),
             release: tokio::sync::Mutex::new(None),
             tool_release: tokio::sync::Mutex::new(None),
         }
@@ -2576,6 +2584,15 @@ impl trouve_agents::AgentBackend for SteerableBackend {
             output_price_per_mtok: None,
             options_schema: serde_json::json!({"type": "object", "properties": {}}),
         }]
+    }
+
+    async fn list_models(&self) -> Vec<trouve_protocol::ModelInfo> {
+        self.model_discovery_gate
+            .acquire()
+            .await
+            .expect("backend model discovery gate remains open")
+            .forget();
+        self.models()
     }
 
     fn status(&self) -> trouve_agents::BackendStatus {
@@ -2785,6 +2802,11 @@ async fn active_backend_turn_can_be_steered_and_replays_on_its_timeline() {
         .await
         .unwrap();
     assert_eq!(started.status(), reqwest::StatusCode::ACCEPTED);
+    assert!(
+        engine.turn_accepts_steering(thread_id, 1),
+        "TurnStarted must not advertise steering before backend startup"
+    );
+    backend.model_discovery_gate.add_permits(8);
     let before = wait_for_event(&client, &events_url, |event| {
         event["type"] == "assistant.thinking"
     })

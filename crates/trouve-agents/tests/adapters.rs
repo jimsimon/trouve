@@ -179,6 +179,80 @@ EOF
 }
 
 #[tokio::test]
+async fn claude_adapter_steers_an_attached_background_turn_without_a_new_prompt() {
+    let tmp = tempfile::tempdir().unwrap();
+    let stub = write_stub(
+        tmp.path(),
+        "claude-background-steer",
+        r#"#!/bin/bash
+IFS= read -r initial_prompt
+cat <<'EOF'
+{"type":"system","subtype":"init","session_id":"sess-bg"}
+{"type":"result","subtype":"success","session_id":"sess-bg","usage":{"input_tokens":1,"output_tokens":1}}
+EOF
+sleep 0.05
+printf '%s\n' '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Background work."}}}'
+IFS= read -r steer
+printf '%s\n' "$steer" > "$0.steer"
+printf '%s\n' '{"type":"result","subtype":"success","session_id":"sess-bg","usage":{"input_tokens":2,"output_tokens":1}}'
+"#,
+    );
+    let backend = ClaudeBackend::new("claude-code", Some(stub.clone()));
+    let mut background_signals = backend
+        .take_background_turn_signals()
+        .expect("Claude exposes one background-turn signal receiver");
+
+    let mut initial = start_turn(&backend, || {
+        turn(tmp.path().to_path_buf(), None, BackendPermission::ReadOnly)
+    })
+    .await;
+    while let Some(event) = initial.next().await {
+        event.unwrap();
+    }
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(2), background_signals.recv())
+            .await
+            .expect("Claude should announce autonomous output")
+            .as_deref(),
+        Some("th_1")
+    );
+
+    let mut attached_turn = turn(
+        tmp.path().to_path_buf(),
+        Some("sess-bg"),
+        BackendPermission::ReadOnly,
+    );
+    attached_turn.attach_background = true;
+    let mut attached = backend.run_turn(attached_turn).await.unwrap();
+    backend
+        .steer_turn(BackendSteer {
+            cancel: Default::default(),
+            session: "sess-bg".into(),
+            prompt: "Refine the background work.".into(),
+            attachments: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+    let steer_path = PathBuf::from(format!("{stub}.steer"));
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !steer_path.exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("steering should be written before the attach stream is polled");
+    assert!(
+        std::fs::read_to_string(steer_path)
+            .unwrap()
+            .contains("Refine the background work.")
+    );
+    while let Some(event) = attached.next().await {
+        event.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn claude_adapter_reaps_persistent_process_before_cancelled_stream_closes() {
     let tmp = tempfile::tempdir().unwrap();
     let stub = write_stub(
