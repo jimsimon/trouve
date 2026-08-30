@@ -2484,6 +2484,32 @@ cat >/dev/null
         })
         .await
         .unwrap();
+    for index in 1..8 {
+        backend
+            .steer_turn(BackendSteer {
+                cancel: Default::default(),
+                session: "sess-steer".into(),
+                prompt: format!("queued direction {index}"),
+                attachments: Vec::new(),
+            })
+            .await
+            .unwrap();
+    }
+    let overflow = backend
+        .steer_turn(BackendSteer {
+            cancel: Default::default(),
+            session: "sess-steer".into(),
+            prompt: "one direction too many".into(),
+            attachments: Vec::new(),
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        overflow
+            .to_string()
+            .contains("pending steering queue is full"),
+        "{overflow}"
+    );
 
     let mut redirected = false;
     while let Some(event) = stream.next().await {

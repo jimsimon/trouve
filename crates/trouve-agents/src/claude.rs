@@ -47,6 +47,10 @@ const POOL_CAP: usize = 3;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 /// How often the reaper scans the pool.
 const REAP_INTERVAL: Duration = Duration::from_secs(60);
+/// Steering accepted before the lazy stream sends its initial prompt. The
+/// engine normally polls that stream immediately, but a continuously-ready
+/// steering producer must not grow process memory without bound.
+const PENDING_STEER_CAP: usize = 8;
 
 pub struct ClaudeBackend {
     id: String,
@@ -786,19 +790,29 @@ impl AgentBackend for ClaudeBackend {
             result = async {
                 let mut input = proc_.input.lock().await;
                 if !proc_.active_turn.load(std::sync::atomic::Ordering::Acquire) {
-                    return Err(std::io::Error::other(format!(
+                    return Err(BackendError::Protocol(format!(
                         "claude steer: session {} has no active turn",
                         steer.session
                     )));
                 }
                 if !input.prompt_sent {
+                    if input.pending_steers.len() >= PENDING_STEER_CAP {
+                        return Err(BackendError::Protocol(format!(
+                            "claude steer: session {} pending steering queue is full",
+                            steer.session
+                        )));
+                    }
                     input.pending_steers.push(message);
                     return Ok(());
                 }
-                input.stdin.write_all(message.to_string().as_bytes()).await?;
-                input.stdin.write_all(b"\n").await?;
-                input.stdin.flush().await
-            } => result.map_err(BackendError::Io),
+                input
+                    .stdin
+                    .write_all(message.to_string().as_bytes())
+                    .await
+                    .map_err(BackendError::Io)?;
+                input.stdin.write_all(b"\n").await.map_err(BackendError::Io)?;
+                input.stdin.flush().await.map_err(BackendError::Io)
+            } => result,
         }
     }
 

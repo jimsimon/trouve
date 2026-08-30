@@ -10363,22 +10363,32 @@ impl Engine {
                 prompts: visible_queue,
             },
         ));
+        let turn_steering = self.turn_supports_steering(&thread, started_tools_enabled);
+        if turn_steering {
+            // Install the receiver before even constructing TurnStarted. This
+            // keeps capability publication and readiness in one visibly
+            // ordered lifecycle: every path after this point unregisters on
+            // failure until the spawned turn takes ownership.
+            self.register_turn_steerer(thread_id, turn);
+        }
+        let shell_events =
+            match self.turn_shell_events(&thread, turn, &started_prompt, started_tools_enabled) {
+                Ok(events) => events,
+                Err(error) => {
+                    if turn_steering {
+                        self.unregister_turn_steerer(thread_id, turn);
+                    }
+                    return Err(error);
+                }
+            };
         events.extend(
-            self.turn_shell_events(&thread, turn, &started_prompt, started_tools_enabled)?
+            shell_events
                 .into_iter()
                 .map(|event| (Scope::Thread(thread_id.to_string()), event)),
         );
 
         active.insert(thread_id.to_string(), thread.session_id.clone());
         let cancel = self.register_cancel(thread_id);
-        let turn_steering = self.turn_supports_steering(&thread, started_tools_enabled);
-        if turn_steering {
-            // Install the receiver before committing TurnStarted. Once that
-            // event is visible, an immediate steering request must have a
-            // live destination even if provider/backend startup has not been
-            // polled.
-            self.register_turn_steerer(thread_id, turn);
-        }
         let accepted = self.store.accept_prompt_with_events(
             PromptAcceptance {
                 prompt,
