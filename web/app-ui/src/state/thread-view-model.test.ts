@@ -512,6 +512,35 @@ describe("ThreadViewModel", () => {
     ]);
   });
 
+  it("ignores an unidentified completion for identified reasoning", () => {
+    const view = new ThreadViewModel();
+    view.apply(envelope(1, {
+      type: "assistant.thinking",
+      turn: 2,
+      id: "reasoning-a",
+      text: "before ",
+    }));
+    view.apply(envelope(2, {
+      type: "assistant.thinking_completed",
+      turn: 2,
+    }));
+    view.apply(envelope(3, {
+      type: "assistant.thinking",
+      turn: 2,
+      id: "reasoning-a",
+      text: "and after",
+    }));
+
+    expect(view.thinking).toBe(true);
+    expect(view.items).toEqual([
+      expect.objectContaining({
+        kind: "thinking",
+        content: "before and after",
+        complete: false,
+      }),
+    ]);
+  });
+
   it("keeps legacy unidentified reasoning split across tool requests", () => {
     const view = new ThreadViewModel();
     view.apply(envelope(1, { type: "assistant.thinking", turn: 2, text: "before" }));

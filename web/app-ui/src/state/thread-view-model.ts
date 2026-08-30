@@ -773,7 +773,7 @@ export class ThreadViewModel {
       }
       case "assistant.thinking_completed": {
         const id = envelope.id ?? undefined;
-        return id === undefined || this.#activeThinkingId === id
+        return this.#activeThinkingId === id
           ? this.finishThinking()
           : false;
       }

@@ -289,7 +289,7 @@ impl ThreadProjection {
                 }
             }
             Event::AssistantThinkingCompleted { id, .. } => {
-                if id.is_none() || self.snapshot.active_thinking_id.as_ref() == id.as_ref() {
+                if self.snapshot.active_thinking_id.as_ref() == id.as_ref() {
                     self.finish_thinking();
                 }
             }
@@ -1865,7 +1865,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_thinking_completion_closes_without_followup_output() {
+    fn thinking_completion_only_closes_the_matching_identity() {
         let mut projection = ThreadProjection::default();
         projection.apply(&envelope(
             1,
@@ -1885,6 +1885,22 @@ mod tests {
         projection.apply(&envelope(
             2,
             25,
+            Event::AssistantThinkingCompleted { turn: 4, id: None },
+        ));
+        assert!(projection.snapshot.thinking);
+
+        projection.apply(&envelope(
+            3,
+            50,
+            Event::AssistantThinking {
+                turn: 4,
+                id: Some("reasoning".into()),
+                text: " Still waiting.".into(),
+            },
+        ));
+        projection.apply(&envelope(
+            4,
+            75,
             Event::AssistantThinkingCompleted {
                 turn: 4,
                 id: Some("reasoning".into()),
@@ -1894,7 +1910,8 @@ mod tests {
         assert!(!projection.snapshot.thinking);
         assert!(matches!(
             projection.snapshot.items.last(),
-            Some(ThreadViewItem::Thinking { complete: true, .. })
+            Some(ThreadViewItem::Thinking { content, complete: true, .. })
+                if content == "Waiting for the next event. Still waiting."
         ));
     }
 

@@ -853,7 +853,7 @@ impl ThreadViewModel {
                 }
             }
             Event::AssistantThinkingCompleted { id, .. } => {
-                if id.is_none() || self.active_thinking_id.as_ref() == id.as_ref() {
+                if self.active_thinking_id.as_ref() == id.as_ref() {
                     self.finish_thinking()
                 } else {
                     None
@@ -2130,7 +2130,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_thinking_completion_clears_the_live_phase() {
+    fn thinking_completion_only_closes_the_matching_identity() {
         let mut vm = ThreadViewModel::new();
         vm.apply(&env(Event::AssistantThinking {
             turn: 1,
@@ -2141,13 +2141,26 @@ mod tests {
 
         let changed = vm.apply(&env(Event::AssistantThinkingCompleted {
             turn: 1,
+            id: None,
+        }));
+        assert_eq!(changed, None);
+        assert!(vm.thinking);
+
+        vm.apply(&env(Event::AssistantThinking {
+            turn: 1,
+            id: Some("reasoning".into()),
+            text: " Still waiting.".into(),
+        }));
+        let changed = vm.apply(&env(Event::AssistantThinkingCompleted {
+            turn: 1,
             id: Some("reasoning".into()),
         }));
         assert_eq!(changed, Some(0));
         assert!(!vm.thinking);
         assert!(matches!(
             vm.items.first(),
-            Some(ChatItem::Thinking { complete: true, .. })
+            Some(ChatItem::Thinking { content, complete: true, .. })
+                if content == "Waiting. Still waiting."
         ));
     }
 
