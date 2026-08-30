@@ -24,7 +24,7 @@ never repurposed.
 - The engine retains a shared per-provider exponential cooldown after a
   throttling response. Turns honor active and extended cooldowns, then proceed
   without a recovery semaphore or gradually opened engine lane.
-- Protocol 7.16 adds `turn.admitted {turn, provider_wait_ms}`. New servers emit
+- Protocol 7.24 adds `turn.admitted {turn, provider_wait_ms}`. New servers emit
   it when any provider cooldown wait has ended and the turn may start provider
   work.
 - `turn.capacity_acquired` remains in the event union only so current clients
