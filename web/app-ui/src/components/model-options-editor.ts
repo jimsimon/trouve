@@ -1,4 +1,5 @@
 import { css, html, LitElement, nothing } from "lit";
+import { live } from "lit/directives/live.js";
 
 import {
   type ModelOptionChangeDetail,

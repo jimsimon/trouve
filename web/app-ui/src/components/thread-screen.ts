@@ -2110,31 +2110,6 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
                     )}
                   ></trouve-model-picker>
                 </div>
-                <div class="composer-option subscription-option">
-                  <span>Subscription</span>
-                  ${selectedModelHealth === undefined
-                    ? html`<div
-                        class=${`model-health-pill ${subscriptionLoading ? "loading" : "unavailable"}`}
-                        role="status"
-                        aria-busy=${subscriptionLoading ? "true" : "false"}
-                        aria-label=${subscriptionLoading
-                          ? "Loading subscription status"
-                          : "Subscription status is unavailable"}
-                      >
-                        <span class="model-health-placeholder-dot" aria-hidden="true"></span>
-                        <span>${subscriptionLoading ? "Loading…" : "Not available"}</span>
-                      </div>`
-                    : html`
-                      <div
-                        class=${`model-health-pill tone-${selectedModelHealth.tone}`}
-                        tabindex="0"
-                        title=${selectedModelHealth.detail}
-                        aria-label=${`Subscription status: ${selectedModelHealth.summary}. ${selectedModelHealth.detail}`}
-                      >
-                        <span class=${`model-health-dot tone-${selectedModelHealth.tone}`} aria-hidden="true"></span>
-                        <span>${selectedModelHealth.summary}</span>
-                      </div>`}
-                </div>
                 ${modelControls.length === 0
                   ? nothing
                   : html`<trouve-model-options-editor

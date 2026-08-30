@@ -331,7 +331,10 @@ pub use requests::*;
 // can distinguish repository grouping from workspace grouping.
 // 7.24: turns emit an additive provider-admission marker with explicit
 // cooldown wait telemetry; the former capacity marker remains replay-only.
-pub const PROTOCOL_VERSION: &str = "7.24";
+// 7.25: model catalogs advertise schema-driven scalar options, and threads,
+// prompts, sessions, and automations accept and persist validated option maps
+// for the selected model (additive).
+pub const PROTOCOL_VERSION: &str = "7.25";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";
 pub const ERROR_CODE_GITHUB_REAUTHENTICATION_REQUIRED: &str = "github_reauthentication_required";
