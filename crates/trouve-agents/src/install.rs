@@ -679,7 +679,7 @@ impl PreparedInstall {
         self,
         mut checkpoint: impl FnMut(ActivationCheckpoint) -> Result<(), InstallError>,
     ) -> Result<ActivationOutcome, InstallError> {
-        self.activate_with_checkpoint_and_sync(&mut checkpoint, sync_runtime_path)
+        self.activate_with_checkpoint_and_sync(&mut checkpoint, sync_path_for_durability)
     }
 
     fn activate_with_checkpoint_and_sync(
@@ -931,12 +931,12 @@ pub(crate) fn replace_file_atomically(
 }
 
 #[cfg(unix)]
-fn sync_runtime_path(path: &Path) -> std::io::Result<()> {
+pub(crate) fn sync_path_for_durability(path: &Path) -> std::io::Result<()> {
     std::fs::File::open(path)?.sync_all()
 }
 
 #[cfg(not(unix))]
-fn sync_runtime_path(path: &Path) -> std::io::Result<()> {
+pub(crate) fn sync_path_for_durability(path: &Path) -> std::io::Result<()> {
     if path.is_file() {
         std::fs::File::open(path)?.sync_all()
     } else {

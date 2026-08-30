@@ -1352,13 +1352,55 @@ async fn record_legacy_session_marker(
     if let Err(error) = tokio::fs::write(&temporary, agent_id).await {
         return Err(BackendError::Io(error));
     }
-    if let Err(error) = crate::install::replace_file_atomically(
-        &temporary,
-        &marker.path,
-        marker.recorded_agent_id.is_some(),
-    ) {
+    let temporary_for_commit = temporary.clone();
+    let destination = marker.path.clone();
+    let replacing_existing = marker.recorded_agent_id.is_some();
+    let commit = tokio::task::spawn_blocking(move || {
+        commit_legacy_session_marker(
+            &temporary_for_commit,
+            &destination,
+            replacing_existing,
+            crate::install::sync_path_for_durability,
+        )
+    })
+    .await;
+    let commit = match commit {
+        Ok(commit) => commit,
+        Err(error) => {
+            let _ = tokio::fs::remove_file(&temporary).await;
+            return Err(BackendError::Protocol(format!(
+                "Cursor legacy session marker commit task failed: {error}"
+            )));
+        }
+    };
+    if let Err(error) = commit {
         let _ = tokio::fs::remove_file(&temporary).await;
         return Err(BackendError::Io(error));
+    }
+    Ok(())
+}
+
+fn commit_legacy_session_marker(
+    temporary: &Path,
+    destination: &Path,
+    replacing_existing: bool,
+    mut sync_path: impl FnMut(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    // The marker becomes the durable authority for resetting one legacy
+    // per-thread store. Flush its contents before publication, then flush both
+    // the containing directory and its parent so first-time directory creation
+    // cannot disappear independently after a power loss.
+    sync_path(temporary)?;
+    crate::install::replace_file_atomically(temporary, destination, replacing_existing)?;
+    let parent = destination.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Cursor legacy session marker has no parent directory",
+        )
+    })?;
+    sync_path(parent)?;
+    if let Some(grandparent) = parent.parent() {
+        sync_path(grandparent)?;
     }
     Ok(())
 }
@@ -4363,6 +4405,44 @@ mod tests {
         let just_used = Instant::now();
         assert!(!bridge_cleanup_is_due(true, just_used, Some(IDLE_TIMEOUT)));
         assert!(bridge_cleanup_is_due(false, just_used, Some(IDLE_TIMEOUT)));
+    }
+
+    #[test]
+    fn legacy_session_marker_flushes_before_atomic_publication() {
+        let temporary_root = tempfile::tempdir().unwrap();
+        let marker_parent = temporary_root.path().join("backend").join("markers");
+        std::fs::create_dir_all(&marker_parent).unwrap();
+        let temporary = marker_parent.join("candidate");
+        let destination = marker_parent.join("thread");
+        std::fs::write(&temporary, "new-agent").unwrap();
+        std::fs::write(&destination, "old-agent").unwrap();
+
+        let error = commit_legacy_session_marker(&temporary, &destination, true, |path| {
+            if path == temporary {
+                Err(std::io::Error::other("injected marker flush failure"))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert_eq!(std::fs::read_to_string(&destination).unwrap(), "old-agent");
+
+        let mut synced = Vec::new();
+        commit_legacy_session_marker(&temporary, &destination, true, |path| {
+            synced.push(path.to_path_buf());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&destination).unwrap(), "new-agent");
+        assert_eq!(
+            synced,
+            vec![
+                temporary,
+                marker_parent.clone(),
+                marker_parent.parent().unwrap().to_path_buf(),
+            ]
+        );
     }
 
     #[test]
