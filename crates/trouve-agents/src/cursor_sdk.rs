@@ -47,7 +47,7 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const CANCEL_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 const SEND_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
-const INTERRUPTED_CALLBACK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+const CALLBACK_ROUTE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const CALLBACK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_RPC_BODY_BYTES: usize = 8 * 1024 * 1024;
@@ -1109,9 +1109,14 @@ async fn run_sdk_turn(
             .await
             .is_err()
     {
-        route.stop().await;
+        let callbacks_settled = route.stop().await;
         let release = close_agent(&client, &agent_id).await;
-        if release.is_err() {
+        if !callbacks_settled {
+            tracing::warn!(
+                "cursor: callback route for agent {agent_id} did not settle after its consumer closed; quarantining shared Bridge"
+            );
+        }
+        if release.is_err() || !callbacks_settled {
             pool.quarantine(process.pooled()).await;
         }
         return finish_shared_turn(Ok(TurnTerminal::ConsumerClosed), release);
@@ -1131,17 +1136,10 @@ async fn run_sdk_turn(
             &route.supervisor.cancel,
         ) => outcome,
     };
-    let callbacks_settled = if matches!(
-        &outcome,
-        Ok(TurnTerminal::Cancelled | TurnTerminal::ConsumerClosed)
-    ) || pool.closing.is_cancelled()
-    {
-        let deadline = tokio::time::Instant::now() + INTERRUPTED_CALLBACK_SHUTDOWN_TIMEOUT;
-        route.stop_until(deadline).await
-    } else {
-        route.stop().await;
-        true
-    };
+    // Cursor can publish a terminal Send frame while an already-admitted
+    // callback is still waiting on MCP. Every terminal path therefore uses
+    // the same bounded, acknowledged drain before releasing the shared lease.
+    let callbacks_settled = route.stop().await;
     let release = close_agent(&client, &agent_id).await;
     if !callbacks_settled {
         tracing::warn!(
@@ -1972,10 +1970,9 @@ impl Drop for CallbackRouter {
 }
 
 impl CallbackRouteLease {
-    async fn stop(&mut self) {
-        self.route.accepting.store(false, Ordering::Release);
-        self.detach();
-        self.supervisor.stop().await;
+    async fn stop(&mut self) -> bool {
+        self.stop_until(tokio::time::Instant::now() + CALLBACK_ROUTE_SHUTDOWN_TIMEOUT)
+            .await
     }
 
     async fn stop_until(&mut self, deadline: tokio::time::Instant) -> bool {
