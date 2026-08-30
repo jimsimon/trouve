@@ -68,6 +68,7 @@ describe("root shell parity wiring", () => {
   it("keeps async new-session defaults synchronized with native select options", () => {
     expect(source).toContain('import { live } from "lit/directives/live.js"');
     expect(source).toContain(".selected=${live(mode.id === this.#newSessionModeId)}");
+    expect(source).toContain(".selected=${live(branch === this.#newSessionBaseRef)}");
     expect(source).toContain(".selected=${live(value === this.#newSessionThinking)}");
     expect(source).toContain(
       '.selected=${live(this.#newSessionPermissionMode === "ask")}',

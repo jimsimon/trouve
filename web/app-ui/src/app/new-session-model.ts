@@ -682,9 +682,7 @@ export const resolveNewSessionBaseRef = (
   const preferred = nonEmpty(preferredBaseRef);
   if (preferred !== undefined && branches.includes(preferred)) return preferred;
   const defaultBranch = nonEmpty(repositoryDefaultBranch);
-  if (defaultBranch !== undefined) {
-    return branches.includes(defaultBranch) ? defaultBranch : "HEAD";
-  }
+  if (defaultBranch !== undefined && branches.includes(defaultBranch)) return defaultBranch;
   if (branches.includes("main")) return "main";
   if (branches.includes("master")) return "master";
   return "HEAD";
