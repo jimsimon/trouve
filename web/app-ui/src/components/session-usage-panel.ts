@@ -73,6 +73,7 @@ export class TrouveSessionUsagePanel extends withSignalTracking(LitElement) {
 
   #generation = 0;
   #loadKey = "";
+  #dataKey = "";
   #loading = false;
   #error = "";
   #health: ProtocolSubscriptionHealth | undefined;
@@ -349,17 +350,27 @@ export class TrouveSessionUsagePanel extends withSignalTracking(LitElement) {
       || this.threadId === ""
       || this.model === "";
     const generation = ++this.#generation;
-    this.#health = undefined;
-    this.#sessionSummary = undefined;
-    this.#threadSummary = undefined;
-    this.#localStatus = undefined;
+    const dataKey = placeholder
+      ? ""
+      : [this.sessionId, this.threadId, this.model].join("|");
+    if (dataKey !== this.#dataKey) {
+      this.#dataKey = dataKey;
+      this.#health = undefined;
+      this.#sessionSummary = undefined;
+      this.#threadSummary = undefined;
+      this.#localStatus = undefined;
+    }
     this.#error = "";
     if (placeholder || services === undefined) {
+      if (!placeholder) this.#loadKey = "";
       this.#loading = false;
       this.requestUpdate();
       return;
     }
-    this.#loading = true;
+    this.#loading = this.#health === undefined
+      && this.#sessionSummary === undefined
+      && this.#threadSummary === undefined
+      && this.#localStatus === undefined;
     this.requestUpdate();
     try {
       if (this.model.startsWith("local/")) {
@@ -378,13 +389,19 @@ export class TrouveSessionUsagePanel extends withSignalTracking(LitElement) {
         const threadSummary = threadResult.status === "fulfilled"
           ? threadResult.value
           : undefined;
-        this.#localStatus = localStatus;
-        this.#sessionSummary = sessionSummary;
-        this.#threadSummary = threadSummary;
+        if (localStatusResult.status === "fulfilled") {
+          this.#localStatus = localStatus;
+        }
+        if (sessionResult.status === "fulfilled") {
+          this.#sessionSummary = sessionSummary;
+        }
+        if (threadResult.status === "fulfilled") {
+          this.#threadSummary = threadSummary;
+        }
         if (
-          localStatus === undefined
-          && sessionSummary === undefined
-          && threadSummary === undefined
+          this.#localStatus === undefined
+          && this.#sessionSummary === undefined
+          && this.#threadSummary === undefined
         ) throw new Error("local usage details unavailable");
       } else {
         const providerId = this.model.split("/", 1)[0] ?? "";
@@ -394,18 +411,20 @@ export class TrouveSessionUsagePanel extends withSignalTracking(LitElement) {
           services.protocol.threadUsage(this.threadId),
         ]);
         if (generation !== this.#generation) return;
-        this.#health = healthResult.status === "fulfilled"
-          ? healthResult.value.find((candidate) => candidate.provider_id === providerId)
-          : undefined;
-        if (this.#health === undefined || this.#health.status === "unsupported") {
-          this.#health = undefined;
+        if (healthResult.status === "fulfilled") {
+          this.#health = healthResult.value.find(
+            (candidate) => candidate.provider_id === providerId,
+          );
+          if (this.#health === undefined || this.#health.status === "unsupported") {
+            this.#health = undefined;
+          }
         }
-        this.#sessionSummary = sessionResult.status === "fulfilled"
-          ? sessionResult.value
-          : undefined;
-        this.#threadSummary = threadResult.status === "fulfilled"
-          ? threadResult.value
-          : undefined;
+        if (sessionResult.status === "fulfilled") {
+          this.#sessionSummary = sessionResult.value;
+        }
+        if (threadResult.status === "fulfilled") {
+          this.#threadSummary = threadResult.value;
+        }
         if (
           this.#health === undefined
           && this.#sessionSummary === undefined
