@@ -2398,6 +2398,27 @@ mod tests {
                 result: serde_json::json!({"content": "a"}),
                 execution_duration_ms: None,
             },
+            Event::AssistantThinking {
+                turn: 1,
+                id: Some("reasoning-a".into()),
+                text: "before ".into(),
+            },
+            Event::ToolRequested {
+                turn: 1,
+                call_id: "call_2".into(),
+                tool: "search".into(),
+                args: serde_json::json!({"query": "reasoning"}),
+                requires_approval: false,
+            },
+            Event::AssistantThinking {
+                turn: 1,
+                id: Some("reasoning-a".into()),
+                text: "after".into(),
+            },
+            Event::AssistantThinkingCompleted {
+                turn: 1,
+                id: Some("reasoning-a".into()),
+            },
             Event::AssistantMessage {
                 turn: 1,
                 content: "done".into(),
