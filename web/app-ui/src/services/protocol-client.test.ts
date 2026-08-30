@@ -185,6 +185,20 @@ describe("ProtocolClient", () => {
     expect(requests[0]?.url).toBe("https://example.test/app/v1/threads/th_1");
   });
 
+  it("preserves a base URL path prefix for helper requests", async () => {
+    const requests: Request[] = [];
+    const client = new ProtocolClient("https://example.test/app/", {
+      fetch: vi.fn<typeof fetch>(async (input, init) => {
+        requests.push(input instanceof Request ? input : new Request(input, init));
+        return Response.json([]);
+      }),
+    });
+
+    await expect(client.models()).resolves.toEqual([]);
+
+    expect(requests[0]?.url).toBe("https://example.test/app/v1/models");
+  });
+
   it("bounds and validates structured update-thread errors", async () => {
     const responses = [
       JSON.stringify({ code: `  ${"c".repeat(700)}  `, message: `  ${"m".repeat(700)}  ` }),

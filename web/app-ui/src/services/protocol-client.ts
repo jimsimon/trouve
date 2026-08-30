@@ -471,7 +471,9 @@ export class ProtocolClient {
   async #request(path: string, label: string, init?: RequestInit): Promise<Response> {
     let response: Response;
     try {
-      response = await this.#fetch(new URL(path, this.#baseUrl), init);
+      const baseUrl = new URL(this.#baseUrl);
+      if (!baseUrl.pathname.endsWith("/")) baseUrl.pathname += "/";
+      response = await this.#fetch(new URL(path.replace(/^\/+/u, ""), baseUrl), init);
     } catch {
       throw new ProtocolClientError("request-failed", `${label} request failed`);
     }
