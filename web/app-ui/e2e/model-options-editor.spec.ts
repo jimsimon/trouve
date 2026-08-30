@@ -18,8 +18,8 @@ test("model-option choices preserve selected state and scalar value types", asyn
         description: "Maximum input context.",
         overridden: true,
         choices: [
-          { label: "300K", value: 300_000, numberSource: "300000" },
-          { label: "1M", value: 1_000_000, numberSource: "1000000" },
+          { label: "300K", value: { value: 300_000, source: "300000" } },
+          { label: "1M", value: { value: 1_000_000, source: "1000000" } },
         ],
         selectedIndex: 1,
       },

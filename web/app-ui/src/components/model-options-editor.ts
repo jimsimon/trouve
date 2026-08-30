@@ -5,6 +5,7 @@ import { jsonNumberValueToken } from "../services/protocol-json.js";
 import {
   type ModelOptionChangeDetail,
   type ModelOptionControl,
+  modelOptionScalarValue,
   modelOptionTextValue,
   type TextModelOptionControl,
 } from "./model-option-controls.js";
@@ -146,15 +147,7 @@ export class TrouveModelOptionsEditor extends LitElement {
                   ? control.choices[choiceIndex]
                   : undefined;
                 if (choice !== undefined) {
-                  if (typeof choice.value === "number") {
-                    if (choice.numberSource === undefined) return;
-                    this.#emit({
-                      key: control.key,
-                      value: { value: choice.value, source: choice.numberSource },
-                    });
-                  } else {
-                    this.#emit({ key: control.key, value: choice.value });
-                  }
+                  this.#emit({ key: control.key, value: choice.value });
                 }
               }}
             >
@@ -169,7 +162,7 @@ export class TrouveModelOptionsEditor extends LitElement {
               </option>
               ${control.choices.map((choice, index) =>
                 html`<option
-                  value=${String(choice.value)}
+                  value=${String(modelOptionScalarValue(choice.value))}
                   data-choice-index=${String(index)}
                   .selected=${live(overridden && index === control.selectedIndex)}
                 >${choice.label}</option>`

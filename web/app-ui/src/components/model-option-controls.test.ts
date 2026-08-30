@@ -193,7 +193,7 @@ describe("model option controls", () => {
       overridden: false,
       choices: [
         { label: "300K", value: "300k" },
-        { label: "1", value: 1, numberSource: "1" },
+        { label: "1", value: { value: 1, source: "1" } },
       ],
       selectedIndex: -1,
     }]);
@@ -244,8 +244,8 @@ describe("model option controls", () => {
     expect(modelOptionControls(advertised, {})[0]).toMatchObject({
       kind: "choice",
       choices: [
-        { value: 9_007_199_254_740_992 },
-        { value: 9_007_199_254_740_994 },
+        { value: { value: 9_007_199_254_740_992, source: "9007199254740992" } },
+        { value: { value: 9_007_199_254_740_994, source: "9007199254740994" } },
       ],
     });
     expect(sanitizeModelOptions(advertised, {
