@@ -1435,7 +1435,23 @@ fn has_thinking_option(options: &serde_json::Map<String, serde_json::Value>) -> 
     THINKING_OPTION_KEYS
         .iter()
         .any(|key| options.contains_key(*key))
-        || options.contains_key("thinking_budget_tokens")
+}
+
+fn validate_thinking_option_aliases(
+    options: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), EngineError> {
+    let aliases = THINKING_OPTION_KEYS
+        .iter()
+        .copied()
+        .filter(|key| options.contains_key(*key))
+        .collect::<Vec<_>>();
+    if aliases.len() > 1 {
+        return Err(EngineError::BadRequest(format!(
+            "model options contain conflicting thinking aliases: {}",
+            aliases.join(", ")
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -1723,6 +1739,7 @@ fn validate_model_options(
     options: &serde_json::Map<String, serde_json::Value>,
     model: &trouve_protocol::ModelInfo,
 ) -> Result<(), EngineError> {
+    validate_thinking_option_aliases(options)?;
     let properties = model
         .options_schema
         .get("properties")
@@ -2025,6 +2042,26 @@ fn normalize_thinking_option(
     if let Some(selected) = selected {
         options.insert(key.into(), serde_json::Value::String(selected));
     }
+}
+
+fn validated_automation_options_for_model(
+    legacy_thinking_level: Option<&str>,
+    requested_options: &serde_json::Map<String, serde_json::Value>,
+    model: &trouve_protocol::ModelInfo,
+) -> Result<serde_json::Map<String, serde_json::Value>, EngineError> {
+    let mut options = requested_options.clone();
+    validate_thinking_option_aliases(&options)?;
+    if let Some(level) = legacy_thinking_level
+        && !has_thinking_option(&options)
+    {
+        options.insert(
+            "thinking_level".into(),
+            serde_json::Value::String(level.into()),
+        );
+    }
+    normalize_thinking_option(&mut options, Some(model));
+    validate_model_options(&options, model)?;
+    Ok(options)
 }
 
 fn thinking_value(value: &serde_json::Value) -> Option<String> {
@@ -2509,6 +2546,13 @@ impl Drop for AutomatedReviewToolBudgetGuard {
     }
 }
 
+#[derive(Clone)]
+struct AutomationModelOptionsValidation {
+    model: trouve_protocol::ModelInfo,
+    source_options: serde_json::Map<String, serde_json::Value>,
+    validated_options: serde_json::Map<String, serde_json::Value>,
+}
+
 pub struct Engine {
     pub(crate) store: Store,
     pub(crate) data_dir: PathBuf,
@@ -2564,6 +2608,11 @@ pub struct Engine {
     /// Serializes automation mutations across asynchronous model validation
     /// so an older request cannot resume over a newer edit or deletion.
     automation_mutation_locks: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
+    /// Successful model-option validation for persisted automations. The map
+    /// is bounded by automation ids and entries are retired with deletions.
+    /// Fires reuse the exact validated schema unless the effective model or
+    /// the synchronously observable canonical schema changes.
+    automation_model_options_validations: Mutex<HashMap<String, AutomationModelOptionsValidation>>,
     /// Narrower execution lanes for tools operating on a session worktree.
     /// Read-only tools may overlap; every potential mutation is exclusive.
     /// Weak entries keep completed/deleted sessions from growing this map.
@@ -3007,6 +3056,7 @@ impl Engine {
             session_locks: Mutex::new(HashMap::new()),
             session_create_locks: Mutex::new(HashMap::new()),
             automation_mutation_locks: Mutex::new(HashMap::new()),
+            automation_model_options_validations: Mutex::new(HashMap::new()),
             tool_execution_locks: Mutex::new(HashMap::new()),
             session_pr_verification_locks: Mutex::new(HashMap::new()),
             session_pr_verification_wake: Arc::new(tokio::sync::Notify::new()),
@@ -4470,7 +4520,7 @@ impl Engine {
         &self,
         req: trouve_protocol::UpsertAutomationRequest,
     ) -> Result<trouve_protocol::Automation, EngineError> {
-        let model_options = self.validate_automation(&req).await?;
+        let (validated_model, model_options) = self.validate_automation(&req).await?;
         let next_run_at = if req.enabled {
             crate::automations::next_run(&req.schedule, chrono::Local::now())
                 .map(|t| t.to_rfc3339())
@@ -4496,6 +4546,11 @@ impl Engine {
             created_at: chrono::Utc::now().to_rfc3339(),
         };
         self.store.insert_automation(&automation)?;
+        self.remember_automation_model_options_validation(
+            &automation,
+            validated_model,
+            automation.model_options.clone(),
+        );
         Ok(automation)
     }
 
@@ -4521,11 +4576,14 @@ impl Engine {
             && automation.model_options == req.model_options
             && automation.permission_mode == req.permission_mode
             && automation.schedule == req.schedule;
-        let model_options = if pausing_only {
-            req.model_options.clone()
+        let validation = if pausing_only {
+            None
         } else {
-            self.validate_automation(&req).await?
+            Some(self.validate_automation(&req).await?)
         };
+        let model_options = validation
+            .as_ref()
+            .map_or_else(|| req.model_options.clone(), |(_, options)| options.clone());
         automation.name = req.name;
         automation.prompt = req.prompt;
         automation.workspace_id = req.workspace_id;
@@ -4543,6 +4601,13 @@ impl Engine {
             None
         };
         self.store.update_automation(&automation)?;
+        if let Some((validated_model, validated_options)) = validation {
+            self.remember_automation_model_options_validation(
+                &automation,
+                validated_model,
+                validated_options,
+            );
+        }
         Ok(automation)
     }
 
@@ -4588,13 +4653,23 @@ impl Engine {
         if !self.store.delete_automation(id)? {
             return Err(EngineError::NotFound(format!("automation {id}")));
         }
+        self.automation_model_options_validations
+            .lock()
+            .unwrap()
+            .remove(id);
         Ok(())
     }
 
     async fn validate_automation(
         &self,
         req: &trouve_protocol::UpsertAutomationRequest,
-    ) -> Result<serde_json::Map<String, serde_json::Value>, EngineError> {
+    ) -> Result<
+        (
+            Option<trouve_protocol::ModelInfo>,
+            serde_json::Map<String, serde_json::Value>,
+        ),
+        EngineError,
+    > {
         if req.name.trim().is_empty() {
             return Err(EngineError::BadRequest("automations need a name".into()));
         }
@@ -4617,17 +4692,15 @@ impl Engine {
         if let Some(complaint) = crate::automations::validate(&req.schedule) {
             return Err(EngineError::BadRequest(complaint));
         }
-        let (_, options) = self
-            .validated_automation_model_options(
-                &workspace,
-                req.mode.as_deref(),
-                req.model.as_deref(),
-                req.thinking_level.as_deref(),
-                &req.model_options,
-                false,
-            )
-            .await?;
-        Ok(options)
+        self.validated_automation_model_options(
+            &workspace,
+            req.mode.as_deref(),
+            req.model.as_deref(),
+            req.thinking_level.as_deref(),
+            &req.model_options,
+            false,
+        )
+        .await
     }
 
     async fn validated_automation_model_options(
@@ -4638,34 +4711,27 @@ impl Engine {
         legacy_thinking_level: Option<&str>,
         requested_options: &serde_json::Map<String, serde_json::Value>,
         validate_legacy_only: bool,
-    ) -> Result<(Option<String>, serde_json::Map<String, serde_json::Value>), EngineError> {
+    ) -> Result<
+        (
+            Option<trouve_protocol::ModelInfo>,
+            serde_json::Map<String, serde_json::Value>,
+        ),
+        EngineError,
+    > {
         if requested_options.is_empty()
             && (!validate_legacy_only || legacy_thinking_level.is_none())
         {
             return Ok((None, serde_json::Map::new()));
         }
-        let all_modes = self.resolve_personas(Some(Path::new(&workspace.path)))?;
-        let mode_id = requested_mode.unwrap_or("code");
-        let mode = personas::find_persona(&all_modes, mode_id)
-            .ok_or_else(|| EngineError::BadRequest(format!("unknown persona: {mode_id}")))?;
-        let global_defaults = self.global_defaults.read().unwrap().clone();
-        let model_id = requested_model
-            .map(String::from)
-            .or_else(|| mode.default_model.clone())
-            .unwrap_or(global_defaults.model);
+        let model_id =
+            self.automation_effective_model_id(workspace, requested_mode, requested_model)?;
         let model = self.resolve_model_info(&model_id).await?;
-        let mut options = requested_options.clone();
-        if let Some(level) = legacy_thinking_level
-            && !has_thinking_option(&options)
-        {
-            options.insert(
-                "thinking_level".into(),
-                serde_json::Value::String(level.into()),
-            );
-        }
-        normalize_thinking_option(&mut options, Some(&model));
-        validate_model_options(&options, &model)?;
-        Ok((Some(model.id.clone()), options))
+        let options = validated_automation_options_for_model(
+            legacy_thinking_level,
+            requested_options,
+            &model,
+        )?;
+        Ok((Some(model), options))
     }
 
     /// Fire an automation immediately, in the background (creating the
@@ -4853,6 +4919,42 @@ impl Engine {
         workspace: &trouve_protocol::Workspace,
         automation: &trouve_protocol::Automation,
     ) -> Result<(Option<String>, serde_json::Map<String, serde_json::Value>), EngineError> {
+        if !automation.model_options.is_empty() {
+            let effective_model = self.automation_effective_model_id(
+                workspace,
+                automation.mode.as_deref(),
+                automation.model.as_deref(),
+            )?;
+            let cached = self
+                .automation_model_options_validations
+                .lock()
+                .unwrap()
+                .get(&automation.id)
+                .filter(|cached| {
+                    cached.model.id == effective_model
+                        && cached.source_options == automation.model_options
+                })
+                .cloned();
+            if let Some(cached) = cached {
+                if let Some(current_model) = self.known_model_info(&effective_model)
+                    && current_model.options_schema != cached.model.options_schema
+                {
+                    let options = validated_automation_options_for_model(
+                        automation.thinking_level.as_deref(),
+                        &automation.model_options,
+                        &current_model,
+                    )?;
+                    self.remember_automation_model_options_validation(
+                        automation,
+                        Some(current_model.clone()),
+                        options.clone(),
+                    );
+                    return Ok((Some(current_model.id), options));
+                }
+                return Ok((Some(cached.model.id), cached.validated_options));
+            }
+        }
+
         match self
             .validated_automation_model_options(
                 workspace,
@@ -4864,7 +4966,14 @@ impl Engine {
             )
             .await
         {
-            Ok(validated) => Ok(validated),
+            Ok((model, options)) => {
+                self.remember_automation_model_options_validation(
+                    automation,
+                    model.clone(),
+                    options.clone(),
+                );
+                Ok((model.map(|model| model.id), options))
+            }
             Err(error) if automation.model_options.is_empty() => {
                 tracing::warn!(
                     automation_id = %automation.id,
@@ -4886,6 +4995,58 @@ impl Engine {
                 ))
             }
             Err(error) => Err(error),
+        }
+    }
+
+    fn automation_effective_model_id(
+        &self,
+        workspace: &trouve_protocol::Workspace,
+        requested_mode: Option<&str>,
+        requested_model: Option<&str>,
+    ) -> Result<String, EngineError> {
+        let all_modes = self.resolve_personas(Some(Path::new(&workspace.path)))?;
+        let mode_id = requested_mode.unwrap_or("code");
+        let mode = personas::find_persona(&all_modes, mode_id)
+            .ok_or_else(|| EngineError::BadRequest(format!("unknown persona: {mode_id}")))?;
+        let global_defaults = self.global_defaults.read().unwrap().clone();
+        Ok(requested_model
+            .map(String::from)
+            .or_else(|| mode.default_model.clone())
+            .unwrap_or(global_defaults.model))
+    }
+
+    fn known_model_info(&self, model_id: &str) -> Option<trouve_protocol::ModelInfo> {
+        if let Some((_, backend, _)) = self.backend_for(model_id) {
+            return backend
+                .models()
+                .into_iter()
+                .find(|model| model.id == model_id);
+        }
+        let (provider, _) = self.resolve_provider(model_id).ok()?;
+        provider
+            .models()
+            .into_iter()
+            .find(|model| model.id == model_id)
+    }
+
+    fn remember_automation_model_options_validation(
+        &self,
+        automation: &trouve_protocol::Automation,
+        model: Option<trouve_protocol::ModelInfo>,
+        validated_options: serde_json::Map<String, serde_json::Value>,
+    ) {
+        let mut validations = self.automation_model_options_validations.lock().unwrap();
+        if let Some(model) = model {
+            validations.insert(
+                automation.id.clone(),
+                AutomationModelOptionsValidation {
+                    model,
+                    source_options: automation.model_options.clone(),
+                    validated_options,
+                },
+            );
+        } else {
+            validations.remove(&automation.id);
         }
     }
 
@@ -9769,6 +9930,7 @@ impl Engine {
             mode.default_thinking_level.as_deref(),
             global_defaults.thinking_level.as_deref(),
         );
+        validate_thinking_option_aliases(&model_options)?;
         let thread = Thread {
             id: new_id("th"),
             session_id: session.id.clone(),
@@ -10054,6 +10216,9 @@ impl Engine {
             return Err(EngineError::BadRequest(format!(
                 "model must be provider-qualified (e.g. openai/gpt-4.1-mini): {model}"
             )));
+        }
+        if let Some(model_options) = req.model_options.as_ref() {
+            validate_thinking_option_aliases(model_options)?;
         }
         self.store.update_thread_with_event(
             id,
@@ -19721,6 +19886,8 @@ mod tests {
 
     struct CatalogTestProvider {
         live_calls: Arc<std::sync::atomic::AtomicUsize>,
+        live_queries_allowed: Arc<std::sync::atomic::AtomicBool>,
+        static_options_advertised: Arc<std::sync::atomic::AtomicBool>,
     }
 
     struct BlockingAutomationProvider {
@@ -19753,6 +19920,16 @@ mod tests {
         }
     }
 
+    impl CatalogTestProvider {
+        fn new(live_calls: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+            Self {
+                live_calls,
+                live_queries_allowed: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                static_options_advertised: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            }
+        }
+    }
+
     #[async_trait::async_trait]
     impl Provider for CatalogTestProvider {
         fn id(&self) -> &str {
@@ -19760,13 +19937,22 @@ mod tests {
         }
 
         fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
-            vec![catalog_test_model(
-                "catalog-test/static",
-                "Static catalog model",
-            )]
+            let mut model = catalog_test_model("catalog-test/static", "Static catalog model");
+            if !self
+                .static_options_advertised
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                model.options_schema = serde_json::json!({});
+            }
+            vec![model]
         }
 
         async fn list_models(&self) -> Vec<trouve_protocol::ModelInfo> {
+            assert!(
+                self.live_queries_allowed
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                "live catalog discovery is unavailable"
+            );
             self.live_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             vec![catalog_test_model(
@@ -20984,9 +21170,7 @@ mod tests {
         )
         .with_provider(
             "catalog-test",
-            Arc::new(CatalogTestProvider {
-                live_calls: live_calls.clone(),
-            }),
+            Arc::new(CatalogTestProvider::new(live_calls.clone())),
         );
 
         let static_models = engine.list_models().await;
@@ -25538,6 +25722,9 @@ default_permission_mode = "ask"
                     "effort": {
                         "enum": ["low", "high"]
                     },
+                    "reasoning_effort": {
+                        "enum": ["low", "high"]
+                    },
                     "budget": {
                         "type": "integer",
                         "minimum": 4,
@@ -25620,6 +25807,16 @@ default_permission_mode = "ask"
         ]);
         assert!(validate_model_options(&valid, &model).is_ok());
 
+        let conflicting_thinking = serde_json::json!({
+            "reasoning_effort": "low",
+            "effort": "high"
+        });
+        let conflicting_thinking_error =
+            validate_model_options(conflicting_thinking.as_object().unwrap(), &model)
+                .unwrap_err()
+                .to_string();
+        assert!(conflicting_thinking_error.contains("conflicting thinking aliases"));
+
         for valid_integer in [
             r#"{"huge_integer":1e20}"#,
             r#"{"huge_integer":100000000000000000000}"#,
@@ -25698,20 +25895,19 @@ default_permission_mode = "ask"
             name: "offline".into(),
             path: data.path().display().to_string(),
         };
-        assert_eq!(
-            engine
-                .validated_automation_model_options(
-                    &workspace,
-                    None,
-                    None,
-                    Some("high"),
-                    &serde_json::Map::new(),
-                    false,
-                )
-                .await
-                .unwrap(),
-            (None, serde_json::Map::new())
-        );
+        let (model, options) = engine
+            .validated_automation_model_options(
+                &workspace,
+                None,
+                None,
+                Some("high"),
+                &serde_json::Map::new(),
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(model.is_none());
+        assert!(options.is_empty());
     }
 
     #[tokio::test]
@@ -25728,9 +25924,9 @@ default_permission_mode = "ask"
             .with_config_dir(None)
             .with_provider(
                 "catalog-test",
-                Arc::new(CatalogTestProvider {
-                    live_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                }),
+                Arc::new(CatalogTestProvider::new(Arc::new(
+                    std::sync::atomic::AtomicUsize::new(0),
+                ))),
             )
             .with_default_model("catalog-test/static");
         let mut request = trouve_protocol::UpsertAutomationRequest {
@@ -25839,6 +26035,90 @@ default_permission_mode = "ask"
             .unwrap();
         assert!(!updated.enabled);
         assert_eq!(updated.model_options, automation.model_options);
+    }
+
+    #[tokio::test]
+    async fn automation_fires_reuse_validation_until_the_schema_changes() {
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let workspace = trouve_protocol::Workspace {
+            id: "ws_cached_automation".into(),
+            name: "cached".into(),
+            path: data.path().display().to_string(),
+        };
+        store.insert_workspace(&workspace).unwrap();
+        let live_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider = Arc::new(CatalogTestProvider::new(live_calls.clone()));
+        let live_queries_allowed = provider.live_queries_allowed.clone();
+        let static_options_advertised = provider.static_options_advertised.clone();
+        let engine = Engine::new(store, data.path().to_path_buf(), &Config::default())
+            .with_config_dir(None)
+            .with_provider("catalog-test", provider)
+            .with_default_model("catalog-test/static");
+        let automation = engine
+            .create_automation(trouve_protocol::UpsertAutomationRequest {
+                name: "Cached options".into(),
+                prompt: "Run later".into(),
+                workspace_id: workspace.id.clone(),
+                mode: None,
+                model: None,
+                thinking_level: None,
+                model_options: serde_json::Map::from_iter([(
+                    "fast".into(),
+                    serde_json::json!(true),
+                )]),
+                permission_mode: trouve_protocol::PermissionMode::Ask,
+                schedule: trouve_protocol::AutomationSchedule {
+                    kind: "daily".into(),
+                    minute: 0,
+                    time: "09:00".into(),
+                    days: Vec::new(),
+                },
+                enabled: true,
+            })
+            .await
+            .unwrap();
+        assert_eq!(live_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        live_queries_allowed.store(false, std::sync::atomic::Ordering::SeqCst);
+        for _ in 0..2 {
+            let (model, options) = engine
+                .automation_model_options_for_fire(&workspace, &automation)
+                .await
+                .unwrap();
+            assert_eq!(model.as_deref(), Some("catalog-test/static"));
+            assert_eq!(options, automation.model_options);
+        }
+        assert_eq!(
+            live_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "unchanged fires must not repeat live catalog discovery"
+        );
+
+        live_queries_allowed.store(true, std::sync::atomic::Ordering::SeqCst);
+        engine.set_default_model("catalog-test/live", None).unwrap();
+        let model_drift_error = engine
+            .automation_model_options_for_fire(&workspace, &automation)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(model_drift_error.contains("model option fast is not advertised"));
+        assert_eq!(
+            live_calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "an inherited model change must trigger revalidation"
+        );
+        engine
+            .set_default_model("catalog-test/static", None)
+            .unwrap();
+        live_queries_allowed.store(false, std::sync::atomic::Ordering::SeqCst);
+        static_options_advertised.store(false, std::sync::atomic::Ordering::SeqCst);
+        let error = engine
+            .automation_model_options_for_fire(&workspace, &automation)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("model option fast is not advertised"));
     }
 
     #[tokio::test]
@@ -26014,7 +26294,10 @@ default_permission_mode = "ask"
             &Config::default(),
         )
         .with_config_dir(None)
-        .with_provider("catalog-test", Arc::new(CatalogTestProvider { live_calls }))
+        .with_provider(
+            "catalog-test",
+            Arc::new(CatalogTestProvider::new(live_calls)),
+        )
         .with_default_model("catalog-test/static");
         let workspace = trouve_protocol::Workspace {
             id: "ws_drift_automation".into(),
@@ -26026,7 +26309,10 @@ default_permission_mode = "ask"
             .validated_automation_model_options(&workspace, None, None, None, &options, true)
             .await
             .unwrap();
-        assert_eq!(validated_model.as_deref(), Some("catalog-test/static"));
+        assert_eq!(
+            validated_model.as_ref().map(|model| model.id.as_str()),
+            Some("catalog-test/static")
+        );
         assert_eq!(validated_options, options);
 
         engine.set_default_model("catalog-test/live", None).unwrap();

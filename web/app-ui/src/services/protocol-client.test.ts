@@ -163,6 +163,28 @@ describe("ProtocolClient", () => {
     });
   });
 
+  it("preserves a base URL path prefix for thread updates", async () => {
+    const requests: Request[] = [];
+    const thread = {
+      id: "th_1",
+      session_id: "se_1",
+      mode: "code",
+      model: "provider/model",
+      permission_mode: "ask",
+      created_at: "2026-08-01T12:00:00Z",
+    };
+    const client = new ProtocolClient("https://example.test/app/", {
+      fetch: vi.fn<typeof fetch>(async (input, init) => {
+        requests.push(input instanceof Request ? input : new Request(input, init));
+        return Response.json(thread);
+      }),
+    });
+
+    await client.updateThread("th_1", { permission_mode: "ask" });
+
+    expect(requests[0]?.url).toBe("https://example.test/app/v1/threads/th_1");
+  });
+
   it("bounds and validates structured update-thread errors", async () => {
     const responses = [
       JSON.stringify({ code: `  ${"c".repeat(700)}  `, message: `  ${"m".repeat(700)}  ` }),

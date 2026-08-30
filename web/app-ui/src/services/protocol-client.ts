@@ -1643,7 +1643,7 @@ export class ProtocolClient {
     let response: Response;
     try {
       response = await this.#fetch(
-        new URL(`/v1/threads/${encodeURIComponent(threadId)}`, this.#baseUrl),
+        new URL(`v1/threads/${encodeURIComponent(threadId)}`, this.#baseUrl),
         {
           method: "PATCH",
           headers: {

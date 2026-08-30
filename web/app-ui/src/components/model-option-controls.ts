@@ -122,13 +122,16 @@ const hasUnsupportedConstraints = (
   && (typeof property[key] !== "number" || !Number.isFinite(property[key]))
 );
 
-/** Decimal values always require verified source provenance. Integers may
- * proceed without it only inside JavaScript's safe-integer range; signed zero
- * also requires provenance so its sign cannot be erased. */
-const optionNumberIsSafe = (value: number, sourceVerified: boolean): boolean => {
+/** Decimal values always require their exact source token. Integers may
+ * proceed without one only inside JavaScript's safe-integer range; signed zero
+ * also requires a token so its sign cannot be erased. Accepting the token,
+ * rather than a separate proof flag, keeps validation tied to the value it
+ * actually proves. */
+const optionNumberIsSafe = (value: number, numberSource?: string): boolean => {
   if (!Number.isFinite(value)) return false;
-  if (!Number.isInteger(value)) return sourceVerified;
-  return !modelOptionNumberNeedsSourceProof(value) || sourceVerified;
+  if (numberSource !== undefined && !jsonNumberTokenIsExact(numberSource, value)) return false;
+  return !modelOptionNumberNeedsSourceProof(value)
+    || numberSource !== undefined;
 };
 
 /** Require parser provenance for every advertised number: lossy input can
@@ -150,13 +153,17 @@ const advertisedNumbersAreExact = (
 ): boolean => protocolOptionSchemaNumbersAreExact(property)
   || type !== "number" && type !== "integer" && !containsNumericMetadata(property);
 
-const matchesScalarType = (type: AdvertisedScalarType, value: unknown): boolean =>
+const matchesScalarType = (
+  type: AdvertisedScalarType,
+  value: unknown,
+  numberSource?: string,
+): boolean =>
   type === "string"
     ? typeof value === "string"
     : type === "boolean"
       ? typeof value === "boolean"
       : typeof value === "number"
-        && optionNumberIsSafe(value, true)
+        && optionNumberIsSafe(value, numberSource)
         && (type !== "integer" || Number.isInteger(value));
 
 const humanize = (token: string): string => {
@@ -201,7 +208,11 @@ const valueLabel = (value: ModelOptionValue): string => {
 
 const choiceValues = (
   property: Readonly<Record<string, unknown>>,
-): readonly { readonly label: string; readonly value: ModelOptionValue }[] | undefined => {
+): readonly {
+  readonly label: string;
+  readonly value: ModelOptionValue;
+  readonly numberSource?: string;
+}[] | undefined => {
   const advertised = property["enum"];
   if (advertised !== undefined && property["oneOf"] !== undefined) return undefined;
   if (
@@ -235,11 +246,16 @@ const choiceValues = (
     const entry = asRecord(candidate);
     const value = entry?.["const"];
     const entryType = entry === undefined ? null : scalarType(entry);
+    const numberSource = typeof value === "number"
+        && entry !== undefined
+        && protocolOptionSchemaNumbersAreExact(entry)
+      ? jsonNumberValueToken(value)
+      : undefined;
     if (
       entry === undefined
       || !scalar(value)
       || entryType === null
-      || entryType !== undefined && !matchesScalarType(entryType, value)
+      || entryType !== undefined && !matchesScalarType(entryType, value, numberSource)
       || hasUnsupportedConstraints(entry)
       || Object.hasOwn(entry, "enum")
       || Object.hasOwn(entry, "oneOf")
@@ -286,7 +302,6 @@ const optionHint = (property: Readonly<Record<string, unknown>>): string => {
 
 interface StoredOptionValue {
   readonly value: unknown;
-  readonly numberSourceVerified: boolean;
   readonly numberSource?: string;
 }
 
@@ -322,9 +337,6 @@ const storedValues = (
       return {
         value,
         ...(numberSource === undefined ? {} : { numberSource }),
-        numberSourceVerified: typeof value !== "number"
-          || !modelOptionNumberNeedsSourceProof(value)
-          || numberSource !== undefined,
       };
     });
 };
@@ -334,10 +346,10 @@ const validTextValue = (
   value: unknown,
   minimum: number | undefined,
   maximum: number | undefined,
-  numberSourceVerified: boolean,
+  numberSource?: string,
 ): boolean => {
   if (type === "string") return typeof value === "string";
-  if (typeof value !== "number" || !optionNumberIsSafe(value, numberSourceVerified)) return false;
+  if (typeof value !== "number" || !optionNumberIsSafe(value, numberSource)) return false;
   if (type === "integer" && !Number.isInteger(value)) return false;
   return (minimum === undefined || value >= minimum)
     && (maximum === undefined || value <= maximum);
@@ -397,19 +409,19 @@ export const modelOptionControls = (
       && (Object.hasOwn(property, "enum") || Object.hasOwn(property, "oneOf"))
     ) continue;
     if (choices !== undefined) {
-      const editableChoices = choices.filter(({ value }) =>
-        (advertisedType === undefined || matchesScalarType(advertisedType, value))
+      const editableChoices = choices.filter(({ value, numberSource }) =>
+        (advertisedType === undefined || matchesScalarType(advertisedType, value, numberSource))
         && (typeof value !== "number"
           || (minimum === undefined || value >= minimum)
             && (maximum === undefined || value <= maximum))
       );
       if (editableChoices.length <= 1) continue;
-      const selected = explicit.find(({ value, numberSourceVerified }) =>
-        (typeof value !== "number" || optionNumberIsSafe(value, numberSourceVerified))
+      const selected = explicit.find(({ value, numberSource }) =>
+        (typeof value !== "number" || optionNumberIsSafe(value, numberSource))
         && editableChoices.some((choice) => Object.is(choice.value, value))
       )?.value;
-      const inheritedValue = inherited.find(({ value, numberSourceVerified }) =>
-        (typeof value !== "number" || optionNumberIsSafe(value, numberSourceVerified))
+      const inheritedValue = inherited.find(({ value, numberSource }) =>
+        (typeof value !== "number" || optionNumberIsSafe(value, numberSource))
         && editableChoices.some((choice) => Object.is(choice.value, value))
       )?.value;
       const selectedIndex = editableChoices.findIndex(({ value }) => Object.is(value, selected));
@@ -447,16 +459,19 @@ export const modelOptionControls = (
     }
     const type = advertisedType;
     if (type === undefined) continue;
-    const explicitValue = explicit.find(({ value, numberSourceVerified }) =>
-      validTextValue(type, value, minimum, maximum, numberSourceVerified)
+    const explicitValue = explicit.find(({ value, numberSource }) =>
+      validTextValue(type, value, minimum, maximum, numberSource)
     );
-    const inheritedValue = inherited.find(({ value, numberSourceVerified }) =>
-      validTextValue(type, value, minimum, maximum, numberSourceVerified)
+    const inheritedValue = inherited.find(({ value, numberSource }) =>
+      validTextValue(type, value, minimum, maximum, numberSource)
     );
     const selected = explicitValue ?? inheritedValue;
+    const defaultNumberSource = typeof defaultValue === "number"
+      ? jsonNumberValueToken(defaultValue)
+      : undefined;
     const value = selected !== undefined
       ? selected.value
-      : validTextValue(type, defaultValue, minimum, maximum, true)
+      : validTextValue(type, defaultValue, minimum, maximum, defaultNumberSource)
         ? defaultValue
         : undefined;
     controls.push({
@@ -483,10 +498,10 @@ export const modelOptionControls = (
 export const modelOptionValueIsValid = (
   control: ModelOptionControl,
   value: unknown,
-  numberSourceVerified = false,
+  numberSource?: string,
 ): value is ModelOptionValue => {
   if (control.kind === "choice") {
-    return (typeof value !== "number" || optionNumberIsSafe(value, numberSourceVerified))
+    return (typeof value !== "number" || optionNumberIsSafe(value, numberSource))
       && control.choices.some((choice) => Object.is(choice.value, value));
   }
   if (control.kind === "boolean") return typeof value === "boolean";
@@ -495,7 +510,7 @@ export const modelOptionValueIsValid = (
     value,
     control.minimum,
     control.maximum,
-    numberSourceVerified,
+    numberSource,
   );
 };
 
@@ -506,7 +521,7 @@ export const modelOptionTextValue = (
   if (control.scalarType === "string") return raw;
   if (raw === "") return undefined;
   const value = Number(raw);
-  return jsonNumberTokenIsExact(raw, value) && modelOptionValueIsValid(control, value, true)
+  return modelOptionValueIsValid(control, value, raw)
     ? value
     : null;
 };
@@ -521,15 +536,15 @@ export const sanitizeModelOptions = (
   const controls = modelOptionControls(model, {});
   let sanitized: Readonly<Record<string, ModelOptionValue>> = {};
   for (const control of controls) {
-    const candidate = storedValues(options, control.key).find(({ value, numberSourceVerified }) =>
-      modelOptionValueIsValid(control, value, numberSourceVerified)
+    const candidate = storedValues(options, control.key).find(({ value, numberSource }) =>
+      modelOptionValueIsValid(control, value, numberSource)
     );
     if (
       candidate !== undefined
       && modelOptionValueIsValid(
         control,
         candidate.value,
-        candidate.numberSourceVerified,
+        candidate.numberSource,
       )
     ) {
       sanitized = updateProtocolModelOption(
