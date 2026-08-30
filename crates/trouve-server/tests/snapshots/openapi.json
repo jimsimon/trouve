@@ -7501,7 +7501,7 @@
         "oneOf": [
           {
             "type": "object",
-            "description": "Legacy admission marker written by protocol 7.15 and earlier. New\nservers retain this variant only to replay existing durable event logs.",
+            "description": "Legacy admission marker written before protocol 7.24. New\nservers retain this variant only to replay existing durable event logs.",
             "required": [
               "turn",
               "wait_ms",
