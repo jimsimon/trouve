@@ -468,12 +468,16 @@ export class ProtocolClient {
     });
   }
 
+  #protocolUrl(path: string): URL {
+    const baseUrl = new URL(this.#baseUrl);
+    if (!baseUrl.pathname.endsWith("/")) baseUrl.pathname += "/";
+    return new URL(path.replace(/^\/+/u, ""), baseUrl);
+  }
+
   async #request(path: string, label: string, init?: RequestInit): Promise<Response> {
     let response: Response;
     try {
-      const baseUrl = new URL(this.#baseUrl);
-      if (!baseUrl.pathname.endsWith("/")) baseUrl.pathname += "/";
-      response = await this.#fetch(new URL(path.replace(/^\/+/u, ""), baseUrl), init);
+      response = await this.#fetch(this.#protocolUrl(path), init);
     } catch {
       throw new ProtocolClientError("request-failed", `${label} request failed`);
     }
@@ -1645,7 +1649,7 @@ export class ProtocolClient {
     let response: Response;
     try {
       response = await this.#fetch(
-        new URL(`v1/threads/${encodeURIComponent(threadId)}`, this.#baseUrl),
+        this.#protocolUrl(`v1/threads/${encodeURIComponent(threadId)}`),
         {
           method: "PATCH",
           headers: {

@@ -173,7 +173,7 @@ describe("ProtocolClient", () => {
       permission_mode: "ask",
       created_at: "2026-08-01T12:00:00Z",
     };
-    const client = new ProtocolClient("https://example.test/app/", {
+    const client = new ProtocolClient("https://example.test/app", {
       fetch: vi.fn<typeof fetch>(async (input, init) => {
         requests.push(input instanceof Request ? input : new Request(input, init));
         return Response.json(thread);
