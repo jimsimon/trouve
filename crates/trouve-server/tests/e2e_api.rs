@@ -2697,6 +2697,11 @@ impl trouve_agents::AgentBackend for SteerableBackend {
         &self,
         steer: trouve_agents::BackendSteer,
     ) -> Result<(), trouve_agents::BackendError> {
+        if steer.prompt == "Reject this steering command." {
+            return Err(trouve_agents::BackendError::Protocol(
+                "deterministic steering rejection".into(),
+            ));
+        }
         self.steers.lock().unwrap().push((
             steer.session,
             steer.prompt,
@@ -3156,6 +3161,49 @@ async fn active_backend_turn_can_be_steered_and_replays_on_its_timeline() {
         assert_eq!(received[3].1, "Finish the restarted turn.");
         assert_eq!(received[3].2.len(), 1);
         assert!(Path::new(&received[3].2[0]).exists());
+    }
+
+    // A command-level backend rejection must fail only that HTTP request. It
+    // is neither durable guidance nor a reason to abort the active turn.
+    let started = client
+        .post(format!("{base}/threads/{thread_id}/messages"))
+        .json(&serde_json::json!({"content": "Keep running after a rejected steer."}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(started.status(), reqwest::StatusCode::ACCEPTED);
+    wait_for_event(&client, &events_url, |event| {
+        event["type"] == "assistant.thinking" && event["turn"] == 6
+    })
+    .await;
+    let rejected = client
+        .post(format!("{base}/threads/{thread_id}/steer"))
+        .json(&serde_json::json!({"content": "Reject this steering command."}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), reqwest::StatusCode::CONFLICT);
+    let accepted = client
+        .post(format!("{base}/threads/{thread_id}/steer"))
+        .json(&serde_json::json!({"content": "Accept this steering command."}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(accepted.status(), reqwest::StatusCode::ACCEPTED);
+    let events = wait_for_event(&client, &events_url, |event| {
+        event["type"] == "turn.completed" && event["turn"] == 6
+    })
+    .await;
+    assert!(!events.iter().any(|event| {
+        event["type"] == "turn.steered" && event["content"] == "Reject this steering command."
+    }));
+    assert!(events.iter().any(|event| {
+        event["type"] == "turn.steered" && event["content"] == "Accept this steering command."
+    }));
+    {
+        let received = backend.steers.lock().unwrap();
+        assert_eq!(received.len(), 5);
+        assert_eq!(received[4].1, "Accept this steering command.");
     }
 }
 

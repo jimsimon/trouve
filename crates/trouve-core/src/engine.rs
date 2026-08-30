@@ -10180,7 +10180,7 @@ impl Engine {
                 Ok(materialized) => materialized,
                 Err(error) => {
                     response.send(Err(error.clone()));
-                    bail!("steering attachment materialization failed: {error}");
+                    return Ok(());
                 }
             }
         };
@@ -13983,7 +13983,8 @@ impl Engine {
                             Ok(materialized) => materialized,
                             Err(error) => {
                                 response.send(Err(error.clone()));
-                                bail!("steering attachment materialization failed: {error}");
+                                consecutive_backend_events = 0;
+                                continue;
                             }
                         }
                     };
@@ -14025,6 +14026,33 @@ impl Engine {
                             return Err(error);
                         }
                     };
+                    let backend_result = backend
+                        .steer_turn(BackendSteer {
+                            cancel: cancel.clone(),
+                            session: active_vendor_session
+                                .clone()
+                                .expect("steering branch requires a backend session"),
+                            prompt: backend_prompt.clone(),
+                            attachments: backend_attachments,
+                        })
+                        .await;
+                    if let Err(error) = backend_result {
+                        let mut message = error.to_string();
+                        if let Err(cleanup) = self.rollback_materialized_attachment_paths(
+                            session,
+                            &materialized_paths,
+                        ) {
+                            message.push_str(&format!(
+                                "; materialized attachment rollback failed: {cleanup}"
+                            ));
+                        }
+                        response.send(Err(message.clone()));
+                        consecutive_backend_events = 0;
+                        continue;
+                    }
+                    // Only vendor-accepted guidance becomes durable. If this
+                    // commit fails after delivery, fail the turn: continuing
+                    // would let later context diverge from the event log.
                     if let Err(error) = self.store.append_event_with_message(
                         scope.clone(),
                         Event::TurnSteered {
@@ -14050,24 +14078,6 @@ impl Engine {
                         return Err(error);
                     }
                     attachment_cleanup.disarm();
-                    // Durable transcript order is established before the
-                    // vendor sees the guidance. A rejection therefore fails
-                    // the owning turn instead of erasing accepted input.
-                    let backend_result = backend
-                        .steer_turn(BackendSteer {
-                            cancel: cancel.clone(),
-                            session: active_vendor_session
-                                .clone()
-                                .expect("steering branch requires a backend session"),
-                            prompt: backend_prompt.clone(),
-                            attachments: backend_attachments,
-                        })
-                        .await;
-                    if let Err(error) = backend_result {
-                        let message = error.to_string();
-                        response.send(Err(message.clone()));
-                        bail!("backend rejected durable steering input: {message}");
-                    }
                     response.send(Ok(()));
                     consecutive_backend_events = 0;
                     continue;
