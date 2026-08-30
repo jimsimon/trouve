@@ -73,6 +73,7 @@ export class TrouveSessionUsagePanel extends withSignalTracking(LitElement) {
 
   #generation = 0;
   #loadKey = "";
+  #dataKey = "";
   #loading = false;
   #error = "";
   #health: ProtocolSubscriptionHealth | undefined;
@@ -144,7 +145,16 @@ export class TrouveSessionUsagePanel extends withSignalTracking(LitElement) {
       class="session-usage-tab-panel"
       role="tabpanel"
       aria-labelledby=${`${this.#idPrefix}-tab-${this.#activeTab}`}
-    >${this.#renderActiveTab(kind)}</div>`;
+    >${this.#error !== "" && this.#hasData()
+        ? html`<p class="tone-warning" role="status">${this.#error}</p>`
+        : nothing}${this.#renderActiveTab(kind)}</div>`;
+  }
+
+  #hasData(): boolean {
+    return this.#health !== undefined
+      || this.#sessionSummary !== undefined
+      || this.#threadSummary !== undefined
+      || this.#localStatus !== undefined;
   }
 
   #renderTabs() {
@@ -349,17 +359,24 @@ export class TrouveSessionUsagePanel extends withSignalTracking(LitElement) {
       || this.threadId === ""
       || this.model === "";
     const generation = ++this.#generation;
-    this.#health = undefined;
-    this.#sessionSummary = undefined;
-    this.#threadSummary = undefined;
-    this.#localStatus = undefined;
+    const dataKey = placeholder
+      ? ""
+      : [this.sessionId, this.threadId, this.model].join("|");
+    if (dataKey !== this.#dataKey) {
+      this.#dataKey = dataKey;
+      this.#health = undefined;
+      this.#sessionSummary = undefined;
+      this.#threadSummary = undefined;
+      this.#localStatus = undefined;
+    }
     this.#error = "";
     if (placeholder || services === undefined) {
+      if (!placeholder) this.#loadKey = "";
       this.#loading = false;
       this.requestUpdate();
       return;
     }
-    this.#loading = true;
+    this.#loading = !this.#hasData();
     this.requestUpdate();
     try {
       if (this.model.startsWith("local/")) {
@@ -369,23 +386,18 @@ export class TrouveSessionUsagePanel extends withSignalTracking(LitElement) {
           services.protocol.threadUsage(this.threadId),
         ]);
         if (generation !== this.#generation) return;
-        const localStatus = localStatusResult.status === "fulfilled"
-          ? localStatusResult.value
-          : undefined;
-        const sessionSummary = sessionResult.status === "fulfilled"
-          ? sessionResult.value
-          : undefined;
-        const threadSummary = threadResult.status === "fulfilled"
-          ? threadResult.value
-          : undefined;
-        this.#localStatus = localStatus;
-        this.#sessionSummary = sessionSummary;
-        this.#threadSummary = threadSummary;
-        if (
-          localStatus === undefined
-          && sessionSummary === undefined
-          && threadSummary === undefined
-        ) throw new Error("local usage details unavailable");
+        if (localStatusResult.status === "fulfilled") {
+          this.#localStatus = localStatusResult.value;
+        }
+        if (sessionResult.status === "fulfilled") {
+          this.#sessionSummary = sessionResult.value;
+        }
+        if (threadResult.status === "fulfilled") {
+          this.#threadSummary = threadResult.value;
+        }
+        if ([localStatusResult, sessionResult, threadResult].every(
+          (result) => result.status === "rejected",
+        )) throw new Error("local usage refresh failed");
       } else {
         const providerId = this.model.split("/", 1)[0] ?? "";
         const [healthResult, sessionResult, threadResult] = await Promise.allSettled([
@@ -394,27 +406,27 @@ export class TrouveSessionUsagePanel extends withSignalTracking(LitElement) {
           services.protocol.threadUsage(this.threadId),
         ]);
         if (generation !== this.#generation) return;
-        this.#health = healthResult.status === "fulfilled"
-          ? healthResult.value.find((candidate) => candidate.provider_id === providerId)
-          : undefined;
-        if (this.#health === undefined || this.#health.status === "unsupported") {
-          this.#health = undefined;
+        if (healthResult.status === "fulfilled") {
+          this.#health = healthResult.value.find(
+            (candidate) => candidate.provider_id === providerId,
+          );
+          if (this.#health === undefined || this.#health.status === "unsupported") {
+            this.#health = undefined;
+          }
         }
-        this.#sessionSummary = sessionResult.status === "fulfilled"
-          ? sessionResult.value
-          : undefined;
-        this.#threadSummary = threadResult.status === "fulfilled"
-          ? threadResult.value
-          : undefined;
-        if (
-          this.#health === undefined
-          && this.#sessionSummary === undefined
-          && this.#threadSummary === undefined
-        ) throw new Error("usage details unavailable");
+        if (sessionResult.status === "fulfilled") {
+          this.#sessionSummary = sessionResult.value;
+        }
+        if (threadResult.status === "fulfilled") {
+          this.#threadSummary = threadResult.value;
+        }
+        if ([healthResult, sessionResult, threadResult].every(
+          (result) => result.status === "rejected",
+        )) throw new Error("usage refresh failed");
       }
     } catch {
       if (generation !== this.#generation) return;
-      this.#error = "Usage details could not be loaded.";
+      this.#error = "Usage refresh failed.";
     } finally {
       if (generation === this.#generation) {
         this.#loading = false;
