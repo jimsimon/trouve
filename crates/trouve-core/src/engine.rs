@@ -2553,6 +2553,23 @@ struct AutomationModelOptionsValidation {
     validated_options: serde_json::Map<String, serde_json::Value>,
 }
 
+fn automation_definition_matches(
+    left: &trouve_protocol::Automation,
+    right: &trouve_protocol::Automation,
+) -> bool {
+    left.id == right.id
+        && left.name == right.name
+        && left.prompt == right.prompt
+        && left.workspace_id == right.workspace_id
+        && left.mode == right.mode
+        && left.model == right.model
+        && left.thinking_level == right.thinking_level
+        && left.model_options == right.model_options
+        && left.permission_mode == right.permission_mode
+        && left.schedule == right.schedule
+        && left.enabled == right.enabled
+}
+
 pub struct Engine {
     pub(crate) store: Store,
     pub(crate) data_dir: PathBuf,
@@ -2605,8 +2622,9 @@ pub struct Engine {
     /// Serializes retries for one client-generated session-create key before
     /// any worktree mutation or event-writer batch is started.
     session_create_locks: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
-    /// Serializes automation mutations across asynchronous model validation
-    /// so an older request cannot resume over a newer edit or deletion.
+    /// Short compare-and-commit lanes for automation mutations and validation
+    /// cache publication. Provider I/O stays outside these locks; an older
+    /// request must still match the latest definition before it can commit.
     automation_mutation_locks: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
     /// Successful model-option validation for persisted automations. The map
     /// is bounded by automation ids and entries are retired with deletions.
@@ -4559,23 +4577,21 @@ impl Engine {
         id: &str,
         req: trouve_protocol::UpsertAutomationRequest,
     ) -> Result<trouve_protocol::Automation, EngineError> {
-        let mutation_lock = self.automation_mutation_lock(id);
-        let _mutation_guard = mutation_lock.lock().await;
-        let mut automation = self
+        let expected = self
             .store
             .automation(id)?
             .ok_or_else(|| EngineError::NotFound(format!("automation {id}")))?;
-        let pausing_only = automation.enabled
+        let pausing_only = expected.enabled
             && !req.enabled
-            && automation.name == req.name
-            && automation.prompt == req.prompt
-            && automation.workspace_id == req.workspace_id
-            && automation.mode == req.mode
-            && automation.model == req.model
-            && automation.thinking_level == req.thinking_level
-            && automation.model_options == req.model_options
-            && automation.permission_mode == req.permission_mode
-            && automation.schedule == req.schedule;
+            && expected.name == req.name
+            && expected.prompt == req.prompt
+            && expected.workspace_id == req.workspace_id
+            && expected.mode == req.mode
+            && expected.model == req.model
+            && expected.thinking_level == req.thinking_level
+            && expected.model_options == req.model_options
+            && expected.permission_mode == req.permission_mode
+            && expected.schedule == req.schedule;
         let validation = if pausing_only {
             None
         } else {
@@ -4584,6 +4600,17 @@ impl Engine {
         let model_options = validation
             .as_ref()
             .map_or_else(|| req.model_options.clone(), |(_, options)| options.clone());
+        let mutation_lock = self.automation_mutation_lock(id);
+        let _mutation_guard = mutation_lock.lock().await;
+        let mut automation = self
+            .store
+            .automation(id)?
+            .ok_or_else(|| EngineError::NotFound(format!("automation {id}")))?;
+        if !automation_definition_matches(&automation, &expected) {
+            return Err(EngineError::Conflict(format!(
+                "automation {id} changed while its model options were validated; reload and retry"
+            )));
+        }
         automation.name = req.name;
         automation.prompt = req.prompt;
         automation.workspace_id = req.workspace_id;
@@ -4944,14 +4971,23 @@ impl Engine {
                         &automation.model_options,
                         &current_model,
                     )?;
-                    self.remember_automation_model_options_validation(
+                    self.commit_automation_model_options_validation(
                         automation,
                         Some(current_model.clone()),
                         options.clone(),
-                    );
+                    )
+                    .await?;
                     return Ok((Some(current_model.id), options));
                 }
-                return Ok((Some(cached.model.id), cached.validated_options));
+                let model_id = cached.model.id.clone();
+                let options = cached.validated_options.clone();
+                self.commit_automation_model_options_validation(
+                    automation,
+                    Some(cached.model),
+                    options.clone(),
+                )
+                .await?;
+                return Ok((Some(model_id), options));
             }
         }
 
@@ -4967,11 +5003,12 @@ impl Engine {
             .await
         {
             Ok((model, options)) => {
-                self.remember_automation_model_options_validation(
+                self.commit_automation_model_options_validation(
                     automation,
                     model.clone(),
                     options.clone(),
-                );
+                )
+                .await?;
                 Ok((model.map(|model| model.id), options))
             }
             Err(error) if automation.model_options.is_empty() => {
@@ -4980,19 +5017,19 @@ impl Engine {
                     %error,
                     "deferring legacy automation thinking validation until its turn"
                 );
-                Ok((
-                    None,
-                    automation
-                        .thinking_level
-                        .as_ref()
-                        .map(|level| {
-                            serde_json::Map::from_iter([(
-                                "thinking_level".into(),
-                                serde_json::Value::String(level.clone()),
-                            )])
-                        })
-                        .unwrap_or_default(),
-                ))
+                let options = automation
+                    .thinking_level
+                    .as_ref()
+                    .map(|level| {
+                        serde_json::Map::from_iter([(
+                            "thinking_level".into(),
+                            serde_json::Value::String(level.clone()),
+                        )])
+                    })
+                    .unwrap_or_default();
+                self.commit_automation_model_options_validation(automation, None, options.clone())
+                    .await?;
+                Ok((None, options))
             }
             Err(error) => Err(error),
         }
@@ -5048,6 +5085,28 @@ impl Engine {
         } else {
             validations.remove(&automation.id);
         }
+    }
+
+    async fn commit_automation_model_options_validation(
+        &self,
+        expected: &trouve_protocol::Automation,
+        model: Option<trouve_protocol::ModelInfo>,
+        validated_options: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<(), EngineError> {
+        let mutation_lock = self.automation_mutation_lock(&expected.id);
+        let _mutation_guard = mutation_lock.lock().await;
+        let current = self
+            .store
+            .automation(&expected.id)?
+            .ok_or_else(|| EngineError::NotFound(format!("automation {}", expected.id)))?;
+        if !automation_definition_matches(&current, expected) {
+            return Err(EngineError::Conflict(format!(
+                "automation {} changed while its model options were validated; retry the run",
+                expected.id
+            )));
+        }
+        self.remember_automation_model_options_validation(expected, model, validated_options);
+        Ok(())
     }
 
     async fn monitor_automation_turn(
@@ -25816,6 +25875,15 @@ default_permission_mode = "ask"
                 .unwrap_err()
                 .to_string();
         assert!(conflicting_thinking_error.contains("conflicting thinking aliases"));
+        let conflicting_budget = serde_json::json!({
+            "reasoning_effort": "low",
+            "thinking_budget_tokens": 8
+        });
+        let conflicting_budget_error =
+            validate_model_options(conflicting_budget.as_object().unwrap(), &model)
+                .unwrap_err()
+                .to_string();
+        assert!(conflicting_budget_error.contains("conflicting thinking aliases"));
 
         for valid_integer in [
             r#"{"huge_integer":1e20}"#,
@@ -26122,7 +26190,7 @@ default_permission_mode = "ask"
     }
 
     #[tokio::test]
-    async fn automation_updates_are_serialized_across_model_validation() {
+    async fn stale_automation_updates_fail_after_model_validation() {
         let data = tempfile::tempdir().unwrap();
         let store = Store::open_in_memory().unwrap();
         let workspace = trouve_protocol::Workspace {
@@ -26195,48 +26263,41 @@ default_permission_mode = "ask"
         started.acquire().await.unwrap().forget();
 
         let second_engine = engine.clone();
-        let mut second = tokio::spawn(async move {
+        let second = tokio::spawn(async move {
             second_engine
                 .set_automation_enabled("auto_serialized", false)
                 .await
         });
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(50), &mut second)
-                .await
-                .is_err(),
-            "the newer update must wait for the in-flight full-row mutation"
-        );
-
-        release.add_permits(2);
-        first.await.unwrap().unwrap();
-        let updated = second.await.unwrap().unwrap();
+        let updated = tokio::time::timeout(std::time::Duration::from_secs(1), second)
+            .await
+            .expect("provider I/O must stay outside the mutation lock")
+            .unwrap()
+            .unwrap();
         assert!(!updated.enabled);
-        assert_eq!(updated.name, "Edited while pause waited");
-        assert_eq!(
-            updated.model_options.get("fast"),
-            Some(&serde_json::json!(true))
-        );
-        assert_eq!(
-            store.automation(&automation.id).unwrap().unwrap().name,
-            "Edited while pause waited"
-        );
+        assert_eq!(updated.name, "Original");
+
+        release.add_permits(1);
+        let error = first.await.unwrap().unwrap_err().to_string();
+        assert!(error.contains("changed while its model options were validated"));
+        let stored = store.automation(&automation.id).unwrap().unwrap();
+        assert!(!stored.enabled);
+        assert_eq!(stored.name, "Original");
+        assert!(stored.model_options.is_empty());
     }
 
     #[tokio::test]
     async fn legacy_automation_thinking_defers_transient_model_resolution_failures() {
         let data = tempfile::tempdir().unwrap();
-        let engine = Engine::new(
-            Store::open_in_memory().unwrap(),
-            data.path().to_path_buf(),
-            &Config::default(),
-        )
-        .with_config_dir(None)
-        .with_default_model("unconfigured/model");
+        let store = Store::open_in_memory().unwrap();
+        let engine = Engine::new(store.clone(), data.path().to_path_buf(), &Config::default())
+            .with_config_dir(None)
+            .with_default_model("unconfigured/model");
         let workspace = trouve_protocol::Workspace {
             id: "ws_legacy_automation".into(),
             name: "legacy".into(),
             path: data.path().display().to_string(),
         };
+        store.insert_workspace(&workspace).unwrap();
         let mut automation = trouve_protocol::Automation {
             id: "auto_legacy_thinking".into(),
             name: "Legacy thinking".into(),
@@ -26260,6 +26321,7 @@ default_permission_mode = "ask"
             last_error: String::new(),
             created_at: chrono::Utc::now().to_rfc3339(),
         };
+        store.insert_automation(&automation).unwrap();
 
         assert_eq!(
             engine
@@ -26281,6 +26343,77 @@ default_permission_mode = "ask"
                 .await
                 .is_err(),
             "explicit persisted options must remain strict when model metadata is unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn deleted_automation_cannot_republish_validation_after_catalog_io() {
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let workspace = trouve_protocol::Workspace {
+            id: "ws_deleted_validation".into(),
+            name: "deleted validation".into(),
+            path: data.path().display().to_string(),
+        };
+        store.insert_workspace(&workspace).unwrap();
+        let automation = trouve_protocol::Automation {
+            id: "auto_deleted_validation".into(),
+            name: "Delete during validation".into(),
+            prompt: "Run later".into(),
+            workspace_id: workspace.id.clone(),
+            mode: None,
+            model: Some("blocking-automation/static".into()),
+            thinking_level: None,
+            model_options: serde_json::Map::from_iter([("fast".into(), serde_json::json!(true))]),
+            permission_mode: trouve_protocol::PermissionMode::Ask,
+            schedule: trouve_protocol::AutomationSchedule {
+                kind: "daily".into(),
+                minute: 0,
+                time: "09:00".into(),
+                days: Vec::new(),
+            },
+            enabled: true,
+            next_run_at: None,
+            last_run_at: None,
+            last_session_id: None,
+            last_error: String::new(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+        store.insert_automation(&automation).unwrap();
+        let started = Arc::new(tokio::sync::Semaphore::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let engine = Arc::new(
+            Engine::new(store, data.path().to_path_buf(), &Config::default())
+                .with_config_dir(None)
+                .with_provider(
+                    "blocking-automation",
+                    Arc::new(BlockingAutomationProvider {
+                        started: started.clone(),
+                        release: release.clone(),
+                    }),
+                ),
+        );
+        let fire_engine = engine.clone();
+        let fire_workspace = workspace.clone();
+        let fire_automation = automation.clone();
+        let fire = tokio::spawn(async move {
+            fire_engine
+                .automation_model_options_for_fire(&fire_workspace, &fire_automation)
+                .await
+        });
+        started.acquire().await.unwrap().forget();
+
+        engine.delete_automation(&automation.id).await.unwrap();
+        release.add_permits(1);
+        let error = fire.await.unwrap().unwrap_err().to_string();
+        assert!(error.contains("automation auto_deleted_validation"));
+        assert!(
+            !engine
+                .automation_model_options_validations
+                .lock()
+                .unwrap()
+                .contains_key(&automation.id),
+            "a deleted automation must not regain a cache entry"
         );
     }
 
