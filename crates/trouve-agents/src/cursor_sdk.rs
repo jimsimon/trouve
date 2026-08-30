@@ -550,7 +550,7 @@ impl BridgePool {
             if let Some((process, leased)) = existing {
                 if !leased {
                     self.quarantine(&process).await;
-                    if self.recycle_if_unleased(&process).await? {
+                    if self.recycle_if_unleased(&process, None).await? {
                         continue;
                     }
                     tokio::select! {
@@ -581,7 +581,20 @@ impl BridgePool {
                     },
                     alive = process.is_alive() => alive,
                 };
-                if alive {
+                // Quarantine and lease admission are serialized by the pool
+                // slot. Revalidate after the asynchronous liveness probe so a
+                // failure in another turn cannot make this pending admission
+                // commit against an unsafe process.
+                let reusable = if alive {
+                    let current = self.process.lock().await;
+                    process.is_reusable()
+                        && current
+                            .as_ref()
+                            .is_some_and(|current| Arc::ptr_eq(current, &process))
+                } else {
+                    false
+                };
+                if reusable {
                     process.touch();
                     return Ok(BridgeLease {
                         process: Some(process),
@@ -592,7 +605,7 @@ impl BridgePool {
                 self.quarantine(&process).await;
                 process.release_lease();
                 notify_available(&self.available);
-                if self.recycle_if_unleased(&process).await? {
+                if self.recycle_if_unleased(&process, None).await? {
                     continue;
                 }
                 tokio::select! {
@@ -675,7 +688,10 @@ impl BridgePool {
         ) {
             return;
         }
-        if let Err(error) = self.recycle_if_unleased(&candidate).await {
+        if let Err(error) = self
+            .recycle_if_unleased(&candidate, Some(IDLE_TIMEOUT))
+            .await
+        {
             tracing::warn!("cursor: retaining shared Bridge after cleanup failed: {error}");
         }
     }
@@ -724,7 +740,15 @@ impl BridgePool {
         let _spawn = self.spawn_gate.lock().await;
         let process = self.process.lock().await.take();
         let result = match process {
-            Some(process) => process.terminate().await,
+            Some(process) => match process.terminate().await {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    // A failed process-tree cleanup remains retryable even
+                    // though the pool is permanently closed to new turns.
+                    self.restore_if_vacant(process).await;
+                    Err(error)
+                }
+            },
             None => Ok(()),
         };
         self.thread_gates.lock().await.clear();
@@ -809,9 +833,18 @@ impl BridgePool {
         }
     }
 
-    async fn take_if_unleased(&self, candidate: &Arc<PooledBridge>) -> Option<Arc<PooledBridge>> {
+    async fn take_if_unleased(
+        &self,
+        candidate: &Arc<PooledBridge>,
+        idle_for: Option<Duration>,
+    ) -> Option<Arc<PooledBridge>> {
         let mut process = self.process.lock().await;
         if candidate.active_leases.load(Ordering::Acquire) != 0
+            || !bridge_cleanup_is_due(
+                candidate.is_reusable(),
+                *candidate.last_used.lock().unwrap(),
+                idle_for,
+            )
             || !process
                 .as_ref()
                 .is_some_and(|current| Arc::ptr_eq(current, candidate))
@@ -824,12 +857,13 @@ impl BridgePool {
     async fn recycle_if_unleased(
         &self,
         candidate: &Arc<PooledBridge>,
+        idle_for: Option<Duration>,
     ) -> Result<bool, BackendError> {
         // The spawn gate covers the interval where the pool slot is empty but
         // the previous process tree is not yet reaped. This keeps the backend's
         // process count at one during idle eviction and quarantine recovery.
         let _spawn = self.spawn_gate.lock().await;
-        let Some(process) = self.take_if_unleased(candidate).await else {
+        let Some(process) = self.take_if_unleased(candidate, idle_for).await else {
             return Ok(false);
         };
         if let Err(error) = process.terminate().await {
@@ -1318,14 +1352,11 @@ async fn record_legacy_session_marker(
     if let Err(error) = tokio::fs::write(&temporary, agent_id).await {
         return Err(BackendError::Io(error));
     }
-    if marker.recorded_agent_id.is_some()
-        && let Err(error) = tokio::fs::remove_file(&marker.path).await
-        && error.kind() != std::io::ErrorKind::NotFound
-    {
-        let _ = tokio::fs::remove_file(&temporary).await;
-        return Err(BackendError::Io(error));
-    }
-    if let Err(error) = tokio::fs::rename(&temporary, &marker.path).await {
+    if let Err(error) = crate::install::replace_file_atomically(
+        &temporary,
+        &marker.path,
+        marker.recorded_agent_id.is_some(),
+    ) {
         let _ = tokio::fs::remove_file(&temporary).await;
         return Err(BackendError::Io(error));
     }
@@ -1557,6 +1588,7 @@ struct CallbackRoute {
     allowed_tools: Arc<HashSet<String>>,
     http: reqwest::Client,
     supervisor: Arc<CallbackSupervisor>,
+    accepting: AtomicBool,
 }
 
 type CallbackKey = [u8; 32];
@@ -1800,6 +1832,7 @@ impl CallbackRouter {
             allowed_tools: Arc::new(allowed_tools),
             http: self.http.clone(),
             supervisor: supervisor.clone(),
+            accepting: AtomicBool::new(true),
         });
         routes.insert(agent_id.clone(), route.clone());
         Ok(CallbackRouteLease {
@@ -1820,14 +1853,41 @@ impl CallbackRouter {
         let routes = self
             .state
             .routes
-            .write()
+            .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .drain()
-            .map(|(_, route)| route)
+            .iter()
+            .map(|(agent_id, route)| (agent_id.clone(), route.clone()))
             .collect::<Vec<_>>();
-        for route in routes {
+        for (_, route) in &routes {
+            route.accepting.store(false, Ordering::Release);
             route.supervisor.cancel.cancel();
-            let _ = tokio::time::timeout_at(deadline, route.supervisor.stop()).await;
+        }
+        let mut timed_out = false;
+        for (agent_id, route) in routes {
+            if tokio::time::timeout_at(deadline, route.supervisor.stop())
+                .await
+                .is_err()
+            {
+                timed_out = true;
+                continue;
+            }
+            let mut routes = self
+                .state
+                .routes
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if routes
+                .get(&agent_id)
+                .is_some_and(|current| Arc::ptr_eq(current, &route))
+            {
+                routes.remove(&agent_id);
+            }
+        }
+        if timed_out {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "Cursor callback routes did not settle before shutdown",
+            ));
         }
         self.shutdown.cancel();
         let Some(mut task) = self.task.lock().await.take() else {
@@ -1857,6 +1917,7 @@ impl Drop for CallbackRouter {
             .drain()
             .map(|(_, route)| route)
         {
+            route.accepting.store(false, Ordering::Release);
             route.supervisor.cancel.cancel();
         }
         self.shutdown.cancel();
@@ -1870,16 +1931,26 @@ impl Drop for CallbackRouter {
 
 impl CallbackRouteLease {
     async fn stop(&mut self) {
+        self.route.accepting.store(false, Ordering::Release);
         self.detach();
         self.supervisor.stop().await;
     }
 
     async fn stop_until(&mut self, deadline: tokio::time::Instant) -> bool {
-        self.detach();
+        self.route.accepting.store(false, Ordering::Release);
         self.supervisor.cancel.cancel();
-        tokio::time::timeout_at(deadline, self.supervisor.stop())
+        let settled = tokio::time::timeout_at(deadline, self.supervisor.stop())
             .await
-            .is_ok()
+            .is_ok();
+        if settled {
+            self.detach();
+        } else {
+            // Relinquish removal ownership while leaving the stopped route in
+            // the process router. Process quarantine can then retry joining
+            // its supervisor before admitting a replacement Bridge.
+            self.active = false;
+        }
+        settled
     }
 
     fn detach(&mut self) {
@@ -1902,6 +1973,7 @@ impl CallbackRouteLease {
 
 impl Drop for CallbackRouteLease {
     fn drop(&mut self) {
+        self.route.accepting.store(false, Ordering::Release);
         self.detach();
         self.supervisor.cancel.cancel();
     }
@@ -1948,6 +2020,13 @@ async fn custom_tool_callback(
             "callback agent id has no active Cursor route",
         );
     };
+    if !route.accepting.load(Ordering::Acquire) {
+        return callback_error(
+            StatusCode::FORBIDDEN,
+            "permission_denied",
+            "callback agent route is shutting down",
+        );
+    }
     if request.tool_name.is_empty() || !request.args.is_object() {
         return callback_error(
             StatusCode::BAD_REQUEST,
@@ -4182,9 +4261,45 @@ mod tests {
             .stop_until(tokio::time::Instant::now() + Duration::from_millis(10))
             .await;
         assert!(!settled, "a timed-out callback route reported clean reuse");
+        assert!(
+            callback
+                .state
+                .routes
+                .read()
+                .unwrap()
+                .contains_key("agent-timeout"),
+            "a timed-out route escaped process-owned cleanup"
+        );
+        let stale = local_http_client()
+            .unwrap()
+            .post(format!("{}{}", callback.url, CALLBACK_PATH))
+            .bearer_auth(&callback.bearer)
+            .json(&json!({
+                "toolName": "stale-tool",
+                "toolCallId": "stale-call",
+                "agentId": "agent-timeout",
+                "args": {},
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(stale.status(), StatusCode::FORBIDDEN);
+        let cleanup = callback
+            .stop_until(tokio::time::Instant::now() + Duration::from_millis(10))
+            .await;
+        assert_eq!(cleanup.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            callback
+                .state
+                .routes
+                .read()
+                .unwrap()
+                .contains_key("agent-timeout"),
+            "failed process cleanup discarded the timed-out route"
+        );
         drop(tasks);
-        supervisor.stop().await;
         callback.stop().await.unwrap();
+        assert!(callback.state.routes.read().unwrap().is_empty());
     }
 
     #[test]
