@@ -296,7 +296,13 @@ test("new-session selects stay synchronized with asynchronously loaded defaults"
     });
   });
   await page.route("**/v1/workspaces/ws_1/branches", async (route) => {
-    await route.fulfill({ json: { branches: ["main"], head: "main" } });
+    await route.fulfill({
+      json: {
+        branches: ["feature", "main", "master"],
+        head: "feature",
+        default_branch: "main",
+      },
+    });
   });
 
   await page.goto("/");
@@ -309,9 +315,11 @@ test("new-session selects stay synchronized with asynchronously loaded defaults"
   }
 
   const screen = page.locator("#new-session-screen");
+  const baseBranch = screen.locator('select[name="base_ref"]');
   const persona = screen.locator('select[name="mode"]');
   const thinking = screen.locator('select[name="thinking"]');
   const permission = screen.locator('select[name="permission_mode"]');
+  await expect(baseBranch).toHaveValue("main");
   await expect(persona).toHaveValue("code");
   await expect(thinking).toHaveValue("high");
   await expect(permission).toHaveValue("yolo");
@@ -321,7 +329,7 @@ test("new-session selects stay synchronized with asynchronously loaded defaults"
   // Reproduce the browser-side drift caused when option lists are replaced
   // after Lit cached the state value. A later render must repair the DOM even
   // though the application state itself has not changed.
-  await screen.locator('select[name="mode"], select[name="thinking"], select[name="permission_mode"]')
+  await screen.locator('select[name="base_ref"], select[name="mode"], select[name="thinking"], select[name="permission_mode"]')
     .evaluateAll((selects) => {
       for (const select of selects) (select as HTMLSelectElement).selectedIndex = 0;
     });
@@ -334,6 +342,7 @@ test("new-session selects stay synchronized with asynchronously loaded defaults"
     await reactive.updateComplete;
   });
 
+  await expect(baseBranch).toHaveValue("main");
   await expect(persona).toHaveValue("code");
   await expect(thinking).toHaveValue("high");
   await expect(permission).toHaveValue("yolo");

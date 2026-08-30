@@ -13,7 +13,7 @@ test("review timeout settings convert between minutes and protocol seconds", () 
   assert.equal(timeoutMinutes(900), "15");
   assert.equal(timeoutMinutes(90), "1.5");
   assert.equal(timeoutMinutes(1), TIMEOUT_MINUTES_INPUT_MIN);
-  assert.equal(TIMEOUT_MINUTES_INPUT_STEP, TIMEOUT_MINUTES_INPUT_MIN);
+  assert.equal(TIMEOUT_MINUTES_INPUT_STEP, "any");
   assert.deepEqual(reviewSettingsFromMinutes("4", "20", "12", "6"), {
     max_parallel_reviews: 4,
     total_timeout_seconds: 1_200,
