@@ -11,6 +11,7 @@ import {
 } from "./cursor-event-stream.js";
 import {
   parseProtocolJson,
+  stringifyProtocolJson,
   UnsupportedModelOptionNumberError,
 } from "./protocol-json.js";
 
@@ -463,6 +464,7 @@ export class ProtocolClient {
     this.#client = createClient<ProtocolPaths>({
       baseUrl: this.#baseUrl,
       fetch: this.#fetch,
+      bodySerializer: stringifyProtocolJson,
     });
   }
 
@@ -495,7 +497,7 @@ export class ProtocolClient {
       if (error instanceof UnsupportedModelOptionNumberError) {
         throw new ProtocolClientError(
           "invalid-response",
-          "server returned model option numbers outside this browser's safe editing range",
+          "server returned model option numbers this browser cannot preserve exactly",
         );
       }
       throw new ProtocolClientError("invalid-response", `server returned invalid ${schemaName}`);
@@ -573,7 +575,7 @@ export class ProtocolClient {
         ...this.#mutationHeaders(),
         ...(body === undefined ? {} : { "content-type": "application/json" }),
       },
-      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      ...(body === undefined ? {} : { body: stringifyProtocolJson(body) }),
     });
   }
 
@@ -1653,7 +1655,7 @@ export class ProtocolClient {
             ...this.#mutationHeaders(),
             "content-type": "application/json",
           },
-          body: JSON.stringify(request),
+          body: stringifyProtocolJson(request),
         },
       );
     } catch {

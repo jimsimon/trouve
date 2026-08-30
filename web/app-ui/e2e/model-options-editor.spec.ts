@@ -135,7 +135,7 @@ test("model-option choices preserve selected state and scalar value types", asyn
   await expect(budget).toHaveAttribute("aria-describedby", /model-option-description-/);
   await expect(streaming.locator("option").first()).toHaveText("Model default");
 
-  for (const value of ["1.0", "1e3", "-0"]) {
+  for (const value of ["1.0", "1e3", "-0", "1e20"]) {
     await temperature.fill(value);
     await temperature.press("Enter");
   }
@@ -143,10 +143,8 @@ test("model-option choices preserve selected state and scalar value types", asyn
     const changes = (window as Window & { modelOptionChanges?: unknown[] })
       .modelOptionChanges as { value: unknown }[];
     return changes.map(({ value }) => Object.is(value, -0) ? "-0" : value);
-  })).toEqual([1, 1_000, "-0"]);
-  await temperature.fill("1e20");
-  await temperature.press("Enter");
-  await expect(temperature).toHaveValue("1e20");
+  })).toEqual([1, 1_000, "-0", 1e20]);
+  await expect(temperature).toHaveValue("100000000000000000000");
   await page.evaluate(() => {
     (window as Window & { modelOptionChanges?: unknown[] }).modelOptionChanges?.splice(0);
   });
@@ -179,8 +177,6 @@ test("model-option choices preserve selected state and scalar value types", asyn
     (window as Window & { modelOptionValidationMessages?: string[] })
       .modelOptionValidationMessages,
   )).toEqual([
-    "Enter a valid number value.",
-    "Enter a valid number value.",
     "Enter a valid integer between 4 and 16.",
     "Enter a valid integer between 4 and 16.",
     "Enter a valid number value.",

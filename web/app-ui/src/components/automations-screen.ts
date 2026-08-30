@@ -10,6 +10,7 @@ import type {
   ProtocolProvidersResponse,
   ProtocolWorkspace,
 } from "../services/protocol-client.js";
+import { copyProtocolModelOptions } from "../services/protocol-json.js";
 import { readSignal, withSignalTracking } from "../state/reactivity.js";
 import {
   changeModelOption,
@@ -886,7 +887,7 @@ export class TrouveAutomationsScreen extends withSignalTracking(LitElement) {
     const selectedId = this.#selectedId;
     const draft: AutomationDraft = {
       ...this.#draft,
-      modelOptions: { ...this.#draft.modelOptions },
+      modelOptions: copyProtocolModelOptions(this.#draft.modelOptions),
       days: [...this.#draft.days],
     };
     const busyId = editing ? selectedId : "new";

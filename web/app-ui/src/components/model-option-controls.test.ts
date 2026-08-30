@@ -48,12 +48,11 @@ describe("model option controls", () => {
       },
       seed: { type: "integer", default: 7 },
       instructions: { type: ["string", "null"], examples: ["Be concise"] },
-    }), {
+    }), changeModelOption({
       reasoning_effort: "xhigh",
       context: "1m",
       fast: false,
-      temperature: 0.8,
-    });
+    }, { key: "temperature", value: 0.8 }));
 
     expect(controls).toEqual([
       {
@@ -207,44 +206,67 @@ describe("model option controls", () => {
     })).toEqual({ fast: true });
   });
 
-  it("does not expose or serialize integers the browser cannot preserve", () => {
-    const unsafeChoices = JSON.parse(`{
-      "type": "integer",
-      "enum": [9007199254740992, 9007199254740994]
-    }`) as Record<string, unknown>;
-    const collapsedChoices = JSON.parse(`{
-      "type": "integer",
-      "enum": [9007199254740992, 9007199254740993]
-    }`) as Record<string, unknown>;
-    const advertised = model({
-      unsafe_choices: unsafeChoices,
-      collapsed_choices: collapsedChoices,
-      unsafe_minimum: { type: "integer", minimum: 9_007_199_254_740_992 },
-      unsafe_maximum: { type: "integer", maximum: -9_007_199_254_740_992 },
-      editable_integer: { type: "integer" },
-    });
+  it("uses verified source tokens for numbers outside the safe-integer subset", () => {
+    const advertised = parseProtocolJson(`{
+      "id": "provider/model",
+      "display_name": "Model",
+      "context_window": 128000,
+      "supports_tools": true,
+      "options_schema": {
+        "type": "object",
+        "properties": {
+          "exact_choices": {
+            "type": "integer",
+            "enum": [9007199254740992, 9007199254740994]
+          },
+          "rounded_choices": {
+            "type": "integer",
+            "enum": [9007199254740992, 9007199254740993]
+          },
+          "exact_minimum": { "type": "integer", "minimum": 9007199254740992 },
+          "exact_maximum": { "type": "integer", "maximum": -9007199254740992 },
+          "editable_integer": { "type": "integer" }
+        }
+      }
+    }`) as ProtocolModelInfo;
 
-    expect(modelOptionControls(advertised, {})).toEqual([{
-      kind: "text",
-      key: "editable_integer",
-      label: "Editable integer",
-      description: "",
-      overridden: false,
-      scalarType: "integer",
-      text: "",
-      hint: "value",
-    }]);
+    expect(modelOptionControls(advertised, {}).map(({ key }) => key)).toEqual([
+      "exact_choices",
+      "exact_minimum",
+      "exact_maximum",
+      "editable_integer",
+    ]);
+    expect(modelOptionControls(advertised, {})[0]).toMatchObject({
+      kind: "choice",
+      choices: [
+        { value: 9_007_199_254_740_992 },
+        { value: 9_007_199_254_740_994 },
+      ],
+    });
     expect(sanitizeModelOptions(advertised, {
       editable_integer: 9_007_199_254_740_992,
     })).toEqual({});
+    const exactIntegerOptions = (parseProtocolJson(
+      '{"model_options":{"editable_integer":9007199254740992}}',
+    ) as { model_options: Record<string, number> }).model_options;
+    expect(sanitizeModelOptions(advertised, exactIntegerOptions)).toEqual({
+      editable_integer: 9_007_199_254_740_992,
+    });
     expect(sanitizeModelOptions(model({
       large_number: { type: "number" },
     }), { large_number: 1e20 })).toEqual({});
+    const exactLargeOptions = (parseProtocolJson(
+      '{"model_options":{"large_number":1e20,"explicit_number":1e20}}',
+    ) as { model_options: Record<string, number> }).model_options;
+    expect(sanitizeModelOptions(model({
+      large_number: { type: "number" },
+    }), exactLargeOptions)).toEqual({ large_number: 1e20 });
     expect(modelOptionControls(model({
       explicit_number: { type: "number" },
       default_number: { type: "number", default: 1e20 },
-    }), { explicit_number: 1e20 })).toMatchObject([
-      { key: "explicit_number", overridden: false, text: "" },
+    }), exactLargeOptions)).toMatchObject([
+      { key: "explicit_number", overridden: true, text: "100000000000000000000" },
+      { key: "default_number", overridden: false, text: "100000000000000000000" },
     ]);
     expect(modelOptionControls(rawModel({
       unverified_integer_number: {
@@ -269,14 +291,13 @@ describe("model option controls", () => {
       "1.0",
       "1e3",
       "-0",
-      "0.25",
+      "1e20",
       "0.10000000000000000",
       "5e-324",
     ]) expect(modelOptionTextValue(control, raw)).not.toBeNull();
     for (const raw of [
       "0.1234567890123456789",
       "9007199254740993",
-      "1e20",
       "1e-324",
       "3e-324",
     ]) expect(modelOptionTextValue(control, raw)).toBeNull();

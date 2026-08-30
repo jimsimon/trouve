@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import type { ProtocolModelInfo } from "../services/protocol-client.js";
+import type {
+  ProtocolAutomation,
+  ProtocolModelInfo,
+} from "../services/protocol-client.js";
+import {
+  parseProtocolJson,
+  stringifyProtocolJson,
+} from "../services/protocol-json.js";
 
 import {
   automationDraftFrom,
@@ -213,6 +220,32 @@ describe("automation form model", () => {
     expect(automationRequestFromDraft(staleAlias, model).model_options).toEqual({
       reasoning_effort: "high",
     });
+  });
+
+  it("preserves verified numeric option tokens through an automation edit", () => {
+    const automation = parseProtocolJson(`{
+      "id": "auto_numeric",
+      "name": "Numeric",
+      "prompt": "Run it",
+      "workspace_id": "ws_1",
+      "model": "provider/model",
+      "model_options": { "temperature": 0.10000000000000000 },
+      "permission_mode": "ask",
+      "schedule": { "kind": "daily", "time": "09:00" },
+      "enabled": true,
+      "created_at": "2026-08-02T12:00:00Z"
+    }`) as ProtocolAutomation;
+    const request = automationRequestFromDraft(automationDraftFrom(automation), {
+      ...model,
+      options_schema: {
+        type: "object",
+        properties: { temperature: { type: "number" } },
+      },
+    });
+
+    expect(stringifyProtocolJson(request)).toContain(
+      '"model_options":{"temperature":0.10000000000000000}',
+    );
   });
 
   it("applies templates without choosing unsafe permissions for the user", () => {

@@ -5,6 +5,7 @@ import type {
   ProtocolModelInfo,
   ProtocolProvidersResponse,
 } from "../services/protocol-client.js";
+import { changeModelOption } from "../components/model-option-controls.js";
 import {
   applyNewSessionModelOptionChange,
   beginNewSessionSubmission,
@@ -690,7 +691,7 @@ describe("new session model", () => {
         thinking: "",
         permissionMode: "ask",
       },
-      modelOptions: { temperature: 0.25 },
+      modelOptions: changeModelOption({}, { key: "temperature", value: 0.25 }),
       edits: createNewThreadOptionEdits(),
       modes: [mode(selectedModel.id)],
       providers: providers(selectedModel.id),
@@ -944,7 +945,10 @@ describe("new session model", () => {
 
   it("keeps unrelated model options without pinning reset thinking across refreshes", () => {
     const reset = applyNewSessionModelOptionChange({
-      modelOptions: { effort: "low", temperature: 0.7 },
+      modelOptions: changeModelOption(
+        { effort: "low" },
+        { key: "temperature", value: 0.7 },
+      ),
       thinking: "low",
       inheritedThinking: undefined,
       change: { key: "effort", value: undefined },

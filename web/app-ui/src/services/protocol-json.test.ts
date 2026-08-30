@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   jsonNumberTokenIsExact,
   parseProtocolJson,
+  stringifyProtocolJson,
   UnsupportedModelOptionNumberError,
 } from "./protocol-json.js";
 
@@ -21,8 +22,7 @@ describe("protocol JSON number preservation", () => {
       "options_schema": {
         "type": "object",
         "properties": {
-          "safe": {"type": "number", "default": 0.25},
-          "unsafe_exact_integer": {"type": "number", "default": 1e20},
+          "safe": {"type": "number", "default": 1e20},
           "unsafe_integer": {"type": "number", "default": 9007199254740993},
           "unsafe_decimal": {"type": "number", "minimum": 0.1234567890123456789}
         }
@@ -32,7 +32,7 @@ describe("protocol JSON number preservation", () => {
       options_schema: {
         type: "object",
         properties: {
-          safe: { type: "number", default: 0.25 },
+          safe: { type: "number", default: 1e20 },
         },
       },
     });
@@ -42,9 +42,13 @@ describe("protocol JSON number preservation", () => {
     expect(() => parseProtocolJson(
       '{"model_options":{"temperature":0.1234567890123456789}}',
     )).toThrow(UnsupportedModelOptionNumberError);
-    expect(() => parseProtocolJson(
-      '{"model_options":{"exact_but_unsafe_integer":1e20}}',
-    )).toThrow(UnsupportedModelOptionNumberError);
+    const exact = parseProtocolJson(
+      '{"model_options":{"temperature":0.10000000000000000,"large":1e20}}',
+    );
+    expect(exact).toEqual({ model_options: { temperature: 0.1, large: 1e20 } });
+    expect(stringifyProtocolJson(exact)).toBe(
+      '{"model_options":{"temperature":0.10000000000000000,"large":1e20}}',
+    );
 
     const nativeParse = JSON.parse.bind(JSON);
     const parseWithoutSource = vi.spyOn(JSON, "parse").mockImplementation((text, reviver) =>

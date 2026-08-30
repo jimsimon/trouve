@@ -646,9 +646,7 @@ export const snapshotNewSessionSubmission = (
   return Object.freeze({
     ...input.selections,
     edits: Object.freeze({ ...input.edits }),
-    modelOptions: Object.freeze({
-      ...sanitizeModelOptions(modelInfo, input.modelOptions),
-    }),
+    modelOptions: Object.freeze(sanitizeModelOptions(modelInfo, input.modelOptions)),
     inheritedThinking: input.inheritedThinking,
     inheritedPermissionMode: input.inheritedPermissionMode,
     modelInfo,
@@ -763,8 +761,8 @@ export const createNewSessionThreadRequest = (
   const advertisedThinking = modelInfoMatches ? thinkingOption(input.modelInfo) : undefined;
   const thinking = nonEmpty(input.thinking);
   const inheritedThinking = nonEmpty(input.inheritedThinking);
-  const modelOptions: Record<string, ModelOptionValue> = modelInfoMatches
-    ? { ...sanitizeModelOptions(input.modelInfo, input.modelOptions ?? undefined) }
+  let modelOptions: Readonly<Record<string, ModelOptionValue>> = modelInfoMatches
+    ? sanitizeModelOptions(input.modelInfo, input.modelOptions ?? undefined)
     : {};
   if (
     thinking !== undefined
@@ -773,8 +771,10 @@ export const createNewSessionThreadRequest = (
     && thinkingSelectionIsValid(advertisedThinking, thinking)
     && modelOptions[advertisedThinking.key] === undefined
   ) {
-    modelOptions[advertisedThinking.key] =
-      advertisedThinking.budget === undefined ? thinking : Number(thinking);
+    modelOptions = changeModelOption(modelOptions, {
+      key: advertisedThinking.key,
+      value: advertisedThinking.budget === undefined ? thinking : Number(thinking),
+    });
   }
 
   return {

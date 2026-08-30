@@ -8,6 +8,10 @@ import type {
   ProtocolUpsertAutomationRequest,
 } from "../services/protocol-client.js";
 import {
+  copyProtocolModelOptions,
+  updateProtocolModelOption,
+} from "../services/protocol-json.js";
+import {
   sanitizeModelOptions,
 } from "./model-option-controls.js";
 
@@ -109,14 +113,18 @@ export const emptyAutomationDraft = (workspaceId = ""): AutomationDraft => ({
 export const automationDraftFrom = (
   automation: ProtocolAutomation,
 ): AutomationDraft => {
-  const modelOptions: Record<string, unknown> = {
-    ...(automation.model_options ?? {}),
-  };
+  let modelOptions: Readonly<Record<string, unknown>> = copyProtocolModelOptions(
+    automation.model_options ?? {},
+  );
   if (
     automation.thinking_level != null
     && !Object.hasOwn(modelOptions, "thinking_level")
   ) {
-    modelOptions["thinking_level"] = automation.thinking_level;
+    modelOptions = updateProtocolModelOption(
+      modelOptions,
+      "thinking_level",
+      automation.thinking_level,
+    );
   }
   return {
     name: automation.name,
@@ -211,7 +219,7 @@ export const automationRequestFromDraft = (
     mode: draft.mode === "" ? null : draft.mode,
     model: draft.model === "" ? null : draft.model,
     thinking_level: null,
-    model_options: { ...sanitizeModelOptions(model, draft.modelOptions) },
+    model_options: sanitizeModelOptions(model, draft.modelOptions),
     permission_mode: draft.permissionMode,
     schedule: scheduleFromDraft(draft),
     enabled: draft.enabled,
