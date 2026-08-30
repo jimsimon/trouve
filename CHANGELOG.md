@@ -4,6 +4,58 @@ All notable changes to this project are documented in this file. The format
 is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.5.0] - 2026-08-30
+
+This release makes large and long-lived workspaces easier to navigate, exposes
+model-level usage, and grounds automated review decisions in evidence from the
+revision being reviewed.
+
+### Added
+
+- **Organized workspace navigation**: workspace sessions can be grouped by
+  repository, filtered by name, date, and branch, and collapsed with preferences
+  that persist across reloads. Repository identity is cached and refreshed
+  without repeatedly invoking Git.
+- **Per-model usage visibility**: the workspace sidebar now shows provider
+  subscription, API, and local-model usage with session- and thread-level
+  breakdowns by model.
+- **Explicit review commands**: maintainers can request a full-branch pass with
+  `@trouve-ai review full` and resolve or reopen threadless findings with
+  attributed, reason-bearing `resolve` and `unresolve` commands.
+
+### Changed
+
+- **Evidence-grounded review gates**: finding confidence and change causation
+  are derived from mechanically verified anchors, execution paths, attempted
+  refutations, and causal waypoints. Only findings verified as caused by the
+  reviewed change block merging; severe pre-existing issues remain visible as
+  non-gating observations.
+- **Broader, convergent reviews**: arbitrary file- and changed-line count
+  cutoffs no longer reject large reviews, while existing byte and model-token
+  budgets still bound work. Carried blockers can be resolved against verified
+  source at the current head even after their fixing commit leaves the
+  incremental window.
+- **Responsive thread reconciliation**: resolved and reopened GitHub review
+  threads prioritize their pull request through a deduplicated, retry-bounded
+  webhook dispatcher. Operators should subscribe the GitHub App to the
+  `Pull request review thread` event; polling remains the fallback.
+- **Higher-quality session titles**: local title generation uses a constrained
+  two-to-five-word grammar, preserves both ends of long prompts, and upgrades
+  legacy Q4 installations to the Qwen3 1.7B Q5 naming model.
+- **Client/server compatibility**: protocol compatibility advances to 7.22.
+  Upgrade the desktop or PWA client and `trouve-server` together.
+
+### Fixed
+
+- **Bounded review publication recovery**: definitively missing or superseded
+  GitHub reviews now reach a safe terminal state instead of retrying forever;
+  current rounds can be reposted only after confirmed absence, and cosmetic
+  thread-collapse retries are abandoned after a bounded attempt window.
+- **Stable workspace and CI behavior**: collapsed workspace session lists are
+  honored, stale usage responses cannot repopulate the wrong scope, and
+  benchmark confirmation compares fresh candidate and base measurements to
+  avoid shared-runner contention false positives.
+
 ## [4.4.0] - 2026-08-27
 
 This release surfaces agent-initiated Claude activity as durable turns and
@@ -935,6 +987,7 @@ semble ([BENCHMARKS.md](BENCHMARKS.md)):
 - Incremental reindex (1 file touched): 0.86 s vs ~3 min (212x)
 - Warm query: 0.55 s vs 7.2 s (13x)
 
+[4.5.0]: https://github.com/jimsimon/trouve/compare/v4.4.0...v4.5.0
 [4.4.0]: https://github.com/jimsimon/trouve/compare/v4.3.0...v4.4.0
 [4.3.0]: https://github.com/jimsimon/trouve/compare/v4.2.0...v4.3.0
 [4.2.0]: https://github.com/jimsimon/trouve/compare/v4.1.2...v4.2.0
