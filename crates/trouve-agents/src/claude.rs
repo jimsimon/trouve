@@ -258,6 +258,10 @@ struct RouterState {
 /// switches at `result` boundaries.
 struct StdoutRouter {
     state: std::sync::Mutex<RouterState>,
+    /// Serializes steering writes with terminal-result attribution. A steer
+    /// that wins this boundary belongs to the active turn; one that loses it
+    /// observes the cleared router consumer and fails closed.
+    turn_boundary: Mutex<()>,
     /// Wakes the router loop when a consumer registers.
     notify: tokio::sync::Notify,
     /// Announces a pending vendor-autonomous turn to the engine. Invoked
@@ -288,6 +292,7 @@ impl StdoutRouter {
     fn new(signal: impl Fn() + Send + Sync + 'static) -> Self {
         Self {
             state: std::sync::Mutex::new(RouterState::default()),
+            turn_boundary: Mutex::new(()),
             notify: tokio::sync::Notify::new(),
             signal: Box::new(signal),
         }
@@ -299,18 +304,22 @@ impl StdoutRouter {
         state.turn.is_some() || state.background_in_flight
     }
 
-    /// True when writing an immediate steering message would target the
-    /// registered turn rather than start unrelated work on idle stdin.
-    fn has_live_background_turn(&self) -> bool {
-        self.state.lock().unwrap().background_in_flight
-    }
-
     /// True while completed autonomous turns sit buffered awaiting an attach
     /// consumer. Pool reaping and cap eviction must treat such processes as
     /// live: recycling one discards its buffered turns before the engine's
     /// attach can drain them.
     fn has_pending_background(&self) -> bool {
         !self.state.lock().unwrap().background.is_empty()
+    }
+
+    /// Must be called while holding `turn_boundary`, which makes this
+    /// synchronized liveness check atomic with the caller's stdin write and
+    /// the router's terminal-result transition.
+    fn can_accept_steer(&self, attach_turn: bool) -> bool {
+        let state = self.state.lock().unwrap();
+        state.turn.is_some()
+            && state.turn_is_attach == attach_turn
+            && (!attach_turn || state.background_in_flight)
     }
 
     /// The registered non-attach turn's prompt reached the vendor; lines
@@ -479,6 +488,11 @@ impl StdoutRouter {
                 _ = self.notify.notified() => continue,
             };
             let is_result = line_is_result(&line);
+            let _turn_boundary = if is_result {
+                Some(self.turn_boundary.lock().await)
+            } else {
+                None
+            };
             // Decide the destination under the lock, send outside it.
             let (destination, attach_completed) = {
                 let mut state = self.state.lock().unwrap();
@@ -847,12 +861,6 @@ impl AgentBackend for ClaudeBackend {
                         steer.session
                     )));
                 }
-                if input.attach_turn && !proc_.router.has_live_background_turn() {
-                    return Err(BackendError::Protocol(format!(
-                        "claude steer: session {} has no active turn",
-                        steer.session
-                    )));
-                }
                 if !input.prompt_sent {
                     if input.pending_steers.len() >= PENDING_STEER_CAP {
                         return Err(BackendError::Protocol(format!(
@@ -862,6 +870,13 @@ impl AgentBackend for ClaudeBackend {
                     }
                     input.pending_steers.push(message);
                     return Ok(());
+                }
+                let _turn_boundary = proc_.router.turn_boundary.lock().await;
+                if !proc_.router.can_accept_steer(input.attach_turn) {
+                    return Err(BackendError::Protocol(format!(
+                        "claude steer: session {} has no active turn",
+                        steer.session
+                    )));
                 }
                 input
                     .stdin

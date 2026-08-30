@@ -2603,6 +2603,52 @@ cat >/dev/null
     assert!(stdin.contains("change direction"), "{stdin}");
 }
 
+#[tokio::test]
+async fn claude_adapter_rejects_steering_after_the_vendor_result() {
+    let tmp = tempfile::tempdir().unwrap();
+    let stub = write_stub(
+        tmp.path(),
+        "claude-completed-steer",
+        r#"#!/bin/bash
+IFS= read -r first
+echo "$first" >> "$0.stdin"
+echo '{"type":"system","subtype":"init","session_id":"sess-complete"}'
+echo '{"type":"result","subtype":"success","session_id":"sess-complete","usage":{"input_tokens":1,"output_tokens":1}}'
+IFS= read -r late
+echo "$late" >> "$0.stdin"
+cat >/dev/null
+"#,
+    );
+    let backend = ClaudeBackend::new("claude-code", Some(stub.clone()));
+    let mut stream = start_turn(&backend, || {
+        turn(
+            tmp.path().to_path_buf(),
+            Some("sess-complete"),
+            BackendPermission::Ask,
+        )
+    })
+    .await;
+
+    while let Some(event) = stream.next().await {
+        if matches!(event.unwrap(), BackendEvent::Completed { .. }) {
+            break;
+        }
+    }
+    let error = backend
+        .steer_turn(BackendSteer {
+            cancel: Default::default(),
+            session: "sess-complete".into(),
+            prompt: "too late".into(),
+            attachments: Vec::new(),
+        })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("has no active turn"), "{error}");
+    let stdin = std::fs::read_to_string(format!("{stub}.stdin")).unwrap();
+    assert_eq!(stdin.lines().count(), 1, "{stdin}");
+    assert!(!stdin.contains("too late"), "{stdin}");
+}
+
 #[test]
 fn backend_tool_free_capabilities_match_vendor_protocols() {
     let claude = ClaudeBackend::new("claude-code", Some("/nonexistent/claude".into()));
