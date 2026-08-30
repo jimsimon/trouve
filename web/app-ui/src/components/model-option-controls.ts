@@ -1,5 +1,8 @@
 import type { ProtocolModelInfo } from "../services/protocol-client.js";
-import { jsonNumberTokenIsExact } from "../services/protocol-json.js";
+import {
+  jsonNumberTokenIsExact,
+  protocolOptionSchemaNumbersAreExact,
+} from "../services/protocol-json.js";
 
 export type ModelOptionValue = string | number | boolean;
 export type ModelOptionScalarType = "string" | "number" | "integer";
@@ -112,6 +115,14 @@ const hasUnsupportedConstraints = (
   Object.hasOwn(property, key)
   && (typeof property[key] !== "number" || !Number.isFinite(property[key]))
 );
+
+const numericMetadataNeedsSourceProof = (value: unknown): boolean =>
+  typeof value === "number"
+    ? !Number.isSafeInteger(value)
+    : Array.isArray(value)
+      ? value.some(numericMetadataNeedsSourceProof)
+      : typeof value === "object" && value !== null
+        && Object.values(value).some(numericMetadataNeedsSourceProof);
 
 const matchesScalarType = (type: AdvertisedScalarType, value: unknown): boolean =>
   type === "string"
@@ -296,6 +307,8 @@ export const modelOptionControls = (
       || (Array.isArray(property["enum"]) && property["enum"].length <= 1)
       || advertisedType === null
       || hasUnsupportedConstraints(property)
+      || numericMetadataNeedsSourceProof(property)
+        && !protocolOptionSchemaNumbersAreExact(property)
     ) continue;
     const label = typeof property["title"] === "string"
       ? property["title"]

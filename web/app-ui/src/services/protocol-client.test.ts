@@ -49,7 +49,7 @@ describe("ProtocolClient", () => {
     });
   });
 
-  it("drops rounded numeric model metadata and persisted options at the response boundary", async () => {
+  it("hides rounded numeric metadata and rejects lossy persisted options", async () => {
     const fakeFetch = vi.fn<typeof fetch>(async (input, init) => {
       const request = input instanceof Request ? input : new Request(input, init);
       if (new URL(request.url).pathname === "/v1/models") {
@@ -64,8 +64,10 @@ describe("ProtocolClient", () => {
       type: "object",
       properties: { safe: { type: "number", maximum: 1e20 } },
     });
-    const threads = await client.threads("se_1");
-    expect(threads[0]?.model_options).toEqual({ safe: 1e20 });
+    await expect(client.threads("se_1")).rejects.toMatchObject({
+      kind: "invalid-response",
+      message: "server returned model option numbers this browser cannot preserve exactly",
+    });
   });
 
   it("loads the cursor-bearing server projection used for cold startup", async () => {

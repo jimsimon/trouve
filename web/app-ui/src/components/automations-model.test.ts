@@ -6,6 +6,7 @@ import {
   automationDraftFromTemplate,
   automationRequestFromDraft,
   automationScheduleSummary,
+  effectiveAutomationModelId,
   emptyAutomationDraft,
   modelOptionsAfterEffectiveModelChange,
   validateAutomationDraft,
@@ -143,6 +144,31 @@ describe("automation form model", () => {
       "openai/gpt-5.6",
       "anthropic/claude-opus-4.1",
     )).toEqual({});
+    expect(modelOptionsAfterEffectiveModelChange(options, undefined, undefined)).toEqual({});
+  });
+
+  it("resolves model identity independently from catalog objects", () => {
+    const modes = [
+      { id: "code", default_model: "provider/shared" },
+      { id: "review", default_model: "provider/shared" },
+      { id: "plan", default_model: "provider/plan" },
+    ];
+    const providers = { default_model: "provider/global" };
+    expect(effectiveAutomationModelId(
+      { mode: "review", model: "" },
+      modes,
+      providers,
+    )).toBe("provider/shared");
+    expect(effectiveAutomationModelId(
+      { mode: "review", model: "provider/explicit" },
+      [],
+      providers,
+    )).toBe("provider/explicit");
+    expect(effectiveAutomationModelId(
+      { mode: "missing", model: "" },
+      modes,
+      providers,
+    )).toBeUndefined();
   });
 
   it("keeps legacy thinking available until a competing alias is validated", () => {

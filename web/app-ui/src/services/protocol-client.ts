@@ -9,7 +9,10 @@ import {
   type EventSourceFactory,
   type SafeStreamDiagnostic,
 } from "./cursor-event-stream.js";
-import { parseProtocolJson } from "./protocol-json.js";
+import {
+  parseProtocolJson,
+  UnsupportedModelOptionNumberError,
+} from "./protocol-json.js";
 
 type ValidateFunction = (value: unknown) => boolean;
 
@@ -488,7 +491,13 @@ export class ProtocolClient {
     let value: unknown;
     try {
       value = parseProtocolJson(await response.text());
-    } catch {
+    } catch (error) {
+      if (error instanceof UnsupportedModelOptionNumberError) {
+        throw new ProtocolClientError(
+          "invalid-response",
+          "server returned model option numbers this browser cannot preserve exactly",
+        );
+      }
       throw new ProtocolClientError("invalid-response", `server returned invalid ${schemaName}`);
     }
     return validateResponse<T>(schemaName, value, validate);

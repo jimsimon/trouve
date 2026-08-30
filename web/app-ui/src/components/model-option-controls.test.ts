@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { ProtocolModelInfo } from "../services/protocol-client.js";
+import { parseProtocolJson } from "../services/protocol-json.js";
 import {
   changeModelOption,
   modelOptionControls,
@@ -10,13 +11,16 @@ import {
   sanitizeModelOptions,
 } from "./model-option-controls.js";
 
-const model = (properties: Record<string, unknown>): ProtocolModelInfo => ({
+const rawModel = (properties: Record<string, unknown>): ProtocolModelInfo => ({
   id: "provider/model",
   display_name: "Model",
   context_window: 128_000,
   supports_tools: true,
   options_schema: { type: "object", properties },
 });
+
+const model = (properties: Record<string, unknown>): ProtocolModelInfo =>
+  parseProtocolJson(JSON.stringify(rawModel(properties))) as ProtocolModelInfo;
 
 describe("model option controls", () => {
   it("derives every supported scalar control from the advertised schema", () => {
@@ -243,6 +247,16 @@ describe("model option controls", () => {
       { key: "explicit_number", overridden: true, text: "100000000000000000000" },
       { key: "default_number", overridden: false, text: "100000000000000000000" },
     ]);
+    expect(modelOptionControls(rawModel({
+      unverified_integer_number: {
+        type: "number",
+        default: 9_007_199_254_740_992,
+      },
+      unverified_decimal: {
+        type: "number",
+        default: 0.12345678901234568,
+      },
+    }), {})).toEqual([]);
   });
 
   it("accepts equivalent number spellings without silently rounding them", () => {

@@ -25,6 +25,7 @@ import {
   automationDraftFromTemplate,
   automationRequestFromDraft,
   automationScheduleSummary,
+  effectiveAutomationModelId,
   emptyAutomationDraft,
   hasAutomationDraftErrors,
   modelOptionsAfterEffectiveModelChange,
@@ -674,9 +675,11 @@ export class TrouveAutomationsScreen extends withSignalTracking(LitElement) {
     const modes = this.#modesWorkspaceId === this.#draft.workspaceId ? this.#modes : [];
     const editing = this.#editorMode === "edit";
     const selectedModel = this.#effectiveAutomationModel(this.#draft, modes);
-    const effectiveModelId = selectedModel?.id
-      ?? this.#draft.model
-      ?? "";
+    const effectiveModelId = effectiveAutomationModelId(
+      this.#draft,
+      modes,
+      this.#providers,
+    ) ?? "";
     const modelControls = modelOptionControls(selectedModel, this.#draft.modelOptions);
     const nameError = this.#draftErrors.name;
     const promptError = this.#draftErrors.prompt;
@@ -812,29 +815,28 @@ export class TrouveAutomationsScreen extends withSignalTracking(LitElement) {
   readonly #modeChanged = (event: Event): void => {
     const modeId = (event.currentTarget as HTMLSelectElement).value;
     const modes = this.#modesWorkspaceId === this.#draft.workspaceId ? this.#modes : [];
-    const previousModel = this.#effectiveAutomationModel(this.#draft, modes);
-    const nextModel = this.#effectiveAutomationModel(
+    const previousModelId = effectiveAutomationModelId(this.#draft, modes, this.#providers);
+    const nextModelId = effectiveAutomationModelId(
       { ...this.#draft, mode: modeId, model: "" },
       modes,
+      this.#providers,
     );
     this.#updateDraft({
       mode: modeId,
       model: "",
       modelOptions: modelOptionsAfterEffectiveModelChange(
         this.#draft.modelOptions,
-        previousModel?.id,
-        nextModel?.id,
+        previousModelId,
+        nextModelId,
       ),
     });
   };
 
   readonly #modelPicked = (event: CustomEvent<{ readonly modelId: string }>): void => {
     const modes = this.#modesWorkspaceId === this.#draft.workspaceId ? this.#modes : [];
-    const previousModel = this.#effectiveAutomationModel(this.#draft, modes);
+    const previousModelId = effectiveAutomationModelId(this.#draft, modes, this.#providers);
     const nextDraft = { ...this.#draft, model: event.detail.modelId };
-    const nextModel = this.#effectiveAutomationModel(nextDraft, modes);
-    const previousModelId = previousModel?.id ?? this.#draft.model.trim();
-    const nextModelId = nextModel?.id ?? event.detail.modelId.trim();
+    const nextModelId = effectiveAutomationModelId(nextDraft, modes, this.#providers);
     this.#updateDraft({
       model: event.detail.modelId,
       modelOptions: modelOptionsAfterEffectiveModelChange(
@@ -1051,12 +1053,10 @@ export class TrouveAutomationsScreen extends withSignalTracking(LitElement) {
     models: readonly ProtocolModelInfo[] = this.#availableModels(),
     providers: ProtocolProvidersResponse | undefined = this.#providers,
   ): ProtocolModelInfo | undefined {
-    const mode = modes.find((candidate) => candidate.id === (draft.mode || "code"));
-    const modelId = draft.model.trim()
-      || mode?.default_model?.trim()
-      || providers?.default_model.trim()
-      || "";
-    return models.find((model) => model.id === modelId);
+    const modelId = effectiveAutomationModelId(draft, modes, providers);
+    return modelId === undefined
+      ? undefined
+      : models.find((model) => model.id === modelId);
   }
 
   async #modelForMutation(

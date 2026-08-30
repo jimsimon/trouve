@@ -35,8 +35,8 @@ const entryLimit = mode === "desktop" ? 856_000 : 850_000;
 // mobile playback notices, the route-scoped subscription/API/local usage
 // panel with its generated per-model usage schema and scope breakdowns, and
 // the scope-verdict causal-waypoint evidence schema and schema-driven model-
-// option editors. The combined graphs emit 3,265,510 B for desktop and
-// 3,250,666 B for PWA; preserve less than 2 kB of headroom for each. Entry,
+// option editors. The combined graphs emit 3,266,054 B for desktop and
+// 3,251,209 B for PWA; preserve less than 2 kB of headroom for each. Entry,
 // worker, and largest-chunk budgets below still prevent one bundle from hiding
 // in the aggregate.
 const totalJavaScriptLimit = mode === "desktop" ? 3_267_000 : 3_252_000;

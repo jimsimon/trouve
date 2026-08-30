@@ -1,8 +1,10 @@
 import type {
+  ProtocolAgentPersona,
   ProtocolAutomation,
   ProtocolAutomationSchedule,
   ProtocolAutomationTemplate,
   ProtocolModelInfo,
+  ProtocolProvidersResponse,
   ProtocolUpsertAutomationRequest,
 } from "../services/protocol-client.js";
 import {
@@ -216,6 +218,21 @@ export const automationRequestFromDraft = (
   };
 };
 
+/** Resolve the effective model identity without requiring a matching catalog
+ * object. A configured mode with unavailable metadata is intentionally
+ * unresolved rather than being mistaken for the global default. */
+export const effectiveAutomationModelId = (
+  draft: Pick<AutomationDraft, "mode" | "model">,
+  modes: readonly Pick<ProtocolAgentPersona, "id" | "default_model">[],
+  providers: Pick<ProtocolProvidersResponse, "default_model"> | undefined,
+): string | undefined => {
+  const explicit = draft.model.trim();
+  if (explicit !== "") return explicit;
+  const mode = modes.find((candidate) => candidate.id === (draft.mode || "code"));
+  if (mode === undefined) return undefined;
+  return mode.default_model?.trim() || providers?.default_model.trim() || undefined;
+};
+
 /** Model options are schema-specific, so they survive only while the effective
  * model remains unchanged. */
 export const modelOptionsAfterEffectiveModelChange = <Value>(
@@ -223,7 +240,11 @@ export const modelOptionsAfterEffectiveModelChange = <Value>(
   previousModelId: string | undefined,
   nextModelId: string | undefined,
 ): Readonly<Record<string, Value>> =>
-  nextModelId === previousModelId ? options : {};
+  previousModelId !== undefined
+    && previousModelId !== ""
+    && nextModelId === previousModelId
+    ? options
+    : {};
 
 export const automationScheduleSummary = (
   schedule: ProtocolAutomationSchedule,

@@ -1,4 +1,5 @@
 const LOSSY_NUMBER = Symbol("trouve-lossy-json-number");
+const EXACT_OPTION_SCHEMA_NODES = new WeakSet<object>();
 
 interface LossyNumber {
   readonly [LOSSY_NUMBER]: true;
@@ -8,6 +9,19 @@ interface LossyNumber {
 interface JsonReviverContext {
   readonly source?: string;
 }
+
+/** Persisted option numbers must never be rounded or silently removed. */
+export class UnsupportedModelOptionNumberError extends TypeError {
+  constructor() {
+    super("model options contain a number this JavaScript runtime cannot preserve exactly");
+    this.name = "UnsupportedModelOptionNumberError";
+  }
+}
+
+/** True only for option-schema nodes whose numeric metadata was checked
+ * against its original JSON token by parseProtocolJson. */
+export const protocolOptionSchemaNumbersAreExact = (value: object): boolean =>
+  EXACT_OPTION_SCHEMA_NODES.has(value);
 
 const normalizedNumberToken = (raw: string): string => {
   const sign = raw.startsWith("-") ? "-" : "";
@@ -70,6 +84,7 @@ const sanitizeOptionsSchema = (value: unknown): unknown => {
       ),
     );
   }
+  EXACT_OPTION_SCHEMA_NODES.add(sanitized);
   return sanitized;
 };
 
@@ -77,11 +92,12 @@ const sanitizeModelOptions = (value: unknown): unknown => {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     return restoreOrdinaryNumbers(value);
   }
-  return Object.fromEntries(Object.entries(value).flatMap(([key, child]) =>
-    containsLossyNumber(child)
-      ? []
-      : [[key, restoreOrdinaryNumbers(child)] as const]
-  ));
+  const restored: Record<string, unknown> = {};
+  for (const [key, child] of Object.entries(value)) {
+    if (containsLossyNumber(child)) throw new UnsupportedModelOptionNumberError();
+    restored[key] = restoreOrdinaryNumbers(child);
+  }
+  return restored;
 };
 
 const restoreProtocolValue = (value: unknown): unknown => {
@@ -99,9 +115,10 @@ const restoreProtocolValue = (value: unknown): unknown => {
 };
 
 /** Parse protocol JSON without allowing JavaScript number rounding to mutate
- * model-specific controls or persisted option values. Modern engines expose
- * each primitive's source token to the reviver. When they do not, every
- * numeric option token is treated conservatively as potentially lossy. */
+ * model-specific controls or persisted option values. Lossy schema properties
+ * are hidden; a lossy persisted option rejects the response so a later
+ * replacement update cannot erase it. Runtimes without reviver source tokens
+ * therefore reject responses that contain numeric model options. */
 export const parseProtocolJson = (text: string): unknown => {
   const parsed = JSON.parse(text, ((
     _key: string,
