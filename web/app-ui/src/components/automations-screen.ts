@@ -22,12 +22,12 @@ const AUTOMATION_RETRY_MS = 5_000;
 import {
   AUTOMATION_DAY_NAMES,
   automationDraftFrom,
-  automationEnabledRequest,
   automationDraftFromTemplate,
   automationRequestFromDraft,
   automationScheduleSummary,
   emptyAutomationDraft,
   hasAutomationDraftErrors,
+  modelOptionsAfterEffectiveModelChange,
   validateAutomationDraft,
   type AutomationDraft,
   type AutomationDraftErrors,
@@ -820,7 +820,11 @@ export class TrouveAutomationsScreen extends withSignalTracking(LitElement) {
     this.#updateDraft({
       mode: modeId,
       model: "",
-      modelOptions: nextModel?.id === previousModel?.id ? this.#draft.modelOptions : {},
+      modelOptions: modelOptionsAfterEffectiveModelChange(
+        this.#draft.modelOptions,
+        previousModel?.id,
+        nextModel?.id,
+      ),
     });
   };
 
@@ -833,7 +837,11 @@ export class TrouveAutomationsScreen extends withSignalTracking(LitElement) {
     const nextModelId = nextModel?.id ?? event.detail.modelId.trim();
     this.#updateDraft({
       model: event.detail.modelId,
-      modelOptions: nextModelId === previousModelId ? this.#draft.modelOptions : {},
+      modelOptions: modelOptionsAfterEffectiveModelChange(
+        this.#draft.modelOptions,
+        previousModelId,
+        nextModelId,
+      ),
     });
   };
 
@@ -916,14 +924,10 @@ export class TrouveAutomationsScreen extends withSignalTracking(LitElement) {
     this.#notice = "";
     this.requestUpdate();
     try {
-      const latest = await services.protocol.automations();
-      const current = latest.find((candidate) => candidate.id === automation.id);
-      if (current === undefined) throw new Error("automation is no longer available");
-      this.#automations = latest;
       this.#replaceAutomation(
-        await services.protocol.updateAutomation(
+        await services.protocol.setAutomationEnabled(
           automation.id,
-          automationEnabledRequest(current, enabled),
+          { enabled },
         ),
       );
       this.#notice = enabled ? "Automation enabled." : "Automation paused.";

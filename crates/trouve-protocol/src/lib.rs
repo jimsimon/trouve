@@ -334,7 +334,9 @@ pub use requests::*;
 // 7.25: model catalogs advertise schema-driven scalar options, and threads,
 // prompts, sessions, and automations accept and persist validated option maps
 // for the selected model (additive).
-pub const PROTOCOL_VERSION: &str = "7.25";
+// 7.26: PUT /v1/automations/{id}/enabled changes automation scheduling without
+// replacing a concurrently edited definition (additive).
+pub const PROTOCOL_VERSION: &str = "7.26";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";
 pub const ERROR_CODE_GITHUB_REAUTHENTICATION_REQUIRED: &str = "github_reauthentication_required";

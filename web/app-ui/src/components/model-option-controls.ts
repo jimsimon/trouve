@@ -1,4 +1,5 @@
 import type { ProtocolModelInfo } from "../services/protocol-client.js";
+import { jsonNumberTokenIsExact } from "../services/protocol-json.js";
 
 export type ModelOptionValue = string | number | boolean;
 export type ModelOptionScalarType = "string" | "number" | "integer";
@@ -426,18 +427,6 @@ export const modelOptionValueIsValid = (
   );
 };
 
-const normalizedNumberToken = (raw: string): string => {
-  const sign = raw.startsWith("-") ? "-" : "";
-  const [coefficient, exponent = "0"] = raw.split(/[eE]/u);
-  const [integer, fraction = ""] = coefficient!.split(".");
-  const digits = `${integer}${fraction}`.replace(/^[+-]?0*/u, "");
-  if (digits === "") return "0";
-  const trimmed = digits.replace(/0+$/u, "");
-  return `${sign}${trimmed}e${
-    Number(exponent) - fraction.length + digits.length - trimmed.length
-  }`;
-};
-
 export const modelOptionTextValue = (
   control: TextModelOptionControl,
   raw: string,
@@ -445,8 +434,7 @@ export const modelOptionTextValue = (
   if (control.scalarType === "string") return raw;
   if (raw === "") return undefined;
   const value = Number(raw);
-  return normalizedNumberToken(raw) === normalizedNumberToken(JSON.stringify(value)!)
-      && modelOptionValueIsValid(control, value)
+  return jsonNumberTokenIsExact(raw, value) && modelOptionValueIsValid(control, value)
     ? value
     : null;
 };

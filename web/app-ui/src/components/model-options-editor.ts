@@ -148,7 +148,11 @@ export class TrouveModelOptionsEditor extends LitElement {
                 if (choice !== undefined) this.#emit(control.key, choice.value);
               }}
             >
-              <option value="" data-model-default="true" .selected=${!overridden}>
+              <option
+                value=""
+                data-model-default="true"
+                .selected=${live(!overridden)}
+              >
                 Model default${control.selectedIndex < 0
                   ? ""
                   : ` · ${control.choices[control.selectedIndex]?.label ?? ""}`}
@@ -157,7 +161,7 @@ export class TrouveModelOptionsEditor extends LitElement {
                 html`<option
                   value=${String(choice.value)}
                   data-choice-index=${String(index)}
-                  .selected=${overridden && index === control.selectedIndex}
+                  .selected=${live(overridden && index === control.selectedIndex)}
                 >${choice.label}</option>`
               )}
             </select>

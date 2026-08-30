@@ -4837,6 +4837,17 @@ async fn automation_records_the_turn_outcome_not_just_dispatch() {
     assert_eq!(automation["thinking_level"], "high");
     assert_eq!(automation["model_options"]["fast"], true);
     let automation_id = automation["id"].as_str().unwrap();
+    let enabled: serde_json::Value = client
+        .put(format!("{base}/automations/{automation_id}/enabled"))
+        .json(&serde_json::json!({"enabled": true}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(enabled["enabled"], true);
+    assert_eq!(enabled["model_options"]["fast"], true);
     let resp = client
         .post(format!("{base}/automations/{automation_id}/run"))
         .send()

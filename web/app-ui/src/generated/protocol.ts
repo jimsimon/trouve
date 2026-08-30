@@ -86,6 +86,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/automations/{id}/enabled": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put: operations["set_automation_enabled"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/automations/{id}/run": {
         parameters: {
             query?: never;
@@ -4408,6 +4424,13 @@ export interface components {
             workspace_id: components["schemas"]["String"];
         };
         /**
+         * @description Change only whether an automation is scheduled to run. This narrow
+         *     mutation avoids replacing a concurrently edited automation definition.
+         */
+        SetAutomationEnabledRequest: {
+            enabled: boolean;
+        };
+        /**
          * @description Replace the persisted automated code-review execution settings
          *     (`PUT /v1/config/code-review`).
          */
@@ -5338,6 +5361,39 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    set_automation_enabled: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetAutomationEnabledRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Automation"];
+                };
             };
             404: {
                 headers: {

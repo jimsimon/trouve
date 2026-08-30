@@ -4533,6 +4533,31 @@ impl Engine {
         Ok(automation)
     }
 
+    /// Change scheduling state against the latest stored definition. The
+    /// per-automation lock makes an in-flight full edit publish first, then
+    /// this mutation preserves every field from that completed edit.
+    pub async fn set_automation_enabled(
+        &self,
+        id: &str,
+        enabled: bool,
+    ) -> Result<trouve_protocol::Automation, EngineError> {
+        let mutation_lock = self.automation_mutation_lock(id);
+        let _mutation_guard = mutation_lock.lock().await;
+        let mut automation = self
+            .store
+            .automation(id)?
+            .ok_or_else(|| EngineError::NotFound(format!("automation {id}")))?;
+        automation.enabled = enabled;
+        automation.next_run_at = if enabled {
+            crate::automations::next_run(&automation.schedule, chrono::Local::now())
+                .map(|time| time.to_rfc3339())
+        } else {
+            None
+        };
+        self.store.update_automation(&automation)?;
+        Ok(automation)
+    }
+
     fn automation_mutation_lock(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
         let mut locks = self.automation_mutation_locks.lock().unwrap();
         locks.retain(|_, lock| lock.strong_count() > 0);
@@ -25843,6 +25868,7 @@ default_permission_mode = "ask"
 
         let first_engine = engine.clone();
         let mut first_request = request.clone();
+        first_request.name = "Edited while pause waited".into();
         first_request
             .model_options
             .insert("fast".into(), serde_json::json!(true));
@@ -25854,11 +25880,9 @@ default_permission_mode = "ask"
         started.acquire().await.unwrap().forget();
 
         let second_engine = engine.clone();
-        let mut second_request = request;
-        second_request.enabled = false;
         let mut second = tokio::spawn(async move {
             second_engine
-                .update_automation("auto_serialized", second_request)
+                .set_automation_enabled("auto_serialized", false)
                 .await
         });
         assert!(
@@ -25872,7 +25896,15 @@ default_permission_mode = "ask"
         first.await.unwrap().unwrap();
         let updated = second.await.unwrap().unwrap();
         assert!(!updated.enabled);
-        assert!(!store.automation(&automation.id).unwrap().unwrap().enabled);
+        assert_eq!(updated.name, "Edited while pause waited");
+        assert_eq!(
+            updated.model_options.get("fast"),
+            Some(&serde_json::json!(true))
+        );
+        assert_eq!(
+            store.automation(&automation.id).unwrap().unwrap().name,
+            "Edited while pause waited"
+        );
     }
 
     #[tokio::test]

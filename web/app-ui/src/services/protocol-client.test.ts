@@ -49,6 +49,25 @@ describe("ProtocolClient", () => {
     });
   });
 
+  it("drops rounded numeric model metadata and persisted options at the response boundary", async () => {
+    const fakeFetch = vi.fn<typeof fetch>(async (input, init) => {
+      const request = input instanceof Request ? input : new Request(input, init);
+      if (new URL(request.url).pathname === "/v1/models") {
+        return new Response(`[{"id":"provider/model","display_name":"Model","context_window":128000,"supports_tools":true,"options_schema":{"type":"object","properties":{"safe":{"type":"number","maximum":1e20},"unsafe":{"type":"integer","maximum":9007199254740993}}}}]`);
+      }
+      return new Response(`[{"id":"th_1","session_id":"se_1","mode":"code","model":"provider/model","permission_mode":"ask","model_options":{"safe":1e20,"unsafe":9007199254740993},"created_at":"2026-08-01T12:00:00Z"}]`);
+    });
+    const client = new ProtocolClient("http://127.0.0.1:43127", { fetch: fakeFetch });
+
+    const models = await client.models();
+    expect(models[0]?.options_schema).toEqual({
+      type: "object",
+      properties: { safe: { type: "number", maximum: 1e20 } },
+    });
+    const threads = await client.threads("se_1");
+    expect(threads[0]?.model_options).toEqual({ safe: 1e20 });
+  });
+
   it("loads the cursor-bearing server projection used for cold startup", async () => {
     const requests: Request[] = [];
     const projection = {
@@ -1077,6 +1096,48 @@ describe("ProtocolClient", () => {
       permission_mode: "allow_list",
     });
   });
+
+  it("updates automation lifecycle state through the narrow endpoint", async () => {
+    const requests: Request[] = [];
+    const automation = {
+      id: "auto/slash",
+      name: "Nightly checks",
+      prompt: "Run all checks",
+      workspace_id: "ws_1",
+      mode: "code",
+      model: "openai/gpt-5.6",
+      thinking_level: null,
+      model_options: { reasoning_effort: "ultra" },
+      permission_mode: "ask" as const,
+      schedule: { kind: "daily", minute: 0, time: "09:00", days: [] },
+      enabled: false,
+      next_run_at: null,
+      last_run_at: null,
+      last_session_id: null,
+      last_error: "",
+      created_at: "2026-08-01T12:00:00Z",
+    };
+    const fakeFetch = vi.fn<typeof fetch>(async (input, init) => {
+      requests.push(input instanceof Request ? input : new Request(input, init));
+      return Response.json(automation);
+    });
+    const client = new ProtocolClient("http://127.0.0.1:43127", {
+      fetch: fakeFetch,
+      mutationHeaders: () => ({ "x-trouve-host-csrf": "ephemeral-token" }),
+    });
+
+    await expect(client.setAutomationEnabled("auto/slash", { enabled: false }))
+      .resolves.toEqual(automation);
+
+    expect(requests).toHaveLength(1);
+    const request = requests[0];
+    if (request === undefined) throw new Error("automation state request was not sent");
+    expect(request.url).toBe(
+      "http://127.0.0.1:43127/v1/automations/auto%2Fslash/enabled",
+    );
+    expect(request.method).toBe("PUT");
+    await expect(request.clone().json()).resolves.toEqual({ enabled: false });
+  });
 });
 
 describe("protocol compatibility", () => {
@@ -1090,11 +1151,11 @@ describe("protocol compatibility", () => {
   });
 
   it("accepts the exact generated protocol version", () => {
-    expect(() => assertProtocolCompatibility("7.24")).not.toThrow();
+    expect(() => assertProtocolCompatibility("7.26")).not.toThrow();
   });
 
   it("rejects older, newer, other-major, and malformed servers", () => {
-    for (const version of ["4.0", "5.2", "6.1", "7.0", "7.1", "7.2", "7.3", "7.4", "7.5", "7.6", "7.7", "7.8", "7.9", "7.10", "7.11", "7.12", "7.13", "7.14", "7.15", "7.16", "7.17", "7.18", "7.19", "7.20", "7.21", "7.22", "7.23", "7.25", "7.24.1", "unknown", ""]) {
+    for (const version of ["4.0", "5.2", "6.1", "7.0", "7.1", "7.2", "7.3", "7.4", "7.5", "7.6", "7.7", "7.8", "7.9", "7.10", "7.11", "7.12", "7.13", "7.14", "7.15", "7.16", "7.17", "7.18", "7.19", "7.20", "7.21", "7.22", "7.23", "7.24", "7.25", "7.27", "7.26.1", "unknown", ""]) {
       expect(() => assertProtocolCompatibility(version)).toThrowError(
         expect.objectContaining({ kind: "incompatible-protocol" }),
       );

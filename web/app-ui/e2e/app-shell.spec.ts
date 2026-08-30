@@ -134,6 +134,21 @@ const installProtocolFixtures = async (page: Page): Promise<void> => {
         providers: [],
       },
       "GET /v1/models": [],
+      "GET /v1/personas": [
+        {
+          id: "code",
+          display_name: "Engineer",
+          group: "general",
+          system_prompt: "Implement the user's request by editing files.",
+        },
+        {
+          id: "plan",
+          display_name: "Planner",
+          group: "general",
+          system_prompt: "Explore the workspace and produce a concrete plan.",
+          read_only: true,
+        },
+      ],
       "GET /v1/persona-infos": [
         {
           origin: "builtin",
@@ -317,11 +332,12 @@ test("new-session selects stay synchronized with asynchronously loaded defaults"
   const screen = page.locator("#new-session-screen");
   const baseBranch = screen.locator('select[name="base_ref"]');
   const persona = screen.locator('select[name="mode"]');
-  const thinking = screen.locator('select[name="thinking"]');
+  const thinking = screen.getByRole("combobox", { name: "Reasoning effort", exact: true });
   const permission = screen.locator('select[name="permission_mode"]');
   await expect(baseBranch).toHaveValue("main");
   await expect(persona).toHaveValue("code");
-  await expect(thinking).toHaveValue("high");
+  await expect(thinking).toHaveValue("");
+  await expect(thinking.locator("option:checked")).toHaveText("Model default · High");
   await expect(permission).toHaveValue("yolo");
   await expect(screen.getByText("Unattended execution (YOLO) is dangerous"))
     .toBeVisible();
@@ -329,10 +345,13 @@ test("new-session selects stay synchronized with asynchronously loaded defaults"
   // Reproduce the browser-side drift caused when option lists are replaced
   // after Lit cached the state value. A later render must repair the DOM even
   // though the application state itself has not changed.
-  await screen.locator('select[name="base_ref"], select[name="mode"], select[name="thinking"], select[name="permission_mode"]')
+  await screen.locator('select[name="base_ref"], select[name="mode"], select[name="permission_mode"]')
     .evaluateAll((selects) => {
       for (const select of selects) (select as HTMLSelectElement).selectedIndex = 0;
     });
+  await thinking.evaluate((select) => {
+    (select as HTMLSelectElement).selectedIndex = 1;
+  });
   await page.locator("trouve-app").evaluate(async (app) => {
     const reactive = app as HTMLElement & {
       requestUpdate(): void;
@@ -344,7 +363,8 @@ test("new-session selects stay synchronized with asynchronously loaded defaults"
 
   await expect(baseBranch).toHaveValue("main");
   await expect(persona).toHaveValue("code");
-  await expect(thinking).toHaveValue("high");
+  await expect(thinking).toHaveValue("");
+  await expect(thinking.locator("option:checked")).toHaveText("Model default · High");
   await expect(permission).toHaveValue("yolo");
 });
 
@@ -762,7 +782,7 @@ test("Personas & Models uses provider-qualified model labels", async ({ page }) 
     .toHaveCount(0);
 });
 
-test("automation create and edit preserve model and thinking choices", async ({ page }) => {
+test("automation create, edit, and pause preserve model options", async ({ page }) => {
   await page.route("**/v1/models", async (route) => {
     await route.fulfill({
       json: [{
@@ -785,11 +805,20 @@ test("automation create and edit preserve model and thinking choices", async ({ 
   });
 
   const requests: Array<Record<string, unknown>> = [];
+  const enabledRequests: Array<Record<string, unknown>> = [];
   let savedAutomation: Record<string, unknown> | undefined;
   const automationMutation = async (route: Route) => {
     const method = route.request().method();
-    if (method === "GET" && new URL(route.request().url()).pathname === "/v1/automations") {
+    const pathname = new URL(route.request().url()).pathname;
+    if (method === "GET" && pathname === "/v1/automations") {
       await route.fulfill({ json: savedAutomation === undefined ? [] : [savedAutomation] });
+      return;
+    }
+    if (method === "PUT" && pathname.endsWith("/enabled")) {
+      const request = route.request().postDataJSON() as Record<string, unknown>;
+      enabledRequests.push(request);
+      savedAutomation = { ...savedAutomation, enabled: request["enabled"] };
+      await route.fulfill({ json: savedAutomation });
       return;
     }
     if (method !== "POST" && method !== "PUT") {
@@ -851,6 +880,14 @@ test("automation create and edit preserve model and thinking choices", async ({ 
   expect(requests[1]).toMatchObject({
     model: "codex/gpt-5.6-sol",
     thinking_level: null,
+    model_options: { reasoning_effort: "ultra" },
+  });
+
+  await page.getByRole("button", { name: "Pause", exact: true }).click();
+  await expect.poll(() => enabledRequests.length).toBe(1);
+  expect(enabledRequests[0]).toEqual({ enabled: false });
+  expect(savedAutomation).toMatchObject({
+    enabled: false,
     model_options: { reasoning_effort: "ultra" },
   });
 });

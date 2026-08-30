@@ -3213,6 +3213,13 @@ pub struct UpsertAutomationRequest {
     pub enabled: bool,
 }
 
+/// Change only whether an automation is scheduled to run. This narrow
+/// mutation avoids replacing a concurrently edited automation definition.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SetAutomationEnabledRequest {
+    pub enabled: bool,
+}
+
 /// A pre-canned automation for a common development task
 /// (`GET /v1/automations/templates`). Clients use these to pre-fill the
 /// create form; the user still picks the workspace and can edit anything.

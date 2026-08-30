@@ -20658,8 +20658,6 @@ mod tests {
                    workspace_id TEXT NOT NULL,
                    mode TEXT,
                    model TEXT,
-                   thinking_level TEXT,
-                   permission_mode TEXT NOT NULL DEFAULT 'ask',
                    schedule TEXT NOT NULL,
                    enabled INTEGER NOT NULL DEFAULT 1,
                    next_run_at TEXT,
@@ -20672,9 +20670,9 @@ mod tests {
             .unwrap();
             conn.execute(
                 "INSERT INTO automations
-                    (id, name, prompt, workspace_id, mode, model, thinking_level,
-                     permission_mode, schedule, enabled, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                    (id, name, prompt, workspace_id, mode, model,
+                     schedule, enabled, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     "auto_legacy",
                     "Legacy",
@@ -20682,8 +20680,6 @@ mod tests {
                     "ws_legacy",
                     "code",
                     Option::<String>::None,
-                    "high",
-                    "ask",
                     serde_json::to_string(&schedule).unwrap(),
                     1,
                     "2026-01-01T00:00:00Z",
@@ -20694,6 +20690,8 @@ mod tests {
 
         let store = Store::open(&path).unwrap();
         let mut legacy = store.automation("auto_legacy").unwrap().unwrap();
+        assert_eq!(legacy.permission_mode, PermissionMode::Ask);
+        assert_eq!(legacy.thinking_level, None);
         assert!(legacy.model_options.is_empty());
         legacy
             .model_options

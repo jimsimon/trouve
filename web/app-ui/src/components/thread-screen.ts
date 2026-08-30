@@ -162,6 +162,7 @@ import {
   rovingTabIndex,
 } from "./tab-navigation.js";
 import { threadNavigationTitle } from "./thread-title.js";
+import { threadModeSettingRequest } from "./thread-settings-model.js";
 import {
   durableThreadTabCapacity,
   threadSwitcherRows,
@@ -2070,17 +2071,8 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
                     ?disabled=${turnControls.effectiveTurnRunning || this.#threadSettingsPending || connectivityBlocked}
                     @change=${(event: Event) => {
                       const modeId = (event.currentTarget as HTMLSelectElement).value;
-                      const mode = this.#modes.find((candidate) => candidate.id === modeId);
-                      const defaultModel = mode?.default_model?.trim() ?? "";
-                      const nextModel = defaultModel || thread.model;
                       return this.#updateThreadSetting(
-                        {
-                          mode: modeId,
-                          ...(defaultModel === ""
-                            ? {}
-                            : { model: defaultModel }),
-                          ...(nextModel === thread.model ? {} : { model_options: {} }),
-                        },
+                        threadModeSettingRequest(this.#modes, modeId, thread.model),
                         "Mode could not be changed.",
                       );
                     }}
