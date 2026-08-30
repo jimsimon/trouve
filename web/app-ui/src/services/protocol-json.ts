@@ -2,6 +2,7 @@ const LOSSY_NUMBER = Symbol("trouve-lossy-json-number");
 const EXACT_OPTION_SCHEMA_NODES = new WeakSet<object>();
 const EXACT_MODEL_OPTION_NUMBER_TOKENS = new WeakMap<object, ReadonlyMap<string, string>>();
 const JSON_NUMBER_TOKEN = /^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$/u;
+const JSON_NUMBER_PREFIX = /^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?/u;
 
 interface ParsedNumber {
   readonly [LOSSY_NUMBER]: true;
@@ -188,12 +189,76 @@ const restoreProtocolValue = (value: unknown): unknown => {
   ]));
 };
 
+const containsString = (value: unknown, candidate: string): boolean => {
+  if (value === candidate) return true;
+  if (Array.isArray(value)) return value.some((child) => containsString(child, candidate));
+  if (typeof value !== "object" || value === null) return false;
+  return Object.entries(value).some(([key, child]) =>
+    key === candidate || containsString(child, candidate)
+  );
+};
+
+/** Replace number tokens outside JSON strings with uniquely tagged objects.
+ * The second native parse then exposes each original token to runtimes whose
+ * reviver does not implement the ES2023 `context.source` argument. */
+const parseWithNumberTokenFallback = (text: string, firstParse: unknown): unknown => {
+  let marker = "\0trouve-json-number";
+  while (containsString(firstParse, marker)) marker += "\0";
+  const markerJson = JSON.stringify(marker);
+  let transformed = "";
+  let inString = false;
+  let escaped = false;
+  for (let index = 0; index < text.length;) {
+    const character = text[index]!;
+    if (inString) {
+      transformed += character;
+      index += 1;
+      if (escaped) escaped = false;
+      else if (character === "\\") escaped = true;
+      else if (character === "\"") inString = false;
+      continue;
+    }
+    if (character === "\"") {
+      inString = true;
+      transformed += character;
+      index += 1;
+      continue;
+    }
+    if (character === "-" || character >= "0" && character <= "9") {
+      const source = JSON_NUMBER_PREFIX.exec(text.slice(index))?.[0];
+      if (source !== undefined) {
+        transformed += `{${markerJson}:${JSON.stringify(source)}}`;
+        index += source.length;
+        continue;
+      }
+    }
+    transformed += character;
+    index += 1;
+  }
+  return JSON.parse(transformed, (_key: string, value: unknown): unknown => {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) return value;
+    const record = value as Record<string, unknown>;
+    const keys = Object.keys(record);
+    const source = record[marker];
+    if (keys.length !== 1 || keys[0] !== marker || typeof source !== "string") {
+      return value;
+    }
+    const rounded = Number(source);
+    return {
+      [LOSSY_NUMBER]: true,
+      rounded,
+      ...(jsonNumberTokenIsExact(source, rounded) ? { source } : {}),
+    } satisfies ParsedNumber;
+  });
+};
+
 /** Parse protocol JSON without allowing JavaScript number rounding to mutate
  * model-specific controls or persisted option values. Lossy schema properties
  * are hidden; a lossy persisted option rejects the response so a later
  * replacement update cannot erase it. Runtimes without reviver source tokens
- * therefore reject responses that contain numeric model options. */
+ * recover the tokens with a lexical fallback before restoring protocol data. */
 export const parseProtocolJson = (text: string): unknown => {
+  let sourceUnavailable = false;
   const parsed = JSON.parse(text, ((
     _key: string,
     value: unknown,
@@ -201,13 +266,16 @@ export const parseProtocolJson = (text: string): unknown => {
   ): unknown => {
     if (typeof value !== "number") return value;
     const source = context?.source;
+    if (source === undefined) sourceUnavailable = true;
     return {
       [LOSSY_NUMBER]: true,
       rounded: value,
       ...(source !== undefined && jsonNumberTokenIsExact(source, value) ? { source } : {}),
     } satisfies ParsedNumber;
   }) as (this: unknown, key: string, value: unknown) => unknown);
-  return restoreProtocolValue(parsed);
+  return restoreProtocolValue(
+    sourceUnavailable ? parseWithNumberTokenFallback(text, parsed) : parsed,
+  );
 };
 
 const serializeProtocolValue = (

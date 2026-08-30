@@ -735,6 +735,22 @@ describe("ThreadViewModel", () => {
     expect(vm.turnDurationMs.get(1)).toBe(7_000);
   });
 
+  it("folds server-dispatched background activity without inventing user input", () => {
+    const vm = new ThreadViewModel();
+    expect(vm.apply(envelope(1, {
+      type: "turn.background_activity",
+      turn: 3,
+    }))).toBe(true);
+    expect(vm.items).toMatchObject([{
+      id: "background:3",
+      kind: "user",
+      turn: 3,
+      content: "",
+      attachments: [],
+      background: true,
+    }]);
+  });
+
   it("closes the live thinking phase on its explicit provider boundary", () => {
     const vm = new ThreadViewModel();
     expect(vm.apply(envelope(1, {

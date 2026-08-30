@@ -306,13 +306,16 @@ pub enum Event {
         /// `GET /v1/attachments/{id}`).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         attachments: Vec<crate::Attachment>,
-        /// The turn was dispatched by the server to attach to
-        /// vendor-autonomous agent activity; `content` is a fixed marker,
-        /// not user input. Clients should render the turn as background
-        /// agent activity.
+        /// Legacy protocol 7.19–7.26 marker retained so existing durable logs
+        /// remain replayable. New servers emit `turn.background_activity`
+        /// instead and leave this false for user-authored messages.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         background: bool,
     },
+    /// The server attached a turn to vendor-autonomous agent activity. This is
+    /// deliberately distinct from `user.message`: no user authored a prompt.
+    #[serde(rename = "turn.background_activity")]
+    TurnBackgroundActivity { turn: u64 },
     /// Additional user input accepted by the backend while `turn` was still
     /// running. This belongs on the active turn's timeline and does not start
     /// or queue another turn.
@@ -830,6 +833,34 @@ mod tests {
                 turn: 3,
                 wait_ms: 125,
                 background: true,
+            }
+        ));
+    }
+
+    #[test]
+    fn background_activity_has_a_distinct_replay_compatible_contract() {
+        let value = serde_json::to_value(Event::TurnBackgroundActivity { turn: 3 }).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "type": "turn.background_activity",
+                "turn": 3,
+            })
+        );
+
+        let legacy: Event = serde_json::from_value(serde_json::json!({
+            "type": "user.message",
+            "turn": 4,
+            "content": "[background agent activity]",
+            "background": true
+        }))
+        .unwrap();
+        assert!(matches!(
+            legacy,
+            Event::UserMessage {
+                turn: 4,
+                background: true,
+                ..
             }
         ));
     }

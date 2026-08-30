@@ -693,6 +693,16 @@ export class ThreadViewModel {
           background: envelope.background ?? false,
         });
         return true;
+      case "turn.background_activity":
+        this.appendItem({
+          id: `background:${envelope.turn}`,
+          kind: "user",
+          turn: envelope.turn,
+          content: "",
+          attachments: [],
+          background: true,
+        });
+        return true;
       case "turn.steered":
         this.finishProgress();
         this.finishThinking();

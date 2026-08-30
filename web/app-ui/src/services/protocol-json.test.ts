@@ -69,8 +69,24 @@ describe("protocol JSON number preservation", () => {
       })
     );
     try {
-      expect(() => parseProtocolJson('{"model_options":{"temperature":0.25}}'))
-        .toThrow(UnsupportedModelOptionNumberError);
+      const fallbackSource = "{\"model_options\":{\"temperature\":0.2500,\"large\":1e20,\"zero\":-0},\"label\":\"0.2500\"}";
+      const fallback = parseProtocolJson(fallbackSource);
+      expect(fallback).toEqual({
+        model_options: { temperature: 0.25, large: 1e20, zero: -0 },
+        label: "0.2500",
+      });
+      expect(stringifyProtocolJson(fallback)).toBe(fallbackSource);
+      expect(() => parseProtocolJson(
+        '{"model_options":{"temperature":0.1234567890123456789}}',
+      )).toThrow(UnsupportedModelOptionNumberError);
+      expect(parseProtocolJson(`{
+        "options_schema":{"properties":{
+          "safe":{"type":"number","default":0.25},
+          "unsafe":{"type":"number","default":9007199254740993}
+        }}
+      }`)).toEqual({
+        options_schema: { properties: { safe: { type: "number", default: 0.25 } } },
+      });
     } finally {
       parseWithoutSource.mockRestore();
     }

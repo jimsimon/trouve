@@ -2883,10 +2883,9 @@ export interface components {
              */
             attachments?: components["schemas"]["Attachment"][];
             /**
-             * @description The turn was dispatched by the server to attach to
-             *     vendor-autonomous agent activity; `content` is a fixed marker,
-             *     not user input. Clients should render the turn as background
-             *     agent activity.
+             * @description Legacy protocol 7.19–7.26 marker retained so existing durable logs
+             *     remain replayable. New servers emit `turn.background_activity`
+             *     instead and leave this false for user-authored messages.
              */
             background?: boolean;
             content: string;
@@ -2894,6 +2893,11 @@ export interface components {
             turn: number;
             /** @enum {string} */
             type: "user.message";
+        } | {
+            /** Format: int64 */
+            turn: number;
+            /** @enum {string} */
+            type: "turn.background_activity";
         } | {
             attachments?: components["schemas"]["Attachment"][];
             content: string;
@@ -4700,8 +4704,9 @@ export interface components {
         ThreadViewItem: {
             attachments: components["schemas"]["Attachment"][];
             /**
-             * @description Server-dispatched attach turn for vendor-autonomous agent
-             *     activity; render as background activity, not as user input.
+             * @description Background-activity display row. New snapshots derive this from
+             *     `turn.background_activity`; true on user rows remains possible when
+             *     replaying protocol 7.19–7.26 logs.
              */
             background?: boolean;
             content: string;

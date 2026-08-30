@@ -6,9 +6,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-/// Marker prompt content for turns that attach to vendor-autonomous agent
-/// activity instead of prompting the model. It is stored and rendered as the
-/// turn's prompt, so it is written to read sensibly in a transcript.
+/// Internal marker prompt for turns that attach to vendor-autonomous agent
+/// activity instead of prompting the model. The durable display boundary is
+/// the dedicated `turn.background_activity` event, not a user message.
 pub const BACKGROUND_ATTACH_PROMPT: &str = "[background agent activity]";
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -45,6 +45,19 @@ use crate::tools::{
     SessionRepositoryPush, ToolCtx, ToolExecutor, ToolResult, edit_strategy_for_model,
 };
 use crate::{context, git, new_id, personas};
+
+fn dispatched_prompt_event(turn: u64, prompt: &trouve_protocol::QueuedPrompt) -> Event {
+    if prompt.background {
+        Event::TurnBackgroundActivity { turn }
+    } else {
+        Event::UserMessage {
+            turn,
+            content: prompt.content.clone(),
+            attachments: prompt.attachments.clone(),
+            background: false,
+        }
+    }
+}
 
 /// Safety valve: maximum provider round-trips within a single turn.
 const MAX_ITERATIONS: usize = 32;
@@ -10459,12 +10472,7 @@ impl Engine {
                 thinking_level,
                 supports_steering,
             },
-            Event::UserMessage {
-                turn,
-                content: prompt.content.clone(),
-                attachments: prompt.attachments.clone(),
-                background: prompt.background,
-            },
+            dispatched_prompt_event(turn, prompt),
         ])
     }
 
@@ -11407,12 +11415,7 @@ impl Engine {
                             thinking_level: None,
                             supports_steering: false,
                         },
-                        Event::UserMessage {
-                            turn,
-                            content: prompt.content.clone(),
-                            attachments: prompt.attachments.clone(),
-                            background: prompt.background,
-                        },
+                        dispatched_prompt_event(turn, &prompt),
                     ]);
                 }
                 terminal_events.push(Event::TurnCancelled { turn });
@@ -18473,6 +18476,38 @@ fn expand_provider_template(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dispatched_background_activity_is_not_a_user_message() {
+        let prompt = trouve_protocol::QueuedPrompt {
+            id: "qp_background".into(),
+            thread_id: "th_background".into(),
+            position: 0,
+            content: BACKGROUND_ATTACH_PROMPT.into(),
+            background: true,
+            attachments: Vec::new(),
+            created_at: "2026-08-30T00:00:00Z".into(),
+        };
+        assert!(matches!(
+            dispatched_prompt_event(7, &prompt),
+            Event::TurnBackgroundActivity { turn: 7 }
+        ));
+
+        let foreground = trouve_protocol::QueuedPrompt {
+            background: false,
+            content: "User prompt".into(),
+            ..prompt
+        };
+        assert!(matches!(
+            dispatched_prompt_event(8, &foreground),
+            Event::UserMessage {
+                turn: 8,
+                content,
+                background: false,
+                ..
+            } if content == "User prompt"
+        ));
+    }
 
     #[tokio::test]
     async fn planned_turn_setup_lane_bounds_only_setup_admission() {

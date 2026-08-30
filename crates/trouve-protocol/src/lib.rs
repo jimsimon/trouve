@@ -313,10 +313,9 @@ pub use requests::*;
 // 7.17 was reserved for an in-flight branch and never released; skipped.
 // 7.18: review stats expose the finding-thread auto-resolve backlog
 // (additive).
-// 7.19: queued prompts, user-message events, and thread-view user items carry
-// an explicit `background` flag marking server-dispatched attach turns for
-// vendor-autonomous agent activity, so attach intent is trusted dispatch
-// metadata rather than prompt-content inference (additive).
+// 7.19: queued prompts, user-message events, and thread-view user items gained
+// an explicit `background` flag for server-dispatched attach turns. The event
+// field remains for replay compatibility but was superseded in 7.27.
 // 7.20: finding evidence carries the coordinator's verification record —
 // anchor quote with a server-derived match verdict, execution-path
 // verification grade, and counterexample search — from which finding
@@ -336,7 +335,9 @@ pub use requests::*;
 // for the selected model (additive).
 // 7.26: PUT /v1/automations/{id}/enabled changes automation scheduling without
 // replacing a concurrently edited definition (additive).
-pub const PROTOCOL_VERSION: &str = "7.26";
+// 7.27: `turn.background_activity` distinguishes server-dispatched autonomous
+// activity from user-authored `user.message` events (additive).
+pub const PROTOCOL_VERSION: &str = "7.27";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";
 pub const ERROR_CODE_GITHUB_REAUTHENTICATION_REQUIRED: &str = "github_reauthentication_required";

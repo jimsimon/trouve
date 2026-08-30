@@ -163,6 +163,24 @@ describe("ProtocolClient", () => {
     });
   });
 
+  it("bounds and validates structured update-thread errors", async () => {
+    const responses = [
+      JSON.stringify({ code: `  ${"c".repeat(700)}  `, message: `  ${"m".repeat(700)}  ` }),
+      JSON.stringify({ code: "   ", message: "   " }),
+      "not JSON",
+    ];
+    const fakeFetch = vi.fn<typeof fetch>(async () => new Response(responses.shift(), { status: 400 }));
+    const client = new ProtocolClient("http://127.0.0.1:43127", { fetch: fakeFetch });
+
+    const bounded = await client.updateThread("th_1", {}).catch((reason: unknown) => reason);
+    expect(bounded).toMatchObject({ status: 400, code: "c".repeat(512) });
+    expect((bounded as ProtocolClientError).message).toBe("m".repeat(512));
+    for (const expected of ["update thread request failed", "update thread request failed"]) {
+      const error = await client.updateThread("th_1", {}).catch((reason: unknown) => reason);
+      expect(error).toMatchObject({ status: 400, code: undefined, message: expected });
+    }
+  });
+
   it("serializes verified model-option number tokens without rounding", async () => {
     const requests: Request[] = [];
     const thread = {
@@ -1188,11 +1206,11 @@ describe("protocol compatibility", () => {
   });
 
   it("accepts the exact generated protocol version", () => {
-    expect(() => assertProtocolCompatibility("7.26")).not.toThrow();
+    expect(() => assertProtocolCompatibility("7.27")).not.toThrow();
   });
 
   it("rejects older, newer, other-major, and malformed servers", () => {
-    for (const version of ["4.0", "5.2", "6.1", "7.0", "7.1", "7.2", "7.3", "7.4", "7.5", "7.6", "7.7", "7.8", "7.9", "7.10", "7.11", "7.12", "7.13", "7.14", "7.15", "7.16", "7.17", "7.18", "7.19", "7.20", "7.21", "7.22", "7.23", "7.24", "7.25", "7.27", "7.26.1", "unknown", ""]) {
+    for (const version of ["4.0", "5.2", "6.1", "7.0", "7.1", "7.2", "7.3", "7.4", "7.5", "7.6", "7.7", "7.8", "7.9", "7.10", "7.11", "7.12", "7.13", "7.14", "7.15", "7.16", "7.17", "7.18", "7.19", "7.20", "7.21", "7.22", "7.23", "7.24", "7.25", "7.26", "7.28", "7.27.1", "unknown", ""]) {
       expect(() => assertProtocolCompatibility(version)).toThrowError(
         expect.objectContaining({ kind: "incompatible-protocol" }),
       );

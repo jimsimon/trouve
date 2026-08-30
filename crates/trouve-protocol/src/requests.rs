@@ -408,8 +408,9 @@ pub enum ThreadViewItem {
         turn: u64,
         content: String,
         attachments: Vec<Attachment>,
-        /// Server-dispatched attach turn for vendor-autonomous agent
-        /// activity; render as background activity, not as user input.
+        /// Background-activity display row. New snapshots derive this from
+        /// `turn.background_activity`; true on user rows remains possible when
+        /// replaying protocol 7.19–7.26 logs.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         background: bool,
     },

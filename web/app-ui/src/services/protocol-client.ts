@@ -431,7 +431,7 @@ const MAX_PROTOCOL_ERROR_FIELD_LENGTH = 512;
 // unions. A newer schema can therefore add a value this bundle cannot decode
 // even when the server labels the change additive. Require the exact schema
 // version this client was generated and tested against.
-export const SUPPORTED_PROTOCOL_VERSION = "7.26";
+export const SUPPORTED_PROTOCOL_VERSION = "7.27";
 
 export const assertProtocolCompatibility = (version: string): void => {
   if (version !== SUPPORTED_PROTOCOL_VERSION) {
@@ -483,6 +483,25 @@ export class ProtocolClient {
       );
     }
     return response;
+  }
+
+  async #requestFailure(response: Response, defaultMessage: string): Promise<ProtocolClientError> {
+    let code: string | undefined;
+    let message = defaultMessage;
+    try {
+      const record = asRecord(JSON.parse(await response.text()));
+      if (record !== undefined && typeof record["code"] === "string") {
+        const candidate = record["code"].trim();
+        if (candidate !== "") code = candidate.slice(0, MAX_PROTOCOL_ERROR_FIELD_LENGTH);
+      }
+      if (record !== undefined && typeof record["message"] === "string") {
+        const candidate = record["message"].trim();
+        if (candidate !== "") message = candidate.slice(0, MAX_PROTOCOL_ERROR_FIELD_LENGTH);
+      }
+    } catch {
+      // Preserve the bounded generic message for malformed error responses.
+    }
+    return new ProtocolClientError("request-failed", message, response.status, code);
   }
 
   async #validatedResponse<T>(
@@ -845,31 +864,7 @@ export class ProtocolClient {
       throw new ProtocolClientError("request-failed", "pull request detail request failed");
     }
     if (!response.ok) {
-      let code: string | undefined;
-      let message = "pull request detail request failed";
-      try {
-        const error: unknown = await response.json();
-        if (typeof error === "object" && error !== null) {
-          const record = error as Record<string, unknown>;
-          if (typeof record["code"] === "string") {
-            code = record["code"].slice(0, MAX_PROTOCOL_ERROR_FIELD_LENGTH);
-          }
-          if (typeof record["message"] === "string") {
-            const candidate = record["message"].trim();
-            if (candidate !== "") {
-              message = candidate.slice(0, MAX_PROTOCOL_ERROR_FIELD_LENGTH);
-            }
-          }
-        }
-      } catch {
-        // Preserve the bounded generic message for malformed error responses.
-      }
-      throw new ProtocolClientError(
-        "request-failed",
-        message,
-        response.status,
-        code,
-      );
+      throw await this.#requestFailure(response, "pull request detail request failed");
     }
     return this.#parsePrDetail(response);
   }
@@ -1662,26 +1657,7 @@ export class ProtocolClient {
       throw new ProtocolClientError("request-failed", "update thread request failed");
     }
     if (!response.ok) {
-      let code: string | undefined;
-      let message = "update thread request failed";
-      try {
-        const error: unknown = JSON.parse(await response.text());
-        if (typeof error === "object" && error !== null) {
-          const record = error as Record<string, unknown>;
-          if (typeof record["code"] === "string") {
-            code = record["code"].slice(0, MAX_PROTOCOL_ERROR_FIELD_LENGTH);
-          }
-          if (typeof record["message"] === "string") {
-            const candidate = record["message"].trim();
-            if (candidate !== "") {
-              message = candidate.slice(0, MAX_PROTOCOL_ERROR_FIELD_LENGTH);
-            }
-          }
-        }
-      } catch {
-        // Preserve the generic message for malformed error responses.
-      }
-      throw new ProtocolClientError("request-failed", message, response.status, code);
+      throw await this.#requestFailure(response, "update thread request failed");
     }
     return this.#validatedResponse<ProtocolThread>(
       response,
