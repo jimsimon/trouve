@@ -984,11 +984,11 @@ const MIGRATIONS: &[&str] = &[
        line INTEGER NOT NULL,
        PRIMARY KEY (finding_id, head_sha)
      )",
-    // Polling is the webhook fallback for threadless resolve commands. Track
-    // command extraction separately from generic comment discovery so
-    // comments seen by older builds are recovered exactly once after upgrade.
+    // Polling is the webhook fallback for threadless resolve commands. Rows
+    // from older builds default to inspected so upgrades never replay command
+    // history; newly discovered comments explicitly start uninspected.
     "ALTER TABLE code_review_polled_comments
-       ADD COLUMN threadless_command_claimed INTEGER NOT NULL DEFAULT 0",
+       ADD COLUMN threadless_command_claimed INTEGER NOT NULL DEFAULT 1",
 ];
 
 /// Blocking-tier predicate for one findings row under the given SQL alias:
@@ -16388,11 +16388,10 @@ impl Store {
         )?)
     }
 
-    /// Claim a comment discovered by reconciliation and atomically persist
-    /// any command it carries. Generic discovery and threadless-command
-    /// extraction have separate latches: that lets an upgraded build recover
-    /// a resolve command from a comment an older build already marked seen,
-    /// without requeuing the command on every later poll.
+    /// Claim a newly discovered comment and atomically persist any command it
+    /// carries. The inspection latch deduplicates webhook and polling delivery;
+    /// comments recorded before this capability are already inspected by the
+    /// migration and are deliberately not backfilled.
     pub fn claim_code_review_polled_comment(
         &self,
         repository: &str,
@@ -16404,8 +16403,8 @@ impl Store {
         let tx = write_transaction(&conn)?;
         let inserted = tx.execute(
             "INSERT OR IGNORE INTO code_review_polled_comments
-                    (repository, comment_id, seen_at)
-             VALUES (?1, ?2, ?3)",
+                    (repository, comment_id, seen_at, threadless_command_claimed)
+             VALUES (?1, ?2, ?3, 0)",
             params![
                 repository,
                 comment_id as i64,
@@ -16427,15 +16426,15 @@ impl Store {
                 ],
             )?;
         }
-        if let Some(command) = threadless_command {
-            let command_claimed = tx.query_row(
-                "SELECT threadless_command_claimed
-                 FROM code_review_polled_comments
-                 WHERE repository = ?1 AND comment_id = ?2",
-                params![repository, comment_id as i64],
-                |row| row.get::<_, bool>(0),
-            )?;
-            if !command_claimed {
+        let command_claimed = tx.query_row(
+            "SELECT threadless_command_claimed
+             FROM code_review_polled_comments
+             WHERE repository = ?1 AND comment_id = ?2",
+            params![repository, comment_id as i64],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !command_claimed {
+            if let Some(command) = threadless_command {
                 tx.execute(
                     "INSERT OR IGNORE INTO code_review_pending_threadless_commands
                             (trigger_key, repository, pull_number, comment_id, author, resolve,
@@ -16453,13 +16452,13 @@ impl Store {
                         chrono::Utc::now().to_rfc3339()
                     ],
                 )?;
-                tx.execute(
-                    "UPDATE code_review_polled_comments
-                     SET threadless_command_claimed = 1
-                     WHERE repository = ?1 AND comment_id = ?2",
-                    params![repository, comment_id as i64],
-                )?;
             }
+            tx.execute(
+                "UPDATE code_review_polled_comments
+                 SET threadless_command_claimed = 1
+                 WHERE repository = ?1 AND comment_id = ?2",
+                params![repository, comment_id as i64],
+            )?;
         }
         tx.commit()?;
         Ok(inserted > 0)

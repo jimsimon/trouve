@@ -25027,7 +25027,7 @@ rename to src/new.rs
     }
 
     #[tokio::test]
-    async fn comment_polling_recovers_review_and_threadless_commands_atomically() {
+    async fn comment_polling_claims_new_review_and_threadless_commands_atomically() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
         let comment = |id, pull_number, body: &str, association: &str, kind: &str| {
@@ -25043,6 +25043,13 @@ rename to src/new.rs
         };
         let mut first_page = vec![
             comment(
+                302,
+                42,
+                "@trouve-ai resolve rvf_7c7d5797 new command",
+                "OWNER",
+                "User",
+            ),
+            comment(
                 301,
                 42,
                 "@trouve-ai resolve rvf_6b6c4686 accepted limitation",
@@ -25055,7 +25062,7 @@ rename to src/new.rs
             comment(297, 42, "@trouve-ai review", "OWNER", "Bot"),
         ];
         first_page.extend(
-            (0..95).map(|index| comment(400 + index, 42, "ordinary discussion", "OWNER", "User")),
+            (0..94).map(|index| comment(400 + index, 42, "ordinary discussion", "OWNER", "User")),
         );
         assert_eq!(first_page.len(), REVIEW_COMMENT_PAGE_SIZE);
 
@@ -25065,9 +25072,8 @@ rename to src/new.rs
                 .claim_code_review_polled_comment("acme/widgets", 200, None, None)
                 .unwrap()
         );
-        // Simulate the deployed bug: an older poll marked the resolve
-        // comment seen without extracting its command. The new extraction
-        // latch must recover it once.
+        // Comments recorded before command polling are already inspected and
+        // must not be replayed as a historical backfill after upgrade.
         assert!(
             store
                 .claim_code_review_polled_comment("acme/widgets", 301, None, None)
@@ -25132,10 +25138,30 @@ rename to src/new.rs
             .pending_threadless_commands("acme/widgets", THREADLESS_COMMAND_PASS_LIMIT)
             .unwrap();
         assert_eq!(pending_commands.len(), 1);
-        assert_eq!(pending_commands[0].comment_id, 301);
+        assert_eq!(pending_commands[0].comment_id, 302);
         assert_eq!(pending_commands[0].author, "jim");
-        assert_eq!(pending_commands[0].finding_prefix, "rvf_6b6c4686");
-        assert_eq!(pending_commands[0].reason, "accepted limitation");
+        assert_eq!(pending_commands[0].finding_prefix, "rvf_7c7d5797");
+        assert_eq!(pending_commands[0].reason, "new command");
+        assert!(
+            !engine
+                .store
+                .claim_code_review_polled_comment(
+                    "acme/widgets",
+                    302,
+                    None,
+                    Some(&pending_commands[0]),
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            engine
+                .store
+                .pending_threadless_commands("acme/widgets", THREADLESS_COMMAND_PASS_LIMIT)
+                .unwrap()
+                .len(),
+            1,
+            "a repeated poll must not queue the command twice"
+        );
         for (comment_id, pull_number) in [
             (299, 99),
             (298, 42),
@@ -25143,6 +25169,7 @@ rename to src/new.rs
             (200, 42),
             (300, 42),
             (301, 42),
+            (302, 42),
         ] {
             assert!(
                 !engine

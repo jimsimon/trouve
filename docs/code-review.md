@@ -111,10 +111,10 @@ HTTPS endpoint:
   not show them until the corresponding Pull requests and Issues repository
   permissions are selected.
 
-Issue comment delivery is required for `resolve` and `unresolve`, and it is the
-immediate path for `@trouve-ai review`. Polling remains enabled as a fallback
-for pull request and manual-review triggers, but it does not process
-`resolve` or `unresolve` commands.
+Issue comment delivery is the immediate path for `@trouve-ai review`, `resolve`,
+and `unresolve`. Polling remains enabled as a fallback for newly discovered
+comments missed by webhook delivery. Comments already seen before command
+polling was introduced are treated as inspected and are not backfilled.
 
 After creating it:
 
