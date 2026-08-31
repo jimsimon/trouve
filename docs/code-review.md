@@ -109,10 +109,12 @@ HTTPS endpoint:
   the trouve dashboard.
 - Subscribe to the **Pull request** and **Issue comment** events. GitHub may
   not show them until the corresponding Pull requests and Issues repository
-  permissions are selected. Issue comment delivery is the immediate path for
-  `@trouve-ai review`, `resolve`, and `unresolve`; polling remains the fallback.
+  permissions are selected.
 
-Polling remains enabled as a fallback for missed webhook deliveries.
+Issue comment delivery is required for `resolve` and `unresolve`, and it is the
+immediate path for `@trouve-ai review`. Polling remains enabled as a fallback
+for pull request and manual-review triggers, but it does not process
+`resolve` or `unresolve` commands.
 
 After creating it:
 
