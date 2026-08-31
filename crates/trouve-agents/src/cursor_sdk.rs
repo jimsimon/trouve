@@ -2,7 +2,8 @@
 //!
 //! One credential-bound backend owns one warm Bridge process and one callback
 //! router. Cursor's local SQLite store holds every agent for that backend; the
-//! router maps each callback's exact `agent_id` to one turn-scoped MCP route.
+//! router maps each callback's exact `agent_id` and ingress generation to one
+//! turn-scoped MCP route.
 //! Cursor's native tools are replaced with the single SDK `mcp` capability;
 //! concrete tool schemas and calls are proxied to trouve's internal,
 //! thread-scoped MCP endpoint and therefore still pass through `ToolExecutor`.
@@ -10,7 +11,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -19,7 +20,7 @@ use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use bytes::BytesMut;
 use futures::{StreamExt as _, TryStreamExt as _};
 use serde::Deserialize;
@@ -581,10 +582,12 @@ impl BridgePool {
                     },
                     alive = process.is_alive() => alive,
                 };
-                // Quarantine and lease admission are serialized by the pool
-                // slot. Revalidate after the asynchronous liveness probe so a
-                // failure in another turn cannot make this pending admission
-                // commit against an unsafe process.
+                // Incrementing the lease under the pool slot above is the
+                // admission boundary. Revalidate after the asynchronous
+                // liveness probe so quarantine during that probe releases the
+                // reservation before any Bridge RPC. Quarantine after this
+                // check is concurrent with an already-admitted turn and, by
+                // design, drains without revoking active leases.
                 let reusable = if alive {
                     let current = self.process.lock().await;
                     process.is_reusable()
@@ -659,7 +662,7 @@ impl BridgePool {
                 client: bridge.client.clone(),
                 bridge: Mutex::new(bridge),
                 callback,
-                reusable: AtomicBool::new(true),
+                reusable: Arc::new(AtomicBool::new(true)),
                 active_leases: std::sync::atomic::AtomicUsize::new(1),
                 state_dir: request.state_dir.to_path_buf(),
                 last_used: StdMutex::new(Instant::now()),
@@ -912,7 +915,7 @@ struct PooledBridge {
     client: BridgeClient,
     bridge: Mutex<BridgeProcess>,
     callback: Arc<CallbackRouter>,
-    reusable: AtomicBool,
+    reusable: Arc<AtomicBool>,
     active_leases: std::sync::atomic::AtomicUsize,
     state_dir: PathBuf,
     last_used: StdMutex<Instant>,
@@ -1088,6 +1091,7 @@ async fn run_sdk_turn(
             mcp_url,
             allowed_tools,
             turn.cancel.child_token(),
+            Some(Arc::downgrade(&process.reusable)),
         )
         .await
     {
@@ -1620,10 +1624,12 @@ async fn mcp_request(
 struct CallbackState {
     bearer: Arc<str>,
     routes: Arc<StdRwLock<HashMap<String, Arc<CallbackRoute>>>>,
+    route_generation: Arc<AtomicU64>,
     request_slots: Arc<Semaphore>,
 }
 
 struct CallbackRoute {
+    generation: u64,
     mcp_url: Option<Arc<str>>,
     allowed_tools: Arc<HashSet<String>>,
     http: reqwest::Client,
@@ -1786,6 +1792,9 @@ struct CustomToolRequest {
     args: Value,
 }
 
+#[derive(Clone, Copy)]
+struct CallbackIngressGeneration(u64);
+
 struct CallbackRouter {
     url: String,
     bearer: String,
@@ -1800,6 +1809,7 @@ struct CallbackRouteLease {
     route: Arc<CallbackRoute>,
     routes: Arc<StdRwLock<HashMap<String, Arc<CallbackRoute>>>>,
     supervisor: Arc<CallbackSupervisor>,
+    owner_reusable: Option<Weak<AtomicBool>>,
     active: bool,
 }
 
@@ -1813,6 +1823,7 @@ impl CallbackRouter {
         let state = CallbackState {
             bearer: Arc::from(bearer.as_str()),
             routes: Arc::new(StdRwLock::new(HashMap::new())),
+            route_generation: Arc::new(AtomicU64::new(0)),
             request_slots: Arc::new(Semaphore::new(MAX_CALLBACK_HTTP_CONCURRENCY)),
         };
         let router = Router::new()
@@ -1850,6 +1861,7 @@ impl CallbackRouter {
         mcp_url: Option<String>,
         allowed_tools: HashSet<String>,
         cancel: CancellationToken,
+        owner_reusable: Option<Weak<AtomicBool>>,
     ) -> Result<CallbackRouteLease, BackendError> {
         if agent_id.is_empty() {
             return Err(BackendError::Protocol(
@@ -1866,8 +1878,17 @@ impl CallbackRouter {
                 "Cursor callback route for agent {agent_id} is already active"
             )));
         }
+        let generation = self
+            .state
+            .route_generation
+            .load(Ordering::Acquire)
+            .checked_add(1)
+            .ok_or_else(|| {
+                BackendError::Protocol("Cursor callback route generation exhausted".into())
+            })?;
         let supervisor = CallbackSupervisor::new(cancel);
         let route = Arc::new(CallbackRoute {
+            generation,
             mcp_url: mcp_url.map(Arc::from),
             allowed_tools: Arc::new(allowed_tools),
             http: self.http.clone(),
@@ -1875,11 +1896,19 @@ impl CallbackRouter {
             accepting: AtomicBool::new(true),
         });
         routes.insert(agent_id.clone(), route.clone());
+        // Publish the generation only after the matching route is present,
+        // while the route-table writer still excludes handler lookup. An
+        // ingress racing registration therefore snapshots either the prior
+        // generation and is rejected, or the fully published replacement.
+        self.state
+            .route_generation
+            .store(generation, Ordering::Release);
         Ok(CallbackRouteLease {
             agent_id,
             route,
             routes: self.state.routes.clone(),
             supervisor,
+            owner_reusable,
             active: true,
         })
     }
@@ -2012,15 +2041,24 @@ impl CallbackRouteLease {
 
 impl Drop for CallbackRouteLease {
     fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
         self.route.accepting.store(false, Ordering::Release);
-        self.detach();
         self.supervisor.cancel.cancel();
+        if let Some(reusable) = self.owner_reusable.as_ref().and_then(Weak::upgrade) {
+            reusable.store(false, Ordering::Release);
+        }
+        // Drop cannot await supervisor settlement. Keep the stopped route in
+        // the process-owned router and fail the process closed; BridgeLease
+        // drop will wake pool recovery after releasing the final active lease.
+        self.active = false;
     }
 }
 
 async fn authenticate_callback(
     State(state): State<CallbackState>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
     let Ok(_permit) = state.request_slots.clone().try_acquire_owned() else {
@@ -2039,11 +2077,18 @@ async fn authenticate_callback(
     if !secure_text_eq(presented, &expected) {
         return callback_error(StatusCode::UNAUTHORIZED, "unauthenticated", "Unauthorized");
     }
+    // Capture the route-table generation before body extraction can yield. A
+    // request already inside the callback server must never bind to a route
+    // registered later for the same durable agent id.
+    request.extensions_mut().insert(CallbackIngressGeneration(
+        state.route_generation.load(Ordering::Acquire),
+    ));
     next.run(request).await
 }
 
 async fn custom_tool_callback(
     State(state): State<CallbackState>,
+    Extension(ingress_generation): Extension<CallbackIngressGeneration>,
     Json(request): Json<CustomToolRequest>,
 ) -> Response {
     let route = state
@@ -2059,6 +2104,13 @@ async fn custom_tool_callback(
             "callback agent id has no active Cursor route",
         );
     };
+    if route.generation > ingress_generation.0 {
+        return callback_error(
+            StatusCode::FORBIDDEN,
+            "permission_denied",
+            "callback request predates the active Cursor route",
+        );
+    }
     if !route.accepting.load(Ordering::Acquire) {
         return callback_error(
             StatusCode::FORBIDDEN,
@@ -4058,6 +4110,7 @@ mod tests {
                 Some(format!("http://{address}/a")),
                 HashSet::from(["shared_tool".into()]),
                 CancellationToken::new(),
+                None,
             )
             .await
             .unwrap();
@@ -4067,6 +4120,7 @@ mod tests {
                 Some(format!("http://{address}/b")),
                 HashSet::from(["shared_tool".into()]),
                 CancellationToken::new(),
+                None,
             )
             .await
             .unwrap();
@@ -4076,6 +4130,7 @@ mod tests {
                 Some(format!("http://{address}/b")),
                 HashSet::from(["shared_tool".into()]),
                 CancellationToken::new(),
+                None,
             )
             .await;
         assert!(matches!(collision, Err(BackendError::Protocol(_))));
@@ -4173,6 +4228,193 @@ mod tests {
 
         route_b.stop().await;
         callback.stop().await.unwrap();
+        mcp_server.abort();
+    }
+
+    #[tokio::test]
+    async fn callback_ingress_generation_rejects_a_delayed_previous_route_request() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let mcp_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let mcp_server = tokio::spawn({
+            let mcp_calls = mcp_calls.clone();
+            async move {
+                axum::serve(
+                    listener,
+                    Router::new().route(
+                        "/mcp",
+                        post(move || {
+                            let mcp_calls = mcp_calls.clone();
+                            async move {
+                                mcp_calls.fetch_add(1, Ordering::AcqRel);
+                                Json(json!({
+                                    "jsonrpc": "2.0",
+                                    "id": "fixture",
+                                    "result": { "content": [] }
+                                }))
+                            }
+                        }),
+                    ),
+                )
+                .await
+            }
+        });
+        let callback = CallbackRouter::start(reqwest::Client::new()).await.unwrap();
+        let mut previous = callback
+            .register(
+                "agent-reused".into(),
+                Some(format!("http://{address}/mcp")),
+                HashSet::from(["shared_tool".into()]),
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let body = serde_json::to_string(&json!({
+            "toolName": "shared_tool",
+            "toolCallId": "delayed-call",
+            "agentId": "agent-reused",
+            "args": {},
+        }))
+        .unwrap();
+        let split = body.len() / 2;
+        let (body_prefix, body_suffix) = body.split_at(split);
+        let port: u16 = callback
+            .url
+            .strip_prefix("http://127.0.0.1:")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let mut request = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        request
+            .write_all(
+                format!(
+                    "POST {CALLBACK_PATH} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    callback.bearer,
+                    body.len(),
+                    body_prefix,
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while callback.state.request_slots.available_permits() == MAX_CALLBACK_HTTP_CONCURRENCY
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("delayed callback never crossed the ingress generation fence");
+
+        assert!(previous.stop().await);
+        let mut replacement = callback
+            .register(
+                "agent-reused".into(),
+                Some(format!("http://{address}/mcp")),
+                HashSet::from(["shared_tool".into()]),
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        request.write_all(body_suffix.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        request.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8(response).unwrap();
+        assert!(
+            response.starts_with("HTTP/1.1 403 Forbidden"),
+            "delayed callback reached its replacement route: {response}"
+        );
+        assert_eq!(mcp_calls.load(Ordering::Acquire), 0);
+
+        assert!(replacement.stop().await);
+        callback.stop().await.unwrap();
+        mcp_server.abort();
+    }
+
+    #[tokio::test]
+    async fn dropped_callback_route_quarantines_its_bridge_until_cleanup() {
+        let blocked_started = Arc::new(Semaphore::new(0));
+        let handler_started = blocked_started.clone();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let mcp_server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/mcp",
+                    post(move || {
+                        let handler_started = handler_started.clone();
+                        async move {
+                            handler_started.add_permits(1);
+                            std::future::pending::<Json<Value>>().await
+                        }
+                    }),
+                ),
+            )
+            .await
+        });
+        let callback = CallbackRouter::start(reqwest::Client::new()).await.unwrap();
+        let reusable = Arc::new(AtomicBool::new(true));
+        let route = callback
+            .register(
+                "agent-dropped".into(),
+                Some(format!("http://{address}/mcp")),
+                HashSet::from(["shared_tool".into()]),
+                CancellationToken::new(),
+                Some(Arc::downgrade(&reusable)),
+            )
+            .await
+            .unwrap();
+        let callback_request = tokio::spawn({
+            let url = format!("{}{}", callback.url, CALLBACK_PATH);
+            let bearer = callback.bearer.clone();
+            async move {
+                reqwest::Client::new()
+                    .post(url)
+                    .bearer_auth(bearer)
+                    .json(&json!({
+                        "toolName": "shared_tool",
+                        "toolCallId": "dropped-call",
+                        "agentId": "agent-dropped",
+                        "args": {},
+                    }))
+                    .send()
+                    .await
+            }
+        });
+        blocked_started.acquire().await.unwrap().forget();
+
+        drop(route);
+        assert!(!reusable.load(Ordering::Acquire));
+        assert!(
+            callback
+                .state
+                .routes
+                .read()
+                .unwrap()
+                .contains_key("agent-dropped"),
+            "unacknowledged Drop discarded process-owned route cleanup"
+        );
+        let response = tokio::time::timeout(Duration::from_secs(1), callback_request)
+            .await
+            .expect("dropped route did not cancel its callback")
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+        callback.stop().await.unwrap();
+        assert!(callback.state.routes.read().unwrap().is_empty());
         mcp_server.abort();
     }
 
@@ -4280,8 +4522,8 @@ mod tests {
         assert!(supervisor.tasks.lock().await.is_empty());
     }
 
-    #[tokio::test]
-    async fn callback_route_timeout_is_reported_for_bridge_quarantine() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn callback_route_timeout_retains_noncooperative_supervised_work() {
         let callback = CallbackRouter::start(local_http_client().unwrap())
             .await
             .unwrap();
@@ -4291,11 +4533,26 @@ mod tests {
                 None,
                 HashSet::new(),
                 CancellationToken::new(),
+                None,
             )
             .await
             .unwrap();
         let supervisor = route.supervisor.clone();
-        let tasks = supervisor.tasks.lock().await;
+        let task_started = Arc::new(Semaphore::new(0));
+        let release = Arc::new((StdMutex::new(false), std::sync::Condvar::new()));
+        supervisor.tasks.lock().await.spawn({
+            let task_started = task_started.clone();
+            let release = release.clone();
+            async move {
+                task_started.add_permits(1);
+                let (released, wake) = &*release;
+                let mut released = released.lock().unwrap();
+                while !*released {
+                    released = wake.wait(released).unwrap();
+                }
+            }
+        });
+        task_started.acquire().await.unwrap().forget();
         let settled = route
             .stop_until(tokio::time::Instant::now() + Duration::from_millis(10))
             .await;
@@ -4336,7 +4593,11 @@ mod tests {
                 .contains_key("agent-timeout"),
             "failed process cleanup discarded the timed-out route"
         );
-        drop(tasks);
+        {
+            let (released, wake) = &*release;
+            *released.lock().unwrap() = true;
+            wake.notify_all();
+        }
         callback.stop().await.unwrap();
         assert!(callback.state.routes.read().unwrap().is_empty());
     }
