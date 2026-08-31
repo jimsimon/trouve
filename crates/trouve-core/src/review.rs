@@ -5606,11 +5606,20 @@ impl Engine {
         // available even when reviewer coverage itself starts at the merge
         // base rather than the incremental watermark.
         let mut optional_shas = Vec::new();
-        for sha in [
-            &review_watermark_sha,
-            &previous_pull_state.last_reviewed_base_sha,
-            &previous_pull_state.last_reviewed_head_sha,
-        ] {
+        let optional_sha_candidates = if incremental_candidate {
+            vec![
+                &review_watermark_sha,
+                &previous_pull_state.last_reviewed_base_sha,
+                &previous_pull_state.last_reviewed_head_sha,
+            ]
+        } else {
+            // Full reviews need only the coordinate space that carried
+            // findings were last advanced onto. Fetching an older base as
+            // well would spend the bounded optional-history budget on an
+            // object that carried-anchor mapping never reads.
+            vec![&previous_pull_state.last_reviewed_head_sha]
+        };
+        for sha in optional_sha_candidates {
             if validate_sha(sha).is_ok()
                 && sha != &job.base_ref
                 && sha != &job.head_sha
@@ -6394,6 +6403,11 @@ impl Engine {
                     })
                     .await
             };
+            // The auxiliary mapping diff is best-effort for ordinary git
+            // failures, but cancellation remains authoritative. Do not turn a
+            // superseded full review into a warning followed by coordinator
+            // work on stale state.
+            ensure_review_current(superseded)?;
             match preferred_diff {
                 Ok(files) => {
                     carried_mapping_base_sha = preferred_carried_base_sha;
