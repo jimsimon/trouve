@@ -65,7 +65,6 @@ export interface SessionPullRequestIdentity {
 
 interface SessionPullRequestMentions {
   readonly urls: ReadonlySet<string>;
-  readonly numbers: ReadonlySet<number>;
 }
 
 /** Latest durable account-level PR slice for one GitHub host. The event
@@ -181,9 +180,7 @@ export const projectSessionPullRequests = (
   for (const pr of lists.flatMap((list) => list.prs)) {
     const exactBranch =
       pr.workspace_id === session.workspaceId && pr.head === session.branch;
-    const mentioned = mentions?.urls.has(pr.url.replace(/\/$/u, "").toLowerCase()) === true
-      || (pr.workspace_id === session.workspaceId
-        && mentions?.numbers.has(pr.number) === true);
+    const mentioned = mentions?.urls.has(pr.url.replace(/\/$/u, "").toLowerCase()) === true;
     if (exactBranch || mentioned || known.some((candidate) => samePullRequest(candidate, pr))) {
       projected.push(pr);
     }
@@ -860,10 +857,8 @@ export class AppStore {
         if (this.#deletedSessions.has(envelope.session_id)) return false;
         const current = this.#sessionPullRequestMentions.get(envelope.session_id);
         const urls = new Set(current?.urls ?? []);
-        const numbers = new Set(current?.numbers ?? []);
-        if (envelope.url == null) numbers.add(envelope.number);
-        else urls.add(envelope.url.replace(/\/$/u, "").toLowerCase());
-        this.#sessionPullRequestMentions.set(envelope.session_id, Object.freeze({ urls, numbers }));
+        urls.add(envelope.url.replace(/\/$/u, "").toLowerCase());
+        this.#sessionPullRequestMentions.set(envelope.session_id, Object.freeze({ urls }));
         this.#touch();
         return false;
       }

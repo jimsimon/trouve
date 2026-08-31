@@ -4570,6 +4570,7 @@ pub struct EventReplayPage {
 
 /// Shared handle to the database plus the live event fan-out.
 type ScopedEventSenders = Arc<Mutex<HashMap<(String, String), broadcast::Sender<EventEnvelope>>>>;
+type LegacySessionPrMentions = Arc<Mutex<HashMap<String, HashSet<String>>>>;
 
 #[derive(Clone)]
 pub struct Store {
@@ -4577,6 +4578,7 @@ pub struct Store {
     events_tx: broadcast::Sender<EventEnvelope>,
     scoped_events: ScopedEventSenders,
     append_tx: std::sync::mpsc::Sender<AppendRequest>,
+    legacy_session_pr_mentions: LegacySessionPrMentions,
 }
 
 #[derive(Debug, Clone)]
@@ -6370,6 +6372,7 @@ impl Store {
             events_tx,
             scoped_events,
             append_tx,
+            legacy_session_pr_mentions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -6431,23 +6434,9 @@ impl Store {
             let Some(content) = chat_pr_mention_content(event) else {
                 continue;
             };
-            let browser_references = crate::github::pr_browser_references_in_text(content);
-            let browser_numbers = browser_references
-                .iter()
-                .map(|(_, number)| *number)
-                .collect::<HashSet<_>>();
-            for (url, number) in browser_references {
+            for (url, number) in crate::github::pr_browser_references_in_text(content) {
                 if seen.insert(url.to_ascii_lowercase()) {
-                    references.push((number, Some(url)));
-                }
-            }
-            for number in crate::github::pr_shorthand_numbers_in_text(content) {
-                if browser_numbers.contains(&number) {
-                    continue;
-                }
-                let key = format!("#{number}");
-                if seen.insert(key) {
-                    references.push((number, None));
+                    references.push((number, url));
                 }
             }
         }
@@ -7182,73 +7171,74 @@ impl Store {
     }
 
     /// Canonical PR browser URLs mentioned in durable chat for one session.
-    /// Dedicated server-scope events keep new lookups bounded. The legacy chat
-    /// query preserves associations for transcripts written before that event
-    /// existed and can be removed after a storage migration backfills them.
-    pub fn session_pr_mentions(&self, session_id: &str) -> Result<(HashSet<String>, HashSet<u64>)> {
-        let mut urls = HashSet::new();
-        let mut shorthand_numbers = HashSet::new();
-        let legacy_payloads = {
+    /// Dedicated server-scope events keep new lookups bounded. Pre-event
+    /// transcripts are scanned once per process and cached; every later chat
+    /// mention has its own dedicated event and does not invalidate that cache.
+    pub fn session_pr_mentions(&self, session_id: &str) -> Result<HashSet<String>> {
+        let cached_legacy = self
+            .legacy_session_pr_mentions
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .cloned();
+        let (mut urls, legacy_payloads) = {
             let conn = self.conn.lock().unwrap();
             let mut mention_stmt = conn.prepare(
-                "SELECT json_extract(payload, '$.url'),
-                        CAST(json_extract(payload, '$.number') AS INTEGER)
+                "SELECT json_extract(payload, '$.url')
                  FROM events
                  WHERE scope_kind = 'server' AND scope_id = ''
                    AND json_extract(payload, '$.type') = 'session.pr_mentioned'
                    AND json_extract(payload, '$.session_id') = ?1",
             )?;
-            let mention_rows = mention_stmt.query_map(params![session_id], |row| {
-                Ok((
-                    row.get::<_, Option<String>>(0)?,
-                    row.get::<_, i64>(1)? as u64,
-                ))
-            })?;
-            for row in mention_rows {
-                let (url, number) = row?;
-                if let Some(url) = url {
-                    urls.insert(url.trim_end_matches('/').to_ascii_lowercase());
-                } else {
-                    shorthand_numbers.insert(number);
+            let mention_rows =
+                mention_stmt.query_map(params![session_id], |row| row.get::<_, String>(0))?;
+            let mut urls = HashSet::new();
+            for url in mention_rows {
+                urls.insert(url?.trim_end_matches('/').to_ascii_lowercase());
+            }
+            let legacy_payloads = if cached_legacy.is_some() {
+                Vec::new()
+            } else {
+                let mut legacy_stmt = conn.prepare(
+                    "SELECT events.payload
+                     FROM events
+                     JOIN threads ON events.scope_kind = 'thread'
+                                 AND events.scope_id = threads.id
+                     WHERE threads.session_id = ?1
+                       AND json_extract(events.payload, '$.type') IN (
+                         'user.message', 'turn.steered', 'assistant.message',
+                         'assistant.progress', 'subagent.spawned'
+                       )",
+                )?;
+                let rows =
+                    legacy_stmt.query_map(params![session_id], |row| row.get::<_, String>(0))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            (urls, legacy_payloads)
+        };
+        let legacy_urls = if let Some(cached) = cached_legacy {
+            cached
+        } else {
+            let mut legacy_urls = HashSet::new();
+            for payload in legacy_payloads {
+                let Ok(event) = serde_json::from_str::<Event>(&payload) else {
+                    continue;
+                };
+                let Some(content) = chat_pr_mention_content(&event) else {
+                    continue;
+                };
+                for (url, _) in crate::github::pr_browser_references_in_text(content) {
+                    legacy_urls.insert(url.trim_end_matches('/').to_ascii_lowercase());
                 }
             }
-
-            let mut legacy_stmt = conn.prepare(
-                "SELECT events.payload
-                 FROM events
-                 JOIN threads ON events.scope_kind = 'thread'
-                             AND events.scope_id = threads.id
-                 WHERE threads.session_id = ?1
-                   AND json_extract(events.payload, '$.type') IN (
-                     'user.message', 'turn.steered', 'assistant.message',
-                     'assistant.progress', 'subagent.spawned'
-                   )",
-            )?;
-            let rows = legacy_stmt.query_map(params![session_id], |row| row.get::<_, String>(0))?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()?
+            self.legacy_session_pr_mentions
+                .lock()
+                .unwrap()
+                .insert(session_id.to_string(), legacy_urls.clone());
+            legacy_urls
         };
-        for payload in legacy_payloads {
-            let Ok(event) = serde_json::from_str::<Event>(&payload) else {
-                continue;
-            };
-            let Some(content) = chat_pr_mention_content(&event) else {
-                continue;
-            };
-            let browser_references = crate::github::pr_browser_references_in_text(content);
-            let browser_numbers = browser_references
-                .iter()
-                .map(|(_, number)| *number)
-                .collect::<HashSet<_>>();
-            for (url, _) in browser_references {
-                urls.insert(url.trim_end_matches('/').to_ascii_lowercase());
-            }
-            shorthand_numbers.extend(
-                crate::github::pr_shorthand_numbers_in_text(content)
-                    .into_iter()
-                    .filter(|number| !browser_numbers.contains(number)),
-            );
-        }
-        Ok((urls, shorthand_numbers))
+        urls.extend(legacy_urls);
+        Ok(urls)
     }
 
     /// Most recently persisted account PR snapshot event for `host`.
@@ -7770,6 +7760,7 @@ impl Store {
         let tx = write_transaction(&conn)?;
         delete_session_rows(&tx, id)?;
         tx.commit()?;
+        self.legacy_session_pr_mentions.lock().unwrap().remove(id);
         Ok(())
     }
 
@@ -7788,10 +7779,12 @@ impl Store {
                 cleanup: Box::new(cleanup),
             },
         )?;
-        Ok(self
+        let envelope = self
             .append_pending_events(pending)?
             .pop()
-            .expect("one lifecycle event returns one envelope"))
+            .expect("one lifecycle event returns one envelope");
+        self.legacy_session_pr_mentions.lock().unwrap().remove(id);
+        Ok(envelope)
     }
 
     pub(crate) fn stage_attachment_cleanup(
@@ -20058,7 +20051,7 @@ mod tests {
             Event::SessionPrMentioned {
                 session_id,
                 number: 350,
-                url: Some(url),
+                url,
             } if session_id == &session.id && url.ends_with("/pull/350")
         )));
         assert_eq!(mentions.len(), 1);
@@ -20068,14 +20061,10 @@ mod tests {
         store
             .append_pending_events(
                 serialize_events(
-                    Scope::Thread(thread.id),
+                    Scope::Thread(thread.id.clone()),
                     vec![Event::UserMessage {
                         turn: 2,
-                        content: concat!(
-                            "Please check PR #351 and ",
-                            "https://github.example.com/other/repo/pull/352"
-                        )
-                        .into(),
+                        content: "https://github.example.com/other/repo/pull/352".into(),
                         attachments: Vec::new(),
                         background: false,
                     }],
@@ -20083,10 +20072,45 @@ mod tests {
                 .unwrap(),
             )
             .unwrap();
-        let (urls, shorthand_numbers) = store.session_pr_mentions(&session.id).unwrap();
+        let urls = store.session_pr_mentions(&session.id).unwrap();
         assert!(urls.contains("https://github.com/trouve-ai/trouve/pull/350"));
         assert!(urls.contains("https://github.example.com/other/repo/pull/352"));
-        assert!(shorthand_numbers.contains(&351));
+
+        // The compatibility scan is cached, while new public appends remain
+        // visible through their dedicated association events.
+        store
+            .append_pending_events(
+                serialize_events(
+                    Scope::Thread(thread.id.clone()),
+                    vec![Event::AssistantMessage {
+                        turn: 3,
+                        content: "https://github.example.com/other/repo/pull/353".into(),
+                    }],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(
+            !store
+                .session_pr_mentions(&session.id)
+                .unwrap()
+                .contains("https://github.example.com/other/repo/pull/353")
+        );
+        store
+            .append_event(
+                Scope::Thread(thread.id),
+                Event::AssistantMessage {
+                    turn: 4,
+                    content: "https://github.example.com/other/repo/pull/354".into(),
+                },
+            )
+            .unwrap();
+        assert!(
+            store
+                .session_pr_mentions(&session.id)
+                .unwrap()
+                .contains("https://github.example.com/other/repo/pull/354")
+        );
     }
 
     #[test]

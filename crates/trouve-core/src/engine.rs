@@ -7356,10 +7356,7 @@ impl Engine {
             .collect())
     }
 
-    fn mentioned_session_prs(
-        &self,
-        session_id: &str,
-    ) -> Result<(HashSet<String>, HashSet<u64>), EngineError> {
+    fn mentioned_session_prs(&self, session_id: &str) -> Result<HashSet<String>, EngineError> {
         Ok(self.store.session_pr_mentions(session_id)?)
     }
 
@@ -7512,7 +7509,7 @@ impl Engine {
     ) -> Result<Vec<trouve_protocol::PrInfo>, EngineError> {
         let session = self.get_session(session_id)?;
         let linked_urls = self.recorded_session_pr_urls(session_id)?;
-        let (mentioned_urls, mentioned_numbers) = self.mentioned_session_prs(session_id)?;
+        let mentioned_urls = self.mentioned_session_prs(session_id)?;
         let mut seen = HashSet::new();
         let mut prs = Vec::new();
         for (host, _) in self.github_hosts() {
@@ -7522,9 +7519,7 @@ impl Engine {
             prs.extend(snapshot.prs.into_iter().filter(|pr| {
                 ((pr.workspace_id == session.workspace_id && pr.head == session.branch)
                     || linked_urls.contains(&pr.url.trim_end_matches('/').to_ascii_lowercase())
-                    || mentioned_urls.contains(&pr.url.trim_end_matches('/').to_ascii_lowercase())
-                    || (pr.workspace_id == session.workspace_id
-                        && mentioned_numbers.contains(&pr.number)))
+                    || mentioned_urls.contains(&pr.url.trim_end_matches('/').to_ascii_lowercase()))
                     && seen.insert((
                         pr.host.to_ascii_lowercase(),
                         pr.repository.to_ascii_lowercase(),
@@ -7836,7 +7831,7 @@ impl Engine {
         let mut session_pull_requests = Vec::new();
         for session in self.list_sessions(None)? {
             let linked_urls = self.recorded_session_pr_urls(&session.id)?;
-            let (mentioned_urls, mentioned_numbers) = self.mentioned_session_prs(&session.id)?;
+            let mentioned_urls = self.mentioned_session_prs(&session.id)?;
             let mut seen = HashSet::new();
             let mut prs = account_prs
                 .iter()
@@ -7846,8 +7841,6 @@ impl Engine {
                         || linked_urls.contains(&pr.url.trim_end_matches('/').to_ascii_lowercase())
                         || mentioned_urls
                             .contains(&pr.url.trim_end_matches('/').to_ascii_lowercase())
-                        || (pr.workspace_id == session.workspace_id
-                            && mentioned_numbers.contains(&pr.number))
                 })
                 .filter(|pr| {
                     seen.insert((
@@ -23269,7 +23262,7 @@ default_permission_mode = "ask"
                 Event::SessionPrMentioned {
                     session_id: session.id.clone(),
                     number: mentioned.number,
-                    url: Some(mentioned.url),
+                    url: mentioned.url,
                 },
             )
             .unwrap();

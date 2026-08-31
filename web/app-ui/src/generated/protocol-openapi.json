@@ -8775,6 +8775,7 @@
             "required": [
               "session_id",
               "number",
+              "url",
               "type"
             ],
             "properties": {
@@ -8793,11 +8794,8 @@
                 ]
               },
               "url": {
-                "type": [
-                  "string",
-                  "null"
-                ],
-                "description": "Canonical browser URL when the chat supplied one. Explicit\nrepository-local shorthand such as `PR #123` omits it."
+                "type": "string",
+                "description": "Canonical browser URL supplied by chat. A number without repository\nidentity is not globally unique and does not emit this event."
               }
             }
           },

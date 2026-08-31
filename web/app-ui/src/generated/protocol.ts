@@ -3124,10 +3124,10 @@ export interface components {
             /** @enum {string} */
             type: "session.pr_mentioned";
             /**
-             * @description Canonical browser URL when the chat supplied one. Explicit
-             *     repository-local shorthand such as `PR #123` omits it.
+             * @description Canonical browser URL supplied by chat. A number without repository
+             *     identity is not globally unique and does not emit this event.
              */
-            url?: string | null;
+            url: string;
         } | {
             session_id: components["schemas"]["String"];
             /** @enum {string} */
