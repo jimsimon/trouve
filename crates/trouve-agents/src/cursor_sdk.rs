@@ -699,7 +699,11 @@ impl BridgePool {
             .recycle_if_unleased(&candidate, Some(IDLE_TIMEOUT))
             .await
         {
-            tracing::warn!("cursor: retaining shared Bridge after cleanup failed: {error}");
+            tracing::warn!(
+                backend_state_dir = %candidate.state_dir.display(),
+                %error,
+                "cursor: retaining shared Bridge after cleanup failed"
+            );
         }
     }
 
