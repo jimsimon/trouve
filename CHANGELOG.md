@@ -4,6 +4,50 @@ All notable changes to this project are documented in this file. The format
 is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.6.0] - 2026-08-31
+
+This release adds provider-native control over model options and live turns,
+removes fixed engine turn ceilings, and improves usage and review workflows.
+
+### Added
+
+- **Live boundary steering**: follow-up instructions and image attachments can
+  steer active direct-API and Claude Code turns. Guidance is queued through
+  response and tool boundaries with durable ordering, bounded admission, and
+  the same-turn transcript preserved.
+- **Schema-driven model options**: New Session, New Thread, live chat, and
+  Automations now render provider-declared choices, booleans, text, and exact
+  numeric settings without provider-specific controls. Selections are
+  validated, persisted, inherited, and rechecked before automated runs.
+- **Detailed usage views**: the session usage panel separates provider,
+  active-thread, and session totals into accessible keyboard-navigable tabs.
+
+### Changed
+
+- **Provider-governed turn admission**: ordinary desktop and spawned-agent
+  turns no longer use fixed engine concurrency caps. Providers govern capacity,
+  shared throttling cooldowns remain in effect, and review-job concurrency
+  stays independently bounded. The retired `TROUVE_TURN_CONCURRENCY`,
+  `TROUVE_BACKGROUND_TURN_CONCURRENCY`,
+  `TROUVE_PROVIDER_TURN_CONCURRENCY`, and
+  `TROUVE_PROVIDER_BACKGROUND_TURN_CONCURRENCY` settings are now ignored
+  with a startup warning and should be removed from operator configuration.
+- **Clearer model and persona configuration**: semantic persona selection is
+  grouped separately from repository instructions, and model-specific option
+  contracts remain stable across catalog refreshes and inherited defaults.
+- **Client/server compatibility**: protocol compatibility advances to 7.27.
+  Upgrade the desktop or PWA client and `trouve-server` together.
+
+### Fixed
+
+- **More reliable automated reviews**: review collection accepts large
+  changesets within the existing byte and model-token bounds, decimal-minute
+  timeout inputs no longer fail browser step validation, and opaque GitHub 422
+  verdict rejections retry safely as comment reviews without losing blockers.
+- **Stable session controls and usage**: new sessions retain the resolved
+  repository default branch after asynchronous option loading, while usage
+  refreshes preserve the last successful data and surface partial failures.
+
 ## [4.5.0] - 2026-08-30
 
 This release makes large and long-lived workspaces easier to navigate, exposes
@@ -987,6 +1031,7 @@ semble ([BENCHMARKS.md](BENCHMARKS.md)):
 - Incremental reindex (1 file touched): 0.86 s vs ~3 min (212x)
 - Warm query: 0.55 s vs 7.2 s (13x)
 
+[4.6.0]: https://github.com/jimsimon/trouve/compare/v4.5.0...v4.6.0
 [4.5.0]: https://github.com/jimsimon/trouve/compare/v4.4.0...v4.5.0
 [4.4.0]: https://github.com/jimsimon/trouve/compare/v4.3.0...v4.4.0
 [4.3.0]: https://github.com/jimsimon/trouve/compare/v4.2.0...v4.3.0
