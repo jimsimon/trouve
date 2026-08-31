@@ -179,6 +179,7 @@ pub enum ChatItem {
     /// Model reasoning ("thinking") text; closed when other output arrives.
     Thinking {
         turn: u64,
+        id: Option<String>,
         content: String,
         complete: bool,
     },
@@ -421,10 +422,12 @@ impl From<ThreadViewItem> for ChatItem {
             },
             ThreadViewItem::Thinking {
                 turn,
+                id,
                 content,
                 complete,
             } => Self::Thinking {
                 turn,
+                id,
                 content,
                 complete,
             },
@@ -529,10 +532,15 @@ impl ThreadViewModel {
 
     /// Preserve a delayed older-turn delta without replacing the newer active
     /// lifecycle. A first-seen stale block is complete by construction.
-    fn append_stale_thinking(&mut self, turn: u64, text: &str) -> usize {
-        if let Some(idx) = self.items.iter().rposition(
-            |item| matches!(item, ChatItem::Thinking { turn: item_turn, .. } if *item_turn == turn),
-        ) {
+    fn append_stale_thinking(&mut self, turn: u64, id: Option<&str>, text: &str) -> usize {
+        if let Some(idx) = self.items.iter().rposition(|item| {
+            matches!(
+                item,
+                ChatItem::Thinking { turn: item_turn, id: item_id, .. }
+                    if *item_turn == turn
+                        && id.is_none_or(|id| item_id.as_deref() == Some(id))
+            )
+        }) {
             if let ChatItem::Thinking { content, .. } = &mut self.items[idx] {
                 content.push_str(text);
             }
@@ -540,6 +548,7 @@ impl ThreadViewModel {
         } else {
             self.items.push(ChatItem::Thinking {
                 turn,
+                id: id.map(str::to_owned),
                 content: text.into(),
                 complete: true,
             });
@@ -880,7 +889,7 @@ impl ThreadViewModel {
                     .latest_thinking_turn
                     .is_some_and(|latest| *turn < latest)
                 {
-                    return Some(self.append_stale_thinking(*turn, text));
+                    return Some(self.append_stale_thinking(*turn, id.as_deref(), text));
                 }
                 self.latest_thinking_turn = Some(
                     self.latest_thinking_turn
@@ -907,6 +916,7 @@ impl ThreadViewModel {
                 } else {
                     self.items.push(ChatItem::Thinking {
                         turn: *turn,
+                        id: id.clone(),
                         content: text.clone(),
                         complete: false,
                     });
@@ -2287,8 +2297,8 @@ mod tests {
         assert!(matches!(
             vm.items.as_slice(),
             [
-                ChatItem::Thinking { turn: 2, content: current, complete: false },
-                ChatItem::Thinking { turn: 1, content: late, complete: true },
+                ChatItem::Thinking { turn: 2, content: current, complete: false, .. },
+                ChatItem::Thinking { turn: 1, content: late, complete: true, .. },
             ] if current == "Current." && late == "Late."
         ));
 
@@ -2309,9 +2319,55 @@ mod tests {
         assert!(matches!(
             vm.items.as_slice(),
             [
-                ChatItem::Thinking { turn: 2, content: current, complete: true },
-                ChatItem::Thinking { turn: 1, content: late, complete: true },
+                ChatItem::Thinking { turn: 2, content: current, complete: true, .. },
+                ChatItem::Thinking { turn: 1, content: late, complete: true, .. },
             ] if current == "Current." && late == "Late. Later."
+        ));
+    }
+
+    #[test]
+    fn stale_thinking_delta_matches_provider_identity_within_the_older_turn() {
+        let mut vm = ThreadViewModel::new();
+        for (id, text) in [("reasoning-a", "First."), ("reasoning-b", "Second.")] {
+            vm.apply(&env(Event::AssistantThinking {
+                turn: 1,
+                id: Some(id.into()),
+                text: text.into(),
+            }));
+            vm.apply(&env(Event::AssistantThinkingCompleted {
+                turn: 1,
+                id: Some(id.into()),
+            }));
+        }
+        vm.apply(&env(Event::AssistantThinking {
+            turn: 2,
+            id: Some("current".into()),
+            text: "Current.".into(),
+        }));
+        vm.apply(&env(Event::AssistantThinkingCompleted {
+            turn: 2,
+            id: Some("current".into()),
+        }));
+
+        let changed = vm.apply(&env(Event::AssistantThinking {
+            turn: 1,
+            id: Some("reasoning-a".into()),
+            text: " Again.".into(),
+        }));
+
+        assert_eq!(changed, Some(0));
+        assert!(!vm.thinking);
+        assert!(matches!(
+            vm.items.as_slice(),
+            [
+                ChatItem::Thinking { id: Some(first_id), content: first, complete: true, .. },
+                ChatItem::Thinking { id: Some(second_id), content: second, complete: true, .. },
+                ChatItem::Thinking { content: current, complete: true, .. },
+            ] if first_id == "reasoning-a"
+                && first == "First. Again."
+                && second_id == "reasoning-b"
+                && second == "Second."
+                && current == "Current."
         ));
     }
 

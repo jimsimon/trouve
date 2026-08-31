@@ -140,6 +140,7 @@ export type ThreadChatItem =
       readonly id: string;
       readonly kind: "thinking";
       readonly turn: number;
+      readonly reasoningId?: string;
       content: string;
       complete: boolean;
     }
@@ -475,6 +476,7 @@ export class ThreadViewModel {
           id,
           kind: "thinking",
           turn: item.turn,
+          ...(item.id == null ? {} : { reasoningId: item.id }),
           content: item.content,
           complete: item.complete,
         };
@@ -762,7 +764,7 @@ export class ThreadViewModel {
       case "assistant.thinking": {
         const activeTurn = this.activeThinkingTurn();
         if (this.#latestThinkingTurn !== undefined && envelope.turn < this.#latestThinkingTurn) {
-          this.appendStaleThinking(envelope.turn, envelope.text);
+          this.appendStaleThinking(envelope.turn, envelope.id ?? undefined, envelope.text);
           return true;
         }
         this.#latestThinkingTurn = Math.max(this.#latestThinkingTurn ?? envelope.turn, envelope.turn);
@@ -784,6 +786,7 @@ export class ThreadViewModel {
             id: this.nextItemId(`thinking:${envelope.turn}`),
             kind: "thinking",
             turn: envelope.turn,
+            ...(id === undefined ? {} : { reasoningId: id }),
             content: envelope.text,
             complete: false,
           });
@@ -1123,9 +1126,12 @@ export class ThreadViewModel {
 
   // Preserve delayed older-turn text without replacing the newer active
   // lifecycle. A first-seen stale block is complete by construction.
-  private appendStaleThinking(turn: number, text: string): void {
+  private appendStaleThinking(turn: number, reasoningId: string | undefined, text: string): void {
     const item = this.#findLast(
-      (candidate) => candidate.kind === "thinking" && candidate.turn === turn,
+      (candidate) =>
+        candidate.kind === "thinking"
+        && candidate.turn === turn
+        && (reasoningId === undefined || candidate.reasoningId === reasoningId),
     );
     if (item?.kind === "thinking") item.content += text;
     else {
@@ -1133,6 +1139,7 @@ export class ThreadViewModel {
         id: this.nextItemId(`thinking:${turn}`),
         kind: "thinking",
         turn,
+        ...(reasoningId === undefined ? {} : { reasoningId }),
         content: text,
         complete: true,
       });

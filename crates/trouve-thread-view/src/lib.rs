@@ -273,7 +273,7 @@ impl ThreadProjection {
                     .latest_thinking_turn
                     .is_some_and(|latest| *turn < latest)
                 {
-                    self.append_stale_thinking(*turn, text);
+                    self.append_stale_thinking(*turn, id.as_deref(), text);
                 } else {
                     self.latest_thinking_turn = Some(
                         self.latest_thinking_turn
@@ -298,6 +298,7 @@ impl ThreadProjection {
                     } else {
                         let idx = self.push(ThreadViewItem::Thinking {
                             turn: *turn,
+                            id: id.clone(),
                             content: text.clone(),
                             complete: false,
                         });
@@ -656,16 +657,22 @@ impl ThreadProjection {
 
     // Preserve delayed older-turn text without making that lifecycle active
     // again. A first-seen stale block is complete by construction.
-    fn append_stale_thinking(&mut self, turn: u64, text: &str) {
-        if let Some(idx) = self.snapshot.items.iter().rposition(
-            |item| matches!(item, ThreadViewItem::Thinking { turn: item_turn, .. } if *item_turn == turn),
-        ) {
+    fn append_stale_thinking(&mut self, turn: u64, id: Option<&str>, text: &str) {
+        if let Some(idx) = self.snapshot.items.iter().rposition(|item| {
+            matches!(
+                item,
+                ThreadViewItem::Thinking { turn: item_turn, id: item_id, .. }
+                    if *item_turn == turn
+                        && id.is_none_or(|id| item_id.as_deref() == Some(id))
+            )
+        }) {
             if let ThreadViewItem::Thinking { content, .. } = &mut self.snapshot.items[idx] {
                 content.push_str(text);
             }
         } else {
             self.push(ThreadViewItem::Thinking {
                 turn,
+                id: id.map(str::to_owned),
                 content: text.into(),
                 complete: true,
             });
@@ -1365,6 +1372,7 @@ mod tests {
             vec![
                 ThreadViewItem::Thinking {
                     turn: 7,
+                    id: None,
                     content: "Delegating the review.".into(),
                     complete: true,
                 },
@@ -2051,8 +2059,8 @@ mod tests {
         assert!(matches!(
             projection.snapshot.items.as_slice(),
             [
-                ThreadViewItem::Thinking { turn: 2, content: current, complete: false },
-                ThreadViewItem::Thinking { turn: 1, content: late, complete: true },
+                ThreadViewItem::Thinking { turn: 2, content: current, complete: false, .. },
+                ThreadViewItem::Thinking { turn: 1, content: late, complete: true, .. },
             ] if current == "Current." && late == "Late."
         ));
 
@@ -2086,9 +2094,79 @@ mod tests {
         assert!(matches!(
             projection.snapshot.items.as_slice(),
             [
-                ThreadViewItem::Thinking { turn: 2, content: current, complete: true },
-                ThreadViewItem::Thinking { turn: 1, content: late, complete: true },
+                ThreadViewItem::Thinking { turn: 2, content: current, complete: true, .. },
+                ThreadViewItem::Thinking { turn: 1, content: late, complete: true, .. },
             ] if current == "Current." && late == "Late. Later."
+        ));
+    }
+
+    #[test]
+    fn stale_thinking_delta_matches_provider_identity_within_the_older_turn() {
+        let mut projection = ThreadProjection::default();
+        let mut cursor = 0;
+        for (id, text) in [("reasoning-a", "First."), ("reasoning-b", "Second.")] {
+            cursor += 1;
+            projection.apply(&envelope(
+                cursor,
+                cursor as i64,
+                Event::AssistantThinking {
+                    turn: 1,
+                    id: Some(id.into()),
+                    text: text.into(),
+                },
+            ));
+            cursor += 1;
+            projection.apply(&envelope(
+                cursor,
+                cursor as i64,
+                Event::AssistantThinkingCompleted {
+                    turn: 1,
+                    id: Some(id.into()),
+                },
+            ));
+        }
+        cursor += 1;
+        projection.apply(&envelope(
+            cursor,
+            cursor as i64,
+            Event::AssistantThinking {
+                turn: 2,
+                id: Some("current".into()),
+                text: "Current.".into(),
+            },
+        ));
+        cursor += 1;
+        projection.apply(&envelope(
+            cursor,
+            cursor as i64,
+            Event::AssistantThinkingCompleted {
+                turn: 2,
+                id: Some("current".into()),
+            },
+        ));
+        cursor += 1;
+        projection.apply(&envelope(
+            cursor,
+            cursor as i64,
+            Event::AssistantThinking {
+                turn: 1,
+                id: Some("reasoning-a".into()),
+                text: " Again.".into(),
+            },
+        ));
+
+        assert!(!projection.snapshot.thinking);
+        assert!(matches!(
+            projection.snapshot.items.as_slice(),
+            [
+                ThreadViewItem::Thinking { id: Some(first_id), content: first, complete: true, .. },
+                ThreadViewItem::Thinking { id: Some(second_id), content: second, complete: true, .. },
+                ThreadViewItem::Thinking { content: current, complete: true, .. },
+            ] if first_id == "reasoning-a"
+                && first == "First. Again."
+                && second_id == "reasoning-b"
+                && second == "Second."
+                && current == "Current."
         ));
     }
 

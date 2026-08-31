@@ -957,6 +957,49 @@ describe("ThreadViewModel", () => {
     ]);
   });
 
+  it("matches delayed older-turn thoughts by provider identity", () => {
+    const vm = new ThreadViewModel();
+    let cursor = 0;
+    for (const [id, text] of [["reasoning-a", "First."], ["reasoning-b", "Second."]]) {
+      vm.apply(envelope(++cursor, {
+        type: "assistant.thinking",
+        turn: 1,
+        id,
+        text,
+      }));
+      vm.apply(envelope(++cursor, {
+        type: "assistant.thinking_completed",
+        turn: 1,
+        id,
+      }));
+    }
+    vm.apply(envelope(++cursor, {
+      type: "assistant.thinking",
+      turn: 2,
+      id: "current",
+      text: "Current.",
+    }));
+    vm.apply(envelope(++cursor, {
+      type: "assistant.thinking_completed",
+      turn: 2,
+      id: "current",
+    }));
+
+    vm.apply(envelope(++cursor, {
+      type: "assistant.thinking",
+      turn: 1,
+      id: "reasoning-a",
+      text: " Again.",
+    }));
+
+    expect(vm.thinking).toBe(false);
+    expect(vm.items).toMatchObject([
+      { kind: "thinking", reasoningId: "reasoning-a", content: "First. Again." },
+      { kind: "thinking", reasoningId: "reasoning-b", content: "Second." },
+      { kind: "thinking", reasoningId: "current", content: "Current." },
+    ]);
+  });
+
   it("keeps an interleaved tool request beneath the growing thought", () => {
     const vm = new ThreadViewModel();
     vm.apply(envelope(1, {

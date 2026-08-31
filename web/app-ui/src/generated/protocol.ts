@@ -4762,6 +4762,11 @@ export interface components {
         } | {
             complete: boolean;
             content: string;
+            /**
+             * @description Provider-owned reasoning-item identity. Absent for legacy,
+             *     boundary-inferred reasoning streams.
+             */
+            id?: string | null;
             /** @enum {string} */
             kind: "thinking";
             /** Format: int64 */

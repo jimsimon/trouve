@@ -445,6 +445,10 @@ pub enum ThreadViewItem {
     },
     Thinking {
         turn: u64,
+        /// Provider-owned reasoning-item identity. Absent for legacy,
+        /// boundary-inferred reasoning streams.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
         content: String,
         complete: bool,
     },
