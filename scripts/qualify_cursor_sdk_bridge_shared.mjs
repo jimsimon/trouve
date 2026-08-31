@@ -32,7 +32,9 @@ import {
   QualificationError,
   assistantText,
   assertUniqueToolLifecycle,
+  combineQualificationAndCleanupErrors,
   exactTerminalResult,
+  installSignalCleanup,
   parseTimeoutSeconds,
   redact,
   resolveBridge,
@@ -385,8 +387,9 @@ async function main() {
   const survivalBRelease = deferred();
   let bridge;
   let callback;
+  const bridgeChildren = new Set();
   let cleanupPromise;
-  const cleanup = () => {
+  const cleanup = (signal) => {
     if (cleanupPromise !== undefined) return cleanupPromise;
     cleanupPromise = (async () => {
       cancelledProbeTeardown.resolve();
@@ -396,10 +399,21 @@ async function main() {
       bridge = undefined;
       callback = undefined;
       const failures = [];
-      try {
-        await stopBridge(activeBridge, timeoutMilliseconds);
-      } catch (error) {
-        failures.push(error);
+      if (signal === undefined && activeBridge !== undefined) {
+        try {
+          await stopBridge(activeBridge, timeoutMilliseconds);
+          bridgeChildren.delete(activeBridge.child);
+        } catch (error) {
+          failures.push(error);
+        }
+      }
+      for (const child of bridgeChildren) {
+        try {
+          await terminateProcessTree(child);
+          bridgeChildren.delete(child);
+        } catch (error) {
+          failures.push(error);
+        }
       }
       try {
         await closeCallback(activeCallback);
@@ -419,6 +433,11 @@ async function main() {
     })();
     return cleanupPromise;
   };
+  const signalCleanup = installSignalCleanup(cleanup, {
+    report: (error) => process.stderr.write(
+      `Shared Cursor signal cleanup failed: ${redact(error, [apiKey])}\n`,
+    ),
+  });
 
   const handler = (slot, toolName, resultMarker) => async (argsValue, record) => {
     if (record.agentId !== expectedAgents.get(slot) || argsValue.token !== toolName) {
@@ -453,8 +472,10 @@ async function main() {
     }],
   ]);
 
+  let qualificationError;
   try {
     const resolvedBridge = await resolveBridge(args.bridge, temporaryRoot, timeoutMilliseconds);
+    signalCleanup.throwIfSignalled();
     callback = await startCallbackServer(handlers, timeoutMilliseconds);
     bridge = await startBridge({
       binary: resolvedBridge.binary,
@@ -463,6 +484,8 @@ async function main() {
       apiKey,
       callback,
       timeoutMilliseconds,
+      beforeSpawn: signalCleanup.throwIfSignalled,
+      onSpawn: (child) => bridgeChildren.add(child),
     });
     const version = await unary(
       bridge,
@@ -638,7 +661,9 @@ async function main() {
 
     await closeAgents(bridge, agents, timeoutMilliseconds);
     const warmRssBytes = await processRssBytes(bridge.child.pid);
+    const warmBridgeChild = bridge.child;
     await stopBridge(bridge, timeoutMilliseconds);
+    bridgeChildren.delete(warmBridgeChild);
     bridge = undefined;
     await closeCallback(callback);
     callback = undefined;
@@ -651,6 +676,8 @@ async function main() {
       apiKey,
       callback,
       timeoutMilliseconds,
+      beforeSpawn: signalCleanup.throwIfSignalled,
+      onSpawn: (child) => bridgeChildren.add(child),
     });
     await resumeAgents(bridge, agents, optionsA, optionsB, timeoutMilliseconds);
     const [resumeFramesA, resumeFramesB] = await Promise.all([
@@ -702,12 +729,24 @@ async function main() {
       cold_resume: coldResume,
     };
     process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+  } catch (error) {
+    qualificationError = error;
   } finally {
-    await cleanup();
-    if (args.keepState) {
-      process.stderr.write(`Kept shared-process qualification state at ${temporaryRoot}\n`);
+    try {
+      await cleanup();
+      if (args.keepState) {
+        process.stderr.write(`Kept shared-process qualification state at ${temporaryRoot}\n`);
+      }
+    } catch (cleanupError) {
+      qualificationError = combineQualificationAndCleanupErrors(
+        qualificationError,
+        cleanupError,
+      );
+    } finally {
+      signalCleanup.dispose();
     }
   }
+  if (qualificationError !== undefined) throw qualificationError;
 }
 
 if (resolve(process.argv[1] ?? "") === fileURLToPath(import.meta.url)) {

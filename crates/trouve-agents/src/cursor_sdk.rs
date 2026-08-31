@@ -1952,26 +1952,35 @@ impl CallbackRouter {
                 routes.remove(&agent_id);
             }
         }
-        if timed_out {
-            return Err(std::io::Error::new(
+        let route_error = timed_out.then(|| {
+            std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 "Cursor callback routes did not settle before shutdown",
-            ));
-        }
+            )
+        });
         self.shutdown.cancel();
-        let Some(mut task) = self.task.lock().await.take() else {
-            return Ok(());
-        };
-        match tokio::time::timeout_at(deadline, &mut task).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(error)) => Err(std::io::Error::other(format!(
-                "Cursor callback router task failed: {error}"
-            ))),
-            Err(_) => {
-                task.abort();
-                let _ = task.await;
-                Ok(())
+        let listener_result = if let Some(mut task) = self.task.lock().await.take() {
+            match tokio::time::timeout_at(deadline, &mut task).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(error)) => Err(std::io::Error::other(format!(
+                    "Cursor callback router task failed: {error}"
+                ))),
+                Err(_) => {
+                    task.abort();
+                    let _ = task.await;
+                    Ok(())
+                }
             }
+        } else {
+            Ok(())
+        };
+        match (route_error, listener_result) {
+            (None, result) => result,
+            (Some(route_error), Ok(())) => Err(route_error),
+            (Some(route_error), Err(listener_error)) => Err(std::io::Error::new(
+                route_error.kind(),
+                format!("{route_error}; callback listener shutdown failed: {listener_error}"),
+            )),
         }
     }
 }
@@ -4584,6 +4593,10 @@ mod tests {
             .stop_until(tokio::time::Instant::now() + Duration::from_millis(10))
             .await;
         assert_eq!(cleanup.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            callback.task.lock().await.is_none(),
+            "route timeout left the callback listener task running"
+        );
         assert!(
             callback
                 .state
