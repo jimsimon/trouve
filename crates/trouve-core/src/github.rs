@@ -741,12 +741,22 @@ pub fn pr_shorthand_numbers_in_text(text: &str) -> Vec<u64> {
     for marker in ["pr #", "pull request #"] {
         let mut rest = lowercase.as_str();
         while let Some(index) = rest.find(marker) {
+            let marker_has_boundary = rest[..index]
+                .chars()
+                .next_back()
+                .is_none_or(|ch| !ch.is_alphanumeric() && ch != '_');
             rest = &rest[index + marker.len()..];
             let digits = rest
                 .chars()
                 .take_while(char::is_ascii_digit)
                 .collect::<String>();
-            if let Ok(number) = digits.parse()
+            let suffix_has_boundary = rest[digits.len()..]
+                .chars()
+                .next()
+                .is_none_or(|ch| !ch.is_alphanumeric() && ch != '_');
+            if marker_has_boundary
+                && suffix_has_boundary
+                && let Ok(number) = digits.parse()
                 && number > 0
                 && !numbers.contains(&number)
             {
@@ -4225,6 +4235,12 @@ mod tests {
                 "widgets",
             ),
             vec![12, 14]
+        );
+        assert!(
+            pr_shorthand_numbers_in_text(
+                "repr #15, xPR #16, PR #17abc, and pull request #18_suffix"
+            )
+            .is_empty()
         );
     }
 

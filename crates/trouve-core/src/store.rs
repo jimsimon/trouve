@@ -16662,8 +16662,9 @@ impl Store {
         attachments: Vec<(trouve_protocol::Attachment, String)>,
         staging_cleanup_claim: Option<ArtifactCleanupClaim>,
     ) -> Result<()> {
+        let (events, _) = self.events_with_chat_pr_mentions(scope, vec![event])?;
         let pending = serialize_lifecycle_events(
-            vec![(scope, event)],
+            events,
             StoreMutation::AppendMessage {
                 thread_id: thread_id.to_string(),
                 payload: payload.to_string(),
@@ -20158,12 +20159,17 @@ mod tests {
                 .contains("https://github.example.com/other/repo/pull/353")
         );
         store
-            .append_event(
-                Scope::Thread(thread.id),
-                Event::AssistantMessage {
+            .append_event_with_message(
+                Scope::Thread(thread.id.clone()),
+                Event::TurnSteered {
                     turn: 4,
-                    content: "https://github.example.com/other/repo/pull/354".into(),
+                    content: "See https://github.example.com/other/repo/pull/354".into(),
+                    attachments: Vec::new(),
                 },
+                &thread.id,
+                &serde_json::json!({"content": "steered"}),
+                Vec::new(),
+                None,
             )
             .unwrap();
         assert!(
@@ -20171,6 +20177,21 @@ mod tests {
                 .session_pr_mentions(&session.id)
                 .unwrap()
                 .contains("https://github.example.com/other/repo/pull/354")
+        );
+        store
+            .append_event(
+                Scope::Thread(thread.id),
+                Event::AssistantMessage {
+                    turn: 5,
+                    content: "https://github.example.com/other/repo/pull/355".into(),
+                },
+            )
+            .unwrap();
+        assert!(
+            store
+                .session_pr_mentions(&session.id)
+                .unwrap()
+                .contains("https://github.example.com/other/repo/pull/355")
         );
     }
 

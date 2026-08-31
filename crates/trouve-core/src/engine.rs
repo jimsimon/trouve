@@ -7517,34 +7517,29 @@ impl Engine {
         Ok(prs)
     }
 
-    /// Session-to-PR authorization from the newest persisted account
-    /// snapshots. Unlike discovery (`session_prs`), this never contacts
-    /// GitHub; the shell's 30-second account refresh keeps the projection
-    /// current in the background.
-    fn projected_session_prs(
-        &self,
-        session_id: &str,
-    ) -> Result<Vec<trouve_protocol::PrInfo>, EngineError> {
-        let session = self.get_session(session_id)?;
-        let linked_urls = self.recorded_session_pr_urls(session_id)?;
-        let mentioned_urls = self.mentioned_session_prs(session_id)?;
+    fn project_session_pr_candidates<'a>(
+        candidates: impl IntoIterator<Item = &'a trouve_protocol::PrInfo>,
+        session: &Session,
+        linked_urls: &HashSet<String>,
+        mentioned_urls: &HashSet<String>,
+    ) -> Vec<trouve_protocol::PrInfo> {
         let mut seen = HashSet::new();
-        let mut prs = Vec::new();
-        for (host, _) in self.github_hosts() {
-            let Some(snapshot) = self.store.latest_github_pr_snapshot(&host)? else {
-                continue;
-            };
-            prs.extend(snapshot.prs.into_iter().filter(|pr| {
-                ((pr.workspace_id == session.workspace_id && pr.head == session.branch)
+        let mut prs = candidates
+            .into_iter()
+            .filter(|pr| {
+                (pr.workspace_id == session.workspace_id && pr.head == session.branch)
                     || linked_urls.contains(&pr.url.trim_end_matches('/').to_ascii_lowercase())
-                    || mentioned_urls.contains(&pr.url.trim_end_matches('/').to_ascii_lowercase()))
-                    && seen.insert((
-                        pr.host.to_ascii_lowercase(),
-                        pr.repository.to_ascii_lowercase(),
-                        pr.number,
-                    ))
-            }));
-        }
+                    || mentioned_urls.contains(&pr.url.trim_end_matches('/').to_ascii_lowercase())
+            })
+            .filter(|pr| {
+                seen.insert((
+                    pr.host.to_ascii_lowercase(),
+                    pr.repository.to_ascii_lowercase(),
+                    pr.number,
+                ))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
         prs.sort_by_key(|pr| {
             let url = pr.url.trim_end_matches('/').to_ascii_lowercase();
             (
@@ -7559,7 +7554,33 @@ impl Engine {
                 std::cmp::Reverse(pr.number),
             )
         });
-        Ok(prs)
+        prs
+    }
+
+    /// Session-to-PR authorization from the newest persisted account
+    /// snapshots. Unlike discovery (`session_prs`), this never contacts
+    /// GitHub; the shell's 30-second account refresh keeps the projection
+    /// current in the background.
+    fn projected_session_prs(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<trouve_protocol::PrInfo>, EngineError> {
+        let session = self.get_session(session_id)?;
+        let linked_urls = self.recorded_session_pr_urls(session_id)?;
+        let mentioned_urls = self.mentioned_session_prs(session_id)?;
+        let mut candidates = Vec::new();
+        for (host, _) in self.github_hosts() {
+            let Some(snapshot) = self.store.latest_github_pr_snapshot(&host)? else {
+                continue;
+            };
+            candidates.extend(snapshot.prs);
+        }
+        Ok(Self::project_session_pr_candidates(
+            &candidates,
+            &session,
+            &linked_urls,
+            &mentioned_urls,
+        ))
     }
 
     fn projected_session_pr(
@@ -7855,39 +7876,12 @@ impl Engine {
         for session in self.list_sessions(None)? {
             let linked_urls = self.recorded_session_pr_urls(&session.id)?;
             let mentioned_urls = self.mentioned_session_prs(&session.id)?;
-            let mut seen = HashSet::new();
-            let mut prs = account_prs
-                .iter()
-                .copied()
-                .filter(|pr| {
-                    (pr.workspace_id == session.workspace_id && pr.head == session.branch)
-                        || linked_urls.contains(&pr.url.trim_end_matches('/').to_ascii_lowercase())
-                        || mentioned_urls
-                            .contains(&pr.url.trim_end_matches('/').to_ascii_lowercase())
-                })
-                .filter(|pr| {
-                    seen.insert((
-                        pr.host.to_ascii_lowercase(),
-                        pr.repository.to_ascii_lowercase(),
-                        pr.number,
-                    ))
-                })
-                .cloned()
-                .collect::<Vec<_>>();
-            prs.sort_by_key(|pr| {
-                let url = pr.url.trim_end_matches('/').to_ascii_lowercase();
-                (
-                    if pr.workspace_id == session.workspace_id && pr.head == session.branch {
-                        0
-                    } else if linked_urls.contains(&url) {
-                        1
-                    } else {
-                        2
-                    },
-                    pr.state != "open",
-                    std::cmp::Reverse(pr.number),
-                )
-            });
+            let prs = Self::project_session_pr_candidates(
+                account_prs.iter().copied(),
+                &session,
+                &linked_urls,
+                &mentioned_urls,
+            );
             if !prs.is_empty() {
                 session_pull_requests.push(trouve_protocol::SessionPrProjection {
                     session_id: session.id,
