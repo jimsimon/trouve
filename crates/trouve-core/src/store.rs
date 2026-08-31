@@ -989,6 +989,11 @@ const MIGRATIONS: &[&str] = &[
     // comments seen by older builds are recovered exactly once after upgrade.
     "ALTER TABLE code_review_polled_comments
        ADD COLUMN threadless_command_claimed INTEGER NOT NULL DEFAULT 0",
+    "CREATE TABLE IF NOT EXISTS code_review_polled_comment_backfills (
+       repository TEXT PRIMARY KEY,
+       next_page INTEGER NOT NULL DEFAULT 1,
+       completed INTEGER NOT NULL DEFAULT 0
+     )",
 ];
 
 /// Blocking-tier predicate for one findings row under the given SQL alias:
@@ -16397,11 +16402,68 @@ impl Store {
         )?)
     }
 
+    /// Return the next page for the one-time threadless-command backfill.
+    /// A missing row belongs to an upgraded database and starts at page one;
+    /// completed repositories return no page and use the ordinary seen cursor.
+    pub(crate) fn code_review_polled_comment_backfill_page(
+        &self,
+        repository: &str,
+    ) -> Result<Option<u64>> {
+        let state = self
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT next_page, completed
+                 FROM code_review_polled_comment_backfills
+                 WHERE repository = ?1",
+                params![repository],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?)),
+            )
+            .optional()?;
+        Ok(match state {
+            Some((_, true)) => None,
+            Some((next_page, false)) => Some(next_page.max(1) as u64),
+            None => Some(1),
+        })
+    }
+
+    /// Persist progress only after a complete backfill page was inspected.
+    pub(crate) fn advance_code_review_polled_comment_backfill(
+        &self,
+        repository: &str,
+        next_page: u64,
+    ) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO code_review_polled_comment_backfills
+                    (repository, next_page, completed)
+             VALUES (?1, ?2, 0)
+             ON CONFLICT(repository) DO UPDATE SET next_page = excluded.next_page
+             WHERE completed = 0",
+            params![repository, next_page as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Mark the historical command scan complete after reaching its end.
+    pub(crate) fn complete_code_review_polled_comment_backfill(
+        &self,
+        repository: &str,
+    ) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO code_review_polled_comment_backfills
+                    (repository, next_page, completed)
+             VALUES (?1, 1, 1)
+             ON CONFLICT(repository) DO UPDATE SET completed = 1",
+            params![repository],
+        )?;
+        Ok(())
+    }
+
     /// Claim a comment discovered by reconciliation and atomically persist
     /// any command it carries. Generic discovery and threadless-command
-    /// inspection have separate latches: that lets an upgraded build scan
-    /// beyond comments an older build already marked seen, recover commands
-    /// exactly once, and stop once both histories reach inspected rows.
+    /// inspection have separate latches, so an upgraded build can recover
+    /// commands from comments an older build already marked seen exactly once.
     pub(crate) fn claim_code_review_polled_comment(
         &self,
         repository: &str,

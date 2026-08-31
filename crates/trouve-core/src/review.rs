@@ -4569,6 +4569,12 @@ impl Engine {
         let initialized = self
             .store
             .code_review_comment_poll_initialized(repository)?;
+        let backfill_page = if initialized {
+            self.store
+                .code_review_polled_comment_backfill_page(repository)?
+        } else {
+            None
+        };
         let max_pages = if initialized {
             REVIEW_COMMENT_MAX_PAGES
         } else {
@@ -4576,7 +4582,9 @@ impl Engine {
             // review command the first time this fallback runs.
             1
         };
-        for page in 1..=max_pages {
+        let first_page = backfill_page.unwrap_or(1);
+        let last_page = first_page.saturating_add(max_pages);
+        for page in first_page..last_page {
             let path = format!(
                 "/repos/{repository}/issues/comments?sort=created&direction=desc&per_page={REVIEW_COMMENT_PAGE_SIZE}&page={page}"
             );
@@ -4587,7 +4595,6 @@ impl Engine {
             self.record_review_rate(rate);
             let count = comments.len();
             let mut reached_seen_comment = false;
-            let mut reached_inspected_comment = false;
             for comment in comments {
                 let manual_request = polled_manual_review_comment(&comment)
                     .filter(|(pull_number, _)| open_pulls.contains(pull_number));
@@ -4602,10 +4609,23 @@ impl Engine {
                     threadless_command.as_ref(),
                 )?;
                 reached_seen_comment |= !claim.comment_inserted;
-                reached_inspected_comment |= !claim.threadless_newly_inspected;
             }
-            if count < REVIEW_COMMENT_PAGE_SIZE
-                || (reached_seen_comment && reached_inspected_comment)
+            if backfill_page.is_some() {
+                if count < REVIEW_COMMENT_PAGE_SIZE {
+                    self.store
+                        .complete_code_review_polled_comment_backfill(repository)?;
+                } else {
+                    self.store
+                        .advance_code_review_polled_comment_backfill(repository, page + 1)?;
+                }
+            } else if !initialized {
+                // The first poll intentionally establishes only a recent
+                // baseline, so its successfully inspected page completes the
+                // historical recovery obligation regardless of page length.
+                self.store
+                    .complete_code_review_polled_comment_backfill(repository)?;
+            }
+            if count < REVIEW_COMMENT_PAGE_SIZE || (backfill_page.is_none() && reached_seen_comment)
             {
                 break;
             }
@@ -25064,11 +25084,15 @@ rename to src/new.rs
         assert_eq!(first_page.len(), REVIEW_COMMENT_PAGE_SIZE);
 
         let store = crate::store::Store::open_in_memory().unwrap();
-        // Model the deployed bug on both pages: the old poller marked these
-        // comments generically seen without inspecting either for a command.
+        // Model a mixed first page: one row was only generically seen by the
+        // old poller, while another was already inspected by the new latch.
         store
             .claim_legacy_code_review_polled_comment("acme/widgets", 495)
             .unwrap();
+        store
+            .claim_code_review_polled_comment("acme/widgets", 494, None, None)
+            .unwrap();
+        // The older command was generically seen but never inspected.
         store
             .claim_legacy_code_review_polled_comment("acme/widgets", 200)
             .unwrap();
@@ -25082,9 +25106,10 @@ rename to src/new.rs
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            for (page, body) in [
-                (1, serde_json::to_string(&first_page).unwrap()),
-                (2, serde_json::to_string(&second_page).unwrap()),
+            for (page, status, body) in [
+                (1, "200 OK", serde_json::to_string(&first_page).unwrap()),
+                (2, "422 Unprocessable Entity", "{}".into()),
+                (2, "200 OK", serde_json::to_string(&second_page).unwrap()),
             ] {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut request = Vec::new();
@@ -25100,7 +25125,7 @@ rename to src/new.rs
                 );
                 assert!(request.starts_with(&expected), "{request}");
                 let response = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                     body.len()
                 );
                 stream.write_all(response.as_bytes()).await.unwrap();
@@ -25113,6 +25138,14 @@ rename to src/new.rs
             "installation:7".into(),
         )
         .unwrap();
+        let first_error = engine
+            .poll_manual_review_comments(&api, "acme/widgets", &HashSet::from([42]))
+            .await
+            .unwrap_err();
+        assert!(first_error.to_string().contains("listing issue comments"));
+        // Page one was committed before page two failed. The durable cursor
+        // resumes page two instead of treating the now-inspected first page
+        // as proof that the older history is complete.
         engine
             .poll_manual_review_comments(&api, "acme/widgets", &HashSet::from([42]))
             .await
