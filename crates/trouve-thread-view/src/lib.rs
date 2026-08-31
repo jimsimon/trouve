@@ -766,8 +766,8 @@ impl ThreadProjection {
                 ThreadViewItem::Thinking { turn, complete, .. } => {
                     if !complete {
                         self.indexes.open_thinking.insert(*turn, idx);
+                        self.indexes.latest_thinking = Some(idx);
                     }
-                    self.indexes.latest_thinking = Some(idx);
                 }
                 ThreadViewItem::Compaction {
                     turn,
@@ -2040,6 +2040,9 @@ mod tests {
                 ThreadViewItem::Thinking { turn: 1, content: late, complete: true },
             ] if current == "Current." && late == "Late."
         ));
+
+        let mut projection: ThreadProjection =
+            serde_json::from_str(&serde_json::to_string(&projection).unwrap()).unwrap();
 
         projection.apply(&envelope(
             3,
