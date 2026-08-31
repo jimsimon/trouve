@@ -772,7 +772,7 @@ pub fn pr_browser_references_in_text(text: &str) -> Vec<(String, u64)> {
         let candidate = rest[..end].trim_end_matches(|ch: char| {
             matches!(
                 ch,
-                ')' | ']' | '}' | '>' | ',' | '.' | ';' | ':' | '!' | '?'
+                ')' | ']' | '}' | '>' | ',' | '.' | ';' | ':' | '!' | '?' | '"' | '\'' | '`'
             )
         });
         if let Ok(mut url) = reqwest::Url::parse(candidate)
@@ -4233,6 +4233,8 @@ mod tests {
         let text = concat!(
             "Compare [PR #350](https://github.com/JimSimon/trouve/pull/350#discussion), ",
             "https://github.example.com/acme/widgets/pull/12). ",
+            "\"https://github.com/acme/quoted/pull/13\" ",
+            "`https://github.com/acme/ticked/pull/14` ",
             "Ignore http://github.com/acme/widgets/pull/9 and https://github.com/acme/widgets/issues/8"
         );
         assert_eq!(
@@ -4240,6 +4242,8 @@ mod tests {
             vec![
                 ("https://github.com/JimSimon/trouve/pull/350".into(), 350),
                 ("https://github.example.com/acme/widgets/pull/12".into(), 12),
+                ("https://github.com/acme/quoted/pull/13".into(), 13),
+                ("https://github.com/acme/ticked/pull/14".into(), 14),
             ]
         );
     }

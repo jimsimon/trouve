@@ -7356,6 +7356,24 @@ impl Engine {
             .collect())
     }
 
+    /// Mention-only associations are navigation evidence, not authorization
+    /// for GitHub mutations. Mutation targets must either have a durable
+    /// session-created link or a head commit verified in the session worktree.
+    async fn session_pr_allows_mutation(
+        &self,
+        session_id: &str,
+        pr: &trouve_protocol::PrInfo,
+    ) -> Result<bool, EngineError> {
+        let normalized_url = pr.url.trim_end_matches('/').to_ascii_lowercase();
+        if self
+            .recorded_session_pr_urls(session_id)?
+            .contains(&normalized_url)
+        {
+            return Ok(true);
+        }
+        Ok(self.pr_has_locally_verified_head(session_id, pr).await)
+    }
+
     fn mentioned_session_prs(&self, session_id: &str) -> Result<HashSet<String>, EngineError> {
         Ok(self.store.session_pr_mentions(session_id)?)
     }
@@ -7684,6 +7702,11 @@ impl Engine {
         use trouve_protocol::{PrActionRequest as Action, PrDetailSection as Section};
 
         let (session, pr) = self.projected_session_pr(session_id, number)?;
+        if !self.session_pr_allows_mutation(session_id, &pr).await? {
+            return Err(EngineError::BadRequest(format!(
+                "pull request #{number} is associated for navigation only"
+            )));
+        }
         let key = GithubPrDetailKey::from_info(&pr);
         let required = match action {
             Action::UpdateReview { .. }
@@ -8376,10 +8399,19 @@ impl Engine {
     ) -> Result<(), EngineError> {
         let session = self.get_session(session_id)?;
         let github = self.github_for_session(&session)?;
-        let pr = self
-            .session_pr(session_id)
-            .await?
-            .ok_or_else(|| EngineError::NotFound("no open PR for this session".into()))?;
+        let mut pr = None;
+        for candidate in self.session_prs(session_id).await? {
+            if candidate.state == "open"
+                && self
+                    .session_pr_allows_mutation(session_id, &candidate)
+                    .await?
+            {
+                pr = Some(candidate);
+                break;
+            }
+        }
+        let pr =
+            pr.ok_or_else(|| EngineError::NotFound("no mutable open PR for this session".into()))?;
         github
             .merge_pr(pr.number, method.unwrap_or("merge"))
             .await

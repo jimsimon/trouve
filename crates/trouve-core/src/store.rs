@@ -204,6 +204,10 @@ CREATE TABLE IF NOT EXISTS events (
   payload TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS events_scope ON events (scope_kind, scope_id, cursor);
+CREATE INDEX IF NOT EXISTS events_session_pr_mentioned
+ON events (json_extract(payload, '$.session_id'), cursor)
+WHERE scope_kind = 'server' AND scope_id = ''
+  AND json_extract(payload, '$.type') = 'session.pr_mentioned';
 CREATE TABLE IF NOT EXISTS thread_view_cache (
   thread_id TEXT PRIMARY KEY REFERENCES threads(id) ON DELETE CASCADE,
   cursor INTEGER NOT NULL,
@@ -6273,7 +6277,6 @@ fn chat_pr_mention_content(event: &Event) -> Option<&str> {
         }
         | Event::TurnSteered { content, .. }
         | Event::AssistantMessage { content, .. } => Some(content.as_str()),
-        Event::AssistantProgress { text, .. } => Some(text.as_str()),
         Event::SubagentSpawned { prompt, .. } => Some(prompt.as_str()),
         _ => None,
     }
@@ -6435,7 +6438,7 @@ impl Store {
                 continue;
             };
             for (url, number) in crate::github::pr_browser_references_in_text(content) {
-                if seen.insert(url.to_ascii_lowercase()) {
+                if seen.insert(url.trim_end_matches('/').to_ascii_lowercase()) {
                     references.push((number, url));
                 }
             }
@@ -6461,6 +6464,9 @@ impl Store {
                 original_len,
             ));
         };
+        let existing = self.dedicated_session_pr_mentions(&session_id)?;
+        references
+            .retain(|(_, url)| !existing.contains(&url.trim_end_matches('/').to_ascii_lowercase()));
         let mentions = references.into_iter().map(|(number, url)| {
             (
                 Scope::Server,
@@ -7170,6 +7176,23 @@ impl Store {
         Ok(out)
     }
 
+    fn dedicated_session_pr_mentions(&self, session_id: &str) -> Result<HashSet<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT json_extract(payload, '$.url')
+             FROM events
+             WHERE scope_kind = 'server' AND scope_id = ''
+               AND json_extract(payload, '$.type') = 'session.pr_mentioned'
+               AND json_extract(payload, '$.session_id') = ?1",
+        )?;
+        let rows = stmt.query_map(params![session_id], |row| row.get::<_, String>(0))?;
+        let mut urls = HashSet::new();
+        for url in rows {
+            urls.insert(url?.trim_end_matches('/').to_ascii_lowercase());
+        }
+        Ok(urls)
+    }
+
     /// Canonical PR browser URLs mentioned in durable chat for one session.
     /// Dedicated server-scope events keep new lookups bounded. Pre-event
     /// transcripts are scanned once per process and cached; every later chat
@@ -7181,56 +7204,53 @@ impl Store {
             .unwrap()
             .get(session_id)
             .cloned();
-        let (mut urls, legacy_payloads) = {
+        let mut urls = self.dedicated_session_pr_mentions(session_id)?;
+        let scanned_legacy = if cached_legacy.is_some() {
+            None
+        } else {
             let conn = self.conn.lock().unwrap();
-            let mut mention_stmt = conn.prepare(
-                "SELECT json_extract(payload, '$.url')
-                 FROM events
-                 WHERE scope_kind = 'server' AND scope_id = ''
-                   AND json_extract(payload, '$.type') = 'session.pr_mentioned'
-                   AND json_extract(payload, '$.session_id') = ?1",
-            )?;
-            let mention_rows =
-                mention_stmt.query_map(params![session_id], |row| row.get::<_, String>(0))?;
-            let mut urls = HashSet::new();
-            for url in mention_rows {
-                urls.insert(url?.trim_end_matches('/').to_ascii_lowercase());
-            }
-            let legacy_payloads = if cached_legacy.is_some() {
-                Vec::new()
-            } else {
+            const PAGE_SIZE: usize = 256;
+            let mut legacy_urls = HashSet::new();
+            let mut after = 0_i64;
+            loop {
                 let mut legacy_stmt = conn.prepare(
-                    "SELECT events.payload
+                    "SELECT events.cursor, events.payload
                      FROM events
                      JOIN threads ON events.scope_kind = 'thread'
                                  AND events.scope_id = threads.id
-                     WHERE threads.session_id = ?1
+                     WHERE threads.session_id = ?1 AND events.cursor > ?2
                        AND json_extract(events.payload, '$.type') IN (
                          'user.message', 'turn.steered', 'assistant.message',
                          'assistant.progress', 'subagent.spawned'
-                       )",
+                       )
+                     ORDER BY events.cursor LIMIT ?3",
                 )?;
-                let rows =
-                    legacy_stmt.query_map(params![session_id], |row| row.get::<_, String>(0))?;
-                rows.collect::<rusqlite::Result<Vec<_>>>()?
-            };
-            (urls, legacy_payloads)
+                let mut rows = legacy_stmt.query(params![session_id, after, PAGE_SIZE as i64])?;
+                let mut loaded = 0;
+                while let Some(row) = rows.next()? {
+                    after = row.get::<_, i64>(0)?;
+                    let payload = row.get::<_, String>(1)?;
+                    loaded += 1;
+                    let Ok(event) = serde_json::from_str::<Event>(&payload) else {
+                        continue;
+                    };
+                    let Some(content) = chat_pr_mention_content(&event) else {
+                        continue;
+                    };
+                    for (url, _) in crate::github::pr_browser_references_in_text(content) {
+                        legacy_urls.insert(url.trim_end_matches('/').to_ascii_lowercase());
+                    }
+                }
+                if loaded < PAGE_SIZE {
+                    break;
+                }
+            }
+            Some(legacy_urls)
         };
         let legacy_urls = if let Some(cached) = cached_legacy {
             cached
         } else {
-            let mut legacy_urls = HashSet::new();
-            for payload in legacy_payloads {
-                let Ok(event) = serde_json::from_str::<Event>(&payload) else {
-                    continue;
-                };
-                let Some(content) = chat_pr_mention_content(&event) else {
-                    continue;
-                };
-                for (url, _) in crate::github::pr_browser_references_in_text(content) {
-                    legacy_urls.insert(url.trim_end_matches('/').to_ascii_lowercase());
-                }
-            }
+            let legacy_urls = scanned_legacy.expect("uncached legacy mentions are scanned");
             self.legacy_session_pr_mentions
                 .lock()
                 .unwrap()
@@ -20056,8 +20076,43 @@ mod tests {
         )));
         assert_eq!(mentions.len(), 1);
 
+        store
+            .append_event(
+                Scope::Thread(thread.id.clone()),
+                Event::AssistantMessage {
+                    turn: 2,
+                    content: "https://github.com/trouve-ai/trouve/pull/350/".into(),
+                },
+            )
+            .unwrap();
+        store
+            .append_event(
+                Scope::Thread(thread.id.clone()),
+                Event::AssistantProgress {
+                    turn: 2,
+                    text: "https://github.com/trouve-ai/trouve/pull/351".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(store.events_after(&Scope::Server, 0).unwrap().len(), 1);
+
         // Simulate chat persisted by a pre-session.pr_mentioned build. The
-        // projection fallback must make old transcripts associative too.
+        // projection fallback must make old transcripts associative too, even
+        // when the matching event falls beyond the first bounded scan page.
+        store
+            .append_pending_events(
+                serialize_events(
+                    Scope::Thread(thread.id.clone()),
+                    (0..256)
+                        .map(|turn| Event::AssistantProgress {
+                            turn,
+                            text: "working".into(),
+                        })
+                        .collect(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
         store
             .append_pending_events(
                 serialize_events(
