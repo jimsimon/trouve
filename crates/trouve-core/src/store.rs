@@ -7208,29 +7208,35 @@ impl Store {
         let scanned_legacy = if cached_legacy.is_some() {
             None
         } else {
-            let conn = self.conn.lock().unwrap();
             const PAGE_SIZE: usize = 256;
             let mut legacy_urls = HashSet::new();
             let mut after = 0_i64;
             loop {
-                let mut legacy_stmt = conn.prepare(
-                    "SELECT events.cursor, events.payload
-                     FROM events
-                     JOIN threads ON events.scope_kind = 'thread'
-                                 AND events.scope_id = threads.id
-                     WHERE threads.session_id = ?1 AND events.cursor > ?2
-                       AND json_extract(events.payload, '$.type') IN (
-                         'user.message', 'turn.steered', 'assistant.message',
-                         'assistant.progress', 'subagent.spawned'
-                       )
-                     ORDER BY events.cursor LIMIT ?3",
-                )?;
-                let mut rows = legacy_stmt.query(params![session_id, after, PAGE_SIZE as i64])?;
-                let mut loaded = 0;
-                while let Some(row) = rows.next()? {
-                    after = row.get::<_, i64>(0)?;
-                    let payload = row.get::<_, String>(1)?;
-                    loaded += 1;
+                let rows = {
+                    let conn = self.conn.lock().unwrap();
+                    let mut legacy_stmt = conn.prepare(
+                        "SELECT events.cursor, events.payload
+                         FROM events
+                         JOIN threads ON events.scope_kind = 'thread'
+                                     AND events.scope_id = threads.id
+                         WHERE threads.session_id = ?1 AND events.cursor > ?2
+                           AND json_extract(events.payload, '$.type') IN (
+                             'user.message', 'turn.steered', 'assistant.message',
+                             'subagent.spawned'
+                           )
+                         ORDER BY events.cursor LIMIT ?3",
+                    )?;
+                    let mut query_rows =
+                        legacy_stmt.query(params![session_id, after, PAGE_SIZE as i64])?;
+                    let mut rows = Vec::new();
+                    while let Some(row) = query_rows.next()? {
+                        rows.push((row.get::<_, i64>(0)?, row.get::<_, String>(1)?));
+                    }
+                    rows
+                };
+                let loaded = rows.len();
+                for (cursor, payload) in rows {
+                    after = cursor;
                     let Ok(event) = serde_json::from_str::<Event>(&payload) else {
                         continue;
                     };
