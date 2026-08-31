@@ -426,7 +426,13 @@ async fn cursor_adapter_reads_dashboard_usage_without_cli_credentials() {
 
 #[tokio::test]
 async fn cursor_health_requires_a_configured_api_key() {
-    let backend = CursorBackend::new("cursor", Some("cursor-agent-must-not-run".into()), None);
+    // An explicit empty key suppresses the production environment fallback,
+    // keeping this negative test independent of the runner's CURSOR_API_KEY.
+    let backend = CursorBackend::new(
+        "cursor",
+        Some("cursor-agent-must-not-run".into()),
+        Some(String::new()),
+    );
     let health = backend.subscription_health().await.unwrap();
     assert_eq!(health.status, "unavailable");
     assert!(health.note.contains("API key"), "{}", health.note);
