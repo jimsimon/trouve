@@ -635,6 +635,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(identity + b"\r\n")
                 self.wfile.flush()
                 if active_options.get("tools", {}).get("names", []) == ["mcp"]:
+                    tool_started = frame({
+                        "sdkMessage": {
+                            "type": "tool_call",
+                            "message": {
+                                "type": "tool_call",
+                                "name": "mcp",
+                                "call_id": "sdk-call-cancel",
+                                "status": "started"
+                            }
+                        }
+                    })
+                    self.wfile.write(
+                        format(len(tool_started), "x").encode("ascii") + b"\r\n"
+                    )
+                    self.wfile.write(tool_started + b"\r\n")
+                    self.wfile.flush()
                     cancel_callback = {
                         "toolName": "trouve_test_echo",
                         "toolCallId": "sdk-call-cancel",
@@ -675,7 +691,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.wfile.flush()
                     return
                 cancelled = "RUN_LIFECYCLE_STATUS_CANCELLED"
-                messages = [
+                messages = []
+                if active_options.get("tools", {}).get("names", []) == ["mcp"]:
+                    messages.append({
+                        "sdkMessage": {
+                            "type": "tool_call",
+                            "message": {
+                                "type": "tool_call",
+                                "name": "mcp",
+                                "call_id": "sdk-call-cancel",
+                                "status": "cancelled"
+                            }
+                        }
+                    })
+                messages.extend([
                     {
                         "result": {
                             "agentId": agent_id,
@@ -689,7 +718,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         }
                     },
                     {"done": {"agentId": agent_id, "runId": run_id}}
-                ]
+                ])
                 body = b"".join(frame(message) for message in messages) + frame({}, 2)
                 self.wfile.write(format(len(body), "x").encode("ascii") + b"\r\n")
                 self.wfile.write(body + b"\r\n0\r\n\r\n")
@@ -762,7 +791,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
                             "run_id": run_id
                         }
                     }
-                },
+                }
+            ]
+            if names == ["mcp"]:
+                messages.append({
+                    "sdkMessage": {
+                        "type": "tool_call",
+                        "message": {
+                            "type": "tool_call",
+                            "name": "mcp",
+                            "call_id": callback["toolCallId"],
+                            "status": "completed"
+                        }
+                    }
+                })
+            messages.extend([
                 {
                     "sdkMessage": {
                         "type": "assistant",
@@ -793,7 +836,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     }
                 },
                 {"done": {"agentId": agent_id, "runId": run_id}}
-            ]
+            ])
             body = b"".join(frame(message) for message in messages) + frame({}, 2)
             self.send_response(200)
             self.send_header("Content-Type", "application/connect+json")

@@ -22,9 +22,13 @@ SQLite store is shared by those agents. See the pinned
 [Bridge README](https://github.com/cursor/sdk-bridge/blob/v1.0.28/README.md)
 and [service contract](https://github.com/cursor/sdk-bridge/blob/v1.0.28/docs/services.md).
 
-A six-turn live qualification used two agents with distinct workspaces and
-tool catalogs in one v1.0.28 Bridge. Concurrent sends, exact callback routing,
-warm close/resume, cold-process resume, and cancellation isolation passed.
+A six-turn live qualification used two agents with distinct configured
+`local.cwd` values and tool catalogs in one v1.0.28 Bridge. Concurrent sends,
+exact callback routing, warm close/resume, cold-process resume, and
+cancellation isolation passed. The current probe also binds each host-owned
+tool route to a workspace-specific marker. The production shipping-path
+qualification, not Cursor-native filesystem access, proves separate session
+worktrees.
 Cursor did not reliably disconnect the cancelled agent's outstanding callback,
 so safe sharing requires Trouve to settle that agent's callback route itself;
 it cannot rely on transport disconnect as the cancellation boundary.
@@ -37,13 +41,19 @@ it cannot rely on transport disconnect as the cancellation boundary.
   that backend's sessions and threads.
 - The Bridge callback URL and random bearer live for the process lifetime on a
   loopback-only listener. Possessing that bearer grants no Trouve tool by
-  itself. A callback must also match an active exact `agent_id` route.
+  itself. A callback must also match an active exact `agent_id` route and the
+  process-lifetime ownership record for its `(agent_id, tool_call_id)` pair.
 - Each turn registers one route only after `CreateAgent` or `ResumeAgent`
   returns its agent id. The route owns that turn's thread-scoped MCP URL and
   ticket, exact custom-tool allowlist, deduplication records, cancellation
-  token, and callback task supervisor. Unknown, stale, duplicate, or mismatched
-  agent routes and tools fail closed. Route removal precedes task cancellation
-  and `CloseAgent`, so no new callback can enter after teardown starts.
+  token, callback task supervisor, and streamed tool-call identities. Unknown,
+  stale, duplicate, or mismatched routes, tools, and call identities fail
+  closed. Route admission closes before task cancellation and `CloseAgent`, so
+  no new callback can enter after teardown starts. A route is reusable only
+  when its callback ids exactly match the ids observed in the Send stream.
+- Tool-call ownership records are never evicted while a Bridge remains live.
+  Reaching their fixed process bound retires and recycles the Bridge after its
+  active leases drain instead of forgetting an authorization tombstone.
 - Bridge RPC clients are cloneable and concurrent; Trouve does not hold the
   child-process mutex across an agent turn. Same-thread turns remain serial,
   and one backend still admits at most three active turns to bound callback and
@@ -69,12 +79,13 @@ it cannot rely on transport disconnect as the cancellation boundary.
   instead of up to three. Startup and the local SQLite connection are amortized
   across all of that backend's threads.
 - A longer-lived loopback callback bearer is acceptable because active
-  agent-route membership, exact tool membership, and the turn-scoped MCP ticket
-  remain short-lived authorization boundaries. Dropping a route also cancels
-  its outstanding callbacks even when Cursor leaves the HTTP request connected.
+  agent-route membership, exact tool and call identity, and the turn-scoped MCP
+  ticket remain authorization boundaries. Dropping a route also cancels its
+  outstanding callbacks even when Cursor leaves the HTTP request connected.
 - Independent Cursor turns can stream concurrently without a global Bridge
   mutex. Cancellation and callback deduplication are isolated per agent, so an
-  identical vendor call id in two agents cannot collide.
+  identical vendor call id in two agents cannot collide. A delayed retry for a
+  reused agent id retains its earlier route generation and fails closed.
 - Quarantine favors isolation over immediate replacement: a new turn may wait
   for existing agents to drain after an ambiguous shared-process failure. It
   does not kill healthy concurrent agents merely to recover capacity.

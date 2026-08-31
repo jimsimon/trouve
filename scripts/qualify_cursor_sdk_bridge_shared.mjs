@@ -6,8 +6,8 @@
  * probe proves that one process can safely host two concurrent local agents when
  * callbacks are routed by the exact owning agent id. Production-adapter route
  * settlement and quarantine are covered by the Rust adapter tests. This exercises
- * per-agent workspaces and tool catalogs, concurrent sends, cancellation
- * isolation, warm close/resume, and cold resume after a Bridge restart.
+ * per-agent Trouve-owned workspace routes and tool catalogs, concurrent sends,
+ * cancellation isolation, warm close/resume, and cold resume after a Bridge restart.
  *
  * The probe performs six paid local SDK turns. It never prints account identity
  * or CURSOR_API_KEY and removes all temporary state unless --keep-state is set.
@@ -439,17 +439,37 @@ async function main() {
     ),
   });
 
-  const handler = (slot, toolName, resultMarker) => async (argsValue, record) => {
+  const handler = (
+    slot,
+    toolName,
+    resultMarker,
+    workspace,
+    expectedWorkspace,
+  ) => async (argsValue, record) => {
     if (record.agentId !== expectedAgents.get(slot) || argsValue.token !== toolName) {
       throw new QualificationError(`${toolName}: callback crossed its agent route`);
     }
-    return { value: resultMarker };
+    const observedWorkspace = (await readFile(join(workspace, "WORKSPACE.txt"), "utf8")).trim();
+    if (observedWorkspace !== expectedWorkspace) {
+      throw new QualificationError(
+        `${toolName}: Trouve-owned workspace route returned ${observedWorkspace}`,
+      );
+    }
+    return { value: resultMarker, workspace: observedWorkspace };
   };
   const handlers = new Map([
-    [TOOLS.initialA, handler(SLOT_A, TOOLS.initialA, RESULTS.initialA)],
-    [TOOLS.initialB, handler(SLOT_B, TOOLS.initialB, RESULTS.initialB)],
-    [TOOLS.resumeA, handler(SLOT_A, TOOLS.resumeA, RESULTS.resumeA)],
-    [TOOLS.resumeB, handler(SLOT_B, TOOLS.resumeB, RESULTS.resumeB)],
+    [TOOLS.initialA, handler(
+      SLOT_A, TOOLS.initialA, RESULTS.initialA, workspaceA, "workspace-a",
+    )],
+    [TOOLS.initialB, handler(
+      SLOT_B, TOOLS.initialB, RESULTS.initialB, workspaceB, "workspace-b",
+    )],
+    [TOOLS.resumeA, handler(
+      SLOT_A, TOOLS.resumeA, RESULTS.resumeA, workspaceA, "workspace-a",
+    )],
+    [TOOLS.resumeB, handler(
+      SLOT_B, TOOLS.resumeB, RESULTS.resumeB, workspaceB, "workspace-b",
+    )],
     [TOOLS.cancelA, async (argsValue, record) => {
       if (record.agentId !== expectedAgents.get(SLOT_A) || argsValue.token !== TOOLS.cancelA) {
         throw new QualificationError("cancel callback crossed its agent route");
@@ -715,7 +735,11 @@ async function main() {
       maximum_concurrent_bridge_processes: 1,
       shared_sqlite_store: true,
       per_agent_api_key: true,
-      per_agent_workspace: true,
+      bridge_local_cwd_configured_per_agent: true,
+      trouve_owned_workspace_routes: true,
+      cursor_native_workspace_qualified: false,
+      production_worktree_isolation_covered_by:
+        "cursor_sdk_shipping_path_installs_tools_resumes_and_cleans_up",
       per_agent_tool_catalog: true,
       callback_route_key: "agent_id",
       concurrent_sends: true,

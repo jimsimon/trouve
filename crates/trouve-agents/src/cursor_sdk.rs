@@ -59,6 +59,10 @@ const MAX_CALLBACK_RECORDS: usize = 128;
 // Historical IDs use fixed-size hashes, but still need a separate hard ceiling
 // so a defective authenticated Bridge cannot grow one turn without bound.
 const MAX_CALLBACKS_PER_TURN: usize = 4 * 1024;
+// Retain exact call ownership for the life of a shared Bridge so a delayed
+// retry from an earlier turn cannot bind to a replacement route. Recycle the
+// process at the bound instead of evicting authorization tombstones.
+const MAX_CALLBACK_IDENTITIES_PER_PROCESS: usize = 16 * 1024;
 const MAX_CALLBACK_REPLAY_RECORDS: usize = 64;
 const MAX_CALLBACK_REPLAY_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CALLBACK_CONCURRENCY: usize = 8;
@@ -1137,7 +1141,7 @@ async fn run_sdk_turn(
             &agent_id,
             &turn,
             events,
-            &route.supervisor.cancel,
+            route.route.clone(),
         ) => outcome,
     };
     // Cursor can publish a terminal Send frame while an already-admitted
@@ -1625,19 +1629,136 @@ struct CallbackState {
     bearer: Arc<str>,
     routes: Arc<StdRwLock<HashMap<String, Arc<CallbackRoute>>>>,
     route_generation: Arc<AtomicU64>,
+    identities: Arc<StdMutex<CallbackIdentities>>,
     request_slots: Arc<Semaphore>,
 }
 
 struct CallbackRoute {
+    agent_id: String,
     generation: u64,
     mcp_url: Option<Arc<str>>,
     allowed_tools: Arc<HashSet<String>>,
     http: reqwest::Client,
     supervisor: Arc<CallbackSupervisor>,
+    identities: Arc<StdMutex<CallbackIdentities>>,
+    streamed_call_ids: StdMutex<HashSet<CallbackKey>>,
+    owner_reusable: Option<Weak<AtomicBool>>,
     accepting: AtomicBool,
 }
 
 type CallbackKey = [u8; 32];
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct CallbackIdentityKey {
+    agent_id: CallbackKey,
+    call_id: CallbackKey,
+}
+
+#[derive(Default)]
+struct CallbackIdentities {
+    generations: HashMap<CallbackIdentityKey, u64>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CallbackIdentityClaim {
+    Accepted,
+    Stale,
+    Exhausted,
+}
+
+impl CallbackIdentities {
+    fn claim(
+        &mut self,
+        identity: CallbackIdentityKey,
+        generation: u64,
+    ) -> (CallbackIdentityClaim, bool) {
+        if let Some(owner) = self.generations.get(&identity) {
+            return (
+                if *owner == generation {
+                    CallbackIdentityClaim::Accepted
+                } else {
+                    CallbackIdentityClaim::Stale
+                },
+                false,
+            );
+        }
+        if self.generations.len() >= MAX_CALLBACK_IDENTITIES_PER_PROCESS {
+            return (CallbackIdentityClaim::Exhausted, true);
+        }
+        self.generations.insert(identity, generation);
+        (
+            CallbackIdentityClaim::Accepted,
+            self.generations.len() == MAX_CALLBACK_IDENTITIES_PER_PROCESS,
+        )
+    }
+}
+
+impl CallbackRoute {
+    fn quarantine_owner(&self) {
+        if let Some(reusable) = self.owner_reusable.as_ref().and_then(Weak::upgrade) {
+            reusable.store(false, Ordering::Release);
+        }
+    }
+
+    fn claim_identity(&self, call_id: CallbackKey) -> CallbackIdentityClaim {
+        let identity = CallbackIdentityKey {
+            agent_id: callback_key(&self.agent_id),
+            call_id,
+        };
+        let (claim, retire) = self
+            .identities
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .claim(identity, self.generation);
+        if retire || claim != CallbackIdentityClaim::Accepted {
+            self.quarantine_owner();
+        }
+        claim
+    }
+
+    fn observe_stream_call_id(&self, call_id: &str) -> Result<(), String> {
+        let call_id = callback_key(call_id);
+        match self.claim_identity(call_id) {
+            CallbackIdentityClaim::Accepted => {
+                self.streamed_call_ids
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(call_id);
+                Ok(())
+            }
+            CallbackIdentityClaim::Stale => {
+                Err("Cursor reused a custom-tool call id owned by an earlier route".into())
+            }
+            CallbackIdentityClaim::Exhausted => {
+                Err("Cursor callback identity history reached its process bound".into())
+            }
+        }
+    }
+
+    async fn identities_correlated(&self) -> bool {
+        // Direct router unit tests that do not own a pooled process exercise
+        // HTTP routing in isolation. Production routes always carry the owner
+        // flag and require the Send stream to corroborate every callback id.
+        if self.owner_reusable.is_none() {
+            return true;
+        }
+        let callback_ids = self
+            .supervisor
+            .calls
+            .lock()
+            .await
+            .seen
+            .keys()
+            .copied()
+            .collect::<HashSet<_>>();
+        let streamed_call_ids = self
+            .streamed_call_ids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        callback_ids == streamed_call_ids
+    }
+}
 
 #[derive(Clone)]
 struct CallbackRecord {
@@ -1809,7 +1930,6 @@ struct CallbackRouteLease {
     route: Arc<CallbackRoute>,
     routes: Arc<StdRwLock<HashMap<String, Arc<CallbackRoute>>>>,
     supervisor: Arc<CallbackSupervisor>,
-    owner_reusable: Option<Weak<AtomicBool>>,
     active: bool,
 }
 
@@ -1824,6 +1944,7 @@ impl CallbackRouter {
             bearer: Arc::from(bearer.as_str()),
             routes: Arc::new(StdRwLock::new(HashMap::new())),
             route_generation: Arc::new(AtomicU64::new(0)),
+            identities: Arc::new(StdMutex::new(CallbackIdentities::default())),
             request_slots: Arc::new(Semaphore::new(MAX_CALLBACK_HTTP_CONCURRENCY)),
         };
         let router = Router::new()
@@ -1888,11 +2009,15 @@ impl CallbackRouter {
             })?;
         let supervisor = CallbackSupervisor::new(cancel);
         let route = Arc::new(CallbackRoute {
+            agent_id: agent_id.clone(),
             generation,
             mcp_url: mcp_url.map(Arc::from),
             allowed_tools: Arc::new(allowed_tools),
             http: self.http.clone(),
             supervisor: supervisor.clone(),
+            identities: self.state.identities.clone(),
+            streamed_call_ids: StdMutex::new(HashSet::new()),
+            owner_reusable,
             accepting: AtomicBool::new(true),
         });
         routes.insert(agent_id.clone(), route.clone());
@@ -1908,7 +2033,6 @@ impl CallbackRouter {
             route,
             routes: self.state.routes.clone(),
             supervisor,
-            owner_reusable,
             active: true,
         })
     }
@@ -2019,19 +2143,19 @@ impl CallbackRouteLease {
         let settled = tokio::time::timeout_at(deadline, self.supervisor.stop())
             .await
             .is_ok();
-        if settled {
+        let identities_correlated = settled && self.route.identities_correlated().await;
+        if identities_correlated {
             self.detach();
         } else {
             // Relinquish removal ownership while leaving the stopped route in
             // the process router. Process quarantine can then retry joining
-            // its supervisor before admitting a replacement Bridge. Mark the
-            // owner fail-closed before any later cleanup await can be dropped.
-            if let Some(reusable) = self.owner_reusable.as_ref().and_then(Weak::upgrade) {
-                reusable.store(false, Ordering::Release);
-            }
+            // its supervisor or reject an uncorroborated callback identity
+            // before admitting a replacement Bridge. Mark the owner
+            // fail-closed before any later cleanup await can be dropped.
+            self.route.quarantine_owner();
             self.active = false;
         }
-        settled
+        identities_correlated
     }
 
     fn detach(&mut self) {
@@ -2059,9 +2183,7 @@ impl Drop for CallbackRouteLease {
         }
         self.route.accepting.store(false, Ordering::Release);
         self.supervisor.cancel.cancel();
-        if let Some(reusable) = self.owner_reusable.as_ref().and_then(Weak::upgrade) {
-            reusable.store(false, Ordering::Release);
-        }
+        self.route.quarantine_owner();
         // Drop cannot await supervisor settlement. Keep the stopped route in
         // the process-owned router and fail the process closed; BridgeLease
         // drop will wake pool recovery after releasing the final active lease.
@@ -2160,6 +2282,23 @@ async fn custom_tool_callback(
         );
     };
     let call_key = callback_key(call_id);
+    match route.claim_identity(call_key) {
+        CallbackIdentityClaim::Accepted => {}
+        CallbackIdentityClaim::Stale => {
+            return callback_error(
+                StatusCode::FORBIDDEN,
+                "permission_denied",
+                "tool-call id belongs to an earlier Cursor route",
+            );
+        }
+        CallbackIdentityClaim::Exhausted => {
+            return callback_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "resource_exhausted",
+                "Cursor callback identity history reached its process bound",
+            );
+        }
+    }
     let fingerprint = callback_fingerprint(&request);
     let (mut outcome, execute) = {
         let mut calls = route.supervisor.calls.lock().await;
@@ -2801,8 +2940,9 @@ async fn stream_turn(
     agent_id: &str,
     turn: &BackendTurn,
     events: &BackendEventSender,
-    callback_cancel: &CancellationToken,
+    callback_route: Arc<CallbackRoute>,
 ) -> Result<TurnTerminal, BackendError> {
+    let callback_cancel = callback_route.supervisor.cancel.clone();
     let text = match turn.instructions.as_deref() {
         Some(instructions) => format!(
             "<mode-instructions>\n{instructions}\n</mode-instructions>\n\n{}",
@@ -2893,7 +3033,10 @@ async fn stream_turn(
 
     let mut stream = Box::pin(response.bytes_stream());
     let mut buffered = BytesMut::new();
-    let mut projection = RunProjection::default();
+    let mut projection = RunProjection {
+        callback_route: Some(callback_route),
+        ..RunProjection::default()
+    };
     let mut connect_state = ConnectStreamState::Active;
     let mut stop = None;
     let mut stop_deadline: Option<tokio::time::Instant> = None;
@@ -3108,6 +3251,8 @@ struct RunProjection {
     terminal_status: Option<Value>,
     terminal_error_code: Option<String>,
     done: DoneState,
+    callback_route: Option<Arc<CallbackRoute>>,
+    protocol_error: Option<String>,
 }
 
 impl RunProjection {
@@ -3169,8 +3314,25 @@ impl RunProjection {
                 // Concrete tool lifecycle events are emitted by the
                 // authenticated callback, which knows the actual trouve tool
                 // name and arguments. SDK messages expose only the dispatcher
-                // name (`mcp`) on some Bridge versions.
-                "tool_call" => {}
+                // name (`mcp`) on some Bridge versions, but their call id is a
+                // turn-specific identity fence for delayed callback retries.
+                "tool_call" => {
+                    if let Some(route) = self.callback_route.as_ref() {
+                        let observed = payload
+                            .get("call_id")
+                            .or_else(|| payload.get("callId"))
+                            .and_then(Value::as_str)
+                            .filter(|value| !value.is_empty())
+                            .ok_or_else(|| {
+                                "Cursor tool lifecycle event omitted its call id".to_string()
+                            })
+                            .and_then(|call_id| route.observe_stream_call_id(call_id));
+                        if let Err(error) = observed {
+                            route.quarantine_owner();
+                            self.protocol_error.get_or_insert(error);
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -3225,7 +3387,7 @@ impl RunProjection {
     }
 
     async fn finish(
-        self,
+        mut self,
         events: &BackendEventSender,
         cancel: &CancellationToken,
     ) -> Result<TurnTerminal, BackendError> {
@@ -3234,6 +3396,9 @@ impl RunProjection {
         }
         if events.is_closed() {
             return Ok(TurnTerminal::ConsumerClosed);
+        }
+        if let Some(error) = self.protocol_error.take() {
+            return Err(BackendError::Protocol(error));
         }
         match self.done {
             DoneState::Seen => {}
@@ -4359,6 +4524,10 @@ mod tests {
             )
             .await
             .unwrap();
+        previous
+            .route
+            .observe_stream_call_id("delayed-call")
+            .unwrap();
 
         let body = serde_json::to_string(&json!({
             "toolName": "shared_tool",
@@ -4417,6 +4586,23 @@ mod tests {
         assert!(
             response.starts_with("HTTP/1.1 403 Forbidden"),
             "delayed callback reached its replacement route: {response}"
+        );
+        let before_ingress = reqwest::Client::new()
+            .post(format!("{}{}", callback.url, CALLBACK_PATH))
+            .bearer_auth(&callback.bearer)
+            .json(&json!({
+                "toolName": "shared_tool",
+                "toolCallId": "delayed-call",
+                "agentId": "agent-reused",
+                "args": {},
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            before_ingress.status(),
+            StatusCode::FORBIDDEN,
+            "a prior route's streamed call id rebound after route replacement"
         );
         assert_eq!(mcp_calls.load(Ordering::Acquire), 0);
 
@@ -4605,6 +4791,43 @@ mod tests {
             .spawn(std::future::pending::<()>());
         supervisor.stop().await;
         assert!(supervisor.tasks.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn uncorroborated_stream_call_quarantines_before_route_reuse() {
+        let callback = CallbackRouter::start(local_http_client().unwrap())
+            .await
+            .unwrap();
+        let reusable = Arc::new(AtomicBool::new(true));
+        let mut route = callback
+            .register(
+                "agent-delayed-before-ingress".into(),
+                None,
+                HashSet::new(),
+                CancellationToken::new(),
+                Some(Arc::downgrade(&reusable)),
+            )
+            .await
+            .unwrap();
+        route
+            .route
+            .observe_stream_call_id("call-delayed-before-ingress")
+            .unwrap();
+
+        assert!(
+            !route.stop().await,
+            "a stream call without a correlated callback allowed route reuse"
+        );
+        assert!(!reusable.load(Ordering::Acquire));
+        assert!(
+            callback
+                .state
+                .routes
+                .read()
+                .unwrap()
+                .contains_key("agent-delayed-before-ingress")
+        );
+        callback.stop().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

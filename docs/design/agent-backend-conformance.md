@@ -89,8 +89,8 @@ CURSOR_API_KEY=... node scripts/qualify_cursor_sdk_bridge_full.mjs
 ```
 
 Qualify one Bridge shared across concurrent agents, including distinct
-workspaces and tool catalogs, agent-scoped cancellation, warm resume, and cold
-process resume, with six paid turns:
+Trouve-owned workspace routes and tool catalogs, agent-scoped cancellation,
+warm resume, and cold process resume, with six paid turns:
 
 ```sh
 CURSOR_API_KEY=... node scripts/qualify_cursor_sdk_bridge_shared.mjs
@@ -185,12 +185,16 @@ only in memory for the query, and never invokes `cursor-agent` or reads its
 credential files.
 
 The 2026-08-28 shared-process qualification passed six paid Composer 2 turns
-through one v1.0.28 Bridge. Two agents used distinct workspaces, API-key-bearing
-options, custom-tool catalogs, and exact callback routes while their sends ran
-concurrently. Cancelling agent A left agent B's callback and turn healthy; the
-Bridge did not disconnect A's callback itself. A production Rust adapter test
-separately verifies Trouve-owned route settlement and same-process reuse; a
-supervisor-timeout test verifies fail-closed quarantine. Both agents passed warm
+through one v1.0.28 Bridge. Two agents used distinct API-key-bearing options,
+configured Cursor `local.cwd` values, custom-tool catalogs, and exact callback
+routes while their sends ran concurrently. That recorded run did not prove
+Cursor-native filesystem separation. The current probe additionally makes
+each host-owned tool route read a different isolated workspace marker, while
+production Rust adapter tests verify exact session-worktree routing,
+Trouve-owned route settlement, same-process reuse, streamed/callback call-id
+correlation, and fail-closed quarantine. Cancelling agent A left agent B's
+callback and turn healthy; the Bridge did not disconnect A's callback itself.
+Both agents passed warm
 `CloseAgent`/`ResumeAgent`, cold-process resume from the shared SQLite store,
 and MCP-only native-tool confinement. The run observed exactly one Bridge
 process and about 228 MiB warm RSS.

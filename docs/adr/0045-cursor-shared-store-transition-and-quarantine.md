@@ -28,9 +28,11 @@ provably settled must not admit a replacement agent.
   that id. The legacy directory is retained for recovery and is never merged
   into the shared SQLite store.
 - Callback-route shutdown reports whether all supervised callback tasks
-  settled before its deadline. A timeout quarantines the shared Bridge even
-  when `CloseAgent` succeeds. No new turn enters that process; existing leases
-  drain before Trouve recycles it against the durable shared store.
+  settled before its deadline and every callback id was corroborated by that
+  turn's Send stream. A timeout or identity mismatch quarantines the shared
+  Bridge even when `CloseAgent` succeeds. No new turn enters that process;
+  existing leases drain before Trouve recycles it against the durable shared
+  store.
 - The direct vendor qualification proves concurrent agents, exact callback
   routing, and Cursor's cancellation transport behavior. Production adapter
   tests own the evidence that Trouve settles a cancelled callback route and
