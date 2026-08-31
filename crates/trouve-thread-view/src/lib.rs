@@ -265,7 +265,9 @@ impl ThreadProjection {
             }
             Event::AssistantThinking { turn, id, text } => {
                 let active_turn = self.active_thinking_turn();
-                if !self.snapshot.thinking || active_turn.is_none_or(|active| *turn >= active) {
+                if self.snapshot.thinking && active_turn.is_some_and(|active| *turn < active) {
+                    self.append_stale_thinking(*turn, text);
+                } else {
                     self.fail_open_compaction(*turn);
                     self.finish_progress(*turn);
                     if self.snapshot.thinking
@@ -638,6 +640,24 @@ impl ThreadProjection {
                 ..
             }) => Some(*turn),
             _ => None,
+        }
+    }
+
+    // Preserve delayed older-turn text without making that lifecycle active
+    // again. A first-seen stale block is complete by construction.
+    fn append_stale_thinking(&mut self, turn: u64, text: &str) {
+        if let Some(idx) = self.snapshot.items.iter().rposition(
+            |item| matches!(item, ThreadViewItem::Thinking { turn: item_turn, .. } if *item_turn == turn),
+        ) {
+            if let ThreadViewItem::Thinking { content, .. } = &mut self.snapshot.items[idx] {
+                content.push_str(text);
+            }
+        } else {
+            self.push(ThreadViewItem::Thinking {
+                turn,
+                content: text.into(),
+                complete: true,
+            });
         }
     }
 
@@ -1959,7 +1979,7 @@ mod tests {
             [
                 ThreadViewItem::Thinking { content: first, complete: true, .. },
                 ThreadViewItem::Thinking { content: second, complete: false, .. },
-            ] if first == "Waiting for the next event. Still waiting."
+            ] if first == "Waiting for the next event. Still waiting. Late."
                 && second == "Next turn."
         ));
 
@@ -1987,6 +2007,52 @@ mod tests {
             projection.snapshot.items.last(),
             Some(ThreadViewItem::Thinking { content, complete: true, .. })
                 if content == "Next turn."
+        ));
+    }
+
+    #[test]
+    fn first_stale_thinking_delta_is_preserved_without_replacing_the_active_turn() {
+        let mut projection = ThreadProjection::default();
+        projection.apply(&envelope(
+            1,
+            0,
+            Event::AssistantThinking {
+                turn: 2,
+                id: Some("reasoning".into()),
+                text: "Current.".into(),
+            },
+        ));
+        projection.apply(&envelope(
+            2,
+            25,
+            Event::AssistantThinking {
+                turn: 1,
+                id: Some("reasoning".into()),
+                text: "Late.".into(),
+            },
+        ));
+
+        assert_eq!(projection.active_thinking_turn(), Some(2));
+        assert!(matches!(
+            projection.snapshot.items.as_slice(),
+            [
+                ThreadViewItem::Thinking { turn: 2, content: current, complete: false },
+                ThreadViewItem::Thinking { turn: 1, content: late, complete: true },
+            ] if current == "Current." && late == "Late."
+        ));
+
+        projection.apply(&envelope(
+            3,
+            50,
+            Event::AssistantThinkingCompleted {
+                turn: 2,
+                id: Some("reasoning".into()),
+            },
+        ));
+        assert!(!projection.snapshot.thinking);
+        assert!(matches!(
+            projection.snapshot.items.first(),
+            Some(ThreadViewItem::Thinking { complete: true, .. })
         ));
     }
 

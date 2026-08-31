@@ -752,7 +752,8 @@ export class ThreadViewModel {
       case "assistant.thinking": {
         const activeTurn = this.activeThinkingTurn();
         if (this.thinking && activeTurn !== undefined && envelope.turn < activeTurn) {
-          return false;
+          this.appendStaleThinking(envelope.turn, envelope.text);
+          return true;
         }
         this.failOpenCompaction(envelope.turn);
         this.finishProgress();
@@ -1107,6 +1108,24 @@ export class ThreadViewModel {
       (candidate) => candidate.kind === "thinking" && !candidate.complete,
     );
     return item?.kind === "thinking" ? item.turn : undefined;
+  }
+
+  // Preserve delayed older-turn text without replacing the newer active
+  // lifecycle. A first-seen stale block is complete by construction.
+  private appendStaleThinking(turn: number, text: string): void {
+    const item = this.#findLast(
+      (candidate) => candidate.kind === "thinking" && candidate.turn === turn,
+    );
+    if (item?.kind === "thinking") item.content += text;
+    else {
+      this.appendItem({
+        id: this.nextItemId(`thinking:${turn}`),
+        kind: "thinking",
+        turn,
+        content: text,
+        complete: true,
+      });
+    }
   }
 
   private finishThinking(): boolean {

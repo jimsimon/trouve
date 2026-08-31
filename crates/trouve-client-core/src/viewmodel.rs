@@ -511,6 +511,26 @@ impl ThreadViewModel {
         })
     }
 
+    /// Preserve a delayed older-turn delta without replacing the newer active
+    /// lifecycle. A first-seen stale block is complete by construction.
+    fn append_stale_thinking(&mut self, turn: u64, text: &str) -> usize {
+        if let Some(idx) = self.items.iter().rposition(
+            |item| matches!(item, ChatItem::Thinking { turn: item_turn, .. } if *item_turn == turn),
+        ) {
+            if let ChatItem::Thinking { content, .. } = &mut self.items[idx] {
+                content.push_str(text);
+            }
+            idx
+        } else {
+            self.items.push(ChatItem::Thinking {
+                turn,
+                content: text.into(),
+                complete: true,
+            });
+            self.items.len() - 1
+        }
+    }
+
     /// Close the currently open thinking block.
     fn finish_thinking(&mut self) -> Option<usize> {
         self.thinking = false;
@@ -841,7 +861,7 @@ impl ThreadViewModel {
             Event::AssistantThinking { turn, id, text } => {
                 let active_turn = self.active_thinking_turn();
                 if self.thinking && active_turn.is_some_and(|active| *turn < active) {
-                    return None;
+                    return Some(self.append_stale_thinking(*turn, text));
                 }
                 self.fail_open_compaction(*turn);
                 self.finish_progress();
@@ -2196,13 +2216,13 @@ mod tests {
             id: Some("reasoning".into()),
             text: " Late.".into(),
         }));
-        assert_eq!(changed, None);
+        assert_eq!(changed, Some(0));
         assert!(matches!(
             vm.items.as_slice(),
             [
                 ChatItem::Thinking { content: first, complete: true, .. },
                 ChatItem::Thinking { content: second, complete: false, .. },
-            ] if first == "Waiting. Still waiting." && second == "Next turn."
+            ] if first == "Waiting. Still waiting. Late." && second == "Next turn."
         ));
 
         let changed = vm.apply(&env(Event::AssistantThinkingCompleted {
@@ -2223,6 +2243,38 @@ mod tests {
             Some(ChatItem::Thinking { content, complete: true, .. })
                 if content == "Next turn."
         ));
+    }
+
+    #[test]
+    fn first_stale_thinking_delta_is_preserved_without_replacing_the_active_turn() {
+        let mut vm = ThreadViewModel::new();
+        vm.apply(&env(Event::AssistantThinking {
+            turn: 2,
+            id: Some("reasoning".into()),
+            text: "Current.".into(),
+        }));
+
+        let changed = vm.apply(&env(Event::AssistantThinking {
+            turn: 1,
+            id: Some("reasoning".into()),
+            text: "Late.".into(),
+        }));
+        assert_eq!(changed, Some(1));
+        assert_eq!(vm.active_thinking_turn(), Some(2));
+        assert!(matches!(
+            vm.items.as_slice(),
+            [
+                ChatItem::Thinking { turn: 2, content: current, complete: false },
+                ChatItem::Thinking { turn: 1, content: late, complete: true },
+            ] if current == "Current." && late == "Late."
+        ));
+
+        let changed = vm.apply(&env(Event::AssistantThinkingCompleted {
+            turn: 2,
+            id: Some("reasoning".into()),
+        }));
+        assert_eq!(changed, Some(0));
+        assert!(!vm.thinking);
     }
 
     #[test]

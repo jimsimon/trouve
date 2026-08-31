@@ -557,7 +557,7 @@ describe("ThreadViewModel", () => {
     expect(view.items).toEqual([
       expect.objectContaining({
         kind: "thinking",
-        content: "before and after",
+        content: "before and after late",
         complete: true,
       }),
       expect.objectContaining({
@@ -578,6 +578,46 @@ describe("ThreadViewModel", () => {
       content: "next turn",
       complete: true,
     }));
+  });
+
+  it("preserves a first stale reasoning delta without replacing the active turn", () => {
+    const view = new ThreadViewModel();
+    view.apply(envelope(1, {
+      type: "assistant.thinking",
+      turn: 3,
+      id: "reasoning-a",
+      text: "current",
+    }));
+    view.apply(envelope(2, {
+      type: "assistant.thinking",
+      turn: 2,
+      id: "reasoning-a",
+      text: "late",
+    }));
+
+    expect(view.thinking).toBe(true);
+    expect(view.items).toEqual([
+      expect.objectContaining({
+        kind: "thinking",
+        turn: 3,
+        content: "current",
+        complete: false,
+      }),
+      expect.objectContaining({
+        kind: "thinking",
+        turn: 2,
+        content: "late",
+        complete: true,
+      }),
+    ]);
+
+    view.apply(envelope(3, {
+      type: "assistant.thinking_completed",
+      turn: 3,
+      id: "reasoning-a",
+    }));
+    expect(view.thinking).toBe(false);
+    expect(view.items[0]).toEqual(expect.objectContaining({ complete: true }));
   });
 
   it("keeps legacy unidentified reasoning split across tool requests", () => {
