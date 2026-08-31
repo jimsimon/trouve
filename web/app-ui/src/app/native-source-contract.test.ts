@@ -76,6 +76,7 @@ const rustEventToWire = {
   ToolStarted: "tool.started",
   TurnCancelled: "turn.cancelled",
   TurnAdmitted: "turn.admitted",
+  TurnBackgroundActivity: "turn.background_activity",
   TurnCapacityAcquired: "turn.capacity_acquired",
   TurnCompleted: "turn.completed",
   TurnFailed: "turn.failed",

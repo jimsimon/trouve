@@ -43,14 +43,14 @@ use trouve_protocol::{
     ReorderQueueRequest, RequestCodeReviewRequest, ResolveApprovalRequest, ResolveQuestionRequest,
     ReviewerProfile, Scope, SendMessageRequest, ServerInfo, ServerProjection, Session, SessionDiff,
     SessionDiffFileSummary, SessionDiffSummary, SessionFileDiff, SessionSummariesSnapshot,
-    SetCodeReviewSettingsRequest, SetDefaultModelRequest, SetDefaultPermissionModeRequest,
-    SetGitWorktreeSettingsRequest, SetGlobalDefaultsRequest, SetLocalEnabledRequest,
-    SetMcpServerEnabledRequest, SteerAccepted, SteerTurnRequest, SubscriptionHealth, TerminalInfo,
-    TerminalInputRequest, TerminalReplayStart, TerminalResizeRequest, Thread, ThreadStatus,
-    ThreadToolDetails, ThreadViewQuery, ThreadViewSnapshot, TurnAccepted,
-    UpdateCodeReviewRepositoryRequest, UpdateQueuedPromptRequest, UpdateSessionRequest,
-    UpdateThreadRequest, UpsertAutomationRequest, UpsertMcpServerRequest, UpsertPersonaRequest,
-    UpsertProviderRequest, UsageSummary, WorkspaceListItem,
+    SetAutomationEnabledRequest, SetCodeReviewSettingsRequest, SetDefaultModelRequest,
+    SetDefaultPermissionModeRequest, SetGitWorktreeSettingsRequest, SetGlobalDefaultsRequest,
+    SetLocalEnabledRequest, SetMcpServerEnabledRequest, SteerAccepted, SteerTurnRequest,
+    SubscriptionHealth, TerminalInfo, TerminalInputRequest, TerminalReplayStart,
+    TerminalResizeRequest, Thread, ThreadStatus, ThreadToolDetails, ThreadViewQuery,
+    ThreadViewSnapshot, TurnAccepted, UpdateCodeReviewRepositoryRequest, UpdateQueuedPromptRequest,
+    UpdateSessionRequest, UpdateThreadRequest, UpsertAutomationRequest, UpsertMcpServerRequest,
+    UpsertPersonaRequest, UpsertProviderRequest, UsageSummary, WorkspaceListItem,
 };
 use utoipa::OpenApi;
 
@@ -214,6 +214,7 @@ impl IntoResponse for ApiError {
         automation_templates,
         create_automation,
         update_automation,
+        set_automation_enabled,
         delete_automation,
         run_automation,
         code_review_dashboard,
@@ -349,6 +350,7 @@ impl IntoResponse for ApiError {
         trouve_protocol::AutomationSchedule,
         trouve_protocol::AutomationTemplate,
         UpsertAutomationRequest,
+        SetAutomationEnabledRequest,
         CodeReviewDashboard,
         ReviewerProfile,
         trouve_protocol::ReviewerOverride,
@@ -399,6 +401,7 @@ impl IntoResponse for ApiError {
         trouve_protocol::ApprovalDecision,
         trouve_protocol::RestoreDirection,
         trouve_protocol::PermissionMode,
+        trouve_protocol::ModelOptionValue,
         trouve_protocol::AgentPersona,
         PersonaInfo,
         UpsertPersonaRequest,
@@ -650,6 +653,10 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route(
             "/v1/automations/{id}",
             axum::routing::put(update_automation).delete(delete_automation),
+        )
+        .route(
+            "/v1/automations/{id}/enabled",
+            axum::routing::put(set_automation_enabled),
         )
         .route("/v1/automations/{id}/run", post(run_automation))
         .route("/v1/code-review", get(code_review_dashboard))
@@ -1986,7 +1993,7 @@ async fn create_automation(
     State(engine): State<Arc<Engine>>,
     Json(req): Json<UpsertAutomationRequest>,
 ) -> Result<Json<Automation>, ApiError> {
-    Ok(Json(engine.create_automation(req)?))
+    Ok(Json(engine.create_automation(req).await?))
 }
 
 #[utoipa::path(put, path = "/v1/automations/{id}", params(("id" = String, Path,)),
@@ -1998,7 +2005,18 @@ async fn update_automation(
     Path(id): Path<String>,
     Json(req): Json<UpsertAutomationRequest>,
 ) -> Result<Json<Automation>, ApiError> {
-    Ok(Json(engine.update_automation(&id, req)?))
+    Ok(Json(engine.update_automation(&id, req).await?))
+}
+
+#[utoipa::path(put, path = "/v1/automations/{id}/enabled", params(("id" = String, Path,)),
+    request_body = SetAutomationEnabledRequest,
+    responses((status = 200, body = Automation), (status = 404, body = ErrorBody)))]
+async fn set_automation_enabled(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+    Json(req): Json<SetAutomationEnabledRequest>,
+) -> Result<Json<Automation>, ApiError> {
+    Ok(Json(engine.set_automation_enabled(&id, req.enabled).await?))
 }
 
 #[utoipa::path(delete, path = "/v1/automations/{id}", params(("id" = String, Path,)),
@@ -2007,7 +2025,7 @@ async fn delete_automation(
     State(engine): State<Arc<Engine>>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    engine.delete_automation(&id)?;
+    engine.delete_automation(&id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

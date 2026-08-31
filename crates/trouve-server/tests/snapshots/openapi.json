@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "7.24"
+    "version": "7.27"
   },
   "paths": {
     "/v1/approvals": {
@@ -252,6 +252,54 @@
         "responses": {
           "204": {
             "description": ""
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/automations/{id}/enabled": {
+      "put": {
+        "tags": [],
+        "operationId": "set_automation_enabled",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetAutomationEnabledRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Automation"
+                }
+              }
+            }
           },
           "404": {
             "description": "",
@@ -5152,6 +5200,16 @@
             ],
             "description": "Model for the runs (None = the persona's default)."
           },
+          "model_options": {
+            "type": "object",
+            "description": "Model-specific values selected from the model's `options_schema`.\n`thinking_level` remains as a compatibility shorthand; values in this\nobject take precedence when both select the same model capability.",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/ModelOptionValue"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
           "name": {
             "type": "string"
           },
@@ -7439,7 +7497,9 @@
           "model_options": {
             "type": "object",
             "description": "Model-specific options validated against the model's options schema.",
-            "additionalProperties": {},
+            "additionalProperties": {
+              "$ref": "#/components/schemas/ModelOptionValue"
+            },
             "propertyNames": {
               "type": "string"
             }
@@ -7742,7 +7802,7 @@
               },
               "background": {
                 "type": "boolean",
-                "description": "The turn was dispatched by the server to attach to\nvendor-autonomous agent activity; `content` is a fixed marker,\nnot user input. Clients should render the turn as background\nagent activity."
+                "description": "Legacy protocol 7.19–7.26 marker retained so existing durable logs\nremain replayable. New servers emit `turn.background_activity`\ninstead and leave this false for user-authored messages."
               },
               "content": {
                 "type": "string"
@@ -7756,6 +7816,27 @@
                 "type": "string",
                 "enum": [
                   "user.message"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "The server attached a turn to vendor-autonomous agent activity. This is\ndeliberately distinct from `user.message`: no user authored a prompt.",
+            "required": [
+              "turn",
+              "type"
+            ],
+            "properties": {
+              "turn": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "turn.background_activity"
                 ]
               }
             }
@@ -9843,6 +9924,21 @@
             "type": "boolean"
           }
         }
+      },
+      "ModelOptionValue": {
+        "oneOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "number",
+            "format": "double"
+          },
+          {
+            "type": "boolean"
+          }
+        ],
+        "description": "A scalar value accepted by a model's advertised options schema.\n\nProtocol request/response structs retain `serde_json::Value` internally so\narbitrary-precision JSON number tokens survive deserialization. Their\nOpenAPI fields use this type to advertise the narrower wire contract that\nthe engine already enforces."
       },
       "ModelUsageSummary": {
         "type": "object",
@@ -12322,6 +12418,18 @@
           }
         }
       },
+      "SetAutomationEnabledRequest": {
+        "type": "object",
+        "description": "Change only whether an automation is scheduled to run. This narrow\nmutation avoids replacing a concurrently edited automation definition.",
+        "required": [
+          "enabled"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          }
+        }
+      },
       "SetCodeReviewSettingsRequest": {
         "type": "object",
         "description": "Replace the persisted automated code-review execution settings\n(`PUT /v1/config/code-review`).",
@@ -12679,7 +12787,9 @@
           "model_options": {
             "type": "object",
             "description": "Current values for the model's options (thinking level, etc.);\nclients render controls from the model's `options_schema`.",
-            "additionalProperties": {},
+            "additionalProperties": {
+              "$ref": "#/components/schemas/ModelOptionValue"
+            },
             "propertyNames": {
               "type": "string"
             }
@@ -12960,7 +13070,7 @@
               },
               "background": {
                 "type": "boolean",
-                "description": "Server-dispatched attach turn for vendor-autonomous agent\nactivity; render as background activity, not as user input."
+                "description": "Background-activity display row. New snapshots derive this from\n`turn.background_activity`; true on user rows remains possible when\nreplaying protocol 7.19–7.26 logs."
               },
               "content": {
                 "type": "string"
@@ -13836,7 +13946,9 @@
               "null"
             ],
             "description": "Replaces the thread's model options when present.",
-            "additionalProperties": {},
+            "additionalProperties": {
+              "$ref": "#/components/schemas/ModelOptionValue"
+            },
             "propertyNames": {
               "type": "string"
             }
@@ -13878,6 +13990,16 @@
               "string",
               "null"
             ]
+          },
+          "model_options": {
+            "type": "object",
+            "description": "Model-specific values selected from the model's `options_schema`.",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/ModelOptionValue"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
           },
           "name": {
             "type": "string"

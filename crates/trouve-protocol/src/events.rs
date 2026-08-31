@@ -9,6 +9,35 @@ use utoipa::ToSchema;
 
 use crate::{CallId, CheckpointId, SessionId, ThreadId, WorkspaceId};
 
+fn deserialize_optional_f64<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<serde_json::Number>::deserialize(deserializer)?
+        .map(|number| {
+            number
+                .as_f64()
+                .filter(|value| value.is_finite())
+                .ok_or_else(|| {
+                    <D::Error as serde::de::Error>::custom("number is outside the finite f64 range")
+                })
+        })
+        .transpose()
+}
+
+fn serialize_optional_f64<S>(value: &Option<f64>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match value {
+        Some(value) if value.is_finite() => serializer.serialize_some(value),
+        Some(_) => Err(<S::Error as serde::ser::Error>::custom(
+            "number is outside the finite f64 range",
+        )),
+        None => serializer.serialize_none(),
+    }
+}
+
 /// Which stream an event belongs to. Cursors are monotonic per scope.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -181,7 +210,12 @@ pub struct Usage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_input_tokens: Option<u64>,
     /// Estimated cost in USD, when list pricing for the model is known.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_optional_f64",
+        deserialize_with = "deserialize_optional_f64"
+    )]
     pub cost_usd: Option<f64>,
     /// The model's context window as reported live by the provider during
     /// the turn. Authoritative over any static catalog value.
@@ -272,13 +306,16 @@ pub enum Event {
         /// `GET /v1/attachments/{id}`).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         attachments: Vec<crate::Attachment>,
-        /// The turn was dispatched by the server to attach to
-        /// vendor-autonomous agent activity; `content` is a fixed marker,
-        /// not user input. Clients should render the turn as background
-        /// agent activity.
+        /// Legacy protocol 7.19–7.26 marker retained so existing durable logs
+        /// remain replayable. New servers emit `turn.background_activity`
+        /// instead and leave this false for user-authored messages.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         background: bool,
     },
+    /// The server attached a turn to vendor-autonomous agent activity. This is
+    /// deliberately distinct from `user.message`: no user authored a prompt.
+    #[serde(rename = "turn.background_activity")]
+    TurnBackgroundActivity { turn: u64 },
     /// Additional user input accepted by the backend while `turn` was still
     /// running. This belongs on the active turn's timeline and does not start
     /// or queue another turn.
@@ -801,6 +838,34 @@ mod tests {
     }
 
     #[test]
+    fn background_activity_has_a_distinct_replay_compatible_contract() {
+        let value = serde_json::to_value(Event::TurnBackgroundActivity { turn: 3 }).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "type": "turn.background_activity",
+                "turn": 3,
+            })
+        );
+
+        let legacy: Event = serde_json::from_value(serde_json::json!({
+            "type": "user.message",
+            "turn": 4,
+            "content": "[background agent activity]",
+            "background": true
+        }))
+        .unwrap();
+        assert!(matches!(
+            legacy,
+            Event::UserMessage {
+                turn: 4,
+                background: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn envelope_roundtrips() {
         let env = EventEnvelope {
             cursor: 42,
@@ -845,6 +910,46 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn usage_cost_roundtrips_through_internally_tagged_events() {
+        let event = Event::TurnUsageUpdated {
+            turn: 1,
+            usage: Usage {
+                cost_usd: Some(0.000_02),
+                ..Usage::default()
+            },
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let decoded: Event = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            decoded,
+            Event::TurnUsageUpdated { usage, .. }
+                if usage.cost_usd == Some(0.000_02)
+        ));
+
+        assert!(
+            serde_json::from_str::<Event>(
+                r#"{
+            "type":"turn.usage_updated",
+            "turn":1,
+            "usage":{"input_tokens":0,"output_tokens":0,"cost_usd":1e400}
+        }"#
+            )
+            .is_err()
+        );
+
+        for cost_usd in [f64::INFINITY, f64::NAN] {
+            let invalid = Event::TurnUsageUpdated {
+                turn: 1,
+                usage: Usage {
+                    cost_usd: Some(cost_usd),
+                    ..Usage::default()
+                },
+            };
+            assert!(serde_json::to_string(&invalid).is_err());
+        }
     }
 
     #[test]

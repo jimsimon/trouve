@@ -2,11 +2,14 @@ import {
   createNewSessionThreadRequest,
   resolveNewSessionModel,
   resolveNewThreadDefaults,
-  thinkingSelectionIsValid,
-  threadTitleFallback,
   thinkingOption,
-  type ThinkingOption,
+  threadTitleFallback,
 } from "../app/new-session-model.js";
+import {
+  modelOptionControls,
+  sanitizeModelOptions,
+  type ModelOptionControl,
+} from "./model-option-controls.js";
 import {
   MAX_ATTACHMENT_BYTES,
   MAX_PENDING_ATTACHMENT_BYTES,
@@ -32,7 +35,7 @@ export interface NewThreadSetupCatalog {
 export interface NewThreadSetupDraft {
   readonly modeId: string;
   readonly modelId: string;
-  readonly thinking: string;
+  readonly modelOptions: Readonly<Record<string, unknown>>;
   readonly permissionMode: NewThreadPermissionSelection;
   /** Captured authoritative sources for the values currently displayed. */
   readonly inheritedThinking: string | undefined;
@@ -105,10 +108,23 @@ export const effectiveNewThreadModel = (
   return knownModel(catalog.models, modelId);
 };
 
-export const newThreadThinkingOption = (
-  draft: Pick<NewThreadSetupDraft, "modeId" | "modelId">,
+export const newThreadModelOptionControls = (
+  draft: Pick<NewThreadSetupDraft, "modeId" | "modelId" | "modelOptions">,
   catalog: NewThreadSetupCatalog,
-): ThinkingOption | undefined => thinkingOption(effectiveNewThreadModel(draft, catalog));
+): readonly ModelOptionControl[] => {
+  const model = effectiveNewThreadModel(draft, catalog);
+  const thinking = thinkingOption(model);
+  const defaults = resolveNewThreadDefaults(
+    catalog.modes,
+    catalog.models,
+    catalog.providers,
+    { modeId: draft.modeId, modelId: draft.modelId },
+  );
+  const inheritedOptions = thinking === undefined || defaults.thinking === ""
+    ? {}
+    : { [thinking.key]: defaults.thinking };
+  return modelOptionControls(model, draft.modelOptions, inheritedOptions);
+};
 
 /** Show the concrete server defaults instead of inheritance placeholders. */
 export const createInitialNewThreadDraft = (
@@ -120,7 +136,12 @@ export const createInitialNewThreadDraft = (
     catalog.providers,
   );
   return {
-    ...defaults,
+    modeId: defaults.modeId,
+    modelId: defaults.modelId,
+    modelOptions: {},
+    permissionMode: defaults.permissionMode,
+    inheritedThinking: defaults.inheritedThinking,
+    inheritedPermissionMode: defaults.inheritedPermissionMode,
     prompt: "",
     attachments: [],
   };
@@ -132,15 +153,26 @@ export const selectNewThreadMode = (
   modeId: string,
   catalog: NewThreadSetupCatalog,
 ): NewThreadSetupDraft => {
+  const previousEffectiveModelId = effectiveNewThreadModel(draft, catalog)?.id;
   const defaults = resolveNewThreadDefaults(
     catalog.modes,
     catalog.models,
     catalog.providers,
     { modeId },
   );
-  return {
+  const next = {
     ...draft,
-    ...defaults,
+    modeId: defaults.modeId,
+    modelId: defaults.modelId,
+    permissionMode: defaults.permissionMode,
+    inheritedThinking: defaults.inheritedThinking,
+    inheritedPermissionMode: defaults.inheritedPermissionMode,
+  };
+  return {
+    ...next,
+    ...(effectiveNewThreadModel(next, catalog)?.id === previousEffectiveModelId
+      ? {}
+      : { modelOptions: {} }),
   };
 };
 
@@ -149,17 +181,23 @@ export const selectNewThreadModel = (
   modelId: string,
   catalog: NewThreadSetupCatalog,
 ): NewThreadSetupDraft => {
+  const previousEffectiveModelId = effectiveNewThreadModel(draft, catalog)?.id;
   const defaults = resolveNewThreadDefaults(
     catalog.modes,
     catalog.models,
     catalog.providers,
     { modeId: draft.modeId, modelId },
   );
-  return {
+  const next = {
     ...draft,
     modelId: defaults.modelId,
-    thinking: defaults.thinking,
     inheritedThinking: defaults.inheritedThinking,
+  };
+  return {
+    ...next,
+    ...(effectiveNewThreadModel(next, catalog)?.id === previousEffectiveModelId
+      ? {}
+      : { modelOptions: {} }),
   };
 };
 
@@ -189,19 +227,25 @@ export const reconcileNewThreadDraft = (
     ? draft.modelId
     : modeDefaults.modelId;
   const refreshed = selectNewThreadModel(modeDefaults, modelId, catalog);
-  const keepThinking = edits.thinking
-    && thinkingSelectionIsValid(newThreadThinkingOption(refreshed, catalog), draft.thinking);
   const keepPermission = edits.permission
     && (draft.permissionMode === "ask"
       || draft.permissionMode === "allow_list"
       || draft.permissionMode === "yolo");
+  const previousEffectiveModelId = effectiveNewThreadModel(draft, catalog)?.id;
+  const effectiveModel = effectiveNewThreadModel(refreshed, catalog);
+  const modelOptions = effectiveModel?.id === previousEffectiveModelId
+    ? sanitizeModelOptions(effectiveModel, draft.modelOptions)
+    : {};
+  const thinking = thinkingOption(effectiveModel);
+  const hasThinkingOverride = thinking !== undefined
+    && modelOptions[thinking.key] !== undefined;
 
   return {
     ...draft,
     modeId: refreshed.modeId,
     modelId: refreshed.modelId,
-    thinking: keepThinking ? draft.thinking : refreshed.thinking,
-    inheritedThinking: keepThinking ? undefined : refreshed.inheritedThinking,
+    modelOptions,
+    inheritedThinking: hasThinkingOverride ? undefined : refreshed.inheritedThinking,
     permissionMode: keepPermission ? draft.permissionMode : refreshed.permissionMode,
     inheritedPermissionMode: keepPermission
       ? undefined
@@ -312,7 +356,7 @@ export const createNewThreadSetupSubmission = (input: {
     ...(mode === undefined ? {} : { mode: mode.id }),
     ...(model === undefined ? {} : { model: model.id }),
     permissionMode: input.draft.permissionMode,
-    thinking: input.draft.thinking,
+    modelOptions: input.draft.modelOptions,
     ...(input.draft.inheritedPermissionMode === undefined
       ? {}
       : { inheritedPermissionMode: input.draft.inheritedPermissionMode }),

@@ -1285,6 +1285,22 @@ impl ProtocolClient {
         decode(resp, &path).await
     }
 
+    pub async fn set_automation_enabled(
+        &self,
+        id: &str,
+        enabled: bool,
+    ) -> Result<trouve_protocol::Automation> {
+        let path = format!("/automations/{id}/enabled");
+        let resp = self
+            .http
+            .put(format!("{}{path}", self.base))
+            .json(&trouve_protocol::SetAutomationEnabledRequest { enabled })
+            .send()
+            .await
+            .with_context(|| format!("PUT {path}"))?;
+        decode(resp, &path).await
+    }
+
     pub async fn delete_automation(&self, id: &str) -> Result<()> {
         self.delete(&format!("/automations/{id}")).await
     }

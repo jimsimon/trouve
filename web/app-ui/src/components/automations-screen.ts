@@ -1,16 +1,22 @@
 import { ContextConsumer } from "@lit/context";
 import { css, html, LitElement, nothing } from "lit";
 
-import { thinkingOption } from "../app/new-session-model.js";
 import { appServicesContext, appStoreContext } from "../contexts/app-contexts.js";
 import type {
+  ProtocolAgentPersona,
   ProtocolAutomation,
   ProtocolAutomationTemplate,
   ProtocolModelInfo,
+  ProtocolProvidersResponse,
   ProtocolWorkspace,
 } from "../services/protocol-client.js";
+import { copyProtocolModelOptions } from "../services/protocol-json.js";
 import { readSignal, withSignalTracking } from "../state/reactivity.js";
-import { modelOptionLabel } from "./model-option-controls.js";
+import {
+  changeModelOption,
+  modelOptionControls,
+  type ModelOptionChangeDetail,
+} from "./model-option-controls.js";
 import { fontAwesomeIcon } from "./font-awesome-icon.js";
 
 const AUTOMATION_RETRY_MS = 5_000;
@@ -20,8 +26,10 @@ import {
   automationDraftFromTemplate,
   automationRequestFromDraft,
   automationScheduleSummary,
+  effectiveAutomationModelId,
   emptyAutomationDraft,
   hasAutomationDraftErrors,
+  modelOptionsAfterEffectiveModelChange,
   validateAutomationDraft,
   type AutomationDraft,
   type AutomationDraftErrors,
@@ -29,6 +37,7 @@ import {
   type AutomationScheduleKind,
 } from "./automations-model.js";
 import "./model-picker.js";
+import "./model-options-editor.js";
 
 type EditorMode = "" | "create" | "edit";
 
@@ -341,7 +350,13 @@ export class TrouveAutomationsScreen extends withSignalTracking(LitElement) {
   #automations: readonly ProtocolAutomation[] = [];
   #templates: readonly ProtocolAutomationTemplate[] = [];
   #workspaces: readonly ProtocolWorkspace[] = [];
+  #modes: readonly ProtocolAgentPersona[] = [];
   #models: readonly ProtocolModelInfo[] = [];
+  #providers: ProtocolProvidersResponse | undefined;
+  #modesLoading = false;
+  #modesError = "";
+  #modesGeneration = 0;
+  #modesWorkspaceId = "";
   #modelsLoading = true;
   #modelsError = "";
   #selectedId = "";
@@ -369,6 +384,47 @@ export class TrouveAutomationsScreen extends withSignalTracking(LitElement) {
     if (catalog === undefined) return this.#models;
     const models = readSignal(catalog);
     return models.length === 0 ? this.#models : models;
+  }
+
+  async #loadModes(workspaceId: string): Promise<void> {
+    const services = this.#services.value;
+    if (services === undefined || workspaceId === "") {
+      this.#modesGeneration += 1;
+      this.#modes = [];
+      this.#modesWorkspaceId = "";
+      this.#modesLoading = false;
+      return;
+    }
+    const generation = ++this.#modesGeneration;
+    if (workspaceId !== this.#modesWorkspaceId) {
+      this.#modes = [];
+      this.#modesWorkspaceId = workspaceId;
+    }
+    this.#modesLoading = true;
+    this.#modesError = "";
+    this.requestUpdate();
+    try {
+      const modes = await services.protocol.personas(workspaceId);
+      if (
+        generation !== this.#modesGeneration
+        || workspaceId !== this.#modesWorkspaceId
+        || !this.isConnected
+      ) return;
+      this.#modes = modes;
+    } catch {
+      if (
+        generation !== this.#modesGeneration
+        || workspaceId !== this.#modesWorkspaceId
+        || !this.isConnected
+      ) return;
+      this.#modes = [];
+      this.#modesError = "Mode choices could not be loaded. The saved value is preserved.";
+    } finally {
+      if (generation === this.#modesGeneration) {
+        this.#modesLoading = false;
+        this.requestUpdate();
+      }
+    }
   }
 
   override connectedCallback(): void {
@@ -399,6 +455,7 @@ export class TrouveAutomationsScreen extends withSignalTracking(LitElement) {
 
   override disconnectedCallback(): void {
     this.#loadGeneration += 1;
+    this.#modesGeneration += 1;
     if (this.#pollTimer !== undefined) globalThis.clearInterval(this.#pollTimer);
     if (this.#deferredRefreshTimer !== undefined) {
       globalThis.clearTimeout(this.#deferredRefreshTimer);
@@ -444,10 +501,11 @@ export class TrouveAutomationsScreen extends withSignalTracking(LitElement) {
       this.requestUpdate();
     });
     try {
-      const [automations, templates, workspaces] = await Promise.all([
+      const [automations, templates, workspaces, providers] = await Promise.all([
         services.protocol.automations(),
         services.protocol.automationTemplates(),
         services.protocol.workspaces(),
+        services.protocol.providers(),
       ]);
       if (generation !== this.#loadGeneration || !this.isConnected) return;
       const selected = automations.find((automation) => automation.id === this.#selectedId);
@@ -458,6 +516,7 @@ export class TrouveAutomationsScreen extends withSignalTracking(LitElement) {
       this.#automations = automations;
       this.#templates = templates;
       this.#workspaces = workspaces;
+      this.#providers = providers;
       if (!automations.some((automation) => automation.id === this.#selectedId)) {
         this.#selectedId = automations[0]?.id ?? "";
         if (this.#editorMode === "edit") this.#editorMode = "";
@@ -465,6 +524,7 @@ export class TrouveAutomationsScreen extends withSignalTracking(LitElement) {
       if (this.#editorMode === "create" && this.#draft.workspaceId === "" && workspaceId !== "") {
         this.#draft = { ...this.#draft, workspaceId };
       }
+      if (this.#editorMode !== "") void this.#loadModes(workspaceId);
       this.#liveError = "";
     } catch {
       if (generation !== this.#loadGeneration || !this.isConnected) return;
@@ -613,9 +673,15 @@ export class TrouveAutomationsScreen extends withSignalTracking(LitElement) {
 
   #renderEditor() {
     const models = this.#availableModels();
+    const modes = this.#modesWorkspaceId === this.#draft.workspaceId ? this.#modes : [];
     const editing = this.#editorMode === "edit";
-    const selectedModel = models.find((model) => model.id === this.#draft.model);
-    const thinking = thinkingOption(selectedModel);
+    const selectedModel = this.#effectiveAutomationModel(this.#draft, modes);
+    const effectiveModelId = effectiveAutomationModelId(
+      this.#draft,
+      modes,
+      this.#providers,
+    ) ?? "";
+    const modelControls = modelOptionControls(selectedModel, this.#draft.modelOptions);
     const nameError = this.#draftErrors.name;
     const promptError = this.#draftErrors.prompt;
     const workspaceError = this.#draftErrors.workspaceId;
@@ -634,40 +700,48 @@ export class TrouveAutomationsScreen extends withSignalTracking(LitElement) {
         ${promptError === undefined ? nothing : html`<span class="field-error" id="automation-prompt-error">${promptError}</span>`}
         <label class="editor-inline" for="automation-workspace"><span>Workspace</span><select id="automation-workspace" name="workspace" required aria-invalid=${workspaceError === undefined ? "false" : "true"} @change=${this.#workspaceChanged}><option value="" ?selected=${this.#draft.workspaceId === ""}>Choose a workspace</option>${this.#workspaces.map((workspace) => html`<option value=${workspace.id} ?selected=${workspace.id === this.#draft.workspaceId}>${workspace.name}</option>`)}</select></label>
         ${workspaceError === undefined ? nothing : html`<span class="field-error" id="automation-workspace-error">${workspaceError}</span>`}
+        <label class="editor-inline" for="automation-mode">
+          <span>Mode</span>
+          <select
+            id="automation-mode"
+            name="mode"
+            .value=${this.#draft.mode}
+            ?disabled=${busy || this.#modesLoading}
+            @change=${this.#modeChanged}
+          >
+            <option value="">Server default</option>
+            ${this.#draft.mode !== "" && !modes.some((mode) => mode.id === this.#draft.mode)
+              ? html`<option value=${this.#draft.mode}>${this.#draft.mode}</option>`
+              : nothing}
+            ${modes.map(
+              (mode) => html`<option value=${mode.id}>${mode.display_name || mode.id}</option>`,
+            )}
+          </select>
+        </label>
         <div class="editor-inline">
           <span>Model</span>
           <trouve-model-picker
             accessible-label="Automation model"
             placement="down"
-            placeholder="Persona or server default"
-            empty-label="Persona or server default"
+            placeholder=${`Mode or server default${effectiveModelId === "" ? "" : ` · ${effectiveModelId}`}`}
+            empty-label=${`Mode or server default${effectiveModelId === "" ? "" : ` · ${effectiveModelId}`}`}
             .value=${this.#draft.model}
             .models=${models}
             .disabled=${busy || this.#modelsLoading}
             @trouve-model-picked=${this.#modelPicked}
           ></trouve-model-picker>
         </div>
-        <label class="editor-inline" for="automation-thinking">
-          <span>Thinking</span>
-          <select
-            id="automation-thinking"
-            name="thinking"
-            ?disabled=${busy || this.#modelsLoading || thinking === undefined}
-            @change=${(event: Event) => this.#updateDraft({ thinkingLevel: (event.currentTarget as HTMLSelectElement).value })}
-          >
-            <option value="" ?selected=${this.#draft.thinkingLevel === ""}>${this.#modelsLoading
-              ? "Loading model options…"
-              : thinking === undefined
-                ? "Choose a supported model"
-                : "Model default"}</option>
-            ${thinking?.values.map(
-              (value) => html`<option value=${value} ?selected=${value === this.#draft.thinkingLevel}>${modelOptionLabel(value)}</option>`,
-            )}
-          </select>
-        </label>
-        ${this.#modelsError === ""
+        ${modelControls.length === 0
           ? nothing
-          : html`<span class="field-note">${this.#modelsError}</span>`}
+          : html`<trouve-model-options-editor
+              class="automation-model-options"
+              .controls=${modelControls}
+              .disabled=${busy || this.#modelsLoading}
+              @trouve-model-option-changed=${this.#modelOptionChanged}
+            ></trouve-model-options-editor>`}
+        ${this.#modelsError === "" && this.#modesError === ""
+          ? nothing
+          : html`<span class="field-note">${[this.#modesError, this.#modelsError].filter(Boolean).join(" ")}</span>`}
         <label class="editor-inline" for="automation-permission"><span>Permissions</span><select id="automation-permission" name="permission" @change=${(event: Event) => { const permissionMode = (event.currentTarget as HTMLSelectElement).value as AutomationPermissionMode; this.#yoloConfirmed = false; this.#updateDraft({ permissionMode }); }}><option value="ask" ?selected=${this.#draft.permissionMode === "ask"}>Ask before changes (safe)</option><option value="allow_list" ?selected=${this.#draft.permissionMode === "allow_list"}>Allow-list (approve as needed)</option><option value="yolo" ?selected=${this.#draft.permissionMode === "yolo"}>Unattended (YOLO)</option></select></label>
         ${this.#draft.permissionMode === "yolo" ? html`<section class="yolo-warning"><strong>Unattended execution is dangerous</strong><span>The agent can run shell commands and edit or delete files without asking. Repository content can influence those actions. This permission applies only to fresh sessions created by this automation and does not change global defaults.</span><label><input type="checkbox" .checked=${this.#yoloConfirmed} @change=${(event: Event) => { this.#yoloConfirmed = (event.currentTarget as HTMLInputElement).checked; this.requestUpdate(); }} />I understand and want this automation to run without approval</label></section>` : nothing}
         <div class="schedule-row"><span>Runs</span><select aria-label="Frequency" @change=${(event: Event) => this.#updateDraft({ scheduleKind: (event.currentTarget as HTMLSelectElement).value as AutomationScheduleKind })}><option value="hourly" ?selected=${this.#draft.scheduleKind === "hourly"}>Hourly</option><option value="daily" ?selected=${this.#draft.scheduleKind === "daily"}>Daily</option><option value="weekly" ?selected=${this.#draft.scheduleKind === "weekly"}>Weekly</option></select>${this.#draft.scheduleKind === "hourly" ? html`<span>at minute</span><input class="minute" aria-label="Minute of the hour" type="number" min="0" max="59" step="1" .value=${this.#draft.minute} @input=${(event: Event) => this.#updateDraft({ minute: (event.currentTarget as HTMLInputElement).value })} />` : html`<span>at</span><input aria-label="Time of day" type="time" step="60" .value=${this.#draft.time} @input=${(event: Event) => this.#updateDraft({ time: (event.currentTarget as HTMLInputElement).value })} />`}<span class="schedule-spacer"></span></div>
@@ -692,6 +766,7 @@ export class TrouveAutomationsScreen extends withSignalTracking(LitElement) {
     this.#actionError = "";
     this.#notice = "";
     this.requestUpdate();
+    void this.#loadModes(workspaceId);
   };
 
   #startEdit(automation: ProtocolAutomation): void {
@@ -704,6 +779,7 @@ export class TrouveAutomationsScreen extends withSignalTracking(LitElement) {
     this.#actionError = "";
     this.#notice = "";
     this.requestUpdate();
+    void this.#loadModes(automation.workspace_id);
   }
 
   readonly #cancelEditor = (): void => {
@@ -721,6 +797,7 @@ export class TrouveAutomationsScreen extends withSignalTracking(LitElement) {
     this.#draftErrors = {};
     this.#notice = `Applied the ${template.name} template. Review it before saving.`;
     this.requestUpdate();
+    void this.#loadModes(workspaceId);
   }
 
   #updateDraft(update: Partial<AutomationDraft>): void {
@@ -732,16 +809,49 @@ export class TrouveAutomationsScreen extends withSignalTracking(LitElement) {
 
   readonly #workspaceChanged = (event: Event): void => {
     const workspaceId = (event.currentTarget as HTMLSelectElement).value;
-    this.#updateDraft({ workspaceId });
+    this.#updateDraft({ workspaceId, mode: "", model: "", modelOptions: {} });
+    void this.#loadModes(workspaceId);
+  };
+
+  readonly #modeChanged = (event: Event): void => {
+    const modeId = (event.currentTarget as HTMLSelectElement).value;
+    const modes = this.#modesWorkspaceId === this.#draft.workspaceId ? this.#modes : [];
+    const previousModelId = effectiveAutomationModelId(this.#draft, modes, this.#providers);
+    const nextModelId = effectiveAutomationModelId(
+      { ...this.#draft, mode: modeId, model: "" },
+      modes,
+      this.#providers,
+    );
+    this.#updateDraft({
+      mode: modeId,
+      model: "",
+      modelOptions: modelOptionsAfterEffectiveModelChange(
+        this.#draft.modelOptions,
+        previousModelId,
+        nextModelId,
+      ),
+    });
   };
 
   readonly #modelPicked = (event: CustomEvent<{ readonly modelId: string }>): void => {
-    const model = this.#availableModels().find((candidate) => candidate.id === event.detail.modelId);
-    const thinking = thinkingOption(model);
-    const thinkingLevel = thinking?.values.includes(this.#draft.thinkingLevel)
-      ? this.#draft.thinkingLevel
-      : "";
-    this.#updateDraft({ model: event.detail.modelId, thinkingLevel });
+    const modes = this.#modesWorkspaceId === this.#draft.workspaceId ? this.#modes : [];
+    const previousModelId = effectiveAutomationModelId(this.#draft, modes, this.#providers);
+    const nextDraft = { ...this.#draft, model: event.detail.modelId };
+    const nextModelId = effectiveAutomationModelId(nextDraft, modes, this.#providers);
+    this.#updateDraft({
+      model: event.detail.modelId,
+      modelOptions: modelOptionsAfterEffectiveModelChange(
+        this.#draft.modelOptions,
+        previousModelId,
+        nextModelId,
+      ),
+    });
+  };
+
+  readonly #modelOptionChanged = (event: CustomEvent<ModelOptionChangeDetail>): void => {
+    this.#updateDraft({
+      modelOptions: changeModelOption(this.#draft.modelOptions, event.detail),
+    });
   };
 
   #toggleDay(day: number): void {
@@ -757,15 +867,6 @@ export class TrouveAutomationsScreen extends withSignalTracking(LitElement) {
       this.#actionError = "Confirm that you understand unattended execution before saving.";
       this.requestUpdate();
       return;
-    }
-    const thinking = thinkingOption(
-      this.#availableModels().find((model) => model.id === this.#draft.model),
-    );
-    if (
-      this.#draft.thinkingLevel !== ""
-      && thinking?.values.includes(this.#draft.thinkingLevel) !== true
-    ) {
-      this.#draft = { ...this.#draft, thinkingLevel: "" };
     }
     const errors = validateAutomationDraft(this.#draft);
     if (hasAutomationDraftErrors(errors)) {
@@ -783,15 +884,26 @@ export class TrouveAutomationsScreen extends withSignalTracking(LitElement) {
     const services = this.#services.value;
     if (services === undefined) return;
     const editing = this.#editorMode === "edit";
-    const busyId = editing ? this.#selectedId : "new";
+    const selectedId = this.#selectedId;
+    const draft: AutomationDraft = {
+      ...this.#draft,
+      modelOptions: copyProtocolModelOptions(this.#draft.modelOptions),
+      days: [...this.#draft.days],
+    };
+    const busyId = editing ? selectedId : "new";
     this.#busyId = busyId;
     this.#actionError = "";
     this.#notice = "";
     this.requestUpdate();
     try {
-      const request = automationRequestFromDraft(this.#draft);
+      const model = await this.#modelForMutation(draft);
+      if (model === undefined) return;
+      const request = automationRequestFromDraft(
+        draft,
+        model,
+      );
       const automation = editing
-        ? await services.protocol.updateAutomation(this.#selectedId, request)
+        ? await services.protocol.updateAutomation(selectedId, request)
         : await services.protocol.createAutomation(request);
       this.#replaceAutomation(automation);
       this.#selectedId = automation.id;
@@ -815,11 +927,10 @@ export class TrouveAutomationsScreen extends withSignalTracking(LitElement) {
     this.#notice = "";
     this.requestUpdate();
     try {
-      const draft = { ...automationDraftFrom(automation), enabled };
       this.#replaceAutomation(
-        await services.protocol.updateAutomation(
+        await services.protocol.setAutomationEnabled(
           automation.id,
-          automationRequestFromDraft(draft),
+          { enabled },
         ),
       );
       this.#notice = enabled ? "Automation enabled." : "Automation paused.";
@@ -933,6 +1044,50 @@ export class TrouveAutomationsScreen extends withSignalTracking(LitElement) {
       : this.#automations.map((candidate, candidateIndex) =>
           candidateIndex === index ? automation : candidate,
         );
+  }
+
+  #effectiveAutomationModel(
+    draft: AutomationDraft = this.#draft,
+    modes: readonly ProtocolAgentPersona[] = this.#modesWorkspaceId === draft.workspaceId
+      ? this.#modes
+      : [],
+    models: readonly ProtocolModelInfo[] = this.#availableModels(),
+    providers: ProtocolProvidersResponse | undefined = this.#providers,
+  ): ProtocolModelInfo | undefined {
+    const modelId = effectiveAutomationModelId(draft, modes, providers);
+    return modelId === undefined
+      ? undefined
+      : models.find((model) => model.id === modelId);
+  }
+
+  async #modelForMutation(
+    draft: AutomationDraft,
+  ): Promise<ProtocolModelInfo | null | undefined> {
+    if (Object.keys(draft.modelOptions).length === 0) return null;
+    const services = this.#services.value;
+    if (services === undefined || draft.workspaceId === "") {
+      this.#actionError = "Mode and model metadata are unavailable. No changes were saved.";
+      this.requestUpdate();
+      return undefined;
+    }
+    try {
+      const [modes, models, providers] = await Promise.all([
+        services.protocol.personas(draft.workspaceId),
+        services.modelCatalog.refresh("if-stale"),
+        services.protocol.providers(),
+      ]);
+      const modeId = draft.mode || "code";
+      if (!modes.some((mode) => mode.id === modeId)) {
+        throw new Error(`mode ${modeId} is unavailable`);
+      }
+      const model = this.#effectiveAutomationModel(draft, modes, models, providers);
+      if (model === undefined) throw new Error("effective model metadata is unavailable");
+      return model;
+    } catch {
+      this.#actionError = "Mode and model metadata could not be loaded. No changes were saved.";
+      this.requestUpdate();
+      return undefined;
+    }
   }
 
   #scheduleLoadRetry(): void {

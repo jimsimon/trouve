@@ -9,6 +9,7 @@ import {
   ProtocolClientError,
   SUPPORTED_PROTOCOL_VERSION,
 } from "./protocol-client.js";
+import { parseProtocolJson } from "./protocol-json.js";
 
 const session = {
   id: "se_1",
@@ -46,6 +47,27 @@ describe("ProtocolClient", () => {
     await expect(client.sessionSummaries()).resolves.toEqual({
       summaries: [summary],
       cursor: 8,
+    });
+  });
+
+  it("hides rounded numeric metadata and rejects lossy persisted options", async () => {
+    const fakeFetch = vi.fn<typeof fetch>(async (input, init) => {
+      const request = input instanceof Request ? input : new Request(input, init);
+      if (new URL(request.url).pathname === "/v1/models") {
+        return new Response(`[{"id":"provider/model","display_name":"Model","context_window":128000,"supports_tools":true,"options_schema":{"type":"object","properties":{"safe":{"type":"number","maximum":1e20},"unsafe":{"type":"integer","maximum":9007199254740993}}}}]`);
+      }
+      return new Response(`[{"id":"th_1","session_id":"se_1","mode":"code","model":"provider/model","permission_mode":"ask","model_options":{"safe":1e20,"unsafe":9007199254740993},"created_at":"2026-08-01T12:00:00Z"}]`);
+    });
+    const client = new ProtocolClient("http://127.0.0.1:43127", { fetch: fakeFetch });
+
+    const models = await client.models();
+    expect(models[0]?.options_schema).toEqual({
+      type: "object",
+      properties: { safe: { type: "number", maximum: 1e20 } },
+    });
+    await expect(client.threads("se_1")).rejects.toMatchObject({
+      kind: "invalid-response",
+      message: "server returned model option numbers this browser cannot preserve exactly",
     });
   });
 
@@ -139,6 +161,94 @@ describe("ProtocolClient", () => {
       status: 409,
       code: "conflict",
     });
+  });
+
+  it("preserves a base URL path prefix for thread updates", async () => {
+    const requests: Request[] = [];
+    const thread = {
+      id: "th_1",
+      session_id: "se_1",
+      mode: "code",
+      model: "provider/model",
+      permission_mode: "ask",
+      created_at: "2026-08-01T12:00:00Z",
+    };
+    const client = new ProtocolClient("https://example.test/app", {
+      fetch: vi.fn<typeof fetch>(async (input, init) => {
+        requests.push(input instanceof Request ? input : new Request(input, init));
+        return Response.json(thread);
+      }),
+    });
+
+    await client.updateThread("th_1", { permission_mode: "ask" });
+
+    expect(requests[0]?.url).toBe("https://example.test/app/v1/threads/th_1");
+  });
+
+  it("preserves a base URL path prefix for helper requests", async () => {
+    const requests: Request[] = [];
+    const client = new ProtocolClient("https://example.test/app/", {
+      fetch: vi.fn<typeof fetch>(async (input, init) => {
+        requests.push(input instanceof Request ? input : new Request(input, init));
+        return Response.json([]);
+      }),
+    });
+
+    await expect(client.models()).resolves.toEqual([]);
+
+    expect(requests[0]?.url).toBe("https://example.test/app/v1/models");
+  });
+
+  it("bounds and validates structured update-thread errors", async () => {
+    const responses = [
+      JSON.stringify({ code: `  ${"c".repeat(700)}  `, message: `  ${"m".repeat(700)}  ` }),
+      JSON.stringify({ code: "   ", message: "   " }),
+      "not JSON",
+    ];
+    const fakeFetch = vi.fn<typeof fetch>(async () => new Response(responses.shift(), { status: 400 }));
+    const client = new ProtocolClient("http://127.0.0.1:43127", { fetch: fakeFetch });
+
+    const bounded = await client.updateThread("th_1", {}).catch((reason: unknown) => reason);
+    expect(bounded).toMatchObject({ status: 400, code: "c".repeat(512) });
+    expect((bounded as ProtocolClientError).message).toBe("m".repeat(512));
+    for (const expected of ["update thread request failed", "update thread request failed"]) {
+      const error = await client.updateThread("th_1", {}).catch((reason: unknown) => reason);
+      expect(error).toMatchObject({ status: 400, code: undefined, message: expected });
+    }
+  });
+
+  it("serializes verified model-option number tokens without rounding", async () => {
+    const requests: Request[] = [];
+    const thread = {
+      id: "th_1",
+      session_id: "se_1",
+      mode: "code",
+      model: "provider/model",
+      permission_mode: "ask",
+      created_at: "2026-08-01T12:00:00Z",
+    };
+    const client = new ProtocolClient("http://127.0.0.1:43127", {
+      fetch: vi.fn<typeof fetch>(async (input, init) => {
+        requests.push(input instanceof Request ? input : new Request(input, init));
+        return Response.json(thread);
+      }),
+    });
+    const parsed = parseProtocolJson(
+      '{"model_options":{"temperature":0.10000000000000000,"large":1e20}}',
+    ) as { model_options: Record<string, number> };
+
+    await client.updateThread("th_1", { model_options: parsed.model_options });
+    await client.createThread({
+      session_id: "se_1",
+      model_options: parsed.model_options,
+    });
+
+    await expect(requests[0]?.text()).resolves.toBe(
+      '{"model_options":{"temperature":0.10000000000000000,"large":1e20}}',
+    );
+    await expect(requests[1]?.text()).resolves.toBe(
+      '{"session_id":"se_1","model_options":{"temperature":0.10000000000000000,"large":1e20}}',
+    );
   });
 
   it("loads lightweight diff metadata separately from one encoded file patch", async () => {
@@ -1077,6 +1187,48 @@ describe("ProtocolClient", () => {
       permission_mode: "allow_list",
     });
   });
+
+  it("updates automation lifecycle state through the narrow endpoint", async () => {
+    const requests: Request[] = [];
+    const automation = {
+      id: "auto/slash",
+      name: "Nightly checks",
+      prompt: "Run all checks",
+      workspace_id: "ws_1",
+      mode: "code",
+      model: "openai/gpt-5.6",
+      thinking_level: null,
+      model_options: { reasoning_effort: "ultra" },
+      permission_mode: "ask" as const,
+      schedule: { kind: "daily", minute: 0, time: "09:00", days: [] },
+      enabled: false,
+      next_run_at: null,
+      last_run_at: null,
+      last_session_id: null,
+      last_error: "",
+      created_at: "2026-08-01T12:00:00Z",
+    };
+    const fakeFetch = vi.fn<typeof fetch>(async (input, init) => {
+      requests.push(input instanceof Request ? input : new Request(input, init));
+      return Response.json(automation);
+    });
+    const client = new ProtocolClient("http://127.0.0.1:43127", {
+      fetch: fakeFetch,
+      mutationHeaders: () => ({ "x-trouve-host-csrf": "ephemeral-token" }),
+    });
+
+    await expect(client.setAutomationEnabled("auto/slash", { enabled: false }))
+      .resolves.toEqual(automation);
+
+    expect(requests).toHaveLength(1);
+    const request = requests[0];
+    if (request === undefined) throw new Error("automation state request was not sent");
+    expect(request.url).toBe(
+      "http://127.0.0.1:43127/v1/automations/auto%2Fslash/enabled",
+    );
+    expect(request.method).toBe("PUT");
+    await expect(request.clone().json()).resolves.toEqual({ enabled: false });
+  });
 });
 
 describe("protocol compatibility", () => {
@@ -1090,11 +1242,11 @@ describe("protocol compatibility", () => {
   });
 
   it("accepts the exact generated protocol version", () => {
-    expect(() => assertProtocolCompatibility("7.24")).not.toThrow();
+    expect(() => assertProtocolCompatibility("7.27")).not.toThrow();
   });
 
   it("rejects older, newer, other-major, and malformed servers", () => {
-    for (const version of ["4.0", "5.2", "6.1", "7.0", "7.1", "7.2", "7.3", "7.4", "7.5", "7.6", "7.7", "7.8", "7.9", "7.10", "7.11", "7.12", "7.13", "7.14", "7.15", "7.16", "7.17", "7.18", "7.19", "7.20", "7.21", "7.22", "7.23", "7.25", "7.24.1", "unknown", ""]) {
+    for (const version of ["4.0", "5.2", "6.1", "7.0", "7.1", "7.2", "7.3", "7.4", "7.5", "7.6", "7.7", "7.8", "7.9", "7.10", "7.11", "7.12", "7.13", "7.14", "7.15", "7.16", "7.17", "7.18", "7.19", "7.20", "7.21", "7.22", "7.23", "7.24", "7.25", "7.26", "7.28", "7.27.1", "unknown", ""]) {
       expect(() => assertProtocolCompatibility(version)).toThrowError(
         expect.objectContaining({ kind: "incompatible-protocol" }),
       );

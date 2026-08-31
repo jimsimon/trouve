@@ -202,6 +202,14 @@ impl ThreadProjection {
                     background: *background,
                 });
             }
+            Event::TurnBackgroundActivity { turn } => {
+                self.push(ThreadViewItem::User {
+                    turn: *turn,
+                    content: String::new(),
+                    attachments: Vec::new(),
+                    background: true,
+                });
+            }
             Event::TurnSteered {
                 turn,
                 content,
@@ -846,13 +854,23 @@ mod tests {
     }
 
     #[test]
-    fn background_user_messages_stay_marked_in_the_projection() {
+    fn background_activity_has_a_distinct_event_and_legacy_messages_still_replay() {
         let mut projection = ThreadProjection::default();
-        projection.apply(&envelope(
-            1,
-            0,
-            Event::UserMessage {
+        projection.apply(&envelope(1, 0, Event::TurnBackgroundActivity { turn: 3 }));
+        assert!(matches!(
+            projection.snapshot.items.last(),
+            Some(ThreadViewItem::User {
                 turn: 3,
+                content,
+                background: true,
+                ..
+            }) if content.is_empty()
+        ));
+        projection.apply(&envelope(
+            2,
+            1,
+            Event::UserMessage {
+                turn: 4,
                 content: "[background agent activity]".into(),
                 attachments: Vec::new(),
                 background: true,
@@ -861,7 +879,7 @@ mod tests {
         assert!(matches!(
             projection.snapshot.items.last(),
             Some(ThreadViewItem::User {
-                turn: 3,
+                turn: 4,
                 background: true,
                 ..
             })

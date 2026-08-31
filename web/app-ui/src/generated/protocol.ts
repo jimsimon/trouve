@@ -86,6 +86,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/automations/{id}/enabled": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put: operations["set_automation_enabled"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/automations/{id}/run": {
         parameters: {
             query?: never;
@@ -1815,6 +1831,14 @@ export interface components {
             mode?: string | null;
             /** @description Model for the runs (None = the persona's default). */
             model?: string | null;
+            /**
+             * @description Model-specific values selected from the model's `options_schema`.
+             *     `thinking_level` remains as a compatibility shorthand; values in this
+             *     object take precedence when both select the same model capability.
+             */
+            model_options?: {
+                [key: string]: components["schemas"]["ModelOptionValue"];
+            };
             name: string;
             /** @description Next fire time (RFC3339), when enabled. */
             next_run_at?: string | null;
@@ -2770,7 +2794,7 @@ export interface components {
             model?: string | null;
             /** @description Model-specific options validated against the model's options schema. */
             model_options?: {
-                [key: string]: unknown;
+                [key: string]: components["schemas"]["ModelOptionValue"];
             };
             permission_mode?: null | components["schemas"]["PermissionMode"];
             session_id: components["schemas"]["String"];
@@ -2859,10 +2883,9 @@ export interface components {
              */
             attachments?: components["schemas"]["Attachment"][];
             /**
-             * @description The turn was dispatched by the server to attach to
-             *     vendor-autonomous agent activity; `content` is a fixed marker,
-             *     not user input. Clients should render the turn as background
-             *     agent activity.
+             * @description Legacy protocol 7.19–7.26 marker retained so existing durable logs
+             *     remain replayable. New servers emit `turn.background_activity`
+             *     instead and leave this false for user-authored messages.
              */
             background?: boolean;
             content: string;
@@ -2870,6 +2893,11 @@ export interface components {
             turn: number;
             /** @enum {string} */
             type: "user.message";
+        } | {
+            /** Format: int64 */
+            turn: number;
+            /** @enum {string} */
+            type: "turn.background_activity";
         } | {
             attachments?: components["schemas"]["Attachment"][];
             content: string;
@@ -3559,6 +3587,15 @@ export interface components {
             output_price_per_mtok?: number | null;
             supports_tools: boolean;
         };
+        /**
+         * @description A scalar value accepted by a model's advertised options schema.
+         *
+         *     Protocol request/response structs retain `serde_json::Value` internally so
+         *     arbitrary-precision JSON number tokens survive deserialization. Their
+         *     OpenAPI fields use this type to advertise the narrower wire contract that
+         *     the engine already enforces.
+         */
+        ModelOptionValue: string | number | boolean;
         /** @description Aggregated usage for a thread or session. */
         ModelUsageSummary: {
             /** Format: int64 */
@@ -4391,6 +4428,13 @@ export interface components {
             workspace_id: components["schemas"]["String"];
         };
         /**
+         * @description Change only whether an automation is scheduled to run. This narrow
+         *     mutation avoids replacing a concurrently edited automation definition.
+         */
+        SetAutomationEnabledRequest: {
+            enabled: boolean;
+        };
+        /**
          * @description Replace the persisted automated code-review execution settings
          *     (`PUT /v1/config/code-review`).
          */
@@ -4560,7 +4604,7 @@ export interface components {
              *     clients render controls from the model's `options_schema`.
              */
             model_options?: {
-                [key: string]: unknown;
+                [key: string]: components["schemas"]["ModelOptionValue"];
             };
             parent_thread_id?: null | components["schemas"]["String"];
             permission_mode: components["schemas"]["PermissionMode"];
@@ -4660,8 +4704,9 @@ export interface components {
         ThreadViewItem: {
             attachments: components["schemas"]["Attachment"][];
             /**
-             * @description Server-dispatched attach turn for vendor-autonomous agent
-             *     activity; render as background activity, not as user input.
+             * @description Background-activity display row. New snapshots derive this from
+             *     `turn.background_activity`; true on user rows remains possible when
+             *     replaying protocol 7.19–7.26 logs.
              */
             background?: boolean;
             content: string;
@@ -4949,7 +4994,7 @@ export interface components {
             model?: string | null;
             /** @description Replaces the thread's model options when present. */
             model_options?: {
-                [key: string]: unknown;
+                [key: string]: components["schemas"]["ModelOptionValue"];
             } | null;
             permission_mode?: null | components["schemas"]["PermissionMode"];
         };
@@ -4961,6 +5006,10 @@ export interface components {
             enabled: boolean;
             mode?: string | null;
             model?: string | null;
+            /** @description Model-specific values selected from the model's `options_schema`. */
+            model_options?: {
+                [key: string]: components["schemas"]["ModelOptionValue"];
+            };
             name: string;
             /**
              * @description Permission policy for each fresh automation session. Omitted by older
@@ -5317,6 +5366,39 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    set_automation_enabled: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetAutomationEnabledRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Automation"];
+                };
             };
             404: {
                 headers: {

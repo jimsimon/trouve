@@ -158,7 +158,10 @@ Thread scope:
 - `turn.phase_changed` `{turn, phase}` — replaces the transient activity
   label for the running turn (for example, `connecting_tools`); it does not
   add a transcript or tool-rail item
-- `user.message` `{turn, content}`
+- `user.message` `{turn, content}` — user-authored input only; the legacy
+  `background` field is read solely when replaying protocol 7.19–7.26 logs
+- `turn.background_activity` `{turn}` — the server attached a turn to
+  vendor-autonomous activity; no user prompt is implied
 - `subagent.spawned` `{turn, thread_id, session_id, prompt, model, call_id?}` —
   a separately navigable child-agent transcript was attached to the parent
   turn; the optional call id identifies a redundant trouve spawn tool row

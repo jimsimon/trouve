@@ -144,8 +144,9 @@ pub enum ChatItem {
         /// Files uploaded with the prompt (metadata only; bytes are served
         /// at `GET /v1/attachments/{id}`).
         attachments: Vec<trouve_protocol::Attachment>,
-        /// Server-dispatched attach turn for vendor-autonomous agent
-        /// activity; render as background activity, not user input.
+        /// Background-activity display row. New events use
+        /// `turn.background_activity`; true on user rows remains possible when
+        /// replaying protocol 7.19–7.26 logs and folded snapshots.
         background: bool,
     },
     /// Additional user guidance appended to an already-running turn.
@@ -757,6 +758,15 @@ impl ThreadViewModel {
                 });
                 Some(self.items.len() - 1)
             }
+            Event::TurnBackgroundActivity { turn } => {
+                self.items.push(ChatItem::User {
+                    turn: *turn,
+                    content: String::new(),
+                    attachments: Vec::new(),
+                    background: true,
+                });
+                Some(self.items.len() - 1)
+            }
             Event::TurnSteered {
                 turn,
                 content,
@@ -1345,10 +1355,20 @@ mod tests {
     }
 
     #[test]
-    fn background_user_messages_stay_marked_in_the_view_model() {
+    fn background_activity_has_a_distinct_event_and_legacy_messages_still_replay() {
         let mut vm = ThreadViewModel::new();
+        vm.apply(&env(Event::TurnBackgroundActivity { turn: 3 }));
+        assert!(matches!(
+            vm.items.last(),
+            Some(ChatItem::User {
+                turn: 3,
+                content,
+                background: true,
+                ..
+            }) if content.is_empty()
+        ));
         vm.apply(&env(Event::UserMessage {
-            turn: 3,
+            turn: 4,
             content: "[background agent activity]".into(),
             attachments: Vec::new(),
             background: true,
@@ -1356,7 +1376,7 @@ mod tests {
         assert!(matches!(
             vm.items.last(),
             Some(ChatItem::User {
-                turn: 3,
+                turn: 4,
                 background: true,
                 ..
             })

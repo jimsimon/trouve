@@ -205,4 +205,5 @@ describe("thread screen asynchronous lifecycle guards", () => {
     expect(agentActivitySource).toContain('aria-atomic="true"');
     expect(agentActivitySource).toContain('aria-hidden="true"');
   });
+
 });
