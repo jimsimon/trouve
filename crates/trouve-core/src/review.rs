@@ -8531,7 +8531,9 @@ impl Engine {
                         .with_context(|| format!("reading GitHub API {status} response"));
                 }
             };
-            if status.as_u16() == 422 && github_review_should_fallback_to_comment(event, &body) {
+            if status.as_u16() == 422
+                && github_review_should_fallback_to_comment(event, include_comments, &body)
+            {
                 event = "COMMENT";
                 continue;
             }
@@ -11761,8 +11763,19 @@ fn github_rejected_own_pull_verdict(response_body: &str) -> bool {
         && (body.contains("approve") || body.contains("request changes"))
 }
 
-fn github_review_should_fallback_to_comment(event: &str, response_body: &str) -> bool {
-    event != "COMMENT" && github_rejected_own_pull_verdict(response_body)
+fn github_review_should_fallback_to_comment(
+    event: &str,
+    include_comments: bool,
+    response_body: &str,
+) -> bool {
+    event != "COMMENT"
+        && (github_rejected_own_pull_verdict(response_body)
+            // GitHub sometimes omits the validation details that identify a
+            // forbidden REQUEST_CHANGES verdict. Once inline comments have
+            // already been removed (or there were none), retrying as COMMENT
+            // is the only remaining non-lossy publication fallback. Other
+            // validation failures still fail on the COMMENT attempt.
+            || (!include_comments && generic_review_validation_failure(response_body)))
 }
 
 fn compact_elapsed(milliseconds: u64) -> String {
@@ -18031,19 +18044,33 @@ mod tests {
     fn own_pull_verdict_rejections_are_detected_without_hiding_other_errors() {
         assert!(github_review_should_fallback_to_comment(
             "APPROVE",
+            true,
             r#"{"message":"Can not approve your own pull request"}"#
         ));
         assert!(github_review_should_fallback_to_comment(
             "REQUEST_CHANGES",
+            false,
             r#"{"message":"Can not request changes on your own pull request"}"#
         ));
         assert!(!github_review_should_fallback_to_comment(
             "APPROVE",
+            false,
             r#"{"message":"commit_id is not part of the pull request"}"#
         ));
         assert!(!github_review_should_fallback_to_comment(
             "COMMENT",
+            false,
             r#"{"message":"Can not approve your own pull request"}"#
+        ));
+        assert!(github_review_should_fallback_to_comment(
+            "REQUEST_CHANGES",
+            false,
+            r#"{"message":"Unprocessable Entity"}"#
+        ));
+        assert!(!github_review_should_fallback_to_comment(
+            "REQUEST_CHANGES",
+            true,
+            r#"{"message":"Unprocessable Entity"}"#
         ));
     }
 
@@ -23532,7 +23559,7 @@ rename to src/new.rs
     }
 
     #[tokio::test]
-    async fn review_without_inline_comments_still_publishes_a_verdict() {
+    async fn opaque_422_without_inline_comments_falls_back_to_comment() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
         let store = crate::store::Store::open_in_memory().unwrap();
@@ -23566,7 +23593,7 @@ rename to src/new.rs
                 (
                     r#""event":"request_changes""#,
                     "422 Unprocessable Entity",
-                    r#"{"message":"Can not request changes on your own pull request"}"#,
+                    r#"{"message":"Unprocessable Entity"}"#,
                 ),
                 (
                     r#""event":"comment""#,
