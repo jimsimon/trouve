@@ -1897,6 +1897,15 @@ fn reject_steer_commands(
     }
 }
 
+/// Stop every current or previously cloned sender before the terminal drain.
+/// Closing the receiver is what makes a send that raced registry removal fail
+/// promptly instead of enqueueing work that no loop will poll.
+fn close_steer_receiver<T>(receiver: &mut Option<tokio::sync::mpsc::Receiver<T>>) {
+    if let Some(receiver) = receiver {
+        receiver.close();
+    }
+}
+
 impl Drop for ActiveTurnSteererGuard<'_> {
     fn drop(&mut self) {
         let mut registry = self.registry.lock().unwrap();
@@ -11950,21 +11959,24 @@ impl Engine {
             }
         }
 
-        if cancel.is_cancelled() {
-            let mut no_pending = None;
-            let mut deferred = Vec::new();
-            reject_steer_commands(
-                &mut turn_steer_rx,
-                &mut no_pending,
-                &mut deferred,
-                "turn cancelled",
-            );
-        }
-
         // The bounded final-report pass is not an agent loop and cannot apply
-        // further guidance. Close the capability before entering it so a late
-        // request fails instead of waiting behind a response-only call.
+        // further guidance. Close the receiver before removing its registry
+        // entry: a request that already cloned the sender must fail or join
+        // this final drain instead of waiting behind a response-only call.
+        close_steer_receiver(&mut turn_steer_rx);
         drop(turn_steerer_guard);
+        let mut no_pending = None;
+        let mut deferred = Vec::new();
+        reject_steer_commands(
+            &mut turn_steer_rx,
+            &mut no_pending,
+            &mut deferred,
+            if cancel.is_cancelled() {
+                "turn cancelled"
+            } else {
+                "turn no longer accepts steering"
+            },
+        );
 
         // Truncated mid-work at the iteration budget: make one final
         // tool-free provider pass over the last tool results so the user gets
@@ -18408,6 +18420,26 @@ fn expand_provider_template(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn closing_steer_receiver_rejects_a_previously_cloned_sender() {
+        let (sender, receiver) = tokio::sync::mpsc::channel(2);
+        let raced_sender = sender.clone();
+        sender.send("already queued").await.unwrap();
+        let mut receiver = Some(receiver);
+
+        close_steer_receiver(&mut receiver);
+
+        assert!(
+            raced_sender.send("too late").await.is_err(),
+            "a sender cloned before the terminal transition must fail closed"
+        );
+        assert_eq!(
+            receiver.as_mut().unwrap().try_recv().unwrap(),
+            "already queued"
+        );
+        assert!(receiver.as_mut().unwrap().try_recv().is_err());
+    }
 
     #[tokio::test]
     async fn planned_turn_setup_lane_bounds_only_setup_admission() {

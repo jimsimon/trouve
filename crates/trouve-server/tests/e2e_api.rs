@@ -1252,6 +1252,8 @@ async fn full_turn_with_approval_checkpoint_and_undo() {
 
 struct IterationLimitProvider {
     calls: AtomicUsize,
+    final_stream_started: tokio::sync::Semaphore,
+    finish_final_stream: tokio::sync::Notify,
 }
 
 #[async_trait::async_trait]
@@ -1269,6 +1271,8 @@ impl Provider for IterationLimitProvider {
     ) -> Result<EventStream, ProviderError> {
         let call = self.calls.fetch_add(1, Ordering::SeqCst);
         let events = if tools.is_empty() {
+            self.final_stream_started.add_permits(1);
+            self.finish_final_stream.notified().await;
             vec![
                 Ok(ProviderEvent::TextDelta(
                     "I stopped at the step limit; continue to finish.".into(),
@@ -1302,6 +1306,8 @@ async fn iteration_limit_gets_a_final_tool_free_model_response() {
 
     let provider = Arc::new(IterationLimitProvider {
         calls: AtomicUsize::new(0),
+        final_stream_started: tokio::sync::Semaphore::new(0),
+        finish_final_stream: tokio::sync::Notify::new(),
     });
     let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
     let engine = Arc::new(
@@ -1351,6 +1357,27 @@ async fn iteration_limit_gets_a_final_tool_free_model_response() {
         .send()
         .await
         .unwrap();
+
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        provider.final_stream_started.acquire(),
+    )
+    .await
+    .expect("iteration-limit final report never started")
+    .unwrap()
+    .forget();
+    let rejected = tokio::time::timeout(
+        Duration::from_secs(2),
+        client
+            .post(format!("{base}/threads/{thread_id}/steer"))
+            .json(&serde_json::json!({"content": "race the final report"}))
+            .send(),
+    )
+    .await
+    .expect("steering raced into the unpolled final-report receiver")
+    .unwrap();
+    assert_eq!(rejected.status(), reqwest::StatusCode::CONFLICT);
+    provider.finish_final_stream.notify_one();
 
     let events = wait_for_event(
         &client,

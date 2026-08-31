@@ -37,8 +37,8 @@ use trouve_protocol::{ModelInfo, Usage};
 use crate::process_env::{ProcessTreeChild, spawn_process_tree};
 use crate::{
     AgentBackend, BackendError, BackendEvent, BackendEventStream, BackendLogin, BackendPermission,
-    BackendStatus, BackendSteer, BackendTurn, async_stream, binary_on_path, format_reset,
-    spawn_claude_login,
+    BackendStatus, BackendSteer, BackendTurn, TurnAttachment, async_stream, binary_on_path,
+    format_reset, spawn_claude_login,
 };
 
 /// Most live processes kept at once; the least recently used is evicted.
@@ -51,6 +51,44 @@ const REAP_INTERVAL: Duration = Duration::from_secs(60);
 /// engine normally polls that stream immediately, but a continuously-ready
 /// steering producer must not grow process memory without bound.
 const PENDING_STEER_CAP: usize = 8;
+
+fn claude_steer_message(prompt: String, attachments: Vec<TurnAttachment>) -> Value {
+    let mut content = Vec::with_capacity(1 + attachments.len());
+    if !prompt.is_empty() {
+        content.push(json!({ "type": "text", "text": prompt }));
+    }
+    for attachment in attachments {
+        content.push(json!({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": attachment.mime,
+                "data": attachment.base64(),
+            }
+        }));
+    }
+    json!({
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": content,
+        }
+    })
+}
+
+fn enqueue_pending_claude_steer(
+    pending: &mut Vec<Value>,
+    session: &str,
+    build_message: impl FnOnce() -> Value,
+) -> Result<(), BackendError> {
+    if pending.len() >= PENDING_STEER_CAP {
+        return Err(BackendError::Protocol(format!(
+            "claude steer: session {session} pending steering queue is full"
+        )));
+    }
+    pending.push(build_message());
+    Ok(())
+}
 
 pub struct ClaudeBackend {
     id: String,
@@ -873,28 +911,6 @@ impl AgentBackend for ClaudeBackend {
                 steer.session
             ))
         })?;
-        let mut content = Vec::with_capacity(1 + steer.attachments.len());
-        if !steer.prompt.is_empty() {
-            content.push(json!({ "type": "text", "text": steer.prompt }));
-        }
-        for attachment in steer.attachments {
-            let data = attachment.base64();
-            content.push(json!({
-                "type": "image",
-                "source": {
-                    "type": "base64",
-                    "media_type": attachment.mime,
-                    "data": data,
-                }
-            }));
-        }
-        let message = json!({
-            "type": "user",
-            "message": {
-                "role": "user",
-                "content": content,
-            }
-        });
         let mut input = tokio::select! {
             biased;
             _ = steer.cancel.cancelled() => return Err(BackendError::Cancelled),
@@ -907,15 +923,16 @@ impl AgentBackend for ClaudeBackend {
             )));
         }
         if !input.prompt_sent {
-            if input.pending_steers.len() >= PENDING_STEER_CAP {
-                return Err(BackendError::Protocol(format!(
-                    "claude steer: session {} pending steering queue is full",
-                    steer.session
-                )));
-            }
-            input.pending_steers.push(message);
+            enqueue_pending_claude_steer(&mut input.pending_steers, &steer.session, || {
+                claude_steer_message(steer.prompt, steer.attachments)
+            })?;
             return Ok(());
         }
+        // The active-turn path has no bounded pending queue. Encode only
+        // after validating process admission, but before reserving the
+        // non-cancellable wire write so terminal receipt can still win while
+        // a large attachment is being encoded.
+        let message = claude_steer_message(steer.prompt, steer.attachments);
         let _turn_boundary = tokio::select! {
             biased;
             _ = steer.cancel.cancelled() => return Err(BackendError::Cancelled),
@@ -936,7 +953,7 @@ impl AgentBackend for ClaudeBackend {
                 steer.session
             )));
         }
-        // Build and write one complete record after the atomic reservation.
+        // Serialize and write one complete record after the atomic reservation.
         // Once this write starts, finish it even if request cancellation or a
         // terminal stdout record arrives; a partial JSON line would corrupt
         // the persistent stream-json transport for every later turn.
@@ -1941,6 +1958,20 @@ mod tests {
     const BG_RESULT: &str = r#"{"type":"result","subtype":"success"}"#;
     const USER_LINE: &str =
         r#"{"type":"assistant","message":{"content":[{"type":"text","text":"user"}]}}"#;
+
+    #[test]
+    fn full_pending_steer_queue_rejects_before_building_attachment_message() {
+        let mut pending = vec![Value::Null; PENDING_STEER_CAP];
+        let built = std::cell::Cell::new(false);
+        let error = enqueue_pending_claude_steer(&mut pending, "session", || {
+            built.set(true);
+            Value::Null
+        })
+        .unwrap_err();
+
+        assert!(!built.get(), "queue rejection must precede base64 encoding");
+        assert!(error.to_string().contains("pending steering queue is full"));
+    }
 
     #[tokio::test]
     async fn router_buffers_background_turns_and_signals_once_per_turn() {
