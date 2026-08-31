@@ -4587,12 +4587,13 @@ impl Engine {
             self.record_review_rate(rate);
             let count = comments.len();
             let mut reached_seen_comment = false;
+            let mut reached_inspected_comment = false;
             for comment in comments {
                 let manual_request = polled_manual_review_comment(&comment)
                     .filter(|(pull_number, _)| open_pulls.contains(pull_number));
                 let threadless_command = polled_threadless_resolve_command(repository, &comment)
                     .filter(|command| open_pulls.contains(&command.pull_number));
-                let inserted = self.store.claim_code_review_polled_comment(
+                let claim = self.store.claim_code_review_polled_comment(
                     repository,
                     comment.id,
                     manual_request
@@ -4600,9 +4601,12 @@ impl Engine {
                         .map(|(pull_number, trigger_key)| (*pull_number, trigger_key.as_str())),
                     threadless_command.as_ref(),
                 )?;
-                reached_seen_comment |= !inserted;
+                reached_seen_comment |= !claim.comment_inserted;
+                reached_inspected_comment |= !claim.threadless_newly_inspected;
             }
-            if count < REVIEW_COMMENT_PAGE_SIZE || reached_seen_comment {
+            if count < REVIEW_COMMENT_PAGE_SIZE
+                || (reached_seen_comment && reached_inspected_comment)
+            {
                 break;
             }
         }
@@ -25027,7 +25031,7 @@ rename to src/new.rs
     }
 
     #[tokio::test]
-    async fn comment_polling_recovers_review_and_threadless_commands_atomically() {
+    async fn comment_polling_recovers_commands_beyond_generic_seen_pages() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
         let comment = |id, pull_number, body: &str, association: &str, kind: &str| {
@@ -25042,37 +25046,32 @@ rename to src/new.rs
             })
         };
         let mut first_page = vec![
-            comment(
-                301,
-                42,
-                "@trouve-ai resolve rvf_6b6c4686 accepted limitation",
-                "OWNER",
-                "User",
-            ),
             comment(300, 42, "@trouve-ai review", "OWNER", "User"),
             comment(299, 99, "@trouve-ai review", "MEMBER", "User"),
             comment(298, 42, "@trouve-ai review", "CONTRIBUTOR", "User"),
             comment(297, 42, "@trouve-ai review", "OWNER", "Bot"),
         ];
         first_page.extend(
-            (0..95).map(|index| comment(400 + index, 42, "ordinary discussion", "OWNER", "User")),
+            (0..96).map(|index| comment(400 + index, 42, "ordinary discussion", "OWNER", "User")),
         );
+        let second_page = vec![comment(
+            200,
+            42,
+            "@trouve-ai resolve rvf_6b6c4686 accepted limitation",
+            "OWNER",
+            "User",
+        )];
         assert_eq!(first_page.len(), REVIEW_COMMENT_PAGE_SIZE);
 
         let store = crate::store::Store::open_in_memory().unwrap();
-        assert!(
-            store
-                .claim_code_review_polled_comment("acme/widgets", 200, None, None)
-                .unwrap()
-        );
-        // Simulate the deployed bug: an older poll marked the resolve
-        // comment seen without extracting its command. The new extraction
-        // latch must recover it once.
-        assert!(
-            store
-                .claim_code_review_polled_comment("acme/widgets", 301, None, None)
-                .unwrap()
-        );
+        // Model the deployed bug on both pages: the old poller marked these
+        // comments generically seen without inspecting either for a command.
+        store
+            .claim_legacy_code_review_polled_comment("acme/widgets", 495)
+            .unwrap();
+        store
+            .claim_legacy_code_review_polled_comment("acme/widgets", 200)
+            .unwrap();
         let data = tempfile::tempdir().unwrap();
         let engine = Engine::new(
             store,
@@ -25083,7 +25082,10 @@ rename to src/new.rs
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            for (page, body) in [(1, serde_json::to_string(&first_page).unwrap())] {
+            for (page, body) in [
+                (1, serde_json::to_string(&first_page).unwrap()),
+                (2, serde_json::to_string(&second_page).unwrap()),
+            ] {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut request = Vec::new();
                 let mut buffer = [0_u8; 1024];
@@ -25132,39 +25134,35 @@ rename to src/new.rs
             .pending_threadless_commands("acme/widgets", THREADLESS_COMMAND_PASS_LIMIT)
             .unwrap();
         assert_eq!(pending_commands.len(), 1);
-        assert_eq!(pending_commands[0].comment_id, 301);
+        assert_eq!(pending_commands[0].comment_id, 200);
         assert_eq!(pending_commands[0].author, "jim");
         assert_eq!(pending_commands[0].finding_prefix, "rvf_6b6c4686");
         assert_eq!(pending_commands[0].reason, "accepted limitation");
-        for (comment_id, pull_number) in [
-            (299, 99),
-            (298, 42),
-            (297, 42),
-            (200, 42),
-            (300, 42),
-            (301, 42),
-        ] {
-            assert!(
-                !engine
-                    .store
-                    .claim_code_review_polled_comment(
-                        "acme/widgets",
-                        comment_id,
-                        Some((pull_number, "manual:comment:duplicate")),
-                        None,
-                    )
-                    .unwrap()
-            );
-        }
+
+        let duplicate = crate::store::PendingThreadlessCommand {
+            trigger_key: "command:comment:200".into(),
+            repository: "acme/widgets".into(),
+            pull_number: 42,
+            comment_id: 200,
+            author: "jim".into(),
+            resolve: true,
+            finding_prefix: "rvf_6b6c4686".into(),
+            reason: "accepted limitation".into(),
+            created_at: String::new(),
+        };
+        let duplicate_claim = engine
+            .store
+            .claim_code_review_polled_comment("acme/widgets", 200, None, Some(&duplicate))
+            .unwrap();
+        assert!(!duplicate_claim.comment_inserted);
+        assert!(!duplicate_claim.threadless_newly_inspected);
         assert_eq!(
             engine
                 .store
-                .pending_code_review_manual_requests("acme/widgets")
-                .unwrap(),
-            vec![CodeReviewManualRequest {
-                pull_number: 42,
-                trigger_key: "manual:comment:300".into(),
-            }]
+                .pending_threadless_commands("acme/widgets", THREADLESS_COMMAND_PASS_LIMIT)
+                .unwrap()
+                .len(),
+            1
         );
     }
 
