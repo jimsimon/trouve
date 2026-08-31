@@ -262,6 +262,7 @@ export class ThreadViewModel {
   #completedUsage: Usage | undefined;
   #activeTurnUsage: { readonly turn: number; readonly usage: Usage } | undefined;
   #activeThinkingId: string | undefined;
+  #latestThinkingTurn: number | undefined;
 
   cursor = 0;
   /** Absolute folded-item position of `items[0]`. */
@@ -361,6 +362,15 @@ export class ThreadViewModel {
     }
     this.thinking = snapshot.thinking ?? false;
     this.#activeThinkingId = snapshot.active_thinking_id ?? undefined;
+    this.#latestThinkingTurn = undefined;
+    for (const item of this.items) {
+      if (
+        item.kind === "thinking"
+        && (this.#latestThinkingTurn === undefined || item.turn > this.#latestThinkingTurn)
+      ) {
+        this.#latestThinkingTurn = item.turn;
+      }
+    }
     this.commands = [...(snapshot.commands ?? [])];
     this.replaceQueue(snapshot.queue ?? []);
     // Protocol 3.1 snapshots predate the todo projection. Preserve any live
@@ -751,10 +761,11 @@ export class ThreadViewModel {
         return this.finishProgress();
       case "assistant.thinking": {
         const activeTurn = this.activeThinkingTurn();
-        if (this.thinking && activeTurn !== undefined && envelope.turn < activeTurn) {
+        if (this.#latestThinkingTurn !== undefined && envelope.turn < this.#latestThinkingTurn) {
           this.appendStaleThinking(envelope.turn, envelope.text);
           return true;
         }
+        this.#latestThinkingTurn = Math.max(this.#latestThinkingTurn ?? envelope.turn, envelope.turn);
         this.failOpenCompaction(envelope.turn);
         this.finishProgress();
         const id = envelope.id ?? undefined;

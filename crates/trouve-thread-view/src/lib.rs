@@ -63,6 +63,10 @@ pub struct ThreadProjection {
     /// when importing historical streams with the opposite ordering.
     #[serde(default, alias = "capacity_acquired_before_start")]
     admitted_before_start: HashSet<u64>,
+    /// Highest turn for which thinking has been observed. Unlike the open-item
+    /// indexes, this survives completion and materialization.
+    #[serde(default)]
+    latest_thinking_turn: Option<u64>,
     #[serde(skip)]
     indexes: ProjectionIndexes,
 }
@@ -265,9 +269,16 @@ impl ThreadProjection {
             }
             Event::AssistantThinking { turn, id, text } => {
                 let active_turn = self.active_thinking_turn();
-                if self.snapshot.thinking && active_turn.is_some_and(|active| *turn < active) {
+                if self
+                    .latest_thinking_turn
+                    .is_some_and(|latest| *turn < latest)
+                {
                     self.append_stale_thinking(*turn, text);
                 } else {
+                    self.latest_thinking_turn = Some(
+                        self.latest_thinking_turn
+                            .map_or(*turn, |latest| latest.max(*turn)),
+                    );
                     self.fail_open_compaction(*turn);
                     self.finish_progress(*turn);
                     if self.snapshot.thinking
@@ -764,6 +775,10 @@ impl ThreadProjection {
                     }
                 }
                 ThreadViewItem::Thinking { turn, complete, .. } => {
+                    self.latest_thinking_turn = Some(
+                        self.latest_thinking_turn
+                            .map_or(*turn, |latest| latest.max(*turn)),
+                    );
                     if !complete {
                         self.indexes.open_thinking.insert(*turn, idx);
                         self.indexes.latest_thinking = Some(idx);
@@ -2056,6 +2071,24 @@ mod tests {
         assert!(matches!(
             projection.snapshot.items.first(),
             Some(ThreadViewItem::Thinking { complete: true, .. })
+        ));
+
+        projection.apply(&envelope(
+            4,
+            75,
+            Event::AssistantThinking {
+                turn: 1,
+                id: Some("reasoning".into()),
+                text: " Later.".into(),
+            },
+        ));
+        assert!(!projection.snapshot.thinking);
+        assert!(matches!(
+            projection.snapshot.items.as_slice(),
+            [
+                ThreadViewItem::Thinking { turn: 2, content: current, complete: true },
+                ThreadViewItem::Thinking { turn: 1, content: late, complete: true },
+            ] if current == "Current." && late == "Late. Later."
         ));
     }
 

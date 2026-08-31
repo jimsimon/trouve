@@ -924,6 +924,39 @@ describe("ThreadViewModel", () => {
     ]);
   });
 
+  it("keeps a delayed older-turn thought inactive after newer thinking completes", () => {
+    const vm = new ThreadViewModel();
+    vm.apply(envelope(1, {
+      type: "assistant.thinking",
+      turn: 2,
+      id: "reasoning",
+      text: "Current.",
+    }));
+    vm.apply(envelope(2, {
+      type: "assistant.thinking",
+      turn: 1,
+      id: "reasoning",
+      text: "Late.",
+    }));
+    vm.apply(envelope(3, {
+      type: "assistant.thinking_completed",
+      turn: 2,
+      id: "reasoning",
+    }));
+
+    expect(vm.apply(envelope(4, {
+      type: "assistant.thinking",
+      turn: 1,
+      id: "reasoning",
+      text: " Later.",
+    }))).toBe(true);
+    expect(vm.thinking).toBe(false);
+    expect(vm.items).toMatchObject([
+      { kind: "thinking", turn: 2, content: "Current.", complete: true },
+      { kind: "thinking", turn: 1, content: "Late. Later.", complete: true },
+    ]);
+  });
+
   it("keeps an interleaved tool request beneath the growing thought", () => {
     const vm = new ThreadViewModel();
     vm.apply(envelope(1, {

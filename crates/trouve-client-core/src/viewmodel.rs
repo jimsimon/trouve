@@ -289,6 +289,9 @@ pub struct ThreadViewModel {
     /// Provider-owned identity for the active thinking item. Legacy replay
     /// leaves this absent so tool requests retain their historical boundary.
     active_thinking_id: Option<String>,
+    /// Highest turn for which thinking has been observed. This keeps delayed
+    /// older deltas historical even after the newer lifecycle has closed.
+    latest_thinking_turn: Option<u64>,
     /// Current transient startup activity for the running turn.
     pub turn_phase: Option<TurnPhase>,
     /// The model that ran each turn ("cursor/claude-fable-5"), from
@@ -319,8 +322,20 @@ impl From<ThreadViewSnapshot> for ThreadViewModel {
         let running_usage = snapshot.active_usage;
         let completed_usage = snapshot.last_usage;
         let last_usage = running_usage.clone().or_else(|| completed_usage.clone());
+        let items = snapshot
+            .items
+            .into_iter()
+            .map(ChatItem::from)
+            .collect::<Vec<_>>();
+        let latest_thinking_turn = items
+            .iter()
+            .filter_map(|item| match item {
+                ChatItem::Thinking { turn, .. } => Some(*turn),
+                _ => None,
+            })
+            .max();
         Self {
-            items: snapshot.items.into_iter().map(ChatItem::from).collect(),
+            items,
             cursor: 0,
             tool_outputs: HashMap::new(),
             tool_started_at: HashMap::new(),
@@ -334,6 +349,7 @@ impl From<ThreadViewSnapshot> for ThreadViewModel {
             turn_running: snapshot.turn_running,
             thinking: snapshot.thinking,
             active_thinking_id: snapshot.active_thinking_id,
+            latest_thinking_turn,
             turn_phase: snapshot.turn_phase,
             turn_models: snapshot.turn_models.into_iter().collect(),
             turn_thinking_levels: snapshot.turn_thinking_levels.into_iter().collect(),
@@ -860,9 +876,16 @@ impl ThreadViewModel {
             Event::AssistantProgressCompleted { .. } => self.finish_progress(),
             Event::AssistantThinking { turn, id, text } => {
                 let active_turn = self.active_thinking_turn();
-                if self.thinking && active_turn.is_some_and(|active| *turn < active) {
+                if self
+                    .latest_thinking_turn
+                    .is_some_and(|latest| *turn < latest)
+                {
                     return Some(self.append_stale_thinking(*turn, text));
                 }
+                self.latest_thinking_turn = Some(
+                    self.latest_thinking_turn
+                        .map_or(*turn, |latest| latest.max(*turn)),
+                );
                 self.fail_open_compaction(*turn);
                 self.finish_progress();
                 if self.thinking
@@ -2275,6 +2298,21 @@ mod tests {
         }));
         assert_eq!(changed, Some(0));
         assert!(!vm.thinking);
+
+        let changed = vm.apply(&env(Event::AssistantThinking {
+            turn: 1,
+            id: Some("reasoning".into()),
+            text: " Later.".into(),
+        }));
+        assert_eq!(changed, Some(1));
+        assert!(!vm.thinking);
+        assert!(matches!(
+            vm.items.as_slice(),
+            [
+                ChatItem::Thinking { turn: 2, content: current, complete: true },
+                ChatItem::Thinking { turn: 1, content: late, complete: true },
+            ] if current == "Current." && late == "Late. Later."
+        ));
     }
 
     #[test]
