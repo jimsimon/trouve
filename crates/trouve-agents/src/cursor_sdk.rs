@@ -2024,7 +2024,11 @@ impl CallbackRouteLease {
         } else {
             // Relinquish removal ownership while leaving the stopped route in
             // the process router. Process quarantine can then retry joining
-            // its supervisor before admitting a replacement Bridge.
+            // its supervisor before admitting a replacement Bridge. Mark the
+            // owner fail-closed before any later cleanup await can be dropped.
+            if let Some(reusable) = self.owner_reusable.as_ref().and_then(Weak::upgrade) {
+                reusable.store(false, Ordering::Release);
+            }
             self.active = false;
         }
         settled
@@ -3581,6 +3585,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn missing_legacy_state_recovers_with_a_shared_store_replacement() {
+        let temporary = tempfile::tempdir().unwrap();
+        let selection = select_backend_session(
+            temporary.path(),
+            "cursor-provider",
+            "thread-with-removed-legacy-state",
+            Some("legacy-agent"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(selection.resume.as_deref(), Some("legacy-agent"));
+        assert!(selection.legacy_marker.is_none());
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let resume_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let create_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server = tokio::spawn({
+            let resume_calls = resume_calls.clone();
+            let create_calls = create_calls.clone();
+            async move {
+                axum::serve(
+                    listener,
+                    Router::new()
+                        .route(
+                            "/sdk.v1.SdkAgentService/ResumeAgent",
+                            post(move || {
+                                resume_calls.fetch_add(1, Ordering::Relaxed);
+                                async {
+                                    (
+                                        StatusCode::NOT_FOUND,
+                                        axum::Json(json!({
+                                            "code": "not_found",
+                                            "message": "agent is absent from the shared store",
+                                        })),
+                                    )
+                                }
+                            }),
+                        )
+                        .route(
+                            "/sdk.v1.SdkAgentService/CreateAgent",
+                            post(move || {
+                                create_calls.fetch_add(1, Ordering::Relaxed);
+                                async { axum::Json(json!({ "agentId": "replacement-agent" })) }
+                            }),
+                        ),
+                )
+                .await
+            }
+        });
+        let client = BridgeClient {
+            http: reqwest::Client::new(),
+            base_url: format!("http://{address}"),
+            token: "fixture-token".into(),
+            secrets: Arc::new(StdMutex::new(vec!["fixture-token".into()])),
+            diagnostics: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
+        };
+
+        let (agent_id, fresh) =
+            create_or_resume_agent(&client, selection.resume.as_deref(), &json!({}))
+                .await
+                .unwrap();
+        assert_eq!(agent_id, "replacement-agent");
+        assert!(fresh, "replacement must publish a new persisted session id");
+        assert_eq!(resume_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(create_calls.load(Ordering::Relaxed), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn stderr_reader_bounds_and_drains_unterminated_diagnostics() {
         let secret = "crsr_boundary_secret";
         let mut input = vec![b'x'; MAX_DIAGNOSTIC_LINE_BYTES - secret.len() + 1];
@@ -4536,13 +4612,14 @@ mod tests {
         let callback = CallbackRouter::start(local_http_client().unwrap())
             .await
             .unwrap();
+        let reusable = Arc::new(AtomicBool::new(true));
         let mut route = callback
             .register(
                 "agent-timeout".into(),
                 None,
                 HashSet::new(),
                 CancellationToken::new(),
-                None,
+                Some(Arc::downgrade(&reusable)),
             )
             .await
             .unwrap();
@@ -4566,6 +4643,10 @@ mod tests {
             .stop_until(tokio::time::Instant::now() + Duration::from_millis(10))
             .await;
         assert!(!settled, "a timed-out callback route reported clean reuse");
+        assert!(
+            !reusable.load(Ordering::Acquire),
+            "route timeout did not synchronously quarantine its Bridge"
+        );
         assert!(
             callback
                 .state
