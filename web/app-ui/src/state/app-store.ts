@@ -63,6 +63,11 @@ export interface SessionPullRequestIdentity {
   readonly branch: string;
 }
 
+interface SessionPullRequestMentions {
+  readonly urls: ReadonlySet<string>;
+  readonly numbers: ReadonlySet<number>;
+}
+
 /** Latest durable account-level PR slice for one GitHub host. The event
  * timestamp drives freshness UI; the per-host cursor prevents a delayed
  * replay from replacing newer account data. */
@@ -170,12 +175,16 @@ export const projectSessionPullRequests = (
   session: SessionPullRequestIdentity,
   lists: readonly ProtocolGithubPrList[],
   known: readonly ProtocolPrInfo[] = [],
+  mentions?: SessionPullRequestMentions,
 ): readonly ProtocolPrInfo[] => {
   const projected: ProtocolPrInfo[] = [];
   for (const pr of lists.flatMap((list) => list.prs)) {
     const exactBranch =
       pr.workspace_id === session.workspaceId && pr.head === session.branch;
-    if (exactBranch || known.some((candidate) => samePullRequest(candidate, pr))) {
+    const mentioned = mentions?.urls.has(pr.url.replace(/\/$/u, "").toLowerCase()) === true
+      || (pr.workspace_id === session.workspaceId
+        && mentions?.numbers.has(pr.number) === true);
+    if (exactBranch || mentioned || known.some((candidate) => samePullRequest(candidate, pr))) {
       projected.push(pr);
     }
   }
@@ -184,9 +193,17 @@ export const projectSessionPullRequests = (
       projected.push(pr);
     }
   }
-  projected.sort((left, right) =>
-    Number(right.state === "open") - Number(left.state === "open") ||
-    right.number - left.number);
+  projected.sort((left, right) => {
+    const leftCreated = left.workspace_id === session.workspaceId && left.head === session.branch;
+    const rightCreated = right.workspace_id === session.workspaceId && right.head === session.branch;
+    const leftKnown = known.findIndex((candidate) => samePullRequest(candidate, left));
+    const rightKnown = known.findIndex((candidate) => samePullRequest(candidate, right));
+    const leftPriority = leftCreated ? 0 : leftKnown >= 0 ? leftKnown + 1 : Number.MAX_SAFE_INTEGER;
+    const rightPriority = rightCreated ? 0 : rightKnown >= 0 ? rightKnown + 1 : Number.MAX_SAFE_INTEGER;
+    return leftPriority - rightPriority
+      || Number(right.state === "open") - Number(left.state === "open")
+      || right.number - left.number;
+  });
   return Object.freeze(projected);
 };
 
@@ -208,6 +225,7 @@ export class AppStore {
   readonly #sessionUsageRevisions = new Map<string, number>();
   readonly #githubPullRequests = new Map<string, GithubPullRequestSnapshot>();
   readonly #sessionPullRequests = new Map<string, readonly ProtocolPrInfo[]>();
+  readonly #sessionPullRequestMentions = new Map<string, SessionPullRequestMentions>();
   #serverProjectionCursor = 0;
   readonly #threadViews = new Map<string, ThreadViewModel>();
   readonly #threadTodoEvents = new Map<string, readonly ProtocolTodoItem[]>();
@@ -304,6 +322,7 @@ export class AppStore {
     this.#sessionSummaries.delete(sessionId);
     this.#seenSessionCursors.delete(sessionId);
     this.#sessionPullRequests.delete(sessionId);
+    this.#sessionPullRequestMentions.delete(sessionId);
     this.#sessionUsageRevisions.delete(sessionId);
     for (const [threadId, thread] of this.#threads) {
       if (thread.session_id === sessionId) {
@@ -559,6 +578,7 @@ export class AppStore {
       session,
       [...this.#githubPullRequests.values()].map(({ pullRequests }) => pullRequests),
       this.#sessionPullRequests.get(sessionId) ?? [],
+      this.#sessionPullRequestMentions.get(sessionId),
     );
   }
 
@@ -836,6 +856,17 @@ export class AppStore {
       case "session.deleted":
         this.removeSession(envelope.session_id, envelope.cursor);
         return false;
+      case "session.pr_mentioned": {
+        if (this.#deletedSessions.has(envelope.session_id)) return false;
+        const current = this.#sessionPullRequestMentions.get(envelope.session_id);
+        const urls = new Set(current?.urls ?? []);
+        const numbers = new Set(current?.numbers ?? []);
+        if (envelope.url == null) numbers.add(envelope.number);
+        else urls.add(envelope.url.replace(/\/$/u, "").toLowerCase());
+        this.#sessionPullRequestMentions.set(envelope.session_id, Object.freeze({ urls, numbers }));
+        this.#touch();
+        return false;
+      }
       case "github.pull_requests_updated": {
         const host = envelope.pull_requests.host;
         const current = this.#githubPullRequests.get(host);

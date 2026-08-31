@@ -85,8 +85,12 @@ or appears after its cursor; there is no snapshot/stream race window.
 
 `GET /v1/server-projection` supplies the durable replacement state not carried
 by `SessionSummary`: the newest cached account PR list per configured GitHub
-host, the branch- and `session.pr_opened`-derived PR associations for every
-session, and session-naming settings. Each host slice retains its source event
+host, the branch-, `session.pr_opened`-, and chat-mention-derived PR
+associations for every session, and session-naming settings. Canonical PR URLs
+and explicit repository-local `PR #123` shorthand in durable user-visible chat
+emit `session.pr_mentioned` on the server scope. This keeps mention-only
+navigation distinct from verified session creation and lets clients rank
+session-created PRs first. Each host slice retains its source event
 cursor and timestamp, and the response carries the current server cursor in
 `x-trouve-event-cursor`. Clients fetch it after the session-summary boundary,
 apply it before opening SSE, and still resume at the earlier session-summary

@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "7.27"
+    "version": "7.28"
   },
   "paths": {
     "/v1/approvals": {
@@ -8771,6 +8771,38 @@
           },
           {
             "type": "object",
+            "description": "A pull request browser URL appeared in user-visible session chat.\nThis is intentionally separate from `session.pr_opened`: mentions\nassociate a PR for navigation without claiming that the session\ncreated or owns its branch.",
+            "required": [
+              "session_id",
+              "number",
+              "type"
+            ],
+            "properties": {
+              "number": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "session_id": {
+                "$ref": "#/components/schemas/String"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "session.pr_mentioned"
+                ]
+              },
+              "url": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Canonical browser URL when the chat supplied one. Explicit\nrepository-local shorthand such as `PR #123` omits it."
+              }
+            }
+          },
+          {
+            "type": "object",
             "required": [
               "session_id",
               "workspace_id",
@@ -12325,7 +12357,7 @@
       },
       "SessionPrProjection": {
         "type": "object",
-        "description": "Pull requests already associated with one session using durable branch or\n`session.pr_opened` evidence. This is a local projection of the persisted\naccount snapshots and never performs a GitHub request.",
+        "description": "Pull requests associated with one session by its branch, verified creation,\nor a durable chat mention. This is a local projection of the persisted\naccount snapshots and never performs a GitHub request. Session-created PRs\nprecede mention-only PRs.",
         "required": [
           "session_id",
           "prs"
