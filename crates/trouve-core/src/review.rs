@@ -1141,8 +1141,6 @@ struct GithubIssueComment {
 
 #[derive(Debug, Deserialize)]
 struct GithubIssueCommentUser {
-    #[serde(default)]
-    login: String,
     #[serde(rename = "type")]
     kind: String,
 }
@@ -1441,57 +1439,6 @@ fn polled_manual_review_comment(comment: &GithubIssueComment) -> Option<(u64, St
         pull_number_from_issue_url(&comment.issue_url)?,
         manual_review_trigger_key(comment.id, scope),
     ))
-}
-
-/// Recover a valid threadless resolve command from the issue-comment polling
-/// fallback. Permission is still checked authoritatively before application;
-/// association and user type are only the same cheap admission filter used by
-/// webhook ingestion.
-fn polled_threadless_resolve_command(
-    repository: &str,
-    comment: &GithubIssueComment,
-) -> Option<crate::store::PendingThreadlessCommand> {
-    if comment.id == 0
-        || comment
-            .user
-            .as_ref()
-            .is_some_and(|user| user.kind.eq_ignore_ascii_case("bot"))
-        || !matches!(
-            comment.author_association.as_str(),
-            "OWNER" | "MEMBER" | "COLLABORATOR"
-        )
-    {
-        return None;
-    }
-    let pull_number = pull_number_from_issue_url(&comment.issue_url)?;
-    let (resolve, finding_prefix, reason) =
-        match parse_threadless_resolve_command(comment.body.as_deref()?)? {
-            ThreadlessCommandParse::Resolve {
-                finding_prefix,
-                reason,
-            } => (true, finding_prefix, reason),
-            ThreadlessCommandParse::Unresolve { finding_prefix } => {
-                (false, finding_prefix, String::new())
-            }
-            // Webhook delivery provides immediate guidance for malformed
-            // commands. Polling only recovers commands safe to persist.
-            ThreadlessCommandParse::Invalid(_) => return None,
-        };
-    Some(crate::store::PendingThreadlessCommand {
-        trigger_key: format!("command:comment:{}", comment.id),
-        repository: repository.to_owned(),
-        pull_number,
-        comment_id: comment.id,
-        author: comment
-            .user
-            .as_ref()
-            .map(|user| user.login.clone())
-            .unwrap_or_default(),
-        resolve,
-        finding_prefix,
-        reason,
-        created_at: String::new(),
-    })
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -4092,9 +4039,6 @@ impl Engine {
                 repository.repository
             ));
         }
-        // The comment poll is the fallback when webhook delivery is absent.
-        // Apply any resolve commands it just recovered in this same pass.
-        self.process_pending_threadless_commands(repository).await;
         let mut comment_requests: HashMap<u64, Vec<CodeReviewManualRequest>> = HashMap::new();
         for request in self
             .store
@@ -4590,15 +4534,12 @@ impl Engine {
             for comment in comments {
                 let manual_request = polled_manual_review_comment(&comment)
                     .filter(|(pull_number, _)| open_pulls.contains(pull_number));
-                let threadless_command = polled_threadless_resolve_command(repository, &comment)
-                    .filter(|command| open_pulls.contains(&command.pull_number));
                 let inserted = self.store.claim_code_review_polled_comment(
                     repository,
                     comment.id,
                     manual_request
                         .as_ref()
                         .map(|(pull_number, trigger_key)| (*pull_number, trigger_key.as_str())),
-                    threadless_command.as_ref(),
                 )?;
                 reached_seen_comment |= !inserted;
             }
@@ -25027,7 +24968,7 @@ rename to src/new.rs
     }
 
     #[tokio::test]
-    async fn comment_polling_recovers_review_and_threadless_commands_atomically() {
+    async fn manual_comment_polling_stops_at_seen_comments_and_claims_requests_atomically() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
         let comment = |id, pull_number, body: &str, association: &str, kind: &str| {
@@ -25038,39 +24979,35 @@ rename to src/new.rs
                 "issue_url": format!(
                     "https://api.github.com/repos/acme/widgets/issues/{pull_number}"
                 ),
-                "user": {"login": "jim", "type": kind}
+                "user": {"type": kind}
             })
         };
         let mut first_page = vec![
-            comment(
-                301,
-                42,
-                "@trouve-ai resolve rvf_6b6c4686 accepted limitation",
-                "OWNER",
-                "User",
-            ),
             comment(300, 42, "@trouve-ai review", "OWNER", "User"),
             comment(299, 99, "@trouve-ai review", "MEMBER", "User"),
             comment(298, 42, "@trouve-ai review", "CONTRIBUTOR", "User"),
             comment(297, 42, "@trouve-ai review", "OWNER", "Bot"),
         ];
         first_page.extend(
-            (0..95).map(|index| comment(400 + index, 42, "ordinary discussion", "OWNER", "User")),
+            (0..96).map(|index| comment(400 + index, 42, "ordinary discussion", "OWNER", "User")),
+        );
+        let mut second_page = vec![comment(
+            200,
+            42,
+            "@trouve-ai review",
+            "COLLABORATOR",
+            "User",
+        )];
+        second_page.extend(
+            (0..99).map(|index| comment(100 + index, 42, "older discussion", "OWNER", "User")),
         );
         assert_eq!(first_page.len(), REVIEW_COMMENT_PAGE_SIZE);
+        assert_eq!(second_page.len(), REVIEW_COMMENT_PAGE_SIZE);
 
         let store = crate::store::Store::open_in_memory().unwrap();
         assert!(
             store
-                .claim_code_review_polled_comment("acme/widgets", 200, None, None)
-                .unwrap()
-        );
-        // Simulate the deployed bug: an older poll marked the resolve
-        // comment seen without extracting its command. The new extraction
-        // latch must recover it once.
-        assert!(
-            store
-                .claim_code_review_polled_comment("acme/widgets", 301, None, None)
+                .claim_code_review_polled_comment("acme/widgets", 200, None)
                 .unwrap()
         );
         let data = tempfile::tempdir().unwrap();
@@ -25083,7 +25020,10 @@ rename to src/new.rs
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            for (page, body) in [(1, serde_json::to_string(&first_page).unwrap())] {
+            for (page, body) in [
+                (1, serde_json::to_string(&first_page).unwrap()),
+                (2, serde_json::to_string(&second_page).unwrap()),
+            ] {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut request = Vec::new();
                 let mut buffer = [0_u8; 1024];
@@ -25127,23 +25067,7 @@ rename to src/new.rs
                 trigger_key: "manual:comment:300".into(),
             }]
         );
-        let pending_commands = engine
-            .store
-            .pending_threadless_commands("acme/widgets", THREADLESS_COMMAND_PASS_LIMIT)
-            .unwrap();
-        assert_eq!(pending_commands.len(), 1);
-        assert_eq!(pending_commands[0].comment_id, 301);
-        assert_eq!(pending_commands[0].author, "jim");
-        assert_eq!(pending_commands[0].finding_prefix, "rvf_6b6c4686");
-        assert_eq!(pending_commands[0].reason, "accepted limitation");
-        for (comment_id, pull_number) in [
-            (299, 99),
-            (298, 42),
-            (297, 42),
-            (200, 42),
-            (300, 42),
-            (301, 42),
-        ] {
+        for (comment_id, pull_number) in [(299, 99), (298, 42), (297, 42), (200, 42), (300, 42)] {
             assert!(
                 !engine
                     .store
@@ -25151,7 +25075,6 @@ rename to src/new.rs
                         "acme/widgets",
                         comment_id,
                         Some((pull_number, "manual:comment:duplicate")),
-                        None,
                     )
                     .unwrap()
             );

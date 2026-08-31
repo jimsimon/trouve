@@ -984,11 +984,6 @@ const MIGRATIONS: &[&str] = &[
        line INTEGER NOT NULL,
        PRIMARY KEY (finding_id, head_sha)
      )",
-    // Polling is the webhook fallback for threadless resolve commands. Track
-    // command extraction separately from generic comment discovery so
-    // comments seen by older builds are recovered exactly once after upgrade.
-    "ALTER TABLE code_review_polled_comments
-       ADD COLUMN threadless_command_claimed INTEGER NOT NULL DEFAULT 0",
 ];
 
 /// Blocking-tier predicate for one findings row under the given SQL alias:
@@ -16163,20 +16158,6 @@ impl Store {
                         chrono::Utc::now().to_rfc3339()
                     ],
                 )?;
-                // Keep the comment poller from rediscovering a command that
-                // arrived successfully through the webhook path.
-                tx.execute(
-                    "INSERT INTO code_review_polled_comments
-                            (repository, comment_id, seen_at, threadless_command_claimed)
-                     VALUES (?1, ?2, ?3, 1)
-                     ON CONFLICT(repository, comment_id) DO UPDATE SET
-                       threadless_command_claimed = 1",
-                    params![
-                        command.repository,
-                        command.comment_id as i64,
-                        chrono::Utc::now().to_rfc3339()
-                    ],
-                )?;
             }
         }
         tx.commit()?;
@@ -16388,17 +16369,15 @@ impl Store {
         )?)
     }
 
-    /// Claim a comment discovered by reconciliation and atomically persist
-    /// any command it carries. Generic discovery and threadless-command
-    /// extraction have separate latches: that lets an upgraded build recover
-    /// a resolve command from a comment an older build already marked seen,
-    /// without requeuing the command on every later poll.
+    /// Claim a comment discovered by reconciliation and, when it is a manual
+    /// review command, record the request in the same transaction. Keeping
+    /// seen comments after their request is consumed prevents an old command
+    /// from retriggering whenever the pull request head changes.
     pub fn claim_code_review_polled_comment(
         &self,
         repository: &str,
         comment_id: u64,
         manual_request: Option<(u64, &str)>,
-        threadless_command: Option<&PendingThreadlessCommand>,
     ) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         let tx = write_transaction(&conn)?;
@@ -16426,40 +16405,6 @@ impl Store {
                     chrono::Utc::now().to_rfc3339()
                 ],
             )?;
-        }
-        if let Some(command) = threadless_command {
-            let command_claimed = tx.query_row(
-                "SELECT threadless_command_claimed
-                 FROM code_review_polled_comments
-                 WHERE repository = ?1 AND comment_id = ?2",
-                params![repository, comment_id as i64],
-                |row| row.get::<_, bool>(0),
-            )?;
-            if !command_claimed {
-                tx.execute(
-                    "INSERT OR IGNORE INTO code_review_pending_threadless_commands
-                            (trigger_key, repository, pull_number, comment_id, author, resolve,
-                             finding_prefix, reason, created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                    params![
-                        command.trigger_key,
-                        command.repository,
-                        command.pull_number as i64,
-                        command.comment_id as i64,
-                        command.author,
-                        command.resolve,
-                        command.finding_prefix,
-                        command.reason,
-                        chrono::Utc::now().to_rfc3339()
-                    ],
-                )?;
-                tx.execute(
-                    "UPDATE code_review_polled_comments
-                     SET threadless_command_claimed = 1
-                     WHERE repository = ?1 AND comment_id = ?2",
-                    params![repository, comment_id as i64],
-                )?;
-            }
         }
         tx.commit()?;
         Ok(inserted > 0)
@@ -21886,7 +21831,6 @@ mod tests {
                     "acme/widgets",
                     200,
                     Some((43, "manual:comment:200")),
-                    None,
                 )
                 .unwrap()
         );
@@ -21901,7 +21845,6 @@ mod tests {
                     "acme/widgets",
                     200,
                     Some((43, "manual:comment:duplicate")),
-                    None,
                 )
                 .unwrap()
         );
