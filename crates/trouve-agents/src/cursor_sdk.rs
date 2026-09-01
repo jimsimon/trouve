@@ -994,7 +994,12 @@ impl PooledBridge {
         match bridge.child.try_wait_leader() {
             Ok(status) => status.is_none(),
             Err(error) => {
-                tracing::debug!("cursor: failed to inspect shared Bridge: {error}");
+                tracing::debug!(
+                    backend_state_dir = %self.state_dir.display(),
+                    bridge_pid = ?bridge.child.id(),
+                    %error,
+                    "cursor: failed to inspect shared Bridge"
+                );
                 false
             }
         }
