@@ -1550,9 +1550,13 @@ fn turn_stream(
         if !cancelled
             && !client_gone
             && !route_overloaded
-            && !route_closed
             && let Some(params) = terminal_params
         {
+            // Once the root terminal notification has been consumed it is
+            // authoritative even if the transport closes while we are
+            // waiting for collaborator tails. Core closes any collaborator
+            // that did not publish its own terminal event when this stream
+            // ends; do not turn the completed root into a protocol failure.
             // Publish completion only after active-turn cleanup is serialized
             // with any replacement startup.
             let _lifecycle = server.lock_turn_lifecycle(&codex_thread_id).await;
@@ -6957,7 +6961,7 @@ while IFS= read -r _; do :; done
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn completion_removes_route_before_terminal_event_is_yielded() {
+    async fn completion_survives_transport_close_with_an_active_collaborator() {
         use futures::StreamExt;
         use std::os::unix::fs::PermissionsExt;
 
@@ -7088,6 +7092,49 @@ while IFS= read -r _; do :; done
         assert!(matches!(
             stream.next().await,
             Some(Ok(BackendEvent::CompactionFailed))
+        ));
+        route_tx
+            .try_send(ServerMsg::Notification {
+                method: "item/started".into(),
+                params: json!({
+                    "threadId": "root",
+                    "turnId": "root-turn",
+                    "item": {
+                        "id": "spawn-1",
+                        "type": "collabAgentToolCall",
+                        "tool": "spawn_agent",
+                        "senderThreadId": "root",
+                        "receiverThreadIds": ["child"],
+                        "prompt": "Inspect the review"
+                    }
+                }),
+            })
+            .unwrap();
+        route_tx
+            .try_send(ServerMsg::Notification {
+                method: "turn/started".into(),
+                params: json!({
+                    "threadId": "child",
+                    "turn": { "id": "child-turn", "status": "inProgress" }
+                }),
+            })
+            .unwrap();
+        assert!(matches!(
+            stream.next().await,
+            Some(Ok(BackendEvent::CollaboratorStarted { session_id, .. }))
+                if session_id == "child"
+        ));
+        assert!(matches!(
+            stream.next().await,
+            Some(Ok(BackendEvent::ToolStarted { .. }))
+        ));
+        assert!(matches!(
+            stream.next().await,
+            Some(Ok(BackendEvent::CollaboratorEvent {
+                session_id,
+                event: BackendCollaboratorEvent::TurnStarted,
+                ..
+            })) if session_id == "child"
         ));
         route_tx
             .try_send(ServerMsg::Notification {
