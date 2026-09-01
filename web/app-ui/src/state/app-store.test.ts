@@ -604,10 +604,41 @@ describe("AppStore", () => {
     });
 
     expect(store.sessionPullRequests("se_1")).toEqual([
+      expect.objectContaining({ number: 8, state: "merged" }),
       expect.objectContaining({ number: 9, title: "Fresh linked PR" }),
       expect.objectContaining({ number: 7 }),
-      expect.objectContaining({ number: 8, state: "merged" }),
     ]);
+  });
+
+  it("associates chat-mentioned PRs while keeping the session branch first", () => {
+    const store = new AppStore();
+    store.replaceSessionMetadata([metadata]);
+    store.replaceSessionSummaries([summary]);
+    store.applyServerEvent({
+      cursor: 11,
+      scope: "server",
+      ts: "2026-08-01T12:11:00Z",
+      type: "session.pr_mentioned",
+      session_id: "se_1",
+      number: 20,
+      url: "https://github.com/trouve-ai/trouve/pull/20",
+    });
+    store.applyServerEvent({
+      cursor: 12,
+      scope: "server",
+      ts: "2026-08-01T12:12:00Z",
+      type: "github.pull_requests_updated",
+      pull_requests: {
+        host: "github.com",
+        viewer: "octocat",
+        prs: [
+          pullRequest(20, { head: "mentioned-only" }),
+          pullRequest(8, { state: "merged" }),
+        ],
+      },
+    });
+
+    expect(store.sessionPullRequests("se_1").map(({ number }) => number)).toEqual([8, 20]);
   });
 
   it("hydrates all session PR associations from the cold-start server projection", () => {

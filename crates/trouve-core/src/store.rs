@@ -204,6 +204,10 @@ CREATE TABLE IF NOT EXISTS events (
   payload TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS events_scope ON events (scope_kind, scope_id, cursor);
+CREATE INDEX IF NOT EXISTS events_session_pr_mentioned
+ON events (json_extract(payload, '$.session_id'), cursor)
+WHERE scope_kind = 'server' AND scope_id = ''
+  AND json_extract(payload, '$.type') = 'session.pr_mentioned';
 CREATE TABLE IF NOT EXISTS thread_view_cache (
   thread_id TEXT PRIMARY KEY REFERENCES threads(id) ON DELETE CASCADE,
   cursor INTEGER NOT NULL,
@@ -4570,6 +4574,7 @@ pub struct EventReplayPage {
 
 /// Shared handle to the database plus the live event fan-out.
 type ScopedEventSenders = Arc<Mutex<HashMap<(String, String), broadcast::Sender<EventEnvelope>>>>;
+type LegacySessionPrMentions = Arc<Mutex<HashMap<String, HashSet<String>>>>;
 
 #[derive(Clone)]
 pub struct Store {
@@ -4577,6 +4582,7 @@ pub struct Store {
     events_tx: broadcast::Sender<EventEnvelope>,
     scoped_events: ScopedEventSenders,
     append_tx: std::sync::mpsc::Sender<AppendRequest>,
+    legacy_session_pr_mentions: LegacySessionPrMentions,
 }
 
 #[derive(Debug, Clone)]
@@ -6246,6 +6252,36 @@ fn serialize_events(scope: Scope, events: Vec<Event>) -> Result<Vec<PendingEvent
         .collect()
 }
 
+fn serialize_scoped_events(events: Vec<(Scope, Event)>) -> Result<Vec<PendingEvent>> {
+    let now = chrono::Utc::now();
+    events
+        .into_iter()
+        .map(|(scope, event)| {
+            Ok(PendingEvent {
+                scope,
+                ts: now,
+                payload: serde_json::to_string(&event)?,
+                event,
+                mutation: None,
+            })
+        })
+        .collect()
+}
+
+fn chat_pr_mention_content(event: &Event) -> Option<&str> {
+    match event {
+        Event::UserMessage {
+            content,
+            background: false,
+            ..
+        }
+        | Event::TurnSteered { content, .. }
+        | Event::AssistantMessage { content, .. } => Some(content.as_str()),
+        Event::SubagentSpawned { prompt, .. } => Some(prompt.as_str()),
+        _ => None,
+    }
+}
+
 fn serialize_lifecycle_events(
     events: Vec<(Scope, Event)>,
     mutation: StoreMutation,
@@ -6339,6 +6375,7 @@ impl Store {
             events_tx,
             scoped_events,
             append_tx,
+            legacy_session_pr_mentions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -6353,8 +6390,13 @@ impl Store {
     /// other on the connection mutex. This call still waits for durability:
     /// it returns once the batch containing this event has committed.
     pub fn append_event(&self, scope: Scope, event: Event) -> Result<EventEnvelope> {
-        let mut envelopes = self.append_pending_events(serialize_events(scope, vec![event])?)?;
-        Ok(envelopes.pop().expect("single append returns one event"))
+        let (events, original_len) = self.events_with_chat_pr_mentions(scope, vec![event])?;
+        let envelopes = self.append_pending_events(serialize_scoped_events(events)?)?;
+        debug_assert_eq!(original_len, 1);
+        Ok(envelopes
+            .into_iter()
+            .next()
+            .expect("single append returns one event"))
     }
 
     /// Persist a same-scope batch synchronously. Use this for cancellation
@@ -6364,7 +6406,83 @@ impl Store {
         if events.is_empty() {
             return Ok(Vec::new());
         }
-        self.append_pending_events(serialize_events(scope, events)?)
+        let (events, original_len) = self.events_with_chat_pr_mentions(scope, events)?;
+        let mut envelopes = self.append_pending_events(serialize_scoped_events(events)?)?;
+        envelopes.truncate(original_len);
+        Ok(envelopes)
+    }
+
+    /// Add server-scoped association events for canonical PR browser URLs in
+    /// durable user-visible chat. Keeping this at the event-log chokepoint
+    /// covers native providers, vendor backends, steering, cancellation, and
+    /// collaborator paths without teaching each producer about GitHub.
+    fn events_with_chat_pr_mentions(
+        &self,
+        scope: Scope,
+        events: Vec<Event>,
+    ) -> Result<(Vec<(Scope, Event)>, usize)> {
+        let original_len = events.len();
+        if !matches!(scope, Scope::Thread(_)) {
+            return Ok((
+                events
+                    .into_iter()
+                    .map(|event| (scope.clone(), event))
+                    .collect(),
+                original_len,
+            ));
+        }
+        let mut references = Vec::new();
+        let mut seen = HashSet::new();
+        for event in &events {
+            let Some(content) = chat_pr_mention_content(event) else {
+                continue;
+            };
+            for (url, number) in crate::github::pr_browser_references_in_text(content) {
+                if seen.insert(url.trim_end_matches('/').to_ascii_lowercase()) {
+                    references.push((number, url));
+                }
+            }
+        }
+        if references.is_empty() {
+            return Ok((
+                events
+                    .into_iter()
+                    .map(|event| (scope.clone(), event))
+                    .collect(),
+                original_len,
+            ));
+        }
+        let Scope::Thread(thread_id) = &scope else {
+            unreachable!("non-thread scopes returned above");
+        };
+        let Some(session_id) = self.thread(thread_id)?.map(|thread| thread.session_id) else {
+            return Ok((
+                events
+                    .into_iter()
+                    .map(|event| (scope.clone(), event))
+                    .collect(),
+                original_len,
+            ));
+        };
+        let existing = self.dedicated_session_pr_mentions(&session_id)?;
+        references
+            .retain(|(_, url)| !existing.contains(&url.trim_end_matches('/').to_ascii_lowercase()));
+        let mentions = references.into_iter().map(|(number, url)| {
+            (
+                Scope::Server,
+                Event::SessionPrMentioned {
+                    session_id: session_id.clone(),
+                    number,
+                    url,
+                },
+            )
+        });
+        let mut scoped = events
+            .into_iter()
+            .map(|event| (scope.clone(), event))
+            .collect::<Vec<_>>();
+        scoped.extend(mentions);
+        Ok((scoped, original_len))
     }
 
     fn append_pending_events(&self, events: Vec<PendingEvent>) -> Result<Vec<EventEnvelope>> {
@@ -6410,19 +6528,22 @@ impl Store {
         if events.is_empty() {
             return Ok(Vec::new());
         }
+        let (events, original_len) = self.events_with_chat_pr_mentions(scope, events)?;
         let (reply, reply_rx) = tokio::sync::oneshot::channel();
         self.append_tx
             .send(AppendRequest {
-                events: serialize_events(scope, events)?,
+                events: serialize_scoped_events(events)?,
                 code_review_outbox_ids: Vec::new(),
                 isolated: false,
                 reply: AppendReply::Async(reply),
                 queued_at: std::time::Instant::now(),
             })
             .map_err(|_| anyhow::anyhow!("event writer thread has exited"))?;
-        reply_rx
+        let mut envelopes = reply_rx
             .await
-            .map_err(|_| anyhow::anyhow!("event writer thread has exited"))?
+            .map_err(|_| anyhow::anyhow!("event writer thread has exited"))??;
+        envelopes.truncate(original_len);
+        Ok(envelopes)
     }
 
     /// Persist a tool completion and the PR verification intents derived from
@@ -6437,14 +6558,14 @@ impl Store {
         if intents.is_empty() {
             return self.append_events_async(scope, events).await;
         }
+        let (events, original_len) = self.events_with_chat_pr_mentions(scope, events)?;
         let pending = serialize_lifecycle_events(
-            events
-                .into_iter()
-                .map(|event| (scope.clone(), event))
-                .collect(),
+            events,
             StoreMutation::UpsertSessionPrVerificationIntents { intents },
         )?;
-        self.append_pending_events_async(pending).await
+        let mut envelopes = self.append_pending_events_async(pending).await?;
+        envelopes.truncate(original_len);
+        Ok(envelopes)
     }
 
     async fn append_pending_events_async(
@@ -7055,6 +7176,97 @@ impl Store {
         Ok(out)
     }
 
+    fn dedicated_session_pr_mentions(&self, session_id: &str) -> Result<HashSet<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT json_extract(payload, '$.url')
+             FROM events
+             WHERE scope_kind = 'server' AND scope_id = ''
+               AND json_extract(payload, '$.type') = 'session.pr_mentioned'
+               AND json_extract(payload, '$.session_id') = ?1",
+        )?;
+        let rows = stmt.query_map(params![session_id], |row| row.get::<_, String>(0))?;
+        let mut urls = HashSet::new();
+        for url in rows {
+            urls.insert(url?.trim_end_matches('/').to_ascii_lowercase());
+        }
+        Ok(urls)
+    }
+
+    /// Canonical PR browser URLs mentioned in durable chat for one session.
+    /// Dedicated server-scope events keep new lookups bounded. Pre-event
+    /// transcripts are scanned once per process and cached; every later chat
+    /// mention has its own dedicated event and does not invalidate that cache.
+    pub fn session_pr_mentions(&self, session_id: &str) -> Result<HashSet<String>> {
+        let cached_legacy = self
+            .legacy_session_pr_mentions
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .cloned();
+        let mut urls = self.dedicated_session_pr_mentions(session_id)?;
+        let scanned_legacy = if cached_legacy.is_some() {
+            None
+        } else {
+            const PAGE_SIZE: usize = 256;
+            let mut legacy_urls = HashSet::new();
+            let mut after = 0_i64;
+            loop {
+                let rows = {
+                    let conn = self.conn.lock().unwrap();
+                    let mut legacy_stmt = conn.prepare(
+                        "SELECT events.cursor, events.payload
+                         FROM events
+                         JOIN threads ON events.scope_kind = 'thread'
+                                     AND events.scope_id = threads.id
+                         WHERE threads.session_id = ?1 AND events.cursor > ?2
+                           AND json_extract(events.payload, '$.type') IN (
+                             'user.message', 'turn.steered', 'assistant.message',
+                             'subagent.spawned'
+                           )
+                         ORDER BY events.cursor LIMIT ?3",
+                    )?;
+                    let mut query_rows =
+                        legacy_stmt.query(params![session_id, after, PAGE_SIZE as i64])?;
+                    let mut rows = Vec::new();
+                    while let Some(row) = query_rows.next()? {
+                        rows.push((row.get::<_, i64>(0)?, row.get::<_, String>(1)?));
+                    }
+                    rows
+                };
+                let loaded = rows.len();
+                for (cursor, payload) in rows {
+                    after = cursor;
+                    let Ok(event) = serde_json::from_str::<Event>(&payload) else {
+                        continue;
+                    };
+                    let Some(content) = chat_pr_mention_content(&event) else {
+                        continue;
+                    };
+                    for (url, _) in crate::github::pr_browser_references_in_text(content) {
+                        legacy_urls.insert(url.trim_end_matches('/').to_ascii_lowercase());
+                    }
+                }
+                if loaded < PAGE_SIZE {
+                    break;
+                }
+            }
+            Some(legacy_urls)
+        };
+        let legacy_urls = if let Some(cached) = cached_legacy {
+            cached
+        } else {
+            let legacy_urls = scanned_legacy.expect("uncached legacy mentions are scanned");
+            self.legacy_session_pr_mentions
+                .lock()
+                .unwrap()
+                .insert(session_id.to_string(), legacy_urls.clone());
+            legacy_urls
+        };
+        urls.extend(legacy_urls);
+        Ok(urls)
+    }
+
     /// Most recently persisted account PR snapshot event for `host`.
     ///
     /// The scan runs newest-first in bounded pages and stops at the first
@@ -7574,6 +7786,7 @@ impl Store {
         let tx = write_transaction(&conn)?;
         delete_session_rows(&tx, id)?;
         tx.commit()?;
+        self.legacy_session_pr_mentions.lock().unwrap().remove(id);
         Ok(())
     }
 
@@ -7592,10 +7805,12 @@ impl Store {
                 cleanup: Box::new(cleanup),
             },
         )?;
-        Ok(self
+        let envelope = self
             .append_pending_events(pending)?
             .pop()
-            .expect("one lifecycle event returns one envelope"))
+            .expect("one lifecycle event returns one envelope");
+        self.legacy_session_pr_mentions.lock().unwrap().remove(id);
+        Ok(envelope)
     }
 
     pub(crate) fn stage_attachment_cleanup(
@@ -16447,8 +16662,9 @@ impl Store {
         attachments: Vec<(trouve_protocol::Attachment, String)>,
         staging_cleanup_claim: Option<ArtifactCleanupClaim>,
     ) -> Result<()> {
+        let (events, _) = self.events_with_chat_pr_mentions(scope, vec![event])?;
         let pending = serialize_lifecycle_events(
-            vec![(scope, event)],
+            events,
             StoreMutation::AppendMessage {
                 thread_id: thread_id.to_string(),
                 payload: payload.to_string(),
@@ -19800,6 +20016,182 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "session deletion must remove pending PR verification work"
+        );
+    }
+
+    #[test]
+    fn chat_pr_mentions_emit_server_associations_without_replacing_chat_envelopes() {
+        let store = Store::open_in_memory().unwrap();
+        let workspace = Workspace {
+            id: "ws_chat_pr".into(),
+            name: "chat-pr".into(),
+            path: "/tmp/repo-chat-pr".into(),
+        };
+        store.insert_workspace(&workspace).unwrap();
+        let session = Session {
+            id: "se_chat_pr".into(),
+            workspace_id: workspace.id,
+            title: "Chat PR".into(),
+            branch: "trouve/chat-pr".into(),
+            worktree_path: "/tmp/wt-chat-pr".into(),
+            base_ref: "main".into(),
+            archived: false,
+            active: false,
+            created_at: chrono::Utc::now(),
+        };
+        store.insert_session(&session).unwrap();
+        let thread = Thread {
+            id: "th_chat_pr".into(),
+            session_id: session.id.clone(),
+            parent_thread_id: None,
+            title: None,
+            mode: "code".into(),
+            model: "p/m".into(),
+            model_options: serde_json::Map::new(),
+            permission_mode: PermissionMode::Ask,
+            created_at: chrono::Utc::now(),
+            spawned: false,
+            todos: Vec::new(),
+        };
+        store
+            .insert_thread(&thread, &serde_json::Map::new())
+            .unwrap();
+
+        let envelope = store
+            .append_event(
+                Scope::Thread(thread.id.clone()),
+                Event::AssistantMessage {
+                    turn: 1,
+                    content: concat!(
+                        "Opened PR #350: ",
+                        "https://github.com/trouve-ai/trouve/pull/350"
+                    )
+                    .into(),
+                },
+            )
+            .unwrap();
+
+        assert!(matches!(envelope.event, Event::AssistantMessage { .. }));
+        let mentions = store.events_after(&Scope::Server, 0).unwrap();
+        assert!(mentions.iter().any(|envelope| matches!(
+            &envelope.event,
+            Event::SessionPrMentioned {
+                session_id,
+                number: 350,
+                url,
+            } if session_id == &session.id && url.ends_with("/pull/350")
+        )));
+        assert_eq!(mentions.len(), 1);
+
+        store
+            .append_event(
+                Scope::Thread(thread.id.clone()),
+                Event::AssistantMessage {
+                    turn: 2,
+                    content: "https://github.com/trouve-ai/trouve/pull/350/".into(),
+                },
+            )
+            .unwrap();
+        store
+            .append_event(
+                Scope::Thread(thread.id.clone()),
+                Event::AssistantProgress {
+                    turn: 2,
+                    text: "https://github.com/trouve-ai/trouve/pull/351".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(store.events_after(&Scope::Server, 0).unwrap().len(), 1);
+
+        // Simulate chat persisted by a pre-session.pr_mentioned build. The
+        // projection fallback must make old transcripts associative too, even
+        // when the matching event falls beyond the first bounded scan page.
+        store
+            .append_pending_events(
+                serialize_events(
+                    Scope::Thread(thread.id.clone()),
+                    (0..256)
+                        .map(|turn| Event::AssistantProgress {
+                            turn,
+                            text: "working".into(),
+                        })
+                        .collect(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        store
+            .append_pending_events(
+                serialize_events(
+                    Scope::Thread(thread.id.clone()),
+                    vec![Event::UserMessage {
+                        turn: 2,
+                        content: "https://github.example.com/other/repo/pull/352".into(),
+                        attachments: Vec::new(),
+                        background: false,
+                    }],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let urls = store.session_pr_mentions(&session.id).unwrap();
+        assert!(urls.contains("https://github.com/trouve-ai/trouve/pull/350"));
+        assert!(urls.contains("https://github.example.com/other/repo/pull/352"));
+
+        // The compatibility scan is cached, while new public appends remain
+        // visible through their dedicated association events.
+        store
+            .append_pending_events(
+                serialize_events(
+                    Scope::Thread(thread.id.clone()),
+                    vec![Event::AssistantMessage {
+                        turn: 3,
+                        content: "https://github.example.com/other/repo/pull/353".into(),
+                    }],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(
+            !store
+                .session_pr_mentions(&session.id)
+                .unwrap()
+                .contains("https://github.example.com/other/repo/pull/353")
+        );
+        store
+            .append_event_with_message(
+                Scope::Thread(thread.id.clone()),
+                Event::TurnSteered {
+                    turn: 4,
+                    content: "See https://github.example.com/other/repo/pull/354".into(),
+                    attachments: Vec::new(),
+                },
+                &thread.id,
+                &serde_json::json!({"content": "steered"}),
+                Vec::new(),
+                None,
+            )
+            .unwrap();
+        assert!(
+            store
+                .session_pr_mentions(&session.id)
+                .unwrap()
+                .contains("https://github.example.com/other/repo/pull/354")
+        );
+        store
+            .append_event(
+                Scope::Thread(thread.id),
+                Event::AssistantMessage {
+                    turn: 5,
+                    content: "https://github.example.com/other/repo/pull/355".into(),
+                },
+            )
+            .unwrap();
+        assert!(
+            store
+                .session_pr_mentions(&session.id)
+                .unwrap()
+                .contains("https://github.example.com/other/repo/pull/355")
         );
     }
 

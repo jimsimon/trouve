@@ -7419,6 +7419,28 @@ impl Engine {
             .collect())
     }
 
+    /// Mention-only associations are navigation evidence, not authorization
+    /// for GitHub mutations. Mutation targets must either have a durable
+    /// session-created link or a head commit verified in the session worktree.
+    async fn session_pr_allows_mutation(
+        &self,
+        session_id: &str,
+        pr: &trouve_protocol::PrInfo,
+    ) -> Result<bool, EngineError> {
+        let normalized_url = pr.url.trim_end_matches('/').to_ascii_lowercase();
+        if self
+            .recorded_session_pr_urls(session_id)?
+            .contains(&normalized_url)
+        {
+            return Ok(true);
+        }
+        Ok(self.pr_has_locally_verified_head(session_id, pr).await)
+    }
+
+    fn mentioned_session_prs(&self, session_id: &str) -> Result<HashSet<String>, EngineError> {
+        Ok(self.store.session_pr_mentions(session_id)?)
+    }
+
     /// Provider-neutral evidence tying GitHub activity to this session.
     /// Explicit PR references work for any integration; successful tool args
     /// and produced commit IDs preserve enough identity to discover a PR that
@@ -7510,12 +7532,14 @@ impl Engine {
         for number in evidence.numbers {
             if seen.insert(number) {
                 let already_recorded = evidence.recorded_numbers.contains(&number);
+                let explicitly_mentioned = evidence.mentioned_numbers.contains(&number);
                 match github.pr(number).await {
                     Ok(pr)
                         if already_recorded
+                            || explicitly_mentioned
                             || self.pr_has_locally_verified_head(session_id, &pr).await =>
                     {
-                        if !already_recorded {
+                        if !already_recorded && !explicitly_mentioned {
                             self.record_session_pr_numbers(
                                 session_id,
                                 &repository,
@@ -7540,8 +7564,60 @@ impl Engine {
                 }
             }
         }
-        prs.sort_by_key(|pr| (pr.state != "open", std::cmp::Reverse(pr.number)));
+        prs.sort_by_key(|pr| {
+            (
+                if pr.workspace_id == session.workspace_id && pr.head == session.branch {
+                    0
+                } else if evidence.recorded_numbers.contains(&pr.number) {
+                    1
+                } else {
+                    2
+                },
+                pr.state != "open",
+                std::cmp::Reverse(pr.number),
+            )
+        });
         Ok(prs)
+    }
+
+    fn project_session_pr_candidates<'a>(
+        candidates: impl IntoIterator<Item = &'a trouve_protocol::PrInfo>,
+        session: &Session,
+        linked_urls: &HashSet<String>,
+        mentioned_urls: &HashSet<String>,
+    ) -> Vec<trouve_protocol::PrInfo> {
+        let mut seen = HashSet::new();
+        let mut prs = candidates
+            .into_iter()
+            .filter(|pr| {
+                (pr.workspace_id == session.workspace_id && pr.head == session.branch)
+                    || linked_urls.contains(&pr.url.trim_end_matches('/').to_ascii_lowercase())
+                    || mentioned_urls.contains(&pr.url.trim_end_matches('/').to_ascii_lowercase())
+            })
+            .filter(|pr| {
+                seen.insert((
+                    pr.host.to_ascii_lowercase(),
+                    pr.repository.to_ascii_lowercase(),
+                    pr.number,
+                ))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        prs.sort_by_key(|pr| {
+            let url = pr.url.trim_end_matches('/').to_ascii_lowercase();
+            (
+                if pr.workspace_id == session.workspace_id && pr.head == session.branch {
+                    0
+                } else if linked_urls.contains(&url) {
+                    1
+                } else {
+                    2
+                },
+                pr.state != "open",
+                std::cmp::Reverse(pr.number),
+            )
+        });
+        prs
     }
 
     /// Session-to-PR authorization from the newest persisted account
@@ -7554,24 +7630,20 @@ impl Engine {
     ) -> Result<Vec<trouve_protocol::PrInfo>, EngineError> {
         let session = self.get_session(session_id)?;
         let linked_urls = self.recorded_session_pr_urls(session_id)?;
-        let mut seen = HashSet::new();
-        let mut prs = Vec::new();
+        let mentioned_urls = self.mentioned_session_prs(session_id)?;
+        let mut candidates = Vec::new();
         for (host, _) in self.github_hosts() {
             let Some(snapshot) = self.store.latest_github_pr_snapshot(&host)? else {
                 continue;
             };
-            prs.extend(snapshot.prs.into_iter().filter(|pr| {
-                ((pr.workspace_id == session.workspace_id && pr.head == session.branch)
-                    || linked_urls.contains(&pr.url.trim_end_matches('/').to_ascii_lowercase()))
-                    && seen.insert((
-                        pr.host.to_ascii_lowercase(),
-                        pr.repository.to_ascii_lowercase(),
-                        pr.number,
-                    ))
-            }));
+            candidates.extend(snapshot.prs);
         }
-        prs.sort_by_key(|pr| (pr.state != "open", std::cmp::Reverse(pr.number)));
-        Ok(prs)
+        Ok(Self::project_session_pr_candidates(
+            &candidates,
+            &session,
+            &linked_urls,
+            &mentioned_urls,
+        ))
     }
 
     fn projected_session_pr(
@@ -7714,6 +7786,11 @@ impl Engine {
         use trouve_protocol::{PrActionRequest as Action, PrDetailSection as Section};
 
         let (session, pr) = self.projected_session_pr(session_id, number)?;
+        if !self.session_pr_allows_mutation(session_id, &pr).await? {
+            return Err(EngineError::BadRequest(format!(
+                "pull request #{number} is associated for navigation only"
+            )));
+        }
         let key = GithubPrDetailKey::from_info(&pr);
         let required = match action {
             Action::UpdateReview { .. }
@@ -7861,24 +7938,13 @@ impl Engine {
         let mut session_pull_requests = Vec::new();
         for session in self.list_sessions(None)? {
             let linked_urls = self.recorded_session_pr_urls(&session.id)?;
-            let mut seen = HashSet::new();
-            let mut prs = account_prs
-                .iter()
-                .copied()
-                .filter(|pr| {
-                    (pr.workspace_id == session.workspace_id && pr.head == session.branch)
-                        || linked_urls.contains(&pr.url.trim_end_matches('/').to_ascii_lowercase())
-                })
-                .filter(|pr| {
-                    seen.insert((
-                        pr.host.to_ascii_lowercase(),
-                        pr.repository.to_ascii_lowercase(),
-                        pr.number,
-                    ))
-                })
-                .cloned()
-                .collect::<Vec<_>>();
-            prs.sort_by_key(|pr| (pr.state != "open", std::cmp::Reverse(pr.number)));
+            let mentioned_urls = self.mentioned_session_prs(&session.id)?;
+            let prs = Self::project_session_pr_candidates(
+                account_prs.iter().copied(),
+                &session,
+                &linked_urls,
+                &mentioned_urls,
+            );
             if !prs.is_empty() {
                 session_pull_requests.push(trouve_protocol::SessionPrProjection {
                     session_id: session.id,
@@ -8390,10 +8456,19 @@ impl Engine {
     ) -> Result<(), EngineError> {
         let session = self.get_session(session_id)?;
         let github = self.github_for_session(&session)?;
-        let pr = self
-            .session_pr(session_id)
-            .await?
-            .ok_or_else(|| EngineError::NotFound("no open PR for this session".into()))?;
+        let mut pr = None;
+        for candidate in self.session_prs(session_id).await? {
+            if candidate.state == "open"
+                && self
+                    .session_pr_allows_mutation(session_id, &candidate)
+                    .await?
+            {
+                pr = Some(candidate);
+                break;
+            }
+        }
+        let pr =
+            pr.ok_or_else(|| EngineError::NotFound("no mutable open PR for this session".into()))?;
         github
             .merge_pr(pr.number, method.unwrap_or("merge"))
             .await
@@ -18595,6 +18670,7 @@ fn requests_remote_ref_mutation(
 struct SessionPrEvidence {
     numbers: HashSet<u64>,
     recorded_numbers: HashSet<u64>,
+    mentioned_numbers: HashSet<u64>,
     successful_tool_args: Vec<String>,
     commit_ids: HashSet<String>,
 }
@@ -18604,6 +18680,7 @@ impl SessionPrEvidence {
     fn extend(&mut self, other: Self) {
         self.numbers.extend(other.numbers);
         self.recorded_numbers.extend(other.recorded_numbers);
+        self.mentioned_numbers.extend(other.mentioned_numbers);
         self.successful_tool_args.extend(other.successful_tool_args);
         self.commit_ids.extend(other.commit_ids);
     }
@@ -18621,6 +18698,27 @@ fn pr_evidence_from_events(
     let mut evidence = SessionPrEvidence::default();
     for event in events {
         match event {
+            Event::UserMessage {
+                content,
+                background: false,
+                ..
+            }
+            | Event::TurnSteered { content, .. }
+            | Event::AssistantMessage { content, .. } => {
+                let numbers = crate::github::pr_numbers_in_chat_text(&content, host, owner, repo);
+                evidence.numbers.extend(numbers.iter().copied());
+                evidence.mentioned_numbers.extend(numbers);
+            }
+            Event::AssistantProgress { text, .. } => {
+                let numbers = crate::github::pr_numbers_in_chat_text(&text, host, owner, repo);
+                evidence.numbers.extend(numbers.iter().copied());
+                evidence.mentioned_numbers.extend(numbers);
+            }
+            Event::SubagentSpawned { prompt, .. } => {
+                let numbers = crate::github::pr_numbers_in_chat_text(&prompt, host, owner, repo);
+                evidence.numbers.extend(numbers.iter().copied());
+                evidence.mentioned_numbers.extend(numbers);
+            }
             Event::ToolRequested {
                 call_id,
                 tool,
@@ -23740,6 +23838,7 @@ default_permission_mode = "ask"
         store.insert_session(&session).unwrap();
         let exact = projection_pr(10, &session.workspace_id, &session.branch);
         let linked = projection_pr(11, &session.workspace_id, "external-branch");
+        let mentioned = projection_pr(12, &session.workspace_id, "mentioned-branch");
         store
             .append_event(
                 Scope::Server,
@@ -23747,8 +23846,18 @@ default_permission_mode = "ask"
                     pull_requests: trouve_protocol::GithubPrList {
                         viewer: "octocat".into(),
                         host: "github.com".into(),
-                        prs: vec![exact, linked.clone()],
+                        prs: vec![exact, linked.clone(), mentioned.clone()],
                     },
+                },
+            )
+            .unwrap();
+        store
+            .append_event(
+                Scope::Server,
+                Event::SessionPrMentioned {
+                    session_id: session.id.clone(),
+                    number: mentioned.number,
+                    url: mentioned.url,
                 },
             )
             .unwrap();
@@ -23766,14 +23875,14 @@ default_permission_mode = "ask"
         let local = engine.projected_session_prs(&session.id).unwrap();
         assert_eq!(
             local.iter().map(|pr| pr.number).collect::<Vec<_>>(),
-            vec![11, 10]
+            vec![10, 11, 12]
         );
 
         let (cursor, projection) = engine.server_projection_snapshot().unwrap();
 
         assert!(cursor > 0);
         assert_eq!(projection.github_pull_requests.len(), 1);
-        assert_eq!(projection.github_pull_requests[0].cursor, cursor);
+        assert!(projection.github_pull_requests[0].cursor < cursor);
         assert_eq!(projection.session_pull_requests.len(), 1);
         assert_eq!(projection.session_pull_requests[0].session_id, session.id);
         assert_eq!(
@@ -23782,7 +23891,7 @@ default_permission_mode = "ask"
                 .iter()
                 .map(|pr| pr.number)
                 .collect::<Vec<_>>(),
-            vec![11, 10]
+            vec![10, 11, 12]
         );
     }
 
@@ -23975,7 +24084,8 @@ default_permission_mode = "ask"
             },
         ];
         let evidence = pr_evidence_from_events(events, "github.com", "o", "r");
-        assert_eq!(evidence.numbers, HashSet::from([75]));
+        assert_eq!(evidence.numbers, HashSet::from([73, 75]));
+        assert_eq!(evidence.mentioned_numbers, HashSet::from([73]));
         assert_eq!(evidence.successful_tool_args.len(), 2);
         assert!(
             evidence
