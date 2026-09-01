@@ -680,7 +680,7 @@ impl PreparedInstall {
         self,
         mut checkpoint: impl FnMut(ActivationCheckpoint) -> Result<(), InstallError>,
     ) -> Result<ActivationOutcome, InstallError> {
-        self.activate_with_checkpoint_and_sync(&mut checkpoint, sync_runtime_path)
+        self.activate_with_checkpoint_and_sync(&mut checkpoint, sync_path_for_durability)
     }
 
     fn activate_with_checkpoint_and_sync(
@@ -745,7 +745,7 @@ impl PreparedInstall {
         drop(pointer_file);
 
         let mut generation_cleanup = PathCleanup::new(generation.clone());
-        replace_runtime_file(&self.stage, &generation, false)?;
+        replace_file_atomically(&self.stage, &generation, false)?;
         // The pointer must never be reported durable while the runtime it
         // names exists only in volatile cache. Flush files before directories,
         // then flush the rename into the generations directory.
@@ -769,7 +769,7 @@ impl PreparedInstall {
         });
         let replacing_pointer = path_exists(&pointer)?;
         checkpoint(ActivationCheckpoint::BeforePointer)?;
-        replace_runtime_file(&pointer_candidate, &pointer, replacing_pointer)?;
+        replace_file_atomically(&pointer_candidate, &pointer, replacing_pointer)?;
 
         // installed.json is the one atomically replaced commit marker. Disarm
         // generation cleanup immediately: a later directory-sync error cannot
@@ -878,7 +878,7 @@ fn managed_runtime_container(
 }
 
 #[cfg(not(windows))]
-fn replace_runtime_file(
+pub(crate) fn replace_file_atomically(
     replacement: &Path,
     destination: &Path,
     _replacing_existing: bool,
@@ -887,7 +887,7 @@ fn replace_runtime_file(
 }
 
 #[cfg(windows)]
-fn replace_runtime_file(
+pub(crate) fn replace_file_atomically(
     replacement: &Path,
     destination: &Path,
     replacing_existing: bool,
@@ -933,12 +933,12 @@ fn replace_runtime_file(
 }
 
 #[cfg(unix)]
-fn sync_runtime_path(path: &Path) -> std::io::Result<()> {
+pub(crate) fn sync_path_for_durability(path: &Path) -> std::io::Result<()> {
     std::fs::File::open(path)?.sync_all()
 }
 
 #[cfg(not(unix))]
-fn sync_runtime_path(path: &Path) -> std::io::Result<()> {
+pub(crate) fn sync_path_for_durability(path: &Path) -> std::io::Result<()> {
     if path.is_file() {
         std::fs::File::open(path)?.sync_all()
     } else {
