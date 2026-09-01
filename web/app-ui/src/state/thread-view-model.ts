@@ -140,6 +140,7 @@ export type ThreadChatItem =
       readonly id: string;
       readonly kind: "thinking";
       readonly turn: number;
+      readonly reasoningId?: string;
       content: string;
       complete: boolean;
     }
@@ -261,6 +262,8 @@ export class ThreadViewModel {
   #queueRevision = 0;
   #completedUsage: Usage | undefined;
   #activeTurnUsage: { readonly turn: number; readonly usage: Usage } | undefined;
+  #activeThinkingId: string | undefined;
+  #latestThinkingTurn: number | undefined;
 
   cursor = 0;
   /** Absolute folded-item position of `items[0]`. */
@@ -359,6 +362,16 @@ export class ThreadViewModel {
       }
     }
     this.thinking = snapshot.thinking ?? false;
+    this.#activeThinkingId = snapshot.active_thinking_id ?? undefined;
+    this.#latestThinkingTurn = undefined;
+    for (const item of this.items) {
+      if (
+        item.kind === "thinking"
+        && (this.#latestThinkingTurn === undefined || item.turn > this.#latestThinkingTurn)
+      ) {
+        this.#latestThinkingTurn = item.turn;
+      }
+    }
     this.commands = [...(snapshot.commands ?? [])];
     this.replaceQueue(snapshot.queue ?? []);
     // Protocol 3.1 snapshots predate the todo projection. Preserve any live
@@ -463,6 +476,7 @@ export class ThreadViewModel {
           id,
           kind: "thinking",
           turn: item.turn,
+          ...(item.id == null ? {} : { reasoningId: item.id }),
           content: item.content,
           complete: item.complete,
         };
@@ -748,9 +762,23 @@ export class ThreadViewModel {
       case "assistant.progress_completed":
         return this.finishProgress();
       case "assistant.thinking": {
+        const activeTurn = this.activeThinkingTurn();
+        if (this.#latestThinkingTurn !== undefined && envelope.turn < this.#latestThinkingTurn) {
+          this.appendStaleThinking(envelope.turn, envelope.id ?? undefined, envelope.text);
+          return true;
+        }
+        this.#latestThinkingTurn = Math.max(this.#latestThinkingTurn ?? envelope.turn, envelope.turn);
         this.failOpenCompaction(envelope.turn);
         this.finishProgress();
+        const id = envelope.id ?? undefined;
+        if (
+          this.thinking
+          && (this.#activeThinkingId !== id || activeTurn !== envelope.turn)
+        ) {
+          this.finishThinking();
+        }
         this.thinking = true;
+        this.#activeThinkingId = id;
         const current = this.findTrailingOpen("thinking", envelope.turn);
         if (current?.kind === "thinking") current.content += envelope.text;
         else {
@@ -758,14 +786,19 @@ export class ThreadViewModel {
             id: this.nextItemId(`thinking:${envelope.turn}`),
             kind: "thinking",
             turn: envelope.turn,
+            ...(id === undefined ? {} : { reasoningId: id }),
             content: envelope.text,
             complete: false,
           });
         }
         return true;
       }
-      case "assistant.thinking_completed":
-        return this.finishThinking();
+      case "assistant.thinking_completed": {
+        const id = envelope.id ?? undefined;
+        return this.#activeThinkingId === id && this.activeThinkingTurn() === envelope.turn
+          ? this.finishThinking()
+          : false;
+      }
       case "assistant.delta": {
         this.failOpenCompaction(envelope.turn);
         this.finishProgress();
@@ -805,7 +838,7 @@ export class ThreadViewModel {
       case "tool.requested":
         this.failOpenCompaction(envelope.turn);
         this.finishProgress();
-        this.finishThinking();
+        if (this.#activeThinkingId === undefined) this.finishThinking();
         this.appendItem({
           id: `tool:${envelope.call_id}`,
           kind: "tool",
@@ -1084,9 +1117,39 @@ export class ThreadViewModel {
     );
   }
 
+  private activeThinkingTurn(): number | undefined {
+    const item = this.#findLast(
+      (candidate) => candidate.kind === "thinking" && !candidate.complete,
+    );
+    return item?.kind === "thinking" ? item.turn : undefined;
+  }
+
+  // Preserve delayed older-turn text without replacing the newer active
+  // lifecycle. A first-seen stale block is complete by construction.
+  private appendStaleThinking(turn: number, reasoningId: string | undefined, text: string): void {
+    const item = this.#findLast(
+      (candidate) =>
+        candidate.kind === "thinking"
+        && candidate.turn === turn
+        && (reasoningId === undefined || candidate.reasoningId === reasoningId),
+    );
+    if (item?.kind === "thinking") item.content += text;
+    else {
+      this.appendItem({
+        id: this.nextItemId(`thinking:${turn}`),
+        kind: "thinking",
+        turn,
+        ...(reasoningId === undefined ? {} : { reasoningId }),
+        content: text,
+        complete: true,
+      });
+    }
+  }
+
   private finishThinking(): boolean {
     const wasThinking = this.thinking;
     this.thinking = false;
+    this.#activeThinkingId = undefined;
     const item = this.#findLast(
       (candidate) => candidate.kind === "thinking" && !candidate.complete,
     );
