@@ -22,6 +22,7 @@ import {
   ConnectRpcError,
   assetName,
   assertUniqueToolLifecycle,
+  bridgeReleaseAttestation,
   capPendingDiagnostic,
   combineQualificationAndCleanupErrors,
   createProcessCleanupBoundary,
@@ -131,6 +132,17 @@ test("a blocked full qualification returns a failing process status", () => {
   assert.equal(qualificationExitCode({ decision: "proceed-with-sdk-bridge-adapter" }), 0);
   assert.equal(qualificationExitCode({ decision: "hold-sdk-bridge-promotion" }), 1);
   assert.equal(qualificationExitCode({ result: "passed" }), 0);
+});
+
+test("explicit Bridge binaries never inherit the pinned-release attestation", () => {
+  assert.deepEqual(bridgeReleaseAttestation({ downloaded: true }), {
+    source: "verified-pinned-release",
+    pinnedRelease: "1.0.28",
+  });
+  assert.deepEqual(bridgeReleaseAttestation({ downloaded: false }), {
+    source: "explicit-unverified-binary",
+    pinnedRelease: null,
+  });
 });
 
 test("tool confinement pins every Cursor native tool except mcp", () => {

@@ -506,6 +506,57 @@ const STREAM_EVENT_BATCH_WINDOW: std::time::Duration = std::time::Duration::from
 /// stream can produce output forever without yielding Pending.
 const MAX_BACKEND_EVENTS_BEFORE_STEER: usize = 32;
 
+#[derive(Default)]
+struct ProviderThinkingState {
+    active: Option<(String, bool)>,
+}
+
+impl ProviderThinkingState {
+    fn start(&mut self, id: String, turn: u64, events: &mut Vec<Event>) {
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|(active, _)| active == &id)
+        {
+            return;
+        }
+        self.finish(turn, events);
+        self.active = Some((id, false));
+    }
+
+    fn delta(&mut self, id: String, text: String, turn: u64, events: &mut Vec<Event>) {
+        if !self
+            .active
+            .as_ref()
+            .is_some_and(|(active, _)| active == &id)
+        {
+            self.start(id, turn, events);
+        }
+        if text.is_empty() {
+            return;
+        }
+        if let Some((_, displayed)) = self.active.as_mut() {
+            *displayed = true;
+        }
+        let id = self.active.as_ref().map(|(id, _)| id.clone());
+        events.push(Event::AssistantThinking { turn, id, text });
+    }
+
+    fn complete(&mut self, id: &str, turn: u64, events: &mut Vec<Event>) {
+        if self.active.as_ref().is_some_and(|(active, _)| active == id) {
+            self.finish(turn, events);
+        }
+    }
+
+    fn finish(&mut self, turn: u64, events: &mut Vec<Event>) {
+        if let Some((id, displayed)) = self.active.take()
+            && displayed
+        {
+            events.push(Event::AssistantThinkingCompleted { turn, id: Some(id) });
+        }
+    }
+}
+
 /// SQLite's busy handler does not cover every `SQLITE_LOCKED` collision. A
 /// checkpoint is post-response bookkeeping, so briefly retry those transient
 /// conflicts instead of turning an otherwise successful model turn into a
@@ -2747,10 +2798,60 @@ impl Drop for BackendRetirement {
     }
 }
 
-fn write_secrets_transactionally(
+struct ProviderSecretTransaction {
+    store: Arc<dyn trouve_providers::secrets::SecretStore>,
+    previous: Vec<(String, Option<String>)>,
+    committed: bool,
+}
+
+impl ProviderSecretTransaction {
+    fn commit(mut self) {
+        self.committed = true;
+    }
+
+    fn rollback(mut self) -> Result<()> {
+        let result = restore_provider_secrets(self.store.as_ref(), &self.previous);
+        self.committed = true;
+        result
+    }
+}
+
+impl Drop for ProviderSecretTransaction {
+    fn drop(&mut self) {
+        if !self.committed
+            && let Err(error) = restore_provider_secrets(self.store.as_ref(), &self.previous)
+        {
+            tracing::error!(%error, "provider secret transaction rollback failed");
+        }
+    }
+}
+
+fn restore_provider_secrets(
     store: &dyn trouve_providers::secrets::SecretStore,
-    writes: Vec<(String, String)>,
+    previous: &[(String, Option<String>)],
 ) -> Result<()> {
+    let rollback_errors = previous
+        .iter()
+        .rev()
+        .filter_map(|(key, value)| {
+            let result = match value {
+                Some(value) => store.set(key, value),
+                None => store.delete(key),
+            };
+            result.err().map(|error| format!("{key}: {error}"))
+        })
+        .collect::<Vec<_>>();
+    if rollback_errors.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow!(rollback_errors.join("; ")))
+    }
+}
+
+fn write_secrets_transactionally(
+    store: Arc<dyn trouve_providers::secrets::SecretStore>,
+    writes: Vec<(String, String)>,
+) -> Result<ProviderSecretTransaction> {
     let previous = writes
         .iter()
         .map(|(key, _)| store.get(key).map(|value| (key.clone(), value)))
@@ -2758,27 +2859,20 @@ fn write_secrets_transactionally(
 
     for (key, value) in &writes {
         if let Err(write_error) = store.set(key, value) {
-            let rollback_errors = previous
-                .iter()
-                .rev()
-                .filter_map(|(rollback_key, rollback_value)| {
-                    let result = match rollback_value {
-                        Some(value) => store.set(rollback_key, value),
-                        None => store.delete(rollback_key),
-                    };
-                    result.err().map(|error| format!("{rollback_key}: {error}"))
-                })
-                .collect::<Vec<_>>();
-            if rollback_errors.is_empty() {
+            if let Err(rollback_error) = restore_provider_secrets(store.as_ref(), &previous) {
+                return Err(anyhow!(
+                    "writing provider secret {key}: {write_error}; secret rollback failed: {rollback_error}"
+                ));
+            } else {
                 return Err(write_error).context(format!("writing provider secret {key}"));
             }
-            return Err(anyhow!(
-                "writing provider secret {key}: {write_error}; secret rollback failed: {}",
-                rollback_errors.join("; ")
-            ));
         }
     }
-    Ok(())
+    Ok(ProviderSecretTransaction {
+        store,
+        previous,
+        committed: false,
+    })
 }
 
 type RetiringBackendBatch = Vec<(String, Arc<dyn AgentBackend>)>;
@@ -4380,33 +4474,55 @@ impl Engine {
         let provider_lock = self.provider_lock(id);
         let _provider_guard = provider_lock.lock().await;
         let target_ids = HashSet::from([id.to_string()]);
+        let mut secret_writes = Vec::new();
+        if let Some(key) = req.api_key.as_deref().filter(|key| !key.is_empty()) {
+            secret_writes.push((
+                trouve_providers::secrets::api_key_secret(id),
+                key.to_string(),
+            ));
+        }
+        for (name, value) in req
+            .secret_values
+            .iter()
+            .filter(|(_, value)| !value.is_empty())
+        {
+            secret_writes.push((
+                trouve_providers::secrets::provider_secret(id, name),
+                value.clone(),
+            ));
+        }
+        let secrets_changed = !secret_writes.is_empty();
+        // Validate and commit the secret-store transaction before disturbing
+        // a healthy backend. The guard restores the previous values if this
+        // future is cancelled or any later transition fails.
+        let secret_transaction = write_secrets_transactionally(self.secrets.clone(), secret_writes)
+            .map_err(EngineError::Internal)?;
         // Retire the previous backend before changing its durable definition.
         // The retirement owns cleanup and registry rollback independently of
         // this request future, so cancellation cannot expose a closing backend
         // or lose the previous process tree.
-        let retirement = self
-            .retire_config_backends_matching_ids(&target_ids)
-            .await?;
-        let mutation = (|| -> Result<(), EngineError> {
-            let mut secret_writes = Vec::new();
-            if let Some(key) = req.api_key.as_deref().filter(|k| !k.is_empty()) {
-                secret_writes.push((
-                    trouve_providers::secrets::api_key_secret(id),
-                    key.to_string(),
-                ));
+        let retirement = match self.retire_config_backends_matching_ids(&target_ids).await {
+            Ok(retirement) => retirement,
+            Err(error) => {
+                if let Err(rollback) = secret_transaction.rollback() {
+                    if secrets_changed {
+                        self.replace_provider_registries_for_ids(&target_ids);
+                    }
+                    return Err(EngineError::Internal(anyhow!(
+                        "{error}; provider secret rollback failed: {rollback}"
+                    )));
+                }
+                // A failed retirement may already have rebuilt the old
+                // definition while the tentative secrets were visible.
+                // Rebuild once more after rollback so captured credentials
+                // match the still-current configuration.
+                if secrets_changed {
+                    self.replace_provider_registries_for_ids(&target_ids);
+                }
+                return Err(error);
             }
-            for (name, value) in req
-                .secret_values
-                .iter()
-                .filter(|(_, value)| !value.is_empty())
-            {
-                secret_writes.push((
-                    trouve_providers::secrets::provider_secret(id, name),
-                    value.clone(),
-                ));
-            }
-            write_secrets_transactionally(self.secrets.as_ref(), secret_writes)
-                .map_err(EngineError::Internal)?;
+        };
+        {
             let mut config = self.config.lock().unwrap();
             let entry = config.providers.entry(id.to_string()).or_default();
             let migrating_legacy_cursor = entry.kind == "cursor-cli" && req.kind == "cursor-sdk";
@@ -4456,12 +4572,10 @@ impl Engine {
                 }
             }
             self.persist_config(&config);
-            Ok(())
-        })();
+        }
         // Keep the registry transition serialized until the new durable
-        // definition is committed. On failure, dropping the unpublished
-        // retirement rebuilds from the still-current configuration.
-        mutation?;
+        // definition and its credentials are committed.
+        secret_transaction.commit();
         retirement.publish();
         let config = self.config.lock().unwrap();
         let registry = self.providers.read().unwrap();
@@ -4949,13 +5063,21 @@ impl Engine {
                         return Ok(None);
                     }
 
-                    let install_result = match prepared.activate_cancellable(&progress) {
-                        Ok(outcome) => {
+                    let activation_progress = progress.clone();
+                    let activation = tokio::task::spawn_blocking(move || {
+                        prepared.activate_cancellable(&activation_progress)
+                    })
+                    .await;
+                    let install_result = match activation {
+                        Ok(Ok(outcome)) => {
                             let (_, warning) = outcome.into_parts();
                             Ok(Some((version, warning)))
                         }
-                        Err(trouve_agents::install::InstallError::Cancelled) => Ok(None),
-                        Err(error) => Err(error.to_string()),
+                        Ok(Err(trouve_agents::install::InstallError::Cancelled)) => Ok(None),
+                        Ok(Err(error)) => Err(error.to_string()),
+                        Err(error) => Err(format!(
+                            "managed Cursor runtime activation task failed: {error}"
+                        )),
                     };
                     // Activation success, failure, and late cancellation all
                     // replace the retired Cursor pools before releasing the
@@ -6900,21 +7022,12 @@ impl Engine {
                     .keys()
                     .cloned()
                     .collect::<HashSet<_>>();
+                if target_ids.is_empty() {
+                    break;
+                }
                 let _target_transitions = engine.lock_provider_transitions(&target_ids).await;
                 let _reload = reload;
-                let retiring = engine
-                    .retiring_backends
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .flat_map(|(id, entries)| {
-                        entries
-                            .iter()
-                            .cloned()
-                            .map(|backend| (id.clone(), backend))
-                            .collect::<Vec<_>>()
-                    })
-                    .collect::<Vec<_>>();
+                let retiring = engine.retiring_backend_batch(&target_ids);
                 if retiring.is_empty() {
                     break;
                 }
@@ -6938,6 +7051,22 @@ impl Engine {
                 }
             }
         });
+    }
+
+    fn retiring_backend_batch(&self, target_ids: &HashSet<String>) -> RetiringBackendBatch {
+        self.retiring_backends
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(id, _)| target_ids.contains(*id))
+            .flat_map(|(id, entries)| {
+                entries
+                    .iter()
+                    .cloned()
+                    .map(|backend| (id.clone(), backend))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
     }
 
     fn release_retiring_backend(&self, id: &str, backend: &Arc<dyn AgentBackend>) {
@@ -13659,7 +13788,7 @@ impl Engine {
             // thinking and OpenAI encrypted reasoning items) to persist and
             // replay verbatim across stateless tool-use turns.
             let mut reasoning: Vec<serde_json::Value> = Vec::new();
-            let mut thinking_streamed = false;
+            let mut thinking = ProviderThinkingState::default();
             let mut pending_events = Vec::new();
             let mut persist_deadline = None;
             let mut pending_native_steer = None;
@@ -13698,6 +13827,7 @@ impl Engine {
                 let event = match ev {
                     Ok(event) => event,
                     Err(error) => {
+                        thinking.finish(turn, &mut pending_events);
                         flush_backend_event_batch(&self.store, &scope, &mut pending_events).await?;
                         return Err(anyhow!("provider stream error: {error}"));
                     }
@@ -13709,9 +13839,14 @@ impl Engine {
                         pending_events.push(Event::AssistantDelta { turn, text: delta });
                     }
                     // Display-only; never joins the provider transcript.
-                    ProviderEvent::ThinkingDelta(delta) => {
-                        thinking_streamed = true;
-                        pending_events.push(Event::AssistantThinking { turn, text: delta });
+                    ProviderEvent::ThinkingStarted { id } => {
+                        thinking.start(id, turn, &mut pending_events);
+                    }
+                    ProviderEvent::ThinkingDelta { id, text } => {
+                        thinking.delta(id, text, turn, &mut pending_events);
+                    }
+                    ProviderEvent::ThinkingCompleted { id } => {
+                        thinking.complete(&id, turn, &mut pending_events);
                     }
                     // Kept out of the UI (already streamed as ThinkingDelta);
                     // carried in the transcript for replay only.
@@ -13734,9 +13869,9 @@ impl Engine {
                     persist_deadline = Some(Instant::now() + STREAM_EVENT_BATCH_WINDOW);
                 }
             }
-            if thinking_streamed {
-                pending_events.push(Event::AssistantThinkingCompleted { turn });
-            }
+            // Malformed or legacy-compatible streams may end without an
+            // explicit item completion. Close only the still-active item.
+            thinking.finish(turn, &mut pending_events);
             flush_backend_event_batch(&self.store, &scope, &mut pending_events).await?;
 
             // Catch every message that arrived at the exact response boundary.
@@ -13964,7 +14099,7 @@ impl Engine {
                 None => {}
                 Some(Ok(stream)) => {
                     let mut stream = trouve_providers::coalesce_event_stream(stream);
-                    let mut thinking_streamed = false;
+                    let mut thinking = ProviderThinkingState::default();
                     let mut pending_events = Vec::new();
                     let mut persist_deadline = None;
                     loop {
@@ -13987,9 +14122,14 @@ impl Engine {
                                 final_text.push_str(&delta);
                                 pending_events.push(Event::AssistantDelta { turn, text: delta });
                             }
-                            Ok(ProviderEvent::ThinkingDelta(delta)) => {
-                                thinking_streamed = true;
-                                pending_events.push(Event::AssistantThinking { turn, text: delta });
+                            Ok(ProviderEvent::ThinkingStarted { id }) => {
+                                thinking.start(id, turn, &mut pending_events);
+                            }
+                            Ok(ProviderEvent::ThinkingDelta { id, text }) => {
+                                thinking.delta(id, text, turn, &mut pending_events);
+                            }
+                            Ok(ProviderEvent::ThinkingCompleted { id }) => {
+                                thinking.complete(&id, turn, &mut pending_events);
                             }
                             Ok(ProviderEvent::Reasoning(block)) => final_reasoning.push(block),
                             Ok(ProviderEvent::Completed { mut usage }) => {
@@ -14019,9 +14159,7 @@ impl Engine {
                             persist_deadline = Some(Instant::now() + STREAM_EVENT_BATCH_WINDOW);
                         }
                     }
-                    if thinking_streamed {
-                        pending_events.push(Event::AssistantThinkingCompleted { turn });
-                    }
+                    thinking.finish(turn, &mut pending_events);
                     flush_backend_event_batch(&self.store, &scope, &mut pending_events).await?;
                 }
                 Some(Err(e)) => tracing::warn!("iteration-limit summary failed: {e}"),
@@ -15375,13 +15513,20 @@ impl Engine {
                         content: std::mem::take(&mut collaborator.segment),
                     });
                 }
+                collaborator.persisted.push(Event::AssistantThinking {
+                    turn,
+                    id: Some("reasoning".into()),
+                    text: delta,
+                });
+            }
+            BackendCollaboratorEvent::ThinkingCompleted => {
                 collaborator
                     .persisted
-                    .push(Event::AssistantThinking { turn, text: delta });
+                    .push(Event::AssistantThinkingCompleted {
+                        turn,
+                        id: Some("reasoning".into()),
+                    })
             }
-            BackendCollaboratorEvent::ThinkingCompleted => collaborator
-                .persisted
-                .push(Event::AssistantThinkingCompleted { turn }),
             BackendCollaboratorEvent::ToolStarted {
                 call_id,
                 tool,
@@ -16214,10 +16359,17 @@ impl Engine {
                             content: std::mem::take(&mut segment),
                         });
                     }
-                    persisted.push(Event::AssistantThinking { turn, text: delta });
+                    persisted.push(Event::AssistantThinking {
+                        turn,
+                        id: Some("reasoning".into()),
+                        text: delta,
+                    });
                 }
                 BackendEvent::ThinkingCompleted => {
-                    persisted.push(Event::AssistantThinkingCompleted { turn });
+                    persisted.push(Event::AssistantThinkingCompleted {
+                        turn,
+                        id: Some("reasoning".into()),
+                    });
                 }
                 BackendEvent::ToolStarted {
                     call_id,
@@ -20573,6 +20725,40 @@ mod tests {
         }
     }
 
+    #[test]
+    fn provider_reasoning_identity_survives_interleaved_tool_events() {
+        let mut thinking = ProviderThinkingState::default();
+        let mut events = Vec::new();
+
+        thinking.start("reasoning-a".into(), 7, &mut events);
+        thinking.delta("reasoning-a".into(), "first".into(), 7, &mut events);
+        events.push(Event::ToolRequested {
+            turn: 7,
+            call_id: "read".into(),
+            tool: "read_file".into(),
+            args: serde_json::json!({}),
+            requires_approval: false,
+        });
+        thinking.delta("reasoning-a".into(), " second".into(), 7, &mut events);
+        thinking.complete("reasoning-a", 7, &mut events);
+        thinking.start("reasoning-b".into(), 7, &mut events);
+        thinking.delta("reasoning-b".into(), "separate".into(), 7, &mut events);
+
+        assert!(matches!(
+            events.as_slice(),
+            [
+                Event::AssistantThinking { text: first, .. },
+                Event::ToolRequested { call_id, .. },
+                Event::AssistantThinking { text: second, .. },
+                Event::AssistantThinkingCompleted { .. },
+                Event::AssistantThinking { text: separate, .. },
+            ] if first == "first"
+                && call_id == "read"
+                && second == " second"
+                && separate == "separate"
+        ));
+    }
+
     fn persona_request(display_name: &str) -> trouve_protocol::UpsertPersonaRequest {
         trouve_protocol::UpsertPersonaRequest {
             display_name: display_name.into(),
@@ -23858,7 +24044,7 @@ default_permission_mode = "ask"
         )));
         assert!(events.iter().any(|event| matches!(
             &event.event,
-            Event::AssistantThinking { turn: 1, text }
+            Event::AssistantThinking { turn: 1, text, .. }
                 if text == "Checking the suite."
         )));
         assert!(events.iter().any(|event| matches!(
@@ -29595,7 +29781,7 @@ default_permission_mode = "ask"
     }
 
     #[tokio::test]
-    async fn provider_upsert_commits_config_before_publishing_replacement() {
+    async fn provider_secret_failure_preserves_the_active_backend() {
         let data = tempfile::tempdir().unwrap();
         let mut config = Config::default();
         config.providers.insert(
@@ -29615,13 +29801,15 @@ default_permission_mode = "ask"
         let engine = Arc::new(engine);
         *observing_store.engine.lock().unwrap() = Arc::downgrade(&engine);
         let entered = Arc::new(tokio::sync::Semaphore::new(0));
-        engine.backends.write().unwrap().insert(
-            "cursor".into(),
-            Arc::new(BlockingShutdownBackend {
-                entered,
-                release: Arc::new(tokio::sync::Semaphore::new(1)),
-            }),
-        );
+        let active: Arc<dyn AgentBackend> = Arc::new(BlockingShutdownBackend {
+            entered: entered.clone(),
+            release: Arc::new(tokio::sync::Semaphore::new(1)),
+        });
+        engine
+            .backends
+            .write()
+            .unwrap()
+            .insert("cursor".into(), active.clone());
 
         let result = engine
             .upsert_provider(
@@ -29636,12 +29824,20 @@ default_permission_mode = "ask"
 
         assert!(result.is_err());
         assert!(
-            !observing_store
+            observing_store
                 .saw_published_backend
                 .load(std::sync::atomic::Ordering::SeqCst),
-            "replacement became visible before the config mutation completed"
+            "the healthy backend was retired before the secret write succeeded"
         );
-        assert!(engine.backends.read().unwrap().contains_key("cursor"));
+        assert_eq!(
+            entered.available_permits(),
+            0,
+            "secret-store rejection attempted backend shutdown"
+        );
+        assert!(Arc::ptr_eq(
+            &engine.backends.read().unwrap()["cursor"],
+            &active
+        ));
         assert_eq!(
             engine.config.lock().unwrap().providers["cursor"].kind,
             "cursor-sdk"
@@ -30119,6 +30315,33 @@ default_permission_mode = "ask"
                 .load(std::sync::atomic::Ordering::SeqCst),
             2
         );
+    }
+
+    #[test]
+    fn retirement_retry_batch_excludes_ids_without_transition_locks() {
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &Config::default(),
+        );
+        let locked: Arc<dyn AgentBackend> = Arc::new(FailingShutdownBackend {
+            shutdowns: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let added_later: Arc<dyn AgentBackend> = Arc::new(FailingShutdownBackend {
+            shutdowns: std::sync::atomic::AtomicUsize::new(0),
+        });
+        engine.retiring_backends.lock().unwrap().extend([
+            ("locked".into(), vec![locked.clone()]),
+            ("added-later".into(), vec![added_later.clone()]),
+        ]);
+
+        let batch = engine.retiring_backend_batch(&HashSet::from(["locked".into()]));
+
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].0, "locked");
+        assert!(Arc::ptr_eq(&batch[0].1, &locked));
+        assert!(!Arc::ptr_eq(&batch[0].1, &added_later));
     }
 
     #[tokio::test]

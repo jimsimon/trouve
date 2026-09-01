@@ -445,6 +445,10 @@ pub enum ThreadViewItem {
     },
     Thinking {
         turn: u64,
+        /// Provider-owned reasoning-item identity. Absent for legacy,
+        /// boundary-inferred reasoning streams.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
         content: String,
         complete: bool,
     },
@@ -584,6 +588,10 @@ pub struct ThreadViewSnapshot {
     pub turn_running: bool,
     #[serde(default)]
     pub thinking: bool,
+    /// Provider-owned identity for the active thinking item. Absent for
+    /// snapshots reconstructed from legacy, boundary-inferred events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_thinking_id: Option<String>,
     /// Current transient activity for the running turn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_phase: Option<crate::TurnPhase>,

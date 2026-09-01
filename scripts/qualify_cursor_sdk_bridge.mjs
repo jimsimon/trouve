@@ -133,7 +133,7 @@ Requires CURSOR_API_KEY. The default run downloads and verifies Cursor SDK
 Bridge v${BRIDGE_VERSION}, then performs two billable local SDK turns.
 
 Options:
-  --bridge PATH     Use an existing cursor-sdk-bridge binary
+  --bridge PATH     Use an existing binary (reported as unverified, not pinned)
   --workspace PATH  Workspace shown to the sandboxed agent (default: repo root)
   --model ID        Cursor model id (default: composer-2 when available)
   --timeout SECONDS Timeout for startup and each RPC/turn (default: 300)
@@ -390,6 +390,18 @@ async function resolveBridge(explicit, temporaryRoot, timeoutMilliseconds) {
   const binary = join(extracted, "bin", executable);
   await access(binary, fsConstants.X_OK);
   return { binary, downloaded: true };
+}
+
+function bridgeReleaseAttestation(resolvedBridge) {
+  return resolvedBridge.downloaded
+    ? {
+        source: "verified-pinned-release",
+        pinnedRelease: BRIDGE_VERSION,
+      }
+    : {
+        source: "explicit-unverified-binary",
+        pinnedRelease: null,
+      };
 }
 
 function secureBearerMatches(header, token) {
@@ -1484,6 +1496,7 @@ async function main() {
       temporaryRoot,
       timeoutMilliseconds,
     );
+    const releaseAttestation = bridgeReleaseAttestation(resolvedBridge);
     callback = await startToolCallbackServer(timeoutMilliseconds);
     bridge = await startBridge({
       binary: resolvedBridge.binary,
@@ -1594,7 +1607,8 @@ async function main() {
           result: "pass",
           bridge_version: version.bridgeVersion,
           protocol_version: version.protocolVersion,
-          pinned_release: BRIDGE_VERSION,
+          bridge_source: releaseAttestation.source,
+          pinned_release: releaseAttestation.pinnedRelease,
           api_key_authentication: true,
           model,
           built_ins_confined: true,
@@ -1636,6 +1650,7 @@ export {
   assetName,
   assistantText,
   assertUniqueToolLifecycle,
+  bridgeReleaseAttestation,
   capPendingDiagnostic,
   combineQualificationAndCleanupErrors,
   connectFrame,

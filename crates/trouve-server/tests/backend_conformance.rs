@@ -82,7 +82,16 @@ impl Provider for ConformanceProvider {
             .any(|message| matches!(message, Message::User(text) if text == "verify parity"));
         drop(observation);
         Ok(Box::pin(futures::stream::iter(vec![
-            Ok(ProviderEvent::ThinkingDelta(THINKING.into())),
+            Ok(ProviderEvent::ThinkingStarted {
+                id: "reasoning".into(),
+            }),
+            Ok(ProviderEvent::ThinkingDelta {
+                id: "reasoning".into(),
+                text: THINKING.into(),
+            }),
+            Ok(ProviderEvent::ThinkingCompleted {
+                id: "reasoning".into(),
+            }),
             Ok(ProviderEvent::TextDelta(ANSWER.into())),
             Ok(ProviderEvent::Completed { usage: usage() }),
         ])))

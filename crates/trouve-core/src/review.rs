@@ -7833,6 +7833,7 @@ impl Engine {
                 Event::AssistantThinking {
                     turn: event_turn,
                     text,
+                    ..
                 } if event_turn == turn => {
                     projected.push(trouve_protocol::CodeReviewOutputStream::Thinking, &text);
                     observed_stage = output_stage;

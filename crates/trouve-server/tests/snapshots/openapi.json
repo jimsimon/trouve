@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "7.30"
+    "version": "7.31"
   },
   "paths": {
     "/v1/approvals": {
@@ -8001,13 +8001,19 @@
           },
           {
             "type": "object",
-            "description": "Streamed model reasoning (\"thinking\") text, where the provider\nexposes it. Display-only: never part of the provider transcript.",
+            "description": "Streamed model reasoning (\"thinking\") text, where the provider\nexposes it. Display-only: never part of the provider transcript.\nThe id is present for identity-aware streams whose reasoning may span\ninterleaved tool events; legacy persisted events omit it.",
             "required": [
               "turn",
               "text",
               "type"
             ],
             "properties": {
+              "id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
               "text": {
                 "type": "string"
               },
@@ -8032,6 +8038,12 @@
               "type"
             ],
             "properties": {
+              "id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
               "turn": {
                 "type": "integer",
                 "format": "int64",
@@ -13276,6 +13288,13 @@
               "content": {
                 "type": "string"
               },
+              "id": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Provider-owned reasoning-item identity. Absent for legacy,\nboundary-inferred reasoning streams."
+              },
               "kind": {
                 "type": "string",
                 "enum": [
@@ -13497,6 +13516,13 @@
           "items"
         ],
         "properties": {
+          "active_thinking_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Provider-owned identity for the active thinking item. Absent for\nsnapshots reconstructed from legacy, boundary-inferred events."
+          },
           "active_usage": {
             "oneOf": [
               {
