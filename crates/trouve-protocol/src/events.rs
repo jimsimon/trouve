@@ -527,6 +527,18 @@ pub enum Event {
     },
     #[serde(rename = "session.pr_opened")]
     SessionPrOpened { number: u64, url: String },
+    /// A pull request browser URL appeared in user-visible session chat.
+    /// This is intentionally separate from `session.pr_opened`: mentions
+    /// associate a PR for navigation without claiming that the session
+    /// created or owns its branch.
+    #[serde(rename = "session.pr_mentioned")]
+    SessionPrMentioned {
+        session_id: SessionId,
+        number: u64,
+        /// Canonical browser URL supplied by chat. A number without repository
+        /// identity is not globally unique and does not emit this event.
+        url: String,
+    },
     #[serde(rename = "session.deleted")]
     SessionDeleted {
         session_id: SessionId,
@@ -739,6 +751,26 @@ mod tests {
             }
             _ => panic!("wrong event variant"),
         }
+    }
+
+    #[test]
+    fn session_pr_mentioned_roundtrips_with_canonical_url() {
+        let event = Event::SessionPrMentioned {
+            session_id: "se_1".into(),
+            number: 350,
+            url: "https://github.com/trouve-ai/trouve/pull/350".into(),
+        };
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value["type"], "session.pr_mentioned");
+        assert_eq!(value["session_id"], "se_1");
+        assert!(matches!(
+            serde_json::from_value::<Event>(value).unwrap(),
+            Event::SessionPrMentioned {
+                session_id,
+                number: 350,
+                url,
+            } if session_id == "se_1" && url.ends_with("/pull/350")
+        ));
     }
 
     #[test]

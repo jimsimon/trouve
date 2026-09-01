@@ -992,9 +992,10 @@ pub struct GithubPrHostProjection {
     pub pull_requests: GithubPrList,
 }
 
-/// Pull requests already associated with one session using durable branch or
-/// `session.pr_opened` evidence. This is a local projection of the persisted
-/// account snapshots and never performs a GitHub request.
+/// Pull requests associated with one session by its branch, verified creation,
+/// or a durable chat mention. This is a local projection of the persisted
+/// account snapshots and never performs a GitHub request. Session-created PRs
+/// precede mention-only PRs.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SessionPrProjection {
     pub session_id: SessionId,

@@ -3127,6 +3127,17 @@ export interface components {
             type: "session.pr_opened";
             url: string;
         } | {
+            /** Format: int64 */
+            number: number;
+            session_id: components["schemas"]["String"];
+            /** @enum {string} */
+            type: "session.pr_mentioned";
+            /**
+             * @description Canonical browser URL supplied by chat. A number without repository
+             *     identity is not globally unique and does not emit this event.
+             */
+            url: string;
+        } | {
             session_id: components["schemas"]["String"];
             /** @enum {string} */
             type: "session.deleted";
@@ -4399,9 +4410,10 @@ export interface components {
          */
         SessionOutcome: "idle" | "running" | "succeeded" | "failed";
         /**
-         * @description Pull requests already associated with one session using durable branch or
-         *     `session.pr_opened` evidence. This is a local projection of the persisted
-         *     account snapshots and never performs a GitHub request.
+         * @description Pull requests associated with one session by its branch, verified creation,
+         *     or a durable chat mention. This is a local projection of the persisted
+         *     account snapshots and never performs a GitHub request. Session-created PRs
+         *     precede mention-only PRs.
          */
         SessionPrProjection: {
             prs: components["schemas"]["PrInfo"][];

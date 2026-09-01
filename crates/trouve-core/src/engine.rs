@@ -2256,18 +2256,50 @@ impl GithubPrDetailCache {
     }
 }
 
+const TURN_STEER_PENDING_CAPACITY: usize = 8;
+
+struct SteerResponse {
+    sender: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
+}
+
+impl SteerResponse {
+    fn send(mut self, result: Result<(), String>) {
+        if let Some(sender) = self.sender.take() {
+            let _ = sender.send(result);
+        }
+    }
+}
+
+impl Drop for SteerResponse {
+    fn drop(&mut self) {
+        if let Some(sender) = self.sender.take() {
+            let _ = sender.send(Err(
+                "turn ended before steering was acknowledged".to_string()
+            ));
+        }
+    }
+}
+
 struct SteerTurnCommand {
     content: String,
     attachments: Vec<trouve_protocol::Attachment>,
     attachment_rows: Vec<(trouve_protocol::Attachment, String)>,
     attachment_cleanup: PreparedAttachmentCleanup,
-    response: tokio::sync::oneshot::Sender<Result<(), String>>,
+    response: SteerResponse,
+    _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
 #[derive(Clone)]
 struct ActiveTurnSteerer {
     turn: u64,
     sender: tokio::sync::mpsc::Sender<SteerTurnCommand>,
+    permits: Arc<tokio::sync::Semaphore>,
+    mutation_lane_state: tokio::sync::watch::Sender<SteerMutationLaneState>,
+}
+
+struct PendingTurnSteerer {
+    turn: u64,
+    receiver: tokio::sync::mpsc::Receiver<SteerTurnCommand>,
     mutation_lane_state: tokio::sync::watch::Sender<SteerMutationLaneState>,
 }
 
@@ -2333,7 +2365,33 @@ fn reserve_ready_steer_after_event_budget<T>(
 
 fn reject_pending_steer(pending: &mut Option<SteerTurnCommand>, reason: &str) {
     if let Some(SteerTurnCommand { response, .. }) = pending.take() {
-        let _ = response.send(Err(reason.into()));
+        response.send(Err(reason.into()));
+    }
+}
+
+fn reject_steer_commands(
+    receiver: &mut Option<tokio::sync::mpsc::Receiver<SteerTurnCommand>>,
+    pending: &mut Option<SteerTurnCommand>,
+    deferred: &mut Vec<SteerTurnCommand>,
+    reason: &str,
+) {
+    reject_pending_steer(pending, reason);
+    for SteerTurnCommand { response, .. } in deferred.drain(..) {
+        response.send(Err(reason.into()));
+    }
+    if let Some(receiver) = receiver {
+        while let Ok(SteerTurnCommand { response, .. }) = receiver.try_recv() {
+            response.send(Err(reason.into()));
+        }
+    }
+}
+
+/// Stop every current or previously cloned sender before the terminal drain.
+/// Closing the receiver is what makes a send that raced registry removal fail
+/// promptly instead of enqueueing work that no loop will poll.
+fn close_steer_receiver<T>(receiver: &mut Option<tokio::sync::mpsc::Receiver<T>>) {
+    if let Some(receiver) = receiver {
+        receiver.close();
     }
 }
 
@@ -2875,6 +2933,10 @@ pub struct Engine {
     /// additional user input during an active turn. The turn number protects
     /// cleanup from removing a newer registration for the same thread.
     turn_steerers: Mutex<HashMap<String, ActiveTurnSteerer>>,
+    /// Provider/backend receivers installed before their steerable
+    /// `turn.started` event becomes visible. `run_turn` claims the receiver;
+    /// the public sender is already ready when clients observe the event.
+    pending_turn_steerers: Mutex<HashMap<String, PendingTurnSteerer>>,
     /// Threads where a new prompt arrived after cancellation was requested.
     /// The cancelling dispatcher consumes this marker and resumes the queue
     /// instead of leaving that explicitly submitted follow-up paused.
@@ -3412,6 +3474,7 @@ impl Engine {
             deleting_sessions: Mutex::new(std::collections::HashSet::new()),
             turn_cancels: Mutex::new(std::collections::HashMap::new()),
             turn_steerers: Mutex::new(HashMap::new()),
+            pending_turn_steerers: Mutex::new(HashMap::new()),
             resume_after_cancel: Mutex::new(HashSet::new()),
             github_dashboard_caches: Mutex::new(HashMap::new()),
             github_pr_detail_cache: Mutex::new(GithubPrDetailCache::default()),
@@ -8207,6 +8270,28 @@ impl Engine {
             .collect())
     }
 
+    /// Mention-only associations are navigation evidence, not authorization
+    /// for GitHub mutations. Mutation targets must either have a durable
+    /// session-created link or a head commit verified in the session worktree.
+    async fn session_pr_allows_mutation(
+        &self,
+        session_id: &str,
+        pr: &trouve_protocol::PrInfo,
+    ) -> Result<bool, EngineError> {
+        let normalized_url = pr.url.trim_end_matches('/').to_ascii_lowercase();
+        if self
+            .recorded_session_pr_urls(session_id)?
+            .contains(&normalized_url)
+        {
+            return Ok(true);
+        }
+        Ok(self.pr_has_locally_verified_head(session_id, pr).await)
+    }
+
+    fn mentioned_session_prs(&self, session_id: &str) -> Result<HashSet<String>, EngineError> {
+        Ok(self.store.session_pr_mentions(session_id)?)
+    }
+
     /// Provider-neutral evidence tying GitHub activity to this session.
     /// Explicit PR references work for any integration; successful tool args
     /// and produced commit IDs preserve enough identity to discover a PR that
@@ -8298,12 +8383,14 @@ impl Engine {
         for number in evidence.numbers {
             if seen.insert(number) {
                 let already_recorded = evidence.recorded_numbers.contains(&number);
+                let explicitly_mentioned = evidence.mentioned_numbers.contains(&number);
                 match github.pr(number).await {
                     Ok(pr)
                         if already_recorded
+                            || explicitly_mentioned
                             || self.pr_has_locally_verified_head(session_id, &pr).await =>
                     {
-                        if !already_recorded {
+                        if !already_recorded && !explicitly_mentioned {
                             self.record_session_pr_numbers(
                                 session_id,
                                 &repository,
@@ -8328,8 +8415,60 @@ impl Engine {
                 }
             }
         }
-        prs.sort_by_key(|pr| (pr.state != "open", std::cmp::Reverse(pr.number)));
+        prs.sort_by_key(|pr| {
+            (
+                if pr.workspace_id == session.workspace_id && pr.head == session.branch {
+                    0
+                } else if evidence.recorded_numbers.contains(&pr.number) {
+                    1
+                } else {
+                    2
+                },
+                pr.state != "open",
+                std::cmp::Reverse(pr.number),
+            )
+        });
         Ok(prs)
+    }
+
+    fn project_session_pr_candidates<'a>(
+        candidates: impl IntoIterator<Item = &'a trouve_protocol::PrInfo>,
+        session: &Session,
+        linked_urls: &HashSet<String>,
+        mentioned_urls: &HashSet<String>,
+    ) -> Vec<trouve_protocol::PrInfo> {
+        let mut seen = HashSet::new();
+        let mut prs = candidates
+            .into_iter()
+            .filter(|pr| {
+                (pr.workspace_id == session.workspace_id && pr.head == session.branch)
+                    || linked_urls.contains(&pr.url.trim_end_matches('/').to_ascii_lowercase())
+                    || mentioned_urls.contains(&pr.url.trim_end_matches('/').to_ascii_lowercase())
+            })
+            .filter(|pr| {
+                seen.insert((
+                    pr.host.to_ascii_lowercase(),
+                    pr.repository.to_ascii_lowercase(),
+                    pr.number,
+                ))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        prs.sort_by_key(|pr| {
+            let url = pr.url.trim_end_matches('/').to_ascii_lowercase();
+            (
+                if pr.workspace_id == session.workspace_id && pr.head == session.branch {
+                    0
+                } else if linked_urls.contains(&url) {
+                    1
+                } else {
+                    2
+                },
+                pr.state != "open",
+                std::cmp::Reverse(pr.number),
+            )
+        });
+        prs
     }
 
     /// Session-to-PR authorization from the newest persisted account
@@ -8342,24 +8481,20 @@ impl Engine {
     ) -> Result<Vec<trouve_protocol::PrInfo>, EngineError> {
         let session = self.get_session(session_id)?;
         let linked_urls = self.recorded_session_pr_urls(session_id)?;
-        let mut seen = HashSet::new();
-        let mut prs = Vec::new();
+        let mentioned_urls = self.mentioned_session_prs(session_id)?;
+        let mut candidates = Vec::new();
         for (host, _) in self.github_hosts() {
             let Some(snapshot) = self.store.latest_github_pr_snapshot(&host)? else {
                 continue;
             };
-            prs.extend(snapshot.prs.into_iter().filter(|pr| {
-                ((pr.workspace_id == session.workspace_id && pr.head == session.branch)
-                    || linked_urls.contains(&pr.url.trim_end_matches('/').to_ascii_lowercase()))
-                    && seen.insert((
-                        pr.host.to_ascii_lowercase(),
-                        pr.repository.to_ascii_lowercase(),
-                        pr.number,
-                    ))
-            }));
+            candidates.extend(snapshot.prs);
         }
-        prs.sort_by_key(|pr| (pr.state != "open", std::cmp::Reverse(pr.number)));
-        Ok(prs)
+        Ok(Self::project_session_pr_candidates(
+            &candidates,
+            &session,
+            &linked_urls,
+            &mentioned_urls,
+        ))
     }
 
     fn projected_session_pr(
@@ -8502,6 +8637,11 @@ impl Engine {
         use trouve_protocol::{PrActionRequest as Action, PrDetailSection as Section};
 
         let (session, pr) = self.projected_session_pr(session_id, number)?;
+        if !self.session_pr_allows_mutation(session_id, &pr).await? {
+            return Err(EngineError::BadRequest(format!(
+                "pull request #{number} is associated for navigation only"
+            )));
+        }
         let key = GithubPrDetailKey::from_info(&pr);
         let required = match action {
             Action::UpdateReview { .. }
@@ -8649,24 +8789,13 @@ impl Engine {
         let mut session_pull_requests = Vec::new();
         for session in self.list_sessions(None)? {
             let linked_urls = self.recorded_session_pr_urls(&session.id)?;
-            let mut seen = HashSet::new();
-            let mut prs = account_prs
-                .iter()
-                .copied()
-                .filter(|pr| {
-                    (pr.workspace_id == session.workspace_id && pr.head == session.branch)
-                        || linked_urls.contains(&pr.url.trim_end_matches('/').to_ascii_lowercase())
-                })
-                .filter(|pr| {
-                    seen.insert((
-                        pr.host.to_ascii_lowercase(),
-                        pr.repository.to_ascii_lowercase(),
-                        pr.number,
-                    ))
-                })
-                .cloned()
-                .collect::<Vec<_>>();
-            prs.sort_by_key(|pr| (pr.state != "open", std::cmp::Reverse(pr.number)));
+            let mentioned_urls = self.mentioned_session_prs(&session.id)?;
+            let prs = Self::project_session_pr_candidates(
+                account_prs.iter().copied(),
+                &session,
+                &linked_urls,
+                &mentioned_urls,
+            );
             if !prs.is_empty() {
                 session_pull_requests.push(trouve_protocol::SessionPrProjection {
                     session_id: session.id,
@@ -9178,10 +9307,19 @@ impl Engine {
     ) -> Result<(), EngineError> {
         let session = self.get_session(session_id)?;
         let github = self.github_for_session(&session)?;
-        let pr = self
-            .session_pr(session_id)
-            .await?
-            .ok_or_else(|| EngineError::NotFound("no open PR for this session".into()))?;
+        let mut pr = None;
+        for candidate in self.session_prs(session_id).await? {
+            if candidate.state == "open"
+                && self
+                    .session_pr_allows_mutation(session_id, &candidate)
+                    .await?
+            {
+                pr = Some(candidate);
+                break;
+            }
+        }
+        let pr =
+            pr.ok_or_else(|| EngineError::NotFound("no mutable open PR for this session".into()))?;
         github
             .merge_pr(pr.number, method.unwrap_or("merge"))
             .await
@@ -11727,35 +11865,36 @@ impl Engine {
         self.send_message_with_tools(thread_id, content, Vec::new(), false, false)
     }
 
+    fn turn_supports_steering(&self, thread: &Thread, tools_enabled: bool) -> bool {
+        tools_enabled
+            && self
+                .backend_for(&thread.model)
+                .is_none_or(|(_, backend, _)| backend.supports_steering())
+    }
+
     fn turn_shell_events(
         &self,
         thread: &Thread,
         turn: u64,
         prompt: &trouve_protocol::QueuedPrompt,
-        tools_enabled: bool,
+        supports_steering: bool,
     ) -> Result<Vec<Event>, EngineError> {
         let mut model_options = self.store.thread_model_options(&thread.id)?;
-        let (selected_model, supports_steering) =
+        let selected_model =
             if let Some((_backend_id, backend, _model_name)) = self.backend_for(&thread.model) {
-                (
-                    backend
-                        .models()
-                        .into_iter()
-                        .find(|model| model.id == thread.model),
-                    tools_enabled && backend.supports_steering(),
-                )
+                backend
+                    .models()
+                    .into_iter()
+                    .find(|model| model.id == thread.model)
             } else {
-                (
-                    self.resolve_provider(&thread.model)
-                        .ok()
-                        .and_then(|(provider, _)| {
-                            provider
-                                .models()
-                                .into_iter()
-                                .find(|model| model.id == thread.model)
-                        }),
-                    false,
-                )
+                self.resolve_provider(&thread.model)
+                    .ok()
+                    .and_then(|(provider, _)| {
+                        provider
+                            .models()
+                            .into_iter()
+                            .find(|model| model.id == thread.model)
+                    })
             };
         if selected_model.is_some() {
             normalize_thinking_option(&mut model_options, selected_model.as_ref());
@@ -11771,6 +11910,95 @@ impl Engine {
             },
             dispatched_prompt_event(turn, prompt),
         ])
+    }
+
+    fn register_turn_steerer(&self, thread_id: &str, turn: u64) {
+        let (sender, receiver) = tokio::sync::mpsc::channel(TURN_STEER_PENDING_CAPACITY);
+        let permits = Arc::new(tokio::sync::Semaphore::new(TURN_STEER_PENDING_CAPACITY));
+        let (mutation_lane_state, _) = tokio::sync::watch::channel(SteerMutationLaneState::Idle);
+        let pending = PendingTurnSteerer {
+            turn,
+            receiver,
+            mutation_lane_state: mutation_lane_state.clone(),
+        };
+        if let Some(replaced) = self
+            .pending_turn_steerers
+            .lock()
+            .unwrap()
+            .insert(thread_id.to_string(), pending)
+        {
+            replaced
+                .mutation_lane_state
+                .send_replace(SteerMutationLaneState::Ended);
+        }
+        if let Some(replaced) = self.turn_steerers.lock().unwrap().insert(
+            thread_id.to_string(),
+            ActiveTurnSteerer {
+                turn,
+                sender,
+                permits,
+                mutation_lane_state,
+            },
+        ) {
+            replaced
+                .mutation_lane_state
+                .send_replace(SteerMutationLaneState::Ended);
+        }
+    }
+
+    fn take_turn_steerer(&self, thread_id: &str, turn: u64) -> Option<PendingTurnSteerer> {
+        let mut pending = self.pending_turn_steerers.lock().unwrap();
+        pending
+            .get(thread_id)
+            .is_some_and(|entry| entry.turn == turn)
+            .then(|| pending.remove(thread_id).expect("matching pending steerer"))
+    }
+
+    fn unregister_turn_steerer(&self, thread_id: &str, turn: u64) {
+        if let Some(pending) = self.take_turn_steerer(thread_id, turn) {
+            pending
+                .mutation_lane_state
+                .send_replace(SteerMutationLaneState::Ended);
+        }
+        let mut active = self.turn_steerers.lock().unwrap();
+        if active
+            .get(thread_id)
+            .is_some_and(|entry| entry.turn == turn)
+            && let Some(removed) = active.remove(thread_id)
+        {
+            removed
+                .mutation_lane_state
+                .send_replace(SteerMutationLaneState::Ended);
+        }
+    }
+
+    /// Returns whether the exact turn has installed its steering receiver.
+    /// This is a narrow lifecycle diagnostic used by integration tests to
+    /// verify that the advertised capability and receiver become visible at
+    /// the same commit boundary.
+    #[doc(hidden)]
+    pub fn turn_accepts_steering(&self, thread_id: &str, turn: u64) -> bool {
+        self.turn_steerers
+            .lock()
+            .unwrap()
+            .get(thread_id)
+            .is_some_and(|steerer| steerer.turn == turn)
+    }
+
+    /// Returns the number of steering commands admitted but not yet
+    /// acknowledged for an exact turn. Integration tests use this instead of
+    /// a scheduling delay when they need to observe bounded queued or
+    /// boundary-deferred work.
+    #[doc(hidden)]
+    pub fn pending_turn_steers(&self, thread_id: &str, turn: u64) -> usize {
+        self.turn_steerers
+            .lock()
+            .unwrap()
+            .get(thread_id)
+            .filter(|steerer| steerer.turn == turn)
+            .map_or(0, |steerer| {
+                TURN_STEER_PENDING_CAPACITY - steerer.permits.available_permits()
+            })
     }
 
     /// Append user guidance to the exact backend turn currently running on a
@@ -11806,6 +12034,9 @@ impl Engine {
             .ok_or_else(|| {
                 EngineError::Conflict(format!("thread {thread_id} has no steerable turn ready"))
             })?;
+        let permit = active.permits.clone().try_acquire_owned().map_err(|_| {
+            EngineError::Conflict(format!("turn {} steering queue is full", active.turn))
+        })?;
         let (prepared, attachment_cleanup) = self.prepare_attachments(uploads)?;
         let attachments = prepared
             .iter()
@@ -11823,7 +12054,10 @@ impl Engine {
                 attachments,
                 attachment_rows,
                 attachment_cleanup,
-                response,
+                response: SteerResponse {
+                    sender: Some(response),
+                },
+                _permit: permit,
             })
             .await
             .is_err()
@@ -11849,6 +12083,124 @@ impl Engine {
             thread_id: thread_id.to_string(),
             turn: active.turn,
         })
+    }
+
+    async fn accept_native_steer_command(
+        &self,
+        session: &Session,
+        thread: &Thread,
+        turn: u64,
+        cancel: &tokio_util::sync::CancellationToken,
+        mutation_lane_state: &tokio::sync::watch::Sender<SteerMutationLaneState>,
+        command: SteerTurnCommand,
+    ) -> Result<()> {
+        let scope = Scope::Thread(thread.id.clone());
+        let SteerTurnCommand {
+            content,
+            attachments,
+            attachment_rows,
+            mut attachment_cleanup,
+            response,
+            _permit,
+        } = command;
+        if cancel.is_cancelled() {
+            response.send(Err("turn cancelled".into()));
+            return Ok(());
+        }
+
+        let staged = attachment_rows
+            .iter()
+            .map(|(attachment, path)| AttachmentMaterializationFile {
+                attachment: attachment.clone(),
+                source: PathBuf::from(path),
+            })
+            .collect::<Vec<_>>();
+        let materialized = if staged.is_empty() {
+            Vec::new()
+        } else {
+            let lane = self.tool_execution_lock(&session.id);
+            let permit = match lane.try_write_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    mutation_lane_state.send_replace(SteerMutationLaneState::Waiting);
+                    let lane = self.tool_execution_lock(&session.id);
+                    let permit = tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => {
+                            mutation_lane_state.send_replace(SteerMutationLaneState::Idle);
+                            response.send(Err("turn cancelled".into()));
+                            return Ok(());
+                        }
+                        permit = lane.write_owned() => permit,
+                    };
+                    mutation_lane_state.send_replace(SteerMutationLaneState::Idle);
+                    permit
+                }
+            };
+            let result = self
+                .executor
+                .materialize_attachments(&AttachmentMaterialization {
+                    source_root: self.data_dir.join("attachments"),
+                    managed_worktree_root: self.data_dir.join("worktrees"),
+                    worktree: PathBuf::from(&session.worktree_path),
+                    files: staged,
+                    cancel: cancel.clone(),
+                })
+                .await;
+            drop(permit);
+            match result {
+                Ok(materialized) => materialized,
+                Err(error) => {
+                    response.send(Err(error.clone()));
+                    return Ok(());
+                }
+            }
+        };
+
+        let prompt_files = materialized
+            .iter()
+            .map(|file| (file.attachment.clone(), file.relative_path.clone()))
+            .collect::<Vec<_>>();
+        let provider_prompt = annotate_attachments(content.clone(), &prompt_files);
+        let payload = match serde_json::to_value(Message::User(provider_prompt)) {
+            Ok(payload) => payload,
+            Err(error) => {
+                let mut message = error.to_string();
+                if let Err(cleanup) = self.rollback_materialized_attachments(session, &materialized)
+                {
+                    message.push_str(&format!(
+                        "; materialized attachment rollback failed: {cleanup}"
+                    ));
+                }
+                let error = anyhow!(message);
+                response.send(Err(error.to_string()));
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.store.append_event_with_message(
+            scope,
+            Event::TurnSteered {
+                turn,
+                content,
+                attachments,
+            },
+            &thread.id,
+            &payload,
+            attachment_rows,
+            attachment_cleanup.claim(),
+        ) {
+            let mut message = error.to_string();
+            if let Err(cleanup) = self.rollback_materialized_attachments(session, &materialized) {
+                message.push_str(&format!(
+                    "; materialized attachment rollback failed: {cleanup}"
+                ));
+            }
+            response.send(Err(message));
+            return Err(error);
+        }
+        attachment_cleanup.disarm();
+        response.send(Ok(()));
+        Ok(())
     }
 
     /// Whether the current turn has accepted attachment-bearing steering and
@@ -12029,8 +12381,26 @@ impl Engine {
                 prompts: visible_queue,
             },
         ));
+        let turn_steering = self.turn_supports_steering(&thread, started_tools_enabled);
+        if turn_steering {
+            // Install the receiver before even constructing TurnStarted. This
+            // keeps capability publication and readiness in one visibly
+            // ordered lifecycle: every path after this point unregisters on
+            // failure until the spawned turn takes ownership.
+            self.register_turn_steerer(thread_id, turn);
+        }
+        let shell_events =
+            match self.turn_shell_events(&thread, turn, &started_prompt, turn_steering) {
+                Ok(events) => events,
+                Err(error) => {
+                    if turn_steering {
+                        self.unregister_turn_steerer(thread_id, turn);
+                    }
+                    return Err(error);
+                }
+            };
         events.extend(
-            self.turn_shell_events(&thread, turn, &started_prompt, started_tools_enabled)?
+            shell_events
                 .into_iter()
                 .map(|event| (Scope::Thread(thread_id.to_string()), event)),
         );
@@ -12049,6 +12419,9 @@ impl Engine {
             events,
         );
         if let Err(error) = accepted {
+            if turn_steering {
+                self.unregister_turn_steerer(thread_id, turn);
+            }
             active.remove(thread_id);
             self.clear_cancel(thread_id);
             drop(active);
@@ -12214,6 +12587,35 @@ impl Engine {
             })
             .await
             .map_err(|error| EngineError::Internal(anyhow!(error)))
+    }
+
+    fn rollback_materialized_attachments(
+        &self,
+        session: &Session,
+        materialized: &[MaterializedAttachment],
+    ) -> Result<(), String> {
+        if materialized.is_empty() {
+            return Ok(());
+        }
+        let paths = materialized
+            .iter()
+            .map(|file| file.absolute_path.clone())
+            .collect::<Vec<_>>();
+        self.rollback_materialized_attachment_paths(session, &paths)
+    }
+
+    fn rollback_materialized_attachment_paths(
+        &self,
+        session: &Session,
+        paths: &[PathBuf],
+    ) -> Result<(), String> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let root = PathBuf::from(&session.worktree_path)
+            .join(".trouve")
+            .join("attachments");
+        self.executor.rollback_attachment_files(&root, paths)
     }
 
     /// Publish the thread's current queue on its event stream.
@@ -12941,11 +13343,41 @@ impl Engine {
         let content = prompt.content.clone();
         let attachments = prompt.attachments.clone();
         let tools_enabled = self.store.queued_prompt_tools_enabled(&prompt.id)?;
+        let turn_steering = self.turn_supports_steering(thread, tools_enabled);
+        if turn_steering && !prompt_persisted.load(Ordering::Acquire) {
+            // Queued prompts publish their shell only when claimed. Register
+            // before that publication for the same readiness guarantee as an
+            // immediately-started prompt.
+            self.register_turn_steerer(&thread.id, turn);
+        }
+        let pending_turn_steerer = if turn_steering {
+            self.take_turn_steerer(&thread.id, turn).or_else(|| {
+                // Defensive recovery for a process-local registry loss: keep
+                // the active turn steerable, though ordinary sends always
+                // install this before TurnStarted is committed.
+                self.register_turn_steerer(&thread.id, turn);
+                self.take_turn_steerer(&thread.id, turn)
+            })
+        } else {
+            None
+        };
+        let (mut turn_steer_rx, turn_steer_mutation_lane_state) =
+            if let Some(pending) = pending_turn_steerer {
+                (Some(pending.receiver), pending.mutation_lane_state)
+            } else {
+                let (state, _) = tokio::sync::watch::channel(SteerMutationLaneState::Idle);
+                (None, state)
+            };
+        let turn_steerer_guard = turn_steering.then(|| ActiveTurnSteererGuard {
+            registry: &self.turn_steerers,
+            thread_id: thread.id.clone(),
+            turn,
+        });
         if !prompt_persisted.load(Ordering::Acquire) {
             self.store
                 .append_events_async(
                     Scope::Thread(thread.id.clone()),
-                    self.turn_shell_events(thread, turn, prompt, tools_enabled)?,
+                    self.turn_shell_events(thread, turn, prompt, turn_steering)?,
                 )
                 .await?;
             prompt_persisted.store(true, Ordering::Release);
@@ -13034,6 +13466,8 @@ impl Engine {
                     &prompt.id,
                     tools_enabled,
                     prompt.background,
+                    turn_steer_rx,
+                    turn_steer_mutation_lane_state,
                 )
                 .await;
         }
@@ -13174,6 +13608,28 @@ impl Engine {
                 hit_iteration_limit = false;
                 break;
             }
+            // Guidance received while tools were finishing belongs before the
+            // next model invocation. Drain every already-accepted message so
+            // the rebuilt transcript presents them in arrival order.
+            loop {
+                let command = match turn_steer_rx.as_mut().map(|rx| rx.try_recv()) {
+                    Some(Ok(command)) => command,
+                    Some(Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)) => {
+                        turn_steer_rx = None;
+                        break;
+                    }
+                    Some(Err(tokio::sync::mpsc::error::TryRecvError::Empty)) | None => break,
+                };
+                self.accept_native_steer_command(
+                    &session,
+                    thread,
+                    turn,
+                    &cancel,
+                    &turn_steer_mutation_lane_state,
+                    command,
+                )
+                .await?;
+            }
             // Rebuild the transcript each iteration; the store is the truth.
             let mut messages = vec![Message::System(system.clone())];
             for payload in self.store.messages(&thread.id)? {
@@ -13206,17 +13662,37 @@ impl Engine {
             let mut thinking_streamed = false;
             let mut pending_events = Vec::new();
             let mut persist_deadline = None;
+            let mut pending_native_steer = None;
+            let mut consecutive_provider_events = 0usize;
+            let mut boundary_steers = Vec::new();
             loop {
                 let flush_at = persist_deadline.unwrap_or_else(Instant::now);
+                let steer_reserved = !cancel.is_cancelled()
+                    && reserve_ready_steer_after_event_budget(
+                        &mut turn_steer_rx,
+                        &mut pending_native_steer,
+                        &mut consecutive_provider_events,
+                    );
                 let ev = tokio::select! {
                     biased;
                     _ = cancel.cancelled() => None,
+                    ev = stream.next(), if !steer_reserved => ev,
                     _ = tokio::time::sleep_until(flush_at.into()), if persist_deadline.is_some() => {
                         flush_backend_event_batch(&self.store, &scope, &mut pending_events).await?;
                         persist_deadline = None;
                         continue;
                     }
-                    ev = stream.next() => ev,
+                    steer = receive_steer_command(
+                        &mut turn_steer_rx,
+                        &mut pending_native_steer,
+                        true,
+                    ), if !cancel.is_cancelled() => {
+                        match steer {
+                            Some(command) => boundary_steers.push(command),
+                            None => turn_steer_rx = None,
+                        }
+                        continue;
+                    }
                 };
                 let Some(ev) = ev else { break };
                 let event = match ev {
@@ -13226,6 +13702,7 @@ impl Engine {
                         return Err(anyhow!("provider stream error: {error}"));
                     }
                 };
+                consecutive_provider_events += 1;
                 match event {
                     ProviderEvent::TextDelta(delta) => {
                         text.push_str(&delta);
@@ -13262,10 +13739,27 @@ impl Engine {
             }
             flush_backend_event_batch(&self.store, &scope, &mut pending_events).await?;
 
+            // Catch every message that arrived at the exact response boundary.
+            // They remain pending until this provider turn, including its tool
+            // batch, has settled.
+            if !cancel.is_cancelled() {
+                loop {
+                    match turn_steer_rx.as_mut().map(|rx| rx.try_recv()) {
+                        Some(Ok(command)) => boundary_steers.push(command),
+                        Some(Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)) => {
+                            turn_steer_rx = None;
+                            break;
+                        }
+                        Some(Err(tokio::sync::mpsc::error::TryRecvError::Empty)) | None => break,
+                    }
+                }
+            }
+
             // Interrupted mid-stream: keep any streamed text for display, but
             // drop the (unexecuted) tool calls so we don't strand tool_use
             // without results, and stop the turn.
             if cancel.is_cancelled() {
+                reject_pending_steer(&mut pending_native_steer, "turn cancelled");
                 if !text.is_empty() {
                     self.store
                         .append_event_async(
@@ -13285,6 +13779,12 @@ impl Engine {
                         })?,
                     )?;
                 }
+                reject_steer_commands(
+                    &mut turn_steer_rx,
+                    &mut pending_native_steer,
+                    &mut boundary_steers,
+                    "turn cancelled",
+                );
                 hit_iteration_limit = false;
                 break;
             }
@@ -13324,9 +13824,24 @@ impl Engine {
                 )?;
             }
 
+            let had_boundary_steers = !boundary_steers.is_empty();
+            for command in boundary_steers.drain(..) {
+                self.accept_native_steer_command(
+                    &session,
+                    thread,
+                    turn,
+                    &cancel,
+                    &turn_steer_mutation_lane_state,
+                    command,
+                )
+                .await?;
+            }
             if tool_calls.is_empty() {
-                hit_iteration_limit = false;
-                break;
+                if !had_boundary_steers {
+                    hit_iteration_limit = false;
+                    break;
+                }
+                continue;
             }
 
             // Providers may request independent calls in one response. Poll
@@ -13334,11 +13849,52 @@ impl Engine {
             // transcript remains valid for APIs that require ordered
             // tool-result blocks. Tool events retain their real start and
             // completion ordering through the durable event log.
-            let results = self
-                .handle_tool_calls_parallel(
-                    &session, thread, turn, &mode, &ctx, tool_calls, &cancel,
-                )
-                .await;
+            let tool_batch = self.handle_tool_calls_parallel(
+                &session, thread, turn, &mode, &ctx, tool_calls, &cancel,
+            );
+            tokio::pin!(tool_batch);
+            let results = loop {
+                tokio::select! {
+                    biased;
+                    results = &mut tool_batch => break results,
+                    steer = receive_steer_command(
+                        &mut turn_steer_rx,
+                        &mut pending_native_steer,
+                        true,
+                    ), if !cancel.is_cancelled() => {
+                        let Some(command) = steer else {
+                            turn_steer_rx = None;
+                            continue;
+                        };
+                        if command.attachment_rows.is_empty() {
+                            self.accept_native_steer_command(
+                                &session,
+                                thread,
+                                turn,
+                                &cancel,
+                                &turn_steer_mutation_lane_state,
+                                command,
+                            )
+                            .await?;
+                        } else {
+                            // Attachment materialization uses the session
+                            // mutation lane held by mutating tools. Keep the
+                            // bounded command (and its queue permit) until the
+                            // whole tool batch has durably recorded its
+                            // results, then accept it at that safe boundary.
+                            boundary_steers.push(command);
+                        }
+                    }
+                }
+            };
+            if cancel.is_cancelled() {
+                reject_steer_commands(
+                    &mut turn_steer_rx,
+                    &mut pending_native_steer,
+                    &mut boundary_steers,
+                    "turn cancelled",
+                );
+            }
             for (call_id, result) in results {
                 let (result_content, images) = result?;
                 self.store.append_message(
@@ -13350,7 +13906,37 @@ impl Engine {
                     })?,
                 )?;
             }
+            for command in boundary_steers.drain(..) {
+                self.accept_native_steer_command(
+                    &session,
+                    thread,
+                    turn,
+                    &cancel,
+                    &turn_steer_mutation_lane_state,
+                    command,
+                )
+                .await?;
+            }
         }
+
+        // The bounded final-report pass is not an agent loop and cannot apply
+        // further guidance. Close the receiver before removing its registry
+        // entry: a request that already cloned the sender must fail or join
+        // this final drain instead of waiting behind a response-only call.
+        close_steer_receiver(&mut turn_steer_rx);
+        drop(turn_steerer_guard);
+        let mut no_pending = None;
+        let mut deferred = Vec::new();
+        reject_steer_commands(
+            &mut turn_steer_rx,
+            &mut no_pending,
+            &mut deferred,
+            if cancel.is_cancelled() {
+                "turn cancelled"
+            } else {
+                "turn no longer accepts steering"
+            },
+        );
 
         // Truncated mid-work at the iteration budget: make one final
         // tool-free provider pass over the last tool results so the user gets
@@ -14973,6 +15559,8 @@ impl Engine {
         queued_prompt_id: &str,
         tools_enabled: bool,
         attach_background: bool,
+        mut steer_rx: Option<tokio::sync::mpsc::Receiver<SteerTurnCommand>>,
+        steer_mutation_lane_state: tokio::sync::watch::Sender<SteerMutationLaneState>,
     ) -> Result<()> {
         let startup_started = Instant::now();
         let scope = Scope::Thread(thread.id.clone());
@@ -14992,7 +15580,6 @@ impl Engine {
         );
         let selected_model = model_catalog.iter().find(|m| m.id == thread.model);
         normalize_thinking_option(&mut model_options, selected_model);
-        let supports_steering = tools_enabled && backend.supports_steering();
         // Some vendor protocols cannot remove their built-in read/search
         // tools. Keep those turns restricted (no mounted MCP tools and
         // read-only permission), but reserve strict tool-use rejection for
@@ -15176,34 +15763,6 @@ impl Engine {
             "agent startup timing: vendor turn accepted"
         );
 
-        let mut steer_rx = None;
-        let (steer_mutation_lane_state, _) =
-            tokio::sync::watch::channel(SteerMutationLaneState::Idle);
-        let _steerer_guard = if supports_steering {
-            let (sender, receiver) = tokio::sync::mpsc::channel(8);
-            let replaced = self.turn_steerers.lock().unwrap().insert(
-                thread.id.clone(),
-                ActiveTurnSteerer {
-                    turn,
-                    sender,
-                    mutation_lane_state: steer_mutation_lane_state.clone(),
-                },
-            );
-            if let Some(replaced) = replaced {
-                replaced
-                    .mutation_lane_state
-                    .send_replace(SteerMutationLaneState::Ended);
-            }
-            steer_rx = Some(receiver);
-            Some(ActiveTurnSteererGuard {
-                registry: &self.turn_steerers,
-                thread_id: thread.id.clone(),
-                turn,
-            })
-        } else {
-            None
-        };
-
         // `text` records the whole turn for the transcript; `segment` is the
         // current streamed block, flushed (finalized) at each tool boundary
         // so tool cards interleave with the text in the order they happened
@@ -15364,12 +15923,13 @@ impl Engine {
                         attachment_rows,
                         mut attachment_cleanup,
                         response,
+                        _permit,
                     } = command;
                     // Cancellation can arrive while the selected steer command
                     // flushes pending backend events. Reject it before either
                     // persisting the user message or calling the backend.
                     if cancel.is_cancelled() {
-                        let _ = response.send(Err("turn cancelled".into()));
+                        response.send(Err("turn cancelled".into()));
                         continue;
                     }
                     let staged = attachment_rows
@@ -15398,11 +15958,16 @@ impl Engine {
                         ).await {
                             Ok(materialized) => materialized,
                             Err(error) => {
-                                let _ = response.send(Err(error.clone()));
-                                bail!("steering attachment materialization failed: {error}");
+                                response.send(Err(error.clone()));
+                                consecutive_backend_events = 0;
+                                continue;
                             }
                         }
                     };
+                    let materialized_paths = materialized
+                        .iter()
+                        .map(|file| file.absolute_path.clone())
+                        .collect::<Vec<_>>();
                     let (images, files): (Vec<_>, Vec<_>) = materialized
                         .into_iter()
                         .partition(|file| file.attachment.mime.starts_with("image/"));
@@ -15423,11 +15988,47 @@ impl Engine {
                     let payload = match serde_json::to_value(Message::User(backend_prompt.clone())) {
                         Ok(payload) => payload,
                         Err(error) => {
-                            let error = anyhow::Error::from(error);
-                            let _ = response.send(Err(error.to_string()));
+                            let mut message = error.to_string();
+                            if let Err(cleanup) = self.rollback_materialized_attachment_paths(
+                                session,
+                                &materialized_paths,
+                            ) {
+                                message.push_str(&format!(
+                                    "; materialized attachment rollback failed: {cleanup}"
+                                ));
+                            }
+                            let error = anyhow!(message);
+                            response.send(Err(error.to_string()));
                             return Err(error);
                         }
                     };
+                    let backend_result = backend
+                        .steer_turn(BackendSteer {
+                            cancel: cancel.clone(),
+                            session: active_vendor_session
+                                .clone()
+                                .expect("steering branch requires a backend session"),
+                            prompt: backend_prompt.clone(),
+                            attachments: backend_attachments,
+                        })
+                        .await;
+                    if let Err(error) = backend_result {
+                        let mut message = error.to_string();
+                        if let Err(cleanup) = self.rollback_materialized_attachment_paths(
+                            session,
+                            &materialized_paths,
+                        ) {
+                            message.push_str(&format!(
+                                "; materialized attachment rollback failed: {cleanup}"
+                            ));
+                        }
+                        response.send(Err(message.clone()));
+                        consecutive_backend_events = 0;
+                        continue;
+                    }
+                    // Only vendor-accepted guidance becomes durable. If this
+                    // commit fails after delivery, fail the turn: continuing
+                    // would let later context diverge from the event log.
                     if let Err(error) = self.store.append_event_with_message(
                         scope.clone(),
                         Event::TurnSteered {
@@ -15440,30 +16041,20 @@ impl Engine {
                         attachment_rows,
                         attachment_cleanup.claim(),
                     ) {
-                        let message = error.to_string();
-                        let _ = response.send(Err(message));
+                        let mut message = error.to_string();
+                        if let Err(cleanup) = self.rollback_materialized_attachment_paths(
+                            session,
+                            &materialized_paths,
+                        ) {
+                            message.push_str(&format!(
+                                "; materialized attachment rollback failed: {cleanup}"
+                            ));
+                        }
+                        response.send(Err(message));
                         return Err(error);
                     }
                     attachment_cleanup.disarm();
-                    // Durable transcript order is established before the
-                    // vendor sees the guidance. A rejection therefore fails
-                    // the owning turn instead of erasing accepted input.
-                    let backend_result = backend
-                        .steer_turn(BackendSteer {
-                            cancel: cancel.clone(),
-                            session: active_vendor_session
-                                .clone()
-                                .expect("steering branch requires a backend session"),
-                            prompt: backend_prompt.clone(),
-                            attachments: backend_attachments,
-                        })
-                        .await;
-                    if let Err(error) = backend_result {
-                        let message = error.to_string();
-                        let _ = response.send(Err(message.clone()));
-                        bail!("backend rejected durable steering input: {message}");
-                    }
-                    let _ = response.send(Ok(()));
+                    response.send(Ok(()));
                     consecutive_backend_events = 0;
                     continue;
                 }
@@ -18936,6 +19527,7 @@ fn requests_remote_ref_mutation(
 struct SessionPrEvidence {
     numbers: HashSet<u64>,
     recorded_numbers: HashSet<u64>,
+    mentioned_numbers: HashSet<u64>,
     successful_tool_args: Vec<String>,
     commit_ids: HashSet<String>,
 }
@@ -18945,6 +19537,7 @@ impl SessionPrEvidence {
     fn extend(&mut self, other: Self) {
         self.numbers.extend(other.numbers);
         self.recorded_numbers.extend(other.recorded_numbers);
+        self.mentioned_numbers.extend(other.mentioned_numbers);
         self.successful_tool_args.extend(other.successful_tool_args);
         self.commit_ids.extend(other.commit_ids);
     }
@@ -18962,6 +19555,27 @@ fn pr_evidence_from_events(
     let mut evidence = SessionPrEvidence::default();
     for event in events {
         match event {
+            Event::UserMessage {
+                content,
+                background: false,
+                ..
+            }
+            | Event::TurnSteered { content, .. }
+            | Event::AssistantMessage { content, .. } => {
+                let numbers = crate::github::pr_numbers_in_chat_text(&content, host, owner, repo);
+                evidence.numbers.extend(numbers.iter().copied());
+                evidence.mentioned_numbers.extend(numbers);
+            }
+            Event::AssistantProgress { text, .. } => {
+                let numbers = crate::github::pr_numbers_in_chat_text(&text, host, owner, repo);
+                evidence.numbers.extend(numbers.iter().copied());
+                evidence.mentioned_numbers.extend(numbers);
+            }
+            Event::SubagentSpawned { prompt, .. } => {
+                let numbers = crate::github::pr_numbers_in_chat_text(&prompt, host, owner, repo);
+                evidence.numbers.extend(numbers.iter().copied());
+                evidence.mentioned_numbers.extend(numbers);
+            }
             Event::ToolRequested {
                 call_id,
                 tool,
@@ -19067,22 +19681,35 @@ fn sanitize_transcript(messages: Vec<Message>) -> Vec<Message> {
                 if ids.is_empty() {
                     continue;
                 }
-                // Absorb the contiguous run of results that follow, tracking
-                // which call ids they answer.
+                // Steering can be durably accepted while this tool batch is
+                // still executing, so its user message may be stored before
+                // the results. Defer intervening non-assistant messages until
+                // every available result has been paired with this call set.
                 let mut answered = std::collections::HashSet::new();
-                while matches!(iter.peek(), Some(Message::ToolResult { .. })) {
-                    if let Some(Message::ToolResult {
-                        call_id,
-                        content,
-                        images,
-                    }) = iter.next()
-                    {
-                        answered.insert(call_id.clone());
-                        out.push(Message::ToolResult {
-                            call_id,
-                            content,
-                            images,
-                        });
+                let mut deferred = Vec::new();
+                while answered.len() < ids.len() {
+                    match iter.peek() {
+                        Some(Message::ToolResult { .. }) => {
+                            if let Some(Message::ToolResult {
+                                call_id,
+                                content,
+                                images,
+                            }) = iter.next()
+                            {
+                                if ids.contains(&call_id) {
+                                    answered.insert(call_id.clone());
+                                }
+                                out.push(Message::ToolResult {
+                                    call_id,
+                                    content,
+                                    images,
+                                });
+                            }
+                        }
+                        Some(Message::Assistant { .. }) | None => break,
+                        Some(_) => {
+                            deferred.push(iter.next().expect("peeked message"));
+                        }
                     }
                 }
                 for id in ids {
@@ -19094,6 +19721,7 @@ fn sanitize_transcript(messages: Vec<Message>) -> Vec<Message> {
                         });
                     }
                 }
+                out.extend(deferred);
             }
             other => out.push(other),
         }
@@ -19810,6 +20438,26 @@ mod tests {
                 ..
             } if content == "User prompt"
         ));
+    }
+
+    #[tokio::test]
+    async fn closing_steer_receiver_rejects_a_previously_cloned_sender() {
+        let (sender, receiver) = tokio::sync::mpsc::channel(2);
+        let raced_sender = sender.clone();
+        sender.send("already queued").await.unwrap();
+        let mut receiver = Some(receiver);
+
+        close_steer_receiver(&mut receiver);
+
+        assert!(
+            raced_sender.send("too late").await.is_err(),
+            "a sender cloned before the terminal transition must fail closed"
+        );
+        assert_eq!(
+            receiver.as_mut().unwrap().try_recv().unwrap(),
+            "already queued"
+        );
+        assert!(receiver.as_mut().unwrap().try_recv().is_err());
     }
 
     #[tokio::test]
@@ -20593,13 +21241,32 @@ mod tests {
                 Vec::new(),
                 None,
             ),
-            response,
+            response: SteerResponse {
+                sender: Some(response),
+            },
+            _permit: Arc::new(tokio::sync::Semaphore::new(1))
+                .try_acquire_owned()
+                .unwrap(),
         });
 
         reject_pending_steer(&mut pending, "turn cancelled");
 
         assert_eq!(received.await.unwrap().unwrap_err(), "turn cancelled");
         assert!(pending.is_none());
+    }
+
+    #[test]
+    fn steering_permits_bound_channel_and_deferred_storage_together() {
+        let permits = Arc::new(tokio::sync::Semaphore::new(TURN_STEER_PENDING_CAPACITY));
+        let held = (0..TURN_STEER_PENDING_CAPACITY)
+            .map(|_| permits.clone().try_acquire_owned().unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            permits.clone().try_acquire_owned().is_err(),
+            "draining commands from the receiver must not create new capacity"
+        );
+        drop(held);
+        assert!(permits.try_acquire_owned().is_ok());
     }
 
     fn init_engine_test_repo(path: &Path) {
@@ -24099,6 +24766,7 @@ default_permission_mode = "ask"
         store.insert_session(&session).unwrap();
         let exact = projection_pr(10, &session.workspace_id, &session.branch);
         let linked = projection_pr(11, &session.workspace_id, "external-branch");
+        let mentioned = projection_pr(12, &session.workspace_id, "mentioned-branch");
         store
             .append_event(
                 Scope::Server,
@@ -24106,8 +24774,18 @@ default_permission_mode = "ask"
                     pull_requests: trouve_protocol::GithubPrList {
                         viewer: "octocat".into(),
                         host: "github.com".into(),
-                        prs: vec![exact, linked.clone()],
+                        prs: vec![exact, linked.clone(), mentioned.clone()],
                     },
+                },
+            )
+            .unwrap();
+        store
+            .append_event(
+                Scope::Server,
+                Event::SessionPrMentioned {
+                    session_id: session.id.clone(),
+                    number: mentioned.number,
+                    url: mentioned.url,
                 },
             )
             .unwrap();
@@ -24125,14 +24803,14 @@ default_permission_mode = "ask"
         let local = engine.projected_session_prs(&session.id).unwrap();
         assert_eq!(
             local.iter().map(|pr| pr.number).collect::<Vec<_>>(),
-            vec![11, 10]
+            vec![10, 11, 12]
         );
 
         let (cursor, projection) = engine.server_projection_snapshot().unwrap();
 
         assert!(cursor > 0);
         assert_eq!(projection.github_pull_requests.len(), 1);
-        assert_eq!(projection.github_pull_requests[0].cursor, cursor);
+        assert!(projection.github_pull_requests[0].cursor < cursor);
         assert_eq!(projection.session_pull_requests.len(), 1);
         assert_eq!(projection.session_pull_requests[0].session_id, session.id);
         assert_eq!(
@@ -24141,7 +24819,7 @@ default_permission_mode = "ask"
                 .iter()
                 .map(|pr| pr.number)
                 .collect::<Vec<_>>(),
-            vec![11, 10]
+            vec![10, 11, 12]
         );
     }
 
@@ -24334,7 +25012,8 @@ default_permission_mode = "ask"
             },
         ];
         let evidence = pr_evidence_from_events(events, "github.com", "o", "r");
-        assert_eq!(evidence.numbers, HashSet::from([75]));
+        assert_eq!(evidence.numbers, HashSet::from([73, 75]));
+        assert_eq!(evidence.mentioned_numbers, HashSet::from([73]));
         assert_eq!(evidence.successful_tool_args.len(), 2);
         assert!(
             evidence
@@ -26791,6 +27470,27 @@ default_permission_mode = "ask"
             other => panic!("expected synthesized result b, got {other:?}"),
         }
         assert!(matches!(&out[4], Message::User(u) if u == "next"));
+
+        // A steer persisted while a tool is running is presented to the next
+        // model invocation only after the matching tool result.
+        let out = sanitize_transcript(vec![
+            Message::Assistant {
+                content: String::new(),
+                tool_calls: vec![call("steered")],
+                reasoning: vec![],
+            },
+            Message::User("change direction".into()),
+            Message::ToolResult {
+                call_id: "steered".into(),
+                content: "done".into(),
+                images: vec![],
+            },
+        ]);
+        assert!(matches!(
+            &out[1],
+            Message::ToolResult { call_id, .. } if call_id == "steered"
+        ));
+        assert!(matches!(&out[2], Message::User(u) if u == "change direction"));
 
         // An empty assistant message is dropped entirely.
         let out = sanitize_transcript(vec![

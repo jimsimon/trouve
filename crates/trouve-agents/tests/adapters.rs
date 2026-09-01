@@ -12,7 +12,8 @@ use trouve_agents::claude::ClaudeBackend;
 use trouve_agents::codex::CodexBackend;
 use trouve_agents::cursor::CursorBackend;
 use trouve_agents::{
-    AgentBackend, BackendCollaboratorEvent, BackendEvent, BackendPermission, BackendTurn,
+    AgentBackend, BackendCollaboratorEvent, BackendEvent, BackendPermission, BackendSteer,
+    BackendTurn,
 };
 
 fn write_stub(dir: &Path, name: &str, script: &str) -> String {
@@ -152,6 +153,163 @@ EOF
     assert!(args.contains("--model"), "{args}");
     assert!(args.contains("--include-partial-messages"), "{args}");
     assert!(args.contains("--thinking-display"), "{args}");
+}
+
+#[tokio::test]
+async fn claude_adapter_steers_an_attached_background_turn_without_a_new_prompt() {
+    let tmp = tempfile::tempdir().unwrap();
+    let stub = write_stub(
+        tmp.path(),
+        "claude-background-steer",
+        r#"#!/bin/bash
+IFS= read -r initial_prompt
+cat <<'EOF'
+{"type":"system","subtype":"init","session_id":"sess-bg"}
+{"type":"result","subtype":"success","session_id":"sess-bg","usage":{"input_tokens":1,"output_tokens":1}}
+EOF
+sleep 0.05
+printf '%s\n' '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Background work."}}}'
+IFS= read -r steer
+printf '%s\n' "$steer" > "$0.steer"
+printf '%s\n' '{"type":"result","subtype":"success","session_id":"sess-bg","usage":{"input_tokens":2,"output_tokens":1}}'
+"#,
+    );
+    let backend = ClaudeBackend::new("claude-code", Some(stub.clone()));
+    let mut background_signals = backend
+        .take_background_turn_signals()
+        .expect("Claude exposes one background-turn signal receiver");
+
+    let mut initial = start_turn(&backend, || {
+        turn(tmp.path().to_path_buf(), None, BackendPermission::ReadOnly)
+    })
+    .await;
+    while let Some(event) = initial.next().await {
+        event.unwrap();
+    }
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(2), background_signals.recv())
+            .await
+            .expect("Claude should announce autonomous output")
+            .as_deref(),
+        Some("th_1")
+    );
+
+    let mut attached_turn = turn(
+        tmp.path().to_path_buf(),
+        Some("sess-bg"),
+        BackendPermission::ReadOnly,
+    );
+    attached_turn.attach_background = true;
+    let mut attached = backend.run_turn(attached_turn).await.unwrap();
+    backend
+        .steer_turn(BackendSteer {
+            cancel: Default::default(),
+            session: "sess-bg".into(),
+            prompt: "Refine the background work.".into(),
+            attachments: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+    let steer_path = PathBuf::from(format!("{stub}.steer"));
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !std::fs::read_to_string(&steer_path)
+            .is_ok_and(|steer| steer.contains("Refine the background work."))
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("steering should be written before the attach stream is polled");
+    while let Some(event) = attached.next().await {
+        event.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn claude_adapter_rejects_steering_for_a_completed_buffered_attach() {
+    let tmp = tempfile::tempdir().unwrap();
+    let stub = write_stub(
+        tmp.path(),
+        "claude-completed-background",
+        r#"#!/bin/bash
+IFS= read -r initial_prompt
+cat <<'EOF'
+{"type":"system","subtype":"init","session_id":"sess-buffered"}
+{"type":"result","subtype":"success","session_id":"sess-buffered","usage":{"input_tokens":1,"output_tokens":1}}
+EOF
+sleep 0.05
+printf '%s\n' '{"type":"result","subtype":"success","session_id":"sess-buffered","usage":{"input_tokens":2,"output_tokens":1}}'
+if IFS= read -r -t 1 unexpected; then
+    printf '%s\n' "$unexpected" > "$0.unexpected"
+fi
+sleep 2
+"#,
+    );
+    let backend = ClaudeBackend::new("claude-code", Some(stub.clone()));
+    let mut background_signals = backend
+        .take_background_turn_signals()
+        .expect("Claude exposes one background-turn signal receiver");
+
+    let mut initial = start_turn(&backend, || {
+        turn(tmp.path().to_path_buf(), None, BackendPermission::ReadOnly)
+    })
+    .await;
+    while let Some(event) = initial.next().await {
+        event.unwrap();
+    }
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(2), background_signals.recv())
+            .await
+            .expect("Claude should announce the completed autonomous turn")
+            .as_deref(),
+        Some("th_1")
+    );
+
+    let mut attached_turn = turn(
+        tmp.path().to_path_buf(),
+        Some("sess-buffered"),
+        BackendPermission::ReadOnly,
+    );
+    attached_turn.attach_background = true;
+    let attached = backend.run_turn(attached_turn).await.unwrap();
+    let error = backend
+        .steer_turn(BackendSteer {
+            cancel: Default::default(),
+            session: "sess-buffered".into(),
+            prompt: "Do not start unrelated work.".into(),
+            attachments: Vec::new(),
+        })
+        .await
+        .expect_err("completed buffered output is not a live steering target");
+    assert!(error.to_string().contains("no active turn"), "{error}");
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(
+        !PathBuf::from(format!("{stub}.unexpected")).exists(),
+        "steering must not be written to idle Claude stdin"
+    );
+
+    // Cancelling before the lazy attach stream is first polled must release
+    // its eager router claim so the buffered turn remains attachable.
+    drop(attached);
+    let mut retry_turn = turn(
+        tmp.path().to_path_buf(),
+        Some("sess-buffered"),
+        BackendPermission::ReadOnly,
+    );
+    retry_turn.attach_background = true;
+    let mut attached = backend.run_turn(retry_turn).await.unwrap();
+
+    let completed = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let mut completed = false;
+        while let Some(event) = attached.next().await {
+            completed |= matches!(event.unwrap(), BackendEvent::Completed { .. });
+        }
+        completed
+    })
+    .await
+    .expect("re-attached buffered stream never ended");
+    assert!(completed, "the buffered completed turn must still drain");
 }
 
 #[tokio::test]
@@ -2740,6 +2898,133 @@ done
     assert_eq!(spawns.lines().count(), 2, "{spawns}");
 }
 
+#[tokio::test]
+async fn claude_adapter_steers_the_active_stream_json_turn() {
+    let tmp = tempfile::tempdir().unwrap();
+    let stub = write_stub(
+        tmp.path(),
+        "claude-steer",
+        r#"#!/bin/bash
+IFS= read -r first
+echo "$first" >> "$0.stdin"
+echo '{"type":"system","subtype":"init","session_id":"sess-steer"}'
+IFS= read -r steer
+echo "$steer" >> "$0.stdin"
+echo '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"redirected"}}}'
+echo '{"type":"result","subtype":"success","session_id":"sess-steer","usage":{"input_tokens":1,"output_tokens":1}}'
+cat >/dev/null
+"#,
+    );
+    let backend = ClaudeBackend::new("claude-code", Some(stub.clone()));
+    assert!(backend.supports_steering());
+
+    let mut stream = start_turn(&backend, || {
+        turn(
+            tmp.path().to_path_buf(),
+            Some("sess-steer"),
+            BackendPermission::Ask,
+        )
+    })
+    .await;
+    // Steering is advertised with TurnStarted, before the returned backend
+    // stream is first polled. The adapter must queue this behind the initial
+    // prompt instead of rejecting it or writing it first.
+    backend
+        .steer_turn(BackendSteer {
+            cancel: Default::default(),
+            session: "sess-steer".into(),
+            prompt: "change direction".into(),
+            attachments: Vec::new(),
+        })
+        .await
+        .unwrap();
+    for index in 1..8 {
+        backend
+            .steer_turn(BackendSteer {
+                cancel: Default::default(),
+                session: "sess-steer".into(),
+                prompt: format!("queued direction {index}"),
+                attachments: Vec::new(),
+            })
+            .await
+            .unwrap();
+    }
+    let overflow = backend
+        .steer_turn(BackendSteer {
+            cancel: Default::default(),
+            session: "sess-steer".into(),
+            prompt: "one direction too many".into(),
+            attachments: Vec::new(),
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        overflow
+            .to_string()
+            .contains("pending steering queue is full"),
+        "{overflow}"
+    );
+
+    let mut redirected = false;
+    while let Some(event) = stream.next().await {
+        let event = event.unwrap();
+        redirected |= matches!(
+            event,
+            BackendEvent::TextDelta(ref text) if text == "redirected"
+        );
+    }
+    assert!(redirected);
+    let stdin = std::fs::read_to_string(format!("{stub}.stdin")).unwrap();
+    assert_eq!(stdin.lines().count(), 2, "{stdin}");
+    assert!(stdin.contains("change direction"), "{stdin}");
+}
+
+#[tokio::test]
+async fn claude_adapter_rejects_steering_after_the_vendor_result() {
+    let tmp = tempfile::tempdir().unwrap();
+    let stub = write_stub(
+        tmp.path(),
+        "claude-completed-steer",
+        r#"#!/bin/bash
+IFS= read -r first
+echo "$first" >> "$0.stdin"
+echo '{"type":"system","subtype":"init","session_id":"sess-complete"}'
+echo '{"type":"result","subtype":"success","session_id":"sess-complete","usage":{"input_tokens":1,"output_tokens":1}}'
+IFS= read -r late
+echo "$late" >> "$0.stdin"
+cat >/dev/null
+"#,
+    );
+    let backend = ClaudeBackend::new("claude-code", Some(stub.clone()));
+    let mut stream = start_turn(&backend, || {
+        turn(
+            tmp.path().to_path_buf(),
+            Some("sess-complete"),
+            BackendPermission::Ask,
+        )
+    })
+    .await;
+
+    while let Some(event) = stream.next().await {
+        if matches!(event.unwrap(), BackendEvent::Completed { .. }) {
+            break;
+        }
+    }
+    let error = backend
+        .steer_turn(BackendSteer {
+            cancel: Default::default(),
+            session: "sess-complete".into(),
+            prompt: "too late".into(),
+            attachments: Vec::new(),
+        })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("has no active turn"), "{error}");
+    let stdin = std::fs::read_to_string(format!("{stub}.stdin")).unwrap();
+    assert_eq!(stdin.lines().count(), 1, "{stdin}");
+    assert!(!stdin.contains("too late"), "{stdin}");
+}
+
 #[test]
 fn backend_tool_free_capabilities_match_vendor_protocols() {
     let claude = ClaudeBackend::new("claude-code", Some("/nonexistent/claude".into()));
@@ -2751,6 +3036,7 @@ fn backend_tool_free_capabilities_match_vendor_protocols() {
     let codex = CodexBackend::new("codex", Some("/nonexistent/codex".into()));
 
     assert!(claude.supports_tool_free_turns());
+    assert!(claude.supports_steering());
     assert!(cursor.supports_tool_free_turns());
     assert!(!codex.supports_tool_free_turns());
     assert!(!claude.confines_read_only_turns());
