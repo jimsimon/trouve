@@ -1141,6 +1141,8 @@ struct GithubIssueComment {
 
 #[derive(Debug, Deserialize)]
 struct GithubIssueCommentUser {
+    #[serde(default)]
+    login: String,
     #[serde(rename = "type")]
     kind: String,
 }
@@ -1382,15 +1384,17 @@ fn parse_threadless_resolve_command(body: &str) -> Option<ThreadlessCommandParse
     None
 }
 
+fn is_trusted_threadless_command_author(author_association: &str, user_kind: Option<&str>) -> bool {
+    !user_kind.is_some_and(|kind| kind.eq_ignore_ascii_case("bot"))
+        && matches!(author_association, "OWNER" | "MEMBER" | "COLLABORATOR")
+}
+
 fn threadless_resolve_comment(payload: &serde_json::Value) -> Option<ThreadlessResolveCommand> {
     if payload["action"].as_str()? != "created"
         || !payload["issue"]["pull_request"].is_object()
-        || payload["comment"]["user"]["type"]
-            .as_str()
-            .is_some_and(|kind| kind.eq_ignore_ascii_case("bot"))
-        || !matches!(
+        || !is_trusted_threadless_command_author(
             payload["comment"]["author_association"].as_str()?,
-            "OWNER" | "MEMBER" | "COLLABORATOR"
+            payload["comment"]["user"]["type"].as_str(),
         )
     {
         return None;
@@ -1439,6 +1443,53 @@ fn polled_manual_review_comment(comment: &GithubIssueComment) -> Option<(u64, St
         pull_number_from_issue_url(&comment.issue_url)?,
         manual_review_trigger_key(comment.id, scope),
     ))
+}
+
+/// Recover a valid threadless resolve command from the issue-comment polling
+/// fallback. Permission is still checked authoritatively before application;
+/// association and user type are only the same cheap admission filter used by
+/// webhook ingestion.
+fn polled_threadless_resolve_command(
+    repository: &str,
+    comment: &GithubIssueComment,
+) -> Option<crate::store::PendingThreadlessCommand> {
+    if comment.id == 0
+        || !is_trusted_threadless_command_author(
+            &comment.author_association,
+            comment.user.as_ref().map(|user| user.kind.as_str()),
+        )
+    {
+        return None;
+    }
+    let pull_number = pull_number_from_issue_url(&comment.issue_url)?;
+    let (resolve, finding_prefix, reason) =
+        match parse_threadless_resolve_command(comment.body.as_deref()?)? {
+            ThreadlessCommandParse::Resolve {
+                finding_prefix,
+                reason,
+            } => (true, finding_prefix, reason),
+            ThreadlessCommandParse::Unresolve { finding_prefix } => {
+                (false, finding_prefix, String::new())
+            }
+            // Webhook delivery provides immediate guidance for malformed
+            // commands. Polling only recovers commands safe to persist.
+            ThreadlessCommandParse::Invalid(_) => return None,
+        };
+    Some(crate::store::PendingThreadlessCommand {
+        trigger_key: format!("command:comment:{}", comment.id),
+        repository: repository.to_owned(),
+        pull_number,
+        comment_id: comment.id,
+        author: comment
+            .user
+            .as_ref()
+            .map(|user| user.login.clone())
+            .unwrap_or_default(),
+        resolve,
+        finding_prefix,
+        reason,
+        created_at: String::new(),
+    })
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -4039,6 +4090,9 @@ impl Engine {
                 repository.repository
             ));
         }
+        // The comment poll is the fallback when webhook delivery is absent.
+        // Apply any resolve commands it just recovered in this same pass.
+        self.process_pending_threadless_commands(repository).await;
         let mut comment_requests: HashMap<u64, Vec<CodeReviewManualRequest>> = HashMap::new();
         for request in self
             .store
@@ -4534,12 +4588,15 @@ impl Engine {
             for comment in comments {
                 let manual_request = polled_manual_review_comment(&comment)
                     .filter(|(pull_number, _)| open_pulls.contains(pull_number));
+                let threadless_command = polled_threadless_resolve_command(repository, &comment)
+                    .filter(|command| open_pulls.contains(&command.pull_number));
                 let inserted = self.store.claim_code_review_polled_comment(
                     repository,
                     comment.id,
                     manual_request
                         .as_ref()
                         .map(|(pull_number, trigger_key)| (*pull_number, trigger_key.as_str())),
+                    threadless_command.as_ref(),
                 )?;
                 reached_seen_comment |= !inserted;
             }
@@ -24969,7 +25026,7 @@ rename to src/new.rs
     }
 
     #[tokio::test]
-    async fn manual_comment_polling_stops_at_seen_comments_and_claims_requests_atomically() {
+    async fn comment_polling_claims_new_review_and_threadless_commands_atomically() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
         let comment = |id, pull_number, body: &str, association: &str, kind: &str| {
@@ -24980,35 +25037,70 @@ rename to src/new.rs
                 "issue_url": format!(
                     "https://api.github.com/repos/acme/widgets/issues/{pull_number}"
                 ),
-                "user": {"type": kind}
+                "user": {"login": "jim", "type": kind}
             })
         };
         let mut first_page = vec![
+            comment(
+                302,
+                43,
+                "@trouve-ai resolve rvf_7c7d5797 webhook command",
+                "OWNER",
+                "User",
+            ),
             comment(300, 42, "@trouve-ai review", "OWNER", "User"),
             comment(299, 99, "@trouve-ai review", "MEMBER", "User"),
             comment(298, 42, "@trouve-ai review", "CONTRIBUTOR", "User"),
             comment(297, 42, "@trouve-ai review", "OWNER", "Bot"),
         ];
         first_page.extend(
-            (0..96).map(|index| comment(400 + index, 42, "ordinary discussion", "OWNER", "User")),
-        );
-        let mut second_page = vec![comment(
-            200,
-            42,
-            "@trouve-ai review",
-            "COLLABORATOR",
-            "User",
-        )];
-        second_page.extend(
-            (0..99).map(|index| comment(100 + index, 42, "older discussion", "OWNER", "User")),
+            (0..95).map(|index| comment(400 + index, 42, "ordinary discussion", "OWNER", "User")),
         );
         assert_eq!(first_page.len(), REVIEW_COMMENT_PAGE_SIZE);
-        assert_eq!(second_page.len(), REVIEW_COMMENT_PAGE_SIZE);
+        let second_page = vec![
+            comment(
+                301,
+                42,
+                "@trouve-ai resolve rvf_6b6c4686 recovered command",
+                "OWNER",
+                "User",
+            ),
+            comment(
+                296,
+                42,
+                "@trouve-ai resolve rvf_5a5b3575 historical command",
+                "OWNER",
+                "User",
+            ),
+        ];
 
         let store = crate::store::Store::open_in_memory().unwrap();
         assert!(
             store
-                .claim_code_review_polled_comment("acme/widgets", 200, None)
+                .claim_code_review_polled_comment("acme/widgets", 200, None, None)
+                .unwrap()
+        );
+        // Comments recorded before command polling are already inspected and
+        // must not be replayed as a historical backfill after upgrade.
+        assert!(
+            store
+                .claim_code_review_polled_comment("acme/widgets", 296, None, None)
+                .unwrap()
+        );
+        let webhook_command = crate::store::PendingThreadlessCommand {
+            trigger_key: "command:comment:302".into(),
+            repository: "acme/widgets".into(),
+            pull_number: 43,
+            comment_id: 302,
+            author: "jim".into(),
+            resolve: true,
+            finding_prefix: "rvf_7c7d5797".into(),
+            reason: "webhook command".into(),
+            created_at: String::new(),
+        };
+        assert!(
+            store
+                .claim_github_webhook_delivery("delivery-302", None, Some(&webhook_command))
                 .unwrap()
         );
         let data = tempfile::tempdir().unwrap();
@@ -25053,7 +25145,7 @@ rename to src/new.rs
         )
         .unwrap();
         engine
-            .poll_manual_review_comments(&api, "acme/widgets", &HashSet::from([42]))
+            .poll_manual_review_comments(&api, "acme/widgets", &HashSet::from([42, 43]))
             .await
             .unwrap();
         await_mock_server(server).await;
@@ -25068,7 +25160,56 @@ rename to src/new.rs
                 trigger_key: "manual:comment:300".into(),
             }]
         );
-        for (comment_id, pull_number) in [(299, 99), (298, 42), (297, 42), (200, 42), (300, 42)] {
+        let pending_commands = engine
+            .store
+            .pending_threadless_commands("acme/widgets", THREADLESS_COMMAND_PASS_LIMIT)
+            .unwrap();
+        assert_eq!(
+            pending_commands
+                .iter()
+                .map(|command| command.comment_id)
+                .collect::<Vec<_>>(),
+            vec![301, 302]
+        );
+        let recovered = pending_commands
+            .iter()
+            .find(|command| command.comment_id == 301)
+            .unwrap();
+        assert_eq!(recovered.author, "jim");
+        assert_eq!(recovered.finding_prefix, "rvf_6b6c4686");
+        assert_eq!(recovered.reason, "recovered command");
+        assert!(
+            !engine
+                .store
+                .claim_code_review_polled_comment(
+                    "acme/widgets",
+                    302,
+                    None,
+                    pending_commands
+                        .iter()
+                        .find(|command| command.comment_id == 302),
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            engine
+                .store
+                .pending_threadless_commands("acme/widgets", THREADLESS_COMMAND_PASS_LIMIT)
+                .unwrap()
+                .len(),
+            2,
+            "a repeated poll must not queue the command twice"
+        );
+        for (comment_id, pull_number) in [
+            (296, 42),
+            (299, 99),
+            (298, 42),
+            (297, 42),
+            (200, 42),
+            (300, 42),
+            (301, 42),
+            (302, 43),
+        ] {
             assert!(
                 !engine
                     .store
@@ -25076,6 +25217,7 @@ rename to src/new.rs
                         "acme/widgets",
                         comment_id,
                         Some((pull_number, "manual:comment:duplicate")),
+                        None,
                     )
                     .unwrap()
             );
