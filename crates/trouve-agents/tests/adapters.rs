@@ -1257,8 +1257,8 @@ async fn cursor_adapter_uses_sdk_bridge_and_trouve_owned_tools() {
         std::fs::read_to_string(format!("{stub}.spawns"))
             .unwrap()
             .trim(),
-        "1",
-        "two turns on one Trouve thread should reuse one Bridge process"
+        "2",
+        "resuming one durable agent must rotate its process-wide callback boundary"
     );
     assert!(
         !Path::new(&format!("{stub}.callback-updates")).exists(),
@@ -1275,7 +1275,7 @@ async fn cursor_adapter_uses_sdk_bridge_and_trouve_owned_tools() {
 }
 
 #[tokio::test]
-async fn cursor_adapter_cancellation_settles_route_and_keeps_shared_bridge_usable() {
+async fn cursor_adapter_cancellation_settles_route_and_recycles_before_resume() {
     use axum::routing::post;
 
     let tmp = tempfile::tempdir().unwrap();
@@ -1392,7 +1392,11 @@ async fn cursor_adapter_cancellation_settles_route_and_keeps_shared_bridge_usabl
     blocked_release.notify_waiters();
 
     let mut recovered = start_turn(&backend, || {
-        let mut next = turn(tmp.path().to_path_buf(), None, BackendPermission::ReadOnly);
+        let mut next = turn(
+            tmp.path().to_path_buf(),
+            Some("sdk-agent-1"),
+            BackendPermission::ReadOnly,
+        );
         next.mcp_bridge = Some(mcp_bridge.clone());
         next
     })
@@ -1428,8 +1432,8 @@ async fn cursor_adapter_cancellation_settles_route_and_keeps_shared_bridge_usabl
         std::fs::read_to_string(format!("{stub}.spawns"))
             .unwrap()
             .trim(),
-        "1",
-        "clean cancellation should keep the same shared Bridge usable"
+        "2",
+        "resuming after cancellation must rotate the retired agent's callback boundary"
     );
 
     let port: u16 = std::fs::read_to_string(format!("{stub}.port"))
@@ -1441,24 +1445,32 @@ async fn cursor_adapter_cancellation_settles_route_and_keeps_shared_bridge_usabl
         tokio::net::TcpStream::connect(("127.0.0.1", port))
             .await
             .is_ok(),
-        "cancelling one agent unexpectedly stopped the shared Cursor Bridge"
+        "the replacement shared Cursor Bridge is not accepting RPCs"
     );
-    #[cfg(target_os = "linux")]
-    assert!(
-        std::path::Path::new(&format!("/proc/{pid}")).exists(),
-        "clean cancellation unexpectedly reaped the shared Cursor Bridge process"
-    );
-    backend.shutdown().await.unwrap();
     #[cfg(target_os = "linux")]
     assert!(
         !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+        "the retired callback boundary survived durable-agent resume"
+    );
+    #[cfg(target_os = "linux")]
+    let recovered_pid: u32 = std::fs::read_to_string(format!("{stub}.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    #[cfg(target_os = "linux")]
+    assert!(std::path::Path::new(&format!("/proc/{recovered_pid}")).exists());
+    backend.shutdown().await.unwrap();
+    #[cfg(target_os = "linux")]
+    assert!(
+        !std::path::Path::new(&format!("/proc/{recovered_pid}")).exists(),
         "backend shutdown did not reap the shared Cursor Bridge process"
     );
     mcp_task.abort();
 }
 
 #[tokio::test]
-async fn cursor_adapter_normal_completion_bounds_callback_drain_and_keeps_bridge_usable() {
+async fn cursor_adapter_normal_completion_bounds_callback_drain_and_recycles_before_resume() {
     use axum::routing::post;
 
     let tmp = tempfile::tempdir().unwrap();
@@ -1546,7 +1558,11 @@ async fn cursor_adapter_normal_completion_bounds_callback_drain_and_keeps_bridge
     blocked_release.notify_waiters();
 
     let mut recovered = start_turn(&backend, || {
-        let mut next = turn(tmp.path().to_path_buf(), None, BackendPermission::ReadOnly);
+        let mut next = turn(
+            tmp.path().to_path_buf(),
+            Some("sdk-agent-1"),
+            BackendPermission::ReadOnly,
+        );
         next.mcp_bridge = Some(mcp_bridge.clone());
         next
     })
@@ -1577,8 +1593,8 @@ async fn cursor_adapter_normal_completion_bounds_callback_drain_and_keeps_bridge
         std::fs::read_to_string(format!("{stub}.spawns"))
             .unwrap()
             .trim(),
-        "1",
-        "clean normal callback cleanup should keep the same shared Bridge usable"
+        "2",
+        "resuming after completion must rotate the retired agent's callback boundary"
     );
 
     backend.shutdown().await.unwrap();

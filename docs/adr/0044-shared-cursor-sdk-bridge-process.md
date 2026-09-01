@@ -28,7 +28,9 @@ exact callback routing, warm close/resume, cold-process resume, and
 cancellation isolation passed. The current probe also binds each host-owned
 tool route to a workspace-specific marker. The production shipping-path
 qualification, not Cursor-native filesystem access, proves separate session
-worktrees.
+worktrees. Warm close/resume establishes a vendor capability, not permission
+for the production adapter to bind one durable agent id to successive callback
+routes on the same process-wide endpoint.
 Cursor did not reliably disconnect the cancelled agent's outstanding callback,
 so safe sharing requires Trouve to settle that agent's callback route itself;
 it cannot rely on transport disconnect as the cancellation boundary.
@@ -43,25 +45,31 @@ it cannot rely on transport disconnect as the cancellation boundary.
   loopback-only listener. Possessing that bearer grants no Trouve tool by
   itself. A callback must also match an active exact `agent_id` route and the
   process-lifetime ownership record for its `(agent_id, tool_call_id)` pair.
+  An agent id retired from that listener can never register there again.
 - Each turn registers one route only after `CreateAgent` or `ResumeAgent`
   returns its agent id. The route owns that turn's thread-scoped MCP URL and
   ticket, exact custom-tool allowlist, deduplication records, cancellation
   token, callback task supervisor, and streamed tool-call identities. Unknown,
   stale, duplicate, or mismatched routes, tools, and call identities fail
   closed. Route admission closes before task cancellation and `CloseAgent`, so
-  no new callback can enter after teardown starts. A route is reusable only
-  when its callback ids exactly match the ids observed in the Send stream.
-- Tool-call ownership records are never evicted while a Bridge remains live.
-  Reaching their fixed process bound retires and recycles the Bridge after its
-  active leases drain instead of forgetting an authorization tombstone.
+  no new callback can enter after teardown starts. Clean shutdown retires the
+  agent id from that callback endpoint; its next `ResumeAgent` first drains and
+  recycles the process. The process remains eligible for other agents only
+  when the retired route's callback ids exactly match its Send-stream ids.
+- Tool-call ownership and retired-agent records are never evicted while a
+  Bridge remains live. Reaching either fixed process bound retires and recycles
+  the Bridge after its active leases drain instead of forgetting an
+  authorization tombstone.
 - Bridge RPC clients are cloneable and concurrent; Trouve does not hold the
   child-process mutex across an agent turn. Same-thread turns remain serial,
   and one backend still admits at most three active turns to bound callback and
   model resource use. That limit no longer represents a process count.
 - Turn cancellation sends `CancelRun` when the run id is available, removes
   and actively settles only that agent's callback route, and closes only that
-  agent. It does not terminate the shared process or interrupt unrelated
-  agents. Cursor steering remains disabled as decided in ADR 0043.
+  agent. It does not immediately terminate the shared process or interrupt
+  unrelated agents; a later resume of that agent waits for those leases to
+  drain before rotating the callback boundary. Cursor steering remains
+  disabled as decided in ADR 0043.
 - A process exit, protocol failure, ambiguous agent setup, callback-route
   collision, or unacknowledged `CloseAgent` quarantines the process. No new
   agent leases enter it; already-active turns drain, then Trouve terminates and
@@ -77,15 +85,17 @@ it cannot rely on transport disconnect as the cancellation boundary.
 
 - Cursor's warm idle cost is bounded to one Bridge per configured backend
   instead of up to three. Startup and the local SQLite connection are amortized
-  across all of that backend's threads.
+  across distinct agents until a durable agent resumes, at which point the
+  one process is rotated against the same shared store.
 - A longer-lived loopback callback bearer is acceptable because active
   agent-route membership, exact tool and call identity, and the turn-scoped MCP
   ticket remain authorization boundaries. Dropping a route also cancels its
   outstanding callbacks even when Cursor leaves the HTTP request connected.
 - Independent Cursor turns can stream concurrently without a global Bridge
   mutex. Cancellation and callback deduplication are isolated per agent, so an
-  identical vendor call id in two agents cannot collide. A delayed retry for a
-  reused agent id retains its earlier route generation and fails closed.
+  identical vendor call id in two agents cannot collide. A delayed callback
+  for a retired agent id has no replacement route on that listener and fails
+  closed; the replacement process has a different callback URL and bearer.
 - Quarantine favors isolation over immediate replacement: a new turn may wait
   for existing agents to drain after an ambiguous shared-process failure. It
   does not kill healthy concurrent agents merely to recover capacity.
@@ -107,6 +117,10 @@ it cannot rely on transport disconnect as the cancellation boundary.
 - **Terminate the shared process whenever one turn is cancelled.** That would
   interrupt unrelated agents even though `CancelRun`, route settlement, and
   `CloseAgent` provide an agent-scoped cleanup path.
+- **Reuse a retired agent id on the same callback endpoint.** The callback wire
+  carries no turn nonce. An as-yet unseen callback delayed before HTTP ingress
+  would be indistinguishable from a callback for the replacement route, so
+  process rotation is the only transport-independent isolation boundary.
 - **Retain several global Bridge processes for capacity.** The pinned Bridge
   already supports concurrent agents; extra processes add memory without a
   demonstrated correctness or throughput requirement.

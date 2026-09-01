@@ -4,8 +4,8 @@
 //! managed runtime, creates a real session worktree, drives the production
 //! Cursor backend through the secured internal MCP bridge, observes the
 //! durable event log, concurrently routes two SDK agents in separate session
-//! worktrees through one warm Bridge process, resumes the first agent, and
-//! removes the managed runtime again.
+//! worktrees through one Bridge process, cold-resumes the first agent through
+//! a rotated callback boundary, and removes the managed runtime again.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -630,40 +630,48 @@ async fn cursor_sdk_shipping_path_installs_tools_resumes_and_cleans_up() {
              After it succeeds, reply with exactly {PARALLEL_MARKER}. Do not call any other tool."
         )
     });
-    let (second_send, parallel_send) = tokio::join!(
-        client
-            .post(format!("{base}/threads/{thread_id}/messages"))
-            .json(&second_body)
-            .send(),
-        client
-            .post(format!("{base}/threads/{parallel_thread_id}/messages"))
-            .json(&parallel_body)
-            .send(),
-    );
-    let second_send = second_send.unwrap();
+    let second_send = client
+        .post(format!("{base}/threads/{thread_id}/messages"))
+        .json(&second_body)
+        .send()
+        .await
+        .unwrap();
     assert!(second_send.status().is_success(), "{second_send:?}");
-    let parallel_send = parallel_send.unwrap();
-    assert!(parallel_send.status().is_success(), "{parallel_send:?}");
-
-    // Neither approval is released until both requests are durably visible.
-    // Reaching this barrier proves that two agents have callbacks concurrently
-    // admitted through the one process-wide Bridge callback registration.
-    let (second_approval_events, parallel_approval_events) = tokio::join!(
-        wait_for_event(&client, &events_url, |event| {
-            (event["type"] == "approval.requested" && event["turn"] == 2)
-                || terminal_event(event, 2)
-        }),
-        wait_for_event(&client, &parallel_events_url, |event| {
-            (event["type"] == "approval.requested" && event["turn"] == 1)
-                || terminal_event(event, 1)
-        }),
-    );
+    // Hold the resumed agent at its approval before starting the fresh agent.
+    // This deterministically rotates the retired callback boundary first, then
+    // proves the fresh agent can join that replacement process concurrently.
+    let second_approval_events = wait_for_event(&client, &events_url, |event| {
+        (event["type"] == "approval.requested" && event["turn"] == 2) || terminal_event(event, 2)
+    })
+    .await;
     let second_approval = second_approval_events
         .iter()
         .find(|event| event["type"] == "approval.requested" && event["turn"] == 2)
         .unwrap_or_else(|| {
             panic!("resume turn terminated before the overlap barrier: {second_approval_events:?}")
         });
+    let resumed_runtime_dirs = bridge_runtime_dirs(&cursor_state_root);
+    assert_eq!(
+        resumed_runtime_dirs.len(),
+        1,
+        "cold resume should retain exactly one replacement Bridge: {resumed_runtime_dirs:?}"
+    );
+    assert_ne!(
+        resumed_runtime_dirs, first_runtime_dirs,
+        "durable-agent resume reused its retired callback boundary"
+    );
+
+    let parallel_send = client
+        .post(format!("{base}/threads/{parallel_thread_id}/messages"))
+        .json(&parallel_body)
+        .send()
+        .await
+        .unwrap();
+    assert!(parallel_send.status().is_success(), "{parallel_send:?}");
+    let parallel_approval_events = wait_for_event(&client, &parallel_events_url, |event| {
+        (event["type"] == "approval.requested" && event["turn"] == 1) || terminal_event(event, 1)
+    })
+    .await;
     let parallel_approval = parallel_approval_events
         .iter()
         .find(|event| event["type"] == "approval.requested" && event["turn"] == 1)
@@ -818,7 +826,7 @@ async fn cursor_sdk_shipping_path_installs_tools_resumes_and_cleans_up() {
             .expect("second turn retained the Cursor SDK agent id")
             .0,
         vendor_session.0,
-        "the warm Bridge process did not resume the same SDK agent"
+        "the replacement Bridge did not cold-resume the same SDK agent"
     );
     let parallel_vendor_session = engine
         .store()
@@ -831,8 +839,8 @@ async fn cursor_sdk_shipping_path_installs_tools_resumes_and_cleans_up() {
     );
     assert_eq!(
         bridge_runtime_dirs(&cursor_state_root),
-        first_runtime_dirs,
-        "parallel agents started another Bridge instead of sharing the warm process"
+        resumed_runtime_dirs,
+        "the fresh parallel agent did not share the replacement Bridge"
     );
 
     let view: serde_json::Value = client

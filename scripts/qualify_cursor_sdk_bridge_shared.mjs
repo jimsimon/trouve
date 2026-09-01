@@ -7,7 +7,9 @@
  * callbacks are routed by the exact owning agent id. Production-adapter route
  * settlement and quarantine are covered by the Rust adapter tests. This exercises
  * per-agent Trouve-owned workspace routes and tool catalogs, concurrent sends,
- * cancellation isolation, warm close/resume, and cold resume after a Bridge restart.
+ * cancellation isolation, vendor-capability warm close/resume, and cold resume after
+ * a Bridge restart. Production rotates the process before routing one durable agent
+ * id again because the callback wire carries no turn nonce.
  *
  * The probe performs six paid local SDK turns. It never prints account identity
  * or CURSOR_API_KEY and removes all temporary state unless --keep-state is set.
@@ -671,7 +673,7 @@ async function main() {
       surviving_callback_completed: survivingRecord.ok,
       surviving_turn: survived,
       adapter_route_settlement_covered_by:
-        "cursor_adapter_cancellation_settles_route_and_keeps_shared_bridge_usable",
+        "cursor_adapter_cancellation_settles_route_and_recycles_before_resume",
     };
     if (!cancellation.surviving_callback_completed) {
       throw new QualificationError("parallel cancellation did not isolate the surviving agent");
@@ -744,7 +746,9 @@ async function main() {
       callback_route_key: "agent_id",
       concurrent_sends: true,
       cancellation_isolated: true,
-      warm_close_resume: true,
+      warm_close_resume_vendor_capability: true,
+      production_same_agent_process_rotation_covered_by:
+        "cursor_adapter_cancellation_settles_route_and_recycles_before_resume",
       cold_process_resume: true,
       native_tools_present: false,
       warm_bridge_rss_bytes: warmRssBytes,

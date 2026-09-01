@@ -63,6 +63,10 @@ const MAX_CALLBACKS_PER_TURN: usize = 4 * 1024;
 // retry from an earlier turn cannot bind to a replacement route. Recycle the
 // process at the bound instead of evicting authorization tombstones.
 const MAX_CALLBACK_IDENTITIES_PER_PROCESS: usize = 16 * 1024;
+// The process-wide callback endpoint has no vendor-visible turn nonce. Never
+// route the same durable agent id twice through one endpoint; recycle at this
+// bound even when a long-lived process sees only distinct, tool-free agents.
+const MAX_RETIRED_AGENT_IDS_PER_PROCESS: usize = 16 * 1024;
 const MAX_CALLBACK_REPLAY_RECORDS: usize = 64;
 const MAX_CALLBACK_REPLAY_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CALLBACK_CONCURRENCY: usize = 8;
@@ -525,6 +529,7 @@ struct BridgeProcessRequest<'a> {
     command: &'a str,
     worktree: &'a Path,
     state_dir: &'a Path,
+    resume_agent_id: Option<&'a str>,
     api_key: &'a str,
     cancel: &'a CancellationToken,
     events: &'a BackendEventSender,
@@ -555,7 +560,15 @@ impl BridgePool {
             let existing = {
                 let process = self.process.lock().await;
                 process.as_ref().map(|process| {
-                    let leased = process.is_reusable() && process.state_dir == request.state_dir;
+                    // The callback wire has no turn nonce. A durable agent id
+                    // already routed through this listener requires a fresh
+                    // process-wide URL and bearer before ResumeAgent.
+                    let agent_route_available = request
+                        .resume_agent_id
+                        .is_none_or(|agent_id| process.callback.accepts_agent_id(agent_id));
+                    let leased = process.is_reusable()
+                        && process.state_dir == request.state_dir
+                        && agent_route_available;
                     if leased {
                         process.acquire_lease();
                     }
@@ -1041,6 +1054,7 @@ async fn run_sdk_turn(
                 command,
                 worktree: &turn.worktree,
                 state_dir: &state_dir,
+                resume_agent_id: session.resume.as_deref(),
                 api_key,
                 cancel: &turn.cancel,
                 events,
@@ -1106,9 +1120,9 @@ async fn run_sdk_turn(
     {
         Ok(route) => route,
         Err(error) => {
-            // A duplicate agent id already belongs to another active route;
-            // closing it here would interrupt that turn. Recycle the Bridge
-            // after all current routes drain instead.
+            // A duplicate or retired agent id cannot safely bind here. Closing
+            // an active duplicate would interrupt that turn, and a retired id
+            // needs a new callback boundary. Recycle after current routes drain.
             pool.quarantine(process.pooled()).await;
             return Err(error);
         }
@@ -1633,6 +1647,7 @@ async fn mcp_request(
 struct CallbackState {
     bearer: Arc<str>,
     routes: Arc<StdRwLock<HashMap<String, Arc<CallbackRoute>>>>,
+    retired_agent_ids: Arc<StdRwLock<HashSet<CallbackKey>>>,
     route_generation: Arc<AtomicU64>,
     identities: Arc<StdMutex<CallbackIdentities>>,
     request_slots: Arc<Semaphore>,
@@ -1934,6 +1949,7 @@ struct CallbackRouteLease {
     agent_id: String,
     route: Arc<CallbackRoute>,
     routes: Arc<StdRwLock<HashMap<String, Arc<CallbackRoute>>>>,
+    retired_agent_ids: Arc<StdRwLock<HashSet<CallbackKey>>>,
     supervisor: Arc<CallbackSupervisor>,
     active: bool,
 }
@@ -1948,6 +1964,7 @@ impl CallbackRouter {
         let state = CallbackState {
             bearer: Arc::from(bearer.as_str()),
             routes: Arc::new(StdRwLock::new(HashMap::new())),
+            retired_agent_ids: Arc::new(StdRwLock::new(HashSet::new())),
             route_generation: Arc::new(AtomicU64::new(0)),
             identities: Arc::new(StdMutex::new(CallbackIdentities::default())),
             request_slots: Arc::new(Semaphore::new(MAX_CALLBACK_HTTP_CONCURRENCY)),
@@ -1981,6 +1998,21 @@ impl CallbackRouter {
         })
     }
 
+    fn accepts_agent_id(&self, agent_id: &str) -> bool {
+        let routes = self
+            .state
+            .routes
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        !routes.contains_key(agent_id)
+            && !self
+                .state
+                .retired_agent_ids
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(&callback_key(agent_id))
+    }
+
     async fn register(
         &self,
         agent_id: String,
@@ -2002,6 +2034,17 @@ impl CallbackRouter {
         if routes.contains_key(&agent_id) {
             return Err(BackendError::Protocol(format!(
                 "Cursor callback route for agent {agent_id} is already active"
+            )));
+        }
+        if self
+            .state
+            .retired_agent_ids
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&callback_key(&agent_id))
+        {
+            return Err(BackendError::Protocol(format!(
+                "Cursor callback route for agent {agent_id} was already retired by this Bridge"
             )));
         }
         let generation = self
@@ -2028,8 +2071,8 @@ impl CallbackRouter {
         routes.insert(agent_id.clone(), route.clone());
         // Publish the generation only after the matching route is present,
         // while the route-table writer still excludes handler lookup. An
-        // ingress racing registration therefore snapshots either the prior
-        // generation and is rejected, or the fully published replacement.
+        // ingress racing first registration therefore snapshots either the
+        // prior generation and is rejected, or the fully published route.
         self.state
             .route_generation
             .store(generation, Ordering::Release);
@@ -2037,6 +2080,7 @@ impl CallbackRouter {
             agent_id,
             route,
             routes: self.state.routes.clone(),
+            retired_agent_ids: self.state.retired_agent_ids.clone(),
             supervisor,
             active: true,
         })
@@ -2175,7 +2219,18 @@ impl CallbackRouteLease {
             .get(&self.agent_id)
             .is_some_and(|route| Arc::ptr_eq(route, &self.route))
         {
+            let retire_at_capacity = {
+                let mut retired = self
+                    .retired_agent_ids
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                retired.insert(callback_key(&self.agent_id));
+                retired.len() >= MAX_RETIRED_AGENT_IDS_PER_PROCESS
+            };
             routes.remove(&self.agent_id);
+            if retire_at_capacity {
+                self.route.quarantine_owner();
+            }
         }
         self.active = false;
     }
@@ -3938,6 +3993,7 @@ mod tests {
                 command: script.to_str().unwrap(),
                 worktree: temp.path(),
                 state_dir: &state,
+                resume_agent_id: None,
                 api_key: "secret",
                 cancel: &cancel,
                 events: &events,
@@ -4575,9 +4631,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn callback_ingress_generation_rejects_a_delayed_previous_route_request() {
-        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-
+    async fn retired_agent_id_cannot_bind_to_a_replacement_route() {
         let mcp_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
@@ -4607,99 +4661,54 @@ mod tests {
             }
         });
         let callback = CallbackRouter::start(reqwest::Client::new()).await.unwrap();
+        let reusable = Arc::new(AtomicBool::new(true));
         let mut previous = callback
             .register(
                 "agent-reused".into(),
                 Some(format!("http://{address}/mcp")),
                 HashSet::from(["shared_tool".into()]),
                 CancellationToken::new(),
-                None,
+                Some(Arc::downgrade(&reusable)),
             )
             .await
             .unwrap();
-        previous
-            .route
-            .observe_stream_call_id("delayed-call")
-            .unwrap();
-
-        let body = serde_json::to_string(&json!({
-            "toolName": "shared_tool",
-            "toolCallId": "delayed-call",
-            "agentId": "agent-reused",
-            "args": {},
-        }))
-        .unwrap();
-        let split = body.len() / 2;
-        let (body_prefix, body_suffix) = body.split_at(split);
-        let port: u16 = callback
-            .url
-            .strip_prefix("http://127.0.0.1:")
-            .unwrap()
-            .parse()
-            .unwrap();
-        let mut request = tokio::net::TcpStream::connect(("127.0.0.1", port))
-            .await
-            .unwrap();
-        request
-            .write_all(
-                format!(
-                    "POST {CALLBACK_PATH} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    callback.bearer,
-                    body.len(),
-                    body_prefix,
-                )
-                .as_bytes(),
-            )
-            .await
-            .unwrap();
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while callback.state.request_slots.available_permits() == MAX_CALLBACK_HTTP_CONCURRENCY
-            {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("delayed callback never crossed the ingress generation fence");
-
         assert!(previous.stop().await);
-        let mut replacement = callback
+        assert!(!callback.accepts_agent_id("agent-reused"));
+
+        let error = match callback
             .register(
                 "agent-reused".into(),
                 Some(format!("http://{address}/mcp")),
                 HashSet::from(["shared_tool".into()]),
                 CancellationToken::new(),
-                None,
+                Some(Arc::downgrade(&reusable)),
             )
             .await
-            .unwrap();
-        request.write_all(body_suffix.as_bytes()).await.unwrap();
-        let mut response = Vec::new();
-        request.read_to_end(&mut response).await.unwrap();
-        let response = String::from_utf8(response).unwrap();
-        assert!(
-            response.starts_with("HTTP/1.1 403 Forbidden"),
-            "delayed callback reached its replacement route: {response}"
-        );
-        let before_ingress = reqwest::Client::new()
+        {
+            Ok(_) => panic!("a retired agent id was routed twice through one Bridge"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("already retired"), "{error}");
+
+        let delayed = reqwest::Client::new()
             .post(format!("{}{}", callback.url, CALLBACK_PATH))
             .bearer_auth(&callback.bearer)
             .json(&json!({
                 "toolName": "shared_tool",
-                "toolCallId": "delayed-call",
+                "toolCallId": "previously-unseen-late-call",
                 "agentId": "agent-reused",
                 "args": {},
             }))
             .send()
             .await
             .unwrap();
+        assert_eq!(delayed.status(), StatusCode::FORBIDDEN);
         assert_eq!(
-            before_ingress.status(),
-            StatusCode::FORBIDDEN,
-            "a prior route's streamed call id rebound after route replacement"
+            mcp_calls.load(Ordering::Acquire),
+            0,
+            "a callback for a retired agent reached a replacement MCP route"
         );
-        assert_eq!(mcp_calls.load(Ordering::Acquire), 0);
 
-        assert!(replacement.stop().await);
         callback.stop().await.unwrap();
         mcp_server.abort();
     }

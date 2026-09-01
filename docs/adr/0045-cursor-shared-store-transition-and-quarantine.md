@@ -16,7 +16,10 @@ them in its durable backend-session record.
 Cursor cancellation also does not reliably disconnect an outstanding custom-
 tool callback. Trouve removes the agent route and cancels its callback tasks,
 but bounded shutdown can itself time out. A process whose old route has not
-provably settled must not admit a replacement agent.
+provably settled must not admit a replacement agent. Even clean settlement
+cannot prove that an unseen callback was not delayed before HTTP ingress: the
+process-wide callback wire identifies the durable agent but carries no turn
+nonce.
 
 ## Decision
 
@@ -33,10 +36,16 @@ provably settled must not admit a replacement agent.
   Bridge even when `CloseAgent` succeeds. No new turn enters that process;
   existing leases drain before Trouve recycles it against the durable shared
   store.
+- Clean route shutdown permanently retires that agent id from the process-wide
+  callback listener. Before a later turn resumes the durable agent, Trouve
+  drains any unrelated active leases, reaps the one Bridge, and starts one
+  replacement with a fresh listener and bearer. This forbids an unseen old
+  callback from acquiring the later turn's MCP ticket or worktree authority.
 - The direct vendor qualification proves concurrent agents, exact callback
   routing, and Cursor's cancellation transport behavior. Production adapter
   tests own the evidence that Trouve settles a cancelled callback route and
-  either safely reuses or quarantines the Bridge.
+  rotates the process before resuming that agent while never running more than
+  one Bridge for the backend.
 
 ## Consequences
 
@@ -48,6 +57,9 @@ provably settled must not admit a replacement agent.
 - A stuck callback can delay new Cursor turns until healthy active turns drain
   and the process is recycled. This preserves concurrent turns while failing
   closed at the process-reuse boundary.
+- Repeated turns for one durable agent pay Bridge restart latency. Distinct
+  agents can still share the one process concurrently, preserving the memory
+  objective without relying on undocumented callback ordering.
 - Qualification claims distinguish vendor transport evidence from behavior
   exercised through Trouve's production adapter.
 
