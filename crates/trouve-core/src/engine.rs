@@ -30119,22 +30119,16 @@ default_permission_mode = "ask"
             .await;
 
         assert!(result.is_err());
-        let refresh = {
-            let engine = engine.clone();
-            tokio::spawn(async move {
-                engine.refresh_api_provider_registry().await;
-            })
-        };
-        tokio::task::yield_now().await;
+        let refresh = engine.refresh_api_provider_registry();
+        tokio::pin!(refresh);
         assert!(
-            !refresh.is_finished(),
+            futures::poll!(refresh.as_mut()).is_pending(),
             "API provider refresh observed tentative credentials"
         );
         wait_for_provider_secret_reconciliation(&engine, secret_store.as_ref(), &api_key).await;
         tokio::time::timeout(Duration::from_secs(3), refresh)
             .await
-            .expect("API provider refresh did not resume after secret reconciliation")
-            .unwrap();
+            .expect("API provider refresh did not resume after secret reconciliation");
         assert_eq!(
             secret_store.values.lock().unwrap().get(&api_key),
             Some(&"old-key".to_string())
