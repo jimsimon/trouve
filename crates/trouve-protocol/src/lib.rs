@@ -337,11 +337,13 @@ pub use requests::*;
 // replacing a concurrently edited definition (additive).
 // 7.27: `turn.background_activity` distinguishes server-dispatched autonomous
 // activity from user-authored `user.message` events (additive).
-// 7.28: the legacy /v1/clis lifecycle also manages non-CLI agent runtimes;
+// 7.28: `session.pr_mentioned` associates pull request browser URLs appearing
+// in durable user-visible chat without claiming session branch ownership.
+// 7.29: the legacy /v1/clis lifecycle also manages non-CLI agent runtimes;
 // Cursor's managed artifact is its standalone Agent SDK Bridge.
-// 7.29: CLI install status can expose a non-fatal durability warning after an
+// 7.30: CLI install status can expose a non-fatal durability warning after an
 // atomically committed runtime activation (additive).
-pub const PROTOCOL_VERSION: &str = "7.29";
+pub const PROTOCOL_VERSION: &str = "7.30";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";
 pub const ERROR_CODE_GITHUB_REAUTHENTICATION_REQUIRED: &str = "github_reauthentication_required";

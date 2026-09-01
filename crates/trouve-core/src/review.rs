@@ -1524,6 +1524,22 @@ fn incremental_review_base_sha(
     }
 }
 
+/// Carried finding coordinates advance from the last published review head,
+/// independently of the diff range selected for reviewer coverage. A full
+/// review uses the pull-request merge base, but carried anchors describe code
+/// at a later reviewed head and cannot safely be interpreted as merge-base
+/// coordinates.
+fn carried_anchor_base_sha<'a>(
+    review_base_sha: &'a str,
+    last_reviewed_head_sha: &'a str,
+) -> &'a str {
+    if validate_sha(last_reviewed_head_sha).is_ok() {
+        last_reviewed_head_sha
+    } else {
+        review_base_sha
+    }
+}
+
 #[derive(Deserialize)]
 struct PublishedReview {
     id: u64,
@@ -5585,21 +5601,33 @@ impl Engine {
         let review_watermark_sha = job.review_watermark_sha.clone();
         let incremental_candidate = job.scope == trouve_protocol::CodeReviewJobScope::Incremental
             && review_watermark_sha != job.base_ref;
-        let optional_shas = if incremental_candidate {
-            let mut shas = Vec::new();
-            for sha in [
+        // The prior reviewed head is also the coordinate space for carried
+        // findings during explicit full reviews. Keep that immutable object
+        // available even when reviewer coverage itself starts at the merge
+        // base rather than the incremental watermark.
+        let mut optional_shas = Vec::new();
+        let optional_sha_candidates = if incremental_candidate {
+            vec![
                 &review_watermark_sha,
                 &previous_pull_state.last_reviewed_base_sha,
                 &previous_pull_state.last_reviewed_head_sha,
-            ] {
-                if validate_sha(sha).is_ok() && !shas.contains(sha) {
-                    shas.push(sha.clone());
-                }
-            }
-            shas
+            ]
         } else {
-            Vec::new()
+            // Full reviews need only the coordinate space that carried
+            // findings were last advanced onto. Fetching an older base as
+            // well would spend the bounded optional-history budget on an
+            // object that carried-anchor mapping never reads.
+            vec![&previous_pull_state.last_reviewed_head_sha]
         };
+        for sha in optional_sha_candidates {
+            if validate_sha(sha).is_ok()
+                && sha != &job.base_ref
+                && sha != &job.head_sha
+                && !optional_shas.contains(sha)
+            {
+                optional_shas.push(sha.clone());
+            }
+        }
         let token = self.installation_token(job.installation_id).await?;
         let repository_path = self
             .executor
@@ -6346,18 +6374,73 @@ impl Engine {
                 analysis_handle.await.ok().flatten()
             };
         let mut carried_anchor_has_more = false;
-        let carried_diff_contents = diff_line_contents(&diff_files);
         let carried_finding_ids = previous_findings
             .iter()
             .map(|finding| finding.id.clone())
             .collect::<Vec<_>>();
-        let carried_base_anchors = self
+        let preferred_carried_base_sha = carried_anchor_base_sha(
+            &job.review_base_sha,
+            &previous_pull_state.last_reviewed_head_sha,
+        )
+        .to_owned();
+        let mut carried_mapping_base_sha = job.review_base_sha.clone();
+        let mut carried_mapping_files = Arc::clone(&diff_files);
+        let mut carried_base_anchors = self
             .store
-            .code_review_carried_finding_anchors(&carried_finding_ids, &job.review_base_sha)?;
+            .code_review_carried_finding_anchors(&carried_finding_ids, &carried_mapping_base_sha)?;
+        if !previous_findings.is_empty() && preferred_carried_base_sha != carried_mapping_base_sha {
+            let preferred_diff = if preferred_carried_base_sha == job.head_sha {
+                Ok(Vec::new())
+            } else {
+                self.executor
+                    .review_repository_diff(&ReviewRepositoryDiff {
+                        managed_root: self.data_dir.join("worktrees"),
+                        worktree: session.worktree_path.clone().into(),
+                        base_sha: preferred_carried_base_sha.clone(),
+                        head_sha: job.head_sha.clone(),
+                        cancel: superseded.clone(),
+                        max_bytes: REVIEW_DIFF_CACHE_MAX_BYTES,
+                    })
+                    .await
+            };
+            // The auxiliary mapping diff is best-effort for ordinary git
+            // failures, but cancellation remains authoritative. Do not turn a
+            // superseded full review into a warning followed by coordinator
+            // work on stale state.
+            ensure_review_current(superseded)?;
+            match preferred_diff {
+                Ok(files) => {
+                    carried_mapping_base_sha = preferred_carried_base_sha;
+                    carried_mapping_files = Arc::new(
+                        files
+                            .into_iter()
+                            .map(|file| ReviewDiffFile {
+                                path: file.path,
+                                diff: file.diff,
+                                generated_header: None,
+                            })
+                            .collect(),
+                    );
+                    carried_base_anchors = self.store.code_review_carried_finding_anchors(
+                        &carried_finding_ids,
+                        &carried_mapping_base_sha,
+                    )?;
+                }
+                Err(error) => tracing::warn!(
+                    job_id = %job.id,
+                    carried_base = %preferred_carried_base_sha,
+                    head = %job.head_sha,
+                    %error,
+                    "could not advance carried finding anchors from the prior reviewed head; \
+                     retaining conservative review-range verification"
+                ),
+            }
+        }
+        let carried_diff_contents = diff_line_contents(&carried_mapping_files);
         let carried_mapping = CarriedAnchorMappingContext {
-            files: &diff_files,
+            files: &carried_mapping_files,
             diff_contents: &carried_diff_contents,
-            review_base_sha: &job.review_base_sha,
+            review_base_sha: &carried_mapping_base_sha,
             base_anchors: &carried_base_anchors,
         };
         let parsed = if coordinator_candidates.is_empty() && previous_findings.is_empty() {
@@ -8531,7 +8614,9 @@ impl Engine {
                         .with_context(|| format!("reading GitHub API {status} response"));
                 }
             };
-            if status.as_u16() == 422 && github_review_should_fallback_to_comment(event, &body) {
+            if status.as_u16() == 422
+                && github_review_should_fallback_to_comment(event, include_comments, &body)
+            {
                 event = "COMMENT";
                 continue;
             }
@@ -11761,8 +11846,19 @@ fn github_rejected_own_pull_verdict(response_body: &str) -> bool {
         && (body.contains("approve") || body.contains("request changes"))
 }
 
-fn github_review_should_fallback_to_comment(event: &str, response_body: &str) -> bool {
-    event != "COMMENT" && github_rejected_own_pull_verdict(response_body)
+fn github_review_should_fallback_to_comment(
+    event: &str,
+    include_comments: bool,
+    response_body: &str,
+) -> bool {
+    event != "COMMENT"
+        && (github_rejected_own_pull_verdict(response_body)
+            // GitHub sometimes omits the validation details that identify a
+            // forbidden REQUEST_CHANGES verdict. Once inline comments have
+            // already been removed (or there were none), retrying as COMMENT
+            // is the only remaining non-lossy publication fallback. Other
+            // validation failures still fail on the COMMENT attempt.
+            || (!include_comments && generic_review_validation_failure(response_body)))
 }
 
 fn compact_elapsed(milliseconds: u64) -> String {
@@ -18031,19 +18127,33 @@ mod tests {
     fn own_pull_verdict_rejections_are_detected_without_hiding_other_errors() {
         assert!(github_review_should_fallback_to_comment(
             "APPROVE",
+            true,
             r#"{"message":"Can not approve your own pull request"}"#
         ));
         assert!(github_review_should_fallback_to_comment(
             "REQUEST_CHANGES",
+            false,
             r#"{"message":"Can not request changes on your own pull request"}"#
         ));
         assert!(!github_review_should_fallback_to_comment(
             "APPROVE",
+            false,
             r#"{"message":"commit_id is not part of the pull request"}"#
         ));
         assert!(!github_review_should_fallback_to_comment(
             "COMMENT",
+            false,
             r#"{"message":"Can not approve your own pull request"}"#
+        ));
+        assert!(github_review_should_fallback_to_comment(
+            "REQUEST_CHANGES",
+            false,
+            r#"{"message":"Unprocessable Entity"}"#
+        ));
+        assert!(!github_review_should_fallback_to_comment(
+            "REQUEST_CHANGES",
+            true,
+            r#"{"message":"Unprocessable Entity"}"#
         ));
     }
 
@@ -20333,6 +20443,52 @@ mod tests {
         assert!(!accepted.contains(&"rvf_stale".to_owned()));
         assert!(accepted.contains(&"rvf_advisory".to_owned()));
         assert!(accepted.contains(&"rvf_unknown".to_owned()));
+    }
+
+    #[test]
+    fn full_review_carried_resolution_maps_from_previous_review_head() {
+        let merge_base = "1".repeat(40);
+        let previous_head = "2".repeat(40);
+        let finding = trouve_protocol::CodeReviewFinding {
+            observed_head: previous_head.clone(),
+            ..open_history_finding("rvf_full", "src/lib.rs", 10, "high")
+        };
+        let selected_base = carried_anchor_base_sha(&merge_base, &previous_head);
+        assert_eq!(selected_base, previous_head);
+
+        // Reviewer coverage may span merge-base..head, but carried coordinates
+        // belong to previous-head..head. Mapping the latter advances the old
+        // anchor onto the replacement line that the coordinator must quote.
+        let files = vec![ReviewDiffFile {
+            path: "src/lib.rs".into(),
+            diff: "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -10 +10 @@\n-old_registration();\n+register_before_start();\n"
+                .into(),
+            generated_header: None,
+        }];
+        let diff_contents = diff_line_contents(&files);
+        let base_anchors = CarriedFindingAnchorMap::new();
+        let mapping = CarriedAnchorMappingContext {
+            files: &files,
+            diff_contents: &diff_contents,
+            review_base_sha: selected_base,
+            base_anchors: &base_anchors,
+        };
+        let claim = ResolvedFindingClaim {
+            finding_id: finding.id.clone(),
+            current_anchor_quote: "register_before_start();".into(),
+        };
+
+        assert_eq!(
+            carried_anchor_history_lines(std::slice::from_ref(&finding), &mapping, &HashMap::new(),),
+            HashMap::from([(
+                ("src/lib.rs".to_owned(), 10),
+                Some("register_before_start();".to_owned()),
+            )])
+        );
+        assert_eq!(
+            verified_resolution_ids(Vec::new(), &[claim], &[finding], &mapping, &HashMap::new(),),
+            vec!["rvf_full".to_owned()]
+        );
     }
 
     #[test]
@@ -23532,7 +23688,7 @@ rename to src/new.rs
     }
 
     #[tokio::test]
-    async fn review_without_inline_comments_still_publishes_a_verdict() {
+    async fn opaque_422_without_inline_comments_falls_back_to_comment() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
         let store = crate::store::Store::open_in_memory().unwrap();
@@ -23566,7 +23722,7 @@ rename to src/new.rs
                 (
                     r#""event":"request_changes""#,
                     "422 Unprocessable Entity",
-                    r#"{"message":"Can not request changes on your own pull request"}"#,
+                    r#"{"message":"Unprocessable Entity"}"#,
                 ),
                 (
                     r#""event":"comment""#,

@@ -26,6 +26,14 @@ struct StaticThenLiveModelProvider {
     live_calls: Arc<AtomicUsize>,
 }
 
+struct SteerableNativeProvider {
+    calls: AtomicUsize,
+    model_discovery_gate: Option<Arc<tokio::sync::Semaphore>>,
+    first_stream_started: Arc<tokio::sync::Semaphore>,
+    finish_first_stream: Arc<tokio::sync::Notify>,
+    messages_seen: std::sync::Mutex<Vec<Vec<Message>>>,
+}
+
 fn catalog_model(id: &str, display_name: &str) -> trouve_protocol::ModelInfo {
     trouve_protocol::ModelInfo {
         id: id.into(),
@@ -117,6 +125,74 @@ impl Provider for ScriptedProvider {
             ],
         };
         Ok(Box::pin(futures::stream::iter(events)))
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for SteerableNativeProvider {
+    fn id(&self) -> &str {
+        "native-steering"
+    }
+
+    fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
+        vec![catalog_model(
+            "native-steering/test-model",
+            "Native steering test model",
+        )]
+    }
+
+    async fn list_models(&self) -> Vec<trouve_protocol::ModelInfo> {
+        if let Some(gate) = &self.model_discovery_gate {
+            gate.acquire().await.unwrap().forget();
+        }
+        self.models()
+    }
+
+    async fn stream_chat(
+        &self,
+        _model: &str,
+        messages: &[Message],
+        _tools: &[ToolSpec],
+        _options: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<EventStream, ProviderError> {
+        self.messages_seen.lock().unwrap().push(messages.to_vec());
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        if call == 0 {
+            self.first_stream_started.add_permits(1);
+            let finish_first_stream = self.finish_first_stream.clone();
+            return Ok(Box::pin(
+                futures::stream::iter(vec![Ok(ProviderEvent::TextDelta(
+                    "Initial direction.".into(),
+                ))])
+                .chain(futures::stream::once(async move {
+                    finish_first_stream.notified().await;
+                    Ok(ProviderEvent::TextDelta(" Boundary completion.".into()))
+                }))
+                .chain(futures::stream::iter(vec![
+                    Ok(ProviderEvent::ToolCall(ToolCallRequest {
+                        id: "boundary-question".into(),
+                        name: "ask_question".into(),
+                        arguments: serde_json::json!({
+                            "title": "Safe boundary",
+                            "questions": [{
+                                "prompt": "Continue?",
+                                "options": ["Yes", "No"],
+                            }],
+                        }),
+                    })),
+                    Ok(ProviderEvent::Completed {
+                        usage: Usage::default(),
+                    }),
+                ])),
+            ));
+        }
+
+        Ok(Box::pin(futures::stream::iter(vec![
+            Ok(ProviderEvent::TextDelta("Redirected result.".into())),
+            Ok(ProviderEvent::Completed {
+                usage: Usage::default(),
+            }),
+        ])))
     }
 }
 
@@ -401,6 +477,256 @@ async fn wait_for_event(
     tokio::time::timeout(Duration::from_secs(30), fut)
         .await
         .expect("timed out waiting for event")
+}
+
+#[tokio::test]
+async fn native_provider_turn_applies_steering_at_the_next_safe_boundary() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+
+    let provider = Arc::new(SteerableNativeProvider {
+        calls: AtomicUsize::new(0),
+        model_discovery_gate: Some(Arc::new(tokio::sync::Semaphore::new(0))),
+        first_stream_started: Arc::new(tokio::sync::Semaphore::new(0)),
+        finish_first_stream: Arc::new(tokio::sync::Notify::new()),
+        messages_seen: std::sync::Mutex::new(Vec::new()),
+    });
+    let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
+    let engine = Arc::new(
+        Engine::new(store, tmp.path().join("data"), &Config::default())
+            .with_config_dir(None)
+            .with_provider("native-steering", provider.clone())
+            .with_default_model("native-steering/test-model"),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = trouve_server::build_router(engine.clone());
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let base = format!("http://{addr}/v1");
+    let client = reqwest::Client::new();
+
+    let workspace: serde_json::Value = client
+        .post(format!("{base}/workspaces"))
+        .json(&serde_json::json!({"path": repo}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let session: serde_json::Value = client
+        .post(format!("{base}/sessions"))
+        .json(&serde_json::json!({"workspace_id": workspace["id"], "title": "Native steer"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let thread: serde_json::Value = client
+        .post(format!("{base}/threads"))
+        .json(&serde_json::json!({
+            "session_id": session["id"],
+            "permission_mode": "yolo",
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let thread_id = thread["id"].as_str().unwrap();
+    let events_url = format!("{base}/threads/{thread_id}/events");
+
+    let started = client
+        .post(format!("{base}/threads/{thread_id}/messages"))
+        .json(&serde_json::json!({"content": "Begin in the initial direction."}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(started.status(), reqwest::StatusCode::ACCEPTED);
+    assert!(
+        engine.turn_accepts_steering(thread_id, 1),
+        "turn 1 steering receiver must be installed before messages POST returns"
+    );
+    let steer_client = client.clone();
+    let steer_url = format!("{base}/threads/{thread_id}/steer");
+    let pending_steer = tokio::spawn(async move {
+        steer_client
+            .post(steer_url)
+            .json(&serde_json::json!({"content": "Change direction now."}))
+            .send()
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while engine.pending_turn_steers(thread_id, 1) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("HTTP steering request should reach the installed receiver");
+    provider
+        .model_discovery_gate
+        .as_ref()
+        .unwrap()
+        .add_permits(8);
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        provider.first_stream_started.acquire(),
+    )
+    .await
+    .expect("provider never started its first stream")
+    .unwrap()
+    .forget();
+    let before = wait_for_event(&client, &events_url, |event| {
+        event["type"] == "assistant.delta"
+    })
+    .await;
+    assert!(before.iter().any(|event| {
+        event["type"] == "turn.started" && event["turn"] == 1 && event["supports_steering"] == true
+    }));
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    provider.finish_first_stream.notify_one();
+    let steered = tokio::time::timeout(Duration::from_secs(10), pending_steer)
+        .await
+        .expect("boundary steering did not resume after the provider response")
+        .unwrap()
+        .unwrap();
+    assert_eq!(steered.status(), reqwest::StatusCode::ACCEPTED);
+    assert_eq!(
+        steered.json::<serde_json::Value>().await.unwrap()["turn"],
+        1
+    );
+
+    // Hold the tool batch open, then admit attachment-bearing steering. The
+    // request must retain its bounded queue permit until the question result
+    // is recorded and attachment materialization can use the safe mutation
+    // boundary.
+    let during_tool = wait_for_event(&client, &events_url, |event| {
+        event["type"] == "question.requested"
+    })
+    .await;
+    let question = during_tool
+        .iter()
+        .find(|event| event["type"] == "question.requested")
+        .unwrap();
+    let request_id = question["request_id"].as_str().unwrap().to_string();
+    let attachment_client = client.clone();
+    let attachment_url = format!("{base}/threads/{thread_id}/steer");
+    let pending_attachment_steer = tokio::spawn(async move {
+        attachment_client
+            .post(attachment_url)
+            .json(&serde_json::json!({
+                "content": "Use this attached guidance.",
+                "attachments": [{
+                    "name": "guidance.txt",
+                    "mime": "text/plain",
+                    "data": "YXR0YWNobWVudA==",
+                }],
+            }))
+            .send()
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while engine.pending_turn_steers(thread_id, 1) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("attachment steering was not retained during tool execution");
+    let answered = client
+        .post(format!("{base}/questions"))
+        .json(&serde_json::json!({
+            "thread_id": thread_id,
+            "request_id": request_id,
+            "answers": [{"question_id": "q1", "selected_option_ids": ["opt1"]}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(answered.status(), reqwest::StatusCode::NO_CONTENT);
+    let attachment_steered =
+        tokio::time::timeout(Duration::from_secs(10), pending_attachment_steer)
+            .await
+            .expect("attachment steering did not resume after the tool boundary")
+            .unwrap()
+            .unwrap();
+    assert_eq!(attachment_steered.status(), reqwest::StatusCode::ACCEPTED);
+
+    let events = wait_for_event(&client, &events_url, |event| {
+        event["type"] == "turn.completed"
+    })
+    .await;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["type"] == "turn.started")
+            .count(),
+        1
+    );
+    assert!(!events.iter().any(|event| event["type"] == "turn.cancelled"));
+    assert!(events.iter().any(|event| {
+        event["type"] == "turn.steered"
+            && event["turn"] == 1
+            && event["content"] == "Change direction now."
+    }));
+    assert!(events.iter().any(|event| {
+        event["type"] == "assistant.delta" && event["text"] == "Redirected result."
+    }));
+    let boundary_index = events
+        .iter()
+        .position(|event| {
+            event["type"] == "assistant.delta" && event["text"] == " Boundary completion."
+        })
+        .unwrap();
+    let steering_index = events
+        .iter()
+        .position(|event| event["type"] == "turn.steered")
+        .unwrap();
+    let tool_result_index = events
+        .iter()
+        .position(|event| event["type"] == "question.resolved")
+        .unwrap();
+    assert!(steering_index < boundary_index && boundary_index < tool_result_index);
+    let attachment_steering_index = events
+        .iter()
+        .position(|event| {
+            event["type"] == "turn.steered" && event["content"] == "Use this attached guidance."
+        })
+        .unwrap();
+    assert!(tool_result_index < attachment_steering_index);
+    assert_eq!(
+        events[attachment_steering_index]["attachments"][0]["name"],
+        "guidance.txt"
+    );
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+
+    let messages_seen = provider.messages_seen.lock().unwrap();
+    assert!(messages_seen[0].iter().any(|message| {
+        matches!(message, Message::User(content) if content == "Change direction now.")
+    }));
+    let resumed = &messages_seen[1];
+    assert!(resumed.iter().any(|message| {
+        matches!(message, Message::User(content) if content == "Change direction now.")
+    }));
+    assert!(resumed.iter().any(|message| {
+        matches!(message, Message::Assistant { content, .. } if content == "Initial direction. Boundary completion.")
+    }));
+    let tool_result = resumed
+        .iter()
+        .position(|message| {
+            matches!(message, Message::ToolResult { call_id, .. } if call_id == "boundary-question")
+        })
+        .unwrap();
+    let attachment_guidance = resumed
+        .iter()
+        .position(|message| {
+            matches!(message, Message::User(content) if content.contains("Use this attached guidance.") && content.contains("guidance.txt"))
+        })
+        .unwrap();
+    assert!(tool_result < attachment_guidance);
 }
 
 #[tokio::test]
@@ -926,6 +1252,8 @@ async fn full_turn_with_approval_checkpoint_and_undo() {
 
 struct IterationLimitProvider {
     calls: AtomicUsize,
+    final_stream_started: tokio::sync::Semaphore,
+    finish_final_stream: tokio::sync::Notify,
 }
 
 #[async_trait::async_trait]
@@ -943,6 +1271,8 @@ impl Provider for IterationLimitProvider {
     ) -> Result<EventStream, ProviderError> {
         let call = self.calls.fetch_add(1, Ordering::SeqCst);
         let events = if tools.is_empty() {
+            self.final_stream_started.add_permits(1);
+            self.finish_final_stream.notified().await;
             vec![
                 Ok(ProviderEvent::TextDelta(
                     "I stopped at the step limit; continue to finish.".into(),
@@ -976,6 +1306,8 @@ async fn iteration_limit_gets_a_final_tool_free_model_response() {
 
     let provider = Arc::new(IterationLimitProvider {
         calls: AtomicUsize::new(0),
+        final_stream_started: tokio::sync::Semaphore::new(0),
+        finish_final_stream: tokio::sync::Notify::new(),
     });
     let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
     let engine = Arc::new(
@@ -1025,6 +1357,27 @@ async fn iteration_limit_gets_a_final_tool_free_model_response() {
         .send()
         .await
         .unwrap();
+
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        provider.final_stream_started.acquire(),
+    )
+    .await
+    .expect("iteration-limit final report never started")
+    .unwrap()
+    .forget();
+    let rejected = tokio::time::timeout(
+        Duration::from_secs(2),
+        client
+            .post(format!("{base}/threads/{thread_id}/steer"))
+            .json(&serde_json::json!({"content": "race the final report"}))
+            .send(),
+    )
+    .await
+    .expect("steering raced into the unpolled final-report receiver")
+    .unwrap();
+    assert_eq!(rejected.status(), reqwest::StatusCode::CONFLICT);
+    provider.finish_final_stream.notify_one();
 
     let events = wait_for_event(
         &client,
@@ -2301,6 +2654,7 @@ async fn model_swap_hands_off_history_and_keeps_vendor_sessions() {
 /// backend capability, durable event ordering, and folded thread view.
 struct SteerableBackend {
     steers: std::sync::Mutex<Vec<(String, String, Vec<String>)>>,
+    model_discovery_gate: Arc<tokio::sync::Semaphore>,
     release: tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     tool_release: tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
@@ -2309,6 +2663,7 @@ impl SteerableBackend {
     fn new() -> Self {
         Self {
             steers: std::sync::Mutex::new(Vec::new()),
+            model_discovery_gate: Arc::new(tokio::sync::Semaphore::new(0)),
             release: tokio::sync::Mutex::new(None),
             tool_release: tokio::sync::Mutex::new(None),
         }
@@ -2343,6 +2698,15 @@ impl trouve_agents::AgentBackend for SteerableBackend {
         }]
     }
 
+    async fn list_models(&self) -> Vec<trouve_protocol::ModelInfo> {
+        self.model_discovery_gate
+            .acquire()
+            .await
+            .expect("backend model discovery gate remains open")
+            .forget();
+        self.models()
+    }
+
     fn status(&self) -> trouve_agents::BackendStatus {
         trouve_agents::BackendStatus {
             installed: true,
@@ -2358,6 +2722,11 @@ impl trouve_agents::AgentBackend for SteerableBackend {
         &self,
         steer: trouve_agents::BackendSteer,
     ) -> Result<(), trouve_agents::BackendError> {
+        if steer.prompt == "Reject this steering command." {
+            return Err(trouve_agents::BackendError::Protocol(
+                "deterministic steering rejection".into(),
+            ));
+        }
         self.steers.lock().unwrap().push((
             steer.session,
             steer.prompt,
@@ -2550,6 +2919,11 @@ async fn active_backend_turn_can_be_steered_and_replays_on_its_timeline() {
         .await
         .unwrap();
     assert_eq!(started.status(), reqwest::StatusCode::ACCEPTED);
+    assert!(
+        engine.turn_accepts_steering(thread_id, 1),
+        "turn 1 steering receiver must be installed before backend startup completes"
+    );
+    backend.model_discovery_gate.add_permits(8);
     let before = wait_for_event(&client, &events_url, |event| {
         event["type"] == "assistant.thinking"
     })
@@ -2812,6 +3186,49 @@ async fn active_backend_turn_can_be_steered_and_replays_on_its_timeline() {
         assert_eq!(received[3].1, "Finish the restarted turn.");
         assert_eq!(received[3].2.len(), 1);
         assert!(Path::new(&received[3].2[0]).exists());
+    }
+
+    // A command-level backend rejection must fail only that HTTP request. It
+    // is neither durable guidance nor a reason to abort the active turn.
+    let started = client
+        .post(format!("{base}/threads/{thread_id}/messages"))
+        .json(&serde_json::json!({"content": "Keep running after a rejected steer."}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(started.status(), reqwest::StatusCode::ACCEPTED);
+    wait_for_event(&client, &events_url, |event| {
+        event["type"] == "assistant.thinking" && event["turn"] == 6
+    })
+    .await;
+    let rejected = client
+        .post(format!("{base}/threads/{thread_id}/steer"))
+        .json(&serde_json::json!({"content": "Reject this steering command."}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), reqwest::StatusCode::CONFLICT);
+    let accepted = client
+        .post(format!("{base}/threads/{thread_id}/steer"))
+        .json(&serde_json::json!({"content": "Accept this steering command."}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(accepted.status(), reqwest::StatusCode::ACCEPTED);
+    let events = wait_for_event(&client, &events_url, |event| {
+        event["type"] == "turn.completed" && event["turn"] == 6
+    })
+    .await;
+    assert!(!events.iter().any(|event| {
+        event["type"] == "turn.steered" && event["content"] == "Reject this steering command."
+    }));
+    assert!(events.iter().any(|event| {
+        event["type"] == "turn.steered" && event["content"] == "Accept this steering command."
+    }));
+    {
+        let received = backend.steers.lock().unwrap();
+        assert_eq!(received.len(), 5);
+        assert_eq!(received[4].1, "Accept this steering command.");
     }
 }
 
