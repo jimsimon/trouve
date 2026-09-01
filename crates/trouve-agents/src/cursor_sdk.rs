@@ -158,15 +158,8 @@ impl CursorBackend {
             return;
         }
         let pool = Arc::downgrade(&self.pool);
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(REAP_INTERVAL).await;
-                let Some(pool) = pool.upgrade() else {
-                    break;
-                };
-                pool.reap_idle().await;
-            }
-        });
+        let closing = self.pool.closing.clone();
+        tokio::spawn(reap_idle_until_closed(pool, closing));
     }
 
     fn effective_api_key(&self) -> Option<String> {
@@ -295,6 +288,23 @@ impl CursorBackend {
             )));
         }
         Ok(body)
+    }
+}
+
+async fn reap_idle_until_closed(pool: Weak<BridgePool>, closing: CancellationToken) {
+    loop {
+        tokio::select! {
+            biased;
+            _ = closing.cancelled() => break,
+            _ = tokio::time::sleep(REAP_INTERVAL) => {}
+        }
+        let Some(pool) = pool.upgrade() else {
+            break;
+        };
+        if !pool.is_open() {
+            break;
+        }
+        pool.reap_idle().await;
     }
 }
 
@@ -595,16 +605,7 @@ impl BridgePool {
         if request.cancel.is_cancelled() || request.events.is_closed() {
             return Err(BackendError::Cancelled);
         }
-        let mut bridge = BridgeProcess::start(
-            request.command,
-            request.worktree,
-            request.state_dir,
-            request.api_key,
-            request.callback,
-            request.cancel,
-            request.events,
-        )
-        .await?;
+        let mut bridge = BridgeProcess::start(&request, &self.closing).await?;
         if !self.is_open() {
             return merge_cleanup_error(
                 Self::closed_error(),
@@ -2097,14 +2098,16 @@ struct BridgeProcess {
 
 impl BridgeProcess {
     async fn start(
-        command: &str,
-        worktree: &Path,
-        state_dir: &Path,
-        api_key: &str,
-        callback: &CallbackServer,
-        cancel: &CancellationToken,
-        events: &BackendEventSender,
+        request: &BridgeProcessRequest<'_>,
+        closing: &CancellationToken,
     ) -> Result<Self, BackendError> {
+        let command = request.command;
+        let worktree = request.worktree;
+        let state_dir = request.state_dir;
+        let api_key = request.api_key;
+        let callback = request.callback;
+        let cancel = request.cancel;
+        let events = request.events;
         let http = local_http_client()?;
         create_private_dir(state_dir)?;
         // The Bridge contract puts its per-process bearer token in the OS
@@ -2141,6 +2144,7 @@ impl BridgeProcess {
         let mut diagnostics = VecDeque::new();
         let ready_result = tokio::select! {
             biased;
+            _ = closing.cancelled() => Err(BridgePool::closed_error()),
             _ = cancel.cancelled() => Err(BackendError::Cancelled),
             _ = events.closed() => Err(BackendError::Cancelled),
             result = tokio::time::timeout(STARTUP_TIMEOUT, async {
@@ -3539,6 +3543,92 @@ mod tests {
             .unwrap();
         let error = waiter.await.unwrap().unwrap_err();
         assert!(error.to_string().contains("pool is shutting down"));
+    }
+
+    #[tokio::test]
+    async fn idle_reaper_exits_when_the_pool_closes() {
+        let pool = Arc::new(BridgePool::default());
+        let reaper = tokio::spawn(reap_idle_until_closed(
+            Arc::downgrade(&pool),
+            pool.closing.clone(),
+        ));
+        tokio::task::yield_now().await;
+        assert!(!reaper.is_finished());
+
+        pool.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), reaper)
+            .await
+            .expect("idle reaper remained scheduled after pool shutdown")
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pool_closure_interrupts_bridge_startup() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state");
+        let started = state.join("started");
+        let script = temp.path().join("bridge-that-never-becomes-ready");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\ntouch \"$CURSOR_SDK_BRIDGE_STATE_ROOT/started\"\nexec sleep 30\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let cancel = CancellationToken::new();
+        let closing = CancellationToken::new();
+        let mut callback = CallbackServer::start(local_http_client().unwrap(), None, &cancel)
+            .await
+            .unwrap();
+        let (sender_tx, sender_rx) = tokio::sync::oneshot::channel();
+        let _stream = async_stream(move |events| async move {
+            let _ = sender_tx.send(events);
+            std::future::pending::<()>().await;
+        });
+        let events = sender_rx.await.unwrap();
+        let error = {
+            let request = BridgeProcessRequest {
+                command: script.to_str().unwrap(),
+                worktree: temp.path(),
+                state_dir: &state,
+                api_key: "secret",
+                callback: &callback,
+                cancel: &cancel,
+                events: &events,
+            };
+            let startup = BridgeProcess::start(&request, &closing);
+            tokio::pin!(startup);
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    tokio::select! {
+                        result = &mut startup => {
+                            match result {
+                                Ok(_) => panic!("fixture Bridge unexpectedly reported readiness"),
+                                Err(error) => panic!("fixture Bridge exited before shutdown: {error}"),
+                            }
+                        }
+                        _ = tokio::time::sleep(Duration::from_millis(10)) => {
+                            if started.is_file() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("fixture Bridge never started");
+
+            closing.cancel();
+            match tokio::time::timeout(Duration::from_secs(5), startup).await {
+                Ok(Err(error)) => error,
+                Ok(Ok(_)) => panic!("fixture Bridge unexpectedly reported readiness"),
+                Err(_) => panic!("pool closure did not interrupt Bridge startup"),
+            }
+        };
+        assert!(error.to_string().contains("pool is shutting down"));
+        callback.stop().await;
     }
 
     #[tokio::test]

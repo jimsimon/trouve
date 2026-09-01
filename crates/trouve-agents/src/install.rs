@@ -23,13 +23,14 @@
 
 use std::fmt::Write as _;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 
 const MAX_TEXT_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_RUNTIME_DOWNLOAD_BYTES: usize = 512 * 1024 * 1024;
-/// Failed root-directory syncs retain every generation that could still be
+/// Failed publication-directory syncs retain every generation that could still be
 /// named by the last durable pointer. Refuse another publication once this
 /// safety set reaches a fixed bound instead of allowing an outage to grow it
 /// without limit.
@@ -774,7 +775,8 @@ impl PreparedInstall {
         // generation cleanup immediately: a later directory-sync error cannot
         // roll the commit back or remove the runtime now named by the pointer.
         generation_cleanup.disarm();
-        let durability_error = sync_path(&root).err();
+        let durability_error =
+            sync_runtime_publication(&self.data_dir, &root, &mut sync_path).err();
         if durability_error.is_none() {
             // Reclamation is safe only after the new pointer is known durable.
             // Across one or more failed root syncs, the last durable pointer may
@@ -801,7 +803,7 @@ impl PreparedInstall {
                     runtime = self.id.as_str(),
                     path = %root.display(),
                     %error,
-                    "managed runtime committed but its root directory could not be synced"
+                    "managed runtime committed but its publication directories could not be synced"
                 );
                 Ok(ActivationOutcome::CommittedNotDurable {
                     installed: info,
@@ -970,6 +972,22 @@ fn sync_runtime_tree(
     }
 }
 
+fn sync_runtime_publication(
+    data_dir: &Path,
+    root: &Path,
+    sync_path: &mut impl FnMut(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    sync_path(root)?;
+    let runtime_parent = root
+        .parent()
+        .ok_or_else(|| std::io::Error::other("managed runtime root has no parent"))?;
+    sync_path(runtime_parent)?;
+    if runtime_parent != data_dir {
+        sync_path(data_dir)?;
+    }
+    Ok(())
+}
+
 fn runtime_generation_count(generations: &Path) -> std::io::Result<usize> {
     let mut retained = 0usize;
     for entry in std::fs::read_dir(generations)? {
@@ -1006,7 +1024,7 @@ fn ensure_runtime_generation_capacity(
         })?;
     sync_runtime_tree(&active, sync_path)?;
     sync_path(generations)?;
-    sync_path(root)?;
+    sync_runtime_publication(data_dir, root, sync_path)?;
     prune_runtime_generations(data_dir, id, generations, &active, None);
     sync_path(generations)?;
 
@@ -1176,11 +1194,15 @@ pub async fn install(
     data_dir: &Path,
     id: CliId,
     version: &str,
-    progress: &Progress,
+    progress: &Arc<Progress>,
 ) -> Result<ActivationOutcome, InstallError> {
-    prepare_install(data_dir, id, version, progress)
-        .await?
-        .activate_cancellable(progress)
+    let prepared = prepare_install(data_dir, id, version, progress).await?;
+    let progress = Arc::clone(progress);
+    tokio::task::spawn_blocking(move || prepared.activate_cancellable(&progress))
+        .await
+        .map_err(|error| {
+            InstallError::Download(format!("managed runtime activation task failed: {error}"))
+        })?
 }
 
 /// Remove the managed install of `id` entirely, including legacy stable-path
@@ -2137,12 +2159,25 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
             }),
             Ok(ActivationOutcome::Durable(_))
         ));
+        let synced = synced.into_inner();
+        for path in [
+            root.clone(),
+            root.parent().unwrap().to_path_buf(),
+            tmp.path().to_path_buf(),
+        ] {
+            assert!(
+                synced.contains(&path),
+                "{} was not synced after pointer publication",
+                path.display()
+            );
+        }
     }
 
     #[test]
     fn directory_sync_failure_after_pointer_reports_degraded_commit() {
         let tmp = tempfile::tempdir().unwrap();
         let root = cli_root(tmp.path(), CliId::Codex);
+        let runtime_parent = root.parent().unwrap().to_path_buf();
         let stage = create_install_stage(&root, "2.0.0").unwrap();
         std::fs::write(stage.join("codex"), "committed runtime").unwrap();
         let prepared = PreparedInstall {
@@ -2156,9 +2191,9 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
         let mut checkpoint = |_| Ok(());
         let outcome = prepared
             .activate_with_checkpoint_and_sync(&mut checkpoint, |path| {
-                if path == root {
+                if path == runtime_parent {
                     Err(std::io::Error::other(
-                        "injected post-commit directory sync failure",
+                        "injected runtime-parent sync failure",
                     ))
                 } else {
                     Ok(())

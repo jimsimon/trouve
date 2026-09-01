@@ -32,6 +32,7 @@ import {
   QualificationError,
   assistantText,
   assertUniqueToolLifecycle,
+  bridgeReleaseAttestation,
   combineQualificationAndCleanupErrors,
   createProcessCleanupBoundary,
   exactTerminalResult,
@@ -89,7 +90,7 @@ billable local Cursor SDK turns.
 
 Options:
   --health-only       Test direct subscription health without starting a Bridge
-  --bridge PATH       Use an existing cursor-sdk-bridge binary
+  --bridge PATH       Use an existing binary (reported as unverified, not pinned)
   --workspace PATH    Read-only qualification workspace (default: repo root)
   --model ID          Cursor model id (default: composer-2 when available)
   --timeout SECONDS   Timeout for each operation/turn (default: 300)
@@ -1148,6 +1149,7 @@ async function fullQualification(args) {
   let qualificationResult;
   try {
     resolvedBridge = await resolveBridge(args.bridge, temporaryRoot, timeoutMilliseconds);
+    const releaseAttestation = bridgeReleaseAttestation(resolvedBridge);
     const binaryStat = await stat(resolvedBridge.binary);
     operational.bridge_binary_bytes = binaryStat.size;
     callback = await startCallbackServer(handlers, timeoutMilliseconds);
@@ -1535,7 +1537,8 @@ async function fullQualification(args) {
           ? "proceed-with-sdk-bridge-adapter"
           : "hold-sdk-bridge-promotion",
       release: {
-        archive_version: BRIDGE_VERSION,
+        archive_version: releaseAttestation.pinnedRelease,
+        source: releaseAttestation.source,
         bridge_version: version.bridgeVersion,
         protocol_version: version.protocolVersion,
         capabilities: version.capabilities ?? [],
