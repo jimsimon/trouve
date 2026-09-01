@@ -1,16 +1,17 @@
 //! External agent backends: vendor coding agents (Codex, Cursor, Claude
-//! Code) driven through their sanctioned CLI/JSON interfaces, running inside
+//! Code) driven through their sanctioned runtime interfaces, running inside
 //! trouve's session worktrees.
 //!
 //! Unlike a `trouve_providers::Provider` (raw model inference inside
 //! trouve's own agent loop), an [`AgentBackend`] owns the whole turn: the
 //! vendor harness plans, calls its own tools, and edits files. Trouve
 //! translates its event stream into the trouve protocol and bridges its
-//! approval requests through the engine's permission layer. Subscription
-//! auth stays inside the vendor binary — we never touch vendor OAuth tokens.
+//! approval requests through the engine's permission layer. Credentials are
+//! passed only through each vendor's supported authentication surface.
 
 pub mod claude;
 pub mod codex;
+#[path = "cursor_sdk.rs"]
 pub mod cursor;
 pub mod install;
 mod login;
@@ -471,12 +472,20 @@ pub trait AgentBackend: Send + Sync {
 
     /// Live subscription usage (plan, metered allowance windows). Codex
     /// answers via its app-server, Claude Code via a stream-json `get_usage`
-    /// control request, and Cursor via the dashboard's undocumented usage
-    /// RPC (using the CLI's stored login). `None` means the vendor shares
-    /// nothing at all.
+    /// control request, and Cursor by exchanging its configured API key for
+    /// an ephemeral token and calling the dashboard's undocumented usage RPC.
+    /// `None` means the vendor shares nothing at all.
     async fn subscription_health(&self) -> Option<trouve_protocol::SubscriptionHealth> {
         None
     }
+
+    /// Stop and reap long-lived vendor processes owned by this backend.
+    /// Registry replacement awaits this hook before exposing a replacement
+    /// backend, so two harness instances never overlap the same durable state.
+    async fn shutdown(&self) -> Result<(), BackendError> {
+        Ok(())
+    }
+
     /// Report startup work the backend expects before it can accept this
     /// turn. The default keeps other adapters on the generic processing
     /// activity. This is advisory; the backend remains authoritative for
@@ -520,6 +529,87 @@ pub trait AgentBackend: Send + Sync {
     /// never be attached: without this, a backend that pins resources on
     /// pending background output would hold them forever. Default: no-op.
     async fn abandon_background_turns(&self, _thread_id: &str) {}
+}
+
+/// Delegating backend wrapper that keeps the managed runtime generation used
+/// to construct `inner` leased for the wrapper's full lifetime. Registry
+/// replacement can then reclaim an old generation only after every delayed
+/// backend clone that might still launch it has drained.
+pub struct RuntimeLeasedBackend {
+    inner: Arc<dyn AgentBackend>,
+    _runtime: install::RuntimeLease,
+}
+
+impl RuntimeLeasedBackend {
+    pub fn new(inner: Arc<dyn AgentBackend>, runtime: install::RuntimeLease) -> Self {
+        Self {
+            inner,
+            _runtime: runtime,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl AgentBackend for RuntimeLeasedBackend {
+    fn id(&self) -> &str {
+        self.inner.id()
+    }
+
+    fn models(&self) -> Vec<ModelInfo> {
+        self.inner.models()
+    }
+
+    async fn list_models(&self) -> Vec<ModelInfo> {
+        self.inner.list_models().await
+    }
+
+    fn status(&self) -> BackendStatus {
+        self.inner.status()
+    }
+
+    fn supports_tool_free_turns(&self) -> bool {
+        self.inner.supports_tool_free_turns()
+    }
+
+    fn confines_read_only_turns(&self) -> bool {
+        self.inner.confines_read_only_turns()
+    }
+
+    async fn subscription_health(&self) -> Option<trouve_protocol::SubscriptionHealth> {
+        self.inner.subscription_health().await
+    }
+
+    async fn shutdown(&self) -> Result<(), BackendError> {
+        self.inner.shutdown().await
+    }
+
+    async fn startup_activity(&self, turn: &BackendTurn) -> Option<BackendStartupActivity> {
+        self.inner.startup_activity(turn).await
+    }
+
+    fn supports_steering(&self) -> bool {
+        self.inner.supports_steering()
+    }
+
+    async fn steer_turn(&self, steer: BackendSteer) -> Result<(), BackendError> {
+        self.inner.steer_turn(steer).await
+    }
+
+    async fn start_login(&self) -> Result<BackendLogin, BackendError> {
+        self.inner.start_login().await
+    }
+
+    async fn run_turn(&self, turn: BackendTurn) -> Result<BackendEventStream, BackendError> {
+        self.inner.run_turn(turn).await
+    }
+
+    fn take_background_turn_signals(&self) -> Option<tokio::sync::mpsc::Receiver<String>> {
+        self.inner.take_background_turn_signals()
+    }
+
+    async fn abandon_background_turns(&self, thread_id: &str) {
+        self.inner.abandon_background_turns(thread_id).await;
+    }
 }
 
 /// Locate a binary on PATH (absolute/relative paths pass through).
@@ -1096,11 +1186,6 @@ where
     })
 }
 
-/// Simple options-schema for backend models: vendors own the knobs.
-pub(crate) fn empty_schema() -> serde_json::Value {
-    serde_json::json!({"type": "object", "properties": {}})
-}
-
 /// "resets in 2h 10m" from a unix timestamp (seconds; tolerates millis).
 pub(crate) fn format_reset(at: i64) -> String {
     let at = if at > 100_000_000_000 { at / 1000 } else { at };
@@ -1118,20 +1203,6 @@ pub(crate) fn format_reset(at: i64) -> String {
         format!("resets in {hours}h {mins}m")
     } else {
         format!("resets in {}m", mins.max(1))
-    }
-}
-
-/// Build a ModelInfo for a backend model.
-pub(crate) fn model(backend_id: &str, name: &str, display: &str, context_window: u64) -> ModelInfo {
-    ModelInfo {
-        id: format!("{backend_id}/{name}"),
-        display_name: display.into(),
-        context_window,
-        supports_tools: true,
-        // Subscription-billed: no per-token prices.
-        input_price_per_mtok: None,
-        output_price_per_mtok: None,
-        options_schema: empty_schema(),
     }
 }
 

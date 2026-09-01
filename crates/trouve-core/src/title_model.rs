@@ -540,7 +540,13 @@ impl TitleModelManager {
             )
             .await
             {
-                Ok(_) => on_runtime_installed(),
+                Ok(outcome) => {
+                    let (_, warning) = outcome.into_parts();
+                    on_runtime_installed();
+                    if let Some(warning) = warning {
+                        tracing::warn!(%warning, "title runtime activation durability is degraded");
+                    }
+                }
                 Err(InstallError::Cancelled) => bail!("installation cancelled"),
                 Err(error) => return Err(error.into()),
             }
