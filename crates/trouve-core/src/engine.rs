@@ -2753,6 +2753,7 @@ struct BackendRetirement {
     engine: Weak<Engine>,
     target_ids: HashSet<String>,
     rollback_on_drop: bool,
+    secret_transaction: Option<ProviderSecretTransaction>,
     _reload: ProviderReloadGuard,
     _target_transitions: Vec<tokio::sync::OwnedMutexGuard<()>>,
 }
@@ -2763,11 +2764,13 @@ impl BackendRetirement {
         target_ids: HashSet<String>,
         reload: ProviderReloadGuard,
         target_transitions: Vec<tokio::sync::OwnedMutexGuard<()>>,
+        secret_transaction: Option<ProviderSecretTransaction>,
     ) -> Self {
         Self {
             engine: Arc::downgrade(engine),
             target_ids,
             rollback_on_drop: false,
+            secret_transaction,
             _reload: reload,
             _target_transitions: target_transitions,
         }
@@ -2777,6 +2780,9 @@ impl BackendRetirement {
     /// release the serialized transition. This is synchronous so no
     /// cancellation point can separate durable mutation from publication.
     fn publish(mut self) {
+        if let Some(transaction) = self.secret_transaction.take() {
+            transaction.commit();
+        }
         self.rollback_on_drop = false;
         if let Some(engine) = self.engine.upgrade() {
             engine.replace_provider_registries_for_ids(&self.target_ids);
@@ -2786,13 +2792,40 @@ impl BackendRetirement {
     fn arm_rollback(&mut self) {
         self.rollback_on_drop = true;
     }
+
+    /// Restore tentative credentials before an old durable definition can be
+    /// republished. The retirement task calls this explicitly so rollback
+    /// failures are reported; Drop preserves the same ordering for task
+    /// cancellation, panic, and abandoned completion receivers.
+    fn rollback(mut self) -> Result<()> {
+        let rebuild = self.rollback_on_drop;
+        self.rollback_on_drop = false;
+        if let Some(transaction) = self.secret_transaction.take() {
+            transaction.rollback()?;
+        }
+        if rebuild && let Some(engine) = self.engine.upgrade() {
+            engine.replace_provider_registries_for_ids(&self.target_ids);
+        }
+        Ok(())
+    }
 }
 
 impl Drop for BackendRetirement {
     fn drop(&mut self) {
-        if self.rollback_on_drop
-            && let Some(engine) = self.engine.upgrade()
+        if !self.rollback_on_drop {
+            return;
+        }
+        self.rollback_on_drop = false;
+        if let Some(transaction) = self.secret_transaction.take()
+            && let Err(error) = transaction.rollback()
         {
+            tracing::error!(
+                %error,
+                "provider secret rollback failed; leaving the retired backend unavailable"
+            );
+            return;
+        }
+        if let Some(engine) = self.engine.upgrade() {
             engine.replace_provider_registries_for_ids(&self.target_ids);
         }
     }
@@ -4491,7 +4524,6 @@ impl Engine {
                 value.clone(),
             ));
         }
-        let secrets_changed = !secret_writes.is_empty();
         // Validate and commit the secret-store transaction before disturbing
         // a healthy backend. The guard restores the previous values if this
         // future is cancelled or any later transition fails.
@@ -4501,27 +4533,9 @@ impl Engine {
         // The retirement owns cleanup and registry rollback independently of
         // this request future, so cancellation cannot expose a closing backend
         // or lose the previous process tree.
-        let retirement = match self.retire_config_backends_matching_ids(&target_ids).await {
-            Ok(retirement) => retirement,
-            Err(error) => {
-                if let Err(rollback) = secret_transaction.rollback() {
-                    if secrets_changed {
-                        self.replace_provider_registries_for_ids(&target_ids);
-                    }
-                    return Err(EngineError::Internal(anyhow!(
-                        "{error}; provider secret rollback failed: {rollback}"
-                    )));
-                }
-                // A failed retirement may already have rebuilt the old
-                // definition while the tentative secrets were visible.
-                // Rebuild once more after rollback so captured credentials
-                // match the still-current configuration.
-                if secrets_changed {
-                    self.replace_provider_registries_for_ids(&target_ids);
-                }
-                return Err(error);
-            }
-        };
+        let retirement = self
+            .retire_config_backends_matching_ids_with_secrets(&target_ids, secret_transaction)
+            .await?;
         {
             let mut config = self.config.lock().unwrap();
             let entry = config.providers.entry(id.to_string()).or_default();
@@ -4575,7 +4589,6 @@ impl Engine {
         }
         // Keep the registry transition serialized until the new durable
         // definition and its credentials are committed.
-        secret_transaction.commit();
         retirement.publish();
         let config = self.config.lock().unwrap();
         let registry = self.providers.read().unwrap();
@@ -6860,6 +6873,7 @@ impl Engine {
             BACKEND_RETIREMENT_TIMEOUT,
             ProviderReloadGuard::exclusive(reload),
             Vec::new(),
+            None,
         )
         .await
     }
@@ -6908,6 +6922,24 @@ impl Engine {
             timeout,
             ProviderReloadGuard::shared(reload),
             target_transitions,
+            None,
+        )
+        .await
+    }
+
+    async fn retire_config_backends_matching_ids_with_secrets(
+        self: &Arc<Self>,
+        target_ids: &HashSet<String>,
+        secret_transaction: ProviderSecretTransaction,
+    ) -> Result<BackendRetirement, EngineError> {
+        let reload = self.provider_reload.clone().read_owned().await;
+        let target_transitions = self.lock_provider_transitions(target_ids).await;
+        self.retire_config_backends_matching_ids_locked(
+            target_ids,
+            BACKEND_RETIREMENT_TIMEOUT,
+            ProviderReloadGuard::shared(reload),
+            target_transitions,
+            Some(secret_transaction),
         )
         .await
     }
@@ -6918,9 +6950,15 @@ impl Engine {
         timeout: Duration,
         reload: ProviderReloadGuard,
         target_transitions: Vec<tokio::sync::OwnedMutexGuard<()>>,
+        secret_transaction: Option<ProviderSecretTransaction>,
     ) -> Result<BackendRetirement, EngineError> {
-        let retirement =
-            BackendRetirement::new(self, target_ids.clone(), reload, target_transitions);
+        let retirement = BackendRetirement::new(
+            self,
+            target_ids.clone(),
+            reload,
+            target_transitions,
+            secret_transaction,
+        );
         let engine = Arc::clone(self);
         let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
         let _retirement_task = tokio::spawn(async move {
@@ -6938,10 +6976,15 @@ impl Engine {
                 let failures = shutdown_retiring_backend_batch(&engine, retiring, deadline).await;
                 if !failures.is_empty() {
                     engine.ensure_retiring_backend_retry();
-                    break Err(EngineError::Internal(anyhow!(
-                        "backend retirement failed: {}",
-                        failures.join("; ")
-                    )));
+                    let failure = failures.join("; ");
+                    break match retirement.rollback() {
+                        Ok(()) => Err(EngineError::Internal(anyhow!(
+                            "backend retirement failed: {failure}"
+                        ))),
+                        Err(rollback) => Err(EngineError::Internal(anyhow!(
+                            "backend retirement failed: {failure}; provider secret rollback failed: {rollback}"
+                        ))),
+                    };
                 }
             };
             let _ = completion_tx.send(completion);
@@ -24872,6 +24915,35 @@ default_permission_mode = "ask"
         }
     }
 
+    struct ObservingProviderSecretStore {
+        values: Mutex<HashMap<String, String>>,
+        reads: Mutex<Vec<(String, Option<String>)>>,
+    }
+
+    impl trouve_providers::secrets::SecretStore for ObservingProviderSecretStore {
+        fn get(&self, key: &str) -> anyhow::Result<Option<String>> {
+            let value = self.values.lock().unwrap().get(key).cloned();
+            self.reads
+                .lock()
+                .unwrap()
+                .push((key.to_string(), value.clone()));
+            Ok(value)
+        }
+
+        fn set(&self, key: &str, value: &str) -> anyhow::Result<()> {
+            self.values
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), value.to_string());
+            Ok(())
+        }
+
+        fn delete(&self, key: &str) -> anyhow::Result<()> {
+            self.values.lock().unwrap().remove(key);
+            Ok(())
+        }
+    }
+
     #[tokio::test]
     async fn removing_github_host_discards_its_dashboard_cache() {
         const HOST: &str = "github.example.com";
@@ -29889,6 +29961,65 @@ default_permission_mode = "ask"
         assert_eq!(values.get(&api_key).map(String::as_str), Some("old-key"));
         assert!(!values.contains_key(&fail_key));
         drop(values);
+        assert!(engine.backends.read().unwrap().contains_key("cursor"));
+    }
+
+    #[tokio::test]
+    async fn failed_retirement_restores_secrets_before_republishing_the_old_backend() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            "cursor".into(),
+            ProviderConfig {
+                kind: "cursor-sdk".into(),
+                ..Default::default()
+            },
+        );
+        let api_key = trouve_providers::secrets::api_key_secret("cursor");
+        let secret_store = Arc::new(ObservingProviderSecretStore {
+            values: Mutex::new(HashMap::from([(api_key.clone(), "old-key".into())])),
+            reads: Mutex::new(Vec::new()),
+        });
+        let mut engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        );
+        engine.secrets = secret_store.clone();
+        let engine = Arc::new(engine);
+        engine.backends.write().unwrap().insert(
+            "cursor".into(),
+            Arc::new(FailingShutdownBackend {
+                shutdowns: std::sync::atomic::AtomicUsize::new(0),
+            }),
+        );
+
+        let result = engine
+            .upsert_provider(
+                "cursor",
+                &UpsertProviderRequest {
+                    kind: "openai-compat".into(),
+                    base_url: Some("https://replacement.example.test/v1".into()),
+                    api_key: Some("new-key".into()),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            secret_store.values.lock().unwrap().get(&api_key),
+            Some(&"old-key".to_string())
+        );
+        let reads = secret_store.reads.lock().unwrap();
+        assert!(
+            reads
+                .iter()
+                .filter(|(key, _)| key == &api_key)
+                .all(|(_, value)| value.as_deref() != Some("new-key")),
+            "registry rebuild observed tentative credentials: {reads:?}"
+        );
+        drop(reads);
         assert!(engine.backends.read().unwrap().contains_key("cursor"));
     }
 
