@@ -75,6 +75,9 @@ Use these common settings:
 - Setup URL: blank (or the dashboard URL as an optional convenience).
 - **Redirect on update**: disabled.
 - Repository permission **Contents**: Read-only.
+- Repository permission **Issues**: Read-only. GitHub requires this permission
+  to deliver `issue_comment` events, including commands written in the pull
+  request conversation.
 - Repository permission **Pull requests**: Read and write.
 - All organization and account permissions: No access.
 - Installation scope: **Only on this account** when every reviewed repository
@@ -104,10 +107,16 @@ HTTPS endpoint:
 - Webhook URL: `https://YOUR_HOST/github/webhooks`.
 - Webhook secret: generate a strong random value and enter the same value in
   the trouve dashboard.
-- Subscribe to the **Pull request** event only. GitHub may not show this event
-  until the Pull requests repository permission is selected.
+- Subscribe to the **Pull request** and **Issue comment** events. GitHub may
+  not show them until the corresponding Pull requests and Issues repository
+  permissions are selected.
 
-Polling remains enabled as a fallback for missed webhook deliveries.
+Issue comment delivery is the immediate path for `@trouve-ai review`, `resolve`,
+and `unresolve`. Polling remains enabled as a fallback for newly discovered
+threadless `resolve` and `unresolve` commands missed by webhook delivery; it
+does not recover missed `@trouve-ai review` commands. Comments already seen
+before command polling was introduced are treated as inspected and are not
+backfilled.
 
 After creating it:
 

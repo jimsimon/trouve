@@ -2754,7 +2754,7 @@ struct BackendRetirement {
     target_ids: HashSet<String>,
     rollback_on_drop: bool,
     secret_transaction: Option<ProviderSecretTransaction>,
-    _reload: ProviderReloadGuard,
+    reload: Option<ProviderReloadGuard>,
     _target_transitions: Vec<tokio::sync::OwnedMutexGuard<()>>,
 }
 
@@ -2771,7 +2771,7 @@ impl BackendRetirement {
             target_ids,
             rollback_on_drop: false,
             secret_transaction,
-            _reload: reload,
+            reload: Some(reload),
             _target_transitions: target_transitions,
         }
     }
@@ -2799,34 +2799,110 @@ impl BackendRetirement {
     /// cancellation, panic, and abandoned completion receivers.
     fn rollback(mut self) -> Result<()> {
         let rebuild = self.rollback_on_drop;
-        self.rollback_on_drop = false;
-        if let Some(transaction) = self.secret_transaction.take() {
-            transaction.rollback()?;
+        if let Some(transaction) = self.secret_transaction.as_mut()
+            && let Err(error) = transaction.try_rollback()
+        {
+            let retry_scheduled = self.schedule_secret_rollback_retry(rebuild);
+            return if retry_scheduled {
+                Err(error).context("provider secret rollback retry scheduled")
+            } else {
+                Err(error)
+            };
         }
+        self.secret_transaction.take();
+        self.rollback_on_drop = false;
         if rebuild && let Some(engine) = self.engine.upgrade() {
             engine.replace_provider_registries_for_ids(&self.target_ids);
         }
         Ok(())
     }
+
+    /// Move a failed rollback and the locks that fence its provider ids into
+    /// a request-independent supervisor. The old backend is not republished
+    /// until the tentative credentials have been restored successfully.
+    fn schedule_secret_rollback_retry(&mut self, rebuild: bool) -> bool {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return false;
+        };
+        let Some(reload) = self.reload.take() else {
+            return false;
+        };
+        let Some(transaction) = self.secret_transaction.take() else {
+            self.reload = Some(reload);
+            return false;
+        };
+        let reconciliation = ProviderSecretRollbackReconciliation {
+            engine: self.engine.clone(),
+            target_ids: self.target_ids.clone(),
+            rebuild,
+            transaction,
+            _reload: reload,
+            _target_transitions: std::mem::take(&mut self._target_transitions),
+        };
+        self.rollback_on_drop = false;
+        runtime.spawn(reconciliation.run());
+        true
+    }
 }
 
 impl Drop for BackendRetirement {
     fn drop(&mut self) {
-        if !self.rollback_on_drop {
-            return;
-        }
-        self.rollback_on_drop = false;
-        if let Some(transaction) = self.secret_transaction.take()
-            && let Err(error) = transaction.rollback()
+        let rebuild = self.rollback_on_drop;
+        if let Some(transaction) = self.secret_transaction.as_mut()
+            && let Err(error) = transaction.try_rollback()
         {
-            tracing::error!(
-                %error,
-                "provider secret rollback failed; leaving the retired backend unavailable"
-            );
+            if self.schedule_secret_rollback_retry(rebuild) {
+                tracing::warn!(
+                    %error,
+                    "provider secret rollback failed; retrying before backend restoration"
+                );
+            } else {
+                tracing::error!(
+                    %error,
+                    "provider secret rollback failed and no retry runtime is available"
+                );
+            }
             return;
         }
-        if let Some(engine) = self.engine.upgrade() {
+        self.secret_transaction.take();
+        self.rollback_on_drop = false;
+        if rebuild && let Some(engine) = self.engine.upgrade() {
             engine.replace_provider_registries_for_ids(&self.target_ids);
+        }
+    }
+}
+
+struct ProviderSecretRollbackReconciliation {
+    engine: Weak<Engine>,
+    target_ids: HashSet<String>,
+    rebuild: bool,
+    transaction: ProviderSecretTransaction,
+    _reload: ProviderReloadGuard,
+    _target_transitions: Vec<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl ProviderSecretRollbackReconciliation {
+    async fn run(mut self) {
+        let mut delay = BACKEND_RETIREMENT_RETRY_INITIAL;
+        loop {
+            tokio::time::sleep(delay).await;
+            match self.transaction.try_rollback() {
+                Ok(()) => {
+                    if self.rebuild
+                        && let Some(engine) = self.engine.upgrade()
+                    {
+                        engine.replace_provider_registries_for_ids(&self.target_ids);
+                    }
+                    return;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "retrying provider secret rollback after bounded backoff"
+                    );
+                    delay = (delay * 2).min(BACKEND_RETIREMENT_RETRY_MAX);
+                }
+            }
         }
     }
 }
@@ -2842,17 +2918,17 @@ impl ProviderSecretTransaction {
         self.committed = true;
     }
 
-    fn rollback(mut self) -> Result<()> {
-        let result = restore_provider_secrets(self.store.as_ref(), &self.previous);
+    fn try_rollback(&mut self) -> Result<()> {
+        restore_provider_secrets(self.store.as_ref(), &self.previous)?;
         self.committed = true;
-        result
+        Ok(())
     }
 }
 
 impl Drop for ProviderSecretTransaction {
     fn drop(&mut self) {
         if !self.committed
-            && let Err(error) = restore_provider_secrets(self.store.as_ref(), &self.previous)
+            && let Err(error) = self.try_rollback()
         {
             tracing::error!(%error, "provider secret transaction rollback failed");
         }
@@ -24915,12 +24991,14 @@ default_permission_mode = "ask"
         }
     }
 
-    struct ObservingProviderSecretStore {
+    struct TransientRollbackFailingProviderSecretStore {
+        rollback_key: String,
         values: Mutex<HashMap<String, String>>,
         reads: Mutex<Vec<(String, Option<String>)>>,
+        rollback_attempts: std::sync::atomic::AtomicUsize,
     }
 
-    impl trouve_providers::secrets::SecretStore for ObservingProviderSecretStore {
+    impl trouve_providers::secrets::SecretStore for TransientRollbackFailingProviderSecretStore {
         fn get(&self, key: &str) -> anyhow::Result<Option<String>> {
             let value = self.values.lock().unwrap().get(key).cloned();
             self.reads
@@ -24931,6 +25009,14 @@ default_permission_mode = "ask"
         }
 
         fn set(&self, key: &str, value: &str) -> anyhow::Result<()> {
+            if key == self.rollback_key && value == "old-key" {
+                let attempt = self
+                    .rollback_attempts
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if attempt == 0 {
+                    return Err(anyhow!("injected transient rollback failure"));
+                }
+            }
             self.values
                 .lock()
                 .unwrap()
@@ -24942,6 +25028,36 @@ default_permission_mode = "ask"
             self.values.lock().unwrap().remove(key);
             Ok(())
         }
+    }
+
+    async fn wait_for_provider_secret_reconciliation(
+        engine: &Arc<Engine>,
+        store: &TransientRollbackFailingProviderSecretStore,
+        api_key: &str,
+    ) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let restored = store
+                    .values
+                    .lock()
+                    .unwrap()
+                    .get(api_key)
+                    .is_some_and(|value| value == "old-key");
+                let republished = engine.backends.read().unwrap().contains_key("cursor");
+                if restored
+                    && republished
+                    && store
+                        .rollback_attempts
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                        >= 2
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("provider secret rollback was not reconciled");
     }
 
     #[tokio::test]
@@ -29965,7 +30081,7 @@ default_permission_mode = "ask"
     }
 
     #[tokio::test]
-    async fn failed_retirement_restores_secrets_before_republishing_the_old_backend() {
+    async fn failed_retirement_retries_secret_rollback_before_republishing_the_old_backend() {
         let data = tempfile::tempdir().unwrap();
         let mut config = Config::default();
         config.providers.insert(
@@ -29976,9 +30092,11 @@ default_permission_mode = "ask"
             },
         );
         let api_key = trouve_providers::secrets::api_key_secret("cursor");
-        let secret_store = Arc::new(ObservingProviderSecretStore {
+        let secret_store = Arc::new(TransientRollbackFailingProviderSecretStore {
+            rollback_key: api_key.clone(),
             values: Mutex::new(HashMap::from([(api_key.clone(), "old-key".into())])),
             reads: Mutex::new(Vec::new()),
+            rollback_attempts: std::sync::atomic::AtomicUsize::new(0),
         });
         let mut engine = Engine::new(
             Store::open_in_memory().unwrap(),
@@ -30007,9 +30125,16 @@ default_permission_mode = "ask"
             .await;
 
         assert!(result.is_err());
+        wait_for_provider_secret_reconciliation(&engine, secret_store.as_ref(), &api_key).await;
         assert_eq!(
             secret_store.values.lock().unwrap().get(&api_key),
             Some(&"old-key".to_string())
+        );
+        assert_eq!(
+            secret_store
+                .rollback_attempts
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2
         );
         let reads = secret_store.reads.lock().unwrap();
         assert!(
@@ -30021,6 +30146,80 @@ default_permission_mode = "ask"
         );
         drop(reads);
         assert!(engine.backends.read().unwrap().contains_key("cursor"));
+    }
+
+    #[tokio::test]
+    async fn abandoned_retirement_retries_secret_rollback_before_republishing_the_old_backend() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            "cursor".into(),
+            ProviderConfig {
+                kind: "cursor-sdk".into(),
+                ..Default::default()
+            },
+        );
+        let api_key = trouve_providers::secrets::api_key_secret("cursor");
+        let secret_store = Arc::new(TransientRollbackFailingProviderSecretStore {
+            rollback_key: api_key.clone(),
+            values: Mutex::new(HashMap::from([(api_key.clone(), "old-key".into())])),
+            reads: Mutex::new(Vec::new()),
+            rollback_attempts: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        );
+        engine.secrets = secret_store.clone();
+        let engine = Arc::new(engine);
+        let entered = Arc::new(tokio::sync::Semaphore::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        engine.backends.write().unwrap().insert(
+            "cursor".into(),
+            Arc::new(BlockingShutdownBackend {
+                entered: entered.clone(),
+                release: release.clone(),
+            }),
+        );
+
+        let update = {
+            let engine = engine.clone();
+            tokio::spawn(async move {
+                engine
+                    .upsert_provider(
+                        "cursor",
+                        &UpsertProviderRequest {
+                            kind: "openai-compat".into(),
+                            base_url: Some("https://replacement.example.test/v1".into()),
+                            api_key: Some("new-key".into()),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            })
+        };
+        entered.acquire().await.unwrap().forget();
+        update.abort();
+        assert!(update.await.unwrap_err().is_cancelled());
+        release.add_permits(1);
+
+        wait_for_provider_secret_reconciliation(&engine, secret_store.as_ref(), &api_key).await;
+        let reads = secret_store.reads.lock().unwrap();
+        assert!(
+            reads
+                .iter()
+                .filter(|(key, _)| key == &api_key)
+                .all(|(_, value)| value.as_deref() != Some("new-key")),
+            "registry rebuild observed tentative credentials: {reads:?}"
+        );
+        drop(reads);
+        assert_eq!(
+            secret_store
+                .rollback_attempts
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
     }
 
     #[tokio::test]
