@@ -4583,6 +4583,11 @@ impl Engine {
         let provider_lock = self.provider_lock(id);
         let _provider_guard = provider_lock.lock().await;
         let target_ids = HashSet::from([id.to_string()]);
+        // Fence API-registry refreshes and same-provider transitions before
+        // the first tentative secret write. These guards move into backend
+        // retirement and, on rollback failure, its detached reconciliation.
+        let reload = self.provider_reload.clone().read_owned().await;
+        let target_transitions = self.lock_provider_transitions(&target_ids).await;
         let mut secret_writes = Vec::new();
         if let Some(key) = req.api_key.as_deref().filter(|key| !key.is_empty()) {
             secret_writes.push((
@@ -4610,7 +4615,13 @@ impl Engine {
         // this request future, so cancellation cannot expose a closing backend
         // or lose the previous process tree.
         let retirement = self
-            .retire_config_backends_matching_ids_with_secrets(&target_ids, secret_transaction)
+            .retire_config_backends_matching_ids_locked(
+                &target_ids,
+                BACKEND_RETIREMENT_TIMEOUT,
+                ProviderReloadGuard::shared(reload),
+                target_transitions,
+                Some(secret_transaction),
+            )
             .await?;
         {
             let mut config = self.config.lock().unwrap();
@@ -6999,23 +7010,6 @@ impl Engine {
             ProviderReloadGuard::shared(reload),
             target_transitions,
             None,
-        )
-        .await
-    }
-
-    async fn retire_config_backends_matching_ids_with_secrets(
-        self: &Arc<Self>,
-        target_ids: &HashSet<String>,
-        secret_transaction: ProviderSecretTransaction,
-    ) -> Result<BackendRetirement, EngineError> {
-        let reload = self.provider_reload.clone().read_owned().await;
-        let target_transitions = self.lock_provider_transitions(target_ids).await;
-        self.retire_config_backends_matching_ids_locked(
-            target_ids,
-            BACKEND_RETIREMENT_TIMEOUT,
-            ProviderReloadGuard::shared(reload),
-            target_transitions,
-            Some(secret_transaction),
         )
         .await
     }
@@ -30125,7 +30119,22 @@ default_permission_mode = "ask"
             .await;
 
         assert!(result.is_err());
+        let refresh = {
+            let engine = engine.clone();
+            tokio::spawn(async move {
+                engine.refresh_api_provider_registry().await;
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(
+            !refresh.is_finished(),
+            "API provider refresh observed tentative credentials"
+        );
         wait_for_provider_secret_reconciliation(&engine, secret_store.as_ref(), &api_key).await;
+        tokio::time::timeout(Duration::from_secs(3), refresh)
+            .await
+            .expect("API provider refresh did not resume after secret reconciliation")
+            .unwrap();
         assert_eq!(
             secret_store.values.lock().unwrap().get(&api_key),
             Some(&"old-key".to_string())
@@ -30146,6 +30155,101 @@ default_permission_mode = "ask"
         );
         drop(reads);
         assert!(engine.backends.read().unwrap().contains_key("cursor"));
+    }
+
+    #[tokio::test]
+    async fn later_provider_upsert_writes_secrets_after_earlier_reconciliation() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            "cursor".into(),
+            ProviderConfig {
+                kind: "cursor-sdk".into(),
+                ..Default::default()
+            },
+        );
+        let api_key = trouve_providers::secrets::api_key_secret("cursor");
+        let secret_store = Arc::new(TransientRollbackFailingProviderSecretStore {
+            rollback_key: api_key.clone(),
+            values: Mutex::new(HashMap::from([(api_key.clone(), "old-key".into())])),
+            reads: Mutex::new(Vec::new()),
+            rollback_attempts: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        );
+        engine.secrets = secret_store.clone();
+        let engine = Arc::new(engine);
+        engine.backends.write().unwrap().insert(
+            "cursor".into(),
+            Arc::new(TransientShutdownBackend {
+                shutdowns: std::sync::atomic::AtomicUsize::new(0),
+            }),
+        );
+
+        let first = engine
+            .upsert_provider(
+                "cursor",
+                &UpsertProviderRequest {
+                    kind: "openai-compat".into(),
+                    base_url: Some("https://first.example.test/v1".into()),
+                    api_key: Some("first-key".into()),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(first.is_err());
+
+        let second = {
+            let engine = engine.clone();
+            tokio::spawn(async move {
+                engine
+                    .upsert_provider(
+                        "cursor",
+                        &UpsertProviderRequest {
+                            kind: "openai-compat".into(),
+                            base_url: Some("https://second.example.test/v1".into()),
+                            api_key: Some("second-key".into()),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            })
+        };
+        let second = tokio::time::timeout(Duration::from_secs(8), second)
+            .await
+            .expect("the later provider update remained blocked after reconciliation")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            second.base_url.as_deref(),
+            Some("https://second.example.test/v1")
+        );
+        assert_eq!(
+            secret_store.values.lock().unwrap().get(&api_key),
+            Some(&"second-key".to_string())
+        );
+        assert_eq!(
+            engine.config.lock().unwrap().providers["cursor"]
+                .base_url
+                .as_deref(),
+            Some("https://second.example.test/v1")
+        );
+        assert!(engine.providers.read().unwrap().contains_key("cursor"));
+        assert_eq!(
+            secret_store
+                .reads
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .find(|(key, _)| key == &api_key)
+                .and_then(|(_, value)| value.as_deref()),
+            Some("second-key")
+        );
     }
 
     #[tokio::test]

@@ -67,6 +67,42 @@ const MAX_TIMER_DELAY_MILLISECONDS = 2_147_483_647;
 const READY_PREFIX = "cursor-sdk-bridge ready ";
 const INVALID_TOOL_NAME = "trouve_qualification_invalid_builtin";
 const KNOWN_NATIVE_TOOL_PROBE = "shell";
+// The downloaded Bridge receives only process basics and explicitly required
+// network configuration. Do not forward unrelated credentials from a
+// developer shell or CI worker into the third-party qualification process.
+const BRIDGE_INHERITED_ENV_NAMES = Object.freeze([
+  "PATH",
+  "HOME",
+  "USER",
+  "LOGNAME",
+  "LANG",
+  "LC_ALL",
+  "TZ",
+  "SYSTEMROOT",
+  "WINDIR",
+  "COMSPEC",
+  "PATHEXT",
+  "USERNAME",
+  "USERPROFILE",
+  "APPDATA",
+  "LOCALAPPDATA",
+  "PROGRAMDATA",
+  "PROGRAMFILES",
+  "PROGRAMFILES(X86)",
+  "COMMONPROGRAMFILES",
+  "COMMONPROGRAMFILES(X86)",
+  "HOMEDRIVE",
+  "HOMEPATH",
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "NO_PROXY",
+  "http_proxy",
+  "https_proxy",
+  "no_proxy",
+  "SSL_CERT_FILE",
+  "SSL_CERT_DIR",
+  "NODE_EXTRA_CA_CERTS",
+]);
 // Public ToolName vocabulary from the pinned @cursor/sdk 1.0.28 package.
 // `mcp` is the only native capability Trouve intentionally allows.
 const CURSOR_NATIVE_TOOL_DENYLIST = Object.freeze([
@@ -556,18 +592,10 @@ async function startBridge({
   beforeSpawn?.();
   const child = spawn(binary, [], {
     detached: process.platform !== "win32",
-    env: {
-      ...process.env,
-      CURSOR_API_KEY: apiKey,
-      CURSOR_SDK_BRIDGE_STATE_ROOT: stateRoot,
-      CURSOR_SDK_BRIDGE_WORKSPACE: workspace,
-      CURSOR_SDK_CLIENT_LANGUAGE: "node",
-      CURSOR_SDK_TOOL_CALLBACK_AUTH_TOKEN: callback.bearer,
-      CURSOR_SDK_TOOL_CALLBACK_URL: callback.url,
-      TMPDIR: runtimeRoot,
-      TEMP: runtimeRoot,
-      TMP: runtimeRoot,
-    },
+    env: bridgeChildEnvironment(
+      { apiKey, stateRoot, workspace, callback, runtimeRoot },
+      process.env,
+    ),
     stdio: ["ignore", "ignore", "pipe"],
   });
   onSpawn?.(child);
@@ -679,6 +707,29 @@ async function startBridge({
     await terminateProcessTree(child);
     throw error;
   }
+}
+
+function bridgeChildEnvironment(
+  { apiKey, stateRoot, workspace, callback, runtimeRoot },
+  parentEnvironment = process.env,
+) {
+  const environment = {};
+  for (const name of BRIDGE_INHERITED_ENV_NAMES) {
+    const value = parentEnvironment[name];
+    if (typeof value === "string" && value !== "") environment[name] = value;
+  }
+  return {
+    ...environment,
+    CURSOR_API_KEY: apiKey,
+    CURSOR_SDK_BRIDGE_STATE_ROOT: stateRoot,
+    CURSOR_SDK_BRIDGE_WORKSPACE: workspace,
+    CURSOR_SDK_CLIENT_LANGUAGE: "node",
+    CURSOR_SDK_TOOL_CALLBACK_AUTH_TOKEN: callback.bearer,
+    CURSOR_SDK_TOOL_CALLBACK_URL: callback.url,
+    TMPDIR: runtimeRoot,
+    TEMP: runtimeRoot,
+    TMP: runtimeRoot,
+  };
 }
 
 const PROCESS_TREE_TERMINATIONS = new WeakMap();
@@ -1651,6 +1702,7 @@ export {
   assistantText,
   assertUniqueToolLifecycle,
   bridgeReleaseAttestation,
+  bridgeChildEnvironment,
   capPendingDiagnostic,
   combineQualificationAndCleanupErrors,
   connectFrame,

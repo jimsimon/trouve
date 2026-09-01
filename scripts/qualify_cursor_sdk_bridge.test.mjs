@@ -22,6 +22,7 @@ import {
   ConnectRpcError,
   assetName,
   assertUniqueToolLifecycle,
+  bridgeChildEnvironment,
   bridgeReleaseAttestation,
   capPendingDiagnostic,
   combineQualificationAndCleanupErrors,
@@ -79,6 +80,40 @@ function connectTestFrame(flags, value) {
 test("timeout parsing rejects values outside Node's timer range", () => {
   assert.equal(parseTimeoutSeconds("300"), 300);
   assert.throws(() => parseTimeoutSeconds("2147484"), /no greater than/u);
+});
+
+test("Bridge child environment omits unrelated ambient secrets", () => {
+  const environment = bridgeChildEnvironment(
+    {
+      apiKey: "selected-cursor-key",
+      stateRoot: "/isolated/state",
+      workspace: "/isolated/workspace",
+      callback: {
+        bearer: "selected-callback-token",
+        url: "http://127.0.0.1:1234",
+      },
+      runtimeRoot: "/isolated/runtime",
+    },
+    {
+      PATH: "/runtime/bin",
+      HOME: "/home/fixture",
+      HTTPS_PROXY: "http://proxy.example.test",
+      CURSOR_API_KEY: "ambient-cursor-key",
+      AWS_SECRET_ACCESS_KEY: "unrelated-secret",
+      GITHUB_TOKEN: "unrelated-token",
+      NODE_OPTIONS: "--require=/untrusted/hook.cjs",
+    },
+  );
+
+  assert.equal(environment.PATH, "/runtime/bin");
+  assert.equal(environment.HOME, "/home/fixture");
+  assert.equal(environment.HTTPS_PROXY, "http://proxy.example.test");
+  assert.equal(environment.CURSOR_API_KEY, "selected-cursor-key");
+  assert.equal(environment.CURSOR_SDK_TOOL_CALLBACK_AUTH_TOKEN, "selected-callback-token");
+  assert.equal(environment.TMPDIR, "/isolated/runtime");
+  assert.equal("AWS_SECRET_ACCESS_KEY" in environment, false);
+  assert.equal("GITHUB_TOKEN" in environment, false);
+  assert.equal("NODE_OPTIONS" in environment, false);
 });
 
 test("cleanup attempts every registered resource before aggregating failures", async () => {
