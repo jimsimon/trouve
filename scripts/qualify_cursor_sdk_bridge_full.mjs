@@ -400,7 +400,8 @@ function fullAgentOptions(apiKey, model, workspace, customTools) {
   };
 }
 
-function messageRunId(frame) {
+export function messageRunId(frame) {
+  if (typeof frame.runId === "string") return frame.runId;
   const message = frame.sdkMessage?.message;
   if (typeof message?.run_id === "string") return message.run_id;
   if (typeof frame.result?.runId === "string") return frame.result.runId;
@@ -564,6 +565,7 @@ async function runTurn({
   mode,
   force = false,
   expectToolError = false,
+  nativeShellNegativeProbe = false,
 }) {
   const callbackStart = callback.calls.length;
   const failureStart = callback.failures.length;
@@ -627,6 +629,7 @@ async function runTurn({
       conversation_steps: frames.filter((frame) => frame.step !== undefined).length,
       assistant_used_result: expectedText === undefined || finalText.includes(expectedText),
       requested_mode: mode ?? null,
+      ...(nativeShellNegativeProbe ? { native_shell_negative_probe: true } : {}),
       ...tools,
     },
   };
@@ -1255,11 +1258,14 @@ async function fullQualification(args) {
       agentId,
       label: "allow-read-under-validated-tool-policy",
       prompt:
-        `Call ${TOOLS.read} exactly once with {"token":"pre-restart-read"}, then reply ` +
-        `only with the callback result's value field.`,
+        `Call ${TOOLS.read} exactly once with {"token":"pre-restart-read"}. Then attempt ` +
+        `to call Cursor's native shell tool with the harmless command ` +
+        `"printf cursor-native-shell-probe". If the native shell tool is unavailable, ` +
+        `do not substitute another tool. Reply only with the callback result's value field.`,
       expectedTools: [TOOLS.read],
       expectedText: RESULTS.preRestartRead,
       timeoutMilliseconds,
+      nativeShellNegativeProbe: true,
     });
     turns.push(readTurn.summary);
 
@@ -1557,6 +1563,8 @@ async function fullQualification(args) {
         confinement: "sdk-tool-allowlist-contract",
         tool_policy_validation: toolPolicy,
         cursor_native_sandbox: false,
+        native_shell_negative_probe:
+          readTurn.summary.native_shell_negative_probe === true,
         host_allow_result: "passed",
         host_denied_is_error_result: "passed",
         host_denied_terminal_stream_event:

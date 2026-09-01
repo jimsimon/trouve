@@ -264,11 +264,15 @@ pub fn installed(data_dir: &Path, id: CliId) -> Option<InstalledCli> {
 /// The activation lock makes pointer selection and shared-lease acquisition
 /// atomic with publication, reclamation, and uninstall in every process.
 pub fn installed_with_lease(data_dir: &Path, id: CliId) -> Option<(InstalledCli, RuntimeLease)> {
-    let _activation_lock = lock_runtime_activation(data_dir, id).ok()?;
-    let info = installed_unlocked(data_dir, id)?;
+    // Activation publishes absolute executable paths even when callers pass a
+    // relative data directory. Use that same normalized root when locating the
+    // active generation and its lease, or strip_prefix cannot relate the two.
+    let data_dir = std::path::absolute(data_dir).ok()?;
+    let _activation_lock = lock_runtime_activation(&data_dir, id).ok()?;
+    let info = installed_unlocked(&data_dir, id)?;
     let bin = PathBuf::from(&info.bin);
-    let (kind, runtime) = managed_runtime_container(data_dir, id, &bin)?;
-    let lock = open_runtime_lease_file(data_dir, id, kind, &runtime).ok()?;
+    let (kind, runtime) = managed_runtime_container(&data_dir, id, &bin)?;
+    let lock = open_runtime_lease_file(&data_dir, id, kind, &runtime).ok()?;
     fs4::fs_std::FileExt::lock_shared(&lock).ok()?;
     Some((
         info,
@@ -2049,6 +2053,11 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
             panic!("ordinary activation unexpectedly lacked durability");
         };
         assert!(Path::new(&activated.bin).is_absolute());
+        let (leased, lease) = installed_with_lease(&data_dir, CliId::Codex)
+            .expect("relative data directory should acquire the active runtime lease");
+        assert_eq!(leased.version, activated.version);
+        assert_eq!(leased.bin, activated.bin);
+        drop(lease);
 
         let compatibility = legacy_managed_bin_path(&data_dir, CliId::Codex);
         let target = std::fs::read_link(&compatibility).unwrap();

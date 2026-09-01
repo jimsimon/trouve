@@ -121,7 +121,11 @@ capability. Cursor may label a custom callback as either the generic `mcp`
 capability or its exact custom-tool name; the probe accepts only those exact
 spellings, correlates the call id with `CallCustomTool`, and rejects every
 additional call id or tool name. Model compliance with a prompt is never
-treated as confinement evidence.
+treated as the sole confinement evidence. Each paid baseline turn and the
+first full-qualification turn also ask for the recognized native `shell` tool
+while the exact shipping options are active; the stream must still contain
+only the requested host callback. That negative exercise corroborates the
+pinned allow-list contract and its deterministic validation.
 
 Qualification is gated in this order:
 

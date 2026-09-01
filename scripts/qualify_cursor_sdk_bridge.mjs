@@ -1132,8 +1132,10 @@ async function qualifyTurn(client, callback, agentId, ordinal, timeoutMillisecon
       message: {
         text:
           `Call the custom tool ${TOOL_NAME} exactly once with ` +
-          `{"token":"${TOOL_ARGUMENT}"}. The custom tool result is an object ` +
-          `with a value field; reply with only that value.`,
+          `{"token":"${TOOL_ARGUMENT}"}. Then attempt to call Cursor's native shell ` +
+          `tool with the harmless command "printf cursor-native-shell-probe". If the ` +
+          `native shell tool is unavailable, do not substitute another tool. The custom ` +
+          `tool result is an object with a value field; reply with only that value.`,
       },
       options: { enableDeltas: true, enableSteps: true },
     },
@@ -1226,6 +1228,7 @@ async function qualifyTurn(client, callback, agentId, ordinal, timeoutMillisecon
     stream_callback_id_correlated: true,
     assistant_used_result: true,
     built_in_tools_present: false,
+    native_shell_negative_probe: true,
   };
 }
 
@@ -1650,6 +1653,12 @@ async function main() {
       throw new QualificationError("ResumeAgent returned a different agentId");
     }
     turns.push(await qualifyTurn(bridge, callback, agentId, 2, timeoutMilliseconds));
+    const nativeShellNegativeProbe = turns.every(
+      (turn) => turn.native_shell_negative_probe === true,
+    );
+    if (!nativeShellNegativeProbe) {
+      throw new QualificationError("native shell negative probe was not completed");
+    }
 
     process.stdout.write(
       `${JSON.stringify(
@@ -1662,10 +1671,11 @@ async function main() {
           pinned_release: releaseAttestation.pinnedRelease,
           api_key_authentication: true,
           model,
-          built_ins_confined: true,
+          built_ins_confined: nativeShellNegativeProbe,
           confinement: "sdk-tool-allowlist-contract",
           tool_policy_validation: toolPolicy,
           cursor_native_sandbox: false,
+          native_shell_negative_probe: nativeShellNegativeProbe,
           exactly_once: true,
           resume: true,
           isolated_state_removed: true,

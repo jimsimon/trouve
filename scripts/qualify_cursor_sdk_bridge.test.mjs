@@ -52,6 +52,7 @@ import {
   createCallbackAdmission,
   inspectToolCalls,
   isNonEmptyTimestamp,
+  messageRunId,
   parseConversationEvidence,
   qualificationExitCode,
   startCallbackServer,
@@ -440,6 +441,17 @@ test("cancelled qualification callbacks settle and release admission", async () 
     callback.server.closeAllConnections?.();
     await new Promise((resolve) => callback.server.close(resolve));
   }
+});
+
+test("cancellation observes run ids from every Bridge frame shape", () => {
+  assert.equal(messageRunId({ runId: "top-level" }), "top-level");
+  assert.equal(
+    messageRunId({ sdkMessage: { message: { run_id: "sdk-message" } } }),
+    "sdk-message",
+  );
+  assert.equal(messageRunId({ result: { runId: "result" } }), "result");
+  assert.equal(messageRunId({ done: { runId: "done" } }), "done");
+  assert.equal(messageRunId({}), undefined);
 });
 
 test("qualification status matching accepts only explicit finished values", () => {
