@@ -600,6 +600,8 @@ async fn cursor_health_requires_a_configured_api_key() {
 #[derive(Clone)]
 struct CursorSdkMcpState {
     calls: std::sync::Arc<tokio::sync::Mutex<Vec<serde_json::Value>>>,
+    blocked_started: Option<std::sync::Arc<tokio::sync::Semaphore>>,
+    blocked_release: Option<std::sync::Arc<tokio::sync::Notify>>,
 }
 
 async fn cursor_sdk_mcp(
@@ -622,11 +624,11 @@ async fn cursor_sdk_mcp(
         }),
         "tools/call" => {
             let params = request["params"].clone();
-            let expected = serde_json::json!({
-                "name": "trouve_test_echo",
-                "arguments": { "token": "from-sdk" }
-            });
-            if params != expected {
+            let token = params["arguments"]["token"].as_str();
+            let blocked = token == Some("block-until-cancelled")
+                && state.blocked_started.is_some()
+                && state.blocked_release.is_some();
+            if token != Some("from-sdk") && !blocked {
                 return axum::Json(serde_json::json!({
                     "jsonrpc": "2.0",
                     "id": id,
@@ -637,7 +639,12 @@ async fn cursor_sdk_mcp(
                 }));
             }
             state.calls.lock().await.push(params);
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if blocked {
+                state.blocked_started.as_ref().unwrap().add_permits(1);
+                state.blocked_release.as_ref().unwrap().notified().await;
+            } else {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
             serde_json::json!({
                 "content": [{ "type": "text", "text": "tool-ok" }],
                 "structuredContent": { "value": "tool-ok" },
@@ -737,7 +744,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             request = json.loads(raw[5:].decode("utf-8"))
             write_json(binary + ".send.json", request)
             send_count += 1
-            if "STALL_FOR_CANCELLATION" in request.get("message", {}).get("text", ""):
+            prompt = request.get("message", {}).get("text", "")
+            finish_with_blocked_callback = "FINISH_WITH_BLOCKED_CALLBACK" in prompt
+            if "STALL_FOR_CANCELLATION" in prompt:
                 run_id = "sdk-run-cancel"
                 first = frame({
                     "sdkMessage": {
@@ -754,6 +763,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_response(200)
                 self.send_header("Content-Type", "application/connect+json")
                 self.send_header("Transfer-Encoding", "chunked")
+                # The production Bridge opens independent RPC connections while
+                # Send is active. Closing this synthetic streaming connection at
+                # its terminal frame prevents BaseHTTPRequestHandler from
+                # advertising it as reusable after the client cancels the body.
+                self.send_header("Connection", "close")
                 self.end_headers()
                 self.wfile.write(format(len(first), "x").encode("ascii") + b"\r\n")
                 self.wfile.write(first + b"\r\n")
@@ -778,12 +792,77 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(format(len(identity), "x").encode("ascii") + b"\r\n")
                 self.wfile.write(identity + b"\r\n")
                 self.wfile.flush()
+                if active_options.get("tools", {}).get("names", []) == ["mcp"]:
+                    tool_started = frame({
+                        "sdkMessage": {
+                            "type": "tool_call",
+                            "message": {
+                                "type": "tool_call",
+                                "name": "mcp",
+                                "call_id": "sdk-call-cancel",
+                                "status": "started"
+                            }
+                        }
+                    })
+                    self.wfile.write(
+                        format(len(tool_started), "x").encode("ascii") + b"\r\n"
+                    )
+                    self.wfile.write(tool_started + b"\r\n")
+                    self.wfile.flush()
+                    cancel_callback = {
+                        "toolName": "trouve_test_echo",
+                        "toolCallId": "sdk-call-cancel",
+                        "agentId": agent_id,
+                        "args": {"token": "block-until-cancelled"}
+                    }
+                    def call_cancel_tool():
+                        callback_parts = urllib.parse.urlsplit(callback_url)
+                        connection = http.client.HTTPConnection(
+                            callback_parts.hostname, callback_parts.port, timeout=10
+                        )
+                        try:
+                            connection.request(
+                                "POST",
+                                "/sdk.v1.SdkCustomToolCallbackService/CallCustomTool",
+                                body=json.dumps(cancel_callback).encode("utf-8"),
+                                headers={
+                                    "Authorization": "Bearer " + callback_token,
+                                    "Content-Type": "application/json"
+                                }
+                            )
+                            response = connection.getresponse()
+                            body = response.read().decode("utf-8", errors="replace")
+                            write_json(
+                                binary + ".cancel-callback.json",
+                                {"status": response.status, "body": body}
+                            )
+                        except Exception as error:
+                            write_json(
+                                binary + ".cancel-callback.json",
+                                {"error": str(error)}
+                            )
+                        finally:
+                            connection.close()
+                    threading.Thread(target=call_cancel_tool, daemon=True).start()
                 if not cancel_received.wait(10):
                     self.wfile.write(b"0\r\n\r\n")
                     self.wfile.flush()
                     return
                 cancelled = "RUN_LIFECYCLE_STATUS_CANCELLED"
-                messages = [
+                messages = []
+                if active_options.get("tools", {}).get("names", []) == ["mcp"]:
+                    messages.append({
+                        "sdkMessage": {
+                            "type": "tool_call",
+                            "message": {
+                                "type": "tool_call",
+                                "name": "mcp",
+                                "call_id": "sdk-call-cancel",
+                                "status": "cancelled"
+                            }
+                        }
+                    })
+                messages.extend([
                     {
                         "result": {
                             "agentId": agent_id,
@@ -797,7 +876,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         }
                     },
                     {"done": {"agentId": agent_id, "runId": run_id}}
-                ]
+                ])
                 body = b"".join(frame(message) for message in messages) + frame({}, 2)
                 self.wfile.write(format(len(body), "x").encode("ascii") + b"\r\n")
                 self.wfile.write(body + b"\r\n0\r\n\r\n")
@@ -809,9 +888,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 tool_name = "trouve_test_echo"
                 callback = {
                     "toolName": tool_name,
-                    "toolCallId": "sdk-call-1",
+                    "toolCallId": "sdk-call-finish" if finish_with_blocked_callback else "sdk-call-1",
                     "agentId": agent_id,
-                    "args": {"token": "from-sdk"}
+                    "args": {
+                        "token": "block-until-cancelled" if finish_with_blocked_callback else "from-sdk"
+                    }
                 }
                 def call_tool(_attempt):
                     # The callback is always adapter-owned loopback traffic.
@@ -832,15 +913,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
                             }
                         )
                         response = connection.getresponse()
+                        response_body = response.read().decode("utf-8", errors="replace")
+                        if finish_with_blocked_callback:
+                            write_json(
+                                binary + ".normal-callback.json",
+                                {"status": response.status, "body": response_body}
+                            )
+                            return None
                         if response.status != 200:
                             raise RuntimeError("callback returned " + str(response.status))
-                        return json.loads(response.read().decode("utf-8"))
+                        return json.loads(response_body)
                     finally:
                         connection.close()
-                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-                    callback_responses = list(executor.map(call_tool, range(2)))
-                write_json(binary + ".callback.json", callback_responses[0])
-                write_json(binary + ".callback-replay.json", callback_responses[1])
+                if finish_with_blocked_callback:
+                    threading.Thread(target=call_tool, args=(0,), daemon=True).start()
+                    deadline = time.monotonic() + 10
+                    while not os.path.exists(binary + ".finish-blocked-callback"):
+                        if time.monotonic() >= deadline:
+                            raise RuntimeError("timed out waiting to finish blocked callback turn")
+                        time.sleep(0.01)
+                else:
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                        callback_responses = list(executor.map(call_tool, range(2)))
+                    write_json(binary + ".callback.json", callback_responses[0])
+                    write_json(binary + ".callback-replay.json", callback_responses[1])
             run_id = "sdk-run-" + str(send_count)
             finished = "RUN_LIFECYCLE_STATUS_FINISHED"
             messages = [
@@ -853,7 +949,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
                             "run_id": run_id
                         }
                     }
-                },
+                }
+            ]
+            if names == ["mcp"]:
+                messages.append({
+                    "sdkMessage": {
+                        "type": "tool_call",
+                        "message": {
+                            "type": "tool_call",
+                            "name": "mcp",
+                            "call_id": callback["toolCallId"],
+                            "status": "completed"
+                        }
+                    }
+                })
+            messages.extend([
                 {
                     "sdkMessage": {
                         "type": "assistant",
@@ -884,7 +994,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     }
                 },
                 {"done": {"agentId": agent_id, "runId": run_id}}
-            ]
+            ])
             body = b"".join(frame(message) for message in messages) + frame({}, 2)
             self.send_response(200)
             self.send_header("Content-Type", "application/connect+json")
@@ -985,6 +1095,8 @@ async fn cursor_adapter_uses_sdk_bridge_and_trouve_owned_tools() {
                 .route("/mcp", post(cursor_sdk_mcp))
                 .with_state(CursorSdkMcpState {
                     calls: server_calls,
+                    blocked_started: None,
+                    blocked_release: None,
                 }),
         )
         .await
@@ -1148,38 +1260,9 @@ async fn cursor_adapter_uses_sdk_bridge_and_trouve_owned_tools() {
         "1",
         "two turns on one Trouve thread should reuse one Bridge process"
     );
-    assert_eq!(
-        std::fs::read_to_string(format!("{stub}.callback-updates"))
-            .unwrap()
-            .trim(),
-        "4",
-        "each turn should register and then clear its callback"
-    );
-    let callback_history: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(format!("{stub}.callback-history.json")).unwrap(),
-    )
-    .unwrap();
-    let callback_history = callback_history.as_array().unwrap();
-    assert_eq!(callback_history.len(), 4);
-    assert!(!callback_history[0]["url"].as_str().unwrap().is_empty());
     assert!(
-        !callback_history[0]["authToken"]
-            .as_str()
-            .unwrap()
-            .is_empty()
-    );
-    assert_eq!(
-        callback_history[1],
-        serde_json::json!({ "url": "", "authToken": "" })
-    );
-    assert!(!callback_history[2]["url"].as_str().unwrap().is_empty());
-    assert_ne!(
-        callback_history[0]["authToken"], callback_history[2]["authToken"],
-        "a reused Bridge must receive a fresh callback bearer for each turn"
-    );
-    assert_eq!(
-        callback_history[3],
-        serde_json::json!({ "url": "", "authToken": "" })
+        !Path::new(&format!("{stub}.callback-updates")).exists(),
+        "the shared callback endpoint should be registered once at process startup"
     );
     assert_eq!(calls.lock().await.len(), 1);
     backend.shutdown().await.unwrap();
@@ -1192,8 +1275,40 @@ async fn cursor_adapter_uses_sdk_bridge_and_trouve_owned_tools() {
 }
 
 #[tokio::test]
-async fn cursor_adapter_cancellation_acknowledges_cancel_run_and_reaps_bridge() {
+async fn cursor_adapter_cancellation_settles_route_and_keeps_shared_bridge_usable() {
+    use axum::routing::post;
+
     let tmp = tempfile::tempdir().unwrap();
+    let calls = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let blocked_started = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    let blocked_release = std::sync::Arc::new(tokio::sync::Notify::new());
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let mcp_task = tokio::spawn({
+        let calls = calls.clone();
+        let blocked_started = blocked_started.clone();
+        let blocked_release = blocked_release.clone();
+        async move {
+            axum::serve(
+                listener,
+                axum::Router::new()
+                    .route("/mcp", post(cursor_sdk_mcp))
+                    .with_state(CursorSdkMcpState {
+                        calls,
+                        blocked_started: Some(blocked_started),
+                        blocked_release: Some(blocked_release),
+                    }),
+            )
+            .await
+        }
+    });
+    let mcp_bridge = trouve_agents::McpBridgeConfig {
+        url: format!("http://{address}/mcp"),
+        bridge_tools: true,
+        disallowed_tools: Vec::new(),
+    };
     let stub = cursor_sdk_bridge_stub(tmp.path());
     let backend = CursorBackend::new(
         "cursor",
@@ -1205,7 +1320,7 @@ async fn cursor_adapter_cancellation_acknowledges_cancel_run_and_reaps_bridge() 
     let mut stream = start_turn(&backend, || {
         let mut next = turn(tmp.path().to_path_buf(), None, BackendPermission::ReadOnly);
         next.prompt = "STALL_FOR_CANCELLATION".into();
-        next.tool_free = true;
+        next.mcp_bridge = Some(mcp_bridge.clone());
         next.cancel = cancel.clone();
         next
     })
@@ -1214,9 +1329,7 @@ async fn cursor_adapter_cancellation_acknowledges_cancel_run_and_reaps_bridge() 
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             match stream.next().await {
-                Some(Ok(BackendEvent::TextDelta(text))) if text == "RUN_READY" => {
-                    break;
-                }
+                Some(Ok(BackendEvent::TextDelta(text))) if text == "RUN_READY" => break,
                 Some(Ok(_)) => {}
                 Some(Err(error)) => panic!("Cursor Send failed before cancellation: {error}"),
                 None => panic!("Cursor Send ended before publishing cancellation readiness"),
@@ -1231,26 +1344,94 @@ async fn cursor_adapter_cancellation_acknowledges_cancel_run_and_reaps_bridge() 
         .trim()
         .parse()
         .unwrap();
-    cancel.cancel();
     std::fs::write(format!("{stub}.release-run-id"), "").unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), blocked_started.acquire())
+        .await
+        .expect("cancelled turn never entered its production callback route")
+        .unwrap()
+        .forget();
+    cancel.cancel();
 
     let mut saw_cancelled = false;
+    let mut observed = Vec::new();
     tokio::time::timeout(std::time::Duration::from_secs(8), async {
         while let Some(event) = stream.next().await {
-            if matches!(event, Err(trouve_agents::BackendError::Cancelled)) {
+            if matches!(&event, Err(trouve_agents::BackendError::Cancelled)) {
                 saw_cancelled = true;
             }
+            observed.push(
+                event
+                    .map(|event| format!("{event:?}"))
+                    .map_err(|error| error.to_string()),
+            );
         }
     })
     .await
     .expect("cancelled Cursor turn did not finish bounded cleanup");
-    assert!(saw_cancelled);
+    assert!(saw_cancelled, "cancelled turn events: {observed:?}");
     assert_eq!(
         std::fs::read_to_string(format!("{stub}.cancel-run"))
             .unwrap()
             .trim(),
         "sdk-run-cancel"
     );
+    let callback_result_path = format!("{stub}.cancel-callback.json");
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !std::path::Path::new(&callback_result_path).exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("adapter cancellation did not settle the held callback route");
+    let callback_result: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&callback_result_path).unwrap()).unwrap();
+    assert_eq!(
+        callback_result["status"], 502,
+        "held callback did not receive adapter-driven cancellation: {callback_result}"
+    );
+    blocked_release.notify_waiters();
+
+    let mut recovered = start_turn(&backend, || {
+        let mut next = turn(tmp.path().to_path_buf(), None, BackendPermission::ReadOnly);
+        next.mcp_bridge = Some(mcp_bridge.clone());
+        next
+    })
+    .await;
+    let recovered_events = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut events = Vec::new();
+        while let Some(event) = recovered.next().await {
+            events.push(event.unwrap());
+        }
+        events
+    })
+    .await
+    .expect("shared Cursor Bridge was not usable after cancellation");
+    assert!(
+        recovered_events
+            .iter()
+            .any(|event| matches!(event, BackendEvent::Completed { .. }))
+    );
+    assert!(
+        recovered_events
+            .iter()
+            .any(|event| matches!(event, BackendEvent::TextDelta(text) if text == "SDK done"))
+    );
+    assert!(
+        calls
+            .lock()
+            .await
+            .iter()
+            .any(|params| { params["arguments"]["token"] == "from-sdk" }),
+        "recovery turn never completed a real callback"
+    );
+    assert_eq!(
+        std::fs::read_to_string(format!("{stub}.spawns"))
+            .unwrap()
+            .trim(),
+        "1",
+        "clean cancellation should keep the same shared Bridge usable"
+    );
+
     let port: u16 = std::fs::read_to_string(format!("{stub}.port"))
         .unwrap()
         .trim()
@@ -1259,14 +1440,149 @@ async fn cursor_adapter_cancellation_acknowledges_cancel_run_and_reaps_bridge() 
     assert!(
         tokio::net::TcpStream::connect(("127.0.0.1", port))
             .await
-            .is_err(),
-        "cancelled Cursor Bridge was still accepting connections"
+            .is_ok(),
+        "cancelling one agent unexpectedly stopped the shared Cursor Bridge"
     );
     #[cfg(target_os = "linux")]
     assert!(
-        !std::path::Path::new(&format!("/proc/{pid}")).exists(),
-        "cancelled Cursor stream closed before the Bridge process was reaped"
+        std::path::Path::new(&format!("/proc/{pid}")).exists(),
+        "clean cancellation unexpectedly reaped the shared Cursor Bridge process"
     );
+    backend.shutdown().await.unwrap();
+    #[cfg(target_os = "linux")]
+    assert!(
+        !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+        "backend shutdown did not reap the shared Cursor Bridge process"
+    );
+    mcp_task.abort();
+}
+
+#[tokio::test]
+async fn cursor_adapter_normal_completion_bounds_callback_drain_and_keeps_bridge_usable() {
+    use axum::routing::post;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let calls = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let blocked_started = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    let blocked_release = std::sync::Arc::new(tokio::sync::Notify::new());
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let mcp_task = tokio::spawn({
+        let calls = calls.clone();
+        let blocked_started = blocked_started.clone();
+        let blocked_release = blocked_release.clone();
+        async move {
+            axum::serve(
+                listener,
+                axum::Router::new()
+                    .route("/mcp", post(cursor_sdk_mcp))
+                    .with_state(CursorSdkMcpState {
+                        calls,
+                        blocked_started: Some(blocked_started),
+                        blocked_release: Some(blocked_release),
+                    }),
+            )
+            .await
+        }
+    });
+    let mcp_bridge = trouve_agents::McpBridgeConfig {
+        url: format!("http://{address}/mcp"),
+        bridge_tools: true,
+        disallowed_tools: Vec::new(),
+    };
+    let stub = cursor_sdk_bridge_stub(tmp.path());
+    let backend = CursorBackend::new(
+        "cursor",
+        Some(stub.clone()),
+        Some("test-cursor-api-key".into()),
+    )
+    .with_state_root(tmp.path().join("sdk-state"));
+    let mut stream = start_turn(&backend, || {
+        let mut next = turn(tmp.path().to_path_buf(), None, BackendPermission::ReadOnly);
+        next.prompt = "FINISH_WITH_BLOCKED_CALLBACK".into();
+        next.mcp_bridge = Some(mcp_bridge.clone());
+        next
+    })
+    .await;
+    let draining = tokio::spawn(async move {
+        let mut events = Vec::new();
+        while let Some(event) = stream.next().await {
+            events.push(event.unwrap());
+        }
+        events
+    });
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), blocked_started.acquire())
+        .await
+        .expect("normal turn never admitted its blocked production callback")
+        .unwrap()
+        .forget();
+    std::fs::write(format!("{stub}.finish-blocked-callback"), "").unwrap();
+    let events = tokio::time::timeout(std::time::Duration::from_secs(3), draining)
+        .await
+        .expect("normal Cursor completion waited indefinitely for a blocked callback")
+        .unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, BackendEvent::Completed { .. }))
+    );
+    let callback_result_path = format!("{stub}.normal-callback.json");
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !std::path::Path::new(&callback_result_path).exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("normal completion did not settle the held callback route");
+    let callback_result: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&callback_result_path).unwrap()).unwrap();
+    assert_eq!(
+        callback_result["status"], 502,
+        "held callback did not receive adapter-driven terminal cleanup: {callback_result}"
+    );
+    blocked_release.notify_waiters();
+
+    let mut recovered = start_turn(&backend, || {
+        let mut next = turn(tmp.path().to_path_buf(), None, BackendPermission::ReadOnly);
+        next.mcp_bridge = Some(mcp_bridge.clone());
+        next
+    })
+    .await;
+    let recovered_events = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut events = Vec::new();
+        while let Some(event) = recovered.next().await {
+            events.push(event.unwrap());
+        }
+        events
+    })
+    .await
+    .expect("shared Cursor Bridge was not usable after normal callback cleanup");
+    assert!(
+        recovered_events
+            .iter()
+            .any(|event| matches!(event, BackendEvent::Completed { .. }))
+    );
+    assert!(
+        calls
+            .lock()
+            .await
+            .iter()
+            .any(|params| params["arguments"]["token"] == "from-sdk"),
+        "recovery turn never completed a real callback"
+    );
+    assert_eq!(
+        std::fs::read_to_string(format!("{stub}.spawns"))
+            .unwrap()
+            .trim(),
+        "1",
+        "clean normal callback cleanup should keep the same shared Bridge usable"
+    );
+
+    backend.shutdown().await.unwrap();
+    mcp_task.abort();
 }
 
 #[tokio::test]
