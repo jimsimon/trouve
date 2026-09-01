@@ -689,10 +689,16 @@ impl PreparedInstall {
         checkpoint: &mut impl FnMut(ActivationCheckpoint) -> Result<(), InstallError>,
         mut sync_path: impl FnMut(&Path) -> std::io::Result<()>,
     ) -> Result<ActivationOutcome, InstallError> {
-        let root = cli_root(&self.data_dir, self.id);
-        let _activation_lock = lock_runtime_activation(&self.data_dir, self.id)?;
-        let staged_bin = self.stage.join(&self.bin_rel);
-        if !self.stage.is_dir() || !staged_bin.is_file() {
+        // Persisted executable paths and Unix compatibility symlink targets
+        // must not depend on the process working directory. Public callers may
+        // supply a relative data directory, so normalize both owned paths at
+        // the activation boundary before constructing publication artifacts.
+        let data_dir = std::path::absolute(&self.data_dir)?;
+        let stage = std::path::absolute(&self.stage)?;
+        let root = cli_root(&data_dir, self.id);
+        let _activation_lock = lock_runtime_activation(&data_dir, self.id)?;
+        let staged_bin = stage.join(&self.bin_rel);
+        if !stage.is_dir() || !staged_bin.is_file() {
             return Err(InstallError::Download(format!(
                 "prepared {} {} artifact is no longer available",
                 self.id.as_str(),
@@ -706,7 +712,7 @@ impl PreparedInstall {
         let generations = root.join(".generations");
         std::fs::create_dir_all(&generations)?;
         ensure_runtime_generation_capacity(
-            &self.data_dir,
+            &data_dir,
             self.id,
             &root,
             &generations,
@@ -722,7 +728,7 @@ impl PreparedInstall {
         // committed pointer must never name a generation that another process
         // cannot protect from reclamation.
         drop(open_runtime_lease_file(
-            &self.data_dir,
+            &data_dir,
             self.id,
             RuntimeContainerKind::Generation,
             &generation,
@@ -746,7 +752,7 @@ impl PreparedInstall {
         drop(pointer_file);
 
         let mut generation_cleanup = PathCleanup::new(generation.clone());
-        replace_file_atomically(&self.stage, &generation, false)?;
+        replace_file_atomically(&stage, &generation, false)?;
         // The pointer must never be reported durable while the runtime it
         // names exists only in volatile cache. Flush files before directories,
         // then flush the rename into the generations directory.
@@ -757,7 +763,7 @@ impl PreparedInstall {
         // publication, and reclamation to lease acquisition. A backend in any
         // process can therefore never select a generation in the gap before
         // an activation removes it.
-        let previous = installed_unlocked(&self.data_dir, self.id);
+        let previous = installed_unlocked(&data_dir, self.id);
         let previous_generation = previous
             .as_ref()
             .and_then(|install| runtime_container(&generations, Path::new(&install.bin)));
@@ -782,32 +788,32 @@ impl PreparedInstall {
         // If compatibility publication fails, retain all generations just as
         // for a directory-sync failure: the previous stable path may still
         // name the prior generation.
-        let compatibility_error = publish_legacy_managed_bin(&self.data_dir, self.id, &bin)
+        let compatibility_error = publish_legacy_managed_bin(&data_dir, self.id, &bin)
             .map_err(|error| {
                 std::io::Error::new(
                     error.kind(),
                     format!(
                         "publishing rolling compatibility executable {}: {error}",
-                        legacy_managed_bin_path(&self.data_dir, self.id).display()
+                        legacy_managed_bin_path(&data_dir, self.id).display()
                     ),
                 )
             })
             .err();
         let publication_sync_error =
-            sync_runtime_publication(&self.data_dir, &root, &mut sync_path).err();
+            sync_runtime_publication(&data_dir, &root, &mut sync_path).err();
         let durability_error = compatibility_error.or(publication_sync_error);
         if durability_error.is_none() {
             // Reclamation is safe only after the new pointer is known durable.
             // Across one or more failed root syncs, the last durable pointer may
             // lag behind the visible pointer by multiple generations.
             prune_runtime_generations(
-                &self.data_dir,
+                &data_dir,
                 self.id,
                 &generations,
                 &generation,
                 previous_generation.as_deref(),
             );
-            prune_old_versions(&self.data_dir, self.id, &root, previous_legacy.as_deref());
+            prune_old_versions(&data_dir, self.id, &root, previous_legacy.as_deref());
         }
         match durability_error {
             None => Ok(ActivationOutcome::Durable(info)),
@@ -2012,6 +2018,44 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
         assert_eq!(
             installed(tmp.path(), CliId::Codex).unwrap().version,
             "2.0.0"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relative_data_dir_publishes_absolute_runtime_paths() {
+        let current_dir = std::env::current_dir().unwrap();
+        let tmp = tempfile::tempdir_in(&current_dir).unwrap();
+        let data_dir = tmp
+            .path()
+            .strip_prefix(&current_dir)
+            .expect("temporary directory is beneath the current directory")
+            .to_path_buf();
+        assert!(!data_dir.is_absolute());
+
+        let root = cli_root(&data_dir, CliId::Codex);
+        let stage = root.join(".stage-2.0.0");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::write(stage.join("codex"), "new runtime").unwrap();
+        let prepared = PreparedInstall {
+            data_dir: data_dir.clone(),
+            id: CliId::Codex,
+            version: "2.0.0".into(),
+            stage,
+            bin_rel: PathBuf::from("codex"),
+        };
+
+        let ActivationOutcome::Durable(activated) = prepared.activate().unwrap() else {
+            panic!("ordinary activation unexpectedly lacked durability");
+        };
+        assert!(Path::new(&activated.bin).is_absolute());
+
+        let compatibility = legacy_managed_bin_path(&data_dir, CliId::Codex);
+        let target = std::fs::read_link(&compatibility).unwrap();
+        assert!(target.is_absolute());
+        assert_eq!(
+            std::fs::read_to_string(compatibility).unwrap(),
+            "new runtime"
         );
     }
 
