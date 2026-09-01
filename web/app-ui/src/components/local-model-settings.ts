@@ -144,6 +144,7 @@ export class TrouveLocalModelSettings extends LitElement {
     .runtime-card { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 8px; }
     .runtime-copy { min-width: 0; display: grid; gap: 4px; }
     .runtime-copy strong { color: var(--trouve-text); font-size: 13px; font-weight: 400; }
+    .runtime-copy .runtime-warning { color: var(--trouve-warn); }
     .runtime-card .actions { margin: 0; }
     .server-card { display: flex; align-items: center; gap: 8px; padding: 8px; border-radius: var(--trouve-radius); color: var(--trouve-text-accent-soft); background: var(--trouve-accent-bg); }
     .server-card > span { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -352,7 +353,9 @@ export class TrouveLocalModelSettings extends LitElement {
                   <progress max=${runtimeProgressMax} .value=${runtimeReceived} aria-label="llama.cpp runtime install progress"></progress>
                 </div>
               `
-            : runtimeInstall?.status === "failed"
+            : runtimeInstall?.warning
+              ? html`<p class="runtime-warning" role="status">${runtimeInstall.warning}</p>`
+              : runtimeInstall?.status === "failed"
               ? html`<p class="error-copy" role="alert">Runtime install failed${runtimeInstall.error ? `: ${runtimeInstall.error}` : "."}</p>`
               : nothing}
           </div>

@@ -1825,7 +1825,7 @@ async fn upsert_provider(
     Path(id): Path<String>,
     Json(req): Json<UpsertProviderRequest>,
 ) -> Result<Json<ProviderInfo>, ApiError> {
-    Ok(Json(engine.upsert_provider(&id, &req)?))
+    Ok(Json(engine.upsert_provider(&id, &req).await?))
 }
 
 #[utoipa::path(post, path = "/v1/providers/{id}/login", params(("id" = String, Path,)),
@@ -1884,7 +1884,7 @@ async fn cli_install_status(
     Json(engine.cli_install_status(&id))
 }
 
-/// Cancel an in-flight install; the CLI returns to its previous state.
+/// Cancel an in-flight install; the agent runtime returns to its previous state.
 #[utoipa::path(delete, path = "/v1/clis/{id}/install", params(("id" = String, Path,)),
     responses((status = 204), (status = 404, body = ErrorBody)))]
 async fn cancel_cli_install(
@@ -1895,7 +1895,7 @@ async fn cancel_cli_install(
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
-/// Remove the managed install of a CLI (a system install found on PATH is
+/// Remove a trouve-managed agent runtime (a system install found on PATH is
 /// untouched and will be used again if present).
 #[utoipa::path(delete, path = "/v1/clis/{id}", params(("id" = String, Path,)),
     responses((status = 204), (status = 404, body = ErrorBody),
@@ -2076,7 +2076,7 @@ async fn delete_provider(
     State(engine): State<Arc<Engine>>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    engine.delete_provider(&id)?;
+    engine.delete_provider(&id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

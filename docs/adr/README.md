@@ -52,3 +52,4 @@ sequentially.
 | [0040](0040-durable-root-cause-history-for-code-review.md) | Durable root-cause history for code review | Accepted |
 | [0041](0041-evidence-backed-review-churn-controls.md) | Evidence-backed review churn controls | Accepted |
 | [0042](0042-provider-governed-turn-admission.md) | Provider-governed turn admission | Accepted |
+| [0043](0043-cursor-sdk-bridge-transport.md) | Cursor SDK Bridge transport | Accepted |

@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "7.28"
+    "version": "7.30"
   },
   "paths": {
     "/v1/approvals": {
@@ -456,7 +456,7 @@
     "/v1/clis/{id}": {
       "delete": {
         "tags": [],
-        "summary": "Remove the managed install of a CLI (a system install found on PATH is\nuntouched and will be used again if present).",
+        "summary": "Remove a trouve-managed agent runtime (a system install found on PATH is\nuntouched and will be used again if present).",
         "operationId": "uninstall_cli",
         "parameters": [
           {
@@ -563,7 +563,7 @@
       },
       "delete": {
         "tags": [],
-        "summary": "Cancel an in-flight install; the CLI returns to its previous state.",
+        "summary": "Cancel an in-flight install; the agent runtime returns to its previous state.",
         "operationId": "cancel_cli_install",
         "parameters": [
           {
@@ -5377,7 +5377,7 @@
       },
       "CliInfo": {
         "type": "object",
-        "description": "A vendor CLI trouve can download and manage (cursor-agent, claude,\ncodex), with its current install state.",
+        "description": "A vendor agent runtime trouve can download and manage (Cursor Agent SDK\nBridge, Claude Code CLI, Codex CLI), with its current install state.",
         "required": [
           "id",
           "display_name",
@@ -5391,21 +5391,21 @@
           },
           "id": {
             "type": "string",
-            "description": "Stable id, also the binary name: \"cursor-agent\", \"claude\", \"codex\"."
+            "description": "Stable artifact id, also the managed binary name:\n\"cursor-sdk-bridge\", \"claude\", or \"codex\"."
           },
           "installed_version": {
             "type": [
               "string",
               "null"
             ],
-            "description": "Version of the binary trouve would run, when one was resolved."
+            "description": "Version of the runtime binary trouve would run, when one was resolved."
           },
           "kinds": {
             "type": "array",
             "items": {
               "type": "string"
             },
-            "description": "Provider kinds served by this CLI (e.g. [\"cursor-cli\"])."
+            "description": "Provider kinds served by this runtime (e.g. [\"cursor-sdk\"])."
           },
           "latest_version": {
             "type": [
@@ -5441,7 +5441,8 @@
             "type": [
               "string",
               "null"
-            ]
+            ],
+            "description": "The terminal error when `status = \"failed\"`."
           },
           "received_bytes": {
             "type": "integer",
@@ -5465,6 +5466,13 @@
               "null"
             ],
             "description": "Version being (or just) installed, when known."
+          },
+          "warning": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A non-fatal activation warning. When present with `status = \"success\"`,\nthe runtime is active but its crash durability could not be confirmed."
           }
         }
       },

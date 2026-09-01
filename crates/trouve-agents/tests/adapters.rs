@@ -62,29 +62,6 @@ async fn start_turn<B: AgentBackend>(
     panic!("spawn kept hitting ETXTBSY");
 }
 
-#[cfg(target_os = "linux")]
-fn process_state(pid: u32) -> Option<char> {
-    std::fs::read_to_string(format!("/proc/{pid}/stat"))
-        .ok()
-        .and_then(|stat| stat.rsplit_once(") ").map(|(_, tail)| tail.to_owned()))
-        .and_then(|tail| tail.chars().next())
-}
-
-#[cfg(target_os = "linux")]
-async fn wait_for_process_to_stop(pid: u32) {
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        loop {
-            let state = process_state(pid);
-            if state.is_none() || state == Some('Z') {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("descendant process {pid} survived Cursor recycle"));
-}
-
 #[tokio::test]
 async fn claude_adapter_maps_stream_json() {
     let tmp = tempfile::tempdir().unwrap();
@@ -493,9 +470,8 @@ cat > /dev/null
     assert!(args.contains("--no-session-persistence"), "{args}");
 }
 
-/// Minimal HTTP stub for Cursor's dashboard Connect-RPC endpoints: answers
-/// GetCurrentPeriodUsage / GetPlanInfo with canned JSON and records each
-/// request's path and Authorization header.
+/// Minimal HTTP stub for Cursor's API-key exchange and dashboard Connect-RPC
+/// endpoints. It records each request's path and Authorization header.
 fn spawn_dashboard_stub(
     listener: tokio::net::TcpListener,
     seen: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
@@ -529,7 +505,9 @@ fn spawn_dashboard_stub(
                             .then(|| value.trim().to_string())
                     })
                     .unwrap_or_default();
-                let body = if path.contains("GetCurrentPeriodUsage") {
+                let body = if path == "/auth/exchange_user_api_key" {
+                    r#"{"accessToken":"ephemeral-access-token"}"#
+                } else if path.contains("GetCurrentPeriodUsage") {
                     r#"{"billingCycleEnd":"1782696817000","planUsage":{"totalPercentUsed":35.7,"apiPercentUsed":100,"autoPercentUsed":1.5},"spendLimitUsage":{"individualUsed":241122,"individualLimit":250000}}"#
                 } else {
                     r#"{"planInfo":{"planName":"Ultra","price":"$200/mo"}}"#
@@ -550,20 +528,20 @@ fn spawn_dashboard_stub(
 }
 
 #[tokio::test]
-async fn cursor_adapter_reads_dashboard_usage() {
-    let dir = tempfile::tempdir().unwrap();
-    let auth_file = dir.path().join("auth.json");
-    std::fs::write(
-        &auth_file,
-        r#"{"accessToken":"cli-token","refreshToken":"r"}"#,
-    )
-    .unwrap();
+async fn cursor_adapter_reads_dashboard_usage_without_cli_credentials() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     spawn_dashboard_stub(listener, seen.clone());
 
-    let backend = CursorBackend::new("cursor", None, None).with_dashboard(auth_file, base);
+    // A deliberately nonexistent command proves the health query cannot
+    // invoke Cursor's CLI. The configured API key is its only credential.
+    let backend = CursorBackend::new(
+        "cursor",
+        Some("cursor-agent-must-not-run".into()),
+        Some("cursor-user-api-key".into()),
+    )
+    .with_dashboard(base);
     let health = backend.subscription_health().await.unwrap();
     assert_eq!(health.status, "ok", "{}", health.note);
     assert_eq!(health.plan, "Ultra");
@@ -584,698 +562,775 @@ async fn cursor_adapter_reads_dashboard_usage() {
         "cycle end in the past"
     );
 
-    // Both RPCs authenticated with the CLI's stored token, never a refresh.
+    // The configured key is sent only to the exchange endpoint. Dashboard
+    // RPCs use the returned ephemeral token.
     let seen = seen.lock().unwrap();
     let paths: Vec<&str> = seen.iter().map(|(p, _)| p.as_str()).collect();
+    assert!(paths.contains(&"/auth/exchange_user_api_key"));
     assert!(paths.contains(&"/aiserver.v1.DashboardService/GetCurrentPeriodUsage"));
     assert!(paths.contains(&"/aiserver.v1.DashboardService/GetPlanInfo"));
+    assert_eq!(
+        seen.iter()
+            .find(|(path, _)| path == "/auth/exchange_user_api_key")
+            .map(|(_, auth)| auth.as_str()),
+        Some("Bearer cursor-user-api-key")
+    );
     assert!(
-        seen.iter().all(|(_, a)| a == "Bearer cli-token"),
-        "{seen:?}"
+        seen.iter()
+            .filter(|(path, _)| path.contains("DashboardService"))
+            .all(|(_, auth)| auth == "Bearer ephemeral-access-token")
     );
 }
 
 #[tokio::test]
-async fn cursor_api_key_backend_reports_no_subscription() {
-    // Usage-billed API-key providers have no subscription allowance; the
-    // entry explains itself instead of querying the dashboard.
-    let backend = CursorBackend::new("cursor-api", None, Some("key-1".into()));
+async fn cursor_health_requires_a_configured_api_key() {
+    // An explicit empty key suppresses the production environment fallback,
+    // keeping this negative test independent of the runner's CURSOR_API_KEY.
+    let backend = CursorBackend::new(
+        "cursor",
+        Some("cursor-agent-must-not-run".into()),
+        Some(String::new()),
+    );
     let health = backend.subscription_health().await.unwrap();
-    assert_eq!(health.status, "unsupported");
+    assert_eq!(health.status, "unavailable");
     assert!(health.note.contains("API key"), "{}", health.note);
+    assert!(!health.note.contains("cursor-agent"), "{}", health.note);
 }
 
-/// ACP stub for cursor-agent: answers the fixed request sequence of a fresh
-/// turn (initialize, session/new, set mode, set model, prompt), streams a
-/// text delta + tool call, raises one permission request, and records what
-/// it received.
-fn cursor_acp_stub(dir: &Path) -> String {
+#[derive(Clone)]
+struct CursorSdkMcpState {
+    calls: std::sync::Arc<tokio::sync::Mutex<Vec<serde_json::Value>>>,
+}
+
+async fn cursor_sdk_mcp(
+    axum::extract::State(state): axum::extract::State<CursorSdkMcpState>,
+    axum::Json(request): axum::Json<serde_json::Value>,
+) -> axum::Json<serde_json::Value> {
+    let id = request["id"].clone();
+    let result = match request["method"].as_str().unwrap_or_default() {
+        "tools/list" => serde_json::json!({
+            "tools": [{
+                "name": "trouve_test_echo",
+                "description": "Return the test sentinel.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": { "token": { "type": "string" } },
+                    "required": ["token"],
+                    "additionalProperties": false
+                }
+            }]
+        }),
+        "tools/call" => {
+            let params = request["params"].clone();
+            let expected = serde_json::json!({
+                "name": "trouve_test_echo",
+                "arguments": { "token": "from-sdk" }
+            });
+            if params != expected {
+                return axum::Json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {
+                        "code": -32602,
+                        "message": format!("unexpected tools/call params: {params}")
+                    }
+                }));
+            }
+            state.calls.lock().await.push(params);
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            serde_json::json!({
+                "content": [{ "type": "text", "text": "tool-ok" }],
+                "structuredContent": { "value": "tool-ok" },
+                "isError": false
+            })
+        }
+        other => {
+            return axum::Json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": { "code": -32601, "message": format!("unsupported {other}") }
+            }));
+        }
+    };
+    axum::Json(serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result }))
+}
+
+fn cursor_sdk_bridge_stub(dir: &Path) -> String {
     write_stub(
         dir,
-        "cursor-agent",
-        r##"#!/bin/bash
-echo "$1" > "$0.args"
-pwd > "$0.cwd"
-echo spawned >> "$0.spawns"
-IFS= read -r line # initialize
-echo '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}'
-IFS= read -r line # session/new
-echo '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"sess-1"}}'
-IFS= read -r line # set_config_option mode
-printf '%s\n' "$line" > "$0.mode"
-echo '{"jsonrpc":"2.0","id":3,"result":{"configOptions":[{"id":"mode","currentValue":"agent"}]}}'
-IFS= read -r line # set_config_option model
-printf '%s\n' "$line" > "$0.model"
-echo '{"jsonrpc":"2.0","id":4,"result":{"configOptions":[{"id":"model","currentValue":"test-model"}]}}'
-IFS= read -r line # session/prompt
-printf '%s\n' "$line" > "$0.prompt"
-echo '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"Hmm."}}}}'
-echo '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Hi "}}}}'
-echo '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"there"}}}}'
-echo '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"tool_call","toolCallId":"c1","title":"`ls`","kind":"execute","status":"pending","rawInput":{"command":"ls"}}}}'
-echo '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"tool_call_update","toolCallId":"c1","status":"in_progress"}}}'
-echo '{"jsonrpc":"2.0","id":100,"method":"session/request_permission","params":{"sessionId":"sess-1","toolCall":{"toolCallId":"c1","title":"`ls`","kind":"execute"},"options":[{"optionId":"allow-once","name":"Allow once","kind":"allow_once"},{"optionId":"allow-always","name":"Allow always","kind":"allow_always"},{"optionId":"reject-once","name":"Reject","kind":"reject_once"}]}}'
-IFS= read -r approval
-printf '%s\n' "$approval" > "$0.approval"
-echo '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"tool_call_update","toolCallId":"c1","status":"completed","rawOutput":{"exitCode":0,"stdout":"a.txt\n"}}}}'
-echo '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"tool_call","toolCallId":"c2","title":"Create Plan","kind":"other","status":"pending","rawInput":{"_toolName":"createPlan"}}}}'
-echo '{"jsonrpc":"2.0","id":101,"method":"cursor/create_plan","params":{"toolCallId":"c2","name":"Plan","plan":"# The plan"}}'
-IFS= read -r planack
-printf '%s\n' "$planack" > "$0.planack"
-echo '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"tool_call_update","toolCallId":"c2","status":"completed"}}}'
-echo '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"tool_call","toolCallId":"c3","title":"Ask Question","kind":"think","status":"pending","rawInput":{"_toolName":"askQuestion"}}}}'
-echo '{"jsonrpc":"2.0","id":102,"method":"cursor/ask_question","params":{"toolCallId":"c3","title":"Prefs","questions":[{"id":"q1","prompt":"Color?","options":[{"id":"red","label":"Red"},{"id":"blue","label":"Blue"}],"allowMultiple":false}]}}'
-IFS= read -r qans
-printf '%s\n' "$qans" > "$0.qans"
-echo '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"tool_call_update","toolCallId":"c3","status":"completed"}}}'
-echo '{"jsonrpc":"2.0","id":5,"result":{"stopReason":"end_turn","usage":{"inputTokens":7,"outputTokens":3,"totalTokens":10}}}'
-cat > /dev/null
+        "cursor-sdk-bridge",
+        r##"#!/usr/bin/env python3
+import http.client
+import http.server
+import json
+import os
+import socketserver
+import struct
+import sys
+import threading
+import time
+import urllib.parse
+
+binary = os.path.abspath(sys.argv[0])
+with open(binary + ".pid", "w", encoding="utf-8") as destination:
+    destination.write(str(os.getpid()))
+count_path = binary + ".spawns"
+try:
+    with open(count_path, "r", encoding="utf-8") as source:
+        count = int(source.read().strip()) + 1
+except Exception:
+    count = 1
+with open(count_path, "w", encoding="utf-8") as destination:
+    destination.write(str(count))
+agent_id = "sdk-agent-1"
+bridge_token = "test-bridge-token"
+callback_url = os.environ["CURSOR_SDK_TOOL_CALLBACK_URL"]
+callback_token = os.environ["CURSOR_SDK_TOOL_CALLBACK_AUTH_TOKEN"]
+callback_history = []
+active_options = {}
+send_count = 0
+callback_updates = 0
+cancel_received = threading.Event()
+
+expected_custom_tool = {
+    "description": "Return the test sentinel.",
+    "inputSchema": {
+        "type": "object",
+        "properties": {"token": {"type": "string"}},
+        "required": ["token"],
+        "additionalProperties": False
+    }
+}
+
+def valid_tool_registration(options):
+    names = options.get("tools", {}).get("names", [])
+    tools = options.get("local", {}).get("customTools", {})
+    if names == ["mcp"]:
+        return tools == {"trouve_test_echo": expected_custom_tool}
+    return names == [] and tools == {}
+
+def write_json(path, value):
+    with open(path, "w", encoding="utf-8") as destination:
+        json.dump(value, destination)
+
+def frame(value, flags=0):
+    payload = json.dumps(value, separators=(",", ":")).encode("utf-8")
+    return struct.pack(">BI", flags, len(payload)) + payload
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *_args):
+        pass
+
+    def do_POST(self):
+        global active_options, callback_history, callback_token, callback_updates, callback_url, send_count
+        if self.headers.get("Authorization") != "Bearer " + bridge_token:
+            self.send_response(401)
+            self.end_headers()
+            return
+        length = int(self.headers.get("Content-Length", "0"))
+        raw = self.rfile.read(length)
+        if self.path.endswith("/Send"):
+            if len(raw) < 5:
+                self.send_response(400)
+                self.end_headers()
+                return
+            request = json.loads(raw[5:].decode("utf-8"))
+            write_json(binary + ".send.json", request)
+            send_count += 1
+            if "STALL_FOR_CANCELLATION" in request.get("message", {}).get("text", ""):
+                run_id = "sdk-run-cancel"
+                first = frame({
+                    "sdkMessage": {
+                        "type": "assistant",
+                        "message": {
+                            "type": "assistant",
+                            "message": {
+                                "content": [{"type": "text", "text": "RUN_READY"}]
+                            }
+                        }
+                    }
+                })
+                self.protocol_version = "HTTP/1.1"
+                self.send_response(200)
+                self.send_header("Content-Type", "application/connect+json")
+                self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+                self.wfile.write(format(len(first), "x").encode("ascii") + b"\r\n")
+                self.wfile.write(first + b"\r\n")
+                self.wfile.flush()
+                deadline = time.monotonic() + 10
+                while not os.path.exists(binary + ".release-run-id"):
+                    if time.monotonic() >= deadline:
+                        self.wfile.write(b"0\r\n\r\n")
+                        self.wfile.flush()
+                        return
+                    time.sleep(0.01)
+                identity = frame({
+                    "sdkMessage": {
+                        "type": "system",
+                        "message": {
+                            "type": "system",
+                            "agent_id": agent_id,
+                            "run_id": run_id
+                        }
+                    }
+                })
+                self.wfile.write(format(len(identity), "x").encode("ascii") + b"\r\n")
+                self.wfile.write(identity + b"\r\n")
+                self.wfile.flush()
+                if not cancel_received.wait(10):
+                    self.wfile.write(b"0\r\n\r\n")
+                    self.wfile.flush()
+                    return
+                cancelled = "RUN_LIFECYCLE_STATUS_CANCELLED"
+                messages = [
+                    {
+                        "result": {
+                            "agentId": agent_id,
+                            "runId": run_id,
+                            "status": cancelled,
+                            "result": {
+                                "agentId": agent_id,
+                                "runId": run_id,
+                                "status": cancelled
+                            }
+                        }
+                    },
+                    {"done": {"agentId": agent_id, "runId": run_id}}
+                ]
+                body = b"".join(frame(message) for message in messages) + frame({}, 2)
+                self.wfile.write(format(len(body), "x").encode("ascii") + b"\r\n")
+                self.wfile.write(body + b"\r\n0\r\n\r\n")
+                self.wfile.flush()
+                return
+            names = active_options.get("tools", {}).get("names", [])
+            if names == ["mcp"]:
+                import concurrent.futures
+                tool_name = "trouve_test_echo"
+                callback = {
+                    "toolName": tool_name,
+                    "toolCallId": "sdk-call-1",
+                    "agentId": agent_id,
+                    "args": {"token": "from-sdk"}
+                }
+                def call_tool(_attempt):
+                    # The callback is always adapter-owned loopback traffic.
+                    # Bypass urllib's macOS system-proxy discovery so bridge
+                    # startup never depends on platform proxy initialization.
+                    callback_parts = urllib.parse.urlsplit(callback_url)
+                    connection = http.client.HTTPConnection(
+                        callback_parts.hostname, callback_parts.port, timeout=10
+                    )
+                    try:
+                        connection.request(
+                            "POST",
+                            "/sdk.v1.SdkCustomToolCallbackService/CallCustomTool",
+                            body=json.dumps(callback).encode("utf-8"),
+                            headers={
+                            "Authorization": "Bearer " + callback_token,
+                            "Content-Type": "application/json"
+                            }
+                        )
+                        response = connection.getresponse()
+                        if response.status != 200:
+                            raise RuntimeError("callback returned " + str(response.status))
+                        return json.loads(response.read().decode("utf-8"))
+                    finally:
+                        connection.close()
+                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                    callback_responses = list(executor.map(call_tool, range(2)))
+                write_json(binary + ".callback.json", callback_responses[0])
+                write_json(binary + ".callback-replay.json", callback_responses[1])
+            run_id = "sdk-run-" + str(send_count)
+            finished = "RUN_LIFECYCLE_STATUS_FINISHED"
+            messages = [
+                {
+                    "sdkMessage": {
+                        "type": "system",
+                        "message": {
+                            "type": "system",
+                            "agent_id": agent_id,
+                            "run_id": run_id
+                        }
+                    }
+                },
+                {
+                    "sdkMessage": {
+                        "type": "assistant",
+                        "message": {
+                            "type": "assistant",
+                            "message": {
+                                "content": [{"type": "text", "text": "SDK done"}]
+                            }
+                        }
+                    }
+                },
+                {
+                    "result": {
+                        "agentId": agent_id,
+                        "runId": run_id,
+                        "status": finished,
+                        "result": {
+                            "agentId": agent_id,
+                            "runId": run_id,
+                            "status": finished,
+                            "result": "SDK done",
+                            "usage": {
+                                "inputTokens": "7",
+                                "outputTokens": "3",
+                                "cacheReadTokens": "2"
+                            }
+                        }
+                    }
+                },
+                {"done": {"agentId": agent_id, "runId": run_id}}
+            ]
+            body = b"".join(frame(message) for message in messages) + frame({}, 2)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/connect+json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        request = json.loads(raw.decode("utf-8") or "{}")
+        status = 200
+        if self.path.endswith("/CreateAgent"):
+            write_json(binary + ".create.json", request)
+            active_options = request.get("options", {})
+            if valid_tool_registration(active_options):
+                response = {"agentId": agent_id}
+            else:
+                status = 400
+                response = {"code": "invalid_argument", "message": "invalid custom tool registration"}
+        elif self.path.endswith("/ResumeAgent"):
+            write_json(binary + ".resume.json", request)
+            active_options = request.get("options", {})
+            if valid_tool_registration(active_options):
+                response = {"agentId": agent_id}
+            else:
+                status = 400
+                response = {"code": "invalid_argument", "message": "invalid custom tool registration"}
+        elif self.path.endswith("/SetToolCallback"):
+            callback_url = request.get("url", "")
+            callback_token = request.get("authToken", "")
+            callback_history.append({"url": callback_url, "authToken": callback_token})
+            write_json(binary + ".callback-history.json", callback_history)
+            callback_updates += 1
+            with open(binary + ".callback-updates", "w", encoding="utf-8") as destination:
+                destination.write(str(callback_updates))
+            response = {}
+        elif self.path.endswith("/CloseAgent"):
+            response = {}
+        elif self.path.endswith("/CancelRun"):
+            with open(binary + ".cancel-run", "w", encoding="utf-8") as destination:
+                destination.write(request.get("runId", ""))
+            cancel_received.set()
+            response = {}
+        elif self.path.endswith("/Shutdown"):
+            with open(binary + ".shutdown", "w", encoding="utf-8") as destination:
+                destination.write("shutdown")
+            response = {}
+            threading.Thread(target=self.server.shutdown, daemon=True).start()
+        else:
+            response = {}
+        body = json.dumps(response, separators=(",", ":")).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+class LoopbackHTTPServer(http.server.ThreadingHTTPServer):
+    def server_bind(self):
+        # HTTPServer resolves its bind address through getfqdn() while setting
+        # display metadata. GitHub's macOS runner can stall in that unrelated
+        # resolver path, so preserve TCPServer binding and use the literal
+        # loopback address as the never-displayed server name.
+        socketserver.TCPServer.server_bind(self)
+        self.server_name = self.server_address[0]
+        self.server_port = self.server_address[1]
+
+server = LoopbackHTTPServer(("127.0.0.1", 0), Handler)
+with open(binary + ".port", "w", encoding="utf-8") as destination:
+    destination.write(str(server.server_address[1]))
+ready = {
+    "schemaVersion": 1,
+    "transport": "tcp",
+    "protocol": "connect",
+    "url": "http://127.0.0.1:" + str(server.server_address[1]),
+    "authToken": bridge_token
+}
+print("cursor-sdk-bridge ready " + json.dumps(ready), file=sys.stderr, flush=True)
+server.serve_forever()
 "##,
     )
 }
 
 #[tokio::test]
-async fn cursor_adapter_speaks_acp_and_bridges_approvals() {
+async fn cursor_adapter_uses_sdk_bridge_and_trouve_owned_tools() {
+    use axum::routing::post;
+
     let tmp = tempfile::tempdir().unwrap();
-    let stub = cursor_acp_stub(tmp.path());
-    let backend = CursorBackend::new("cursor", Some(stub.clone()), None);
+    let calls = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let server_calls = calls.clone();
+    let mcp_task = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            axum::Router::new()
+                .route("/mcp", post(cursor_sdk_mcp))
+                .with_state(CursorSdkMcpState {
+                    calls: server_calls,
+                }),
+        )
+        .await
+    });
+    let stub = cursor_sdk_bridge_stub(tmp.path());
+    let backend = CursorBackend::new(
+        "cursor",
+        Some(stub.clone()),
+        Some("test-cursor-api-key".into()),
+    )
+    .with_state_root(tmp.path().join("sdk-state"));
+    let mut first_turn = turn(tmp.path().to_path_buf(), None, BackendPermission::Ask);
+    first_turn.mcp_bridge = Some(trouve_agents::McpBridgeConfig {
+        url: format!("http://{address}/mcp"),
+        bridge_tools: true,
+        disallowed_tools: Vec::new(),
+    });
     let mut stream = start_turn(&backend, || {
-        turn(tmp.path().to_path_buf(), None, BackendPermission::Ask)
+        let mut next = turn(tmp.path().to_path_buf(), None, BackendPermission::Ask);
+        next.mcp_bridge = first_turn.mcp_bridge.clone();
+        next
     })
     .await;
 
-    let mut events = Vec::new();
-    let mut asked = None;
-    while let Some(ev) = stream.next().await {
-        let ev = ev.unwrap();
-        if let BackendEvent::ApprovalNeeded {
-            call_id,
-            tool,
-            args,
-            responder,
-        } = ev
-        {
-            assert_eq!(call_id, "c1");
-            assert_eq!(tool, "execute");
-            assert_eq!(args["rawInput"]["command"], "ls");
-            responder.send(true).unwrap();
-            continue;
+    let events = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut events = Vec::new();
+        while let Some(event) = stream.next().await {
+            events.push(event.unwrap());
         }
-        if let BackendEvent::QuestionsNeeded {
-            request_id,
-            title,
-            questions,
-            responder,
-        } = ev
-        {
-            asked = Some((request_id, title, questions.clone()));
-            responder
-                .send(Some(vec![trouve_protocol::QuestionAnswer {
-                    question_id: questions[0].id.clone(),
-                    selected_option_ids: vec!["red".into()],
-                    other_text: Some("crimson, really".into()),
-                }]))
-                .unwrap();
-            continue;
-        }
-        events.push(ev);
-    }
-
-    // Fresh thread: the ACP session id is persisted for resume.
+        events
+    })
+    .await
+    .expect("initial Cursor SDK stream did not close within five seconds");
     assert!(events.iter().any(
-        |e| matches!(e, BackendEvent::SessionStarted { session_id } if session_id == "sess-1")
-    ));
+        |event| matches!(event, BackendEvent::SessionStarted { session_id } if session_id == "sdk-agent-1")
+    ), "{events:?}");
+    assert!(
+        events.iter().all(|event| !matches!(
+            event,
+            BackendEvent::ToolStarted { .. } | BackendEvent::ToolCompleted { .. }
+        )),
+        "the internal MCP endpoint persists the canonical tool lifecycle; the adapter must not duplicate it"
+    );
     let text: String = events
         .iter()
-        .filter_map(|e| match e {
-            BackendEvent::TextDelta(t) => Some(t.as_str()),
+        .filter_map(|event| match event {
+            BackendEvent::TextDelta(text) => Some(text.as_str()),
             _ => None,
         })
         .collect();
-    assert_eq!(text, "Hi there");
-    let thinking: String = events
-        .iter()
-        .filter_map(|e| match e {
-            BackendEvent::ThinkingDelta(t) => Some(t.as_str()),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(thinking, "Hmm.");
-    assert!(events.iter().any(
-        |e| matches!(e, BackendEvent::ToolStarted { call_id, tool, .. } if call_id == "c1" && tool == "execute")
-    ));
-    assert!(events.iter().any(
-        |e| matches!(e, BackendEvent::ToolCompleted { call_id, ok: true, .. } if call_id == "c1")
-    ));
-    // Plan mode: catch-all "other" calls surface their real tool name, the
-    // cursor/create_plan request is acked (else the turn hangs), and its
-    // stashed content becomes the plan tool's result.
-    assert!(events.iter().any(
-        |e| matches!(e, BackendEvent::ToolStarted { call_id, tool, .. } if call_id == "c2" && tool == "createPlan")
-    ));
-    assert!(events.iter().any(|e| matches!(
-        e,
-        BackendEvent::ToolCompleted { call_id, ok: true, result }
-            if call_id == "c2" && result["plan"] == "# The plan"
+    assert_eq!(text, "SDK done");
+    assert!(events.iter().any(|event| matches!(
+        event,
+        BackendEvent::Completed { usage }
+            if usage.input_tokens == 7
+                && usage.output_tokens == 3
+                && usage.cached_input_tokens == 2
     )));
-    let planack = std::fs::read_to_string(format!("{stub}.planack")).unwrap();
-    assert!(planack.contains("\"id\":101"), "{planack}");
-    assert!(planack.contains("\"result\":{}"), "{planack}");
-    // The session-less cursor/ask_question request routed to the turn via
-    // its toolCallId, surfaced as QuestionsNeeded, and our answers went
-    // back in cursor's outcome shape.
-    let (request_id, title, questions) = asked.expect("QuestionsNeeded surfaced");
-    assert_eq!(request_id, "c3");
-    assert_eq!(title.as_deref(), Some("Prefs"));
-    assert_eq!(questions.len(), 1);
-    assert_eq!(questions[0].prompt, "Color?");
-    assert_eq!(questions[0].options[1].label, "Blue");
-    assert!(!questions[0].allow_multiple);
-    let qans = std::fs::read_to_string(format!("{stub}.qans")).unwrap();
-    assert!(qans.contains("\"id\":102"), "{qans}");
-    assert!(qans.contains("\"outcome\":\"answered\""), "{qans}");
-    assert!(qans.contains("\"selectedOptionIds\":[\"red\"]"), "{qans}");
-    assert!(
-        qans.contains("\"freeformText\":\"crimson, really\""),
-        "{qans}"
-    );
-    assert!(events.iter().any(|e| matches!(
-        e,
-        BackendEvent::Completed { usage } if usage.input_tokens == 7 && usage.output_tokens == 3
-    )));
-
-    // The child ran in ACP mode and got our config before the prompt.
-    let args = std::fs::read_to_string(format!("{stub}.args")).unwrap();
-    assert_eq!(args.trim(), "acp");
-    let cwd = std::fs::read_to_string(format!("{stub}.cwd")).unwrap();
+    let create: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(format!("{stub}.create.json")).unwrap())
+            .unwrap();
+    assert_eq!(create["options"]["apiKey"], "test-cursor-api-key");
     assert_eq!(
-        Path::new(cwd.trim()).canonicalize().unwrap(),
-        tmp.path().canonicalize().unwrap()
+        create["options"]["tools"]["names"],
+        serde_json::json!(["mcp"])
     );
-    let mode = std::fs::read_to_string(format!("{stub}.mode")).unwrap();
-    assert!(mode.contains("\"configId\":\"mode\""), "{mode}");
-    assert!(mode.contains("\"value\":\"agent\""), "{mode}");
-    let model = std::fs::read_to_string(format!("{stub}.model")).unwrap();
-    assert!(model.contains("\"configId\":\"model\""), "{model}");
-    assert!(model.contains("\"value\":\"test-model\""), "{model}");
-    // Mode instructions ride in the first prompt of a fresh session.
-    let prompt = std::fs::read_to_string(format!("{stub}.prompt")).unwrap();
-    assert!(prompt.contains("mode-instructions"), "{prompt}");
-    assert!(prompt.contains("do the thing"), "{prompt}");
-
-    // Our approval reply picked the allow-once option.
-    let reply = std::fs::read_to_string(format!("{stub}.approval")).unwrap();
-    assert!(reply.contains("\"id\":100"), "{reply}");
-    assert!(reply.contains("allow-once"), "{reply}");
-}
-
-#[tokio::test]
-async fn cursor_adapter_overload_fails_only_the_affected_session() {
-    let tmp = tempfile::tempdir().unwrap();
-    let stub = write_stub(
-        tmp.path(),
-        "cursor-agent-burst",
-        r#"#!/bin/bash
-read_request() {
-    local expected="$1"
-    while IFS= read -r line; do
-        if [[ "$line" == *"\"id\":$expected"* ]]; then
-            return
-        fi
-    done
-}
-IFS= read -r line # initialize
-echo '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}'
-
-IFS= read -r line # first session/new
-echo '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"sess-1"}}'
-IFS= read -r line # first set mode
-echo '{"jsonrpc":"2.0","id":3,"result":{"configOptions":[{"id":"mode","currentValue":"agent"}]}}'
-IFS= read -r line # first set model
-echo '{"jsonrpc":"2.0","id":4,"result":{"configOptions":[{"id":"model","currentValue":"test-model"}]}}'
-IFS= read -r line # first session/prompt
-# Keep this above both ROUTE_EVENT_BUDGET and BACKEND_BUFFER_MAX_ITEMS.
-for sequence in $(seq 1 4096); do
-    if (( sequence % 2 )); then
-        update="agent_message_chunk"
-    else
-        update="agent_thought_chunk"
-    fi
-    printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"%s","content":{"type":"text","text":"%s"}}}}\n' "$update" "$sequence"
-done
-echo '{"jsonrpc":"2.0","id":5,"result":{"stopReason":"end_turn"}}'
-
-read_request 6 # second session/new; ignore first session's cancel notification
-echo '{"jsonrpc":"2.0","id":6,"result":{"sessionId":"sess-2"}}'
-read_request 7 # second set mode
-echo '{"jsonrpc":"2.0","id":7,"result":{"configOptions":[{"id":"mode","currentValue":"agent"}]}}'
-read_request 8 # second set model
-echo '{"jsonrpc":"2.0","id":8,"result":{"configOptions":[{"id":"model","currentValue":"test-model"}]}}'
-read_request 9 # second session/prompt
-echo '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-2","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"second"}}}}'
-echo '{"jsonrpc":"2.0","id":9,"result":{"stopReason":"end_turn"}}'
-"#,
-    );
-    let backend = CursorBackend::new("cursor", Some(stub), None);
-    let deadline = std::time::Duration::from_secs(2);
-
-    // Leave the first stream unread and drive it past both bounded ingestion
-    // layers. Alternating delta kinds prevents the provider-neutral coalescer
-    // from collapsing this deliberate overload fixture; neither its
-    // backpressure nor the route overload may block the shared reader.
-    let mut first = tokio::time::timeout(
-        deadline,
-        start_turn(&backend, || {
-            turn(tmp.path().to_path_buf(), None, BackendPermission::Ask)
-        }),
-    )
-    .await
-    .expect("first turn should start");
-    let mut second = tokio::time::timeout(
-        deadline,
-        start_turn(&backend, || {
-            turn(tmp.path().to_path_buf(), None, BackendPermission::Ask)
-        }),
-    )
-    .await
-    .expect("a burst on one route must not block another session");
-
-    let mut second_text = String::new();
-    while let Some(event) = tokio::time::timeout(deadline, second.next())
-        .await
-        .expect("second session must keep streaming")
-    {
-        if let BackendEvent::TextDelta(text) = event.unwrap() {
-            second_text.push_str(&text);
-        }
-    }
-    assert_eq!(second_text, "second");
-
-    let mut first_error = None;
-    while let Some(event) = tokio::time::timeout(deadline, first.next())
-        .await
-        .expect("overloaded first session must terminate")
-    {
-        if let Err(error) = event {
-            first_error = Some(error.to_string());
-        }
-    }
-    assert!(
-        first_error
-            .as_deref()
-            .is_some_and(|error| error.contains("event backlog exceeded")),
-        "{first_error:?}"
-    );
-}
-
-#[tokio::test]
-async fn cursor_adapter_rejects_request_that_overflows_its_route() {
-    let tmp = tempfile::tempdir().unwrap();
-    let stub = write_stub(
-        tmp.path(),
-        "cursor-agent-request-overload",
-        r#"#!/bin/bash
-IFS= read -r line # initialize
-echo '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}'
-IFS= read -r line # session/new
-echo '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"sess-1"}}'
-IFS= read -r line # set mode
-echo '{"jsonrpc":"2.0","id":3,"result":{"configOptions":[{"id":"mode","currentValue":"agent"}]}}'
-IFS= read -r line # set model
-echo '{"jsonrpc":"2.0","id":4,"result":{"configOptions":[{"id":"model","currentValue":"test-model"}]}}'
-IFS= read -r line # session/prompt
-echo '{"jsonrpc":"2.0","id":100,"method":"session/request_permission","params":{"sessionId":"sess-1","toolCall":{"toolCallId":"c1","title":"first","kind":"execute"},"options":[{"optionId":"allow-once","kind":"allow_once"},{"optionId":"reject-once","kind":"reject_once"}]}}'
-while [[ ! -f "$0.continue" ]]; do sleep 0.01; done
-for sequence in $(seq 1 1024); do
-    printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"%s"}}}}\n' "$sequence"
-done
-echo '{"jsonrpc":"2.0","id":101,"method":"session/request_permission","params":{"sessionId":"sess-1","toolCall":{"toolCallId":"c2","title":"overflow","kind":"execute"},"options":[{"optionId":"allow-once","kind":"allow_once"},{"optionId":"reject-once","kind":"reject_once"}]}}'
-received_dropped=false
-received_cancel=false
-while [[ "$received_dropped" != true || "$received_cancel" != true ]] && IFS= read -r message; do
-    if [[ "$message" == *'"id":101'* ]]; then
-        printf '%s\n' "$message" > "$0.dropped.tmp"
-        mv "$0.dropped.tmp" "$0.dropped"
-        received_dropped=true
-    fi
-    if [[ "$message" == *'"method":"session/cancel"'* ]]; then
-        echo '{"jsonrpc":"2.0","id":5,"result":{"stopReason":"cancelled"}}'
-        received_cancel=true
-    fi
-done
-cat > /dev/null
-"#,
-    );
-    let backend = CursorBackend::new("cursor", Some(stub.clone()), None);
-    let deadline = std::time::Duration::from_secs(2);
-    let mut stream = start_turn(&backend, || {
-        turn(tmp.path().to_path_buf(), None, BackendPermission::Ask)
-    })
-    .await;
-
-    let held_responder = loop {
-        let event = tokio::time::timeout(deadline, stream.next())
-            .await
-            .expect("first permission request must arrive")
-            .expect("stream must remain open")
-            .expect("first permission request must be valid");
-        if let BackendEvent::ApprovalNeeded { responder, .. } = event {
-            break responder;
-        }
-    };
-    std::fs::write(format!("{stub}.continue"), "").unwrap();
-
-    let dropped_path = std::path::PathBuf::from(format!("{stub}.dropped"));
-    tokio::time::timeout(deadline, async {
-        while !dropped_path.exists() {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("overflowed request must receive a JSON-RPC error");
-    let dropped: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(dropped_path).unwrap()).unwrap();
-    assert_eq!(dropped["id"], 101);
-    assert_eq!(dropped["error"]["code"], -32603);
     assert_eq!(
-        dropped["error"]["message"],
-        "session event route unavailable"
+        create["options"]["disallowedTools"],
+        serde_json::json!([
+            "shell",
+            "read",
+            "edit",
+            "grep",
+            "glob",
+            "ls",
+            "task",
+            "webSearch",
+            "delete",
+            "readLints",
+            "webFetch",
+            "semSearch",
+            "updateTodos",
+            "readTodos",
+            "askQuestion",
+            "await",
+            "generateImage",
+            "applyAgentDiff"
+        ])
     );
-    let mut overload_error = None;
-    // Overload cleanup may spend up to five seconds waiting for Cursor's
-    // cancellation acknowledgement before entering its bounded process-reap
-    // fallback. Keep the short setup deadline above, but cover that complete
-    // production shutdown contract here.
-    let shutdown_deadline = std::time::Duration::from_secs(12);
-    while let Some(event) = tokio::time::timeout(shutdown_deadline, stream.next())
-        .await
-        .expect("overloaded Cursor stream must terminate")
-    {
-        if let Err(error) = event {
-            overload_error = Some(error.to_string());
-        }
-    }
-    drop(held_responder);
-    assert!(
-        overload_error
-            .as_deref()
-            .is_some_and(|error| error.contains("event backlog exceeded")),
-        "{overload_error:?}"
+    assert_eq!(
+        create["options"]["local"]["settingSources"],
+        serde_json::json!([])
     );
-}
-
-#[cfg(target_os = "linux")]
-#[tokio::test]
-async fn cursor_adapter_recycles_process_tree_when_eof_closes_cancel_waiter() {
-    let tmp = tempfile::tempdir().unwrap();
-    let stub = write_stub(
-        tmp.path(),
-        "cursor-agent-eof-overload",
-        r#"#!/bin/bash
-spawns=$(($(cat "$0.spawns" 2>/dev/null || echo 0) + 1))
-printf '%s\n' "$spawns" > "$0.spawns.tmp"
-mv "$0.spawns.tmp" "$0.spawns"
-if (( spawns == 1 )); then
-    sleep 60 </dev/null >/dev/null 2>&1 &
-    printf '%s\n' "$!" > "$0.descendant.tmp"
-    mv "$0.descendant.tmp" "$0.descendant"
-fi
-IFS= read -r line # initialize
-echo '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}'
-IFS= read -r line # session/new
-echo '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"sess-1"}}'
-IFS= read -r line # set mode
-echo '{"jsonrpc":"2.0","id":3,"result":{"configOptions":[{"id":"mode","currentValue":"agent"}]}}'
-IFS= read -r line # set model
-echo '{"jsonrpc":"2.0","id":4,"result":{"configOptions":[{"id":"model","currentValue":"test-model"}]}}'
-IFS= read -r line # session/prompt
-if (( spawns > 1 )); then
-    echo '{"jsonrpc":"2.0","id":5,"result":{"stopReason":"end_turn"}}'
-    cat > /dev/null
-    exit 0
-fi
-echo '{"jsonrpc":"2.0","id":100,"method":"session/request_permission","params":{"sessionId":"sess-1","toolCall":{"toolCallId":"c1","title":"hold route","kind":"execute"},"options":[{"optionId":"allow-once","kind":"allow_once"},{"optionId":"reject-once","kind":"reject_once"}]}}'
-while [[ ! -f "$0.continue" ]]; do sleep 0.01; done
-for sequence in $(seq 1 1025); do
-    printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"%s"}}}}\n' "$sequence"
-done
-while IFS= read -r cancel; do
-    if [[ "$cancel" == *'"method":"session/cancel"'* ]]; then
-        printf '%s\n' "$cancel" > "$0.cancel.tmp"
-        mv "$0.cancel.tmp" "$0.cancel"
-        # Exit without a session/prompt response. Reader EOF clears the
-        # pending sender; that closed oneshot is not an acknowledgement.
-        exit 0
-    fi
-done
-"#,
+    assert_eq!(
+        create["options"]["local"]["sandboxOptions"]["enabled"],
+        false
     );
-    let backend = CursorBackend::new("cursor", Some(stub.clone()), None);
-    let deadline = std::time::Duration::from_secs(3);
-    let mut stream = start_turn(&backend, || {
-        turn(tmp.path().to_path_buf(), None, BackendPermission::Ask)
-    })
-    .await;
-
-    let held_responder = loop {
-        let event = tokio::time::timeout(deadline, stream.next())
-            .await
-            .expect("permission request must arrive")
-            .expect("stream must remain open")
-            .expect("permission request must be valid");
-        if let BackendEvent::ApprovalNeeded { responder, .. } = event {
-            break responder;
-        }
-    };
-    let descendant_path = PathBuf::from(format!("{stub}.descendant"));
-    let descendant = tokio::time::timeout(deadline, async {
-        loop {
-            if let Ok(pid) = std::fs::read_to_string(&descendant_path)
-                && let Ok(pid) = pid.trim().parse::<u32>()
-            {
-                break pid;
+    assert_eq!(
+        create["options"]["local"]["customTools"]["trouve_test_echo"],
+        serde_json::json!({
+            "description": "Return the test sentinel.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "token": { "type": "string" } },
+                "required": ["token"],
+                "additionalProperties": false
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        })
+    );
+    let send: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(format!("{stub}.send.json")).unwrap())
+            .unwrap();
+    assert!(
+        send["message"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("<mode-instructions>")
+    );
+    assert_eq!(send["options"]["mode"], "AGENT_MODE_OPTION_AGENT");
+    assert_eq!(calls.lock().await.len(), 1);
+    let callback: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(format!("{stub}.callback.json")).unwrap())
+            .unwrap();
+    assert_eq!(callback["result"]["structuredContent"]["value"], "tool-ok");
+    let replay: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(format!("{stub}.callback-replay.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        replay, callback,
+        "a retried callback must replay its result"
+    );
+
+    let mut resumed = start_turn(&backend, || {
+        let mut next = turn(
+            tmp.path().to_path_buf(),
+            Some("sdk-agent-1"),
+            BackendPermission::ReadOnly,
+        );
+        next.tool_free = true;
+        next
+    })
+    .await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while let Some(event) = resumed.next().await {
+            event.unwrap();
         }
     })
     .await
-    .expect("Cursor stub did not publish its descendant pid");
-    std::fs::write(format!("{stub}.continue"), "").unwrap();
-
-    let mut overload_error = None;
-    while let Some(event) = tokio::time::timeout(deadline, stream.next())
-        .await
-        .expect("overloaded stream must terminate after EOF cleanup")
-    {
-        if let Err(error) = event {
-            overload_error = Some(error.to_string());
-        }
-    }
-    drop(held_responder);
-    assert!(
-        overload_error
-            .as_deref()
-            .is_some_and(|error| error.contains("event backlog exceeded")),
-        "{overload_error:?}"
-    );
-    assert!(PathBuf::from(format!("{stub}.cancel")).exists());
-    wait_for_process_to_stop(descendant).await;
-
-    // The closed transport must be removed from the pool, not reused.
-    let mut replacement = start_turn(&backend, || {
-        turn(tmp.path().to_path_buf(), None, BackendPermission::Ask)
-    })
-    .await;
-    while let Some(event) = tokio::time::timeout(deadline, replacement.next())
-        .await
-        .expect("replacement Cursor process must finish")
-    {
-        event.unwrap();
-    }
+    .expect("resumed Cursor SDK stream did not close within five seconds");
+    let resume: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(format!("{stub}.resume.json")).unwrap())
+            .unwrap();
+    assert_eq!(resume["agentId"], "sdk-agent-1");
+    assert_eq!(resume["options"]["tools"]["names"], serde_json::json!([]));
+    assert_eq!(resume["options"]["mode"], "AGENT_MODE_OPTION_PLAN");
     assert_eq!(
         std::fs::read_to_string(format!("{stub}.spawns"))
             .unwrap()
             .trim(),
-        "2"
+        "1",
+        "two turns on one Trouve thread should reuse one Bridge process"
     );
-}
-
-#[tokio::test]
-async fn cursor_adapter_releases_requests_when_the_transport_exits() {
-    let tmp = tempfile::tempdir().unwrap();
-    let stub = write_stub(
-        tmp.path(),
-        "cursor-agent-exits",
-        r#"#!/bin/bash
-IFS= read -r line # initialize
-echo '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}'
-IFS= read -r line # session/new, then exit without responding
-"#,
+    assert_eq!(
+        std::fs::read_to_string(format!("{stub}.callback-updates"))
+            .unwrap()
+            .trim(),
+        "4",
+        "each turn should register and then clear its callback"
     );
-    let backend = CursorBackend::new("cursor", Some(stub), None);
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        backend.run_turn(turn(tmp.path().to_path_buf(), None, BackendPermission::Ask)),
+    let callback_history: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(format!("{stub}.callback-history.json")).unwrap(),
     )
-    .await
-    .expect("transport EOF must release the pending session/new request");
-
-    let error = match result {
-        Err(error) => error,
-        Ok(_) => panic!("the interrupted request should fail"),
-    };
+    .unwrap();
+    let callback_history = callback_history.as_array().unwrap();
+    assert_eq!(callback_history.len(), 4);
+    assert!(!callback_history[0]["url"].as_str().unwrap().is_empty());
     assert!(
-        error
-            .to_string()
-            .contains("cursor-agent closed before responding"),
-        "{error}"
+        !callback_history[0]["authToken"]
+            .as_str()
+            .unwrap()
+            .is_empty()
     );
+    assert_eq!(
+        callback_history[1],
+        serde_json::json!({ "url": "", "authToken": "" })
+    );
+    assert!(!callback_history[2]["url"].as_str().unwrap().is_empty());
+    assert_ne!(
+        callback_history[0]["authToken"], callback_history[2]["authToken"],
+        "a reused Bridge must receive a fresh callback bearer for each turn"
+    );
+    assert_eq!(
+        callback_history[3],
+        serde_json::json!({ "url": "", "authToken": "" })
+    );
+    assert_eq!(calls.lock().await.len(), 1);
+    backend.shutdown().await.unwrap();
+    assert_eq!(
+        std::fs::read_to_string(format!("{stub}.shutdown")).unwrap(),
+        "shutdown",
+        "backend shutdown must gracefully stop its retained warm Bridge"
+    );
+    mcp_task.abort();
 }
 
 #[tokio::test]
-async fn cursor_adapter_waits_for_prompt_cancellation_acknowledgement() {
+async fn cursor_adapter_cancellation_acknowledges_cancel_run_and_reaps_bridge() {
     let tmp = tempfile::tempdir().unwrap();
-    let stub = write_stub(
-        tmp.path(),
-        "cursor-agent-cancel-ack",
-        r#"#!/bin/bash
-IFS= read -r line # initialize
-echo '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1}}'
-IFS= read -r line # session/new
-echo '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"sess-1"}}'
-IFS= read -r line # set mode
-echo '{"jsonrpc":"2.0","id":3,"result":{"configOptions":[{"id":"mode","currentValue":"agent"}]}}'
-IFS= read -r line # set model
-echo '{"jsonrpc":"2.0","id":4,"result":{"configOptions":[{"id":"model","currentValue":"test-model"}]}}'
-IFS= read -r line # session/prompt (id 5)
-while IFS= read -r cancel; do
-    if [[ "$cancel" == *'"method":"session/cancel"'* ]]; then
-        printf '%s\n' "$cancel" > "$0.cancel.tmp"
-        mv "$0.cancel.tmp" "$0.cancel"
-        while [[ ! -f "$0.release" ]]; do sleep 0.01; done
-        echo '{"jsonrpc":"2.0","id":5,"result":{"stopReason":"cancelled"}}'
-        break
-    fi
-done
-cat > /dev/null
-"#,
-    );
-    let backend = CursorBackend::new("cursor", Some(stub.clone()), None);
+    let stub = cursor_sdk_bridge_stub(tmp.path());
+    let backend = CursorBackend::new(
+        "cursor",
+        Some(stub.clone()),
+        Some("test-cursor-api-key".into()),
+    )
+    .with_state_root(tmp.path().join("sdk-state"));
     let cancel = tokio_util::sync::CancellationToken::new();
     let mut stream = start_turn(&backend, || {
-        let mut turn = turn(tmp.path().to_path_buf(), None, BackendPermission::Ask);
-        turn.cancel = cancel.clone();
-        turn
+        let mut next = turn(tmp.path().to_path_buf(), None, BackendPermission::ReadOnly);
+        next.prompt = "STALL_FOR_CANCELLATION".into();
+        next.tool_free = true;
+        next.cancel = cancel.clone();
+        next
     })
     .await;
 
-    cancel.cancel();
-    let drain = tokio::spawn(async move {
-        while let Some(event) = stream.next().await {
-            event.unwrap();
-        }
-    });
-    let cancel_path = std::path::PathBuf::from(format!("{stub}.cancel"));
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        while !cancel_path.exists() {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match stream.next().await {
+                Some(Ok(BackendEvent::TextDelta(text))) if text == "RUN_READY" => {
+                    break;
+                }
+                Some(Ok(_)) => {}
+                Some(Err(error)) => panic!("Cursor Send failed before cancellation: {error}"),
+                None => panic!("Cursor Send ended before publishing cancellation readiness"),
+            }
         }
     })
     .await
-    .expect("Cursor should receive session/cancel");
-    assert!(
-        !drain.is_finished(),
-        "backend stream closed before session/prompt acknowledged cancellation"
-    );
-
-    std::fs::write(format!("{stub}.release"), "").unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(2), drain)
-        .await
-        .expect("stream should close after Cursor acknowledges cancellation")
+    .expect("Cursor Send did not publish cancellation readiness");
+    #[cfg(target_os = "linux")]
+    let pid: u32 = std::fs::read_to_string(format!("{stub}.pid"))
+        .unwrap()
+        .trim()
+        .parse()
         .unwrap();
+    cancel.cancel();
+    std::fs::write(format!("{stub}.release-run-id"), "").unwrap();
+
+    let mut saw_cancelled = false;
+    tokio::time::timeout(std::time::Duration::from_secs(8), async {
+        while let Some(event) = stream.next().await {
+            if matches!(event, Err(trouve_agents::BackendError::Cancelled)) {
+                saw_cancelled = true;
+            }
+        }
+    })
+    .await
+    .expect("cancelled Cursor turn did not finish bounded cleanup");
+    assert!(saw_cancelled);
+    assert_eq!(
+        std::fs::read_to_string(format!("{stub}.cancel-run"))
+            .unwrap()
+            .trim(),
+        "sdk-run-cancel"
+    );
+    let port: u16 = std::fs::read_to_string(format!("{stub}.port"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(
+        tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_err(),
+        "cancelled Cursor Bridge was still accepting connections"
+    );
+    #[cfg(target_os = "linux")]
+    assert!(
+        !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+        "cancelled Cursor stream closed before the Bridge process was reaped"
+    );
 }
 
 #[tokio::test]
-async fn cursor_adapter_maps_permissions_to_safe_modes() {
+async fn cursor_backend_shutdown_drains_an_active_send_before_reaping_bridge() {
     let tmp = tempfile::tempdir().unwrap();
-    let stub = cursor_acp_stub(tmp.path());
-    let backend = CursorBackend::new("cursor", Some(stub.clone()), None);
-    let mut stream = start_turn(&backend, || {
-        turn(tmp.path().to_path_buf(), None, BackendPermission::Yolo)
-    })
-    .await;
-
-    // Yolo still surfaces the internal approval event so the engine can
-    // reject an out-of-worktree target. The engine auto-approves safe calls,
-    // represented here by replying true; no user prompt is created.
-    let mut saw_approval = false;
-    let mut completed = false;
-    while let Some(ev) = stream.next().await {
-        match ev.unwrap() {
-            BackendEvent::ApprovalNeeded { responder, .. } => {
-                saw_approval = true;
-                responder.send(true).unwrap();
-            }
-            BackendEvent::Completed { .. } => completed = true,
-            _ => {}
-        }
-    }
-    assert!(saw_approval);
-    assert!(completed);
-    let reply = std::fs::read_to_string(format!("{stub}.approval")).unwrap();
-    assert!(reply.contains("allow-once"), "{reply}");
-
-    // A different worktree gets a different cwd-pinned child from the same
-    // backend pool; it cannot inherit or reuse the first child's cwd.
-    let other_worktree = tempfile::tempdir().unwrap();
-    let mut other = start_turn(&backend, || {
-        turn(
-            other_worktree.path().to_path_buf(),
-            None,
-            BackendPermission::Yolo,
+    let stub = cursor_sdk_bridge_stub(tmp.path());
+    let backend = std::sync::Arc::new(
+        CursorBackend::new(
+            "cursor",
+            Some(stub.clone()),
+            Some("test-cursor-api-key".into()),
         )
-    })
-    .await;
-    while let Some(ev) = other.next().await {
-        if let BackendEvent::ApprovalNeeded { responder, .. } = ev.unwrap() {
-            responder.send(true).unwrap();
-        }
-    }
-    let cwd = std::fs::read_to_string(format!("{stub}.cwd")).unwrap();
-    assert_eq!(
-        Path::new(cwd.trim()).canonicalize().unwrap(),
-        other_worktree.path().canonicalize().unwrap()
+        .with_state_root(tmp.path().join("sdk-state")),
     );
-    let spawns = std::fs::read_to_string(format!("{stub}.spawns")).unwrap();
-    assert_eq!(spawns.lines().count(), 2, "{spawns}");
-    let mode = std::fs::read_to_string(format!("{stub}.mode")).unwrap();
-    assert!(mode.contains("\"value\":\"agent\""), "{mode}");
+    let mut next = turn(tmp.path().to_path_buf(), None, BackendPermission::ReadOnly);
+    next.prompt = "STALL_FOR_CANCELLATION".into();
+    next.tool_free = true;
+    let mut stream = backend.run_turn(next).await.unwrap();
 
-    // Read-only turns use Cursor Ask mode (search-only); approval-gated turns
-    // retain agent mode. Use fresh backends because the ACP child is pooled
-    // per worktree.
-    for (permission, expected_mode) in [
-        (BackendPermission::ReadOnly, "ask"),
-        (BackendPermission::Ask, "agent"),
-    ] {
-        let permission_worktree = tempfile::tempdir().unwrap();
-        let permission_stub = cursor_acp_stub(permission_worktree.path());
-        let permission_backend = CursorBackend::new("cursor", Some(permission_stub.clone()), None);
-        let mut permission_stream = start_turn(&permission_backend, || {
-            turn(permission_worktree.path().to_path_buf(), None, permission)
-        })
-        .await;
-        while let Some(event) = permission_stream.next().await {
-            if let BackendEvent::ApprovalNeeded { responder, .. } = event.unwrap() {
-                let _ = responder.send(false);
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match stream.next().await {
+                Some(Ok(BackendEvent::TextDelta(text))) if text == "RUN_READY" => break,
+                Some(Ok(_)) => {}
+                Some(Err(error)) => panic!("Cursor Send failed before shutdown: {error}"),
+                None => panic!("Cursor Send ended before publishing shutdown readiness"),
             }
         }
-        let mode = std::fs::read_to_string(format!("{permission_stub}.mode")).unwrap();
-        assert!(
-            mode.contains(&format!("\"value\":\"{expected_mode}\"")),
-            "{permission:?}: {mode}"
-        );
-    }
+    })
+    .await
+    .expect("Cursor Send did not publish shutdown readiness");
+
+    let shutting_backend = backend.clone();
+    let shutdown_started = std::time::Instant::now();
+    let mut shutdown = tokio::spawn(async move { shutting_backend.shutdown().await });
+    let mut saw_shutdown = false;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while let Some(event) = stream.next().await {
+            if let Err(error) = event {
+                saw_shutdown |= error.to_string().contains("pool is shutting down");
+            }
+        }
+    })
+    .await
+    .expect("active Cursor turn did not stop after the bounded shutdown drain");
+    assert!(saw_shutdown, "active turn did not report pool shutdown");
+    tokio::time::timeout(std::time::Duration::from_secs(5), &mut shutdown)
+        .await
+        .expect("backend shutdown remained blocked behind the active turn")
+        .unwrap()
+        .unwrap();
+    assert!(shutdown_started.elapsed() >= std::time::Duration::from_millis(750));
+
+    let port: u16 = std::fs::read_to_string(format!("{stub}.port"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(
+        tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_err(),
+        "shut down Cursor Bridge was still accepting connections"
+    );
 }
 
 #[tokio::test]
@@ -2657,12 +2712,16 @@ cat >/dev/null
 #[test]
 fn backend_tool_free_capabilities_match_vendor_protocols() {
     let claude = ClaudeBackend::new("claude-code", Some("/nonexistent/claude".into()));
-    let cursor = CursorBackend::new("cursor", Some("/nonexistent/cursor-agent".into()), None);
+    let cursor = CursorBackend::new(
+        "cursor",
+        Some("/nonexistent/cursor-sdk-bridge".into()),
+        None,
+    );
     let codex = CodexBackend::new("codex", Some("/nonexistent/codex".into()));
 
     assert!(claude.supports_tool_free_turns());
     assert!(claude.supports_steering());
-    assert!(!cursor.supports_tool_free_turns());
+    assert!(cursor.supports_tool_free_turns());
     assert!(!codex.supports_tool_free_turns());
     assert!(!claude.confines_read_only_turns());
     assert!(cursor.confines_read_only_turns());
@@ -2673,7 +2732,11 @@ fn backend_tool_free_capabilities_match_vendor_protocols() {
 async fn status_reports_missing_binary() {
     let backend = ClaudeBackend::new("claude-code", Some("/nonexistent/claude".into()));
     assert!(!backend.status().installed);
-    let backend = CursorBackend::new("cursor", Some("/nonexistent/cursor-agent".into()), None);
+    let backend = CursorBackend::new(
+        "cursor",
+        Some("/nonexistent/cursor-sdk-bridge".into()),
+        None,
+    );
     assert!(!backend.status().installed);
     let backend = CodexBackend::new("codex", Some("/nonexistent/codex".into()));
     assert!(!backend.status().installed);
