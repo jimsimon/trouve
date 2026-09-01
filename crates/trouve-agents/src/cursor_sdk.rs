@@ -1,19 +1,18 @@
 //! Cursor backend driven by the standalone Cursor Agent SDK Bridge.
 //!
-//! A bounded pool keeps one Bridge warm per recently active Trouve thread.
-//! Cursor keeps conversation state in a thread-scoped SQLite store, so a cold
-//! replacement can still resume the durable agent. Callback servers and their
-//! credentials remain turn-scoped and are registered immediately before each
-//! run. Cursor's native tools are replaced with the single SDK `mcp`
-//! capability; concrete tool schemas and calls are proxied to trouve's
-//! internal, thread-scoped MCP endpoint and therefore still pass through
-//! `ToolExecutor`.
+//! One credential-bound backend owns one warm Bridge process and one callback
+//! router. Cursor's local SQLite store holds every agent for that backend; the
+//! router maps each callback's exact `agent_id` and ingress generation to one
+//! turn-scoped MCP route.
+//! Cursor's native tools are replaced with the single SDK `mcp` capability;
+//! concrete tool schemas and calls are proxied to trouve's internal,
+//! thread-scoped MCP endpoint and therefore still pass through `ToolExecutor`.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, Weak};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock, Weak};
 use std::time::{Duration, Instant};
 
 use axum::extract::{DefaultBodyLimit, Request, State};
@@ -21,7 +20,7 @@ use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use bytes::BytesMut;
 use futures::{StreamExt as _, TryStreamExt as _};
 use serde::Deserialize;
@@ -49,8 +48,7 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const CANCEL_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 const SEND_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
-const INTERRUPTED_CALLBACK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
-const INTERRUPTED_REAP_TIMEOUT: Duration = Duration::from_secs(2);
+const CALLBACK_ROUTE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const CALLBACK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_RPC_BODY_BYTES: usize = 8 * 1024 * 1024;
@@ -61,10 +59,19 @@ const MAX_CALLBACK_RECORDS: usize = 128;
 // Historical IDs use fixed-size hashes, but still need a separate hard ceiling
 // so a defective authenticated Bridge cannot grow one turn without bound.
 const MAX_CALLBACKS_PER_TURN: usize = 4 * 1024;
+// Retain exact call ownership for the life of a shared Bridge so a delayed
+// retry from an earlier turn cannot bind to a replacement route. Recycle the
+// process at the bound instead of evicting authorization tombstones.
+const MAX_CALLBACK_IDENTITIES_PER_PROCESS: usize = 16 * 1024;
+// The process-wide callback endpoint has no vendor-visible turn nonce. Never
+// route the same durable agent id twice through one endpoint; recycle at this
+// bound even when a long-lived process sees only distinct, tool-free agents.
+const MAX_RETIRED_AGENT_IDS_PER_PROCESS: usize = 16 * 1024;
 const MAX_CALLBACK_REPLAY_RECORDS: usize = 64;
 const MAX_CALLBACK_REPLAY_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CALLBACK_CONCURRENCY: usize = 8;
 const MAX_CALLBACK_HTTP_CONCURRENCY: usize = 16;
+const MAX_LEGACY_SESSION_MARKER_BYTES: u64 = 4 * 1024;
 const READY_PREFIX: &str = "cursor-sdk-bridge ready ";
 const CALLBACK_PATH: &str = "/sdk.v1.SdkCustomToolCallbackService/CallCustomTool";
 /// Cursor-native tool vocabulary in the pinned Agent SDK (1.0.28), excluding
@@ -91,9 +98,9 @@ const CURSOR_NATIVE_TOOL_DENYLIST: &[&str] = &[
     "generateImage",
     "applyAgentDiff",
 ];
-/// Most warm Cursor Bridge processes retained by one configured backend.
-const POOL_CAP: usize = 3;
-/// Warm Bridges are inexpensive to resume but large enough to reap when idle.
+/// Concurrent turns admitted to one shared Cursor Bridge process.
+const MAX_CONCURRENT_TURNS: usize = 3;
+/// The shared Bridge is expensive enough to reap when the backend stays idle.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const REAP_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -453,12 +460,12 @@ enum TurnTerminal {
 }
 
 struct BridgePool {
-    processes: Mutex<HashMap<String, Arc<PooledBridge>>>,
+    process: Mutex<Option<Arc<PooledBridge>>>,
+    spawn_gate: Mutex<()>,
     thread_gates: Mutex<HashMap<String, Weak<Mutex<()>>>>,
     lifecycle: RwLock<()>,
     closed: AtomicBool,
     closing: CancellationToken,
-    capacity: Arc<Semaphore>,
     turn_admission: Arc<Semaphore>,
     available: Arc<Notify>,
     reaper_started: AtomicBool,
@@ -467,13 +474,13 @@ struct BridgePool {
 impl Default for BridgePool {
     fn default() -> Self {
         Self {
-            processes: Mutex::new(HashMap::new()),
+            process: Mutex::new(None),
+            spawn_gate: Mutex::new(()),
             thread_gates: Mutex::new(HashMap::new()),
             lifecycle: RwLock::new(()),
             closed: AtomicBool::new(false),
             closing: CancellationToken::new(),
-            capacity: Arc::new(Semaphore::new(POOL_CAP)),
-            turn_admission: Arc::new(Semaphore::new(POOL_CAP)),
+            turn_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_TURNS)),
             available: Arc::new(Notify::new()),
             reaper_started: AtomicBool::new(false),
         }
@@ -498,11 +505,6 @@ impl BridgeLease {
             .as_ref()
             .expect("a live Cursor Bridge lease owns its process")
     }
-
-    fn release_thread_gate(&mut self) {
-        self.thread_guard.take();
-        notify_available(&self.available);
-    }
 }
 
 impl std::ops::Deref for BridgeLease {
@@ -515,9 +517,10 @@ impl std::ops::Deref for BridgeLease {
 
 impl Drop for BridgeLease {
     fn drop(&mut self) {
-        // Wake capacity waiters only after releasing both retained resources.
+        if let Some(process) = self.process.take() {
+            process.release_lease();
+        }
         self.thread_guard.take();
-        self.process.take();
         notify_available(&self.available);
     }
 }
@@ -526,8 +529,8 @@ struct BridgeProcessRequest<'a> {
     command: &'a str,
     worktree: &'a Path,
     state_dir: &'a Path,
+    resume_agent_id: Option<&'a str>,
     api_key: &'a str,
-    callback: &'a CallbackServer,
     cancel: &'a CancellationToken,
     events: &'a BackendEventSender,
 }
@@ -535,7 +538,6 @@ struct BridgeProcessRequest<'a> {
 impl BridgePool {
     async fn process_for(
         &self,
-        thread_id: &str,
         admission: ThreadBridgeAdmission<'_>,
         request: BridgeProcessRequest<'_>,
     ) -> Result<BridgeLease, BackendError> {
@@ -551,136 +553,171 @@ impl BridgePool {
         if request.cancel.is_cancelled() || request.events.is_closed() {
             return Err(BackendError::Cancelled);
         }
-        let existing = self.processes.lock().await.get(thread_id).cloned();
-        if let Some(process) = existing {
-            let alive = if process.is_reusable()
-                && process.worktree == request.worktree
-                && process.state_dir == request.state_dir
-            {
-                let mut bridge = tokio::select! {
+        loop {
+            if !self.is_open() {
+                return Err(Self::closed_error());
+            }
+            let existing = {
+                let process = self.process.lock().await;
+                process.as_ref().map(|process| {
+                    // The callback wire has no turn nonce. A durable agent id
+                    // already routed through this listener requires a fresh
+                    // process-wide URL and bearer before ResumeAgent.
+                    let agent_route_available = request
+                        .resume_agent_id
+                        .is_none_or(|agent_id| process.callback.accepts_agent_id(agent_id));
+                    let leased = process.is_reusable()
+                        && process.state_dir == request.state_dir
+                        && agent_route_available;
+                    if leased {
+                        process.acquire_lease();
+                    }
+                    (process.clone(), leased)
+                })
+            };
+            if let Some((process, leased)) = existing {
+                if !leased {
+                    self.quarantine(&process).await;
+                    if self.recycle_if_unleased(&process, None).await? {
+                        continue;
+                    }
+                    tokio::select! {
+                        biased;
+                        _ = self.closing.cancelled() => return Err(Self::closed_error()),
+                        _ = request.cancel.cancelled() => return Err(BackendError::Cancelled),
+                        _ = request.events.closed() => return Err(BackendError::Cancelled),
+                        _ = self.available.notified() => {}
+                    }
+                    continue;
+                }
+                let alive = tokio::select! {
+                    biased;
+                    _ = self.closing.cancelled() => {
+                        process.release_lease();
+                        notify_available(&self.available);
+                        return Err(Self::closed_error());
+                    },
+                    _ = request.cancel.cancelled() => {
+                        process.release_lease();
+                        notify_available(&self.available);
+                        return Err(BackendError::Cancelled);
+                    },
+                    _ = request.events.closed() => {
+                        process.release_lease();
+                        notify_available(&self.available);
+                        return Err(BackendError::Cancelled);
+                    },
+                    alive = process.is_alive() => alive,
+                };
+                // Incrementing the lease under the pool slot above is the
+                // admission boundary. Revalidate after the asynchronous
+                // liveness probe so quarantine during that probe releases the
+                // reservation before any Bridge RPC. Quarantine after this
+                // check is concurrent with an already-admitted turn and, by
+                // design, drains without revoking active leases.
+                let reusable = if alive {
+                    let current = self.process.lock().await;
+                    process.is_reusable()
+                        && current
+                            .as_ref()
+                            .is_some_and(|current| Arc::ptr_eq(current, &process))
+                } else {
+                    false
+                };
+                if reusable {
+                    process.touch();
+                    return Ok(BridgeLease {
+                        process: Some(process),
+                        thread_guard: Some(thread_guard),
+                        available: self.available.clone(),
+                    });
+                }
+                self.quarantine(&process).await;
+                process.release_lease();
+                notify_available(&self.available);
+                if self.recycle_if_unleased(&process, None).await? {
+                    continue;
+                }
+                tokio::select! {
                     biased;
                     _ = self.closing.cancelled() => return Err(Self::closed_error()),
                     _ = request.cancel.cancelled() => return Err(BackendError::Cancelled),
                     _ = request.events.closed() => return Err(BackendError::Cancelled),
-                    bridge = process.bridge.lock() => bridge,
-                };
-                match bridge.child.try_wait_leader() {
-                    Ok(status) => status.is_none(),
-                    Err(error) => {
-                        tracing::debug!(
-                            %thread_id,
-                            "cursor: failed to inspect pooled Bridge: {error}"
-                        );
-                        false
-                    }
+                    _ = self.available.notified() => {}
                 }
-            } else {
-                false
+                continue;
+            }
+
+            let _spawn = tokio::select! {
+                biased;
+                _ = self.closing.cancelled() => return Err(Self::closed_error()),
+                _ = request.cancel.cancelled() => return Err(BackendError::Cancelled),
+                _ = request.events.closed() => return Err(BackendError::Cancelled),
+                gate = self.spawn_gate.lock() => gate,
             };
-            if alive {
-                process.touch();
-                return Ok(BridgeLease {
-                    process: Some(process),
-                    thread_guard: Some(thread_guard),
-                    available: self.available.clone(),
-                });
+            if self.process.lock().await.is_some() {
+                continue;
             }
-            process.quarantine();
-            self.remove_if_same(thread_id, &process).await;
-            if let Err(error) = process.terminate().await {
-                self.restore_if_vacant(thread_id, process).await;
-                drop(thread_guard);
-                notify_available(&self.available);
-                return Err(error);
+            if !self.is_open() {
+                return Err(Self::closed_error());
             }
-            drop(process);
-            if request.cancel.is_cancelled() || request.events.is_closed() {
-                return Err(BackendError::Cancelled);
+            let callback = Arc::new(CallbackRouter::start(local_http_client()?).await?);
+            let bridge = BridgeProcess::start(&request, &callback, &self.closing).await;
+            let mut bridge = match bridge {
+                Ok(bridge) => bridge,
+                Err(error) => return cleanup_error(error, callback.stop().await),
+            };
+            if !self.is_open() {
+                let process_cleanup = bridge.shutdown().await;
+                let callback_cleanup = callback.stop().await;
+                return merge_io_cleanup_errors(
+                    Self::closed_error(),
+                    process_cleanup,
+                    callback_cleanup,
+                );
             }
+            let process = Arc::new(PooledBridge {
+                client: bridge.client.clone(),
+                bridge: Mutex::new(bridge),
+                callback,
+                reusable: Arc::new(AtomicBool::new(true)),
+                active_leases: std::sync::atomic::AtomicUsize::new(1),
+                state_dir: request.state_dir.to_path_buf(),
+                last_used: StdMutex::new(Instant::now()),
+            });
+            *self.process.lock().await = Some(process.clone());
+            return Ok(BridgeLease {
+                process: Some(process),
+                thread_guard: Some(thread_guard),
+                available: self.available.clone(),
+            });
         }
-
-        let permit = self
-            .acquire_capacity(request.cancel, request.events)
-            .await?;
-        if request.cancel.is_cancelled() || request.events.is_closed() {
-            return Err(BackendError::Cancelled);
-        }
-        let mut bridge = BridgeProcess::start(&request, &self.closing).await?;
-        if !self.is_open() {
-            return merge_cleanup_error(
-                Self::closed_error(),
-                bridge.shutdown().await.map_err(BackendError::Io),
-            );
-        }
-        let process = Arc::new(PooledBridge {
-            bridge: Mutex::new(bridge),
-            reusable: AtomicBool::new(true),
-            worktree: request.worktree.to_path_buf(),
-            state_dir: request.state_dir.to_path_buf(),
-            last_used: StdMutex::new(Instant::now()),
-            _permit: permit,
-        });
-        self.processes
-            .lock()
-            .await
-            .insert(thread_id.to_string(), process.clone());
-        Ok(BridgeLease {
-            process: Some(process),
-            thread_guard: Some(thread_guard),
-            available: self.available.clone(),
-        })
-    }
-
-    async fn terminate_and_remove(
-        &self,
-        thread_id: &str,
-        process: &BridgeLease,
-    ) -> Result<(), BackendError> {
-        process.quarantine();
-        self.remove_if_same(thread_id, process.pooled()).await;
-        if let Err(error) = process.terminate().await {
-            self.restore_if_vacant(thread_id, process.pooled().clone())
-                .await;
-            return Err(error);
-        }
-        Ok(())
-    }
-
-    async fn terminate_and_remove_now_until(
-        &self,
-        thread_id: &str,
-        process: &BridgeLease,
-        deadline: tokio::time::Instant,
-    ) -> Result<(), BackendError> {
-        process.quarantine();
-        self.remove_if_same(thread_id, process.pooled()).await;
-        if let Err(error) = process.terminate_now_until(deadline).await {
-            self.restore_if_vacant(thread_id, process.pooled().clone())
-                .await;
-            return Err(error);
-        }
-        Ok(())
     }
 
     async fn reap_idle(&self) {
         if !self.is_open() {
             return;
         }
-        while let Some((thread_id, process, guard)) = self.take_evictable(Some(IDLE_TIMEOUT)).await
+        let candidate = self.process.lock().await.clone();
+        let Some(candidate) = candidate else {
+            return;
+        };
+        if !bridge_cleanup_is_due(
+            candidate.is_reusable(),
+            *candidate.last_used.lock().unwrap(),
+            Some(IDLE_TIMEOUT),
+        ) {
+            return;
+        }
+        if let Err(error) = self
+            .recycle_if_unleased(&candidate, Some(IDLE_TIMEOUT))
+            .await
         {
-            match process.terminate().await {
-                Ok(()) => {}
-                Err(error) => {
-                    self.restore_if_vacant(&thread_id, process).await;
-                    drop(guard);
-                    notify_available(&self.available);
-                    tracing::warn!(
-                        %thread_id,
-                        "cursor: retaining idle Bridge after unacknowledged cleanup: {error}"
-                    );
-                    break;
-                }
-            }
+            tracing::warn!(
+                backend_state_dir = %candidate.state_dir.display(),
+                %error,
+                "cursor: retaining shared Bridge after cleanup failed"
+            );
         }
     }
 
@@ -692,25 +729,10 @@ impl BridgePool {
         BackendError::Protocol("Cursor SDK Bridge pool is shutting down".into())
     }
 
-    /// Commit warm retention while ordered before the shutdown writer.
-    async fn retain_if_open<F, Fut>(&self, retain: F) -> bool
-    where
-        F: FnOnce() -> Fut,
-        Fut: std::future::Future<Output = ()>,
-    {
-        let _lifecycle = self.lifecycle.read().await;
-        if !self.is_open() {
-            return false;
-        }
-        retain().await;
-        true
-    }
-
     async fn shutdown(&self) -> Result<(), BackendError> {
         // Close new admission, drain admitted turns, then wake shutdown waiters.
         let drain_deadline = tokio::time::Instant::now() + SHUTDOWN_DRAIN_TIMEOUT;
         self.closed.store(true, Ordering::Release);
-        self.capacity.close();
         self.turn_admission.close();
         notify_available(&self.available);
         let _lifecycle = match tokio::time::timeout_at(drain_deadline, self.lifecycle.write()).await
@@ -721,17 +743,16 @@ impl BridgePool {
                 self.lifecycle.write().await
             }
         };
-        let mut first_error = None;
-        let thread_ids = self
-            .processes
+        let gates = self
+            .thread_gates
             .lock()
             .await
-            .keys()
-            .cloned()
+            .values()
+            .filter_map(Weak::upgrade)
             .collect::<Vec<_>>();
-        for thread_id in thread_ids {
-            let gate = self.thread_gate(&thread_id).await;
-            let _guard =
+        let mut guards = Vec::with_capacity(gates.len());
+        for gate in gates {
+            let guard =
                 match tokio::time::timeout_at(drain_deadline, gate.clone().lock_owned()).await {
                     Ok(guard) => guard,
                     Err(_) => {
@@ -739,25 +760,27 @@ impl BridgePool {
                         gate.lock_owned().await
                     }
                 };
-            let process = self.processes.lock().await.remove(&thread_id);
-            let Some(process) = process else {
-                continue;
-            };
-            process.quarantine();
-            if let Err(error) = process.terminate().await {
-                self.restore_if_vacant(&thread_id, process).await;
-                first_error.get_or_insert(error);
-            }
-            notify_available(&self.available);
+            guards.push(guard);
         }
-        if self.processes.lock().await.is_empty() {
-            self.thread_gates.lock().await.clear();
-        }
-        self.closing.cancel();
-        match first_error {
-            Some(error) => Err(error),
+        let _spawn = self.spawn_gate.lock().await;
+        let process = self.process.lock().await.take();
+        let result = match process {
+            Some(process) => match process.terminate().await {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    // A failed process-tree cleanup remains retryable even
+                    // though the pool is permanently closed to new turns.
+                    self.restore_if_vacant(process).await;
+                    Err(error)
+                }
+            },
             None => Ok(()),
-        }
+        };
+        self.thread_gates.lock().await.clear();
+        drop(guards);
+        self.closing.cancel();
+        notify_available(&self.available);
+        result
     }
 
     async fn thread_gate(&self, thread_id: &str) -> Arc<Mutex<()>> {
@@ -810,89 +833,6 @@ impl BridgePool {
         })
     }
 
-    async fn remove_if_same(&self, thread_id: &str, process: &Arc<PooledBridge>) {
-        let mut processes = self.processes.lock().await;
-        if processes
-            .get(thread_id)
-            .is_some_and(|entry| Arc::ptr_eq(entry, process))
-        {
-            processes.remove(thread_id);
-        }
-    }
-
-    async fn restore_if_vacant(&self, thread_id: &str, process: Arc<PooledBridge>) {
-        self.processes
-            .lock()
-            .await
-            .entry(thread_id.to_string())
-            .or_insert(process);
-    }
-
-    async fn terminate_after_declined_retention(
-        &self,
-        thread_id: &str,
-        process: &BridgeLease,
-    ) -> Result<(), BackendError> {
-        let gate = self.thread_gate(thread_id).await;
-        let _guard = gate.lock_owned().await;
-        let still_owned = self
-            .processes
-            .lock()
-            .await
-            .get(thread_id)
-            .is_some_and(|candidate| Arc::ptr_eq(candidate, process.pooled()));
-        if !still_owned {
-            // A racing pool shutdown already reaped this exact process.
-            return Ok(());
-        }
-        self.terminate_and_remove(thread_id, process).await
-    }
-
-    async fn acquire_capacity(
-        &self,
-        cancel: &CancellationToken,
-        events: &BackendEventSender,
-    ) -> Result<OwnedSemaphorePermit, BackendError> {
-        loop {
-            if !self.is_open() {
-                return Err(Self::closed_error());
-            }
-            if let Ok(permit) = self.capacity.clone().try_acquire_owned() {
-                if !self.is_open() {
-                    drop(permit);
-                    return Err(Self::closed_error());
-                }
-                return Ok(permit);
-            }
-            if self.evict_one().await? {
-                continue;
-            }
-            tokio::select! {
-                biased;
-                _ = self.closing.cancelled() => return Err(Self::closed_error()),
-                _ = cancel.cancelled() => return Err(BackendError::Cancelled),
-                _ = events.closed() => return Err(BackendError::Cancelled),
-                permit = self.capacity.clone().acquire_owned() => {
-                    let permit = permit.map_err(|_| {
-                        if self.is_open() {
-                            BackendError::Protocol(
-                                "Cursor SDK Bridge pool capacity closed unexpectedly".into()
-                            )
-                        } else {
-                            Self::closed_error()
-                        }
-                    })?;
-                    if !self.is_open() {
-                        drop(permit);
-                        return Err(Self::closed_error());
-                    }
-                    return Ok(permit);
-                }
-                _ = self.available.notified() => {}
-            }
-        }
-    }
-
     async fn acquire_turn_admission(
         &self,
         cancel: &CancellationToken,
@@ -918,66 +858,64 @@ impl BridgePool {
         }
     }
 
-    async fn evict_one(&self) -> Result<bool, BackendError> {
-        let Some((thread_id, process, guard)) = self.take_evictable(None).await else {
+    async fn take_if_unleased(
+        &self,
+        candidate: &Arc<PooledBridge>,
+        idle_for: Option<Duration>,
+    ) -> Option<Arc<PooledBridge>> {
+        let mut process = self.process.lock().await;
+        if candidate.active_leases.load(Ordering::Acquire) != 0
+            || !bridge_cleanup_is_due(
+                candidate.is_reusable(),
+                *candidate.last_used.lock().unwrap(),
+                idle_for,
+            )
+            || !process
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, candidate))
+        {
+            return None;
+        }
+        process.take()
+    }
+
+    async fn recycle_if_unleased(
+        &self,
+        candidate: &Arc<PooledBridge>,
+        idle_for: Option<Duration>,
+    ) -> Result<bool, BackendError> {
+        // The spawn gate covers the interval where the pool slot is empty but
+        // the previous process tree is not yet reaped. This keeps the backend's
+        // process count at one during idle eviction and quarantine recovery.
+        let _spawn = self.spawn_gate.lock().await;
+        let Some(process) = self.take_if_unleased(candidate, idle_for).await else {
             return Ok(false);
         };
         if let Err(error) = process.terminate().await {
-            self.restore_if_vacant(&thread_id, process).await;
-            drop(guard);
+            self.restore_if_vacant(process).await;
             notify_available(&self.available);
             return Err(error);
         }
+        notify_available(&self.available);
         Ok(true)
     }
 
-    async fn take_evictable(
-        &self,
-        idle_for: Option<Duration>,
-    ) -> Option<(String, Arc<PooledBridge>, OwnedMutexGuard<()>)> {
-        let mut candidates = {
-            let processes = self.processes.lock().await;
-            processes
-                .iter()
-                .filter(|(_, process)| bridge_is_evictable(process, idle_for))
-                .map(|(thread_id, process)| (thread_id.clone(), *process.last_used.lock().unwrap()))
-                .collect::<Vec<_>>()
-        };
-        candidates.sort_by_key(|(_, last_used)| *last_used);
-        for (thread_id, _) in candidates {
-            let gate = self.thread_gate(&thread_id).await;
-            let Ok(guard) = gate.try_lock_owned() else {
-                continue;
-            };
-            let process = {
-                let mut processes = self.processes.lock().await;
-                let evictable = processes
-                    .get(&thread_id)
-                    .is_some_and(|process| bridge_is_evictable(process, idle_for));
-                if !evictable {
-                    None
-                } else {
-                    let process = processes.remove(&thread_id).expect("entry checked above");
-                    process.quarantine();
-                    Some(process)
-                }
-            };
-            if let Some(process) = process {
-                return Some((thread_id, process, guard));
-            }
+    async fn quarantine(&self, candidate: &Arc<PooledBridge>) {
+        let process = self.process.lock().await;
+        if process
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, candidate))
+        {
+            candidate.quarantine();
         }
-        None
     }
-}
 
-fn bridge_is_evictable(process: &Arc<PooledBridge>, idle_for: Option<Duration>) -> bool {
-    Arc::strong_count(process) == 1
-        && process.bridge.try_lock().is_ok()
-        && bridge_cleanup_is_due(
-            process.is_reusable(),
-            *process.last_used.lock().unwrap(),
-            idle_for,
-        )
+    async fn restore_if_vacant(&self, process: Arc<PooledBridge>) {
+        let mut current = self.process.lock().await;
+        if current.is_none() {
+            *current = Some(process);
+        }
+    }
 }
 
 fn bridge_cleanup_is_due(reusable: bool, last_used: Instant, idle_for: Option<Duration>) -> bool {
@@ -995,24 +933,26 @@ fn notify_available(available: &Notify) {
     available.notify_one();
 }
 
-async fn retain_lease_if_open<F>(pool: &BridgePool, lease: &mut BridgeLease, retain: F) -> bool
-where
-    F: FnOnce(&BridgeLease),
-{
-    lease.release_thread_gate();
-    pool.retain_if_open(|| async { retain(lease) }).await
-}
-
 struct PooledBridge {
+    client: BridgeClient,
     bridge: Mutex<BridgeProcess>,
-    reusable: AtomicBool,
-    worktree: PathBuf,
+    callback: Arc<CallbackRouter>,
+    reusable: Arc<AtomicBool>,
+    active_leases: std::sync::atomic::AtomicUsize,
     state_dir: PathBuf,
     last_used: StdMutex<Instant>,
-    _permit: OwnedSemaphorePermit,
 }
 
 impl PooledBridge {
+    fn acquire_lease(&self) {
+        self.active_leases.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn release_lease(&self) {
+        let previous = self.active_leases.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "Cursor Bridge lease count underflowed");
+    }
+
     fn is_reusable(&self) -> bool {
         self.reusable.load(Ordering::Acquire)
     }
@@ -1025,27 +965,22 @@ impl PooledBridge {
         *self.last_used.lock().unwrap() = Instant::now();
     }
 
-    async fn terminate(&self) -> Result<(), BackendError> {
-        self.quarantine();
-        self.bridge
-            .lock()
-            .await
-            .shutdown()
-            .await
-            .map_err(BackendError::Io)
+    async fn is_alive(&self) -> bool {
+        let mut bridge = self.bridge.lock().await;
+        match bridge.child.try_wait_leader() {
+            Ok(status) => status.is_none(),
+            Err(error) => {
+                tracing::debug!("cursor: failed to inspect shared Bridge: {error}");
+                false
+            }
+        }
     }
 
-    async fn terminate_now_until(
-        &self,
-        deadline: tokio::time::Instant,
-    ) -> Result<(), BackendError> {
+    async fn terminate(&self) -> Result<(), BackendError> {
         self.quarantine();
-        self.bridge
-            .lock()
-            .await
-            .shutdown_now_until(deadline)
-            .await
-            .map_err(BackendError::Io)
+        let process = self.bridge.lock().await.shutdown().await;
+        let callback = self.callback.stop().await;
+        merge_io_cleanup_results(process, callback)
     }
 }
 
@@ -1103,29 +1038,24 @@ async fn run_sdk_turn(
             "trouve's Cursor tool bridge returned no tools".into(),
         ));
     }
-    let callback = tokio::select! {
-        biased;
-        _ = pool.closing.cancelled() => return Err(BridgePool::closed_error()),
-        _ = turn.cancel.cancelled() => return Ok(TurnTerminal::Cancelled),
-        _ = events.closed() => return Ok(TurnTerminal::ConsumerClosed),
-        callback = CallbackServer::start(local_http, mcp_url, &turn.cancel) => callback?,
-    };
-    let mut callback = callback;
-    if events.is_closed() {
-        callback.stop().await;
-        return Ok(TurnTerminal::ConsumerClosed);
-    }
-    let state_dir = thread_state_dir(state_root, provider_id, &turn.thread_id);
-    let mut process = match pool
+    let allowed_tools = custom_tools.keys().cloned().collect::<HashSet<_>>();
+    let state_dir = backend_state_dir(state_root, provider_id);
+    let session = select_backend_session(
+        state_root,
+        provider_id,
+        &turn.thread_id,
+        turn.session.as_deref(),
+    )
+    .await?;
+    let process = match pool
         .process_for(
-            &turn.thread_id,
             thread_admission,
             BridgeProcessRequest {
                 command,
                 worktree: &turn.worktree,
                 state_dir: &state_dir,
+                resume_agent_id: session.resume.as_deref(),
                 api_key,
-                callback: &callback,
                 cancel: &turn.cancel,
                 events,
             },
@@ -1133,108 +1063,72 @@ async fn run_sdk_turn(
         .await
     {
         Ok(process) => process,
-        Err(error) => {
-            callback.stop().await;
-            return Err(error);
-        }
-    };
-    let mut bridge = tokio::select! {
-        biased;
-        _ = pool.closing.cancelled() => {
-            return terminate_interrupted_process(
-                pool,
-                &turn.thread_id,
-                &process,
-                &mut callback,
-                BridgePool::closed_error(),
-            ).await;
-        }
-        _ = turn.cancel.cancelled() => {
-            callback.stop().await;
-            pool.terminate_and_remove(&turn.thread_id, &process).await?;
-            return Ok(TurnTerminal::Cancelled);
-        }
-        _ = events.closed() => {
-            callback.stop().await;
-            pool.terminate_and_remove(&turn.thread_id, &process).await?;
+        Err(BackendError::Cancelled) if events.is_closed() => {
             return Ok(TurnTerminal::ConsumerClosed);
         }
-        bridge = process.bridge.lock() => bridge,
+        Err(BackendError::Cancelled) => return Ok(TurnTerminal::Cancelled),
+        Err(error) => return Err(error),
     };
-    let process_exited = match bridge.child.try_wait_leader() {
-        Ok(status) => status.is_some(),
-        Err(error) => {
-            drop(bridge);
-            callback.stop().await;
-            let cleanup = pool.terminate_and_remove(&turn.thread_id, &process).await;
-            return merge_cleanup_error(BackendError::Io(error), cleanup);
-        }
-    };
-    if !process.is_reusable() || process_exited {
-        drop(bridge);
-        callback.stop().await;
-        pool.terminate_and_remove(&turn.thread_id, &process).await?;
-        return Err(BackendError::Protocol(
-            "pooled Cursor SDK Bridge exited before the turn started".into(),
-        ));
-    }
-    let callback_registration = tokio::select! {
-        biased;
-        _ = pool.closing.cancelled() => Err(BridgePool::closed_error()),
-        result = bridge.set_tool_callback(Some(&callback)) => result,
-    };
-    if let Err(error) = callback_registration {
-        drop(bridge);
-        if pool.closing.is_cancelled() {
-            return terminate_interrupted_process(
-                pool,
-                &turn.thread_id,
-                &process,
-                &mut callback,
-                error,
-            )
-            .await;
-        }
-        callback.stop().await;
-        let cleanup = pool.terminate_and_remove(&turn.thread_id, &process).await;
-        return merge_cleanup_error(error, cleanup);
-    }
-
+    let client = process.client.clone();
     let options = agent_options(&turn, api_key, custom_tools);
     let setup = tokio::select! {
         biased;
         _ = pool.closing.cancelled() => Err(BridgePool::closed_error()),
         _ = turn.cancel.cancelled() => Err(BackendError::Cancelled),
-        _ = events.closed() => {
-            drop(bridge);
-            callback.stop().await;
-            pool.terminate_and_remove(&turn.thread_id, &process).await?;
-            return Ok(TurnTerminal::ConsumerClosed);
-        }
-        setup = create_or_resume_agent(&bridge.client, turn.session.as_deref(), &options) => setup,
+        _ = events.closed() => Err(BackendError::Cancelled),
+        setup = create_or_resume_agent(&client, session.resume.as_deref(), &options) => setup,
     };
     let (agent_id, fresh) = match setup {
         Ok(value) => value,
         Err(error) => {
-            drop(bridge);
+            // A cancelled or failed CreateAgent/ResumeAgent request can still
+            // have committed inside the Bridge after the HTTP future was
+            // dropped. Quarantine the process so its shared store is reopened
+            // cleanly once already-active turns have drained.
+            pool.quarantine(process.pooled()).await;
             if pool.closing.is_cancelled() {
-                return terminate_interrupted_process(
-                    pool,
-                    &turn.thread_id,
-                    &process,
-                    &mut callback,
-                    error,
-                )
-                .await;
+                return Err(BridgePool::closed_error());
             }
-            callback.stop().await;
-            let cleanup = pool.terminate_and_remove(&turn.thread_id, &process).await;
-            return merge_cleanup_error(error, cleanup);
+            if matches!(error, BackendError::Cancelled) {
+                return Ok(if events.is_closed() {
+                    TurnTerminal::ConsumerClosed
+                } else {
+                    TurnTerminal::Cancelled
+                });
+            }
+            return Err(error);
         }
     };
-    *callback.expected_agent_id.write().await = Some(agent_id.clone());
+    if let Some(marker) = session.legacy_marker.as_ref()
+        && marker.recorded_agent_id.as_deref() != Some(agent_id.as_str())
+        && let Err(error) = record_legacy_session_marker(marker, &agent_id).await
+    {
+        pool.quarantine(process.pooled()).await;
+        let release = close_agent(&client, &agent_id).await;
+        return finish_shared_turn(Err(error), release);
+    }
+    let mut route = match process
+        .callback
+        .register(
+            agent_id.clone(),
+            mcp_url,
+            allowed_tools,
+            turn.cancel.child_token(),
+            Some(Arc::downgrade(&process.reusable)),
+        )
+        .await
+    {
+        Ok(route) => route,
+        Err(error) => {
+            // A duplicate or retired agent id cannot safely bind here. Closing
+            // an active duplicate would interrupt that turn, and a retired id
+            // needs a new callback boundary. Recycle after current routes drain.
+            pool.quarantine(process.pooled()).await;
+            return Err(error);
+        }
+    };
 
-    if fresh
+    if (fresh || turn.session.as_deref() != Some(agent_id.as_str()))
         && events
             .send(Ok(BackendEvent::SessionStarted {
                 session_id: agent_id.clone(),
@@ -1242,141 +1136,71 @@ async fn run_sdk_turn(
             .await
             .is_err()
     {
-        drop(bridge);
-        callback.stop().await;
-        pool.terminate_and_remove(&turn.thread_id, &process).await?;
-        return Ok(TurnTerminal::ConsumerClosed);
+        let callbacks_settled = route.stop().await;
+        let release = close_agent(&client, &agent_id).await;
+        if !callbacks_settled {
+            tracing::warn!(
+                "cursor: callback route for agent {agent_id} did not settle after its consumer closed; quarantining shared Bridge"
+            );
+        }
+        if release.is_err() || !callbacks_settled {
+            pool.quarantine(process.pooled()).await;
+        }
+        return finish_shared_turn(Ok(TurnTerminal::ConsumerClosed), release);
     }
 
     let outcome = tokio::select! {
         biased;
         _ = pool.closing.cancelled() => {
-            callback.supervisor.cancel.cancel();
+            route.supervisor.cancel.cancel();
             Err(BridgePool::closed_error())
         }
         outcome = stream_turn(
-            &bridge.client,
+            &client,
             &agent_id,
             &turn,
             events,
-            &callback.supervisor.cancel,
+            route.route.clone(),
         ) => outcome,
     };
-    if pool.closing.is_cancelled() {
-        drop(bridge);
-        return terminate_interrupted_process(
-            pool,
-            &turn.thread_id,
-            &process,
-            &mut callback,
-            BridgePool::closed_error(),
-        )
-        .await;
+    // Cursor can publish a terminal Send frame while an already-admitted
+    // callback is still waiting on MCP. Every terminal path therefore uses
+    // the same bounded, acknowledged drain before releasing the shared lease.
+    let callbacks_settled = route.stop().await;
+    let release = close_agent(&client, &agent_id).await;
+    if !callbacks_settled {
+        tracing::warn!(
+            "cursor: callback route for agent {agent_id} did not settle; quarantining shared Bridge"
+        );
     }
-    if matches!(
-        &outcome,
-        Ok(TurnTerminal::Cancelled | TurnTerminal::ConsumerClosed)
-    ) {
-        // CancelRun observation, callback shutdown, and process reaping share
-        // a five-second budget. Give child reaping its own final interval so a
-        // callback server that consumes its allowance cannot strand the warm
-        // Bridge or its pool permit.
-        let callback_deadline = tokio::time::Instant::now() + INTERRUPTED_CALLBACK_SHUTDOWN_TIMEOUT;
-        callback.stop_until(callback_deadline).await;
-        drop(bridge);
-        let reap_deadline = tokio::time::Instant::now() + INTERRUPTED_REAP_TIMEOUT;
-        let process_cleanup = pool
-            .terminate_and_remove_now_until(&turn.thread_id, &process, reap_deadline)
-            .await;
-        return finish_recycled_turn(outcome, Ok(()), process_cleanup);
-    }
-
-    // No callback may start after the terminal Send frame. The Bridge mutex
-    // stays held until callback tasks are joined and its registration clears.
-    callback.stop().await;
-    let release = tokio::select! {
-        biased;
-        _ = pool.closing.cancelled() => None,
-        release = bridge.release_turn(&agent_id) => Some(release),
-    };
-    let Some(release) = release else {
-        drop(bridge);
-        return terminate_interrupted_process(
-            pool,
-            &turn.thread_id,
-            &process,
-            &mut callback,
-            BridgePool::closed_error(),
-        )
-        .await;
-    };
-    let warm_eligible = matches!(&outcome, Ok(TurnTerminal::Finished(_))) && release.is_ok();
-    drop(bridge);
-
-    // Drop the Bridge mutex before waiting for the lifecycle reader: a queued
-    // shutdown writer may need that mutex to drain the process. Once admitted,
-    // retain_if_open keeps the retention commit ordered before shutdown.
-    let keep_warm = if warm_eligible {
-        // Never wait for the lifecycle reader while owning the per-thread
-        // gate: shutdown owns the writer before acquiring that same gate.
-        retain_lease_if_open(pool, &mut process, |process| process.touch()).await
+    if outcome.is_err() || release.is_err() || !callbacks_settled {
+        pool.quarantine(process.pooled()).await;
     } else {
-        false
-    };
-
-    if keep_warm {
-        return outcome;
+        process.touch();
     }
-    let process_cleanup = if warm_eligible {
-        pool.terminate_after_declined_retention(&turn.thread_id, &process)
-            .await
-    } else {
-        pool.terminate_and_remove(&turn.thread_id, &process).await
-    };
-    finish_recycled_turn(outcome, release, process_cleanup)
+    finish_shared_turn(outcome, release)
 }
 
-async fn terminate_interrupted_process(
-    pool: &BridgePool,
-    thread_id: &str,
-    process: &BridgeLease,
-    callback: &mut CallbackServer,
-    primary: BackendError,
-) -> Result<TurnTerminal, BackendError> {
-    let callback_deadline = tokio::time::Instant::now() + INTERRUPTED_CALLBACK_SHUTDOWN_TIMEOUT;
-    callback.stop_until(callback_deadline).await;
-    let reap_deadline = tokio::time::Instant::now() + INTERRUPTED_REAP_TIMEOUT;
-    let cleanup = pool
-        .terminate_and_remove_now_until(thread_id, process, reap_deadline)
-        .await;
-    merge_cleanup_error(primary, cleanup)
+async fn close_agent(client: &BridgeClient, agent_id: &str) -> Result<(), BackendError> {
+    client
+        .unary_with_timeout(
+            "SdkAgentService",
+            "CloseAgent",
+            json!({ "agentId": agent_id }),
+            Duration::from_secs(10),
+        )
+        .await
+        .map(|_| ())
 }
 
-fn merge_cleanup_error<T>(
-    primary: BackendError,
-    cleanup: Result<(), BackendError>,
-) -> Result<T, BackendError> {
-    match cleanup {
-        Ok(()) => Err(primary),
-        Err(cleanup) => Err(BackendError::Protocol(format!(
-            "{primary}; Cursor SDK Bridge process cleanup was not acknowledged: {cleanup}"
-        ))),
-    }
-}
-
-fn finish_recycled_turn(
+fn finish_shared_turn(
     outcome: Result<TurnTerminal, BackendError>,
     release: Result<(), BackendError>,
-    process_cleanup: Result<(), BackendError>,
 ) -> Result<TurnTerminal, BackendError> {
     let mut error = outcome.as_ref().err().map(ToString::to_string);
     if let Err(release) = release {
         let release = format!("Cursor SDK agent release was not acknowledged: {release}");
         error = Some(error.map_or(release.clone(), |error| format!("{error}; {release}")));
-    }
-    if let Err(cleanup) = process_cleanup {
-        let cleanup = format!("Cursor SDK Bridge process cleanup was not acknowledged: {cleanup}");
-        error = Some(error.map_or(cleanup.clone(), |error| format!("{error}; {cleanup}")));
     }
     match error {
         Some(error) => Err(BackendError::Protocol(error)),
@@ -1396,6 +1220,33 @@ fn cleanup_error<T>(
     }
 }
 
+fn merge_io_cleanup_results(
+    process: std::io::Result<()>,
+    callback: std::io::Result<()>,
+) -> Result<(), BackendError> {
+    match (process, callback) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(BackendError::Io(error)),
+        (Ok(()), Err(error)) => Err(BackendError::Protocol(format!(
+            "Cursor callback router cleanup was not acknowledged: {error}"
+        ))),
+        (Err(process), Err(callback)) => Err(BackendError::Protocol(format!(
+            "Cursor SDK Bridge process cleanup was not acknowledged: {process}; callback router cleanup was not acknowledged: {callback}"
+        ))),
+    }
+}
+
+fn merge_io_cleanup_errors<T>(
+    primary: BackendError,
+    process: std::io::Result<()>,
+    callback: std::io::Result<()>,
+) -> Result<T, BackendError> {
+    match merge_io_cleanup_results(process, callback) {
+        Ok(()) => Err(primary),
+        Err(cleanup) => Err(BackendError::Protocol(format!("{primary}; {cleanup}"))),
+    }
+}
+
 fn local_http_client() -> Result<reqwest::Client, BackendError> {
     reqwest::Client::builder()
         .no_proxy()
@@ -1404,14 +1255,179 @@ fn local_http_client() -> Result<reqwest::Client, BackendError> {
         .map_err(|error| BackendError::Protocol(format!("local HTTP client: {error}")))
 }
 
-fn thread_state_dir(root: &Path, provider_id: &str, thread_id: &str) -> PathBuf {
+fn backend_state_dir(root: &Path, provider_id: &str) -> PathBuf {
+    use base64::Engine as _;
+    let mut hasher = Sha256::new();
+    hasher.update(provider_id.as_bytes());
+    let key = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hasher.finalize());
+    root.join(key)
+}
+
+fn legacy_thread_state_key(provider_id: &str, thread_id: &str) -> String {
     use base64::Engine as _;
     let mut hasher = Sha256::new();
     hasher.update(provider_id.as_bytes());
     hasher.update([0]);
     hasher.update(thread_id.as_bytes());
-    let key = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hasher.finalize());
-    root.join(key)
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hasher.finalize())
+}
+
+fn legacy_thread_state_dir(root: &Path, provider_id: &str, thread_id: &str) -> PathBuf {
+    root.join(legacy_thread_state_key(provider_id, thread_id))
+}
+
+fn legacy_session_marker_path(root: &Path, provider_id: &str, thread_id: &str) -> PathBuf {
+    backend_state_dir(root, provider_id)
+        .join(".trouve-legacy-sessions")
+        .join(legacy_thread_state_key(provider_id, thread_id))
+}
+
+struct BackendSessionSelection {
+    resume: Option<String>,
+    legacy_marker: Option<LegacySessionMarker>,
+}
+
+struct LegacySessionMarker {
+    path: PathBuf,
+    recorded_agent_id: Option<String>,
+}
+
+async fn select_backend_session(
+    root: &Path,
+    provider_id: &str,
+    thread_id: &str,
+    persisted_agent_id: Option<&str>,
+) -> Result<BackendSessionSelection, BackendError> {
+    let marker_path = legacy_session_marker_path(root, provider_id, thread_id);
+    match tokio::fs::metadata(&marker_path).await {
+        Ok(metadata) => {
+            if !metadata.is_file() || metadata.len() > MAX_LEGACY_SESSION_MARKER_BYTES {
+                return Err(BackendError::Protocol(format!(
+                    "Cursor legacy session marker is invalid: {}",
+                    marker_path.display()
+                )));
+            }
+            let agent_id = tokio::fs::read_to_string(&marker_path)
+                .await
+                .map_err(BackendError::Io)?;
+            if agent_id.is_empty() {
+                return Err(BackendError::Protocol(format!(
+                    "Cursor legacy session marker is empty: {}",
+                    marker_path.display()
+                )));
+            }
+            return Ok(BackendSessionSelection {
+                resume: Some(agent_id.clone()),
+                legacy_marker: Some(LegacySessionMarker {
+                    path: marker_path,
+                    recorded_agent_id: Some(agent_id),
+                }),
+            });
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(BackendError::Io(error)),
+    }
+
+    let legacy_state = legacy_thread_state_dir(root, provider_id, thread_id);
+    match tokio::fs::metadata(&legacy_state).await {
+        Ok(metadata) => {
+            if !metadata.is_dir() {
+                return Err(BackendError::Protocol(format!(
+                    "Cursor legacy thread state is not a directory: {}",
+                    legacy_state.display()
+                )));
+            }
+            tracing::info!(
+                "cursor: resetting legacy per-thread SDK session into the shared backend store"
+            );
+            Ok(BackendSessionSelection {
+                resume: None,
+                legacy_marker: Some(LegacySessionMarker {
+                    path: marker_path,
+                    recorded_agent_id: None,
+                }),
+            })
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(BackendSessionSelection {
+            resume: persisted_agent_id.map(str::to_string),
+            legacy_marker: None,
+        }),
+        Err(error) => Err(BackendError::Io(error)),
+    }
+}
+
+async fn record_legacy_session_marker(
+    marker: &LegacySessionMarker,
+    agent_id: &str,
+) -> Result<(), BackendError> {
+    if agent_id.is_empty() || agent_id.len() as u64 > MAX_LEGACY_SESSION_MARKER_BYTES {
+        return Err(BackendError::Protocol(
+            "Cursor agent id cannot be recorded in the legacy session marker".into(),
+        ));
+    }
+    let parent = marker.path.parent().ok_or_else(|| {
+        BackendError::Protocol("Cursor legacy session marker has no parent directory".into())
+    })?;
+    tokio::fs::create_dir_all(parent)
+        .await
+        .map_err(BackendError::Io)?;
+    let temporary = marker
+        .path
+        .with_extension(format!("tmp-{}", uuid::Uuid::new_v4().simple()));
+    if let Err(error) = tokio::fs::write(&temporary, agent_id).await {
+        return Err(BackendError::Io(error));
+    }
+    let temporary_for_commit = temporary.clone();
+    let destination = marker.path.clone();
+    let replacing_existing = marker.recorded_agent_id.is_some();
+    let commit = tokio::task::spawn_blocking(move || {
+        commit_legacy_session_marker(
+            &temporary_for_commit,
+            &destination,
+            replacing_existing,
+            crate::install::sync_path_for_durability,
+        )
+    })
+    .await;
+    let commit = match commit {
+        Ok(commit) => commit,
+        Err(error) => {
+            let _ = tokio::fs::remove_file(&temporary).await;
+            return Err(BackendError::Protocol(format!(
+                "Cursor legacy session marker commit task failed: {error}"
+            )));
+        }
+    };
+    if let Err(error) = commit {
+        let _ = tokio::fs::remove_file(&temporary).await;
+        return Err(BackendError::Io(error));
+    }
+    Ok(())
+}
+
+fn commit_legacy_session_marker(
+    temporary: &Path,
+    destination: &Path,
+    replacing_existing: bool,
+    mut sync_path: impl FnMut(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    // The marker becomes the durable authority for resetting one legacy
+    // per-thread store. Flush its contents before publication, then flush both
+    // the containing directory and its parent so first-time directory creation
+    // cannot disappear independently after a power loss.
+    sync_path(temporary)?;
+    crate::install::replace_file_atomically(temporary, destination, replacing_existing)?;
+    let parent = destination.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Cursor legacy session marker has no parent directory",
+        )
+    })?;
+    sync_path(parent)?;
+    if let Some(grandparent) = parent.parent() {
+        sync_path(grandparent)?;
+    }
+    Ok(())
 }
 
 fn agent_options(turn: &BackendTurn, api_key: &str, custom_tools: Map<String, Value>) -> Value {
@@ -1630,14 +1646,139 @@ async fn mcp_request(
 #[derive(Clone)]
 struct CallbackState {
     bearer: Arc<str>,
-    expected_agent_id: Arc<RwLock<Option<String>>>,
-    mcp_url: Option<Arc<str>>,
-    http: reqwest::Client,
-    supervisor: Arc<CallbackSupervisor>,
+    routes: Arc<StdRwLock<HashMap<String, Arc<CallbackRoute>>>>,
+    retired_agent_ids: Arc<StdRwLock<HashSet<CallbackKey>>>,
+    route_generation: Arc<AtomicU64>,
+    identities: Arc<StdMutex<CallbackIdentities>>,
     request_slots: Arc<Semaphore>,
 }
 
+struct CallbackRoute {
+    agent_id: String,
+    generation: u64,
+    mcp_url: Option<Arc<str>>,
+    allowed_tools: Arc<HashSet<String>>,
+    http: reqwest::Client,
+    supervisor: Arc<CallbackSupervisor>,
+    identities: Arc<StdMutex<CallbackIdentities>>,
+    streamed_call_ids: StdMutex<HashSet<CallbackKey>>,
+    owner_reusable: Option<Weak<AtomicBool>>,
+    accepting: AtomicBool,
+}
+
 type CallbackKey = [u8; 32];
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct CallbackIdentityKey {
+    agent_id: CallbackKey,
+    call_id: CallbackKey,
+}
+
+#[derive(Default)]
+struct CallbackIdentities {
+    generations: HashMap<CallbackIdentityKey, u64>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CallbackIdentityClaim {
+    Accepted,
+    Stale,
+    Exhausted,
+}
+
+impl CallbackIdentities {
+    fn claim(
+        &mut self,
+        identity: CallbackIdentityKey,
+        generation: u64,
+    ) -> (CallbackIdentityClaim, bool) {
+        if let Some(owner) = self.generations.get(&identity) {
+            return (
+                if *owner == generation {
+                    CallbackIdentityClaim::Accepted
+                } else {
+                    CallbackIdentityClaim::Stale
+                },
+                false,
+            );
+        }
+        if self.generations.len() >= MAX_CALLBACK_IDENTITIES_PER_PROCESS {
+            return (CallbackIdentityClaim::Exhausted, true);
+        }
+        self.generations.insert(identity, generation);
+        (
+            CallbackIdentityClaim::Accepted,
+            self.generations.len() == MAX_CALLBACK_IDENTITIES_PER_PROCESS,
+        )
+    }
+}
+
+impl CallbackRoute {
+    fn quarantine_owner(&self) {
+        if let Some(reusable) = self.owner_reusable.as_ref().and_then(Weak::upgrade) {
+            reusable.store(false, Ordering::Release);
+        }
+    }
+
+    fn claim_identity(&self, call_id: CallbackKey) -> CallbackIdentityClaim {
+        let identity = CallbackIdentityKey {
+            agent_id: callback_key(&self.agent_id),
+            call_id,
+        };
+        let (claim, retire) = self
+            .identities
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .claim(identity, self.generation);
+        if retire || claim != CallbackIdentityClaim::Accepted {
+            self.quarantine_owner();
+        }
+        claim
+    }
+
+    fn observe_stream_call_id(&self, call_id: &str) -> Result<(), String> {
+        let call_id = callback_key(call_id);
+        match self.claim_identity(call_id) {
+            CallbackIdentityClaim::Accepted => {
+                self.streamed_call_ids
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(call_id);
+                Ok(())
+            }
+            CallbackIdentityClaim::Stale => {
+                Err("Cursor reused a custom-tool call id owned by an earlier route".into())
+            }
+            CallbackIdentityClaim::Exhausted => {
+                Err("Cursor callback identity history reached its process bound".into())
+            }
+        }
+    }
+
+    async fn identities_correlated(&self) -> bool {
+        // Direct router unit tests that do not own a pooled process exercise
+        // HTTP routing in isolation. Production routes always carry the owner
+        // flag and require the Send stream to corroborate every callback id.
+        if self.owner_reusable.is_none() {
+            return true;
+        }
+        let callback_ids = self
+            .supervisor
+            .calls
+            .lock()
+            .await
+            .seen
+            .keys()
+            .copied()
+            .collect::<HashSet<_>>();
+        let streamed_call_ids = self
+            .streamed_call_ids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        callback_ids == streamed_call_ids
+    }
+}
 
 #[derive(Clone)]
 struct CallbackRecord {
@@ -1792,34 +1933,40 @@ struct CustomToolRequest {
     args: Value,
 }
 
-struct CallbackServer {
+#[derive(Clone, Copy)]
+struct CallbackIngressGeneration(u64);
+
+struct CallbackRouter {
     url: String,
     bearer: String,
-    expected_agent_id: Arc<RwLock<Option<String>>>,
-    supervisor: Arc<CallbackSupervisor>,
+    state: CallbackState,
+    http: reqwest::Client,
     shutdown: CancellationToken,
-    task: tokio::task::JoinHandle<std::io::Result<()>>,
+    task: Mutex<Option<tokio::task::JoinHandle<std::io::Result<()>>>>,
 }
 
-impl CallbackServer {
-    async fn start(
-        http: reqwest::Client,
-        mcp_url: Option<String>,
-        turn_cancel: &CancellationToken,
-    ) -> Result<Self, BackendError> {
+struct CallbackRouteLease {
+    agent_id: String,
+    route: Arc<CallbackRoute>,
+    routes: Arc<StdRwLock<HashMap<String, Arc<CallbackRoute>>>>,
+    retired_agent_ids: Arc<StdRwLock<HashSet<CallbackKey>>>,
+    supervisor: Arc<CallbackSupervisor>,
+    active: bool,
+}
+
+impl CallbackRouter {
+    async fn start(http: reqwest::Client) -> Result<Self, BackendError> {
         let bearer = format!(
             "{}{}",
             uuid::Uuid::new_v4().simple(),
             uuid::Uuid::new_v4().simple()
         );
-        let expected_agent_id = Arc::new(RwLock::new(None));
-        let supervisor = CallbackSupervisor::new(turn_cancel.child_token());
         let state = CallbackState {
             bearer: Arc::from(bearer.as_str()),
-            expected_agent_id: expected_agent_id.clone(),
-            mcp_url: mcp_url.map(Arc::from),
-            http,
-            supervisor: supervisor.clone(),
+            routes: Arc::new(StdRwLock::new(HashMap::new())),
+            retired_agent_ids: Arc::new(StdRwLock::new(HashSet::new())),
+            route_generation: Arc::new(AtomicU64::new(0)),
+            identities: Arc::new(StdMutex::new(CallbackIdentities::default())),
             request_slots: Arc::new(Semaphore::new(MAX_CALLBACK_HTTP_CONCURRENCY)),
         };
         let router = Router::new()
@@ -1829,7 +1976,7 @@ impl CallbackServer {
                 authenticate_callback,
             ))
             .layer(DefaultBodyLimit::max(MAX_RPC_BODY_BYTES))
-            .with_state(state);
+            .with_state(state.clone());
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .map_err(BackendError::Io)?;
@@ -1844,35 +1991,269 @@ impl CallbackServer {
         Ok(Self {
             url: format!("http://127.0.0.1:{}", address.port()),
             bearer,
-            expected_agent_id,
-            supervisor,
+            state,
+            http,
             shutdown,
-            task,
+            task: Mutex::new(Some(task)),
         })
     }
 
-    async fn stop(&mut self) {
-        self.stop_until(tokio::time::Instant::now() + CALLBACK_SHUTDOWN_TIMEOUT)
-            .await;
+    fn accepts_agent_id(&self, agent_id: &str) -> bool {
+        let routes = self
+            .state
+            .routes
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        !routes.contains_key(agent_id)
+            && !self
+                .state
+                .retired_agent_ids
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(&callback_key(agent_id))
     }
 
-    async fn stop_until(&mut self, deadline: tokio::time::Instant) {
-        self.supervisor.cancel.cancel();
-        self.shutdown.cancel();
-        if tokio::time::timeout_at(deadline, &mut self.task)
-            .await
-            .is_err()
-        {
-            self.task.abort();
-            let _ = (&mut self.task).await;
+    async fn register(
+        &self,
+        agent_id: String,
+        mcp_url: Option<String>,
+        allowed_tools: HashSet<String>,
+        cancel: CancellationToken,
+        owner_reusable: Option<Weak<AtomicBool>>,
+    ) -> Result<CallbackRouteLease, BackendError> {
+        if agent_id.is_empty() {
+            return Err(BackendError::Protocol(
+                "Cursor callback route omitted its agent id".into(),
+            ));
         }
-        self.supervisor.stop().await;
+        let mut routes = self
+            .state
+            .routes
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if routes.contains_key(&agent_id) {
+            return Err(BackendError::Protocol(format!(
+                "Cursor callback route for agent {agent_id} is already active"
+            )));
+        }
+        if self
+            .state
+            .retired_agent_ids
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&callback_key(&agent_id))
+        {
+            return Err(BackendError::Protocol(format!(
+                "Cursor callback route for agent {agent_id} was already retired by this Bridge"
+            )));
+        }
+        let generation = self
+            .state
+            .route_generation
+            .load(Ordering::Acquire)
+            .checked_add(1)
+            .ok_or_else(|| {
+                BackendError::Protocol("Cursor callback route generation exhausted".into())
+            })?;
+        let supervisor = CallbackSupervisor::new(cancel);
+        let route = Arc::new(CallbackRoute {
+            agent_id: agent_id.clone(),
+            generation,
+            mcp_url: mcp_url.map(Arc::from),
+            allowed_tools: Arc::new(allowed_tools),
+            http: self.http.clone(),
+            supervisor: supervisor.clone(),
+            identities: self.state.identities.clone(),
+            streamed_call_ids: StdMutex::new(HashSet::new()),
+            owner_reusable,
+            accepting: AtomicBool::new(true),
+        });
+        routes.insert(agent_id.clone(), route.clone());
+        // Publish the generation only after the matching route is present,
+        // while the route-table writer still excludes handler lookup. An
+        // ingress racing first registration therefore snapshots either the
+        // prior generation and is rejected, or the fully published route.
+        self.state
+            .route_generation
+            .store(generation, Ordering::Release);
+        Ok(CallbackRouteLease {
+            agent_id,
+            route,
+            routes: self.state.routes.clone(),
+            retired_agent_ids: self.state.retired_agent_ids.clone(),
+            supervisor,
+            active: true,
+        })
+    }
+
+    async fn stop(&self) -> std::io::Result<()> {
+        self.stop_until(tokio::time::Instant::now() + CALLBACK_SHUTDOWN_TIMEOUT)
+            .await
+    }
+
+    async fn stop_until(&self, deadline: tokio::time::Instant) -> std::io::Result<()> {
+        let routes = self
+            .state
+            .routes
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|(agent_id, route)| (agent_id.clone(), route.clone()))
+            .collect::<Vec<_>>();
+        for (_, route) in &routes {
+            route.accepting.store(false, Ordering::Release);
+            route.supervisor.cancel.cancel();
+        }
+        let mut timed_out = false;
+        for (agent_id, route) in routes {
+            if tokio::time::timeout_at(deadline, route.supervisor.stop())
+                .await
+                .is_err()
+            {
+                timed_out = true;
+                continue;
+            }
+            let mut routes = self
+                .state
+                .routes
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if routes
+                .get(&agent_id)
+                .is_some_and(|current| Arc::ptr_eq(current, &route))
+            {
+                routes.remove(&agent_id);
+            }
+        }
+        let route_error = timed_out.then(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "Cursor callback routes did not settle before shutdown",
+            )
+        });
+        self.shutdown.cancel();
+        let listener_result = if let Some(mut task) = self.task.lock().await.take() {
+            match tokio::time::timeout_at(deadline, &mut task).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(error)) => Err(std::io::Error::other(format!(
+                    "Cursor callback router task failed: {error}"
+                ))),
+                Err(_) => {
+                    task.abort();
+                    let _ = task.await;
+                    Ok(())
+                }
+            }
+        } else {
+            Ok(())
+        };
+        match (route_error, listener_result) {
+            (None, result) => result,
+            (Some(route_error), Ok(())) => Err(route_error),
+            (Some(route_error), Err(listener_error)) => Err(std::io::Error::new(
+                route_error.kind(),
+                format!("{route_error}; callback listener shutdown failed: {listener_error}"),
+            )),
+        }
+    }
+}
+
+impl Drop for CallbackRouter {
+    fn drop(&mut self) {
+        for route in self
+            .state
+            .routes
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .drain()
+            .map(|(_, route)| route)
+        {
+            route.accepting.store(false, Ordering::Release);
+            route.supervisor.cancel.cancel();
+        }
+        self.shutdown.cancel();
+        if let Ok(mut task) = self.task.try_lock()
+            && let Some(task) = task.take()
+        {
+            task.abort();
+        }
+    }
+}
+
+impl CallbackRouteLease {
+    async fn stop(&mut self) -> bool {
+        self.stop_until(tokio::time::Instant::now() + CALLBACK_ROUTE_SHUTDOWN_TIMEOUT)
+            .await
+    }
+
+    async fn stop_until(&mut self, deadline: tokio::time::Instant) -> bool {
+        self.route.accepting.store(false, Ordering::Release);
+        self.supervisor.cancel.cancel();
+        let settled = tokio::time::timeout_at(deadline, self.supervisor.stop())
+            .await
+            .is_ok();
+        let identities_correlated = settled && self.route.identities_correlated().await;
+        if identities_correlated {
+            self.detach();
+        } else {
+            // Relinquish removal ownership while leaving the stopped route in
+            // the process router. Process quarantine can then retry joining
+            // its supervisor or reject an uncorroborated callback identity
+            // before admitting a replacement Bridge. Mark the owner
+            // fail-closed before any later cleanup await can be dropped.
+            self.route.quarantine_owner();
+            self.active = false;
+        }
+        identities_correlated
+    }
+
+    fn detach(&mut self) {
+        if !self.active {
+            return;
+        }
+        let mut routes = self
+            .routes
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if routes
+            .get(&self.agent_id)
+            .is_some_and(|route| Arc::ptr_eq(route, &self.route))
+        {
+            let retire_at_capacity = {
+                let mut retired = self
+                    .retired_agent_ids
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                retired.insert(callback_key(&self.agent_id));
+                retired.len() >= MAX_RETIRED_AGENT_IDS_PER_PROCESS
+            };
+            routes.remove(&self.agent_id);
+            if retire_at_capacity {
+                self.route.quarantine_owner();
+            }
+        }
+        self.active = false;
+    }
+}
+
+impl Drop for CallbackRouteLease {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        self.route.accepting.store(false, Ordering::Release);
+        self.supervisor.cancel.cancel();
+        self.route.quarantine_owner();
+        // Drop cannot await supervisor settlement. Keep the stopped route in
+        // the process-owned router and fail the process closed; BridgeLease
+        // drop will wake pool recovery after releasing the final active lease.
+        self.active = false;
     }
 }
 
 async fn authenticate_callback(
     State(state): State<CallbackState>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
     let Ok(_permit) = state.request_slots.clone().try_acquire_owned() else {
@@ -1891,19 +2272,45 @@ async fn authenticate_callback(
     if !secure_text_eq(presented, &expected) {
         return callback_error(StatusCode::UNAUTHORIZED, "unauthenticated", "Unauthorized");
     }
+    // Capture the route-table generation before body extraction can yield. A
+    // request already inside the callback server must never bind to a route
+    // registered later for the same durable agent id.
+    request.extensions_mut().insert(CallbackIngressGeneration(
+        state.route_generation.load(Ordering::Acquire),
+    ));
     next.run(request).await
 }
 
 async fn custom_tool_callback(
     State(state): State<CallbackState>,
+    Extension(ingress_generation): Extension<CallbackIngressGeneration>,
     Json(request): Json<CustomToolRequest>,
 ) -> Response {
-    let expected_agent = state.expected_agent_id.read().await.clone();
-    if expected_agent.as_deref() != Some(request.agent_id.as_str()) {
+    let route = state
+        .routes
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&request.agent_id)
+        .cloned();
+    let Some(route) = route else {
         return callback_error(
             StatusCode::FORBIDDEN,
             "permission_denied",
-            "callback agent id does not match the active Cursor agent",
+            "callback agent id has no active Cursor route",
+        );
+    };
+    if route.generation > ingress_generation.0 {
+        return callback_error(
+            StatusCode::FORBIDDEN,
+            "permission_denied",
+            "callback request predates the active Cursor route",
+        );
+    }
+    if !route.accepting.load(Ordering::Acquire) {
+        return callback_error(
+            StatusCode::FORBIDDEN,
+            "permission_denied",
+            "callback agent route is shutting down",
         );
     }
     if request.tool_name.is_empty() || !request.args.is_object() {
@@ -1913,7 +2320,14 @@ async fn custom_tool_callback(
             "custom-tool callback is malformed",
         );
     }
-    let Some(mcp_url) = state.mcp_url.as_deref() else {
+    if !route.allowed_tools.contains(&request.tool_name) {
+        return callback_error(
+            StatusCode::FORBIDDEN,
+            "permission_denied",
+            "custom tool is not enabled for this Cursor agent",
+        );
+    }
+    let Some(mcp_url) = route.mcp_url.as_deref() else {
         return callback_error(
             StatusCode::FORBIDDEN,
             "permission_denied",
@@ -1928,9 +2342,26 @@ async fn custom_tool_callback(
         );
     };
     let call_key = callback_key(call_id);
+    match route.claim_identity(call_key) {
+        CallbackIdentityClaim::Accepted => {}
+        CallbackIdentityClaim::Stale => {
+            return callback_error(
+                StatusCode::FORBIDDEN,
+                "permission_denied",
+                "tool-call id belongs to an earlier Cursor route",
+            );
+        }
+        CallbackIdentityClaim::Exhausted => {
+            return callback_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "resource_exhausted",
+                "Cursor callback identity history reached its process bound",
+            );
+        }
+    }
     let fingerprint = callback_fingerprint(&request);
     let (mut outcome, execute) = {
-        let mut calls = state.supervisor.calls.lock().await;
+        let mut calls = route.supervisor.calls.lock().await;
         if let Some(expected) = calls.seen.get(&call_key) {
             if expected != &fingerprint {
                 return callback_error(
@@ -1960,14 +2391,14 @@ async fn custom_tool_callback(
         }
     };
     if let Some(sender) = execute {
-        let http = state.http.clone();
+        let http = route.http.clone();
         let mcp_url = Arc::<str>::from(mcp_url);
-        if !state
+        if !route
             .supervisor
             .spawn(call_key, http, mcp_url, request, sender)
             .await
         {
-            state.supervisor.calls.lock().await.forget(&call_key);
+            route.supervisor.calls.lock().await.forget(&call_key);
             return callback_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "cancelled",
@@ -2099,13 +2530,13 @@ struct BridgeProcess {
 impl BridgeProcess {
     async fn start(
         request: &BridgeProcessRequest<'_>,
+        callback: &CallbackRouter,
         closing: &CancellationToken,
     ) -> Result<Self, BackendError> {
         let command = request.command;
         let worktree = request.worktree;
         let state_dir = request.state_dir;
         let api_key = request.api_key;
-        let callback = request.callback;
         let cancel = request.cancel;
         let events = request.events;
         let http = local_http_client()?;
@@ -2206,7 +2637,6 @@ impl BridgeProcess {
         };
         let process_secrets = vec![api_key.to_string(), callback.bearer.clone(), token.clone()];
         redact_diagnostics(&mut diagnostics, &process_secrets);
-        let process_secret_count = process_secrets.len();
         let secrets = Arc::new(StdMutex::new(process_secrets));
         let shared_diagnostics = Arc::new(tokio::sync::Mutex::new(diagnostics));
         let drain_diagnostics = shared_diagnostics.clone();
@@ -2233,60 +2663,11 @@ impl BridgeProcess {
                 base_url: ready.url.trim_end_matches('/').to_string(),
                 token,
                 secrets,
-                process_secret_count,
                 diagnostics: shared_diagnostics,
             },
             stderr_task,
             _runtime_dir: runtime_dir,
         })
-    }
-
-    async fn set_tool_callback(
-        &self,
-        callback: Option<&CallbackServer>,
-    ) -> Result<(), BackendError> {
-        if let Some(callback) = callback {
-            self.client.set_turn_secret(Some(&callback.bearer));
-        }
-        let (url, auth_token) = callback
-            .map(|callback| (callback.url.as_str(), callback.bearer.as_str()))
-            .unwrap_or(("", ""));
-        self.client
-            .unary_with_timeout(
-                "SdkBridgeControlService",
-                "SetToolCallback",
-                json!({ "url": url, "authToken": auth_token }),
-                Duration::from_secs(10),
-            )
-            .await?;
-        if callback.is_none() {
-            self.client.set_turn_secret(None);
-        }
-        Ok(())
-    }
-
-    async fn release_turn(&self, agent_id: &str) -> Result<(), BackendError> {
-        let close = self
-            .client
-            .unary_with_timeout(
-                "SdkAgentService",
-                "CloseAgent",
-                json!({ "agentId": agent_id }),
-                Duration::from_secs(10),
-            )
-            .await;
-        // Registration is process-wide. The turn-scoped callback server is
-        // already stopped while the Bridge mutex is still held; clear the
-        // stale URL before this process can serve another turn.
-        let clear = self.set_tool_callback(None).await;
-        match (close, clear) {
-            (Ok(_), Ok(())) => Ok(()),
-            (Err(close), Ok(())) => Err(close),
-            (Ok(_), Err(clear)) => Err(clear),
-            (Err(close), Err(clear)) => Err(BackendError::Protocol(format!(
-                "{close}; clearing the Cursor SDK tool callback failed: {clear}"
-            ))),
-        }
     }
 
     async fn shutdown(&mut self) -> std::io::Result<()> {
@@ -2303,16 +2684,6 @@ impl BridgeProcess {
             tracing::debug!("Cursor SDK Bridge shutdown RPC failed: {error}");
         }
         let cleanup = self.child.terminate_and_reap().await.map(|_| ());
-        self.stderr_task.abort();
-        cleanup
-    }
-
-    async fn shutdown_now_until(&mut self, deadline: tokio::time::Instant) -> std::io::Result<()> {
-        let cleanup = self
-            .child
-            .terminate_and_reap_until(deadline)
-            .await
-            .map(|_| ());
         self.stderr_task.abort();
         cleanup
     }
@@ -2483,26 +2854,12 @@ fn redact(value: &str, secrets: &[&str]) -> String {
         })
 }
 
-fn replace_turn_secret(
-    secrets: &mut Vec<String>,
-    process_secret_count: usize,
-    secret: Option<&str>,
-) {
-    secrets.truncate(process_secret_count);
-    if let Some(secret) = secret.filter(|secret| !secret.is_empty())
-        && !secrets.iter().any(|known| known == secret)
-    {
-        secrets.push(secret.to_string());
-    }
-}
-
 #[derive(Clone)]
 struct BridgeClient {
     http: reqwest::Client,
     base_url: String,
     token: String,
     secrets: Arc<StdMutex<Vec<String>>>,
-    process_secret_count: usize,
     diagnostics: Arc<tokio::sync::Mutex<VecDeque<String>>>,
 }
 
@@ -2605,11 +2962,6 @@ impl BridgeClient {
         )
     }
 
-    fn set_turn_secret(&self, secret: Option<&str>) {
-        let mut secrets = self.secrets.lock().unwrap();
-        replace_turn_secret(&mut secrets, self.process_secret_count, secret);
-    }
-
     async fn diagnostic_suffix(&self) -> String {
         let diagnostics = self
             .diagnostics
@@ -2651,8 +3003,9 @@ async fn stream_turn(
     agent_id: &str,
     turn: &BackendTurn,
     events: &BackendEventSender,
-    callback_cancel: &CancellationToken,
+    callback_route: Arc<CallbackRoute>,
 ) -> Result<TurnTerminal, BackendError> {
+    let callback_cancel = callback_route.supervisor.cancel.clone();
     let text = match turn.instructions.as_deref() {
         Some(instructions) => format!(
             "<mode-instructions>\n{instructions}\n</mode-instructions>\n\n{}",
@@ -2743,7 +3096,10 @@ async fn stream_turn(
 
     let mut stream = Box::pin(response.bytes_stream());
     let mut buffered = BytesMut::new();
-    let mut projection = RunProjection::default();
+    let mut projection = RunProjection {
+        callback_route: Some(callback_route),
+        ..RunProjection::default()
+    };
     let mut connect_state = ConnectStreamState::Active;
     let mut stop = None;
     let mut stop_deadline: Option<tokio::time::Instant> = None;
@@ -2958,6 +3314,8 @@ struct RunProjection {
     terminal_status: Option<Value>,
     terminal_error_code: Option<String>,
     done: DoneState,
+    callback_route: Option<Arc<CallbackRoute>>,
+    protocol_error: Option<String>,
 }
 
 impl RunProjection {
@@ -3019,8 +3377,25 @@ impl RunProjection {
                 // Concrete tool lifecycle events are emitted by the
                 // authenticated callback, which knows the actual trouve tool
                 // name and arguments. SDK messages expose only the dispatcher
-                // name (`mcp`) on some Bridge versions.
-                "tool_call" => {}
+                // name (`mcp`) on some Bridge versions, but their call id is a
+                // turn-specific identity fence for delayed callback retries.
+                "tool_call" => {
+                    if let Some(route) = self.callback_route.as_ref() {
+                        let observed = payload
+                            .get("call_id")
+                            .or_else(|| payload.get("callId"))
+                            .and_then(Value::as_str)
+                            .filter(|value| !value.is_empty())
+                            .ok_or_else(|| {
+                                "Cursor tool lifecycle event omitted its call id".to_string()
+                            })
+                            .and_then(|call_id| route.observe_stream_call_id(call_id));
+                        if let Err(error) = observed {
+                            route.quarantine_owner();
+                            self.protocol_error.get_or_insert(error);
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -3075,7 +3450,7 @@ impl RunProjection {
     }
 
     async fn finish(
-        self,
+        mut self,
         events: &BackendEventSender,
         cancel: &CancellationToken,
     ) -> Result<TurnTerminal, BackendError> {
@@ -3084,6 +3459,9 @@ impl RunProjection {
         }
         if events.is_closed() {
             return Ok(TurnTerminal::ConsumerClosed);
+        }
+        if let Some(error) = self.protocol_error.take() {
+            return Err(BackendError::Protocol(error));
         }
         match self.done {
             DoneState::Seen => {}
@@ -3392,26 +3770,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bridge_redaction_retains_only_the_current_turn_secret() {
-        let process_secrets = vec![
-            "api-key".to_string(),
-            "startup-callback".to_string(),
-            "bridge-token".to_string(),
-        ];
-        let mut secrets = process_secrets.clone();
-
-        for index in 0..1_000 {
-            let turn_secret = format!("turn-callback-{index}");
-            replace_turn_secret(&mut secrets, process_secrets.len(), Some(&turn_secret));
-            assert_eq!(secrets.len(), process_secrets.len() + 1);
-            assert_eq!(secrets.last(), Some(&turn_secret));
-        }
-
-        replace_turn_secret(&mut secrets, process_secrets.len(), None);
-        assert_eq!(secrets, process_secrets);
-    }
-
-    #[test]
     fn bridge_url_requires_a_literal_loopback_address() {
         for url in ["http://127.0.0.1:43123", "http://[::1]:43123"] {
             assert!(validate_loopback_bridge_url(url).is_ok(), "{url}");
@@ -3452,6 +3810,78 @@ mod tests {
             error: BackendError::Protocol("opaque failure".into()),
         };
         assert!(structured.is_not_found());
+    }
+
+    #[tokio::test]
+    async fn missing_legacy_state_recovers_with_a_shared_store_replacement() {
+        let temporary = tempfile::tempdir().unwrap();
+        let selection = select_backend_session(
+            temporary.path(),
+            "cursor-provider",
+            "thread-with-removed-legacy-state",
+            Some("legacy-agent"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(selection.resume.as_deref(), Some("legacy-agent"));
+        assert!(selection.legacy_marker.is_none());
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let resume_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let create_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server = tokio::spawn({
+            let resume_calls = resume_calls.clone();
+            let create_calls = create_calls.clone();
+            async move {
+                axum::serve(
+                    listener,
+                    Router::new()
+                        .route(
+                            "/sdk.v1.SdkAgentService/ResumeAgent",
+                            post(move || {
+                                resume_calls.fetch_add(1, Ordering::Relaxed);
+                                async {
+                                    (
+                                        StatusCode::NOT_FOUND,
+                                        axum::Json(json!({
+                                            "code": "not_found",
+                                            "message": "agent is absent from the shared store",
+                                        })),
+                                    )
+                                }
+                            }),
+                        )
+                        .route(
+                            "/sdk.v1.SdkAgentService/CreateAgent",
+                            post(move || {
+                                create_calls.fetch_add(1, Ordering::Relaxed);
+                                async { axum::Json(json!({ "agentId": "replacement-agent" })) }
+                            }),
+                        ),
+                )
+                .await
+            }
+        });
+        let client = BridgeClient {
+            http: reqwest::Client::new(),
+            base_url: format!("http://{address}"),
+            token: "fixture-token".into(),
+            secrets: Arc::new(StdMutex::new(vec!["fixture-token".into()])),
+            diagnostics: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
+        };
+
+        let (agent_id, fresh) =
+            create_or_resume_agent(&client, selection.resume.as_deref(), &json!({}))
+                .await
+                .unwrap();
+        assert_eq!(agent_id, "replacement-agent");
+        assert!(fresh, "replacement must publish a new persisted session id");
+        assert_eq!(resume_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(create_calls.load(Ordering::Relaxed), 1);
+        server.abort();
     }
 
     #[tokio::test]
@@ -3516,36 +3946,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pool_shutdown_wakes_capacity_waiters_before_taking_the_writer() {
-        let pool = Arc::new(BridgePool::default());
-        let _permits = (0..POOL_CAP)
-            .map(|_| pool.capacity.clone().try_acquire_owned().unwrap())
-            .collect::<Vec<_>>();
-        let (sender_tx, sender_rx) = tokio::sync::oneshot::channel();
-        let _stream = async_stream(move |events| async move {
-            let _ = sender_tx.send(events);
-            std::future::pending::<()>().await;
-        });
-        let events = sender_rx.await.unwrap();
-        let cancel = CancellationToken::new();
-        let (waiting_tx, waiting_rx) = tokio::sync::oneshot::channel();
-        let waiting_pool = pool.clone();
-        let waiter = tokio::spawn(async move {
-            let _lifecycle = waiting_pool.lifecycle.read().await;
-            let _ = waiting_tx.send(());
-            waiting_pool.acquire_capacity(&cancel, &events).await
-        });
-        waiting_rx.await.unwrap();
-
-        tokio::time::timeout(Duration::from_secs(1), pool.shutdown())
-            .await
-            .expect("shutdown remained blocked behind queued admission")
-            .unwrap();
-        let error = waiter.await.unwrap().unwrap_err();
-        assert!(error.to_string().contains("pool is shutting down"));
-    }
-
-    #[tokio::test]
     async fn idle_reaper_exits_when_the_pool_closes() {
         let pool = Arc::new(BridgePool::default());
         let reaper = tokio::spawn(reap_idle_until_closed(
@@ -3579,7 +3979,7 @@ mod tests {
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
         let cancel = CancellationToken::new();
         let closing = CancellationToken::new();
-        let mut callback = CallbackServer::start(local_http_client().unwrap(), None, &cancel)
+        let callback = CallbackRouter::start(local_http_client().unwrap())
             .await
             .unwrap();
         let (sender_tx, sender_rx) = tokio::sync::oneshot::channel();
@@ -3593,12 +3993,12 @@ mod tests {
                 command: script.to_str().unwrap(),
                 worktree: temp.path(),
                 state_dir: &state,
+                resume_agent_id: None,
                 api_key: "secret",
-                callback: &callback,
                 cancel: &cancel,
                 events: &events,
             };
-            let startup = BridgeProcess::start(&request, &closing);
+            let startup = BridgeProcess::start(&request, &callback, &closing);
             tokio::pin!(startup);
             tokio::time::timeout(Duration::from_secs(2), async {
                 loop {
@@ -3628,7 +4028,7 @@ mod tests {
             }
         };
         assert!(error.to_string().contains("pool is shutting down"));
-        callback.stop().await;
+        callback.stop().await.unwrap();
     }
 
     #[tokio::test]
@@ -3659,7 +4059,7 @@ mod tests {
     #[tokio::test]
     async fn turn_admission_bounds_callback_owners_and_wakes_on_shutdown() {
         let pool = Arc::new(BridgePool::default());
-        let _permits = (0..POOL_CAP)
+        let _permits = (0..MAX_CONCURRENT_TURNS)
             .map(|_| pool.turn_admission.clone().try_acquire_owned().unwrap())
             .collect::<Vec<_>>();
         assert!(pool.turn_admission.clone().try_acquire_owned().is_err());
@@ -3700,13 +4100,13 @@ mod tests {
             .unwrap();
         let _active_turn = pool.acquire_turn_admission(&cancel, &events).await.unwrap();
         let mut same_thread_queue = futures::stream::FuturesUnordered::new();
-        for _ in 0..POOL_CAP {
+        for _ in 0..MAX_CONCURRENT_TURNS {
             same_thread_queue.push(pool.acquire_thread_admission("busy-thread", &cancel, &events));
         }
         assert!(futures::poll!(same_thread_queue.next()).is_pending());
         assert_eq!(
             pool.turn_admission.available_permits(),
-            POOL_CAP - 1,
+            MAX_CONCURRENT_TURNS - 1,
             "same-thread waiters reserved provider-wide permits"
         );
 
@@ -3729,7 +4129,7 @@ mod tests {
     #[tokio::test]
     async fn queued_turn_does_not_discover_tools_before_admission() {
         let pool = BridgePool::default();
-        let _permits = (0..POOL_CAP)
+        let _permits = (0..MAX_CONCURRENT_TURNS)
             .map(|_| pool.turn_admission.clone().try_acquire_owned().unwrap())
             .collect::<Vec<_>>();
         let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -3816,68 +4216,6 @@ mod tests {
             TurnTerminal::Cancelled
         ));
         server.abort();
-    }
-
-    #[tokio::test]
-    async fn warm_retention_commit_cannot_finish_after_pool_shutdown() {
-        let pool = Arc::new(BridgePool::default());
-        let entered = Arc::new(Semaphore::new(0));
-        let release = Arc::new(Semaphore::new(0));
-        let retaining_pool = pool.clone();
-        let retaining_entered = entered.clone();
-        let retaining_release = release.clone();
-        let retention = tokio::spawn(async move {
-            retaining_pool
-                .retain_if_open(|| async move {
-                    retaining_entered.add_permits(1);
-                    retaining_release.acquire().await.unwrap().forget();
-                })
-                .await
-        });
-        entered.acquire().await.unwrap().forget();
-
-        let shutting_pool = pool.clone();
-        let mut shutdown = tokio::spawn(async move { shutting_pool.shutdown().await });
-        while pool.is_open() {
-            tokio::task::yield_now().await;
-        }
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), &mut shutdown)
-                .await
-                .is_err(),
-            "shutdown crossed a retention commit that still owned the lifecycle reader"
-        );
-
-        release.add_permits(1);
-        assert!(retention.await.unwrap());
-        shutdown.await.unwrap().unwrap();
-        assert!(!pool.is_open());
-    }
-
-    #[tokio::test]
-    async fn warm_retention_releases_thread_gate_before_waiting_for_lifecycle() {
-        let pool = BridgePool::default();
-        let lifecycle_writer = pool.lifecycle.write().await;
-        let gate = Arc::new(Mutex::new(()));
-        let guard = gate.clone().lock_owned().await;
-        let mut lease = BridgeLease {
-            process: None,
-            thread_guard: Some(guard),
-            available: pool.available.clone(),
-        };
-        let retention = retain_lease_if_open(&pool, &mut lease, |_| {});
-        tokio::pin!(retention);
-
-        assert!(matches!(
-            futures::poll!(retention.as_mut()),
-            std::task::Poll::Pending
-        ));
-        assert!(
-            gate.clone().try_lock_owned().is_ok(),
-            "retention waited for the lifecycle reader while holding the thread gate"
-        );
-        drop(lifecycle_writer);
-        assert!(retention.await);
     }
 
     #[test]
@@ -4056,7 +4394,6 @@ mod tests {
             base_url: format!("http://{address}"),
             token: "fixture-token".into(),
             secrets: Arc::new(StdMutex::new(vec!["fixture-token".into()])),
-            process_secret_count: 1,
             diagnostics: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
         };
 
@@ -4116,10 +4453,7 @@ mod tests {
 
     #[tokio::test]
     async fn callback_authentication_precedes_json_deserialization() {
-        let cancel = CancellationToken::new();
-        let mut callback = CallbackServer::start(reqwest::Client::new(), None, &cancel)
-            .await
-            .unwrap();
+        let callback = CallbackRouter::start(reqwest::Client::new()).await.unwrap();
         let response = reqwest::Client::new()
             .post(format!("{}{}", callback.url, CALLBACK_PATH))
             .header("Content-Type", "application/json")
@@ -4128,7 +4462,333 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-        callback.stop().await;
+        callback.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shared_callback_router_isolates_agents_tools_and_cancellation() {
+        let blocked_started = Arc::new(Semaphore::new(0));
+        let handler_started = blocked_started.clone();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let mcp_server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route(
+                        "/a",
+                        post(move || {
+                            let handler_started = handler_started.clone();
+                            async move {
+                                handler_started.add_permits(1);
+                                std::future::pending::<Json<Value>>().await
+                            }
+                        }),
+                    )
+                    .route(
+                        "/b",
+                        post(|| async {
+                            Json(json!({
+                                "jsonrpc": "2.0",
+                                "id": "fixture",
+                                "result": {
+                                    "content": [{ "type": "text", "text": "agent-b" }]
+                                }
+                            }))
+                        }),
+                    ),
+            )
+            .await
+        });
+        let callback = CallbackRouter::start(reqwest::Client::new()).await.unwrap();
+        let mut route_a = callback
+            .register(
+                "agent-a".into(),
+                Some(format!("http://{address}/a")),
+                HashSet::from(["shared_tool".into()]),
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        let mut route_b = callback
+            .register(
+                "agent-b".into(),
+                Some(format!("http://{address}/b")),
+                HashSet::from(["shared_tool".into()]),
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        let collision = callback
+            .register(
+                "agent-a".into(),
+                Some(format!("http://{address}/b")),
+                HashSet::from(["shared_tool".into()]),
+                CancellationToken::new(),
+                None,
+            )
+            .await;
+        assert!(matches!(collision, Err(BackendError::Protocol(_))));
+
+        let http = reqwest::Client::new();
+        let callback_url = format!("{}{}", callback.url, CALLBACK_PATH);
+        let bearer = callback.bearer.clone();
+        let blocked_call = tokio::spawn({
+            let http = http.clone();
+            let callback_url = callback_url.clone();
+            let bearer = bearer.clone();
+            async move {
+                http.post(callback_url)
+                    .bearer_auth(bearer)
+                    .json(&json!({
+                        "toolName": "shared_tool",
+                        "toolCallId": "same-call-id",
+                        "agentId": "agent-a",
+                        "args": {},
+                    }))
+                    .send()
+                    .await
+            }
+        });
+        blocked_started.acquire().await.unwrap().forget();
+
+        let b_response = http
+            .post(&callback_url)
+            .bearer_auth(&bearer)
+            .json(&json!({
+                "toolName": "shared_tool",
+                "toolCallId": "same-call-id",
+                "agentId": "agent-b",
+                "args": {},
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(b_response.status(), StatusCode::OK);
+        let b_body: Value = b_response.json().await.unwrap();
+        assert_eq!(
+            b_body
+                .pointer("/result/content/0/text")
+                .and_then(Value::as_str),
+            Some("agent-b")
+        );
+
+        route_a.stop().await;
+        let a_response = tokio::time::timeout(Duration::from_secs(1), blocked_call)
+            .await
+            .expect("cancelling agent A did not settle its callback")
+            .unwrap()
+            .unwrap();
+        assert_eq!(a_response.status(), StatusCode::BAD_GATEWAY);
+
+        let stale = http
+            .post(&callback_url)
+            .bearer_auth(&bearer)
+            .json(&json!({
+                "toolName": "shared_tool",
+                "toolCallId": "stale-call",
+                "agentId": "agent-a",
+                "args": {},
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(stale.status(), StatusCode::FORBIDDEN);
+        let disallowed = http
+            .post(&callback_url)
+            .bearer_auth(&bearer)
+            .json(&json!({
+                "toolName": "not_enabled",
+                "toolCallId": "wrong-tool",
+                "agentId": "agent-b",
+                "args": {},
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(disallowed.status(), StatusCode::FORBIDDEN);
+        let surviving = http
+            .post(&callback_url)
+            .bearer_auth(&bearer)
+            .json(&json!({
+                "toolName": "shared_tool",
+                "toolCallId": "surviving-call",
+                "agentId": "agent-b",
+                "args": {},
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(surviving.status(), StatusCode::OK);
+
+        route_b.stop().await;
+        callback.stop().await.unwrap();
+        mcp_server.abort();
+    }
+
+    #[tokio::test]
+    async fn retired_agent_id_cannot_bind_to_a_replacement_route() {
+        let mcp_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let mcp_server = tokio::spawn({
+            let mcp_calls = mcp_calls.clone();
+            async move {
+                axum::serve(
+                    listener,
+                    Router::new().route(
+                        "/mcp",
+                        post(move || {
+                            let mcp_calls = mcp_calls.clone();
+                            async move {
+                                mcp_calls.fetch_add(1, Ordering::AcqRel);
+                                Json(json!({
+                                    "jsonrpc": "2.0",
+                                    "id": "fixture",
+                                    "result": { "content": [] }
+                                }))
+                            }
+                        }),
+                    ),
+                )
+                .await
+            }
+        });
+        let callback = CallbackRouter::start(reqwest::Client::new()).await.unwrap();
+        let reusable = Arc::new(AtomicBool::new(true));
+        let mut previous = callback
+            .register(
+                "agent-reused".into(),
+                Some(format!("http://{address}/mcp")),
+                HashSet::from(["shared_tool".into()]),
+                CancellationToken::new(),
+                Some(Arc::downgrade(&reusable)),
+            )
+            .await
+            .unwrap();
+        assert!(previous.stop().await);
+        assert!(!callback.accepts_agent_id("agent-reused"));
+
+        let error = match callback
+            .register(
+                "agent-reused".into(),
+                Some(format!("http://{address}/mcp")),
+                HashSet::from(["shared_tool".into()]),
+                CancellationToken::new(),
+                Some(Arc::downgrade(&reusable)),
+            )
+            .await
+        {
+            Ok(_) => panic!("a retired agent id was routed twice through one Bridge"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("already retired"), "{error}");
+
+        let delayed = reqwest::Client::new()
+            .post(format!("{}{}", callback.url, CALLBACK_PATH))
+            .bearer_auth(&callback.bearer)
+            .json(&json!({
+                "toolName": "shared_tool",
+                "toolCallId": "previously-unseen-late-call",
+                "agentId": "agent-reused",
+                "args": {},
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(delayed.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            mcp_calls.load(Ordering::Acquire),
+            0,
+            "a callback for a retired agent reached a replacement MCP route"
+        );
+
+        callback.stop().await.unwrap();
+        mcp_server.abort();
+    }
+
+    #[tokio::test]
+    async fn dropped_callback_route_quarantines_its_bridge_until_cleanup() {
+        let blocked_started = Arc::new(Semaphore::new(0));
+        let handler_started = blocked_started.clone();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let mcp_server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/mcp",
+                    post(move || {
+                        let handler_started = handler_started.clone();
+                        async move {
+                            handler_started.add_permits(1);
+                            std::future::pending::<Json<Value>>().await
+                        }
+                    }),
+                ),
+            )
+            .await
+        });
+        let callback = CallbackRouter::start(reqwest::Client::new()).await.unwrap();
+        let reusable = Arc::new(AtomicBool::new(true));
+        let route = callback
+            .register(
+                "agent-dropped".into(),
+                Some(format!("http://{address}/mcp")),
+                HashSet::from(["shared_tool".into()]),
+                CancellationToken::new(),
+                Some(Arc::downgrade(&reusable)),
+            )
+            .await
+            .unwrap();
+        let callback_request = tokio::spawn({
+            let url = format!("{}{}", callback.url, CALLBACK_PATH);
+            let bearer = callback.bearer.clone();
+            async move {
+                reqwest::Client::new()
+                    .post(url)
+                    .bearer_auth(bearer)
+                    .json(&json!({
+                        "toolName": "shared_tool",
+                        "toolCallId": "dropped-call",
+                        "agentId": "agent-dropped",
+                        "args": {},
+                    }))
+                    .send()
+                    .await
+            }
+        });
+        blocked_started.acquire().await.unwrap().forget();
+
+        drop(route);
+        assert!(!reusable.load(Ordering::Acquire));
+        assert!(
+            callback
+                .state
+                .routes
+                .read()
+                .unwrap()
+                .contains_key("agent-dropped"),
+            "unacknowledged Drop discarded process-owned route cleanup"
+        );
+        let response = tokio::time::timeout(Duration::from_secs(1), callback_request)
+            .await
+            .expect("dropped route did not cancel its callback")
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+        callback.stop().await.unwrap();
+        assert!(callback.state.routes.read().unwrap().is_empty());
+        mcp_server.abort();
     }
 
     #[tokio::test]
@@ -4235,6 +4895,132 @@ mod tests {
         assert!(supervisor.tasks.lock().await.is_empty());
     }
 
+    #[tokio::test]
+    async fn uncorroborated_stream_call_quarantines_before_route_reuse() {
+        let callback = CallbackRouter::start(local_http_client().unwrap())
+            .await
+            .unwrap();
+        let reusable = Arc::new(AtomicBool::new(true));
+        let mut route = callback
+            .register(
+                "agent-delayed-before-ingress".into(),
+                None,
+                HashSet::new(),
+                CancellationToken::new(),
+                Some(Arc::downgrade(&reusable)),
+            )
+            .await
+            .unwrap();
+        route
+            .route
+            .observe_stream_call_id("call-delayed-before-ingress")
+            .unwrap();
+
+        assert!(
+            !route.stop().await,
+            "a stream call without a correlated callback allowed route reuse"
+        );
+        assert!(!reusable.load(Ordering::Acquire));
+        assert!(
+            callback
+                .state
+                .routes
+                .read()
+                .unwrap()
+                .contains_key("agent-delayed-before-ingress")
+        );
+        callback.stop().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn callback_route_timeout_retains_noncooperative_supervised_work() {
+        let callback = CallbackRouter::start(local_http_client().unwrap())
+            .await
+            .unwrap();
+        let reusable = Arc::new(AtomicBool::new(true));
+        let mut route = callback
+            .register(
+                "agent-timeout".into(),
+                None,
+                HashSet::new(),
+                CancellationToken::new(),
+                Some(Arc::downgrade(&reusable)),
+            )
+            .await
+            .unwrap();
+        let supervisor = route.supervisor.clone();
+        let task_started = Arc::new(Semaphore::new(0));
+        let release = Arc::new((StdMutex::new(false), std::sync::Condvar::new()));
+        supervisor.tasks.lock().await.spawn({
+            let task_started = task_started.clone();
+            let release = release.clone();
+            async move {
+                task_started.add_permits(1);
+                let (released, wake) = &*release;
+                let mut released = released.lock().unwrap();
+                while !*released {
+                    released = wake.wait(released).unwrap();
+                }
+            }
+        });
+        task_started.acquire().await.unwrap().forget();
+        let settled = route
+            .stop_until(tokio::time::Instant::now() + Duration::from_millis(10))
+            .await;
+        assert!(!settled, "a timed-out callback route reported clean reuse");
+        assert!(
+            !reusable.load(Ordering::Acquire),
+            "route timeout did not synchronously quarantine its Bridge"
+        );
+        assert!(
+            callback
+                .state
+                .routes
+                .read()
+                .unwrap()
+                .contains_key("agent-timeout"),
+            "a timed-out route escaped process-owned cleanup"
+        );
+        let stale = local_http_client()
+            .unwrap()
+            .post(format!("{}{}", callback.url, CALLBACK_PATH))
+            .bearer_auth(&callback.bearer)
+            .json(&json!({
+                "toolName": "stale-tool",
+                "toolCallId": "stale-call",
+                "agentId": "agent-timeout",
+                "args": {},
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(stale.status(), StatusCode::FORBIDDEN);
+        let cleanup = callback
+            .stop_until(tokio::time::Instant::now() + Duration::from_millis(10))
+            .await;
+        assert_eq!(cleanup.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            callback.task.lock().await.is_none(),
+            "route timeout left the callback listener task running"
+        );
+        assert!(
+            callback
+                .state
+                .routes
+                .read()
+                .unwrap()
+                .contains_key("agent-timeout"),
+            "failed process cleanup discarded the timed-out route"
+        );
+        {
+            let (released, wake) = &*release;
+            *released.lock().unwrap() = true;
+            wake.notify_all();
+        }
+        callback.stop().await.unwrap();
+        assert!(callback.state.routes.read().unwrap().is_empty());
+    }
+
     #[test]
     fn cursor_terminal_statuses_require_exact_sdk_values() {
         for status in [json!(3), json!("3"), json!("RUN_LIFECYCLE_STATUS_FINISHED")] {
@@ -4299,6 +5085,44 @@ mod tests {
     }
 
     #[test]
+    fn legacy_session_marker_flushes_before_atomic_publication() {
+        let temporary_root = tempfile::tempdir().unwrap();
+        let marker_parent = temporary_root.path().join("backend").join("markers");
+        std::fs::create_dir_all(&marker_parent).unwrap();
+        let temporary = marker_parent.join("candidate");
+        let destination = marker_parent.join("thread");
+        std::fs::write(&temporary, "new-agent").unwrap();
+        std::fs::write(&destination, "old-agent").unwrap();
+
+        let error = commit_legacy_session_marker(&temporary, &destination, true, |path| {
+            if path == temporary {
+                Err(std::io::Error::other("injected marker flush failure"))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert_eq!(std::fs::read_to_string(&destination).unwrap(), "old-agent");
+
+        let mut synced = Vec::new();
+        commit_legacy_session_marker(&temporary, &destination, true, |path| {
+            synced.push(path.to_path_buf());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&destination).unwrap(), "new-agent");
+        assert_eq!(
+            synced,
+            vec![
+                temporary,
+                marker_parent.clone(),
+                marker_parent.parent().unwrap().to_path_buf(),
+            ]
+        );
+    }
+
+    #[test]
     fn derives_common_image_dimensions() {
         let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
         png.extend_from_slice(&[0; 8]);
@@ -4323,10 +5147,69 @@ mod tests {
     }
 
     #[test]
-    fn thread_state_path_does_not_embed_external_ids() {
-        let path = thread_state_dir(Path::new("/state"), "../provider", "../../thread");
+    fn backend_state_path_does_not_embed_external_ids() {
+        let path = backend_state_dir(Path::new("/state"), "../provider");
         assert_eq!(path.parent(), Some(Path::new("/state")));
         assert!(!path.to_string_lossy().contains("provider"));
-        assert!(!path.to_string_lossy().contains("thread"));
+    }
+
+    #[tokio::test]
+    async fn legacy_per_thread_session_is_reset_once_into_the_shared_store() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        let provider_id = "cursor-provider";
+        let thread_id = "thread-from-per-thread-store";
+        let legacy = legacy_thread_state_dir(root, provider_id, thread_id);
+        assert_eq!(
+            legacy.file_name().and_then(|name| name.to_str()),
+            Some("3X4zI2VSLSnWs8ezqXYPa9LDLz12HET6AyHGPWtrMaM"),
+            "legacy detection must preserve the pre-shared-store hash layout"
+        );
+        tokio::fs::create_dir_all(&legacy).await.unwrap();
+
+        let first = select_backend_session(root, provider_id, thread_id, Some("legacy-agent"))
+            .await
+            .unwrap();
+        assert_eq!(
+            first.resume, None,
+            "legacy agent cannot resume in shared SQLite"
+        );
+        let marker = first
+            .legacy_marker
+            .as_ref()
+            .expect("legacy state requires a transition marker");
+        assert_eq!(marker.recorded_agent_id, None);
+        record_legacy_session_marker(marker, "shared-agent")
+            .await
+            .unwrap();
+
+        let recover = select_backend_session(root, provider_id, thread_id, Some("legacy-agent"))
+            .await
+            .unwrap();
+        assert_eq!(recover.resume.as_deref(), Some("shared-agent"));
+        assert_eq!(
+            recover
+                .legacy_marker
+                .as_ref()
+                .and_then(|marker| marker.recorded_agent_id.as_deref()),
+            Some("shared-agent")
+        );
+        let settled = select_backend_session(root, provider_id, thread_id, Some("shared-agent"))
+            .await
+            .unwrap();
+        assert_eq!(settled.resume.as_deref(), Some("shared-agent"));
+        let marker = settled.legacy_marker.as_ref().unwrap();
+        record_legacy_session_marker(marker, "replacement-agent")
+            .await
+            .unwrap();
+        let replaced =
+            select_backend_session(root, provider_id, thread_id, Some("replacement-agent"))
+                .await
+                .unwrap();
+        assert_eq!(replaced.resume.as_deref(), Some("replacement-agent"));
+        assert!(
+            legacy.is_dir(),
+            "safe reset must retain the legacy state for recovery"
+        );
     }
 }
