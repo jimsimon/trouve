@@ -25042,15 +25042,8 @@ rename to src/new.rs
         let mut first_page = vec![
             comment(
                 302,
-                42,
-                "@trouve-ai resolve rvf_7c7d5797 new command",
-                "OWNER",
-                "User",
-            ),
-            comment(
-                301,
-                42,
-                "@trouve-ai resolve rvf_6b6c4686 accepted limitation",
+                43,
+                "@trouve-ai resolve rvf_7c7d5797 webhook command",
                 "OWNER",
                 "User",
             ),
@@ -25060,9 +25053,25 @@ rename to src/new.rs
             comment(297, 42, "@trouve-ai review", "OWNER", "Bot"),
         ];
         first_page.extend(
-            (0..94).map(|index| comment(400 + index, 42, "ordinary discussion", "OWNER", "User")),
+            (0..95).map(|index| comment(400 + index, 42, "ordinary discussion", "OWNER", "User")),
         );
         assert_eq!(first_page.len(), REVIEW_COMMENT_PAGE_SIZE);
+        let second_page = vec![
+            comment(
+                301,
+                42,
+                "@trouve-ai resolve rvf_6b6c4686 recovered command",
+                "OWNER",
+                "User",
+            ),
+            comment(
+                296,
+                42,
+                "@trouve-ai resolve rvf_5a5b3575 historical command",
+                "OWNER",
+                "User",
+            ),
+        ];
 
         let store = crate::store::Store::open_in_memory().unwrap();
         assert!(
@@ -25074,7 +25083,23 @@ rename to src/new.rs
         // must not be replayed as a historical backfill after upgrade.
         assert!(
             store
-                .claim_code_review_polled_comment("acme/widgets", 301, None, None)
+                .claim_code_review_polled_comment("acme/widgets", 296, None, None)
+                .unwrap()
+        );
+        let webhook_command = crate::store::PendingThreadlessCommand {
+            trigger_key: "command:comment:302".into(),
+            repository: "acme/widgets".into(),
+            pull_number: 43,
+            comment_id: 302,
+            author: "jim".into(),
+            resolve: true,
+            finding_prefix: "rvf_7c7d5797".into(),
+            reason: "webhook command".into(),
+            created_at: String::new(),
+        };
+        assert!(
+            store
+                .claim_github_webhook_delivery("delivery-302", None, Some(&webhook_command))
                 .unwrap()
         );
         let data = tempfile::tempdir().unwrap();
@@ -25087,7 +25112,10 @@ rename to src/new.rs
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            for (page, body) in [(1, serde_json::to_string(&first_page).unwrap())] {
+            for (page, body) in [
+                (1, serde_json::to_string(&first_page).unwrap()),
+                (2, serde_json::to_string(&second_page).unwrap()),
+            ] {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut request = Vec::new();
                 let mut buffer = [0_u8; 1024];
@@ -25116,7 +25144,7 @@ rename to src/new.rs
         )
         .unwrap();
         engine
-            .poll_manual_review_comments(&api, "acme/widgets", &HashSet::from([42]))
+            .poll_manual_review_comments(&api, "acme/widgets", &HashSet::from([42, 43]))
             .await
             .unwrap();
         await_mock_server(server).await;
@@ -25135,11 +25163,20 @@ rename to src/new.rs
             .store
             .pending_threadless_commands("acme/widgets", THREADLESS_COMMAND_PASS_LIMIT)
             .unwrap();
-        assert_eq!(pending_commands.len(), 1);
-        assert_eq!(pending_commands[0].comment_id, 302);
-        assert_eq!(pending_commands[0].author, "jim");
-        assert_eq!(pending_commands[0].finding_prefix, "rvf_7c7d5797");
-        assert_eq!(pending_commands[0].reason, "new command");
+        assert_eq!(
+            pending_commands
+                .iter()
+                .map(|command| command.comment_id)
+                .collect::<Vec<_>>(),
+            vec![301, 302]
+        );
+        let recovered = pending_commands
+            .iter()
+            .find(|command| command.comment_id == 301)
+            .unwrap();
+        assert_eq!(recovered.author, "jim");
+        assert_eq!(recovered.finding_prefix, "rvf_6b6c4686");
+        assert_eq!(recovered.reason, "recovered command");
         assert!(
             !engine
                 .store
@@ -25147,7 +25184,9 @@ rename to src/new.rs
                     "acme/widgets",
                     302,
                     None,
-                    Some(&pending_commands[0]),
+                    pending_commands
+                        .iter()
+                        .find(|command| command.comment_id == 302),
                 )
                 .unwrap()
         );
@@ -25157,17 +25196,18 @@ rename to src/new.rs
                 .pending_threadless_commands("acme/widgets", THREADLESS_COMMAND_PASS_LIMIT)
                 .unwrap()
                 .len(),
-            1,
+            2,
             "a repeated poll must not queue the command twice"
         );
         for (comment_id, pull_number) in [
+            (296, 42),
             (299, 99),
             (298, 42),
             (297, 42),
             (200, 42),
             (300, 42),
             (301, 42),
-            (302, 42),
+            (302, 43),
         ] {
             assert!(
                 !engine

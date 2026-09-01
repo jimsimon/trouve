@@ -989,6 +989,11 @@ const MIGRATIONS: &[&str] = &[
     // history; newly discovered comments explicitly start uninspected.
     "ALTER TABLE code_review_polled_comments
        ADD COLUMN threadless_command_claimed INTEGER NOT NULL DEFAULT 1",
+    // Existing rows were reached by polling and remain valid pagination
+    // frontiers. Webhook-only receipts explicitly set this false so command
+    // deduplication cannot make the poller skip older unseen pages.
+    "ALTER TABLE code_review_polled_comments
+       ADD COLUMN poll_seen INTEGER NOT NULL DEFAULT 1",
 ];
 
 /// Blocking-tier predicate for one findings row under the given SQL alias:
@@ -16164,11 +16169,13 @@ impl Store {
                     ],
                 )?;
                 // Keep the comment poller from rediscovering a command that
-                // arrived successfully through the webhook path.
+                // arrived successfully through the webhook path. This receipt
+                // is not a polling frontier until the poller observes it.
                 tx.execute(
                     "INSERT INTO code_review_polled_comments
-                            (repository, comment_id, seen_at, threadless_command_claimed)
-                     VALUES (?1, ?2, ?3, 1)
+                            (repository, comment_id, seen_at,
+                             threadless_command_claimed, poll_seen)
+                     VALUES (?1, ?2, ?3, 1, 0)
                      ON CONFLICT(repository, comment_id) DO UPDATE SET
                        threadless_command_claimed = 1",
                     params![
@@ -16381,17 +16388,19 @@ impl Store {
         Ok(self.conn.lock().unwrap().query_row(
             "SELECT EXISTS(
                  SELECT 1 FROM code_review_polled_comments
-                 WHERE repository = ?1 LIMIT 1
+                 WHERE repository = ?1 AND poll_seen = 1 LIMIT 1
              )",
             params![repository],
             |row| row.get(0),
         )?)
     }
 
-    /// Claim a newly discovered comment and atomically persist any command it
-    /// carries. The inspection latch deduplicates webhook and polling delivery;
-    /// comments recorded before this capability are already inspected by the
-    /// migration and are deliberately not backfilled.
+    /// Claim a comment newly reached by polling and atomically persist any
+    /// command it carries. The inspection latch deduplicates webhook and
+    /// polling delivery, while poll_seen keeps webhook-only receipts from
+    /// advancing the ordered polling frontier. Comments recorded before this
+    /// capability are already inspected by the migration and are deliberately
+    /// not backfilled.
     pub fn claim_code_review_polled_comment(
         &self,
         repository: &str,
@@ -16401,17 +16410,22 @@ impl Store {
     ) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         let tx = write_transaction(&conn)?;
-        let inserted = tx.execute(
-            "INSERT OR IGNORE INTO code_review_polled_comments
-                    (repository, comment_id, seen_at, threadless_command_claimed)
-             VALUES (?1, ?2, ?3, 0)",
+        let newly_polled = tx.execute(
+            "INSERT INTO code_review_polled_comments
+                    (repository, comment_id, seen_at,
+                     threadless_command_claimed, poll_seen)
+             VALUES (?1, ?2, ?3, 0, 1)
+             ON CONFLICT(repository, comment_id) DO UPDATE SET
+               seen_at = excluded.seen_at,
+               poll_seen = 1
+             WHERE code_review_polled_comments.poll_seen = 0",
             params![
                 repository,
                 comment_id as i64,
                 chrono::Utc::now().to_rfc3339()
             ],
         )?;
-        if inserted > 0
+        if newly_polled > 0
             && let Some((pull_number, trigger_key)) = manual_request
         {
             tx.execute(
@@ -16461,7 +16475,7 @@ impl Store {
             )?;
         }
         tx.commit()?;
-        Ok(inserted > 0)
+        Ok(newly_polled > 0)
     }
 
     // --- provider transcript --------------------------------------------------
