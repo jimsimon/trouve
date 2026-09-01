@@ -806,7 +806,7 @@ fn terminate_platform_process_tree(child: &mut ProcessTreeChild) -> std::io::Res
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
 fn unix_process_group_active(process_group: i32) -> std::io::Result<bool> {
     let result = unsafe { libc::kill(-process_group, 0) };
     if result == 0 {
@@ -862,10 +862,45 @@ fn signal_unix_process_group(process_group: i32) -> std::io::Result<()> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn linux_process_parent_id(pid: i32) -> Option<i32> {
+fn linux_process_stat(pid: i32) -> Option<(char, i32, i32)> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let (_, tail) = stat.rsplit_once(") ")?;
-    tail.split_whitespace().nth(1)?.parse().ok()
+    let mut fields = tail.split_whitespace();
+    let state = fields.next()?.chars().next()?;
+    let parent_id = fields.next()?.parse().ok()?;
+    let process_group = fields.next()?.parse().ok()?;
+    Some((state, parent_id, process_group))
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn linux_process_parent_id(pid: i32) -> Option<i32> {
+    linux_process_stat(pid).map(|(_, parent_id, _)| parent_id)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn linux_process_state_is_active(state: char, parent_id: i32, owner_pid: i32) -> bool {
+    !matches!(state, 'Z' | 'X') || parent_id == owner_pid
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn unix_process_group_active(process_group: i32) -> std::io::Result<bool> {
+    let own_pid = i32::try_from(std::process::id()).unwrap_or(-1);
+    for process in std::fs::read_dir("/proc")? {
+        let Ok(process) = process else { continue };
+        let Some(pid) = process
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        if linux_process_stat(pid).is_some_and(|(state, parent_id, group)| {
+            group == process_group && linux_process_state_is_active(state, parent_id, own_pid)
+        }) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -1367,6 +1402,25 @@ mod tests {
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
         let path = std::env::join_paths([directory.path()]).unwrap();
         assert_eq!(find_executable_in_path("npx", &path), Some(executable));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_group_liveness_classifies_zombies_by_reap_owner() {
+        let own_pid = i32::try_from(std::process::id()).unwrap();
+
+        assert!(
+            linux_process_state_is_active('S', 1, own_pid),
+            "a live orphan remains active"
+        );
+        assert!(
+            linux_process_state_is_active('Z', own_pid, own_pid),
+            "a direct zombie remains active until trouve can reap it"
+        );
+        assert!(
+            !linux_process_state_is_active('Z', 1, own_pid),
+            "an inert zombie owned by another reaper cannot quarantine the tree"
+        );
     }
 
     #[cfg(target_os = "linux")]
