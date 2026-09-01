@@ -452,6 +452,30 @@ enum TurnTerminal {
     ConsumerClosed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionPublicationStop {
+    PoolClosing,
+    Cancelled,
+    ConsumerClosed,
+}
+
+async fn publish_session_started(
+    pool_closing: &CancellationToken,
+    cancel: &CancellationToken,
+    events: &BackendEventSender,
+    session_id: String,
+) -> Result<(), SessionPublicationStop> {
+    tokio::select! {
+        biased;
+        _ = pool_closing.cancelled() => Err(SessionPublicationStop::PoolClosing),
+        _ = cancel.cancelled() => Err(SessionPublicationStop::Cancelled),
+        _ = events.closed() => Err(SessionPublicationStop::ConsumerClosed),
+        result = events.send(Ok(BackendEvent::SessionStarted { session_id })) => {
+            result.map_err(|()| SessionPublicationStop::ConsumerClosed)
+        }
+    }
+}
+
 struct BridgePool {
     processes: Mutex<HashMap<String, Arc<PooledBridge>>>,
     thread_gates: Mutex<HashMap<String, Weak<Mutex<()>>>>,
@@ -1234,18 +1258,33 @@ async fn run_sdk_turn(
     };
     *callback.expected_agent_id.write().await = Some(agent_id.clone());
 
-    if fresh
-        && events
-            .send(Ok(BackendEvent::SessionStarted {
-                session_id: agent_id.clone(),
-            }))
-            .await
-            .is_err()
-    {
-        drop(bridge);
-        callback.stop().await;
-        pool.terminate_and_remove(&turn.thread_id, &process).await?;
-        return Ok(TurnTerminal::ConsumerClosed);
+    if fresh {
+        match publish_session_started(&pool.closing, &turn.cancel, events, agent_id.clone()).await {
+            Ok(()) => {}
+            Err(SessionPublicationStop::PoolClosing) => {
+                drop(bridge);
+                return terminate_interrupted_process(
+                    pool,
+                    &turn.thread_id,
+                    &process,
+                    &mut callback,
+                    BridgePool::closed_error(),
+                )
+                .await;
+            }
+            Err(SessionPublicationStop::Cancelled) => {
+                drop(bridge);
+                callback.stop().await;
+                pool.terminate_and_remove(&turn.thread_id, &process).await?;
+                return Ok(TurnTerminal::Cancelled);
+            }
+            Err(SessionPublicationStop::ConsumerClosed) => {
+                drop(bridge);
+                callback.stop().await;
+                pool.terminate_and_remove(&turn.thread_id, &process).await?;
+                return Ok(TurnTerminal::ConsumerClosed);
+            }
+        }
     }
 
     let outcome = tokio::select! {
@@ -3994,6 +4033,61 @@ mod tests {
                 .await
                 .expect("cancellation did not release projection backpressure"),
             Err(StreamStop::Cancelled)
+        );
+    }
+
+    #[tokio::test]
+    async fn session_publication_backpressure_observes_cancellation_and_pool_shutdown() {
+        let (sender_tx, sender_rx) = tokio::sync::oneshot::channel();
+        let _stream = async_stream(move |events| async move {
+            let _ = sender_tx.send(events);
+            std::future::pending::<()>().await;
+        });
+        let events = sender_rx.await.unwrap();
+
+        loop {
+            let event = BackendEvent::SessionStarted {
+                session_id: "fill".into(),
+            };
+            match tokio::time::timeout(Duration::from_millis(100), events.send(Ok(event))).await {
+                Ok(Ok(())) => {}
+                Ok(Err(())) => panic!("event stream closed while filling its buffer"),
+                Err(_) => break,
+            }
+        }
+
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                publish_session_started(
+                    &CancellationToken::new(),
+                    &cancel,
+                    &events,
+                    "cancelled".into(),
+                ),
+            )
+            .await
+            .expect("cancellation did not release session publication backpressure"),
+            Err(SessionPublicationStop::Cancelled)
+        );
+
+        let closing = CancellationToken::new();
+        closing.cancel();
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                publish_session_started(
+                    &closing,
+                    &CancellationToken::new(),
+                    &events,
+                    "closing".into(),
+                ),
+            )
+            .await
+            .expect("pool shutdown did not release session publication backpressure"),
+            Err(SessionPublicationStop::PoolClosing)
         );
     }
 

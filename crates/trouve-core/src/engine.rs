@@ -2824,19 +2824,19 @@ impl BackendRetirement {
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return false;
         };
-        let Some(reload) = self.reload.take() else {
-            return false;
-        };
         let Some(transaction) = self.secret_transaction.take() else {
-            self.reload = Some(reload);
             return false;
         };
+        // The provider-scoped transition guards are sufficient to keep the
+        // tentative credentials unpublished. Release the global reload
+        // barrier before a potentially unbounded secret-store recovery so
+        // unrelated refreshes and runtime operations can still make progress.
+        drop(self.reload.take());
         let reconciliation = ProviderSecretRollbackReconciliation {
             engine: self.engine.clone(),
             target_ids: self.target_ids.clone(),
             rebuild,
             transaction,
-            _reload: reload,
             _target_transitions: std::mem::take(&mut self._target_transitions),
         };
         self.rollback_on_drop = false;
@@ -2877,7 +2877,6 @@ struct ProviderSecretRollbackReconciliation {
     target_ids: HashSet<String>,
     rebuild: bool,
     transaction: ProviderSecretTransaction,
-    _reload: ProviderReloadGuard,
     _target_transitions: Vec<tokio::sync::OwnedMutexGuard<()>>,
 }
 
@@ -2911,6 +2910,11 @@ struct ProviderSecretTransaction {
     store: Arc<dyn trouve_providers::secrets::SecretStore>,
     previous: Vec<(String, Option<String>)>,
     committed: bool,
+}
+
+struct ProviderSecretWriteFailure {
+    error: anyhow::Error,
+    transaction: Option<ProviderSecretTransaction>,
 }
 
 impl ProviderSecretTransaction {
@@ -2960,28 +2964,39 @@ fn restore_provider_secrets(
 fn write_secrets_transactionally(
     store: Arc<dyn trouve_providers::secrets::SecretStore>,
     writes: Vec<(String, String)>,
-) -> Result<ProviderSecretTransaction> {
+) -> std::result::Result<ProviderSecretTransaction, ProviderSecretWriteFailure> {
     let previous = writes
         .iter()
         .map(|(key, _)| store.get(key).map(|value| (key.clone(), value)))
-        .collect::<Result<Vec<_>>>()?;
-
-    for (key, value) in &writes {
-        if let Err(write_error) = store.set(key, value) {
-            if let Err(rollback_error) = restore_provider_secrets(store.as_ref(), &previous) {
-                return Err(anyhow!(
-                    "writing provider secret {key}: {write_error}; secret rollback failed: {rollback_error}"
-                ));
-            } else {
-                return Err(write_error).context(format!("writing provider secret {key}"));
-            }
-        }
-    }
-    Ok(ProviderSecretTransaction {
+        .collect::<Result<Vec<_>>>()
+        .map_err(|error| ProviderSecretWriteFailure {
+            error,
+            transaction: None,
+        })?;
+    let mut transaction = ProviderSecretTransaction {
         store,
         previous,
         committed: false,
-    })
+    };
+
+    for (key, value) in &writes {
+        if let Err(write_error) = transaction.store.set(key, value) {
+            if let Err(rollback_error) = transaction.try_rollback() {
+                return Err(ProviderSecretWriteFailure {
+                    error: anyhow!(
+                        "writing provider secret {key}: {write_error}; secret rollback failed: {rollback_error}"
+                    ),
+                    transaction: Some(transaction),
+                });
+            } else {
+                return Err(ProviderSecretWriteFailure {
+                    error: write_error.context(format!("writing provider secret {key}")),
+                    transaction: None,
+                });
+            }
+        }
+    }
+    Ok(transaction)
 }
 
 type RetiringBackendBatch = Vec<(String, Arc<dyn AgentBackend>)>;
@@ -4586,8 +4601,9 @@ impl Engine {
         // Fence API-registry refreshes and same-provider transitions before
         // the first tentative secret write. These guards move into backend
         // retirement and, on rollback failure, its detached reconciliation.
-        let reload = self.provider_reload.clone().read_owned().await;
-        let target_transitions = self.lock_provider_transitions(&target_ids).await;
+        let (reload, target_transitions) = self
+            .lock_provider_transitions_with_shared_reload(&target_ids)
+            .await;
         let mut secret_writes = Vec::new();
         if let Some(key) = req.api_key.as_deref().filter(|key| !key.is_empty()) {
             secret_writes.push((
@@ -4608,8 +4624,30 @@ impl Engine {
         // Validate and commit the secret-store transaction before disturbing
         // a healthy backend. The guard restores the previous values if this
         // future is cancelled or any later transition fails.
-        let secret_transaction = write_secrets_transactionally(self.secrets.clone(), secret_writes)
-            .map_err(EngineError::Internal)?;
+        let secret_transaction =
+            match write_secrets_transactionally(self.secrets.clone(), secret_writes) {
+                Ok(transaction) => transaction,
+                Err(ProviderSecretWriteFailure { error, transaction }) => {
+                    if let Some(transaction) = transaction {
+                        let reconciliation = ProviderSecretRollbackReconciliation {
+                            engine: Arc::downgrade(self),
+                            target_ids,
+                            rebuild: false,
+                            transaction,
+                            _target_transitions: target_transitions,
+                        };
+                        // Provider-scoped guards keep refreshes from observing the
+                        // tentative values. Do not retain the shared global
+                        // barrier across an unbounded secret-store retry.
+                        drop(reload);
+                        tokio::spawn(reconciliation.run());
+                        return Err(EngineError::Internal(
+                            error.context("provider secret rollback retry scheduled"),
+                        ));
+                    }
+                    return Err(EngineError::Internal(error));
+                }
+            };
         // Retire the previous backend before changing its durable definition.
         // The retirement owns cleanup and registry rollback independently of
         // this request future, so cancellation cannot expose a closing backend
@@ -4756,21 +4794,52 @@ impl Engine {
             .clone()
     }
 
-    async fn lock_provider_transitions(
+    fn try_lock_provider_transitions(
         &self,
         target_ids: &HashSet<String>,
-    ) -> Vec<tokio::sync::OwnedMutexGuard<()>> {
-        let mut ids = target_ids.iter().collect::<Vec<_>>();
+    ) -> std::result::Result<Vec<tokio::sync::OwnedMutexGuard<()>>, String> {
+        let mut ids = target_ids.iter().cloned().collect::<Vec<_>>();
         ids.sort_unstable();
         let locks = ids
             .into_iter()
-            .map(|id| self.provider_transition_lock(id))
+            .map(|id| {
+                let lock = self.provider_transition_lock(&id);
+                (id, lock)
+            })
             .collect::<Vec<_>>();
         let mut guards = Vec::with_capacity(locks.len());
-        for lock in locks {
-            guards.push(lock.lock_owned().await);
+        for (id, lock) in locks {
+            match lock.try_lock_owned() {
+                Ok(guard) => guards.push(guard),
+                Err(_) => return Err(id),
+            }
         }
-        guards
+        Ok(guards)
+    }
+
+    /// Acquire provider-scoped transition locks without ever waiting for one
+    /// while retaining the shared global reload barrier. A failed credential
+    /// rollback may own a provider lock indefinitely; unrelated exclusive
+    /// refreshes must remain admissible throughout that recovery.
+    async fn lock_provider_transitions_with_shared_reload(
+        &self,
+        target_ids: &HashSet<String>,
+    ) -> (
+        tokio::sync::OwnedRwLockReadGuard<()>,
+        Vec<tokio::sync::OwnedMutexGuard<()>>,
+    ) {
+        let mut ids = target_ids.iter().cloned().collect::<Vec<_>>();
+        ids.sort_unstable();
+        let mut guards = Vec::with_capacity(ids.len());
+        for id in ids {
+            guards.push(self.provider_transition_lock(&id).lock_owned().await);
+        }
+        // Exclusive paths only probe provider locks while holding the global
+        // barrier; they never await them. Acquiring provider locks first is
+        // therefore deadlock-free and, critically, never pins the global
+        // barrier behind a stalled credential reconciliation.
+        let reload = self.provider_reload.clone().read_owned().await;
+        (reload, guards)
     }
 
     // --- OAuth login (subscription providers) ---------------------------------
@@ -6955,11 +7024,18 @@ impl Engine {
     ) -> Result<BackendRetirement, EngineError> {
         let reload = self.provider_reload.clone().write_owned().await;
         let target_ids = self.configured_provider_ids_for_runtime(runtime);
+        let target_transitions = self
+            .try_lock_provider_transitions(&target_ids)
+            .map_err(|id| {
+                EngineError::Conflict(format!(
+                    "provider {id} is still reconciling credentials; retry the runtime operation after recovery"
+                ))
+            })?;
         self.retire_config_backends_matching_ids_locked(
             &target_ids,
             BACKEND_RETIREMENT_TIMEOUT,
             ProviderReloadGuard::exclusive(reload),
-            Vec::new(),
+            target_transitions,
             None,
         )
         .await
@@ -7002,8 +7078,9 @@ impl Engine {
         target_ids: &HashSet<String>,
         timeout: Duration,
     ) -> Result<BackendRetirement, EngineError> {
-        let reload = self.provider_reload.clone().read_owned().await;
-        let target_transitions = self.lock_provider_transitions(target_ids).await;
+        let (reload, target_transitions) = self
+            .lock_provider_transitions_with_shared_reload(target_ids)
+            .await;
         self.retire_config_backends_matching_ids_locked(
             target_ids,
             timeout,
@@ -7127,7 +7204,6 @@ impl Engine {
                 let Some(engine) = engine.upgrade() else {
                     return;
                 };
-                let reload = engine.provider_reload.clone().read_owned().await;
                 let target_ids = engine
                     .retiring_backends
                     .lock()
@@ -7138,7 +7214,9 @@ impl Engine {
                 if target_ids.is_empty() {
                     break;
                 }
-                let _target_transitions = engine.lock_provider_transitions(&target_ids).await;
+                let (reload, _target_transitions) = engine
+                    .lock_provider_transitions_with_shared_reload(&target_ids)
+                    .await;
                 let _reload = reload;
                 let retiring = engine.retiring_backend_batch(&target_ids);
                 if retiring.is_empty() {
@@ -7265,11 +7343,60 @@ impl Engine {
 
     fn refresh_api_provider_registry_locked(&self) {
         let config = self.config.lock().unwrap().clone();
-        let mut replacements = build_all_providers(&config, &self.secrets, &self.model_catalog);
-        for (id, provider) in self.injected_providers.lock().unwrap().iter() {
-            replacements.insert(id.clone(), provider.clone());
+        let injected = self.injected_providers.lock().unwrap().clone();
+        let mut target_ids = config.providers.keys().cloned().collect::<HashSet<_>>();
+        target_ids.extend(self.providers.read().unwrap().keys().cloned());
+        target_ids.extend(injected.keys().cloned());
+        // Zero-config providers may enter or leave the registry when their
+        // conventional environment variables change.
+        target_ids.extend(["openai".to_string(), "anthropic".to_string()]);
+
+        // A detached credential reconciliation retains only its provider lock.
+        // Preserve that provider's published instance instead of either
+        // blocking the global refresh or rebuilding it from tentative secrets.
+        let mut ids = target_ids.into_iter().collect::<Vec<_>>();
+        ids.sort_unstable();
+        let mut refresh_ids = HashSet::with_capacity(ids.len());
+        let mut transition_guards = Vec::with_capacity(ids.len());
+        for id in ids {
+            let lock = self.provider_transition_lock(&id);
+            match lock.try_lock_owned() {
+                Ok(guard) => {
+                    refresh_ids.insert(id);
+                    transition_guards.push(guard);
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        provider_id = %id,
+                        "skipping API provider refresh while credential rollback is reconciling"
+                    );
+                }
+            }
         }
-        *self.providers.write().unwrap() = replacements;
+
+        let mut replacements = build_providers_for_ids(
+            &config,
+            &self.secrets,
+            &self.model_catalog,
+            Some(&refresh_ids),
+        );
+        let mut providers = self.providers.write().unwrap();
+        for id in &refresh_ids {
+            match injected
+                .get(id)
+                .cloned()
+                .or_else(|| replacements.remove(id))
+            {
+                Some(replacement) => {
+                    providers.insert(id.clone(), replacement);
+                }
+                None => {
+                    providers.remove(id);
+                }
+            }
+        }
+        drop(providers);
+        drop(transition_guards);
     }
 
     async fn reload_provider(self: &Arc<Self>, id: &str) -> Result<(), EngineError> {
@@ -25024,6 +25151,52 @@ default_permission_mode = "ask"
         }
     }
 
+    struct RecoverableInitialWriteFailureSecretStore {
+        rollback_key: String,
+        forward_failure_key: String,
+        values: Mutex<HashMap<String, String>>,
+        reads: Mutex<Vec<(String, Option<String>)>>,
+        allow_rollback: std::sync::atomic::AtomicBool,
+        rollback_attempts: std::sync::atomic::AtomicUsize,
+    }
+
+    impl trouve_providers::secrets::SecretStore for RecoverableInitialWriteFailureSecretStore {
+        fn get(&self, key: &str) -> anyhow::Result<Option<String>> {
+            let value = self.values.lock().unwrap().get(key).cloned();
+            self.reads
+                .lock()
+                .unwrap()
+                .push((key.to_string(), value.clone()));
+            Ok(value)
+        }
+
+        fn set(&self, key: &str, value: &str) -> anyhow::Result<()> {
+            if key == self.rollback_key && value == "old-key" {
+                self.rollback_attempts
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if !self
+                    .allow_rollback
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    return Err(anyhow!("injected recoverable rollback failure"));
+                }
+            }
+            self.values
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), value.to_string());
+            if key == self.forward_failure_key && value == "new-team" {
+                return Err(anyhow!("injected later secret-write failure"));
+            }
+            Ok(())
+        }
+
+        fn delete(&self, key: &str) -> anyhow::Result<()> {
+            self.values.lock().unwrap().remove(key);
+            Ok(())
+        }
+    }
+
     async fn wait_for_provider_secret_reconciliation(
         engine: &Arc<Engine>,
         store: &TransientRollbackFailingProviderSecretStore,
@@ -30075,6 +30248,97 @@ default_permission_mode = "ask"
     }
 
     #[tokio::test]
+    async fn initial_secret_write_failure_retains_rollback_until_reconciled() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            "cursor".into(),
+            ProviderConfig {
+                kind: "openai-compat".into(),
+                base_url: Some("https://cursor.example.test/v1".into()),
+                ..Default::default()
+            },
+        );
+        let api_key = trouve_providers::secrets::api_key_secret("cursor");
+        let team_key = trouve_providers::secrets::provider_secret("cursor", "team");
+        let secret_store = Arc::new(RecoverableInitialWriteFailureSecretStore {
+            rollback_key: api_key.clone(),
+            forward_failure_key: team_key.clone(),
+            values: Mutex::new(HashMap::from([(api_key.clone(), "old-key".into())])),
+            reads: Mutex::new(Vec::new()),
+            allow_rollback: std::sync::atomic::AtomicBool::new(false),
+            rollback_attempts: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        );
+        engine.secrets = secret_store.clone();
+        let engine = Arc::new(engine);
+        engine.replace_provider_registries_for_ids(&HashSet::from(["cursor".to_string()]));
+        let published = engine.providers.read().unwrap()["cursor"].clone();
+
+        let result = engine
+            .upsert_provider(
+                "cursor",
+                &UpsertProviderRequest {
+                    kind: "openai-compat".into(),
+                    api_key: Some("new-key".into()),
+                    secret_values: std::collections::BTreeMap::from([(
+                        "team".into(),
+                        "new-team".into(),
+                    )]),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(result.is_err());
+        assert_eq!(
+            secret_store.values.lock().unwrap().get(&api_key),
+            Some(&"new-key".to_string())
+        );
+        assert!(!secret_store.values.lock().unwrap().contains_key(&team_key));
+
+        secret_store.reads.lock().unwrap().clear();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            engine.refresh_api_provider_registry(),
+        )
+        .await
+        .expect("an unrelated API registry refresh waited for secret reconciliation");
+        assert!(secret_store.reads.lock().unwrap().is_empty());
+        assert!(Arc::ptr_eq(
+            &engine.providers.read().unwrap()["cursor"],
+            &published
+        ));
+
+        secret_store
+            .allow_rollback
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if secret_store
+                    .values
+                    .lock()
+                    .unwrap()
+                    .get(&api_key)
+                    .is_some_and(|value| value == "old-key")
+                    && secret_store
+                        .rollback_attempts
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                        >= 2
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the retained initial-write transaction was not reconciled");
+    }
+
+    #[tokio::test]
     async fn failed_retirement_retries_secret_rollback_before_republishing_the_old_backend() {
         let data = tempfile::tempdir().unwrap();
         let mut config = Config::default();
@@ -30119,16 +30383,13 @@ default_permission_mode = "ask"
             .await;
 
         assert!(result.is_err());
-        let refresh = engine.refresh_api_provider_registry();
-        tokio::pin!(refresh);
-        assert!(
-            futures::poll!(refresh.as_mut()).is_pending(),
-            "API provider refresh observed tentative credentials"
-        );
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            engine.refresh_api_provider_registry(),
+        )
+        .await
+        .expect("API provider refresh waited for secret reconciliation");
         wait_for_provider_secret_reconciliation(&engine, secret_store.as_ref(), &api_key).await;
-        tokio::time::timeout(Duration::from_secs(3), refresh)
-            .await
-            .expect("API provider refresh did not resume after secret reconciliation");
         assert_eq!(
             secret_store.values.lock().unwrap().get(&api_key),
             Some(&"old-key".to_string())
@@ -30176,12 +30437,14 @@ default_permission_mode = "ask"
         );
         engine.secrets = secret_store.clone();
         let engine = Arc::new(engine);
-        engine.backends.write().unwrap().insert(
-            "cursor".into(),
-            Arc::new(TransientShutdownBackend {
-                shutdowns: std::sync::atomic::AtomicUsize::new(0),
-            }),
-        );
+        let shutdowns = Arc::new(TransientShutdownBackend {
+            shutdowns: std::sync::atomic::AtomicUsize::new(0),
+        });
+        engine
+            .backends
+            .write()
+            .unwrap()
+            .insert("cursor".into(), shutdowns.clone());
 
         let first = engine
             .upsert_provider(
@@ -30212,11 +30475,19 @@ default_permission_mode = "ask"
                     .await
             })
         };
-        let second = tokio::time::timeout(Duration::from_secs(8), second)
-            .await
-            .expect("the later provider update remained blocked after reconciliation")
-            .unwrap()
-            .unwrap();
+        let second = match tokio::time::timeout(Duration::from_secs(8), second).await {
+            Ok(second) => second.unwrap().unwrap(),
+            Err(_) => panic!(
+                "the later provider update remained blocked after reconciliation (rollbacks={}, shutdowns={}, retiring={})",
+                secret_store
+                    .rollback_attempts
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                shutdowns
+                    .shutdowns
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                engine.retiring_backends.lock().unwrap().len(),
+            ),
+        };
 
         assert_eq!(
             second.base_url.as_deref(),
@@ -30434,6 +30705,47 @@ default_permission_mode = "ask"
             &engine.backends.read().unwrap()["cursor"],
             &backend
         ));
+    }
+
+    #[tokio::test]
+    async fn runtime_retirement_conflicts_with_provider_reconciliation_without_blocking_refresh() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            "cursor".into(),
+            ProviderConfig {
+                kind: "cursor-sdk".into(),
+                ..Default::default()
+            },
+        );
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        ));
+        let _reconciliation = engine.provider_transition_lock("cursor").lock_owned().await;
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            engine
+                .retire_config_backends_for_runtime(trouve_agents::install::CliId::CursorSdkBridge),
+        )
+        .await
+        .expect("runtime retirement waited on a provider-scoped reconciliation");
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("runtime retirement bypassed provider-scoped reconciliation"),
+        };
+        assert!(
+            matches!(error, EngineError::Conflict(message) if message.contains("reconciling credentials"))
+        );
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            engine.refresh_api_provider_registry(),
+        )
+        .await
+        .expect("API registry refresh was blocked by provider-scoped reconciliation");
     }
 
     #[tokio::test]
