@@ -7,6 +7,7 @@
 //! Layout under `<data_dir>/cli/`:
 //! - `<id>/.generations/…`    — immutable runtime generations
 //! - `<id>/installed.json`    — pointer to the active version + binary
+//! - `bin/<id>`               — rolling compatibility executable for older processes
 //! - `.leases/<id>/…`         — filesystem-wide generation lifetime locks
 //!
 //! `installed.json` is the single source used by both discovery and process
@@ -775,8 +776,26 @@ impl PreparedInstall {
         // generation cleanup immediately: a later directory-sync error cannot
         // roll the commit back or remove the runtime now named by the pointer.
         generation_cleanup.disarm();
-        let durability_error =
+        // Releases before generation-backed launches resolved this stable path
+        // for every child spawn. Keep it atomically pointed at the new active
+        // generation so a rolling older Trouve process remains functional.
+        // If compatibility publication fails, retain all generations just as
+        // for a directory-sync failure: the previous stable path may still
+        // name the prior generation.
+        let compatibility_error = publish_legacy_managed_bin(&self.data_dir, self.id, &bin)
+            .map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "publishing rolling compatibility executable {}: {error}",
+                        legacy_managed_bin_path(&self.data_dir, self.id).display()
+                    ),
+                )
+            })
+            .err();
+        let publication_sync_error =
             sync_runtime_publication(&self.data_dir, &root, &mut sync_path).err();
+        let durability_error = compatibility_error.or(publication_sync_error);
         if durability_error.is_none() {
             // Reclamation is safe only after the new pointer is known durable.
             // Across one or more failed root syncs, the last durable pointer may
@@ -789,7 +808,6 @@ impl PreparedInstall {
                 previous_generation.as_deref(),
             );
             prune_old_versions(&self.data_dir, self.id, &root, previous_legacy.as_deref());
-            remove_legacy_managed_bin_best_effort(&self.data_dir, self.id);
         }
         match durability_error {
             None => Ok(ActivationOutcome::Durable(info)),
@@ -981,6 +999,7 @@ fn sync_runtime_publication(
     let runtime_parent = root
         .parent()
         .ok_or_else(|| std::io::Error::other("managed runtime root has no parent"))?;
+    sync_path(&runtime_parent.join("bin"))?;
     sync_path(runtime_parent)?;
     if runtime_parent != data_dir {
         sync_path(data_dir)?;
@@ -1263,14 +1282,27 @@ fn lock_all_runtime_leases_exclusive(
     Ok(leases)
 }
 
-fn remove_legacy_managed_bin_best_effort(data_dir: &Path, id: CliId) {
-    let path = legacy_managed_bin_path(data_dir, id);
-    if let Err(error) = remove_path(&path) {
-        tracing::warn!(
-            "managed runtime activation completed, but obsolete stable executable {} could not be removed: {error}",
-            path.display()
-        );
+fn publish_legacy_managed_bin(data_dir: &Path, id: CliId, bin: &Path) -> std::io::Result<()> {
+    let destination = legacy_managed_bin_path(data_dir, id);
+    let directory = destination
+        .parent()
+        .ok_or_else(|| std::io::Error::other("compatibility executable has no parent"))?;
+    std::fs::create_dir_all(directory)?;
+    let candidate = unique_runtime_path(directory, &format!("{}.candidate", id.as_str()))?;
+    let mut cleanup = PathCleanup::new(candidate.clone());
+
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(bin, &candidate)?;
+    #[cfg(not(unix))]
+    {
+        std::fs::copy(bin, &candidate)?;
+        std::fs::File::open(&candidate)?.sync_all()?;
     }
+
+    let replacing_existing = path_exists(&destination)?;
+    replace_file_atomically(&candidate, &destination, replacing_existing)?;
+    cleanup.disarm();
+    Ok(())
 }
 
 /// Fetch and unpack one runtime into `dir`; returns the executable's path
@@ -1894,7 +1926,11 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
             Some("5357a42d3faa668a3ef25c6669fe576544b032dd17fabbbfa515355cd8d33c19")
         );
         assert!(matches!(
-            verify_cursor_sdk_bridge_digests(asset, reviewed.unwrap(), "00", "00"),
+            verify_cursor_sdk_bridge_digests(asset, reviewed.unwrap(), "00", reviewed.unwrap()),
+            Err(InstallError::Checksum(_))
+        ));
+        assert!(matches!(
+            verify_cursor_sdk_bridge_digests(asset, reviewed.unwrap(), reviewed.unwrap(), "00"),
             Err(InstallError::Checksum(_))
         ));
         assert_eq!(cursor_sdk_bridge_reviewed_checksum("1.0.29", asset), None);
@@ -1939,7 +1975,7 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
     }
 
     #[test]
-    fn prepared_install_does_not_publish_until_activation() {
+    fn prepared_install_publishes_pointer_and_rolling_compatibility_path_together() {
         let tmp = tempfile::tempdir().unwrap();
         let root = cli_root(tmp.path(), CliId::Codex);
         let stage = root.join(".stage-2.0.0");
@@ -1969,7 +2005,10 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
             std::fs::read_to_string(&activated.bin).unwrap(),
             "new runtime"
         );
-        assert!(legacy_stable.symlink_metadata().is_err());
+        assert_eq!(
+            std::fs::read_to_string(&legacy_stable).unwrap(),
+            "new runtime"
+        );
         assert_eq!(
             installed(tmp.path(), CliId::Codex).unwrap().version,
             "2.0.0"
@@ -2162,6 +2201,7 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
         let synced = synced.into_inner();
         for path in [
             root.clone(),
+            root.parent().unwrap().join("bin"),
             root.parent().unwrap().to_path_buf(),
             tmp.path().to_path_buf(),
         ] {
