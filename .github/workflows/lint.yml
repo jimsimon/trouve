@@ -176,16 +176,26 @@ jobs:
       - name: Review UI tests
         working-directory: web/review-ui
         run: npm test
+      - name: Cursor SDK qualification helper tests
+        run: node --test scripts/qualify_cursor_sdk_bridge.test.mjs
       # The test-with-model job in test.yml runs ignored tests from these three
-      # crates, so an #[ignore]d test anywhere else would silently never run.
-      # Keep them there, or widen that job's scope on purpose.
+      # crates. The Cursor shipping-path qualification is the sole manual paid
+      # exception and is independently gated by TROUVE_E2E plus CURSOR_API_KEY.
+      # Keep that exception exact so other ignored tests cannot accumulate.
       # Matches bare #[ignore] and #[cfg_attr(..., ignore)] forms; a comment
       # or string that happens to match fails loudly here, which is cheap to
       # fix, unlike a silently skipped test.
-      - name: Ignored tests are covered by the gated job
+      - name: Ignored tests are intentionally gated
         run: |
-          if grep -rlnE '#\[(cfg_attr\(.*,[[:space:]]*)?ignore\b' crates --include='*.rs' | grep -vE '^crates/(trouve-search|trouve-client-core|trouve-core)/'; then
-            echo "Found an #[ignore]d test outside crates covered by test-with-model — update test.yml or move the test" >&2
+          cursor_live_test='crates/trouve-server/tests/cursor_sdk_live.rs'
+          cursor_ignore_count=$(grep -cE '#\[(cfg_attr\(.*,[[:space:]]*)?ignore\b' "$cursor_live_test" || true)
+          cursor_ignore_target=$(grep -A1 -E '#\[(cfg_attr\(.*,[[:space:]]*)?ignore\b' "$cursor_live_test" | tail -n 1 || true)
+          if [ "$cursor_ignore_count" -ne 1 ] || [ "$cursor_ignore_target" != 'async fn cursor_sdk_shipping_path_installs_tools_resumes_and_cleans_up() {' ]; then
+            echo "Cursor live qualification must contain exactly its one explicitly gated shipping-path test" >&2
+            exit 1
+          fi
+          if grep -rlnE '#\[(cfg_attr\(.*,[[:space:]]*)?ignore\b' crates --include='*.rs' | grep -vE '^crates/(trouve-search|trouve-client-core|trouve-core)/|^crates/trouve-server/tests/cursor_sdk_live\.rs$'; then
+            echo "Found an #[ignore]d test outside the gated crates or explicit paid Cursor qualification" >&2
             exit 1
           fi
       - name: Upload Rust compliance evidence

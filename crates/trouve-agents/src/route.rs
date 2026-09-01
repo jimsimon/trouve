@@ -110,6 +110,7 @@ impl<T> RouteReceiver<T> {
         self.events.recv().await
     }
 
+    #[cfg(test)]
     pub(crate) fn try_recv(&mut self) -> Result<T, mpsc::error::TryRecvError> {
         self.events.try_recv()
     }

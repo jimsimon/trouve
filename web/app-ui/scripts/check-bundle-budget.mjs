@@ -30,19 +30,20 @@ const entryLimit = mode === "desktop" ? 856_000 : 850_000;
 // review-history, churn-metrics, implementation-analyst configuration,
 // durable turn-phase, conditional-title, route-scoped new-session lifecycle,
 // outside-diff review, version-check, per-thread transcript-search, detailed
-// agent-activity, attachment-gallery, external-video, and PR-wide
+// agent-activity, attachment-gallery, external-video, managed-agent runtime
+// status, and PR-wide
 // review-state and workspace-organization additions, including lazy previews,
 // mobile playback notices, the route-scoped subscription/API/local usage
 // panel with its generated per-model usage schema and scope breakdowns, and
 // the scope-verdict causal-waypoint evidence schema and schema-driven model-
 // option editors, exact model-option number preservation (including the
 // WebKit fallback), and the dedicated background-activity event. The combined
-// graphs emit 3,280,024 B for desktop and 3,265,169 B for PWA after combining
-// the durable PR-mention event with identity-aware reasoning lifecycle schemas;
-// preserve less than 2 kB of headroom for each. Entry,
-// worker, and largest-chunk budgets below still prevent one bundle from hiding
-// in the aggregate.
-const totalJavaScriptLimit = mode === "desktop" ? 3_281_000 : 3_266_000;
+// graphs emit 3,281,107 B for desktop and 3,266,252 B for PWA
+// after combining identity-aware reasoning, managed-agent runtime status, and
+// the durable PR-mention schema; preserve less than 2 kB of headroom for each.
+// Entry, worker, and largest-chunk budgets below still prevent one bundle from
+// hiding in the aggregate.
+const totalJavaScriptLimit = mode === "desktop" ? 3_283_000 : 3_268_000;
 // Version-check, transcript-search, compact navigation, and the sticky
 // multi-mode usage panel with thread/session model rows plus workspace
 // organization styling bring the clean artifact to 190,958 B. Preserve less

@@ -163,7 +163,9 @@ export class TrouveCliSettings extends LitElement {
       height: 8px;
       accent-color: var(--trouve-accent);
     }
-    .install-error { grid-column: 1 / -1; color: var(--trouve-err); }
+    .install-error, .install-warning { grid-column: 1 / -1; }
+    .install-error { color: var(--trouve-err); }
+    .install-warning { color: var(--trouve-warn); }
 
     .confirmation {
       grid-column: 1 / -1;
@@ -249,8 +251,8 @@ export class TrouveCliSettings extends LitElement {
       <section class="settings-stack" aria-labelledby="cli-settings-heading" aria-busy=${this.#loading}>
         <header class="section-heading">
           <div>
-            <h2 id="cli-settings-heading">Vendor CLIs</h2>
-            <p>Agent backends (Cursor, Claude Code, Codex) run through the vendor's CLI. trouve can download and update these directly — managed installs live in trouve's data directory and take precedence over system packages.</p>
+            <h2 id="cli-settings-heading">Agent runtimes</h2>
+            <p>Cursor runs through its standalone Agent SDK Bridge; Claude Code and Codex use their vendor CLIs. trouve can download, update, and remove each managed runtime here. Managed installs live in trouve's data directory and take precedence over system copies.</p>
           </div>
         </header>
 
@@ -258,13 +260,13 @@ export class TrouveCliSettings extends LitElement {
           ? nothing
           : html`<p class="notice ${this.#error ? "error" : ""}" role="status" aria-live="polite" aria-atomic="true">${this.#message}</p>`}
 
-        <section class="settings-card" aria-label="Vendor CLI installations">
+        <section class="settings-card" aria-label="Agent runtime installations">
           ${clis === undefined
             ? this.#loading
-              ? html`<div class="empty" role="status"><strong>Loading vendor CLIs…</strong><span>Checking installed sources and available versions.</span></div>`
-              : html`<div class="empty" role="alert"><strong>Vendor CLIs could not be loaded.</strong><span>Retrying automatically when the server is available.</span></div>`
+              ? html`<div class="empty" role="status"><strong>Loading agent runtimes…</strong><span>Checking installed sources and available versions.</span></div>`
+              : html`<div class="empty" role="alert"><strong>Agent runtimes could not be loaded.</strong><span>Retrying automatically when the server is available.</span></div>`
             : clis.length === 0
-              ? html`<div class="empty"><strong>No vendor CLIs reported.</strong><span>This server did not return any supported vendor binaries.</span></div>`
+              ? html`<div class="empty"><strong>No agent runtimes reported.</strong><span>This server did not return any supported vendor runtimes.</span></div>`
               : html`<div class="cli-list">${clis.map((cli, index) => this.#renderCli(cli, index))}</div>`}
         </section>
       </section>
@@ -321,7 +323,9 @@ export class TrouveCliSettings extends LitElement {
                   : html`<progress max="100" value=${percent} aria-label=${`${cli.display_name} download ${percent}% complete`}></progress>`}
               </div>
             `
-          : status.status === "failed"
+          : status.warning
+            ? html`<small class="install-warning" role="status">${status.warning}</small>`
+            : status.status === "failed"
             ? html`<small class="install-error" role="alert">Installation failed. Retry the install or check the server logs.</small>`
             : nothing}
 
@@ -351,7 +355,7 @@ export class TrouveCliSettings extends LitElement {
     if (protocol === undefined) {
       this.#clis = undefined;
       this.#loading = false;
-      this.#message = "Vendor CLI status is unavailable. Retrying automatically.";
+      this.#message = "Agent runtime status is unavailable. Retrying automatically.";
       this.#error = true;
       this.#scheduleStatusRefresh(CLI_STATUS_RETRY_MS);
       this.requestUpdate();
@@ -362,7 +366,7 @@ export class TrouveCliSettings extends LitElement {
     const request = ++this.#loadRequest;
     this.#stopPolling();
     this.#loading = true;
-    this.#message = "Loading vendor CLI status…";
+    this.#message = "Loading agent runtime status…";
     this.#error = false;
     this.requestUpdate();
     try {
@@ -390,7 +394,7 @@ export class TrouveCliSettings extends LitElement {
       this.#error = partialFailure;
     } catch {
       if (!this.#loadIsCurrent(lifecycle, request)) return;
-      this.#message = "Vendor CLI status could not be loaded. Retrying automatically.";
+      this.#message = "Agent runtime status could not be loaded. Retrying automatically.";
       this.#error = true;
     } finally {
       if (this.#loadIsCurrent(lifecycle, request)) {
