@@ -308,6 +308,7 @@ fn vertex_events(
         let mut buffer = crate::sse::LineBuffer::default();
         let mut usage = Usage::default();
         let mut call_index = 0_u64;
+        let mut thinking_active = false;
         while let Some(chunk) = bytes.next().await {
             let chunk = match chunk {
                 Ok(chunk) => chunk,
@@ -325,6 +326,13 @@ fn vertex_events(
                 };
                 let data = data.trim();
                 if data == "[DONE]" {
+                    if thinking_active {
+                        let _ = tx
+                            .send(Ok(ProviderEvent::ThinkingCompleted {
+                                id: "reasoning".into(),
+                            }))
+                            .await;
+                    }
                     let _ = tx.send(Ok(ProviderEvent::Completed { usage })).await;
                     return;
                 }
@@ -353,12 +361,32 @@ fn vertex_events(
                             .await;
                     }
                     if let Some(text) = part["text"].as_str().filter(|text| !text.is_empty()) {
-                        let event = if part["thought"].as_bool() == Some(true) {
-                            ProviderEvent::ThinkingDelta(text.into())
+                        if part["thought"].as_bool() == Some(true) {
+                            if !thinking_active {
+                                let _ = tx
+                                    .send(Ok(ProviderEvent::ThinkingStarted {
+                                        id: "reasoning".into(),
+                                    }))
+                                    .await;
+                                thinking_active = true;
+                            }
+                            let _ = tx
+                                .send(Ok(ProviderEvent::ThinkingDelta {
+                                    id: "reasoning".into(),
+                                    text: text.into(),
+                                }))
+                                .await;
                         } else {
-                            ProviderEvent::TextDelta(text.into())
-                        };
-                        let _ = tx.send(Ok(event)).await;
+                            if thinking_active {
+                                let _ = tx
+                                    .send(Ok(ProviderEvent::ThinkingCompleted {
+                                        id: "reasoning".into(),
+                                    }))
+                                    .await;
+                                thinking_active = false;
+                            }
+                            let _ = tx.send(Ok(ProviderEvent::TextDelta(text.into()))).await;
+                        }
                     }
                     if let Some(call) = part.get("functionCall") {
                         let name = call["name"].as_str().unwrap_or("vertex-tool");
@@ -377,6 +405,13 @@ fn vertex_events(
                 }
             }
         }
+        if thinking_active {
+            let _ = tx
+                .send(Ok(ProviderEvent::ThinkingCompleted {
+                    id: "reasoning".into(),
+                }))
+                .await;
+        }
         let _ = tx.send(Ok(ProviderEvent::Completed { usage })).await;
     });
     Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))
@@ -385,6 +420,45 @@ fn vertex_events(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn reasoning_lifecycle_survives_interleaved_function_calls() {
+        let payload = concat!(
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"thought\":true,\"text\":\"inspect\"}]}}]}\n\n",
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"id\":\"call-1\",",
+            "\"name\":\"read_file\",\"args\":{}}}]}}]}\n\n",
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"thought\":true,\"text\":\" continue\"}]}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let source = futures::stream::iter([Ok::<_, reqwest::Error>(bytes::Bytes::from(payload))]);
+        let events: Vec<_> = vertex_events(source).collect().await;
+
+        assert_eq!(events.len(), 6);
+        assert!(matches!(
+            &events[0],
+            Ok(ProviderEvent::ThinkingStarted { id }) if id == "reasoning"
+        ));
+        assert!(matches!(
+            &events[1],
+            Ok(ProviderEvent::ThinkingDelta { id, text })
+                if id == "reasoning" && text == "inspect"
+        ));
+        assert!(matches!(
+            &events[2],
+            Ok(ProviderEvent::ToolCall(call))
+                if call.id == "call-1" && call.name == "read_file"
+        ));
+        assert!(matches!(
+            &events[3],
+            Ok(ProviderEvent::ThinkingDelta { id, text })
+                if id == "reasoning" && text == " continue"
+        ));
+        assert!(matches!(
+            &events[4],
+            Ok(ProviderEvent::ThinkingCompleted { id }) if id == "reasoning"
+        ));
+        assert!(matches!(&events[5], Ok(ProviderEvent::Completed { .. })));
+    }
 
     #[test]
     fn request_maps_tools_and_native_thinking_config() {
