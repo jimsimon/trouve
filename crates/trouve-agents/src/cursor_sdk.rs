@@ -954,7 +954,7 @@ impl PooledBridge {
     }
 
     fn is_reusable(&self) -> bool {
-        self.reusable.load(Ordering::Acquire)
+        self.reusable.load(Ordering::Acquire) && self.callback.listener_is_running()
     }
 
     fn quarantine(&self) {
@@ -1943,7 +1943,7 @@ struct CallbackRouter {
     state: CallbackState,
     http: reqwest::Client,
     shutdown: CancellationToken,
-    task: Mutex<Option<tokio::task::JoinHandle<std::io::Result<()>>>>,
+    task: StdMutex<Option<tokio::task::JoinHandle<std::io::Result<()>>>>,
 }
 
 struct CallbackRouteLease {
@@ -1995,8 +1995,16 @@ impl CallbackRouter {
             state,
             http,
             shutdown,
-            task: Mutex::new(Some(task)),
+            task: StdMutex::new(Some(task)),
         })
+    }
+
+    fn listener_is_running(&self) -> bool {
+        self.task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(|task| !task.is_finished())
     }
 
     fn accepts_agent_id(&self, agent_id: &str) -> bool {
@@ -2134,7 +2142,12 @@ impl CallbackRouter {
             )
         });
         self.shutdown.cancel();
-        let listener_result = if let Some(mut task) = self.task.lock().await.take() {
+        let task = self
+            .task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let listener_result = if let Some(mut task) = task {
             match tokio::time::timeout_at(deadline, &mut task).await {
                 Ok(Ok(result)) => result,
                 Ok(Err(error)) => Err(std::io::Error::other(format!(
@@ -4475,6 +4488,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn callback_listener_failure_revokes_bridge_reuse_health() {
+        let callback = CallbackRouter::start(reqwest::Client::new()).await.unwrap();
+        assert!(callback.listener_is_running());
+        callback
+            .task
+            .lock()
+            .unwrap()
+            .as_ref()
+            .expect("callback listener task is present")
+            .abort();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while callback.listener_is_running() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("aborted callback listener still appeared reusable");
+        assert!(callback.stop().await.is_err());
+    }
+
+    #[tokio::test]
     async fn shared_callback_router_isolates_agents_tools_and_cancellation() {
         let blocked_started = Arc::new(Semaphore::new(0));
         let handler_started = blocked_started.clone();
@@ -5146,7 +5181,7 @@ mod tests {
             .await;
         assert_eq!(cleanup.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
         assert!(
-            callback.task.lock().await.is_none(),
+            callback.task.lock().unwrap().is_none(),
             "route timeout left the callback listener task running"
         );
         assert!(
