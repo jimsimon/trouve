@@ -1729,7 +1729,7 @@ impl LocalToolExecutor {
             Arc::new(shell::ShellOutput { jobs: jobs.clone() }),
             Arc::new(shell::ShellKill { jobs: jobs.clone() }),
             Arc::new(grep::Grep),
-            Arc::new(web::WebFetch::default()),
+            Arc::new(web::WebFetch),
             Arc::new(todo::TodoWrite),
             Arc::new(search::Search {
                 cache: search_cache.clone(),
