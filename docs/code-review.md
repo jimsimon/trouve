@@ -113,8 +113,10 @@ HTTPS endpoint:
 
 Issue comment delivery is the immediate path for `@trouve-ai review`, `resolve`,
 and `unresolve`. Polling remains enabled as a fallback for newly discovered
-comments missed by webhook delivery. Comments already seen before command
-polling was introduced are treated as inspected and are not backfilled.
+threadless `resolve` and `unresolve` commands missed by webhook delivery; it
+does not recover missed `@trouve-ai review` commands. Comments already seen
+before command polling was introduced are treated as inspected and are not
+backfilled.
 
 After creating it:
 

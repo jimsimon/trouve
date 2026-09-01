@@ -1384,15 +1384,17 @@ fn parse_threadless_resolve_command(body: &str) -> Option<ThreadlessCommandParse
     None
 }
 
+fn is_trusted_threadless_command_author(author_association: &str, user_kind: Option<&str>) -> bool {
+    !user_kind.is_some_and(|kind| kind.eq_ignore_ascii_case("bot"))
+        && matches!(author_association, "OWNER" | "MEMBER" | "COLLABORATOR")
+}
+
 fn threadless_resolve_comment(payload: &serde_json::Value) -> Option<ThreadlessResolveCommand> {
     if payload["action"].as_str()? != "created"
         || !payload["issue"]["pull_request"].is_object()
-        || payload["comment"]["user"]["type"]
-            .as_str()
-            .is_some_and(|kind| kind.eq_ignore_ascii_case("bot"))
-        || !matches!(
+        || !is_trusted_threadless_command_author(
             payload["comment"]["author_association"].as_str()?,
-            "OWNER" | "MEMBER" | "COLLABORATOR"
+            payload["comment"]["user"]["type"].as_str(),
         )
     {
         return None;
@@ -1452,13 +1454,9 @@ fn polled_threadless_resolve_command(
     comment: &GithubIssueComment,
 ) -> Option<crate::store::PendingThreadlessCommand> {
     if comment.id == 0
-        || comment
-            .user
-            .as_ref()
-            .is_some_and(|user| user.kind.eq_ignore_ascii_case("bot"))
-        || !matches!(
-            comment.author_association.as_str(),
-            "OWNER" | "MEMBER" | "COLLABORATOR"
+        || !is_trusted_threadless_command_author(
+            &comment.author_association,
+            comment.user.as_ref().map(|user| user.kind.as_str()),
         )
     {
         return None;
