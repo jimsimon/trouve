@@ -428,8 +428,8 @@ impl Shell {
         pump(child.take_stdout(), output.clone());
         pump(child.take_stderr(), output.clone());
         let child = Arc::new(tokio::sync::Mutex::new(child));
-        let mutation_lease = ctx
-            .background_mutation_lease
+        let background_mutation_lease = ctx.background_mutation_lease.clone();
+        let mutation_guard = background_mutation_lease
             .as_ref()
             .and_then(|lease| lease.take());
 
@@ -441,8 +441,10 @@ impl Shell {
             let child = child.clone();
             let output = output.clone();
             let cleanup = self.jobs.cleanup.clone();
+            let background_mutation_lease = background_mutation_lease.clone();
             tokio::spawn(async move {
-                let _mutation_lease = mutation_lease;
+                let _mutation_guard = mutation_guard;
+                let _background_mutation_lease = background_mutation_lease;
                 loop {
                     let status = child.lock().await.try_wait_tree();
                     match status {
@@ -520,10 +522,13 @@ impl Shell {
                 },
             );
         }
+        if let Some(lease) = &ctx.background_mutation_lease {
+            lease.set_job_id(id.clone());
+        }
         ToolResult::ok(json!({
             "job_id": id,
             "pid": pid,
-            "note": "running in background; read output with shell_output, stop with shell_kill",
+            "note": "running in background and holding the session tool lane; only shell_output and shell_kill are available until it exits",
         }))
     }
 }

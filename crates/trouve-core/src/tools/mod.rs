@@ -593,6 +593,7 @@ async fn run_optional_review_fetches(
 /// dropped.
 pub struct BackgroundMutationLease {
     guard: Mutex<Option<tokio::sync::OwnedRwLockWriteGuard<()>>>,
+    job_id: Mutex<Option<String>>,
 }
 
 impl std::fmt::Debug for BackgroundMutationLease {
@@ -600,6 +601,7 @@ impl std::fmt::Debug for BackgroundMutationLease {
         formatter
             .debug_struct("BackgroundMutationLease")
             .field("available", &self.guard.lock().unwrap().is_some())
+            .field("job_id", &self.job_id.lock().unwrap())
             .finish()
     }
 }
@@ -608,11 +610,20 @@ impl BackgroundMutationLease {
     pub(crate) fn new(guard: tokio::sync::OwnedRwLockWriteGuard<()>) -> Self {
         Self {
             guard: Mutex::new(Some(guard)),
+            job_id: Mutex::new(None),
         }
     }
 
     pub(crate) fn take(&self) -> Option<tokio::sync::OwnedRwLockWriteGuard<()>> {
         self.guard.lock().unwrap().take()
+    }
+
+    pub(crate) fn set_job_id(&self, job_id: String) {
+        *self.job_id.lock().unwrap() = Some(job_id);
+    }
+
+    pub(crate) fn job_id(&self) -> Option<String> {
+        self.job_id.lock().unwrap().clone()
     }
 }
 
