@@ -37,12 +37,12 @@ const entryLimit = mode === "desktop" ? 856_000 : 850_000;
 // the scope-verdict causal-waypoint evidence schema and schema-driven model-
 // option editors, exact model-option number preservation (including the
 // WebKit fallback), and the dedicated background-activity event. The combined
-// graphs emit 3,274,761 B for desktop and 3,259,906 B for PWA after adding the
-// durable PR-mention event schema; preserve less than 2 kB of headroom for
-// each. Entry,
+// graphs emit 3,280,024 B for desktop and 3,265,169 B for PWA after combining
+// the durable PR-mention event with identity-aware reasoning lifecycle schemas;
+// preserve less than 2 kB of headroom for each. Entry,
 // worker, and largest-chunk budgets below still prevent one bundle from hiding
 // in the aggregate.
-const totalJavaScriptLimit = mode === "desktop" ? 3_276_000 : 3_261_000;
+const totalJavaScriptLimit = mode === "desktop" ? 3_281_000 : 3_266_000;
 // Version-check, transcript-search, compact navigation, and the sticky
 // multi-mode usage panel with thread/session model rows plus workspace
 // organization styling bring the clean artifact to 190,958 B. Preserve less
