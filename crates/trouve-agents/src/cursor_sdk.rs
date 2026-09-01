@@ -70,7 +70,7 @@ const MAX_RETIRED_AGENT_IDS_PER_PROCESS: usize = 16 * 1024;
 const MAX_CALLBACK_REPLAY_RECORDS: usize = 64;
 const MAX_CALLBACK_REPLAY_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CALLBACK_CONCURRENCY: usize = 8;
-const MAX_CALLBACK_HTTP_CONCURRENCY: usize = 16;
+const MAX_CALLBACK_HTTP_CONCURRENCY: usize = MAX_CONCURRENT_TURNS * MAX_CALLBACK_CONCURRENCY;
 const MAX_LEGACY_SESSION_MARKER_BYTES: u64 = 4 * 1024;
 const READY_PREFIX: &str = "cursor-sdk-bridge ready ";
 const CALLBACK_PATH: &str = "/sdk.v1.SdkCustomToolCallbackService/CallCustomTool";
@@ -1660,6 +1660,7 @@ struct CallbackRoute {
     allowed_tools: Arc<HashSet<String>>,
     http: reqwest::Client,
     supervisor: Arc<CallbackSupervisor>,
+    request_slots: Arc<Semaphore>,
     identities: Arc<StdMutex<CallbackIdentities>>,
     streamed_call_ids: StdMutex<HashSet<CallbackKey>>,
     owner_reusable: Option<Weak<AtomicBool>>,
@@ -2063,6 +2064,7 @@ impl CallbackRouter {
             allowed_tools: Arc::new(allowed_tools),
             http: self.http.clone(),
             supervisor: supervisor.clone(),
+            request_slots: Arc::new(Semaphore::new(MAX_CALLBACK_CONCURRENCY)),
             identities: self.state.identities.clone(),
             streamed_call_ids: StdMutex::new(HashSet::new()),
             owner_reusable,
@@ -2313,6 +2315,13 @@ async fn custom_tool_callback(
             "callback agent route is shutting down",
         );
     }
+    let Ok(_route_permit) = route.request_slots.clone().try_acquire_owned() else {
+        return callback_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "resource_exhausted",
+            "too many custom-tool callback requests are active for this Cursor route",
+        );
+    };
     if request.tool_name.is_empty() || !request.args.is_object() {
         return callback_error(
             StatusCode::BAD_REQUEST,
@@ -4626,6 +4635,143 @@ mod tests {
         assert_eq!(surviving.status(), StatusCode::OK);
 
         route_b.stop().await;
+        callback.stop().await.unwrap();
+        mcp_server.abort();
+    }
+
+    #[tokio::test]
+    async fn shared_callback_router_reserves_ingress_for_every_admitted_route() {
+        let callbacks_started = Arc::new(Semaphore::new(0));
+        let callbacks_release = Arc::new(Semaphore::new(0));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let mcp_server = tokio::spawn({
+            let callbacks_started = callbacks_started.clone();
+            let callbacks_release = callbacks_release.clone();
+            async move {
+                axum::serve(
+                    listener,
+                    Router::new().route(
+                        "/mcp",
+                        post(move || {
+                            let callbacks_started = callbacks_started.clone();
+                            let callbacks_release = callbacks_release.clone();
+                            async move {
+                                callbacks_started.add_permits(1);
+                                callbacks_release.acquire().await.unwrap().forget();
+                                Json(json!({
+                                    "jsonrpc": "2.0",
+                                    "id": "fixture",
+                                    "result": { "content": [] }
+                                }))
+                            }
+                        }),
+                    ),
+                )
+                .await
+            }
+        });
+        let callback = CallbackRouter::start(reqwest::Client::new()).await.unwrap();
+        let mut route_a = callback
+            .register(
+                "agent-a".into(),
+                Some(format!("http://{address}/mcp")),
+                HashSet::from(["shared_tool".into()]),
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        let mut route_b = callback
+            .register(
+                "agent-b".into(),
+                Some(format!("http://{address}/mcp")),
+                HashSet::from(["shared_tool".into()]),
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        let mut route_c = callback
+            .register(
+                "agent-c".into(),
+                Some(format!("http://{address}/mcp")),
+                HashSet::from(["shared_tool".into()]),
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        let http = reqwest::Client::new();
+        let callback_url = format!("{}{}", callback.url, CALLBACK_PATH);
+        let bearer = callback.bearer.clone();
+        let send_callback = |agent_id: &'static str, call_id: String| {
+            let http = http.clone();
+            let callback_url = callback_url.clone();
+            let bearer = bearer.clone();
+            tokio::spawn(async move {
+                http.post(callback_url)
+                    .bearer_auth(bearer)
+                    .json(&json!({
+                        "toolName": "shared_tool",
+                        "toolCallId": call_id,
+                        "agentId": agent_id,
+                        "args": {},
+                    }))
+                    .send()
+                    .await
+            })
+        };
+
+        let mut blocked = Vec::new();
+        for agent_id in ["agent-a", "agent-b"] {
+            for index in 0..MAX_CALLBACK_CONCURRENCY {
+                blocked.push(send_callback(agent_id, format!("{agent_id}-{index}")));
+            }
+        }
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            callbacks_started.acquire_many(u32::try_from(2 * MAX_CALLBACK_CONCURRENCY).unwrap()),
+        )
+        .await
+        .expect("the first two routes did not fill their callback reservations")
+        .unwrap()
+        .forget();
+
+        let overloaded = send_callback("agent-a", "agent-a-over-capacity".into())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(overloaded.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let third = send_callback("agent-c", "agent-c-0".into());
+        tokio::time::timeout(Duration::from_secs(1), callbacks_started.acquire())
+            .await
+            .expect("two routes exhausted the third route's callback capacity")
+            .unwrap()
+            .forget();
+        callbacks_release.add_permits(2 * MAX_CALLBACK_CONCURRENCY + 1);
+
+        let third_response = tokio::time::timeout(Duration::from_secs(1), third)
+            .await
+            .expect("the third route callback did not settle")
+            .unwrap()
+            .unwrap();
+        assert_eq!(third_response.status(), StatusCode::OK);
+        for request in blocked {
+            let response = tokio::time::timeout(Duration::from_secs(1), request)
+                .await
+                .expect("a saturated route callback did not settle")
+                .unwrap()
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        assert!(route_a.stop().await);
+        assert!(route_b.stop().await);
+        assert!(route_c.stop().await);
         callback.stop().await.unwrap();
         mcp_server.abort();
     }
