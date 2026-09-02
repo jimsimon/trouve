@@ -63,10 +63,6 @@ export interface SessionPullRequestIdentity {
   readonly branch: string;
 }
 
-interface SessionPullRequestMentions {
-  readonly urls: ReadonlySet<string>;
-}
-
 /** Latest durable account-level PR slice for one GitHub host. The event
  * timestamp drives freshness UI; the per-host cursor prevents a delayed
  * replay from replacing newer account data. */
@@ -174,14 +170,12 @@ export const projectSessionPullRequests = (
   session: SessionPullRequestIdentity,
   lists: readonly ProtocolGithubPrList[],
   known: readonly ProtocolPrInfo[] = [],
-  mentions?: SessionPullRequestMentions,
 ): readonly ProtocolPrInfo[] => {
   const projected: ProtocolPrInfo[] = [];
   for (const pr of lists.flatMap((list) => list.prs)) {
     const exactBranch =
       pr.workspace_id === session.workspaceId && pr.head === session.branch;
-    const mentioned = mentions?.urls.has(pr.url.replace(/\/$/u, "").toLowerCase()) === true;
-    if (exactBranch || mentioned || known.some((candidate) => samePullRequest(candidate, pr))) {
+    if (exactBranch || known.some((candidate) => samePullRequest(candidate, pr))) {
       projected.push(pr);
     }
   }
@@ -222,7 +216,6 @@ export class AppStore {
   readonly #sessionUsageRevisions = new Map<string, number>();
   readonly #githubPullRequests = new Map<string, GithubPullRequestSnapshot>();
   readonly #sessionPullRequests = new Map<string, readonly ProtocolPrInfo[]>();
-  readonly #sessionPullRequestMentions = new Map<string, SessionPullRequestMentions>();
   #serverProjectionCursor = 0;
   readonly #threadViews = new Map<string, ThreadViewModel>();
   readonly #threadTodoEvents = new Map<string, readonly ProtocolTodoItem[]>();
@@ -319,7 +312,6 @@ export class AppStore {
     this.#sessionSummaries.delete(sessionId);
     this.#seenSessionCursors.delete(sessionId);
     this.#sessionPullRequests.delete(sessionId);
-    this.#sessionPullRequestMentions.delete(sessionId);
     this.#sessionUsageRevisions.delete(sessionId);
     for (const [threadId, thread] of this.#threads) {
       if (thread.session_id === sessionId) {
@@ -575,7 +567,6 @@ export class AppStore {
       session,
       [...this.#githubPullRequests.values()].map(({ pullRequests }) => pullRequests),
       this.#sessionPullRequests.get(sessionId) ?? [],
-      this.#sessionPullRequestMentions.get(sessionId),
     );
   }
 
@@ -853,15 +844,6 @@ export class AppStore {
       case "session.deleted":
         this.removeSession(envelope.session_id, envelope.cursor);
         return false;
-      case "session.pr_mentioned": {
-        if (this.#deletedSessions.has(envelope.session_id)) return false;
-        const current = this.#sessionPullRequestMentions.get(envelope.session_id);
-        const urls = new Set(current?.urls ?? []);
-        urls.add(envelope.url.replace(/\/$/u, "").toLowerCase());
-        this.#sessionPullRequestMentions.set(envelope.session_id, Object.freeze({ urls }));
-        this.#touch();
-        return false;
-      }
       case "github.pull_requests_updated": {
         const host = envelope.pull_requests.host;
         const current = this.#githubPullRequests.get(host);

@@ -46,9 +46,8 @@ const pullRequestStatus = (pr: ProtocolPrInfo): PullRequestBadgeStatus => {
   };
 };
 
-/** Account snapshots are also the established sidebar source. PRs created
- * from the session lead mention-only associations, then open and newer PRs
- * lead within each provenance group. */
+/** Account snapshots are also the established sidebar source. Matching
+ * session-branch PRs are presented open-first and newest-first. */
 export const pullRequestsForSession = (
   session: SessionPullRequestIdentity,
   lists: readonly ProtocolGithubPrList[],
