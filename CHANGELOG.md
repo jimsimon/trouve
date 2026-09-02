@@ -6,6 +6,22 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [4.8.0] - 2026-09-02
+
+This release preserves model-produced media in conversations, adds faster and
+clearer model controls, and makes every pull-request review cover the complete
+branch while improving background-job concurrency and session accuracy.
+
+### Added
+
+- **Durable assistant media**: screenshots, audio, video, and embedded binary
+  resources returned by first-party or MCP tools are stored as bounded
+  attachments, recorded in the event log, and rendered in chat with the
+  existing image and video previews.
+- **Schema-driven Fast controls**: supported Codex and Cursor models expose
+  provider-declared Fast options in New Session, New Thread, and the chat
+  composer; Codex selections are forwarded as service-tier overrides.
+
 ### Changed
 
 - **Full-branch review on every head**: automatic, manual, and retried reviews
@@ -14,10 +30,25 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   dismissal, root-cause, rejection, external-thread, and carried-anchor history
   continues to inform later rounds.
 - **Client/server compatibility**: protocol compatibility advances to 8.0.
-  Upgrade the desktop, PWA, review dashboard, and `trouve-server` together. A
-  derived compatibility-pending and exhausted states keep clean pre-8.0
+  Upgrade the desktop, PWA, review dashboard, and `trouve-server` together.
+  Derived compatibility-pending and exhausted states keep clean pre-8.0
   partial results neutral while the server performs a bounded full-branch
   migration review and surface when a manual retry is required.
+- **Non-blocking managed background jobs**: launching a managed background
+  shell job now releases the session mutation lane immediately, so later tools
+  can poll or stop the process and continue other work without surrendering
+  process-tree ownership or cleanup.
+
+### Fixed
+
+- **Accurate, faster session pull-request associations**: pull requests are
+  associated only through matching branches or verified creation evidence;
+  chat-only URL mentions no longer create associations, and large databases no
+  longer require a historical transcript scan during startup.
+- **Reliable Claude usage and session controls**: compact Max-plan usage
+  buckets, percentage fields, and reset aliases are accepted across Claude CLI
+  surfaces, while New Session restores prompt-first controls, effective
+  reasoning defaults, optional branch labels, and a separate YOLO warning.
 
 ### Removed
 
@@ -1092,6 +1123,7 @@ semble ([BENCHMARKS.md](BENCHMARKS.md)):
 - Incremental reindex (1 file touched): 0.86 s vs ~3 min (212x)
 - Warm query: 0.55 s vs 7.2 s (13x)
 
+[4.8.0]: https://github.com/jimsimon/trouve/compare/v4.7.0...v4.8.0
 [4.7.0]: https://github.com/jimsimon/trouve/compare/v4.6.0...v4.7.0
 [4.6.0]: https://github.com/jimsimon/trouve/compare/v4.5.0...v4.6.0
 [4.5.0]: https://github.com/jimsimon/trouve/compare/v4.4.0...v4.5.0
