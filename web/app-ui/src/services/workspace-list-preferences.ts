@@ -40,7 +40,7 @@ export interface WorkspaceListPreferencesStorage {
 export const DEFAULT_WORKSPACE_LIST_PREFERENCES: WorkspaceListPreferences = Object.freeze({
   grouping: "repository",
   ordering: "updated",
-  showBranches: true,
+  showBranches: false,
   showStatus: true,
   filters: Object.freeze({}),
 });
@@ -86,7 +86,7 @@ export const normalizeWorkspaceListPreferences = (
     ordering: ordering(source["ordering"]),
     showBranches: typeof source["showBranches"] === "boolean"
       ? source["showBranches"]
-      : true,
+      : false,
     showStatus: typeof source["showStatus"] === "boolean"
       ? source["showStatus"]
       : true,

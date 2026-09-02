@@ -535,6 +535,11 @@ const installProtocolFixtures = async (
               enum: ["300k", "1m"],
               default: "300k",
             },
+            fast: {
+              type: "boolean",
+              default: false,
+              description: "Run faster with increased usage",
+            },
           },
         },
       }],
@@ -2261,6 +2266,8 @@ test("regular thread tabs can be closed and reopened from the session menu", asy
   ).click();
   await expect(page.getByRole("form", { name: "New thread setup (provisional)" }))
     .toBeVisible();
+  await expect(page.getByRole("form", { name: "New thread setup (provisional)" })
+    .getByRole("combobox", { name: "Fast", exact: true })).toBeVisible();
   const setupUsagePlaceholder = page.getByText(
     "Subscription and model usage details will show here once a session is started.",
     { exact: true },
@@ -2426,10 +2433,12 @@ test("turn cards unify prompt, activity, and response while preserving copy acti
   await page.goto("/");
   await replayHistory(page);
 
-  const thinking = page.getByRole("combobox", { name: "Reasoning effort", exact: true });
+  const thinking = page.getByRole("combobox", { name: "Reasoning", exact: true });
   await expect(thinking).toHaveValue("max");
   await expect(thinking.locator("option:checked")).toHaveText("Max");
   await expect(page.getByRole("combobox", { name: "Context", exact: true })).toHaveValue("1m");
+  await expect(page.getByRole("combobox", { name: "Fast", exact: true })
+    .locator("option:checked")).toHaveText("Model default · Off");
   await expect(page.locator(".conversation-turn")).toHaveCount(1);
   const agentCard = page.locator(".conversation-turn").first();
   await expect(agentCard).toHaveAccessibleName("Turn 7");

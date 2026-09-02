@@ -529,6 +529,7 @@ impl AgentBackend for CodexBackend {
             turn_params["model"] = json!(model_name);
         }
         apply_reasoning_options(&mut turn_params, effort);
+        apply_service_tier_option(&mut turn_params, &turn.model_options);
         let turn_request_started = std::time::Instant::now();
         let (codex_turn_id, cleanup) = match server
             .start_turn(&codex_thread_id, &route.tx, turn_params, lifecycle, &cancel)
@@ -627,6 +628,14 @@ fn apply_reasoning_options(params: &mut Value, effort: Option<&str>) {
     params["summary"] = json!("none");
     if let Some(effort) = effort {
         params["effort"] = json!(effort);
+    }
+}
+
+/// Fast mode is a per-turn Codex service-tier override. Omission preserves the
+/// user's Codex default; an explicit Off selection restores the standard tier.
+fn apply_service_tier_option(params: &mut Value, options: &serde_json::Map<String, Value>) {
+    if let Some(fast) = options.get("fast").and_then(Value::as_bool) {
+        params["serviceTier"] = json!(if fast { "priority" } else { "default" });
     }
 }
 
@@ -5346,6 +5355,26 @@ mod tests {
         apply_reasoning_options(&mut without_effort, None);
         assert_eq!(without_effort["summary"], "none");
         assert!(without_effort["effort"].is_null());
+    }
+
+    #[test]
+    fn turn_maps_fast_mode_to_codex_service_tier() {
+        let mut params = json!({});
+        apply_service_tier_option(
+            &mut params,
+            &serde_json::Map::from_iter([("fast".into(), json!(true))]),
+        );
+        assert_eq!(params["serviceTier"], "priority");
+
+        apply_service_tier_option(
+            &mut params,
+            &serde_json::Map::from_iter([("fast".into(), json!(false))]),
+        );
+        assert_eq!(params["serviceTier"], "default");
+
+        let mut inherited = json!({});
+        apply_service_tier_option(&mut inherited, &serde_json::Map::new());
+        assert!(inherited["serviceTier"].is_null());
     }
 
     #[test]

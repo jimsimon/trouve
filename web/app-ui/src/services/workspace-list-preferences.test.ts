@@ -22,6 +22,10 @@ describe("workspace list preferences", () => {
     });
   });
 
+  it("hides branch names by default", () => {
+    expect(normalizeWorkspaceListPreferences(undefined).showBranches).toBe(false);
+  });
+
   it("persists global choices and independent workspace filters", () => {
     const saved: unknown[] = [];
     const controller = new WorkspaceListPreferencesController({
