@@ -388,10 +388,11 @@ describe("Trouve visual contract", () => {
     expect(shell).toContain('id="new-session-screen"');
     expect(shell).toContain('class="thread-panel new-session-screen"');
     expect(shell).not.toContain('id="new-session-dialog"');
-    expect(shell).toContain("Pick where to work, what to branch from, and how the agent should run.");
+    expect(shell).toContain("What do you want to do today?");
     expect(shell).toContain("Use latest remote branch");
     expect(app).toMatch(/\.new-session-screen \{[^}]*grid-column:\s*3[^}]*grid-row:\s*1/s);
     expect(app).toMatch(/\.new-session-screen form \{[^}]*align-content:\s*center[^}]*padding:\s*40px/s);
+    expect(app).toMatch(/\.new-session-screen \.dialog-option-grid \{[^}]*display:\s*flex[^}]*overflow-x:\s*auto/s);
     expect(app).toMatch(/\.new-session-screen\[hidden\] \{[^}]*display:\s*none\s*!important/s);
   });
 

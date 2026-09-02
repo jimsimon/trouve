@@ -5,6 +5,7 @@ import { jsonNumberValueToken } from "../services/protocol-json.js";
 import {
   type ModelOptionChangeDetail,
   type ModelOptionControl,
+  isThinkingModelOption,
   modelOptionScalarValue,
   modelOptionTextValue,
   type TextModelOptionControl,
@@ -123,6 +124,8 @@ export class TrouveModelOptionsEditor extends LitElement {
 
   override render() {
     return this.controls.map((control, index) => {
+      const thinking = isThinkingModelOption(control.key);
+      const label = thinking ? "Reasoning" : control.label;
       const descriptionId = control.description === ""
         ? nothing
         : `model-option-description-${index}`;
@@ -130,9 +133,9 @@ export class TrouveModelOptionsEditor extends LitElement {
         const overridden = control.overridden ?? true;
         return html`
           <label title=${this.compact ? control.description : nothing}>
-            <span class="option-label">${control.label}</span>
+            <span class="option-label">${label}</span>
             <select
-              aria-label=${control.label}
+              aria-label=${label}
               aria-describedby=${descriptionId}
               ?disabled=${this.disabled}
               @change=${(event: Event) => {
@@ -151,20 +154,22 @@ export class TrouveModelOptionsEditor extends LitElement {
                 }
               }}
             >
-              <option
-                value=""
-                data-model-default="true"
-                .selected=${live(!overridden)}
-              >
-                Model default${control.selectedIndex < 0
-                  ? ""
-                  : ` · ${control.choices[control.selectedIndex]?.label ?? ""}`}
-              </option>
+              ${thinking
+                ? nothing
+                : html`<option
+                    value=""
+                    data-model-default="true"
+                    .selected=${live(!overridden)}
+                  >
+                    Model default${control.selectedIndex < 0
+                      ? ""
+                      : ` · ${control.choices[control.selectedIndex]?.label ?? ""}`}
+                  </option>`}
               ${control.choices.map((choice, index) =>
                 html`<option
                   value=${String(modelOptionScalarValue(choice.value))}
                   data-choice-index=${String(index)}
-                  .selected=${live(overridden && index === control.selectedIndex)}
+                  .selected=${live((thinking || overridden) && index === control.selectedIndex)}
                 >${choice.label}</option>`
               )}
             </select>

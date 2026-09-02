@@ -285,6 +285,11 @@ test("new-session selects stay synchronized with asynchronously loaded defaults"
                 enum: ["low", "high"],
                 default: "low",
               },
+              fast: {
+                type: "boolean",
+                default: false,
+                description: "Run faster with increased usage",
+              },
             },
           },
         },
@@ -332,15 +337,36 @@ test("new-session selects stay synchronized with asynchronously loaded defaults"
   const screen = page.locator("#new-session-screen");
   const baseBranch = screen.locator('select[name="base_ref"]');
   const persona = screen.locator('select[name="mode"]');
-  const thinking = screen.getByRole("combobox", { name: "Reasoning effort", exact: true });
+  const thinking = screen.getByRole("combobox", { name: "Reasoning", exact: true });
+  const fast = screen.getByRole("combobox", { name: "Fast", exact: true });
   const permission = screen.locator('select[name="permission_mode"]');
   await expect(baseBranch).toHaveValue("main");
   await expect(persona).toHaveValue("code");
-  await expect(thinking).toHaveValue("");
-  await expect(thinking.locator("option:checked")).toHaveText("Model default · High");
+  await expect(thinking).toHaveValue("high");
+  await expect(thinking.locator("option:checked")).toHaveText("High");
+  await expect(thinking.locator('option[data-model-default="true"]')).toHaveCount(0);
+  await expect(fast.locator("option:checked")).toHaveText("Model default · Off");
   await expect(permission).toHaveValue("yolo");
   await expect(screen.getByText("Unattended execution (YOLO) is dangerous"))
     .toBeVisible();
+  const controlGeometry = await screen.evaluate((root) => {
+    const controls = [
+      root.querySelector(".new-session-workspace"),
+      root.querySelector(".new-session-branch"),
+      root.querySelector(".new-session-mode"),
+      root.querySelector(".new-session-model"),
+      root.querySelector(".new-session-model-options"),
+      root.querySelector(".new-session-permission"),
+    ].map((control) => {
+      if (!(control instanceof HTMLElement)) throw new Error("missing new-session control");
+      const bounds = control.getBoundingClientRect();
+      return { top: Math.round(bounds.top), width: bounds.width };
+    });
+    return controls;
+  });
+  expect(Math.max(...controlGeometry.map(({ top }) => top))
+    - Math.min(...controlGeometry.map(({ top }) => top))).toBeLessThanOrEqual(8);
+  expect(controlGeometry.at(-1)?.width).toBeLessThanOrEqual(110);
 
   // Reproduce the browser-side drift caused when option lists are replaced
   // after Lit cached the state value. A later render must repair the DOM even
@@ -363,8 +389,8 @@ test("new-session selects stay synchronized with asynchronously loaded defaults"
 
   await expect(baseBranch).toHaveValue("main");
   await expect(persona).toHaveValue("code");
-  await expect(thinking).toHaveValue("");
-  await expect(thinking.locator("option:checked")).toHaveText("Model default · High");
+  await expect(thinking).toHaveValue("high");
+  await expect(thinking.locator("option:checked")).toHaveText("High");
   await expect(permission).toHaveValue("yolo");
 });
 
@@ -372,7 +398,7 @@ test("session navigation shows configured branch names", async ({ page }, testIn
   await page.addInitScript(() => {
     localStorage.setItem(
       "trouve.workspace-list-preferences.v1",
-      JSON.stringify({ showStatus: false }),
+      JSON.stringify({ showBranches: true, showStatus: false }),
     );
   });
   await page.goto("/");
@@ -854,7 +880,7 @@ test("automation create, edit, and pause preserve model options", async ({ page 
   await modelPicker
     .getByRole("option", { name: "codex/gpt-5.6-sol", exact: true })
     .click();
-  const thinking = page.getByRole("combobox", { name: "Reasoning effort", exact: true });
+  const thinking = page.getByRole("combobox", { name: "Reasoning", exact: true });
   await expect(thinking).toBeEnabled();
   await thinking.selectOption("max");
   await page.getByRole("button", { name: "Create", exact: true }).click();
@@ -870,9 +896,9 @@ test("automation create, edit, and pause preserve model options", async ({ page 
   await page.getByRole("button", { name: "Edit", exact: true }).click();
   await expect(page.getByRole("combobox", { name: "Automation model" }))
     .toContainText("codex/gpt-5.6-sol");
-  await expect(page.getByRole("combobox", { name: "Reasoning effort", exact: true }))
+  await expect(page.getByRole("combobox", { name: "Reasoning", exact: true }))
     .toHaveValue("max");
-  await page.getByRole("combobox", { name: "Reasoning effort", exact: true })
+  await page.getByRole("combobox", { name: "Reasoning", exact: true })
     .selectOption("ultra");
   await page.getByRole("button", { name: "Save", exact: true }).click();
 

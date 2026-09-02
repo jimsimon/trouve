@@ -83,6 +83,11 @@ struct CatalogModel {
     temperature: Option<bool>,
     #[serde(default)]
     reasoning_options: Vec<ReasoningOption>,
+    /// Trouve-owned serving surfaces may advertise transport-specific scalar
+    /// controls that models.dev does not describe (for example Fast mode).
+    /// Each value is the JSON Schema property for that option.
+    #[serde(default)]
+    options: Map<String, Value>,
     #[serde(default)]
     limit: ModelLimit,
     #[serde(default)]
@@ -554,7 +559,7 @@ impl CatalogModel {
     }
 
     fn options_schema(&self, dialect: OptionsDialect) -> Value {
-        let mut properties = Map::new();
+        let mut properties = self.options.clone();
         for option in &self.reasoning_options {
             match option.kind.as_str() {
                 "effort" if option.values.len() > 1 => {
@@ -1213,6 +1218,10 @@ mod tests {
                 .pointer("/properties/reasoning_effort/default"),
             Some(&json!("low"))
         );
+        assert_eq!(
+            sol.options_schema.pointer("/properties/fast/default"),
+            Some(&json!(false))
+        );
 
         let luna = models
             .iter()
@@ -1277,6 +1286,10 @@ mod tests {
             .unwrap();
         assert_eq!(composer.context_window, 200_000);
         assert!(composer.supports_tools);
+        assert_eq!(
+            composer.options_schema.pointer("/properties/fast/default"),
+            Some(&json!(false))
+        );
     }
 
     #[test]
