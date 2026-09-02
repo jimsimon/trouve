@@ -347,11 +347,11 @@ pub use requests::*;
 // session.pr_mentioned event remains replay-only.
 // 7.31: assistant.artifacts events and folded artifact items expose durable
 // model/tool-produced files without embedding media bytes in the event log.
-// 8.0: code review always covers the complete pull-request branch at the
-// exact head. Manual requests no longer select a scope, and jobs no longer
-// expose incremental watermarks or raw coverage markers. Derived legacy
-// compatibility-pending and exhausted states remain available while pre-8.0
-// rows settle through bounded full-branch reviews (breaking).
+// 8.0: new code reviews always cover the complete pull-request branch at the
+// exact head. Manual requests no longer select a scope, and new jobs omit
+// incremental watermarks and raw coverage markers. Historical rows may still
+// expose their legacy scope and review base for compatibility; derived pending
+// and exhausted states describe their bounded full-branch migration (breaking).
 pub const PROTOCOL_VERSION: &str = "8.0";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";

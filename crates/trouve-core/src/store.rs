@@ -3686,7 +3686,8 @@ pub(crate) fn code_review_round_covered_full_branch(
     base_ref: &str,
 ) -> bool {
     scope == trouve_protocol::CodeReviewJobScope::Full
-        || covered_full_branch.unwrap_or(review_base_sha.is_empty() || review_base_sha == base_ref)
+        || covered_full_branch
+            .unwrap_or_else(|| review_base_sha.is_empty() || review_base_sha == base_ref)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
