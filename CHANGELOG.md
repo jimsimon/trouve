@@ -23,6 +23,43 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   The separate full-review Check Run action and coverage-confirmation round are
   removed; `@trouve-ai review full` remains an alias for the standard command.
 
+## [4.7.0] - 2026-09-01
+
+This release keeps pull requests and model reasoning connected to the sessions
+that produced them, while improving recovery from missed events and transport
+shutdown races.
+
+### Added
+
+- **Durable pull-request associations**: pull request URLs mentioned in chat
+  are recorded against their session, normalized across repositories, and
+  shown alongside session-created pull requests without granting mention-only
+  entries mutation authority. Existing transcripts are recovered lazily and
+  paged for large histories.
+- **Continuous provider reasoning**: assistant thinking now retains
+  provider-owned identity across interleaved tool calls, delayed deltas, and
+  rebuilt thread snapshots instead of being split or attached to the wrong
+  lifecycle.
+
+### Changed
+
+- **Client/server compatibility**: protocol compatibility advances to 7.29 for
+  durable pull-request mention events and identity-aware reasoning lifecycles.
+  Upgrade the desktop or PWA client and `trouve-server` together.
+- **Session-governed private web access**: approved private-address fetches now
+  follow the session's Ask, allow-list, or Yolo policy while retaining scheme,
+  redirect, resolution, and connection-pinning safeguards.
+
+### Fixed
+
+- **Reliable review commands**: polling can recover newly missed resolve and
+  unresolve commands exactly once without replaying historical commands or
+  confusing webhook receipts with polling progress.
+- **Clean Codex completion and process shutdown**: observed root completion
+  remains authoritative when transport EOF races collaborator collection, and
+  inert Linux zombies owned by another reaper no longer quarantine a completed
+  app-server process tree.
+
 ## [4.6.0] - 2026-08-31
 
 This release adds provider-native control over model options and live turns,
@@ -1050,6 +1087,7 @@ semble ([BENCHMARKS.md](BENCHMARKS.md)):
 - Incremental reindex (1 file touched): 0.86 s vs ~3 min (212x)
 - Warm query: 0.55 s vs 7.2 s (13x)
 
+[4.7.0]: https://github.com/jimsimon/trouve/compare/v4.6.0...v4.7.0
 [4.6.0]: https://github.com/jimsimon/trouve/compare/v4.5.0...v4.6.0
 [4.5.0]: https://github.com/jimsimon/trouve/compare/v4.4.0...v4.5.0
 [4.4.0]: https://github.com/jimsimon/trouve/compare/v4.3.0...v4.4.0

@@ -1824,31 +1824,45 @@ fn parse_usage_health(provider_id: &str, payload: &Value) -> trouve_protocol::Su
     let rate_limits = &payload["rate_limits"];
 
     let mut windows: Vec<trouve_protocol::SubscriptionWindow> = Vec::new();
+    let percent = |bucket: &Value| {
+        ["utilization", "used_percentage", "percent"]
+            .into_iter()
+            .find_map(|key| bucket[key].as_f64())
+    };
+    let reset = |bucket: &Value| {
+        bucket
+            .get("resets_at")
+            .or_else(|| bucket.get("resetsAt"))
+            .and_then(parse_reset_at)
+    };
     let push = |windows: &mut Vec<trouve_protocol::SubscriptionWindow>,
                 label: String,
-                used: &Value,
-                resets: &Value| {
-        let Some(pct) = used.as_f64() else { return };
+                pct: f64,
+                resets: Option<i64>| {
         windows.push(trouve_protocol::SubscriptionWindow {
             label,
             used_percent: (pct.round() as i64).clamp(0, 100),
-            resets: parse_reset_at(resets).map(format_reset).unwrap_or_default(),
+            resets: resets.map(format_reset).unwrap_or_default(),
         });
     };
 
-    for (key, label) in [
-        ("five_hour", "5h window"),
-        ("seven_day", "Weekly (all models)"),
-        ("seven_day_sonnet", "Weekly (Sonnet)"),
-        ("seven_day_opus", "Weekly (Opus)"),
+    // Claude has used both descriptive and compact keys for these buckets,
+    // and the status-line form calls the percentage `used_percentage`.
+    // Accept all of those spellings because `get_usage` is experimental and
+    // has changed independently of the CLI versioned output formats.
+    for (keys, label) in [
+        (&["five_hour", "5h"][..], "5h window"),
+        (&["seven_day", "7d"][..], "Weekly (all models)"),
+        (&["seven_day_sonnet", "7d_sonnet"][..], "Weekly (Sonnet)"),
+        (&["seven_day_opus", "7d_opus"][..], "Weekly (Opus)"),
     ] {
-        let bucket = &rate_limits[key];
-        push(
-            &mut windows,
-            label.to_string(),
-            &bucket["utilization"],
-            &bucket["resets_at"],
-        );
+        let Some((bucket, pct)) = keys
+            .iter()
+            .find_map(|key| percent(&rate_limits[*key]).map(|pct| (&rate_limits[*key], pct)))
+        else {
+            continue;
+        };
+        push(&mut windows, label.to_string(), pct, reset(bucket));
     }
 
     // Newer payloads carry the buckets in a self-describing `limits` array
@@ -1867,7 +1881,8 @@ fn parse_usage_health(provider_id: &str, payload: &Value) -> trouve_protocol::Su
         if windows.iter().any(|w| w.label.eq_ignore_ascii_case(&label)) {
             continue;
         }
-        push(&mut windows, label, &entry["percent"], &entry["resets_at"]);
+        let Some(pct) = percent(entry) else { continue };
+        push(&mut windows, label, pct, reset(entry));
     }
 
     // Pay-per-use overage riding on top of the subscription, when enabled.
@@ -2710,6 +2725,41 @@ cat >/dev/null
         assert!(health.windows[0].resets.starts_with("resets in 2h"));
         assert_eq!(health.windows[2].used_percent, 8, "rounded");
         assert!(health.windows[1].resets.starts_with("resets in 3d"));
+    }
+
+    #[test]
+    fn parses_compact_usage_buckets_and_status_line_fields() {
+        let soon = chrono::Utc::now().timestamp() + 3600;
+        let payload = json!({
+            "subscription_type": "max",
+            "rate_limits_available": true,
+            "rate_limits": {
+                "5h": { "used_percentage": 28.0, "resetsAt": soon },
+                "7d": { "used_percentage": 67.0, "resets_at": soon + 86_400 },
+                "7d_opus": { "percent": 12.0, "resets_at": soon },
+            },
+        });
+        let health = parse_usage_health("claude-code", &payload);
+        assert_eq!(health.status, "ok");
+        let windows: Vec<(&str, i64)> = health
+            .windows
+            .iter()
+            .map(|window| (window.label.as_str(), window.used_percent))
+            .collect();
+        assert_eq!(
+            windows,
+            vec![
+                ("5h window", 28),
+                ("Weekly (all models)", 67),
+                ("Weekly (Opus)", 12),
+            ]
+        );
+        assert!(
+            health
+                .windows
+                .iter()
+                .all(|window| !window.resets.is_empty())
+        );
     }
 
     #[test]
