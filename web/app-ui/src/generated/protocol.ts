@@ -4410,10 +4410,10 @@ export interface components {
          */
         SessionOutcome: "idle" | "running" | "succeeded" | "failed";
         /**
-         * @description Pull requests associated with one session by its branch, verified creation,
-         *     or a durable chat mention. This is a local projection of the persisted
-         *     account snapshots and never performs a GitHub request. Session-created PRs
-         *     precede mention-only PRs.
+         * @description Pull requests associated with one session by its branch or verified
+         *     creation. This is a local projection of the persisted account snapshots
+         *     and never performs a GitHub request. Matching session-branch PRs precede
+         *     cross-branch PRs with durable creation evidence.
          */
         SessionPrProjection: {
             prs: components["schemas"]["PrInfo"][];

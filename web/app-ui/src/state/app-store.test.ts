@@ -610,7 +610,7 @@ describe("AppStore", () => {
     ]);
   });
 
-  it("associates chat-mentioned PRs while keeping the session branch first", () => {
+  it("ignores chat-mentioned PRs while keeping the session branch", () => {
     const store = new AppStore();
     store.replaceSessionMetadata([metadata]);
     store.replaceSessionSummaries([summary]);
@@ -638,7 +638,7 @@ describe("AppStore", () => {
       },
     });
 
-    expect(store.sessionPullRequests("se_1").map(({ number }) => number)).toEqual([8, 20]);
+    expect(store.sessionPullRequests("se_1").map(({ number }) => number)).toEqual([8]);
   });
 
   it("hydrates all session PR associations from the cold-start server projection", () => {

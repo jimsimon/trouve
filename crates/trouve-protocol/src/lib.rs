@@ -343,9 +343,11 @@ pub use requests::*;
 // optional provider-owned identity. Legacy no-id events retain inferred tool
 // boundaries while identity-aware reasoning can span interleaved tools, and
 // delayed deltas append to the correct lifecycle within an older turn.
-// 7.30: assistant.artifacts events and folded artifact items expose durable
+// 7.30: chat mentions no longer create session PR associations; the legacy
+// session.pr_mentioned event remains replay-only.
+// 7.31: assistant.artifacts events and folded artifact items expose durable
 // model/tool-produced files without embedding media bytes in the event log.
-pub const PROTOCOL_VERSION: &str = "7.30";
+pub const PROTOCOL_VERSION: &str = "7.31";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";
 pub const ERROR_CODE_GITHUB_REAUTHENTICATION_REQUIRED: &str = "github_reauthentication_required";

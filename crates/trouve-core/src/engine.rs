@@ -39,10 +39,10 @@ use crate::store::{
     ReviewWorkspaceCleanupIntent, SessionPrVerificationIntent, Store,
 };
 use crate::tools::{
-    AttachmentMaterialization, AttachmentMaterializationFile, BackgroundMutationLease,
-    DeletedSessionCleanup, LocalToolExecutor, MaterializedAttachment, McpConfigMutation,
-    McpConfigMutationOutcome, McpConfigMutationRequest, SessionRepositoryDiff,
-    SessionRepositoryPush, ToolCtx, ToolExecutor, ToolResult, edit_strategy_for_model,
+    AttachmentMaterialization, AttachmentMaterializationFile, DeletedSessionCleanup,
+    LocalToolExecutor, MaterializedAttachment, McpConfigMutation, McpConfigMutationOutcome,
+    McpConfigMutationRequest, SessionRepositoryDiff, SessionRepositoryPush, ToolCtx, ToolExecutor,
+    ToolResult, edit_strategy_for_model,
 };
 use crate::{context, git, new_id, personas};
 
@@ -7470,9 +7470,8 @@ impl Engine {
             .collect())
     }
 
-    /// Mention-only associations are navigation evidence, not authorization
-    /// for GitHub mutations. Mutation targets must either have a durable
-    /// session-created link or a head commit verified in the session worktree.
+    /// Mutation targets must either have a durable session-created link or a
+    /// head commit verified in the session worktree.
     async fn session_pr_allows_mutation(
         &self,
         session_id: &str,
@@ -7488,14 +7487,9 @@ impl Engine {
         Ok(self.pr_has_locally_verified_head(session_id, pr).await)
     }
 
-    fn mentioned_session_prs(&self, session_id: &str) -> Result<HashSet<String>, EngineError> {
-        Ok(self.store.session_pr_mentions(session_id)?)
-    }
-
     /// Provider-neutral evidence tying GitHub activity to this session.
-    /// Explicit PR references work for any integration; successful tool args
-    /// and produced commit IDs preserve enough identity to discover a PR that
-    /// the user creates later in GitHub's UI.
+    /// Successful tool arguments and produced commit IDs preserve enough
+    /// identity to discover PRs created through provider-neutral tooling.
     fn session_pr_evidence(
         &self,
         session_id: &str,
@@ -7583,14 +7577,12 @@ impl Engine {
         for number in evidence.numbers {
             if seen.insert(number) {
                 let already_recorded = evidence.recorded_numbers.contains(&number);
-                let explicitly_mentioned = evidence.mentioned_numbers.contains(&number);
                 match github.pr(number).await {
                     Ok(pr)
                         if already_recorded
-                            || explicitly_mentioned
                             || self.pr_has_locally_verified_head(session_id, &pr).await =>
                     {
-                        if !already_recorded && !explicitly_mentioned {
+                        if !already_recorded {
                             self.record_session_pr_numbers(
                                 session_id,
                                 &repository,
@@ -7635,7 +7627,6 @@ impl Engine {
         candidates: impl IntoIterator<Item = &'a trouve_protocol::PrInfo>,
         session: &Session,
         linked_urls: &HashSet<String>,
-        mentioned_urls: &HashSet<String>,
     ) -> Vec<trouve_protocol::PrInfo> {
         let mut seen = HashSet::new();
         let mut prs = candidates
@@ -7643,7 +7634,6 @@ impl Engine {
             .filter(|pr| {
                 (pr.workspace_id == session.workspace_id && pr.head == session.branch)
                     || linked_urls.contains(&pr.url.trim_end_matches('/').to_ascii_lowercase())
-                    || mentioned_urls.contains(&pr.url.trim_end_matches('/').to_ascii_lowercase())
             })
             .filter(|pr| {
                 seen.insert((
@@ -7681,7 +7671,6 @@ impl Engine {
     ) -> Result<Vec<trouve_protocol::PrInfo>, EngineError> {
         let session = self.get_session(session_id)?;
         let linked_urls = self.recorded_session_pr_urls(session_id)?;
-        let mentioned_urls = self.mentioned_session_prs(session_id)?;
         let mut candidates = Vec::new();
         for (host, _) in self.github_hosts() {
             let Some(snapshot) = self.store.latest_github_pr_snapshot(&host)? else {
@@ -7693,7 +7682,6 @@ impl Engine {
             &candidates,
             &session,
             &linked_urls,
-            &mentioned_urls,
         ))
     }
 
@@ -7989,12 +7977,10 @@ impl Engine {
         let mut session_pull_requests = Vec::new();
         for session in self.list_sessions(None)? {
             let linked_urls = self.recorded_session_pr_urls(&session.id)?;
-            let mentioned_urls = self.mentioned_session_prs(&session.id)?;
             let prs = Self::project_session_pr_candidates(
                 account_prs.iter().copied(),
                 &session,
                 &linked_urls,
-                &mentioned_urls,
             );
             if !prs.is_empty() {
                 session_pull_requests.push(trouve_protocol::SessionPrProjection {
@@ -12605,7 +12591,6 @@ impl Engine {
             config_dir: self.config_dir.clone(),
             workspace_root: Some(PathBuf::from(&ws.path)),
             edit_strategy: edit_strategy_for_model(&thread.model),
-            background_mutation_lease: None,
         };
 
         let all_modes = self.resolve_personas(Some(Path::new(&ws.path)))?;
@@ -13973,7 +13958,6 @@ impl Engine {
             config_dir: self.config_dir.clone(),
             workspace_root: Some(PathBuf::from(&ws.path)),
             edit_strategy: edit_strategy_for_model(&thread.model),
-            background_mutation_lease: None,
         };
         Ok((session, thread, mode, ctx))
     }
@@ -16832,19 +16816,7 @@ impl Engine {
                 )
                 .await?;
             let executor = self.executor.clone();
-            let mut tool_ctx = ctx.clone();
-            if call.name == "shell"
-                && call
-                    .arguments
-                    .get("run_in_background")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false)
-                && let Some(ExecutionPermit::Write { guard }) = permit.as_mut()
-                && let Some(guard) = guard.take()
-            {
-                tool_ctx.background_mutation_lease =
-                    Some(Arc::new(BackgroundMutationLease::new(guard)));
-            }
+            let tool_ctx = ctx.clone();
             let tool_name = call.name.clone();
             let tool_arguments = call.arguments.clone();
             let execution_started = std::time::Instant::now();
@@ -16944,11 +16916,10 @@ impl Engine {
         // Images remain native provider vision input; all accepted media also
         // becomes a durable attachment-backed artifact row.
         let (images, artifact_uploads) = take_tool_media(&mut outcome.result);
-        let mut prepared_artifacts = if artifact_uploads.is_empty() {
-            None
-        } else {
-            Some(self.prepare_attachments(artifact_uploads)?)
-        };
+        let mut prepared_artifacts =
+            prepare_tool_artifacts(&mut outcome.result, artifact_uploads, |uploads| {
+                self.prepare_attachments(uploads)
+            });
         let todos = self.persist_todos_from_result(
             &thread.id,
             &call.name,
@@ -16966,42 +16937,7 @@ impl Engine {
         if let Some(todos) = todos {
             completion_events.push(Event::TodosUpdated { todos });
         }
-        if let Some(intents) = verification {
-            self.store
-                .append_events_with_session_pr_verification_intents(
-                    scope.clone(),
-                    completion_events,
-                    intents.clone(),
-                )
-                .await?;
-            if !intents.is_empty() {
-                self.session_pr_verification_wake.notify_one();
-            }
-            if let Some((prepared, cleanup)) = prepared_artifacts.as_mut() {
-                let attachments = prepared
-                    .iter()
-                    .map(|(attachment, _)| attachment.clone())
-                    .collect::<Vec<_>>();
-                let rows = prepared
-                    .iter()
-                    .map(|(attachment, path)| {
-                        (attachment.clone(), path.to_string_lossy().into_owned())
-                    })
-                    .collect();
-                self.store.append_events_with_attachments(
-                    scope,
-                    vec![Event::AssistantArtifacts {
-                        turn,
-                        call_id: Some(call_id.clone()),
-                        attachments,
-                    }],
-                    &thread.id,
-                    rows,
-                    cleanup.claim(),
-                )?;
-                cleanup.disarm();
-            }
-        } else if let Some((prepared, cleanup)) = prepared_artifacts.as_mut() {
+        if let Some((prepared, cleanup)) = prepared_artifacts.as_mut() {
             let attachments = prepared
                 .iter()
                 .map(|(attachment, _)| attachment.clone())
@@ -17020,9 +16956,27 @@ impl Engine {
                 completion_events,
                 &thread.id,
                 rows,
+                verification.clone().unwrap_or_default(),
                 cleanup.claim(),
             )?;
+            if verification
+                .as_ref()
+                .is_some_and(|intents| !intents.is_empty())
+            {
+                self.session_pr_verification_wake.notify_one();
+            }
             cleanup.disarm();
+        } else if let Some(intents) = verification {
+            self.store
+                .append_events_with_session_pr_verification_intents(
+                    scope,
+                    completion_events,
+                    intents.clone(),
+                )
+                .await?;
+            if !intents.is_empty() {
+                self.session_pr_verification_wake.notify_one();
+            }
         } else {
             self.store
                 .append_events_async(scope, completion_events)
@@ -17899,6 +17853,62 @@ fn artifact_upload(
     }
 }
 
+fn tool_media_persistence_failed(result: &mut serde_json::Value) {
+    const MESSAGE: &str =
+        "Agent-produced media could not be stored; the tool itself completed normally.";
+    match result {
+        serde_json::Value::Object(fields) => {
+            fields.insert(
+                "artifact_persistence_error".into(),
+                serde_json::Value::String(MESSAGE.into()),
+            );
+        }
+        serde_json::Value::Array(blocks) => blocks.push(serde_json::json!({
+            "type": "text",
+            "text": MESSAGE,
+            "artifact_persistence_error": true,
+        })),
+        other => {
+            *other = serde_json::json!({
+                "result": std::mem::take(other),
+                "artifact_persistence_error": MESSAGE,
+            });
+        }
+    }
+}
+
+/// Artifact storage is supplemental to an already-completed tool call. Keep
+/// the terminal result durable even when staging the media bytes fails.
+fn prepare_tool_artifacts<T>(
+    result: &mut serde_json::Value,
+    uploads: Vec<trouve_protocol::AttachmentUpload>,
+    prepare: impl FnOnce(Vec<trouve_protocol::AttachmentUpload>) -> Result<T, EngineError>,
+) -> Option<T> {
+    if uploads.is_empty() {
+        return None;
+    }
+    match prepare(uploads) {
+        Ok(prepared) => Some(prepared),
+        Err(error) => {
+            tracing::warn!(%error, "tool media could not be staged for durable presentation");
+            tool_media_persistence_failed(result);
+            None
+        }
+    }
+}
+
+fn accept_tool_media_upload(
+    uploads: &mut Vec<trouve_protocol::AttachmentUpload>,
+    upload: trouve_protocol::AttachmentUpload,
+) -> Result<(), String> {
+    uploads.push(upload);
+    if let Err(error) = validate_attachment_uploads(uploads) {
+        uploads.pop();
+        return Err(error.to_string());
+    }
+    Ok(())
+}
+
 /// Remove inline media bytes from a tool result. Images continue to travel to
 /// the provider as native vision content; every accepted media block is also
 /// returned as an attachment upload for durable UI presentation.
@@ -17911,26 +17921,44 @@ fn take_tool_media(
     let payload = result
         .as_object_mut()
         .and_then(|object| object.remove("_images"));
-    let mut images: Vec<trouve_providers::ToolImage> = payload
-        .and_then(|payload| serde_json::from_value(payload).ok())
-        .unwrap_or_default();
-    let mut media = images
-        .iter()
-        .map(|image| ("image", image.mime.clone(), image.data.clone()))
-        .collect::<Vec<_>>();
-    if !images.is_empty() {
-        result["images"] = serde_json::json!(
-            images
-                .iter()
-                .map(|img| {
-                    serde_json::json!({
-                        "mime": img.mime,
-                        // Base64 expands bytes 4:3; report the real size.
-                        "bytes": img.data.len() * 3 / 4,
-                    })
-                })
-                .collect::<Vec<_>>()
-        );
+    let mut images = Vec::new();
+    let mut uploads = Vec::new();
+    let mut image_summaries = Vec::new();
+    if let Some(payload) = payload {
+        let blocks = payload.as_array().cloned().unwrap_or_default();
+        for block in blocks {
+            let Ok(image) = serde_json::from_value::<trouve_providers::ToolImage>(block) else {
+                image_summaries.push(serde_json::json!({
+                    "media_omitted": true,
+                    "media_error": "invalid tool image metadata",
+                }));
+                continue;
+            };
+            let upload = artifact_upload(
+                uploads.len(),
+                "image",
+                image.mime.clone(),
+                image.data.clone(),
+            );
+            let rejection = accept_tool_media_upload(&mut uploads, upload).err();
+            let accepted = rejection.is_none();
+            image_summaries.push(serde_json::json!({
+                "mime": image.mime,
+                "bytes": image.data.len().saturating_mul(3) / 4,
+                "media_omitted": true,
+                "media_error": rejection,
+            }));
+            if accepted {
+                images.push(image);
+            }
+        }
+        if image_summaries.is_empty() {
+            image_summaries.push(serde_json::json!({
+                "media_omitted": true,
+                "media_error": "invalid tool image payload",
+            }));
+        }
+        result["images"] = serde_json::Value::Array(image_summaries);
     }
 
     if let Some(blocks) = result.as_array_mut() {
@@ -17968,33 +17996,28 @@ fn take_tool_media(
                 .to_string();
             let data_key = if kind == "resource" { "blob" } else { "data" };
             let Some(data) = source
-                .remove(data_key)
-                .and_then(|data| data.as_str().map(str::to_string))
+                .get(data_key)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
             else {
                 continue;
             };
+            let upload = artifact_upload(uploads.len(), media_kind, mime.clone(), data.clone());
+            let rejection = accept_tool_media_upload(&mut uploads, upload).err();
+            source.remove(data_key);
             source.insert("media_omitted".into(), serde_json::Value::Bool(true));
             source.insert(
                 "size_bytes".into(),
                 serde_json::json!(data.len().saturating_mul(3) / 4),
             );
-            if media_kind == "image" {
+            if let Some(error) = rejection {
+                source.insert("media_error".into(), serde_json::Value::String(error));
+            } else if media_kind == "image" {
                 images.push(trouve_providers::ToolImage {
                     mime: mime.clone(),
-                    data: data.clone(),
+                    data,
                 });
             }
-            media.push((media_kind, mime, data));
-        }
-    }
-
-    let mut uploads = Vec::new();
-    for (kind, mime, data) in media {
-        let upload = artifact_upload(uploads.len(), kind, mime, data);
-        let mut candidates = uploads.clone();
-        candidates.push(upload.clone());
-        if validate_attachment_uploads(&candidates).is_ok() {
-            uploads.push(upload);
         }
     }
     (images, uploads)
@@ -18899,7 +18922,6 @@ fn requests_remote_ref_mutation(
 struct SessionPrEvidence {
     numbers: HashSet<u64>,
     recorded_numbers: HashSet<u64>,
-    mentioned_numbers: HashSet<u64>,
     successful_tool_args: Vec<String>,
     commit_ids: HashSet<String>,
 }
@@ -18909,13 +18931,12 @@ impl SessionPrEvidence {
     fn extend(&mut self, other: Self) {
         self.numbers.extend(other.numbers);
         self.recorded_numbers.extend(other.recorded_numbers);
-        self.mentioned_numbers.extend(other.mentioned_numbers);
         self.successful_tool_args.extend(other.successful_tool_args);
         self.commit_ids.extend(other.commit_ids);
     }
 }
 
-/// Collect PR references, successful branch activity, and commits from events.
+/// Collect successful PR creation, branch activity, and commits from events.
 fn pr_evidence_from_events(
     events: impl IntoIterator<Item = Event>,
     host: &str,
@@ -18927,27 +18948,6 @@ fn pr_evidence_from_events(
     let mut evidence = SessionPrEvidence::default();
     for event in events {
         match event {
-            Event::UserMessage {
-                content,
-                background: false,
-                ..
-            }
-            | Event::TurnSteered { content, .. }
-            | Event::AssistantMessage { content, .. } => {
-                let numbers = crate::github::pr_numbers_in_chat_text(&content, host, owner, repo);
-                evidence.numbers.extend(numbers.iter().copied());
-                evidence.mentioned_numbers.extend(numbers);
-            }
-            Event::AssistantProgress { text, .. } => {
-                let numbers = crate::github::pr_numbers_in_chat_text(&text, host, owner, repo);
-                evidence.numbers.extend(numbers.iter().copied());
-                evidence.mentioned_numbers.extend(numbers);
-            }
-            Event::SubagentSpawned { prompt, .. } => {
-                let numbers = crate::github::pr_numbers_in_chat_text(&prompt, host, owner, repo);
-                evidence.numbers.extend(numbers.iter().copied());
-                evidence.mentioned_numbers.extend(numbers);
-            }
             Event::ToolRequested {
                 call_id,
                 tool,
@@ -19863,6 +19863,51 @@ mod tests {
         assert_eq!(uploads[0].name, "tool-image-1.png");
         assert!(result.get("_images").is_none());
         assert_eq!(result["images"][0]["mime"], "image/png");
+    }
+
+    #[test]
+    fn rejected_tool_media_is_not_forwarded_or_persisted() {
+        let mut result = serde_json::json!([
+            {
+                "type": "image",
+                "mimeType": "not-a-mime",
+                "data": "aGVsbG8="
+            }
+        ]);
+
+        let (images, uploads) = take_tool_media(&mut result);
+
+        assert!(images.is_empty());
+        assert!(uploads.is_empty());
+        assert!(result[0].get("data").is_none());
+        assert_eq!(result[0]["media_omitted"], true);
+        assert!(result[0]["media_error"].as_str().is_some());
+    }
+
+    #[test]
+    fn artifact_staging_failure_preserves_a_terminal_tool_result() {
+        let upload = artifact_upload(0, "image", "image/png".into(), "aGVsbG8=".into());
+        let mut result = serde_json::json!({ "note": "tool finished" });
+
+        let prepared: Option<()> = prepare_tool_artifacts(&mut result, vec![upload], |_| {
+            Err(EngineError::Internal(anyhow!("injected staging failure")))
+        });
+        let terminal = Event::ToolCompleted {
+            call_id: "call_with_media".into(),
+            status: ToolStatus::Ok,
+            result,
+            execution_duration_ms: Some(1),
+        };
+
+        assert!(prepared.is_none());
+        assert!(matches!(
+            terminal,
+            Event::ToolCompleted {
+                status: ToolStatus::Ok,
+                result,
+                ..
+            } if result["artifact_persistence_error"].as_str().is_some()
+        ));
     }
 
     #[tokio::test]
@@ -24191,7 +24236,7 @@ default_permission_mode = "ask"
         let local = engine.projected_session_prs(&session.id).unwrap();
         assert_eq!(
             local.iter().map(|pr| pr.number).collect::<Vec<_>>(),
-            vec![10, 11, 12]
+            vec![10, 11]
         );
 
         let (cursor, projection) = engine.server_projection_snapshot().unwrap();
@@ -24207,7 +24252,7 @@ default_permission_mode = "ask"
                 .iter()
                 .map(|pr| pr.number)
                 .collect::<Vec<_>>(),
-            vec![10, 11, 12]
+            vec![10, 11]
         );
     }
 
@@ -24400,8 +24445,7 @@ default_permission_mode = "ask"
             },
         ];
         let evidence = pr_evidence_from_events(events, "github.com", "o", "r");
-        assert_eq!(evidence.numbers, HashSet::from([73, 75]));
-        assert_eq!(evidence.mentioned_numbers, HashSet::from([73]));
+        assert_eq!(evidence.numbers, HashSet::from([75]));
         assert_eq!(evidence.successful_tool_args.len(), 2);
         assert!(
             evidence

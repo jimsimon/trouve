@@ -547,10 +547,9 @@ pub enum Event {
     },
     #[serde(rename = "session.pr_opened")]
     SessionPrOpened { number: u64, url: String },
-    /// A pull request browser URL appeared in user-visible session chat.
-    /// This is intentionally separate from `session.pr_opened`: mentions
-    /// associate a PR for navigation without claiming that the session
-    /// created or owns its branch.
+    /// Legacy association emitted when a pull request browser URL appeared in
+    /// session chat. Current servers retain this variant only to replay old
+    /// event logs; mentions no longer create session PR associations.
     #[serde(rename = "session.pr_mentioned")]
     SessionPrMentioned {
         session_id: SessionId,
