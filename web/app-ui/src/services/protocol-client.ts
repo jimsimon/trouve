@@ -136,6 +136,8 @@ export type ProtocolCodeReviewDashboard =
   ProtocolComponents["schemas"]["CodeReviewDashboard"];
 export type ProtocolCodeReviewJob =
   ProtocolComponents["schemas"]["CodeReviewJob"];
+export type ProtocolRequestCodeReviewRequest =
+  ProtocolComponents["schemas"]["RequestCodeReviewRequest"];
 export type ProtocolCodeReviewSettings =
   ProtocolComponents["schemas"]["CodeReviewSettings"];
 export type ProtocolSetCodeReviewSettingsRequest =
@@ -1239,6 +1241,19 @@ export class ProtocolClient {
 
   async refreshCodeReviews(): Promise<void> {
     await this.#mutation("/v1/code-review/refresh", "refresh code reviews", "POST");
+  }
+
+  requestCodeReview(
+    request: ProtocolRequestCodeReviewRequest,
+  ): Promise<ProtocolCodeReviewJob> {
+    return this.#validatedMutation(
+      "/v1/code-review/requests",
+      "request code review",
+      "POST",
+      "CodeReviewJob",
+      (loaded) => loaded.codeReviewJob,
+      request,
+    );
   }
 
   retryCodeReviewJob(jobId: string): Promise<ProtocolCodeReviewJob> {

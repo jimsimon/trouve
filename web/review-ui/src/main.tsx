@@ -26,6 +26,7 @@ import {
   loginStatus,
   openJobEvents,
   openServerEvents,
+  requestReview,
   resetPersona,
   retryFinalEditor,
   retryJob,
@@ -1150,14 +1151,16 @@ function JobDetailPane({
     });
   }, [selectedTaskId]);
 
-  const act = async (action: "cancel" | "retry"): Promise<void> => {
+  const act = async (action: "cancel" | "request" | "retry"): Promise<void> => {
     if (!detail) return;
     setBusy(action);
     try {
       const replacement =
         action === "cancel"
           ? await cancelJob(detail.job.id)
-          : await retryJob(detail.job.id);
+          : action === "request"
+            ? await requestReview(detail.job)
+            : await retryJob(detail.job.id);
       onChanged();
       if (action !== "cancel") {
         if (replacement.id === detail.job.id) {
@@ -1568,9 +1571,15 @@ function JobDetailPane({
                 {busy === "final-editor" ? "Retrying…" : "Retry final editor"}
               </button>
             )}
-            <button type="button" disabled={Boolean(busy)} onClick={() => void act("retry")}>
-              {busy === "retry" ? "Retrying…" : unadjudicatedCandidates.length > 0 ? "Rerun all reviewers" : "Retry"}
-            </button>
+            {job.legacy_coverage_exhausted ? (
+              <button type="button" disabled={Boolean(busy)} onClick={() => void act("request")}>
+                {busy === "request" ? "Queueing…" : "Run whole review"}
+              </button>
+            ) : (
+              <button type="button" disabled={Boolean(busy)} onClick={() => void act("retry")}>
+                {busy === "retry" ? "Retrying…" : unadjudicatedCandidates.length > 0 ? "Rerun all reviewers" : "Retry"}
+              </button>
+            )}
           </>
         )}
       </div>
@@ -1586,12 +1595,12 @@ function JobDetailPane({
         <div class="banner warning stacked" role="alert">
           <strong>Automatic full-branch compatibility attempts exhausted</strong>
           <p>
-            This pre-8.0 partial result cannot establish branch coverage. Retry the whole review to run every selected reviewer against the full branch.
+            This pre-8.0 partial result cannot establish branch coverage. Use Run whole review above to request the current head with every selected reviewer.
           </p>
         </div>
       )}
       {job.legacy_coverage_pending && (
-        <div class="banner warning stacked" role="alert">
+        <div class="banner warning stacked" role="status" aria-live="polite">
           <strong>Full-branch compatibility review pending</strong>
           <p>
             This successful result came from a pre-8.0 partial review. A full-branch compatibility result is still required before the revision can pass; the server schedules at most two automatic attempts.

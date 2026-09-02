@@ -37,7 +37,9 @@ test("legacy partial success stays visibly pending until its full review", () =>
   assert.match(source, /if \(job\.legacy_coverage_exhausted\) return "coverage_exhausted"/u);
   assert.match(source, /<span class="status warning">full review required<\/span>/u);
   assert.match(source, /Automatic full-branch compatibility attempts exhausted/u);
-  assert.match(source, /Retry the whole review/u);
+  assert.match(source, /requestReview\(detail\.job\)/u);
+  assert.match(source, /Run whole review/u);
+  assert.match(source, /role="status" aria-live="polite"/u);
 });
 
 test("attention replaces succeeded and job rows reserve its full width", () => {

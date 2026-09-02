@@ -9027,6 +9027,12 @@ impl Engine {
             .code_review_job(&job.id)?
             .ok_or_else(|| anyhow!("review job no longer exists"))?;
         let final_editor_retryable = record.can_retry_final_editor;
+        // A later full-branch publication at this head owns the current Check
+        // Run. Re-projecting the historical partial row could overwrite that
+        // authoritative verdict with its stale PR-wide finding snapshot.
+        if legacy_review_check_is_superseded(&record) {
+            return Ok(());
+        }
         let covered_full_branch = review_round_covered_full_branch(&record);
         let detail = self
             .store
@@ -10294,9 +10300,11 @@ impl Engine {
         )? {
             return Ok(false);
         }
-        let Some(job_id) = self
-            .store
-            .latest_published_code_review_job_id(&repository.repository, pull.number)?
+        let Some(job_id) = self.store.latest_published_code_review_job_id_for_head(
+            &repository.repository,
+            pull.number,
+            &pull.head.sha,
+        )?
         else {
             return Ok(false);
         };
@@ -10316,35 +10324,37 @@ impl Engine {
             &pull.head.sha,
             &config_hash,
         ) {
-            let Some(job) = self.store.enqueue_code_review_job(&NewCodeReviewJob {
-                dedupe_key,
-                installation_id: repository.installation_id,
-                repository: repository.repository.clone(),
-                pull_number: pull.number,
-                pull_title: pull.title.clone(),
-                pull_body: bounded_review_pull_body(pull.body.as_deref()),
-                pull_url: pull.html_url.clone(),
-                head_sha: pull.head.sha.clone(),
-                review_base_sha: String::new(),
-                base_ref: pull.base.sha.clone(),
-                head_ref: pull.head.name.clone(),
-                scope: trouve_protocol::CodeReviewJobScope::Full,
-                trigger: "legacy-full-coverage".into(),
-                retry_of: None,
-                model: repository.model.clone(),
-                coordinator_thinking_level: repository.coordinator_thinking_level.clone(),
-                router_model: repository.router_model.clone(),
-                router_thinking_level: repository.router_thinking_level.clone(),
-                analyst_model: repository.analyst_model.clone(),
-                analyst_thinking_level: repository.analyst_thinking_level.clone(),
-                prompt: repository.prompt.clone(),
-                reviewers: reviewers.clone(),
-                routing_mode: repository.routing_mode,
-                semantic_routing: repository.semantic_routing,
-                included_reviewer_ids: repository.included_reviewer_ids.clone(),
-                excluded_reviewer_ids: repository.excluded_reviewer_ids.clone(),
-                config_hash: config_hash.clone(),
-            })?
+            let Some(job) = self
+                .store
+                .enqueue_legacy_full_coverage_job(&NewCodeReviewJob {
+                    dedupe_key,
+                    installation_id: repository.installation_id,
+                    repository: repository.repository.clone(),
+                    pull_number: pull.number,
+                    pull_title: pull.title.clone(),
+                    pull_body: bounded_review_pull_body(pull.body.as_deref()),
+                    pull_url: pull.html_url.clone(),
+                    head_sha: pull.head.sha.clone(),
+                    review_base_sha: String::new(),
+                    base_ref: pull.base.sha.clone(),
+                    head_ref: pull.head.name.clone(),
+                    scope: trouve_protocol::CodeReviewJobScope::Full,
+                    trigger: "legacy-full-coverage".into(),
+                    retry_of: None,
+                    model: repository.model.clone(),
+                    coordinator_thinking_level: repository.coordinator_thinking_level.clone(),
+                    router_model: repository.router_model.clone(),
+                    router_thinking_level: repository.router_thinking_level.clone(),
+                    analyst_model: repository.analyst_model.clone(),
+                    analyst_thinking_level: repository.analyst_thinking_level.clone(),
+                    prompt: repository.prompt.clone(),
+                    reviewers: reviewers.clone(),
+                    routing_mode: repository.routing_mode,
+                    semantic_routing: repository.semantic_routing,
+                    included_reviewer_ids: repository.included_reviewer_ids.clone(),
+                    excluded_reviewer_ids: repository.excluded_reviewer_ids.clone(),
+                    config_hash: config_hash.clone(),
+                })?
             else {
                 continue;
             };
@@ -11445,6 +11455,10 @@ fn review_round_covered_full_branch(record: &CodeReviewJobRecord) -> bool {
     )
 }
 
+fn legacy_review_check_is_superseded(record: &CodeReviewJobRecord) -> bool {
+    record.legacy_coverage_settled && !review_round_covered_full_branch(record)
+}
+
 fn legacy_full_coverage_dedupe_keys(
     repository: &str,
     pull_number: u64,
@@ -11470,6 +11484,7 @@ fn legacy_round_requires_full_coverage(record: &CodeReviewJobRecord, head_sha: &
     record.job.head_sha == head_sha
         && record.job.status == "succeeded"
         && record.job.open_issue_count == Some(0)
+        && !record.legacy_coverage_settled
         && !review_round_covered_full_branch(record)
 }
 
@@ -18256,6 +18271,14 @@ mod tests {
             &record.job.head_sha
         ));
         record.job.scope = trouve_protocol::CodeReviewJobScope::Incremental;
+        record.legacy_coverage_settled = true;
+        assert!(legacy_review_check_is_superseded(&record));
+        assert!(!legacy_round_requires_full_coverage(
+            &record,
+            &record.job.head_sha
+        ));
+        record.legacy_coverage_settled = false;
+        assert!(!legacy_review_check_is_superseded(&record));
         assert!(!legacy_round_requires_full_coverage(
             &record,
             "3333333333333333333333333333333333333333"
@@ -18263,7 +18286,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_full_coverage_bridge_retries_once_after_terminal_failure() {
+    fn legacy_full_coverage_bridge_caps_attempts_across_configuration_changes() {
         let store = crate::store::Store::open_in_memory().unwrap();
         let keys = legacy_full_coverage_dedupe_keys(
             "acme/widgets",
@@ -18279,9 +18302,18 @@ mod tests {
         first_request.scope = trouve_protocol::CodeReviewJobScope::Full;
         first_request.trigger = "legacy-full-coverage".into();
         let first = store
-            .enqueue_code_review_job(&first_request)
+            .enqueue_legacy_full_coverage_job(&first_request)
             .unwrap()
             .unwrap();
+        let mut retry_request = first_request.clone();
+        retry_request.dedupe_key.clone_from(&keys[1]);
+        assert!(
+            store
+                .enqueue_legacy_full_coverage_job(&retry_request)
+                .unwrap()
+                .is_none(),
+            "an active attempt must prevent a concurrent reservation"
+        );
         assert_eq!(
             store.claim_code_review_job().unwrap().unwrap().job.id,
             first.id
@@ -18291,15 +18323,13 @@ mod tests {
             .unwrap();
         assert!(
             store
-                .enqueue_code_review_job(&first_request)
+                .enqueue_legacy_full_coverage_job(&first_request)
                 .unwrap()
                 .is_none()
         );
 
-        let mut retry_request = first_request.clone();
-        retry_request.dedupe_key.clone_from(&keys[1]);
         let retry = store
-            .enqueue_code_review_job(&retry_request)
+            .enqueue_legacy_full_coverage_job(&retry_request)
             .unwrap()
             .unwrap();
         assert_ne!(retry.id, first.id);
@@ -18314,8 +18344,25 @@ mod tests {
         for key in keys {
             let mut consumed = first_request.clone();
             consumed.dedupe_key = key;
-            assert!(store.enqueue_code_review_job(&consumed).unwrap().is_none());
+            assert!(
+                store
+                    .enqueue_legacy_full_coverage_job(&consumed)
+                    .unwrap()
+                    .is_none()
+            );
         }
+        let mut changed_configuration = first_request;
+        changed_configuration.dedupe_key =
+            "acme/widgets#42:new-base:new-head:legacy-full-coverage:new-config".into();
+        changed_configuration.base_ref = "4444444444444444444444444444444444444444".into();
+        changed_configuration.config_hash = "new-config".into();
+        assert!(
+            store
+                .enqueue_legacy_full_coverage_job(&changed_configuration)
+                .unwrap()
+                .is_none(),
+            "mutable settings must not reopen the per-head attempt budget"
+        );
     }
 
     #[test]

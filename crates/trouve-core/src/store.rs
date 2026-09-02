@@ -3659,6 +3659,9 @@ pub struct CodeReviewJobRecord {
     /// Persisted coverage marker retained only to settle pre-8.0 incremental
     /// rows without exposing incremental state on the current protocol.
     pub covered_full_branch: Option<bool>,
+    /// A published full-branch round at this exact head settles any historical
+    /// partial round when its GitHub surfaces are projected again.
+    pub legacy_coverage_settled: bool,
     pub prompt: String,
     /// Author-written pull-request description snapshotted at enqueue.
     /// Untrusted claimed intent for review prompts; never serialized to the
@@ -3863,6 +3866,7 @@ fn row_to_code_review_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<CodeReviewJ
         },
         can_retry_final_editor: r.get(61)?,
         covered_full_branch,
+        legacy_coverage_settled,
         prompt: r.get(12)?,
         pull_body: r.get(57)?,
         config_hash: r.get(14)?,
@@ -9657,6 +9661,45 @@ impl Store {
         Self::enqueue_code_review_job_conn(&conn, new_job)
     }
 
+    /// Atomically reserve one of the bounded compatibility attempts for a
+    /// historical partial round. The budget is per immutable pull-request
+    /// head, so mutable base or repository settings cannot reopen it.
+    pub(crate) fn enqueue_legacy_full_coverage_job(
+        &self,
+        new_job: &NewCodeReviewJob,
+    ) -> Result<Option<trouve_protocol::CodeReviewJob>> {
+        anyhow::ensure!(
+            new_job.trigger == "legacy-full-coverage",
+            "legacy coverage reservation requires its compatibility trigger"
+        );
+        let conn = self.conn.lock().unwrap();
+        let tx = write_transaction(&conn)?;
+        let (attempts, active) = tx.query_row(
+            "SELECT
+               (SELECT COUNT(*) FROM code_review_jobs
+                WHERE repository = ?1 AND pull_number = ?2 AND head_sha = ?3
+                  AND trigger = 'legacy-full-coverage'),
+               EXISTS(
+                 SELECT 1 FROM code_review_jobs
+                 WHERE repository = ?1 AND pull_number = ?2 AND head_sha = ?3
+                   AND status IN ('queued', 'running')
+               )",
+            params![
+                new_job.repository,
+                new_job.pull_number as i64,
+                new_job.head_sha,
+            ],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, bool>(1)?)),
+        )?;
+        if active || attempts >= LEGACY_FULL_COVERAGE_MAX_ATTEMPTS as i64 {
+            tx.commit()?;
+            return Ok(None);
+        }
+        let job = Self::enqueue_code_review_job_conn(&tx, new_job)?;
+        tx.commit()?;
+        Ok(job)
+    }
+
     pub fn supersede_code_review_jobs(
         &self,
         repository: &str,
@@ -12645,6 +12688,29 @@ impl Store {
                  ORDER BY publication_order DESC, created_at DESC, id DESC
                  LIMIT 1",
                 params![repository, pull_number as i64],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// The newest published round for one immutable pull-request head.
+    pub fn latest_published_code_review_job_id_for_head(
+        &self,
+        repository: &str,
+        pull_number: u64,
+        head_sha: &str,
+    ) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT id FROM code_review_jobs
+                 WHERE repository = ?1 AND pull_number = ?2 AND head_sha = ?3
+                   AND review_published = 1
+                 ORDER BY publication_order DESC, created_at DESC, id DESC
+                 LIMIT 1",
+                params![repository, pull_number as i64, head_sha],
                 |row| row.get(0),
             )
             .optional()?)
@@ -28592,10 +28658,11 @@ mod tests {
             &[],
         );
 
-        let projected = store.code_review_job(&partial.id).unwrap().unwrap().job;
-        assert_eq!(projected.open_issue_count, Some(0));
-        assert!(projected.legacy_coverage_pending);
-        assert!(!projected.legacy_coverage_exhausted);
+        let projected = store.code_review_job(&partial.id).unwrap().unwrap();
+        assert_eq!(projected.job.open_issue_count, Some(0));
+        assert!(projected.job.legacy_coverage_pending);
+        assert!(!projected.job.legacy_coverage_exhausted);
+        assert!(!projected.legacy_coverage_settled);
 
         for attempt in 1..=LEGACY_FULL_COVERAGE_MAX_ATTEMPTS {
             let mut request = backoff_test_job_request();
@@ -28623,9 +28690,46 @@ mod tests {
             &[],
             &[],
         );
-        let settled = store.code_review_job(&partial.id).unwrap().unwrap().job;
-        assert!(!settled.legacy_coverage_pending);
-        assert!(!settled.legacy_coverage_exhausted);
+        let settled = store.code_review_job(&partial.id).unwrap().unwrap();
+        assert!(!settled.job.legacy_coverage_pending);
+        assert!(!settled.job.legacy_coverage_exhausted);
+        assert!(settled.legacy_coverage_settled);
+    }
+
+    #[test]
+    fn latest_published_review_for_head_survives_a_later_different_head() {
+        let store = Store::open_in_memory().unwrap();
+        let (first, _) = publish_leveled_test_round(
+            &store,
+            "acme/widgets#42:first-head",
+            "1111111111111111111111111111111111111111",
+            trouve_protocol::CodeReviewJobScope::Incremental,
+            &[],
+            &[],
+        );
+        let (later, _) = publish_leveled_test_round(
+            &store,
+            "acme/widgets#42:later-head",
+            "2222222222222222222222222222222222222222",
+            trouve_protocol::CodeReviewJobScope::Full,
+            &[],
+            &[],
+        );
+
+        assert_eq!(
+            store
+                .latest_published_code_review_job_id("acme/widgets", 42)
+                .unwrap()
+                .as_deref(),
+            Some(later.id.as_str())
+        );
+        assert_eq!(
+            store
+                .latest_published_code_review_job_id_for_head("acme/widgets", 42, &first.head_sha,)
+                .unwrap()
+                .as_deref(),
+            Some(first.id.as_str())
+        );
     }
 
     #[test]
