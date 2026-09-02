@@ -376,6 +376,15 @@ pub enum Event {
     /// Folded final assistant text for the turn.
     #[serde(rename = "assistant.message")]
     AssistantMessage { turn: u64, content: String },
+    /// Durable files produced by the assistant or one of its tools. Bytes are
+    /// served through the same attachment endpoint as user uploads.
+    #[serde(rename = "assistant.artifacts")]
+    AssistantArtifacts {
+        turn: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_id: Option<CallId>,
+        attachments: Vec<crate::Attachment>,
+    },
 
     #[serde(rename = "tool.requested")]
     ToolRequested {

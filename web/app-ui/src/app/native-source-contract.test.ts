@@ -55,6 +55,7 @@ const readRepositoryFile = (path: string): string =>
 const rustEventToWire = {
   ApprovalRequested: "approval.requested",
   ApprovalResolved: "approval.resolved",
+  AssistantArtifacts: "assistant.artifacts",
   AssistantDelta: "assistant.delta",
   AssistantMessage: "assistant.message",
   AssistantProgress: "assistant.progress",

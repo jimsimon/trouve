@@ -178,6 +178,8 @@ Thread scope:
   `assistant.thinking_completed` `{turn}` — the provider explicitly closed
   the current thinking item, even when no visible output follows immediately
 - `assistant.message` `{turn, content}` — folded final text for the turn
+- `assistant.artifacts` `{turn, call_id?, attachments}` — durable
+  model/tool-produced files stored behind the attachment endpoint
 - `tool.requested` `{turn, call_id, tool, args, requires_approval}`
 - `approval.requested` `{turn, call_id}` / `approval.resolved` `{call_id,
   decision, by}`

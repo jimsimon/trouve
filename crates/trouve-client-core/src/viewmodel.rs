@@ -170,6 +170,11 @@ pub enum ChatItem {
         content: String,
         complete: bool,
     },
+    Artifacts {
+        turn: u64,
+        call_id: Option<String>,
+        attachments: Vec<trouve_protocol::Attachment>,
+    },
     /// User-facing progress authored by the agent harness.
     Progress {
         turn: u64,
@@ -410,6 +415,15 @@ impl From<ThreadViewItem> for ChatItem {
                 turn,
                 content,
                 complete,
+            },
+            ThreadViewItem::Artifacts {
+                turn,
+                call_id,
+                attachments,
+            } => Self::Artifacts {
+                turn,
+                call_id,
+                attachments,
             },
             ThreadViewItem::Progress {
                 turn,
@@ -975,6 +989,21 @@ impl ThreadViewModel {
                     Some(self.items.len() - 1)
                 }
             }
+            Event::AssistantArtifacts {
+                turn,
+                call_id,
+                attachments,
+            } => {
+                self.fail_open_compaction(*turn);
+                self.finish_progress();
+                self.finish_thinking();
+                self.items.push(ChatItem::Artifacts {
+                    turn: *turn,
+                    call_id: call_id.clone(),
+                    attachments: attachments.clone(),
+                });
+                Some(self.items.len() - 1)
+            }
             Event::ToolRequested {
                 turn,
                 call_id,
@@ -1294,6 +1323,7 @@ mod tests {
                 ChatItem::Steered { .. } => "steered",
                 ChatItem::Subagent { .. } => "subagent",
                 ChatItem::Assistant { .. } => "assistant",
+                ChatItem::Artifacts { .. } => "artifacts",
                 ChatItem::Progress { .. } => "progress",
                 ChatItem::Thinking { .. } => "thinking",
                 ChatItem::Compaction { .. } => "compaction",

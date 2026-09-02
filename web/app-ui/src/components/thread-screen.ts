@@ -3206,6 +3206,22 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         index += 1;
         continue;
       }
+      if (item.kind === "artifacts") {
+        flushActivityRows();
+        rows.push(html`<section
+          class="turn-rail-node turn-response-node agent-artifacts"
+          data-chat-anchor-id=${`item:${item.id}`}
+          aria-label="Agent attachments"
+        >
+          <span class="turn-rail-marker response complete" aria-hidden="true">
+            ${fontAwesomeIcon("paperclip")}
+          </span>
+          <header class="turn-node-header"><strong>Attachments</strong></header>
+          ${this.#renderAttachments(item.attachments, "Agent attachments")}
+        </section>`);
+        index += 1;
+        continue;
+      }
       if (item.kind === "assistant") {
         flushActivityRows();
         const stretch: Extract<AgentChatItem, { readonly kind: "assistant" }>[] = [];
@@ -3369,6 +3385,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         if (
           candidate === undefined
           || candidate.kind === "assistant"
+          || candidate.kind === "artifacts"
           || candidate.kind === "steered"
           || candidate.kind === "questions"
           || candidate.kind === "progress"
@@ -4963,10 +4980,11 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
 
   #renderAttachments(
     attachments: Extract<ThreadChatItem, { kind: "user" }>["attachments"],
+    label = "Message attachments",
   ) {
     if (attachments.length === 0) return nothing;
     return html`
-      <ul class="attachment-list" aria-label="Message attachments">
+      <ul class="attachment-list" aria-label=${label}>
         ${attachments.map((attachment) => {
           const path = protocolAttachmentPath(attachment);
           const image = isImageAttachment(attachment);

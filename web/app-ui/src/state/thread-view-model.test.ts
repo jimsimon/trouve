@@ -17,6 +17,28 @@ const envelope = (
   ({ cursor, scope: { thread: "th_1" }, ts, ...event }) as ProtocolEventEnvelope;
 
 describe("ThreadViewModel", () => {
+  it("projects assistant-produced attachments from live events", () => {
+    const vm = new ThreadViewModel();
+    vm.apply(envelope(1, {
+      type: "assistant.artifacts",
+      turn: 4,
+      call_id: "call_screenshot",
+      attachments: [{
+        id: "attachment_1",
+        name: "tool-image-1.png",
+        mime: "image/png",
+        size_bytes: 5,
+      }],
+    }));
+
+    expect(vm.items).toMatchObject([{
+      kind: "artifacts",
+      turn: 4,
+      callId: "call_screenshot",
+      attachments: [{ name: "tool-image-1.png", mime: "image/png" }],
+    }]);
+  });
+
   it("updates a running turn phase without adding transcript items", () => {
     const vm = new ThreadViewModel();
     vm.apply(envelope(1, {

@@ -40,7 +40,9 @@ These are load-bearing. Do not violate them without a new ADR.
    loopback HTTP + SSE and never touches engine internals.
 2. **One durable event log.** Durable server→client state flows through the
    append-only, persisted, cursor-addressed event log. New durable UI-visible
-   state means a new event type, not a side channel. Explicitly ephemeral
+   state means a new event type, not a side channel. Durable binary artifacts
+   are referenced by events and stored in the attachment store; base64 payloads
+   never enter the event log. Explicitly ephemeral
    transports such as integrated PTY instances and their byte streams may use
    request/SSE endpoints and are not reconstructed after server restart (ADR
    0019).

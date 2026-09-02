@@ -4901,6 +4901,11 @@ enum StoreMutation {
         attachments: Vec<(trouve_protocol::Attachment, String)>,
         staging_cleanup_claim: Option<ArtifactCleanupClaim>,
     },
+    AppendAttachments {
+        thread_id: String,
+        attachments: Vec<(trouve_protocol::Attachment, String)>,
+        staging_cleanup_claim: Option<ArtifactCleanupClaim>,
+    },
 }
 
 /// One caller's event batch, in flight to the writer thread.
@@ -5789,6 +5794,39 @@ fn apply_store_mutation(
                  )",
                 params![thread_id, payload],
             )?;
+            if let Some(claim) = staging_cleanup_claim {
+                let deleted = conn.execute(
+                    "DELETE FROM artifact_cleanup_jobs WHERE id = ?1 AND claim_token = ?2",
+                    params![claim.id, claim.token],
+                )?;
+                anyhow::ensure!(
+                    deleted == 1,
+                    "attachment staging claim {} is no longer owned",
+                    claim.id
+                );
+            }
+        }
+        StoreMutation::AppendAttachments {
+            thread_id,
+            attachments,
+            staging_cleanup_claim,
+        } => {
+            for (attachment, path) in attachments {
+                conn.execute(
+                    "INSERT INTO attachments
+                       (id, thread_id, name, mime, size_bytes, path, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        attachment.id,
+                        thread_id,
+                        attachment.name,
+                        attachment.mime,
+                        attachment.size_bytes as i64,
+                        path,
+                        timestamp.to_rfc3339(),
+                    ],
+                )?;
+            }
             if let Some(claim) = staging_cleanup_claim {
                 let deleted = conn.execute(
                     "DELETE FROM artifact_cleanup_jobs WHERE id = ?1 AND claim_token = ?2",
@@ -16736,6 +16774,27 @@ impl Store {
             StoreMutation::AppendMessage {
                 thread_id: thread_id.to_string(),
                 payload: payload.to_string(),
+                attachments,
+                staging_cleanup_claim,
+            },
+        )?;
+        self.append_pending_events(pending)?;
+        Ok(())
+    }
+
+    pub(crate) fn append_events_with_attachments(
+        &self,
+        scope: Scope,
+        events: Vec<Event>,
+        thread_id: &str,
+        attachments: Vec<(trouve_protocol::Attachment, String)>,
+        staging_cleanup_claim: Option<ArtifactCleanupClaim>,
+    ) -> Result<()> {
+        let (events, _) = self.events_with_chat_pr_mentions(scope, events)?;
+        let pending = serialize_lifecycle_events(
+            events,
+            StoreMutation::AppendAttachments {
+                thread_id: thread_id.to_string(),
                 attachments,
                 staging_cleanup_claim,
             },
