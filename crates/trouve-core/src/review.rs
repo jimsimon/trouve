@@ -1119,10 +1119,17 @@ struct ManualReviewComment {
     trigger_key: String,
 }
 
-/// Whether a trusted comment requests a review. `review full` remains an
-/// accepted alias for existing workflows, but every command now reviews the
-/// complete branch. Any other trailing word is not a command.
-fn contains_manual_review_command(body: &str) -> bool {
+/// The accepted spelling of a manual review command. Both variants review the
+/// complete branch. The legacy alias remains distinct only as a durable
+/// identity so comments consumed before protocol 8.0 keep their historical
+/// `:full` dedupe key when webhook delivery and polling overlap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManualReviewCommand {
+    Review,
+    LegacyFullAlias,
+}
+
+fn manual_review_command(body: &str) -> Option<ManualReviewCommand> {
     for line in body.lines() {
         let mut words = line.split_whitespace();
         if !words
@@ -1138,41 +1145,45 @@ fn contains_manual_review_command(body: &str) -> bool {
             continue;
         }
         match words.next() {
-            None => return true,
+            None => return Some(ManualReviewCommand::Review),
             Some(word) if word.eq_ignore_ascii_case("full") && words.next().is_none() => {
-                return true;
+                return Some(ManualReviewCommand::LegacyFullAlias);
             }
             _ => continue,
         }
     }
-    false
+    None
 }
 
-fn manual_review_trigger_key(comment_id: u64) -> String {
-    format!("manual:comment:{comment_id}")
+fn manual_review_trigger_key(comment_id: u64, command: ManualReviewCommand) -> String {
+    match command {
+        ManualReviewCommand::Review => format!("manual:comment:{comment_id}"),
+        ManualReviewCommand::LegacyFullAlias => format!("manual:comment:{comment_id}:full"),
+    }
 }
 
-fn is_trusted_manual_review_command(
+fn trusted_manual_review_command(
     body: &str,
     author_association: &str,
     user_kind: Option<&str>,
-) -> bool {
-    !user_kind.is_some_and(|kind| kind.eq_ignore_ascii_case("bot"))
-        && matches!(author_association, "OWNER" | "MEMBER" | "COLLABORATOR")
-        && contains_manual_review_command(body)
-}
-
-fn manual_review_comment(payload: &serde_json::Value) -> Option<ManualReviewComment> {
-    if payload["action"].as_str()? != "created"
-        || !payload["issue"]["pull_request"].is_object()
-        || !is_trusted_manual_review_command(
-            payload["comment"]["body"].as_str()?,
-            payload["comment"]["author_association"].as_str()?,
-            payload["comment"]["user"]["type"].as_str(),
-        )
+) -> Option<ManualReviewCommand> {
+    if user_kind.is_some_and(|kind| kind.eq_ignore_ascii_case("bot"))
+        || !matches!(author_association, "OWNER" | "MEMBER" | "COLLABORATOR")
     {
         return None;
     }
+    manual_review_command(body)
+}
+
+fn manual_review_comment(payload: &serde_json::Value) -> Option<ManualReviewComment> {
+    if payload["action"].as_str()? != "created" || !payload["issue"]["pull_request"].is_object() {
+        return None;
+    }
+    let command = trusted_manual_review_command(
+        payload["comment"]["body"].as_str()?,
+        payload["comment"]["author_association"].as_str()?,
+        payload["comment"]["user"]["type"].as_str(),
+    )?;
     let repository = payload["repository"]["full_name"].as_str()?.to_owned();
     let installation_id = payload["installation"]["id"].as_u64()?;
     let pull_number = payload["issue"]["number"].as_u64()?;
@@ -1181,7 +1192,7 @@ fn manual_review_comment(payload: &serde_json::Value) -> Option<ManualReviewComm
         repository,
         installation_id,
         pull_number,
-        trigger_key: manual_review_trigger_key(comment_id),
+        trigger_key: manual_review_trigger_key(comment_id, command),
     })
 }
 
@@ -1373,18 +1384,17 @@ fn pull_number_from_issue_url(issue_url: &str) -> Option<u64> {
 }
 
 fn polled_manual_review_comment(comment: &GithubIssueComment) -> Option<(u64, String)> {
-    if comment.id == 0
-        || !is_trusted_manual_review_command(
-            comment.body.as_deref()?,
-            &comment.author_association,
-            comment.user.as_ref().map(|user| user.kind.as_str()),
-        )
-    {
+    if comment.id == 0 {
         return None;
     }
+    let command = trusted_manual_review_command(
+        comment.body.as_deref()?,
+        &comment.author_association,
+        comment.user.as_ref().map(|user| user.kind.as_str()),
+    )?;
     Some((
         pull_number_from_issue_url(&comment.issue_url)?,
-        manual_review_trigger_key(comment.id),
+        manual_review_trigger_key(comment.id, command),
     ))
 }
 
@@ -19730,15 +19740,29 @@ rename to src/new.rs
 
     #[test]
     fn manual_review_commands_accept_the_legacy_full_alias() {
-        assert!(contains_manual_review_command("@trouve-ai review"));
-        assert!(contains_manual_review_command("@trouve-ai review full"));
-        assert!(contains_manual_review_command("@TROUVE-AI REVIEW FULL"));
-        assert!(!contains_manual_review_command("@trouve-ai review fuller"));
-        assert!(!contains_manual_review_command(
-            "@trouve-ai review full now"
-        ));
-        assert!(!contains_manual_review_command("please review"));
-        assert_eq!(manual_review_trigger_key(7), "manual:comment:7");
+        assert_eq!(
+            manual_review_command("@trouve-ai review"),
+            Some(ManualReviewCommand::Review)
+        );
+        assert_eq!(
+            manual_review_command("@trouve-ai review full"),
+            Some(ManualReviewCommand::LegacyFullAlias)
+        );
+        assert_eq!(
+            manual_review_command("@TROUVE-AI REVIEW FULL"),
+            Some(ManualReviewCommand::LegacyFullAlias)
+        );
+        assert_eq!(manual_review_command("@trouve-ai review fuller"), None);
+        assert_eq!(manual_review_command("@trouve-ai review full now"), None);
+        assert_eq!(manual_review_command("please review"), None);
+        assert_eq!(
+            manual_review_trigger_key(7, ManualReviewCommand::Review),
+            "manual:comment:7"
+        );
+        assert_eq!(
+            manual_review_trigger_key(7, ManualReviewCommand::LegacyFullAlias),
+            "manual:comment:7:full"
+        );
     }
 
     #[test]
@@ -27389,7 +27413,7 @@ rename to src/new.rs
             "  @TROUVE-AI   REVIEW  ",
             "Context before\n@trouve-ai review\nContext after",
         ] {
-            assert!(contains_manual_review_command(body), "{body:?}");
+            assert!(manual_review_command(body).is_some(), "{body:?}");
         }
         for body in [
             "@trouve-ai reviews",
@@ -27397,7 +27421,7 @@ rename to src/new.rs
             "@trouve-ai review this",
             "`@trouve-ai review`",
         ] {
-            assert!(!contains_manual_review_command(body), "{body:?}");
+            assert!(manual_review_command(body).is_none(), "{body:?}");
         }
     }
 
@@ -27428,6 +27452,19 @@ rename to src/new.rs
             })
         );
 
+        payload["comment"]["body"] = serde_json::json!("Looks good");
+        assert_eq!(manual_review_comment(&payload), None);
+        payload["comment"]["body"] = serde_json::json!("@trouve-ai review full");
+        assert_eq!(
+            manual_review_comment(&payload),
+            Some(ManualReviewComment {
+                repository: "acme/widgets".into(),
+                installation_id: 7,
+                pull_number: 42,
+                trigger_key: "manual:comment:100:full".into(),
+            })
+        );
+        payload["comment"]["body"] = serde_json::json!("@trouve-ai review");
         payload["comment"]["author_association"] = serde_json::json!("CONTRIBUTOR");
         assert_eq!(manual_review_comment(&payload), None);
         payload["comment"]["author_association"] = serde_json::json!("OWNER");
@@ -27453,6 +27490,14 @@ rename to src/new.rs
             Some((42, "manual:comment:100".into()))
         );
 
+        comment.body = Some("Looks good".into());
+        assert_eq!(polled_manual_review_comment(&comment), None);
+        comment.body = Some("@Trouve-AI review full".into());
+        assert_eq!(
+            polled_manual_review_comment(&comment),
+            Some((42, "manual:comment:100:full".into()))
+        );
+        comment.body = Some("@Trouve-AI review".into());
         comment.author_association = "CONTRIBUTOR".into();
         assert_eq!(polled_manual_review_comment(&comment), None);
         comment.author_association = "OWNER".into();
