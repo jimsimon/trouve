@@ -18375,6 +18375,36 @@ mod tests {
     }
 
     #[test]
+    fn legacy_full_coverage_bridge_waits_for_succeeded_unpublished_attempt() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let mut first_request =
+            test_review_job_request("acme/widgets#42:legacy-full-coverage:unpublished-first");
+        first_request.scope = trouve_protocol::CodeReviewJobScope::Full;
+        first_request.trigger = "legacy-full-coverage".into();
+        let first = store
+            .enqueue_legacy_full_coverage_job(&first_request)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            first.id
+        );
+        store
+            .finish_code_review_job(&first.id, "succeeded", "", "")
+            .unwrap();
+
+        let mut retry_request = first_request;
+        retry_request.dedupe_key = "acme/widgets#42:legacy-full-coverage:unpublished-retry".into();
+        assert!(
+            store
+                .enqueue_legacy_full_coverage_job(&retry_request)
+                .unwrap()
+                .is_none(),
+            "a succeeded attempt must block its retry until publication is durable"
+        );
+    }
+
+    #[test]
     fn lifecycle_comment_keeps_legacy_partial_success_pending() {
         let store = crate::store::Store::open_in_memory().unwrap();
         let queued = enqueue_test_review_job(&store, "acme/widgets#42:legacy-lifecycle");

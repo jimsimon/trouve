@@ -3929,7 +3929,8 @@ const CODE_REVIEW_JOB_COLUMNS: &str = "id, installation_id, repository, pull_num
        WHERE settled.repository = code_review_jobs.repository \
          AND settled.pull_number = code_review_jobs.pull_number \
          AND settled.head_sha = code_review_jobs.head_sha \
-         AND settled.review_scope = 'full' \
+         AND (settled.review_scope = 'full' \
+              OR COALESCE(settled.review_covered_full_branch, 0) != 0) \
          AND settled.review_published != 0 \
      ) AS legacy_coverage_settled, \
      EXISTS ( \
@@ -3938,7 +3939,8 @@ const CODE_REVIEW_JOB_COLUMNS: &str = "id, installation_id, repository, pull_num
          AND active.pull_number = code_review_jobs.pull_number \
          AND active.head_sha = code_review_jobs.head_sha \
          AND active.id != code_review_jobs.id \
-         AND active.status IN ('queued', 'running') \
+         AND (active.status IN ('queued', 'running') \
+              OR (active.status = 'succeeded' AND active.review_published = 0)) \
      ) AS legacy_coverage_active, \
      (SELECT COUNT(*) FROM code_review_jobs AS attempt \
       WHERE attempt.repository = code_review_jobs.repository \
@@ -9682,7 +9684,8 @@ impl Store {
                EXISTS(
                  SELECT 1 FROM code_review_jobs
                  WHERE repository = ?1 AND pull_number = ?2 AND head_sha = ?3
-                   AND status IN ('queued', 'running')
+                   AND (status IN ('queued', 'running')
+                        OR (status = 'succeeded' AND review_published = 0))
                )",
             params![
                 new_job.repository,
@@ -28697,6 +28700,46 @@ mod tests {
     }
 
     #[test]
+    fn succeeded_unpublished_legacy_attempt_keeps_partial_pending() {
+        let store = Store::open_in_memory().unwrap();
+        let (partial, _) = publish_leveled_test_round(
+            &store,
+            "acme/widgets#42:legacy-partial-awaiting-publication",
+            "2222222222222222222222222222222222222222",
+            trouve_protocol::CodeReviewJobScope::Incremental,
+            &[],
+            &[],
+        );
+
+        for attempt in 1..=LEGACY_FULL_COVERAGE_MAX_ATTEMPTS {
+            let mut request = backoff_test_job_request();
+            request.dedupe_key = format!("acme/widgets#42:unpublished-attempt-{attempt}");
+            request.scope = trouve_protocol::CodeReviewJobScope::Full;
+            request.trigger = "legacy-full-coverage".into();
+            let queued = store
+                .enqueue_legacy_full_coverage_job(&request)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                store.claim_code_review_job().unwrap().unwrap().job.id,
+                queued.id
+            );
+            let (status, error) = if attempt == LEGACY_FULL_COVERAGE_MAX_ATTEMPTS {
+                ("succeeded", "")
+            } else {
+                ("failed", "compatibility review failed")
+            };
+            store
+                .finish_code_review_job(&queued.id, status, "", error)
+                .unwrap();
+        }
+
+        let projected = store.code_review_job(&partial.id).unwrap().unwrap().job;
+        assert!(projected.legacy_coverage_pending);
+        assert!(!projected.legacy_coverage_exhausted);
+    }
+
+    #[test]
     fn latest_published_review_for_head_survives_a_later_different_head() {
         let store = Store::open_in_memory().unwrap();
         let (first, _) = publish_leveled_test_round(
@@ -28733,8 +28776,16 @@ mod tests {
     }
 
     #[test]
-    fn upgraded_worker_marks_an_in_flight_legacy_job_as_full_coverage() {
+    fn upgraded_worker_full_coverage_settles_an_older_legacy_partial() {
         let store = Store::open_in_memory().unwrap();
+        let (partial, _) = publish_leveled_test_round(
+            &store,
+            "acme/widgets#42:older-legacy-partial",
+            "2222222222222222222222222222222222222222",
+            trouve_protocol::CodeReviewJobScope::Incremental,
+            &[],
+            &[],
+        );
         let mut request = backoff_test_job_request();
         request.dedupe_key = "acme/widgets#42:upgraded-legacy-worker".into();
         request.review_base_sha.clear();
@@ -28759,6 +28810,36 @@ mod tests {
             "1111111111111111111111111111111111111111"
         );
         assert_eq!(updated.covered_full_branch, Some(true));
+
+        store
+            .save_code_review_result(&queued.id, "Upgraded clean result.", "", 0, &[], &[])
+            .unwrap();
+        assert!(store.claim_code_review_publication(&queued.id).unwrap());
+        store
+            .record_code_review_publication(
+                &queued.id,
+                &queued.repository,
+                queued.pull_number,
+                &queued.base_ref,
+                &queued.head_sha,
+                "https://example.test/upgraded-review",
+                false,
+                &[],
+            )
+            .unwrap();
+        store
+            .finish_code_review_job(
+                &queued.id,
+                "succeeded",
+                "https://example.test/upgraded-review",
+                "",
+            )
+            .unwrap();
+
+        let settled = store.code_review_job(&partial.id).unwrap().unwrap();
+        assert!(!settled.job.legacy_coverage_pending);
+        assert!(!settled.job.legacy_coverage_exhausted);
+        assert!(settled.legacy_coverage_settled);
     }
 
     #[test]
