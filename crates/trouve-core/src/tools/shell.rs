@@ -428,21 +428,16 @@ impl Shell {
         pump(child.take_stdout(), output.clone());
         pump(child.take_stderr(), output.clone());
         let child = Arc::new(tokio::sync::Mutex::new(child));
-        let mutation_lease = ctx
-            .background_mutation_lease
-            .as_ref()
-            .and_then(|lease| lease.take());
-
         // Waiter: the job is complete only when the leader and every
-        // descendant have exited. In particular, a shell that daemonizes a
-        // child does not release the session mutation lane when the shell
-        // leader exits.
+        // descendant has exited. Process-tree ownership remains independent of
+        // the session mutation lane, which covers the launch call rather than
+        // the lifetime of a service intentionally left running in the
+        // background.
         {
             let child = child.clone();
             let output = output.clone();
             let cleanup = self.jobs.cleanup.clone();
             tokio::spawn(async move {
-                let _mutation_lease = mutation_lease;
                 loop {
                     let status = child.lock().await.try_wait_tree();
                     match status {
@@ -1029,19 +1024,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn background_job_holds_transferred_mutation_lease_until_reaped() {
+    async fn background_job_releases_callers_mutation_lane_after_launch() {
         let tmp = tempfile::tempdir().unwrap();
         let started = tmp.path().join("started");
         let lane = Arc::new(tokio::sync::RwLock::new(()));
-        let guard = lane.clone().write_owned().await;
+        let launch_guard = lane.clone().write_owned().await;
         let ctx = ToolCtx {
             worktree: tmp.path().to_path_buf(),
-            background_mutation_lease: Some(Arc::new(crate::tools::BackgroundMutationLease::new(
-                guard,
-            ))),
             ..Default::default()
         };
-        let (shell, output, kill) = tools();
+        let (shell, _, kill) = tools();
         let launched = shell
             .run(
                 &ctx,
@@ -1052,6 +1044,7 @@ mod tests {
             )
             .await;
         let id = launched.result["job_id"].as_str().unwrap().to_string();
+        drop(launch_guard);
 
         tokio::time::timeout(Duration::from_secs(2), async {
             while !started.exists() {
@@ -1061,28 +1054,12 @@ mod tests {
         .await
         .expect("background shell did not reach its blocking command");
 
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), lane.clone().write_owned())
-                .await
-                .is_err(),
-            "a live background mutation released its session lane"
-        );
-        tokio::time::timeout(
-            Duration::from_millis(100),
-            output.run(&ctx, &json!({"job_id": id})),
-        )
-        .await
-        .expect("shell_output must not wait on the background mutation lane");
-        tokio::time::timeout(
-            Duration::from_millis(100),
-            kill.run(&ctx, &json!({"job_id": id})),
-        )
-        .await
-        .expect("shell_kill must not wait on the background mutation lane");
-
-        tokio::time::timeout(Duration::from_secs(2), lane.write_owned())
+        let next_call = tokio::time::timeout(Duration::from_millis(100), lane.write_owned())
             .await
-            .expect("the waiter did not release the mutation lane after reaping");
+            .expect("a live background job retained the completed launch call's mutation lane");
+        drop(next_call);
+        let killed = kill.run(&ctx, &json!({"job_id": id})).await;
+        assert_eq!(killed.status, trouve_protocol::ToolStatus::Ok);
     }
 
     #[cfg(target_os = "linux")]
@@ -1116,13 +1093,8 @@ mod tests {
     #[tokio::test]
     async fn shell_kill_owns_daemonized_descendant_after_leader_exit() {
         let tmp = tempfile::tempdir().unwrap();
-        let lane = Arc::new(tokio::sync::RwLock::new(()));
-        let guard = lane.clone().write_owned().await;
         let ctx = ToolCtx {
             worktree: tmp.path().to_path_buf(),
-            background_mutation_lease: Some(Arc::new(crate::tools::BackgroundMutationLease::new(
-                guard,
-            ))),
             ..Default::default()
         };
         let (shell, output, kill) = tools();
@@ -1142,19 +1114,10 @@ mod tests {
 
         let state = output.run(&ctx, &json!({"job_id": id})).await;
         assert_eq!(state.result["running"], true);
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), lane.clone().write_owned())
-                .await
-                .is_err(),
-            "leader exit released the descendant's mutation lease"
-        );
 
         let killed = kill.run(&ctx, &json!({"job_id": id})).await;
         assert_eq!(killed.status, trouve_protocol::ToolStatus::Ok);
         wait_for_process_exit(child_pid).await;
-        tokio::time::timeout(Duration::from_secs(2), lane.write_owned())
-            .await
-            .expect("shell_kill did not release the daemonized descendant's lease");
     }
 
     #[cfg(target_os = "linux")]
@@ -1165,13 +1128,8 @@ mod tests {
             "setsid is required"
         );
         let tmp = tempfile::tempdir().unwrap();
-        let lane = Arc::new(tokio::sync::RwLock::new(()));
-        let guard = lane.clone().write_owned().await;
         let ctx = ToolCtx {
             worktree: tmp.path().to_path_buf(),
-            background_mutation_lease: Some(Arc::new(crate::tools::BackgroundMutationLease::new(
-                guard,
-            ))),
             ..Default::default()
         };
         let (shell, output, kill) = tools();
@@ -1191,32 +1149,18 @@ mod tests {
 
         let state = output.run(&ctx, &json!({"job_id": id})).await;
         assert_eq!(state.result["running"], true);
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), lane.clone().write_owned())
-                .await
-                .is_err(),
-            "setsid descendant released the session mutation lease"
-        );
 
         let killed = kill.run(&ctx, &json!({"job_id": id})).await;
         assert_eq!(killed.status, trouve_protocol::ToolStatus::Ok);
         wait_for_process_exit(child_pid).await;
-        tokio::time::timeout(Duration::from_secs(2), lane.write_owned())
-            .await
-            .expect("shell_kill did not release the setsid descendant's lease");
     }
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn lifetime_cap_owns_daemonized_descendant_after_leader_exit() {
         let tmp = tempfile::tempdir().unwrap();
-        let lane = Arc::new(tokio::sync::RwLock::new(()));
-        let guard = lane.clone().write_owned().await;
         let ctx = ToolCtx {
             worktree: tmp.path().to_path_buf(),
-            background_mutation_lease: Some(Arc::new(crate::tools::BackgroundMutationLease::new(
-                guard,
-            ))),
             ..Default::default()
         };
         let (shell, output, _) = tools();
@@ -1231,17 +1175,8 @@ mod tests {
         let leader_pid = launched.result["pid"].as_u64().unwrap() as u32;
         let child_pid = wait_for_pid_file(&tmp.path().join("child.pid")).await;
         wait_for_process_exit(leader_pid).await;
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), lane.clone().write_owned())
-                .await
-                .is_err(),
-            "leader exit released the descendant before the lifetime cap"
-        );
 
         wait_for_process_exit(child_pid).await;
-        tokio::time::timeout(Duration::from_secs(2), lane.write_owned())
-            .await
-            .expect("lifetime cap did not release the daemonized descendant's lease");
         let state = output.run(&ctx, &json!({"job_id": id})).await;
         assert_eq!(state.result["running"], false);
         assert_eq!(state.result["killed"], true);
