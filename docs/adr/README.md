@@ -39,7 +39,7 @@ sequentially.
 | [0027](0027-wry-default-desktop-frontend.md) | Wry as the default desktop frontend | Superseded by 0028 |
 | [0028](0028-retire-slint-frontend.md) | Retire the Slint frontend | Partially superseded by 0039 |
 | [0029](0029-short-session-branch-names.md) | Short session branch names by default | Accepted |
-| [0030](0030-parallel-tool-execution-and-vendor-mutation-confinement.md) | Parallel tool execution with per-session mutation confinement | Accepted |
+| [0030](0030-parallel-tool-execution-and-vendor-mutation-confinement.md) | Parallel tool execution with per-session mutation confinement | Partially superseded by 0034 and 0043 |
 | [0031](0031-acknowledged-turn-cancellation.md) | Acknowledged turn cancellation | Accepted |
 | [0032](0032-single-local-server-owner.md) | Single local server owner per data directory | Accepted |
 | [0033](0033-materialized-pageable-thread-history.md) | Materialized pageable thread history | Accepted |
@@ -52,3 +52,4 @@ sequentially.
 | [0040](0040-durable-root-cause-history-for-code-review.md) | Durable root-cause history for code review | Accepted |
 | [0041](0041-evidence-backed-review-churn-controls.md) | Evidence-backed review churn controls | Accepted |
 | [0042](0042-provider-governed-turn-admission.md) | Provider-governed turn admission | Accepted |
+| [0043](0043-background-jobs-release-mutation-lane.md) | Background jobs release the session mutation lane | Accepted |

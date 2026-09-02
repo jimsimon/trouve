@@ -39,10 +39,10 @@ use crate::store::{
     ReviewWorkspaceCleanupIntent, SessionPrVerificationIntent, Store,
 };
 use crate::tools::{
-    AttachmentMaterialization, AttachmentMaterializationFile, BackgroundMutationLease,
-    DeletedSessionCleanup, LocalToolExecutor, MaterializedAttachment, McpConfigMutation,
-    McpConfigMutationOutcome, McpConfigMutationRequest, SessionRepositoryDiff,
-    SessionRepositoryPush, ToolCtx, ToolExecutor, ToolResult, edit_strategy_for_model,
+    AttachmentMaterialization, AttachmentMaterializationFile, DeletedSessionCleanup,
+    LocalToolExecutor, MaterializedAttachment, McpConfigMutation, McpConfigMutationOutcome,
+    McpConfigMutationRequest, SessionRepositoryDiff, SessionRepositoryPush, ToolCtx, ToolExecutor,
+    ToolResult, edit_strategy_for_model,
 };
 use crate::{context, git, new_id, personas};
 
@@ -12591,7 +12591,6 @@ impl Engine {
             config_dir: self.config_dir.clone(),
             workspace_root: Some(PathBuf::from(&ws.path)),
             edit_strategy: edit_strategy_for_model(&thread.model),
-            background_mutation_lease: None,
         };
 
         let all_modes = self.resolve_personas(Some(Path::new(&ws.path)))?;
@@ -13959,7 +13958,6 @@ impl Engine {
             config_dir: self.config_dir.clone(),
             workspace_root: Some(PathBuf::from(&ws.path)),
             edit_strategy: edit_strategy_for_model(&thread.model),
-            background_mutation_lease: None,
         };
         Ok((session, thread, mode, ctx))
     }
@@ -16818,19 +16816,7 @@ impl Engine {
                 )
                 .await?;
             let executor = self.executor.clone();
-            let mut tool_ctx = ctx.clone();
-            if call.name == "shell"
-                && call
-                    .arguments
-                    .get("run_in_background")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false)
-                && let Some(ExecutionPermit::Write { guard }) = permit.as_mut()
-                && let Some(guard) = guard.take()
-            {
-                tool_ctx.background_mutation_lease =
-                    Some(Arc::new(BackgroundMutationLease::new(guard)));
-            }
+            let tool_ctx = ctx.clone();
             let tool_name = call.name.clone();
             let tool_arguments = call.arguments.clone();
             let execution_started = std::time::Instant::now();

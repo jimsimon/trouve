@@ -56,7 +56,9 @@ These are load-bearing. Do not violate them without a new ADR.
    capabilities never widen mutation paths (ADR 0037). Threads share the
    session worktree and their turns may run concurrently; read-only tools may
    overlap, but mutation-capable tool calls and checkpoints are exclusive per
-   session (ADRs 0030 and 0034).
+   session. Managed background jobs release that lane after launch so later
+   tools can interact with intentionally persistent development services
+   (ADRs 0030, 0034, and 0043).
 5. **Protocol changes are versioned.** `trouve-protocol` is the single
    source of truth; the OpenAPI schema snapshot test must be updated
    deliberately with a version bump. Generated clients require an exact
