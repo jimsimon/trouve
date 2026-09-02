@@ -2229,8 +2229,9 @@ export interface components {
             retried_by?: string | null;
             retry_of?: string | null;
             /**
-             * @description Pull-request merge base used as the left side of this review's diff.
-             *     Legacy jobs may expose an older incremental watermark here.
+             * @description Actual pull-request merge base used as the left side of this review's
+             *     diff. Omitted while a queued or early-running job is still preparing
+             *     its repository. Legacy jobs may expose an incremental watermark here.
              */
             review_base_sha?: string;
             review_url?: string;

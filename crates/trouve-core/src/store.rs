@@ -3656,6 +3656,9 @@ pub struct CodeReviewManualRequest {
 pub struct CodeReviewJobRecord {
     pub job: trouve_protocol::CodeReviewJob,
     pub can_retry_final_editor: bool,
+    /// Persisted coverage marker retained only to settle pre-8.0 incremental
+    /// rows without exposing incremental state on the current protocol.
+    pub covered_full_branch: Option<bool>,
     pub prompt: String,
     /// Author-written pull-request description snapshotted at enqueue.
     /// Untrusted claimed intent for review prompts; never serialized to the
@@ -3756,11 +3759,6 @@ fn row_to_code_review_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<CodeReviewJ
         job_elapsed_ms(&status, created_at, started_at, completed_at);
     let base_ref: String = r.get(7)?;
     let review_base_sha: String = r.get(22)?;
-    let effective_review_base_sha = if review_base_sha.is_empty() {
-        base_ref.clone()
-    } else {
-        review_base_sha
-    };
     Ok(CodeReviewJobRecord {
         job: trouve_protocol::CodeReviewJob {
             id: r.get(0)?,
@@ -3770,7 +3768,7 @@ fn row_to_code_review_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<CodeReviewJ
             pull_title: r.get(4)?,
             pull_url: r.get(5)?,
             head_sha: r.get(6)?,
-            review_base_sha: effective_review_base_sha.clone(),
+            review_base_sha,
             base_ref,
             head_ref: r.get(8)?,
             scope: code_review_scope_from(&r.get::<_, String>(23)?),
@@ -3828,6 +3826,7 @@ fn row_to_code_review_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<CodeReviewJ
             publication_elapsed_ms: r.get::<_, i64>(42)? as u64,
         },
         can_retry_final_editor: r.get(61)?,
+        covered_full_branch: r.get(62)?,
         prompt: r.get(12)?,
         pull_body: r.get(57)?,
         config_hash: r.get(14)?,

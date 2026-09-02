@@ -3009,6 +3009,22 @@ impl Engine {
         Ok(job)
     }
 
+    async fn request_current_head_review_from_job(
+        self: &Arc<Self>,
+        id: &str,
+    ) -> Result<trouve_protocol::CodeReviewJob, EngineError> {
+        let previous = self
+            .store
+            .code_review_job(id)?
+            .ok_or_else(|| EngineError::NotFound(format!("review job {id}")))?;
+        self.request_code_review(trouve_protocol::RequestCodeReviewRequest {
+            installation_id: previous.job.installation_id,
+            repository: previous.job.repository,
+            pull_number: previous.job.pull_number,
+        })
+        .await
+    }
+
     pub async fn request_code_review(
         self: &Arc<Self>,
         request: trouve_protocol::RequestCodeReviewRequest,
@@ -3112,7 +3128,7 @@ impl Engine {
             pull_body: bounded_review_pull_body(pull.body.as_deref()),
             pull_url: pull.html_url,
             head_sha,
-            review_base_sha: base_ref.clone(),
+            review_base_sha: String::new(),
             base_ref,
             head_ref,
             scope: trouve_protocol::CodeReviewJobScope::Full,
@@ -4139,7 +4155,7 @@ impl Engine {
                         pull_body: bounded_review_pull_body(pull.body.as_deref()),
                         pull_url: pull.html_url.clone(),
                         head_sha: pull.head.sha.clone(),
-                        review_base_sha: pull.base.sha.clone(),
+                        review_base_sha: String::new(),
                         base_ref: pull.base.sha.clone(),
                         head_ref: pull.head.name.clone(),
                         scope: trouve_protocol::CodeReviewJobScope::Full,
@@ -4552,12 +4568,18 @@ impl Engine {
             {
                 let engine = self.clone();
                 let job_id = external_id.to_owned();
-                let final_editor_only = retry_action == ReviewCheckRetryAction::FinalEditor;
                 tokio::spawn(async move {
-                    let result = if final_editor_only {
-                        engine.retry_review_final_editor(&job_id).await.map(|_| ())
-                    } else {
-                        engine.retry_review_job(&job_id).await.map(|_| ())
+                    let result = match retry_action {
+                        ReviewCheckRetryAction::SameRevision => {
+                            engine.retry_review_job(&job_id).await.map(|_| ())
+                        }
+                        ReviewCheckRetryAction::CurrentHead => engine
+                            .request_current_head_review_from_job(&job_id)
+                            .await
+                            .map(|_| ()),
+                        ReviewCheckRetryAction::FinalEditor => {
+                            engine.retry_review_final_editor(&job_id).await.map(|_| ())
+                        }
                     };
                     if let Err(error) = result {
                         engine.record_review_error(format!(
@@ -9004,6 +9026,7 @@ impl Engine {
             .code_review_job(&job.id)?
             .ok_or_else(|| anyhow!("review job no longer exists"))?;
         let final_editor_retryable = record.can_retry_final_editor;
+        let covered_full_branch = review_round_covered_full_branch(&record);
         let detail = self
             .store
             .code_review_job_detail(&job.id)?
@@ -9012,14 +9035,22 @@ impl Engine {
         let needs_adjudication =
             job.status == "failed" && !detail.unadjudicated_candidates.is_empty();
         let open_issue_count = review_open_issue_count(job);
-        let needs_attention =
-            needs_adjudication || (job.status == "succeeded" && open_issue_count != Some(0));
+        let awaiting_full_coverage =
+            job.status == "succeeded" && open_issue_count == Some(0) && !covered_full_branch;
+        let needs_attention = needs_adjudication
+            || awaiting_full_coverage
+            || (job.status == "succeeded" && open_issue_count != Some(0));
         let status = match job.status.as_str() {
             "queued" => "queued",
             "running" => "in_progress",
             _ => "completed",
         };
-        let conclusion = review_check_conclusion(&job.status, open_issue_count, needs_adjudication);
+        let conclusion = review_check_conclusion(
+            &job.status,
+            open_issue_count,
+            needs_adjudication,
+            covered_full_branch,
+        );
         let check_summary = match job.status.as_str() {
             "queued" => "Waiting for a review worker.".to_string(),
             "running" => format!(
@@ -9028,6 +9059,7 @@ impl Engine {
                 job.progress.total_reviewers,
                 job.progress.percent
             ),
+            "succeeded" if awaiting_full_coverage => "Legacy incremental review finished with no open blocking issues, but it did not cover the complete branch. A full-branch review is required before this check can succeed.".to_string(),
             "succeeded" => match open_issue_count {
                 Some(open_issue_count) => format!(
                     "Review finished with {} new confirmed issue(s); {} previously reported issue(s) were fixed; {} blocking issue(s) remain open across the pull request{}.",
@@ -10244,6 +10276,78 @@ impl Engine {
         )))
     }
 
+    /// Settle a pre-8.0 clean incremental round with one full-branch job.
+    ///
+    /// The stable dedupe key makes this a compatibility bridge rather than a
+    /// revived coverage-debt scheduler: every current job is already full.
+    fn enqueue_legacy_full_coverage_review(
+        &self,
+        repository: &CodeReviewRepository,
+        pull: &GithubPullRequest,
+    ) -> Result<bool> {
+        if self.store.code_review_pull_has_active_job(
+            &repository.repository,
+            pull.number,
+            &pull.head.sha,
+        )? {
+            return Ok(false);
+        }
+        let Some(job_id) = self
+            .store
+            .latest_published_code_review_job_id(&repository.repository, pull.number)?
+        else {
+            return Ok(false);
+        };
+        let Some(record) = self.store.code_review_job(&job_id)? else {
+            return Ok(false);
+        };
+        if !legacy_round_requires_full_coverage(&record, &pull.head.sha) {
+            return Ok(false);
+        }
+
+        let reviewers = self.reviewers_for_repository_policy(repository)?;
+        let config_hash = Self::code_review_config_hash(repository, &reviewers)?;
+        let dedupe_key = format!(
+            "{}#{}:{}:{}:legacy-full-coverage:{config_hash}",
+            repository.repository, pull.number, pull.base.sha, pull.head.sha
+        );
+        let Some(job) = self.store.enqueue_code_review_job(&NewCodeReviewJob {
+            dedupe_key,
+            installation_id: repository.installation_id,
+            repository: repository.repository.clone(),
+            pull_number: pull.number,
+            pull_title: pull.title.clone(),
+            pull_body: bounded_review_pull_body(pull.body.as_deref()),
+            pull_url: pull.html_url.clone(),
+            head_sha: pull.head.sha.clone(),
+            review_base_sha: String::new(),
+            base_ref: pull.base.sha.clone(),
+            head_ref: pull.head.name.clone(),
+            scope: trouve_protocol::CodeReviewJobScope::Full,
+            trigger: "legacy-full-coverage".into(),
+            retry_of: None,
+            model: repository.model.clone(),
+            coordinator_thinking_level: repository.coordinator_thinking_level.clone(),
+            router_model: repository.router_model.clone(),
+            router_thinking_level: repository.router_thinking_level.clone(),
+            analyst_model: repository.analyst_model.clone(),
+            analyst_thinking_level: repository.analyst_thinking_level.clone(),
+            prompt: repository.prompt.clone(),
+            reviewers,
+            routing_mode: repository.routing_mode,
+            semantic_routing: repository.semantic_routing,
+            included_reviewer_ids: repository.included_reviewer_ids.clone(),
+            excluded_reviewer_ids: repository.excluded_reviewer_ids.clone(),
+            config_hash,
+        })?
+        else {
+            return Ok(false);
+        };
+        self.emit_code_review_updated(Some(job.id))?;
+        self.code_review.job_wake.notify_one();
+        Ok(true)
+    }
+
     async fn reconcile_user_resolved_review_findings(
         &self,
         api: &GithubApi,
@@ -10290,7 +10394,16 @@ impl Engine {
             .code_review
             .publication_lock(&repository.repository, pull.number);
         if targets.is_empty() {
-            return Ok(ReviewThreadReconciliationOutcome::Skipped);
+            let Ok(_publication_guard) = publication_lock.try_lock() else {
+                return Ok(ReviewThreadReconciliationOutcome::Skipped);
+            };
+            return Ok(
+                if self.enqueue_legacy_full_coverage_review(repository, pull)? {
+                    ReviewThreadReconciliationOutcome::Completed
+                } else {
+                    ReviewThreadReconciliationOutcome::Skipped
+                },
+            );
         }
         let Ok(preflight_guard) = publication_lock.try_lock() else {
             return Ok(ReviewThreadReconciliationOutcome::Skipped);
@@ -10431,6 +10544,8 @@ impl Engine {
                 }
             }
         }
+
+        self.enqueue_legacy_full_coverage_review(repository, pull)?;
 
         self.clear_review_thread_listing_progress(&review_thread_listing_key(
             &repository.repository,
@@ -11314,13 +11429,29 @@ fn review_open_issue_count(job: &trouve_protocol::CodeReviewJob) -> Option<u64> 
     job.open_issue_count
 }
 
+fn review_round_covered_full_branch(record: &CodeReviewJobRecord) -> bool {
+    record.job.scope == trouve_protocol::CodeReviewJobScope::Full
+        || record.covered_full_branch.unwrap_or(
+            record.job.review_base_sha.is_empty()
+                || record.job.review_base_sha == record.job.base_ref,
+        )
+}
+
+fn legacy_round_requires_full_coverage(record: &CodeReviewJobRecord, head_sha: &str) -> bool {
+    record.job.head_sha == head_sha
+        && record.job.status == "succeeded"
+        && record.job.open_issue_count == Some(0)
+        && !review_round_covered_full_branch(record)
+}
+
 fn review_check_conclusion(
     status: &str,
     open_issue_count: Option<u64>,
     needs_adjudication: bool,
+    covered_full_branch: bool,
 ) -> Option<&'static str> {
     match status {
-        "succeeded" if open_issue_count == Some(0) => Some("success"),
+        "succeeded" if open_issue_count == Some(0) && covered_full_branch => Some("success"),
         "succeeded" => Some("neutral"),
         "failed" if needs_adjudication => Some("action_required"),
         "failed" => Some("failure"),
@@ -11351,20 +11482,23 @@ fn review_check_actions(final_editor_retryable: bool) -> serde_json::Value {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReviewCheckRetryAction {
-    WholeReview,
+    SameRevision,
+    CurrentHead,
     FinalEditor,
 }
 
 /// Accept the retired `full_review` identifier as an inbound alias while old
-/// Check Runs can still expose it. New Check Runs publish only `retry`.
+/// Check Runs can still expose it. Unlike an ordinary retry, the retired action
+/// historically requested a fresh review of the pull request's current head.
 fn review_check_retry_action(
     action: &str,
     requested_action: &str,
 ) -> Option<ReviewCheckRetryAction> {
     match (action, requested_action) {
-        ("rerequested", _) | ("requested_action", "retry" | "full_review") => {
-            Some(ReviewCheckRetryAction::WholeReview)
+        ("rerequested", _) | ("requested_action", "retry") => {
+            Some(ReviewCheckRetryAction::SameRevision)
         }
+        ("requested_action", "full_review") => Some(ReviewCheckRetryAction::CurrentHead),
         ("requested_action", "retry_final_editor") => Some(ReviewCheckRetryAction::FinalEditor),
         _ => None,
     }
@@ -16823,7 +16957,7 @@ fn carried_anchor_continuation_request(
         pull_body: record.pull_body.clone(),
         pull_url: job.pull_url.clone(),
         head_sha: job.head_sha.clone(),
-        review_base_sha: job.base_ref.clone(),
+        review_base_sha: String::new(),
         base_ref: job.base_ref.clone(),
         head_ref: job.head_ref.clone(),
         scope: trouve_protocol::CodeReviewJobScope::Full,
@@ -18024,6 +18158,63 @@ mod tests {
         request
     }
 
+    #[test]
+    fn queued_full_review_does_not_publish_a_provisional_merge_base() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let mut request = test_review_job_request("acme/widgets#42:unresolved-merge-base");
+        request.scope = trouve_protocol::CodeReviewJobScope::Full;
+        request.review_base_sha.clear();
+
+        let queued = store.enqueue_code_review_job(&request).unwrap().unwrap();
+        assert!(queued.review_base_sha.is_empty());
+        assert!(
+            serde_json::to_value(&queued)
+                .unwrap()
+                .get("review_base_sha")
+                .is_none()
+        );
+        assert!(
+            store
+                .code_review_job(&queued.id)
+                .unwrap()
+                .unwrap()
+                .job
+                .review_base_sha
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn only_clean_legacy_incremental_rounds_require_full_coverage() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let queued = enqueue_test_review_job(&store, "acme/widgets#42:legacy-coverage");
+        let mut record = store.code_review_job(&queued.id).unwrap().unwrap();
+        record.job.status = "succeeded".into();
+        record.job.open_issue_count = Some(0);
+        record.covered_full_branch = Some(false);
+
+        assert!(legacy_round_requires_full_coverage(
+            &record,
+            &record.job.head_sha
+        ));
+        record.covered_full_branch = Some(true);
+        assert!(!legacy_round_requires_full_coverage(
+            &record,
+            &record.job.head_sha
+        ));
+        record.covered_full_branch = Some(false);
+        record.job.scope = trouve_protocol::CodeReviewJobScope::Full;
+        assert!(!legacy_round_requires_full_coverage(
+            &record,
+            &record.job.head_sha
+        ));
+        record.job.scope = trouve_protocol::CodeReviewJobScope::Incremental;
+        assert!(!legacy_round_requires_full_coverage(
+            &record,
+            "3333333333333333333333333333333333333333"
+        ));
+    }
+
     #[tokio::test]
     async fn repeated_retry_returns_linked_replacement_without_reloading_repository() {
         let store = crate::store::Store::open_in_memory().unwrap();
@@ -18877,7 +19068,7 @@ mod tests {
 
         assert_eq!(review_open_issue_count(&detail.job), Some(2));
         assert_eq!(
-            review_check_conclusion(&detail.job.status, Some(2), false),
+            review_check_conclusion(&detail.job.status, Some(2), false, true),
             Some("neutral")
         );
         let body = render_lifecycle_comment(&detail, &[], false, &[]);
@@ -18888,8 +19079,13 @@ mod tests {
 
         detail.job.open_issue_count = Some(0);
         assert_eq!(
-            review_check_conclusion(&detail.job.status, Some(0), false),
+            review_check_conclusion(&detail.job.status, Some(0), false, true),
             Some("success")
+        );
+        assert_eq!(
+            review_check_conclusion(&detail.job.status, Some(0), false, false),
+            Some("neutral"),
+            "a clean legacy incremental round must wait for full-branch coverage"
         );
         assert!(
             render_lifecycle_comment(&detail, &[], false, &[])
@@ -18899,7 +19095,7 @@ mod tests {
         detail.job.open_issue_count = None;
         assert_eq!(review_open_issue_count(&detail.job), None);
         assert_eq!(
-            review_check_conclusion(&detail.job.status, None, false),
+            review_check_conclusion(&detail.job.status, None, false, true),
             Some("neutral")
         );
         let body = render_lifecycle_comment(&detail, &[], false, &[]);
@@ -19800,7 +19996,7 @@ rename to src/new.rs
             continuation.scope,
             trouve_protocol::CodeReviewJobScope::Full
         );
-        assert_eq!(continuation.review_base_sha, legacy.base_ref);
+        assert!(continuation.review_base_sha.is_empty());
         assert_eq!(continuation.retry_of.as_deref(), Some(legacy.id.as_str()));
     }
 
@@ -20497,14 +20693,14 @@ rename to src/new.rs
     }
 
     #[test]
-    fn legacy_full_review_check_action_retries_the_whole_review() {
+    fn legacy_full_review_check_action_requests_the_current_head() {
         assert_eq!(
             review_check_retry_action("requested_action", "full_review"),
-            Some(ReviewCheckRetryAction::WholeReview)
+            Some(ReviewCheckRetryAction::CurrentHead)
         );
         assert_eq!(
             review_check_retry_action("requested_action", "retry"),
-            Some(ReviewCheckRetryAction::WholeReview)
+            Some(ReviewCheckRetryAction::SameRevision)
         );
         assert_eq!(
             review_check_retry_action("requested_action", "retry_final_editor"),
@@ -20512,7 +20708,7 @@ rename to src/new.rs
         );
         assert_eq!(
             review_check_retry_action("rerequested", ""),
-            Some(ReviewCheckRetryAction::WholeReview)
+            Some(ReviewCheckRetryAction::SameRevision)
         );
         assert_eq!(
             review_check_retry_action("requested_action", "unknown"),

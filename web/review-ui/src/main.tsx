@@ -1502,7 +1502,13 @@ function JobDetailPane({
         <div>
           <dt>Revision</dt>
           <dd>
-            <code>{(job.review_base_sha || job.base_ref).slice(0, 8)}</code>…<code>{job.head_sha.slice(0, 8)}</code>
+            {job.review_base_sha ? (
+              <>
+                <code>{job.review_base_sha.slice(0, 8)}</code>…<code>{job.head_sha.slice(0, 8)}</code>
+              </>
+            ) : (
+              <>Preparing merge base for <code>{job.head_sha.slice(0, 8)}</code></>
+            )}
           </dd>
         </div>
         <div>

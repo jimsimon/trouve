@@ -6123,7 +6123,7 @@
           },
           "review_base_sha": {
             "type": "string",
-            "description": "Pull-request merge base used as the left side of this review's diff.\nLegacy jobs may expose an older incremental watermark here."
+            "description": "Actual pull-request merge base used as the left side of this review's\ndiff. Omitted while a queued or early-running job is still preparing\nits repository. Legacy jobs may expose an incremental watermark here."
           },
           "review_url": {
             "type": "string"

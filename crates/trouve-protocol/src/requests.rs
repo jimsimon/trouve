@@ -2367,8 +2367,9 @@ pub struct CodeReviewJob {
     pub pull_title: String,
     pub pull_url: String,
     pub head_sha: String,
-    /// Pull-request merge base used as the left side of this review's diff.
-    /// Legacy jobs may expose an older incremental watermark here.
+    /// Actual pull-request merge base used as the left side of this review's
+    /// diff. Omitted while a queued or early-running job is still preparing
+    /// its repository. Legacy jobs may expose an incremental watermark here.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub review_base_sha: String,
     pub base_ref: String,
