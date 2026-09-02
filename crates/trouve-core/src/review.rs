@@ -51,7 +51,6 @@ const DEFAULT_RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
 const REVIEW_RECONCILIATION_PASS_BUDGET: Duration = Duration::from_secs(45);
 const REVIEW_THREAD_VERIFICATION_EPOCH: Duration = Duration::from_secs(90);
 const REVIEW_RECONCILIATION_FAILURE_RESET_THRESHOLD: u32 = 3;
-const MAX_THREAD_RECHECK_ATTEMPTS_PER_REVISION: u64 = 3;
 const JOB_IDLE_INTERVAL: Duration = Duration::from_secs(5);
 /// A stopped review retains its workspace-registration fence only for a small
 /// foreground retry budget. The durable generation-bearing intent then lets
@@ -191,7 +190,6 @@ const LIFECYCLE_COMMENT_TRUNCATION_MARKER: &str =
     "\n\n---\nComment truncated; open the trouve dashboard for complete review details.";
 const RETRY_CHECK_ACTION_DESCRIPTION: &str = "Retry this review on the current PR head";
 const RETRY_FINAL_EDITOR_CHECK_ACTION_DESCRIPTION: &str = "Retry only the final review editor";
-const FULL_REVIEW_CHECK_ACTION_DESCRIPTION: &str = "Review full branch against the PR base";
 const REVIEWER_EXECUTION_GUIDANCE: &str = "\
 Time and exploration budget: finish this review in about three minutes. Use no more than 24 \
 tool calls total. Treat the supplied diff as the primary evidence; do not inventory the \
@@ -613,8 +611,6 @@ fn prepare_review_thread_verification_epoch(
 #[derive(Clone)]
 struct ReviewReconciliationCandidate {
     repository: CodeReviewRepository,
-    reviewers: Vec<ReviewerProfile>,
-    config_hash: String,
     pull: GithubPullRequest,
 }
 
@@ -1084,38 +1080,6 @@ struct GithubPullRequest {
     requested_reviewers: Vec<GithubUser>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum IncrementalHistory {
-    NotApplicable,
-    Linear,
-    Rewritten,
-    Unknown,
-}
-
-fn classify_incremental_history(
-    incremental_candidate: bool,
-    review_watermark_sha: &str,
-    merge_base: Option<&str>,
-) -> IncrementalHistory {
-    if !incremental_candidate {
-        IncrementalHistory::NotApplicable
-    } else {
-        match merge_base {
-            Some(merge_base) if merge_base == review_watermark_sha => IncrementalHistory::Linear,
-            Some(_) => IncrementalHistory::Rewritten,
-            None => IncrementalHistory::Unknown,
-        }
-    }
-}
-
-fn incremental_diff_can_use_watermark(
-    history: IncrementalHistory,
-    last_reviewed_base_sha: &str,
-    current_base_sha: &str,
-) -> bool {
-    history == IncrementalHistory::Linear && last_reviewed_base_sha == current_base_sha
-}
-
 #[derive(Clone, Deserialize)]
 struct GithubPullRef {
     #[serde(rename = "ref")]
@@ -1155,12 +1119,10 @@ struct ManualReviewComment {
     trigger_key: String,
 }
 
-/// The scope a manual review command names: `@trouve-ai review` runs the
-/// standard incremental round, and `@trouve-ai review full` reviews the
-/// whole branch — the comment-command form of the check run's full-review
-/// action, for unsticking a carried finding whose fix left the incremental
-/// window. Any other trailing word is not a command.
-fn manual_review_command_scope(body: &str) -> Option<trouve_protocol::CodeReviewJobScope> {
+/// Whether a trusted comment requests a review. `review full` remains an
+/// accepted alias for existing workflows, but every command now reviews the
+/// complete branch. Any other trailing word is not a command.
+fn contains_manual_review_command(body: &str) -> bool {
     for line in body.lines() {
         let mut words = line.split_whitespace();
         if !words
@@ -1176,35 +1138,18 @@ fn manual_review_command_scope(body: &str) -> Option<trouve_protocol::CodeReview
             continue;
         }
         match words.next() {
-            None => return Some(trouve_protocol::CodeReviewJobScope::Incremental),
+            None => return true,
             Some(word) if word.eq_ignore_ascii_case("full") && words.next().is_none() => {
-                return Some(trouve_protocol::CodeReviewJobScope::Full);
+                return true;
             }
             _ => continue,
         }
     }
-    None
+    false
 }
 
-fn contains_manual_review_command(body: &str) -> bool {
-    manual_review_command_scope(body).is_some()
-}
-
-/// The durable trigger key for a manual review comment. Scope rides in the
-/// key (`:full` suffix) so it survives the manual-request table without a
-/// schema change; every other consumer treats the key as opaque.
-fn manual_review_trigger_key(
-    comment_id: u64,
-    scope: trouve_protocol::CodeReviewJobScope,
-) -> String {
-    match scope {
-        trouve_protocol::CodeReviewJobScope::Full => {
-            format!("manual:comment:{comment_id}:full")
-        }
-        trouve_protocol::CodeReviewJobScope::Incremental => {
-            format!("manual:comment:{comment_id}")
-        }
-    }
+fn manual_review_trigger_key(comment_id: u64) -> String {
+    format!("manual:comment:{comment_id}")
 }
 
 fn is_trusted_manual_review_command(
@@ -1232,12 +1177,11 @@ fn manual_review_comment(payload: &serde_json::Value) -> Option<ManualReviewComm
     let installation_id = payload["installation"]["id"].as_u64()?;
     let pull_number = payload["issue"]["number"].as_u64()?;
     let comment_id = payload["comment"]["id"].as_u64()?;
-    let scope = manual_review_command_scope(payload["comment"]["body"].as_str()?)?;
     (installation_id > 0 && pull_number > 0 && comment_id > 0).then(|| ManualReviewComment {
         repository,
         installation_id,
         pull_number,
-        trigger_key: manual_review_trigger_key(comment_id, scope),
+        trigger_key: manual_review_trigger_key(comment_id),
     })
 }
 
@@ -1438,10 +1382,9 @@ fn polled_manual_review_comment(comment: &GithubIssueComment) -> Option<(u64, St
     {
         return None;
     }
-    let scope = manual_review_command_scope(comment.body.as_deref()?)?;
     Some((
         pull_number_from_issue_url(&comment.issue_url)?,
-        manual_review_trigger_key(comment.id, scope),
+        manual_review_trigger_key(comment.id),
     ))
 }
 
@@ -1554,25 +1497,13 @@ fn review_id_from_url(url: &str) -> Option<u64> {
 
 fn should_skip_automatic_review(trigger: &str, revision_job_exists: bool) -> bool {
     // The store query matches both the current base and head. The pull-state
-    // watermark is intentionally not used here because it also tracks manual
-    // reviews (including draft reviews) for incremental diff selection.
+    // pull state is intentionally not used here because it also tracks manual
+    // reviews, including draft reviews.
     should_terminate_duplicate_review_job(trigger, revision_job_exists)
 }
 
 fn should_terminate_duplicate_review_job(trigger: &str, prior_revision_job_exists: bool) -> bool {
     trigger == "automatic" && prior_revision_job_exists
-}
-
-fn incremental_review_base_sha(
-    base_sha: &str,
-    head_sha: &str,
-    last_reviewed_head_sha: &str,
-) -> String {
-    if last_reviewed_head_sha.is_empty() || last_reviewed_head_sha == head_sha {
-        base_sha.into()
-    } else {
-        last_reviewed_head_sha.into()
-    }
 }
 
 /// Carried finding coordinates advance from the last published review head,
@@ -2983,7 +2914,6 @@ impl Engine {
                 old.job.installation_id,
                 &old.job.repository,
                 old.job.pull_number,
-                old.job.scope,
                 "retry",
                 Some(&old.job),
             )
@@ -3078,7 +3008,6 @@ impl Engine {
                 request.installation_id,
                 &request.repository,
                 request.pull_number,
-                request.scope,
                 "manual",
                 None,
             )
@@ -3106,7 +3035,6 @@ impl Engine {
         installation_id: u64,
         repository_name: &str,
         pull_number: u64,
-        scope: trouve_protocol::CodeReviewJobScope,
         trigger: &str,
         predecessor: Option<&trouve_protocol::CodeReviewJob>,
     ) -> Result<NewCodeReviewJob, EngineError> {
@@ -3149,34 +3077,17 @@ impl Engine {
         }
         let reviewers = self.reviewers_for_repository_policy(&repository)?;
         let config_hash = Self::code_review_config_hash(&repository, &reviewers)?;
-        let (base_ref, head_sha, head_ref, review_base_sha) = match predecessor {
+        let (base_ref, head_sha, head_ref) = match predecessor {
             Some(predecessor) => (
                 predecessor.base_ref.clone(),
                 predecessor.head_sha.clone(),
                 predecessor.head_ref.clone(),
-                predecessor.review_base_sha.clone(),
             ),
-            None => {
-                let pull_state = self
-                    .store
-                    .code_review_pull_state(&repository.repository, pull.number)?;
-                let review_base_sha = match scope {
-                    trouve_protocol::CodeReviewJobScope::Full => pull.base.sha.clone(),
-                    trouve_protocol::CodeReviewJobScope::Incremental => {
-                        incremental_review_base_sha(
-                            &pull.base.sha,
-                            &pull.head.sha,
-                            &pull_state.last_reviewed_head_sha,
-                        )
-                    }
-                };
-                (
-                    pull.base.sha.clone(),
-                    pull.head.sha.clone(),
-                    pull.head.name.clone(),
-                    review_base_sha,
-                )
-            }
+            None => (
+                pull.base.sha.clone(),
+                pull.head.sha.clone(),
+                pull.head.name.clone(),
+            ),
         };
         let nonce = uuid::Uuid::new_v4().simple().to_string();
         Ok(NewCodeReviewJob {
@@ -3191,10 +3102,10 @@ impl Engine {
             pull_body: bounded_review_pull_body(pull.body.as_deref()),
             pull_url: pull.html_url,
             head_sha,
-            review_base_sha,
+            review_base_sha: base_ref.clone(),
             base_ref,
             head_ref,
-            scope,
+            scope: trouve_protocol::CodeReviewJobScope::Full,
             trigger: trigger.into(),
             retry_of: predecessor.map(|job| job.id.clone()),
             model: repository.model,
@@ -4158,9 +4069,6 @@ impl Engine {
                     "{}#{}:{}:{}:automatic:{config_hash}",
                     repository.repository, pull.number, pull.base.sha, pull.head.sha
                 );
-                let pull_state = self
-                    .store
-                    .code_review_pull_state(&repository.repository, pull.number)?;
                 let revision_job_exists = self.store.code_review_job_exists_for_revision(
                     &repository.repository,
                     pull.number,
@@ -4212,21 +4120,6 @@ impl Engine {
                         dedupe_key.push(':');
                         dedupe_key.push_str(&uuid::Uuid::new_v4().simple().to_string());
                     }
-                    // A `review full` comment names the whole branch as its
-                    // scope; the flag rides in the durable trigger key.
-                    let full_branch = requested
-                        .comment_key
-                        .as_deref()
-                        .is_some_and(|key| key.ends_with(":full"));
-                    let review_base_sha = if full_branch {
-                        pull.base.sha.clone()
-                    } else {
-                        incremental_review_base_sha(
-                            &pull.base.sha,
-                            &pull.head.sha,
-                            &pull_state.last_reviewed_head_sha,
-                        )
-                    };
                     let job = self.store.enqueue_code_review_job(&NewCodeReviewJob {
                         dedupe_key,
                         installation_id: repository.installation_id,
@@ -4236,14 +4129,10 @@ impl Engine {
                         pull_body: bounded_review_pull_body(pull.body.as_deref()),
                         pull_url: pull.html_url.clone(),
                         head_sha: pull.head.sha.clone(),
-                        review_base_sha,
+                        review_base_sha: pull.base.sha.clone(),
                         base_ref: pull.base.sha.clone(),
                         head_ref: pull.head.name.clone(),
-                        scope: if full_branch {
-                            trouve_protocol::CodeReviewJobScope::Full
-                        } else {
-                            trouve_protocol::CodeReviewJobScope::Incremental
-                        },
+                        scope: trouve_protocol::CodeReviewJobScope::Full,
                         trigger: requested.trigger.into(),
                         retry_of: None,
                         model: repository.model.clone(),
@@ -4288,8 +4177,6 @@ impl Engine {
             } else {
                 reconciliation_candidates.push(ReviewReconciliationCandidate {
                     repository: repository.clone(),
-                    reviewers: reviewers.clone(),
-                    config_hash: config_hash.clone(),
                     pull,
                 });
             }
@@ -4398,8 +4285,6 @@ impl Engine {
                 .reconcile_user_resolved_review_findings(
                     &api,
                     &candidate.repository,
-                    &candidate.reviewers,
-                    &candidate.config_hash,
                     &candidate.pull,
                     deadline,
                 )
@@ -4655,32 +4540,14 @@ impl Engine {
             if !external_id.is_empty()
                 && (action == "rerequested"
                     || (action == "requested_action"
-                        && matches!(
-                            requested_action,
-                            "retry" | "retry_final_editor" | "full_review"
-                        )))
+                        && matches!(requested_action, "retry" | "retry_final_editor")))
             {
                 let engine = self.clone();
                 let job_id = external_id.to_owned();
-                let full = requested_action == "full_review";
                 let final_editor_only = requested_action == "retry_final_editor";
                 tokio::spawn(async move {
                     let result = if final_editor_only {
                         engine.retry_review_final_editor(&job_id).await.map(|_| ())
-                    } else if full {
-                        match engine.store.code_review_job(&job_id) {
-                            Ok(Some(record)) => engine
-                                .request_code_review(trouve_protocol::RequestCodeReviewRequest {
-                                    installation_id: record.job.installation_id,
-                                    repository: record.job.repository,
-                                    pull_number: record.job.pull_number,
-                                    scope: trouve_protocol::CodeReviewJobScope::Full,
-                                })
-                                .await
-                                .map(|_| ()),
-                            Ok(None) => Err(EngineError::NotFound(format!("review job {job_id}"))),
-                            Err(error) => Err(error.into()),
-                        }
                     } else {
                         engine.retry_review_job(&job_id).await.map(|_| ())
                     };
@@ -4942,9 +4809,8 @@ impl Engine {
             }
             let engine = self.clone();
             // A command names its pull, so the walk that follows application
-            // prioritizes it: dismissing the last blocking finding by
-            // command schedules the full-coverage confirmation round in this
-            // same pass instead of waiting for the rotation.
+            // prioritizes it: the resulting finding and Check Run projections
+            // are refreshed in this pass instead of waiting for the rotation.
             let command_priority = resolve_command
                 .as_ref()
                 .map(|command| (command.repository.clone(), command.pull_number))
@@ -5277,18 +5143,17 @@ impl Engine {
             let _ = self.emit_code_review_updated(Some(continuation_job.id));
             self.code_review.job_wake.notify_one();
         }
-        if record.job.scope == trouve_protocol::CodeReviewJobScope::Incremental
-            && let Err(cleanup_error) = self
-                .executor
-                .cleanup_review_repository_history(&ReviewRepositoryHistoryCleanup {
-                    worktree: self
-                        .data_dir
-                        .join("review-repositories")
-                        .join(&record.job.repository),
-                    job_id: job_id.clone(),
-                    pull_number: record.job.pull_number,
-                })
-                .await
+        if let Err(cleanup_error) = self
+            .executor
+            .cleanup_review_repository_history(&ReviewRepositoryHistoryCleanup {
+                worktree: self
+                    .data_dir
+                    .join("review-repositories")
+                    .join(&record.job.repository),
+                job_id: job_id.clone(),
+                pull_number: record.job.pull_number,
+            })
+            .await
         {
             tracing::warn!(
                 job_id = %job_id,
@@ -5651,32 +5516,14 @@ impl Engine {
         validate_repository(&job.repository)?;
         validate_sha(&job.base_ref)?;
         validate_sha(&job.head_sha)?;
-        validate_sha(&job.review_watermark_sha)?;
         let previous_pull_state = self
             .store
             .code_review_pull_state(&job.repository, job.pull_number)?;
-        let review_watermark_sha = job.review_watermark_sha.clone();
-        let incremental_candidate = job.scope == trouve_protocol::CodeReviewJobScope::Incremental
-            && review_watermark_sha != job.base_ref;
-        // The prior reviewed head is also the coordinate space for carried
-        // findings during explicit full reviews. Keep that immutable object
-        // available even when reviewer coverage itself starts at the merge
-        // base rather than the incremental watermark.
+        // The prior reviewed head is the coordinate space for carried
+        // findings. Keep that immutable object available even though reviewer
+        // coverage always starts at the pull request merge base.
         let mut optional_shas = Vec::new();
-        let optional_sha_candidates = if incremental_candidate {
-            vec![
-                &review_watermark_sha,
-                &previous_pull_state.last_reviewed_base_sha,
-                &previous_pull_state.last_reviewed_head_sha,
-            ]
-        } else {
-            // Full reviews need only the coordinate space that carried
-            // findings were last advanced onto. Fetching an older base as
-            // well would spend the bounded optional-history budget on an
-            // object that carried-anchor mapping never reads.
-            vec![&previous_pull_state.last_reviewed_head_sha]
-        };
-        for sha in optional_sha_candidates {
+        for sha in [&previous_pull_state.last_reviewed_head_sha] {
             if validate_sha(sha).is_ok()
                 && sha != &job.base_ref
                 && sha != &job.head_sha
@@ -5702,74 +5549,23 @@ impl Engine {
             .await
             .map_err(|error| anyhow!(error))?;
         ensure_review_current(superseded)?;
-        let watermark_merge_base = if incremental_candidate {
-            match self
-                .executor
-                .review_repository_merge_base(&ReviewRepositoryMergeBase {
-                    managed_root: self.data_dir.join("review-repositories"),
-                    worktree: repository_path.clone(),
-                    base_sha: review_watermark_sha.clone(),
-                    head_sha: job.head_sha.clone(),
-                    cancel: superseded.clone(),
-                })
-                .await
-            {
-                Ok(merge_base) => Some(merge_base),
-                Err(error) => {
-                    tracing::warn!(
-                        job_id = %job.id,
-                        watermark = %review_watermark_sha,
-                        %error,
-                        "could not establish incremental review ancestry; reviewing the full pull request diff"
-                    );
-                    None
-                }
-            }
-        } else {
-            None
-        };
-        let incremental_history = classify_incremental_history(
-            incremental_candidate,
-            &review_watermark_sha,
-            watermark_merge_base.as_deref(),
-        );
-        let rewritten_history = incremental_history == IncrementalHistory::Rewritten;
-        // Whether the chosen diff base spans the entire branch is decided
-        // right here and recorded explicitly: the watermark path reviews the
-        // delta since the last published head, while the merge-base path
-        // reviews everything the branch changed. Inferring this later from
-        // `review_base_sha == base_ref` is wrong whenever the base branch
-        // advanced past the branch point, because the merge base then differs
-        // from the base tip even though the diff covers the full branch.
-        let covered_full_branch = if incremental_diff_can_use_watermark(
-            incremental_history,
-            &previous_pull_state.last_reviewed_base_sha,
-            &job.base_ref,
-        ) {
-            job.review_base_sha = review_watermark_sha;
-            false
-        } else {
-            job.review_base_sha = self
-                .executor
-                .review_repository_merge_base(&ReviewRepositoryMergeBase {
-                    managed_root: self.data_dir.join("review-repositories"),
-                    worktree: repository_path.clone(),
-                    base_sha: job.base_ref.clone(),
-                    head_sha: job.head_sha.clone(),
-                    cancel: superseded.clone(),
-                })
-                .await
-                .map_err(|error| anyhow!(error))
-                .context("resolving the pull request merge base locally")?;
-            validate_sha(&job.review_base_sha)?;
-            true
-        };
-        job.covered_full_branch = Some(covered_full_branch);
-        if !self.store.set_code_review_job_review_base(
-            &job.id,
-            &job.review_base_sha,
-            covered_full_branch,
-        )? {
+        job.review_base_sha = self
+            .executor
+            .review_repository_merge_base(&ReviewRepositoryMergeBase {
+                managed_root: self.data_dir.join("review-repositories"),
+                worktree: repository_path.clone(),
+                base_sha: job.base_ref.clone(),
+                head_sha: job.head_sha.clone(),
+                cancel: superseded.clone(),
+            })
+            .await
+            .map_err(|error| anyhow!(error))
+            .context("resolving the pull request merge base locally")?;
+        validate_sha(&job.review_base_sha)?;
+        if !self
+            .store
+            .set_code_review_job_review_base(&job.id, &job.review_base_sha)?
+        {
             bail!("stale: review was superseded while selecting its diff base");
         }
         let registration_engine = Arc::clone(self);
@@ -5854,88 +5650,14 @@ impl Engine {
             cache.insert(diff_cache_key, loaded.clone());
             loaded
         };
-        let (diff_files, reused_hunk_count) = if rewritten_history
-            && previous_pull_state.last_reviewed_head_sha == job.review_watermark_sha
-            && validate_sha(&previous_pull_state.last_reviewed_base_sha).is_ok()
-            && validate_sha(&previous_pull_state.last_reviewed_head_sha).is_ok()
-        {
-            let previous_merge_base = self
-                .executor
-                .review_repository_merge_base(&ReviewRepositoryMergeBase {
-                    managed_root: self.data_dir.join("worktrees"),
-                    worktree: session.worktree_path.clone().into(),
-                    base_sha: previous_pull_state.last_reviewed_base_sha.clone(),
-                    head_sha: previous_pull_state.last_reviewed_head_sha.clone(),
-                    cancel: superseded.clone(),
-                })
-                .await;
-            match previous_merge_base {
-                Ok(previous_merge_base) => {
-                    let previous_diff = self
-                        .executor
-                        .review_repository_diff(&ReviewRepositoryDiff {
-                            managed_root: self.data_dir.join("worktrees"),
-                            worktree: session.worktree_path.clone().into(),
-                            base_sha: previous_merge_base.clone(),
-                            head_sha: previous_pull_state.last_reviewed_head_sha.clone(),
-                            cancel: superseded.clone(),
-                            max_bytes: REVIEW_DIFF_CACHE_MAX_BYTES,
-                        })
-                        .await;
-                    match previous_diff {
-                        Ok(previous_diff) => {
-                            let previous_diff = previous_diff
-                                .into_iter()
-                                .map(|file| ReviewDiffFile {
-                                    path: file.path,
-                                    diff: file.diff,
-                                    generated_header: None,
-                                })
-                                .collect::<Vec<_>>();
-                            let (filtered, reused) =
-                                filter_previously_reviewed_hunks(&diff_files, &previous_diff);
-                            (Arc::new(filtered), reused)
-                        }
-                        Err(error) => {
-                            tracing::warn!(
-                                job_id = %job.id,
-                                previous_base = %previous_merge_base,
-                                previous_head = %previous_pull_state.last_reviewed_head_sha,
-                                %error,
-                                "could not load the previous review diff; reviewing the full current diff"
-                            );
-                            (diff_files, 0)
-                        }
-                    }
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        job_id = %job.id,
-                        previous_base = %previous_pull_state.last_reviewed_base_sha,
-                        previous_head = %previous_pull_state.last_reviewed_head_sha,
-                        %error,
-                        "could not resolve the previous review merge base; reviewing the full current diff"
-                    );
-                    (diff_files, 0)
-                }
-            }
-        } else {
-            (diff_files, 0)
-        };
         let reviewers = if record.reviewers.is_empty() {
             self.resolve_code_review_reviewers(&crate::reviewers::default_reviewer_ids())?
         } else {
             record.reviewers.clone()
         };
         let prompt_budgets = self.review_prompt_budgets(&job, &reviewers).await;
-        let batches =
-            build_effective_review_batches(&diff_files, reused_hunk_count, prompt_budgets);
-        let batch_digest = review_batch_digest(
-            &job.review_base_sha,
-            &job.head_sha,
-            reused_hunk_count,
-            &batches,
-        );
+        let batches = build_review_batches(&diff_files, prompt_budgets);
+        let batch_digest = review_batch_digest(&job.review_base_sha, &job.head_sha, &batches);
         let snapshot = self
             .store
             .prepare_code_review_batch_snapshot(&job.id, &batch_digest)?;
@@ -6056,7 +5778,6 @@ impl Engine {
                         batch_index,
                         batches.len(),
                         &decision.reasons,
-                        reused_hunk_count,
                     )
                 } else {
                     review_batch_identity(&batch, batch_index, batches.len())
@@ -6512,11 +6233,7 @@ impl Engine {
                 self.emit_code_review_task(&job.id, skipped)?;
             }
             ReviewOutput {
-                summary: no_candidate_review_summary(
-                    selected_reviewer_count,
-                    diff_files.len(),
-                    reused_hunk_count,
-                ),
+                summary: no_candidate_review_summary(selected_reviewer_count, diff_files.len()),
                 findings: Vec::new(),
                 rejected_candidates: invalid_candidate_anchor_ids
                     .into_iter()
@@ -6535,7 +6252,8 @@ impl Engine {
             // Carried-finding verification at head: the server reads the
             // current code at each carried open blocking finding's anchor
             // so the coordinator can judge — and provably ground — fixes
-            // whose commits predate this round's diff window. In-context
+            // whose fixes no longer appear as changed hunks in the cumulative
+            // branch diff. In-context
             // comparison, no extra model turns or tool calls.
             let (carried_anchor_lines, has_more) = self
                 .prefetch_carried_anchor_lines(
@@ -6563,7 +6281,6 @@ impl Engine {
                 &prior_fix_context,
                 implementation_analysis.as_ref(),
                 &diff_files,
-                reused_hunk_count,
                 prompt_budgets,
             )?;
             let task = if let Some(task) = queued_coordinator.take() {
@@ -9287,21 +9004,14 @@ impl Engine {
         let needs_adjudication =
             job.status == "failed" && !detail.unadjudicated_candidates.is_empty();
         let open_issue_count = review_open_issue_count(job);
-        let awaiting_full_coverage = review_awaiting_full_coverage(job, open_issue_count);
-        let needs_attention = needs_adjudication
-            || (job.status == "succeeded"
-                && (open_issue_count != Some(0) || awaiting_full_coverage));
+        let needs_attention =
+            needs_adjudication || (job.status == "succeeded" && open_issue_count != Some(0));
         let status = match job.status.as_str() {
             "queued" => "queued",
             "running" => "in_progress",
             _ => "completed",
         };
-        let conclusion = review_check_conclusion(
-            &job.status,
-            open_issue_count,
-            needs_adjudication,
-            awaiting_full_coverage,
-        );
+        let conclusion = review_check_conclusion(&job.status, open_issue_count, needs_adjudication);
         let check_summary = match job.status.as_str() {
             "queued" => "Waiting for a review worker.".to_string(),
             "running" => format!(
@@ -9310,34 +9020,23 @@ impl Engine {
                 job.progress.total_reviewers,
                 job.progress.percent
             ),
-            "succeeded" => {
-                let mut summary = match open_issue_count {
-                    Some(open_issue_count) => format!(
-                        "Review finished with {} new confirmed issue(s); {} previously reported issue(s) were fixed; {} blocking issue(s) remain open across the pull request{}.",
-                        job.issue_count,
-                        job.fixed_issue_count,
-                        open_issue_count,
-                        match job.advisory_open_issue_count {
-                            Some(advisory) if advisory > 0 =>
-                                format!(" ({advisory} advisory note(s) recorded in trouve)"),
-                            _ => String::new(),
-                        }
-                    ),
-                    None => format!(
-                        "Review finished with {} new confirmed issue(s); the PR-wide open issue count is unavailable for this legacy review, so its overall cleanliness is unknown.",
-                        job.issue_count
-                    ),
-                };
-                if awaiting_full_coverage {
-                    summary.push_str(
-                        " Success awaits a clean full-branch review: this round examined only \
-                         changes since the last review, and the whole branch as it now stands \
-                         has not been reviewed clean. Resolving all review threads or \
-                         requesting a full-branch review runs the confirming round.",
-                    );
-                }
-                summary
-            }
+            "succeeded" => match open_issue_count {
+                Some(open_issue_count) => format!(
+                    "Review finished with {} new confirmed issue(s); {} previously reported issue(s) were fixed; {} blocking issue(s) remain open across the pull request{}.",
+                    job.issue_count,
+                    job.fixed_issue_count,
+                    open_issue_count,
+                    match job.advisory_open_issue_count {
+                        Some(advisory) if advisory > 0 =>
+                            format!(" ({advisory} advisory note(s) recorded in trouve)"),
+                        _ => String::new(),
+                    }
+                ),
+                None => format!(
+                    "Review finished with {} new confirmed issue(s); the PR-wide open issue count is unavailable for this legacy review, so its overall cleanliness is unknown.",
+                    job.issue_count
+                ),
+            },
             "failed" if needs_adjudication => format!(
                 "Review requires another final-editor pass: {} candidate decision(s) remain unresolved.",
                 detail.unadjudicated_candidates.len()
@@ -9377,7 +9076,6 @@ impl Engine {
                 [
                     RETRY_CHECK_ACTION_DESCRIPTION,
                     RETRY_FINAL_EDITOR_CHECK_ACTION_DESCRIPTION,
-                    FULL_REVIEW_CHECK_ACTION_DESCRIPTION,
                 ]
                 .iter()
                 .all(|description| {
@@ -10542,8 +10240,6 @@ impl Engine {
         &self,
         api: &GithubApi,
         repository: &CodeReviewRepository,
-        reviewers: &[ReviewerProfile],
-        config_hash: &str,
         pull: &GithubPullRequest,
         deadline: Instant,
     ) -> Result<ReviewThreadReconciliationOutcome> {
@@ -10586,51 +10282,7 @@ impl Engine {
             .code_review
             .publication_lock(&repository.repository, pull.number);
         if targets.is_empty() {
-            // No published finding threads to reconcile. The pull request can
-            // still owe the full-coverage confirmation: a clean incremental
-            // round leaves zero open blocking findings without any round
-            // having examined the whole branch at this head. That debt is a
-            // state, not a thread event, so it is evaluated on every pass.
-            let Ok(publication_guard) = publication_lock.try_lock() else {
-                return Ok(ReviewThreadReconciliationOutcome::Skipped);
-            };
-            if self.store.code_review_pull_has_active_job(
-                &repository.repository,
-                pull.number,
-                &pull.head.sha,
-            )? {
-                return Ok(ReviewThreadReconciliationOutcome::Skipped);
-            }
-            let awaiting_full_coverage = self
-                .store
-                .code_review_open_blocking_finding_count(&repository.repository, pull.number)?
-                == 0
-                && matches!(
-                    self.store
-                        .latest_published_code_review_round_covered_full_branch(
-                            &repository.repository,
-                            pull.number,
-                            &pull.head.sha,
-                        )?,
-                    Some(false)
-                );
-            if !awaiting_full_coverage {
-                return Ok(ReviewThreadReconciliationOutcome::Skipped);
-            }
-            let new_job = thread_recheck_review_request(repository, reviewers, config_hash, pull);
-            let job = self.store.enqueue_code_review_thread_recheck(
-                &new_job,
-                "full-coverage-confirmation",
-                &[],
-                true,
-                MAX_THREAD_RECHECK_ATTEMPTS_PER_REVISION,
-            )?;
-            drop(publication_guard);
-            if let Some(job) = job {
-                self.emit_code_review_updated(Some(job.id.clone()))?;
-                self.code_review.job_wake.notify_one();
-            }
-            return Ok(ReviewThreadReconciliationOutcome::Completed);
+            return Ok(ReviewThreadReconciliationOutcome::Skipped);
         }
         let Ok(preflight_guard) = publication_lock.try_lock() else {
             return Ok(ReviewThreadReconciliationOutcome::Skipped);
@@ -10734,58 +10386,25 @@ impl Engine {
         let thread_by_comment = &authoritative_listing.0;
 
         let mut changed_jobs = HashSet::new();
-        let mut state_key = Vec::new();
-        let mut reconciled_finding_ids = Vec::new();
-        let mut open_blocking = 0_u64;
         for state in &findings {
-            let blocking = finding_is_blocking(&state.finding.severity, &state.finding.confidence)
-                && finding_scope_blocks(&state.finding.evidence);
-            let open = !matches!(state.finding.status.as_str(), "fixed" | "dismissed");
             let Some(comment_id) = state.finding.github_comment_id else {
-                // An open finding with no thread cannot be dismissed by a
-                // maintainer; if it blocks, only a fix can settle it.
-                if open && blocking {
-                    open_blocking += 1;
-                }
                 continue;
             };
             let Some((thread_id, is_resolved)) = thread_by_comment.get(&comment_id) else {
-                if open && blocking {
-                    open_blocking += 1;
-                }
                 continue;
             };
             // Recording the observed thread state applies maintainer
             // judgment directly: resolving an open finding's thread
             // dismisses it, unresolving a closed finding's thread restores
             // it to open. No model re-adjudicates either direction.
-            let (changed, generation) = self.store.record_code_review_thread_state(
+            let (changed, _) = self.store.record_code_review_thread_state(
                 &state.finding.id,
                 thread_id,
                 *is_resolved,
             )?;
-            // Every reconciled finding reaches
-            // enqueue_code_review_thread_recheck so lingering recheck
-            // markers from older deployments are consumed as bookkeeping.
-            reconciled_finding_ids.push(state.finding.id.clone());
             if changed {
                 changed_jobs.insert(state.finding.job_id.clone());
             }
-            // The gate derives from the post-transition status, not the
-            // pre-record snapshot: a resolved thread just dismissed an open
-            // finding, and an unresolved thread just restored a closed one.
-            let open_after_transition = if open {
-                !*is_resolved
-            } else {
-                state.is_resolved == Some(true) && !*is_resolved
-            };
-            if !open && !open_after_transition {
-                continue;
-            }
-            if blocking && open_after_transition {
-                open_blocking += 1;
-            }
-            state_key.push((state.finding.id.clone(), generation, *is_resolved));
         }
         for job_id in &changed_jobs {
             self.emit_code_review_updated(Some(job_id.clone()))?;
@@ -10805,36 +10424,6 @@ impl Engine {
             }
         }
 
-        state_key.sort_unstable();
-        let state_hash = format!("{:x}", Sha256::digest(serde_json::to_vec(&state_key)?));
-        let finding_ids = reconciled_finding_ids
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>();
-        let new_job = thread_recheck_review_request(repository, reviewers, config_hash, pull);
-        // The only remaining reason to schedule a round from reconciliation
-        // is coverage debt: maintainer dismissals brought the blocking
-        // ledger to zero, but no round has examined the whole branch at this
-        // head, so one full-scope round confirms before the check reports
-        // success. Reopens and dismissals themselves never schedule work —
-        // maintainer judgment is applied as-is and re-projected in place.
-        let awaiting_full_coverage = open_blocking == 0
-            && matches!(
-                self.store
-                    .latest_published_code_review_round_covered_full_branch(
-                        &repository.repository,
-                        pull.number,
-                        &pull.head.sha,
-                    )?,
-                Some(false)
-            );
-        let job = self.store.enqueue_code_review_thread_recheck(
-            &new_job,
-            &state_hash,
-            &finding_ids,
-            thread_reconciliation_schedules_full_round(open_blocking, awaiting_full_coverage),
-            MAX_THREAD_RECHECK_ATTEMPTS_PER_REVISION,
-        )?;
         self.clear_review_thread_listing_progress(&review_thread_listing_key(
             &repository.repository,
             pull.number,
@@ -10842,10 +10431,6 @@ impl Engine {
             &targets,
         ));
         drop(publication_guard);
-        if let Some(job) = job {
-            self.emit_code_review_updated(Some(job.id.clone()))?;
-            self.code_review.job_wake.notify_one();
-        }
         Ok(ReviewThreadReconciliationOutcome::Completed)
     }
 
@@ -11705,62 +11290,6 @@ impl Engine {
     }
 }
 
-/// State-based scheduling for the reconciliation-driven full round: it fires
-/// only when maintainer dismissals cleared the blocking ledger while no
-/// round has covered the full branch at this head (coverage debt). Every
-/// input is re-derivable at any time, so a missed pass never wedges the
-/// pull request; and because dismissals apply directly, no round ever runs
-/// just to second-guess a maintainer's thread resolution.
-fn thread_reconciliation_schedules_full_round(
-    open_blocking: u64,
-    awaiting_full_coverage: bool,
-) -> bool {
-    open_blocking == 0 && awaiting_full_coverage
-}
-
-/// The full-scope round request used by state-based scheduling from thread
-/// reconciliation: claim adjudication, reopened-finding resurfacing, and the
-/// full-coverage confirmation all run the same ordinary review.
-fn thread_recheck_review_request(
-    repository: &CodeReviewRepository,
-    reviewers: &[ReviewerProfile],
-    config_hash: &str,
-    pull: &GithubPullRequest,
-) -> NewCodeReviewJob {
-    NewCodeReviewJob {
-        dedupe_key: format!(
-            "{}#{}:{}:{}:thread-recheck:{config_hash}",
-            repository.repository, pull.number, pull.base.sha, pull.head.sha
-        ),
-        installation_id: repository.installation_id,
-        repository: repository.repository.clone(),
-        pull_number: pull.number,
-        pull_title: pull.title.clone(),
-        pull_body: bounded_review_pull_body(pull.body.as_deref()),
-        pull_url: pull.html_url.clone(),
-        head_sha: pull.head.sha.clone(),
-        review_base_sha: pull.base.sha.clone(),
-        base_ref: pull.base.sha.clone(),
-        head_ref: pull.head.name.clone(),
-        scope: trouve_protocol::CodeReviewJobScope::Full,
-        trigger: "thread-recheck".into(),
-        retry_of: None,
-        model: repository.model.clone(),
-        coordinator_thinking_level: repository.coordinator_thinking_level.clone(),
-        router_model: repository.router_model.clone(),
-        router_thinking_level: repository.router_thinking_level.clone(),
-        analyst_model: repository.analyst_model.clone(),
-        analyst_thinking_level: repository.analyst_thinking_level.clone(),
-        prompt: repository.prompt.clone(),
-        reviewers: reviewers.to_vec(),
-        routing_mode: repository.routing_mode,
-        semantic_routing: repository.semantic_routing,
-        included_reviewer_ids: repository.included_reviewer_ids.clone(),
-        excluded_reviewer_ids: repository.excluded_reviewer_ids.clone(),
-        config_hash: config_hash.to_owned(),
-    }
-}
-
 fn should_log_code_review_job_failure(status: &str, finish_transition: Option<bool>) -> bool {
     status == "failed" && finish_transition != Some(false)
 }
@@ -11777,45 +11306,13 @@ fn review_open_issue_count(job: &trouve_protocol::CodeReviewJob) -> Option<u64> 
     job.open_issue_count
 }
 
-/// Whether this round's diff covered the entire branch. A pull request's
-/// first review is incremental *from the pull-request base*, so it counts;
-/// later incremental rounds cover only the delta since the last published
-/// head. Success requires the newest published round to be both clean of
-/// blocking findings and full-coverage: a clean look at a sliver of a branch
-/// is not evidence the branch is clean — on observed loops, clean
-/// incremental rounds were repeatedly followed by double-digit full-scope
-/// findings on the same head.
-fn review_round_covered_full_branch(job: &trouve_protocol::CodeReviewJob) -> bool {
-    job.scope == trouve_protocol::CodeReviewJobScope::Full
-        || job
-            .covered_full_branch
-            // Rounds that predate the explicit flag fall back to the sha
-            // comparison, which understates coverage when the base branch
-            // advanced past the branch point (the merge base then differs
-            // from the base tip). New rounds always record the flag.
-            .unwrap_or(job.review_base_sha == job.base_ref)
-}
-
-/// Zero open blocking findings, but the round that established that state
-/// examined only part of the branch: hold the check at neutral until a clean
-/// full-coverage round confirms.
-fn review_awaiting_full_coverage(
-    job: &trouve_protocol::CodeReviewJob,
-    open_issue_count: Option<u64>,
-) -> bool {
-    job.status == "succeeded"
-        && open_issue_count == Some(0)
-        && !review_round_covered_full_branch(job)
-}
-
 fn review_check_conclusion(
     status: &str,
     open_issue_count: Option<u64>,
     needs_adjudication: bool,
-    awaiting_full_coverage: bool,
 ) -> Option<&'static str> {
     match status {
-        "succeeded" if open_issue_count == Some(0) && !awaiting_full_coverage => Some("success"),
+        "succeeded" if open_issue_count == Some(0) => Some("success"),
         "succeeded" => Some("neutral"),
         "failed" if needs_adjudication => Some("action_required"),
         "failed" => Some("failure"),
@@ -11831,11 +11328,6 @@ fn review_check_actions(final_editor_retryable: bool) -> serde_json::Value {
                 "label": "Retry final editor",
                 "description": RETRY_FINAL_EDITOR_CHECK_ACTION_DESCRIPTION,
                 "identifier": "retry_final_editor"
-            },
-            {
-                "label": "Full branch review",
-                "description": FULL_REVIEW_CHECK_ACTION_DESCRIPTION,
-                "identifier": "full_review"
             }
         ])
     } else {
@@ -11844,11 +11336,6 @@ fn review_check_actions(final_editor_retryable: bool) -> serde_json::Value {
                 "label": "Run again",
                 "description": RETRY_CHECK_ACTION_DESCRIPTION,
                 "identifier": "retry"
-            },
-            {
-                "label": "Full branch review",
-                "description": FULL_REVIEW_CHECK_ACTION_DESCRIPTION,
-                "identifier": "full_review"
             }
         ])
     }
@@ -12488,9 +11975,7 @@ fn render_lifecycle_comment(
 ) -> String {
     let job = &detail.job;
     let open_issue_count = review_open_issue_count(job);
-    let awaiting_full_coverage = review_awaiting_full_coverage(job, open_issue_count);
-    let succeeded_needing_attention =
-        job.status == "succeeded" && (open_issue_count != Some(0) || awaiting_full_coverage);
+    let succeeded_needing_attention = job.status == "succeeded" && open_issue_count != Some(0);
     // Only terminal review outcomes expose coordinator-authored results. A
     // queued or running job may hold a staged result while its live revision
     // is revalidated; cancelled and stale jobs never accepted that result.
@@ -12514,7 +11999,7 @@ fn render_lifecycle_comment(
     let icon = match job.status.as_str() {
         "queued" => "⏳",
         "running" => "🔎",
-        "succeeded" if open_issue_count == Some(0) && !awaiting_full_coverage => "✅",
+        "succeeded" if open_issue_count == Some(0) => "✅",
         "succeeded" => "🟡",
         "failed" if !detail.unadjudicated_candidates.is_empty() => "⚠️",
         "cancelled" | "stale" => "⏹️",
@@ -12569,14 +12054,6 @@ fn render_lifecycle_comment(
         pending = compact_elapsed(job.pending_elapsed_ms),
         running = compact_elapsed(job.running_elapsed_ms),
     ));
-    if review_awaiting_full_coverage(job, open_issue_count) {
-        body.push_str(
-            "### ⏳ Full-branch confirmation pending\n\nNo blocking issues remain open, but \
-             this round reviewed only the changes since the last review. The check reports \
-             success once a clean review covers the whole branch as it now stands — resolving \
-             all review threads (or requesting a full-branch review) runs that round.\n\n",
-        );
-    }
     if !detail.personas.is_empty() {
         body.push_str("### Reviewer coverage\n\n");
         body.push_str("| Reviewer | Status | Model | Elapsed | Candidates | Confirmed |\n");
@@ -14080,256 +13557,6 @@ fn should_replace_manual_review(
     mode == CodeReviewMode::Manual && review_superseded && manual_requested && generation.is_none()
 }
 
-#[derive(Debug)]
-struct ReusableDiff<'a> {
-    prefix: &'a str,
-    metadata: String,
-    preimage: String,
-    hunks: Vec<ReusableHunk<'a>>,
-}
-
-#[derive(Debug)]
-struct ReusableHunk<'a> {
-    text: &'a str,
-    fingerprint: String,
-    anchor: String,
-    old_location: u64,
-}
-
-/// Remove only complete, exactly equivalent textual hunks that were present in
-/// the prior full PR diff. The full preimage object and preimage-relative
-/// coordinate anchor semantic location; paths, metadata, context, and every
-/// added/removed byte remain part of the identity. New-file coordinates are
-/// ignored for existing files so added siblings do not invalidate an otherwise
-/// stable hunk. Repeated identities in the same path are retained because their
-/// relocation is ambiguous.
-fn filter_previously_reviewed_hunks(
-    current: &[ReviewDiffFile],
-    previous: &[ReviewDiffFile],
-) -> (Vec<ReviewDiffFile>, usize) {
-    let mut reviewed = HashMap::<(String, String, String, u64, String), usize>::new();
-    let mut reviewed_anchors = HashMap::<(String, String, String), usize>::new();
-    for file in previous {
-        let Some(parsed) = reusable_diff(&file.diff) else {
-            return (current.to_vec(), 0);
-        };
-        if parsed.hunks.is_empty() {
-            return (current.to_vec(), 0);
-        }
-        for hunk in parsed.hunks {
-            *reviewed_anchors
-                .entry((file.path.clone(), parsed.metadata.clone(), hunk.anchor))
-                .or_default() += 1;
-            *reviewed
-                .entry((
-                    file.path.clone(),
-                    parsed.metadata.clone(),
-                    parsed.preimage.clone(),
-                    hunk.old_location,
-                    hunk.fingerprint,
-                ))
-                .or_default() += 1;
-        }
-    }
-
-    let mut current_fingerprints = HashMap::<(String, String, String, u64, String), usize>::new();
-    for file in current {
-        let Some(parsed) = reusable_diff(&file.diff) else {
-            continue;
-        };
-        for hunk in parsed.hunks {
-            *current_fingerprints
-                .entry((
-                    file.path.clone(),
-                    parsed.metadata.clone(),
-                    parsed.preimage.clone(),
-                    hunk.old_location,
-                    hunk.fingerprint,
-                ))
-                .or_default() += 1;
-        }
-    }
-
-    let mut filtered = Vec::with_capacity(current.len());
-    let mut reused = 0;
-    let mut current_anchors = HashMap::<(String, String, String), usize>::new();
-    for file in current {
-        let Some(parsed) = reusable_diff(&file.diff) else {
-            filtered.push(file.clone());
-            continue;
-        };
-        let hunk_count = parsed.hunks.len();
-        let mut retained = Vec::new();
-        let mut matched_in_file = 0;
-        for hunk in parsed.hunks {
-            let anchor_key = (
-                file.path.clone(),
-                parsed.metadata.clone(),
-                hunk.anchor.clone(),
-            );
-            let key = (
-                file.path.clone(),
-                parsed.metadata.clone(),
-                parsed.preimage.clone(),
-                hunk.old_location,
-                hunk.fingerprint,
-            );
-            let unambiguous =
-                reviewed.get(&key) == Some(&1) && current_fingerprints.get(&key) == Some(&1);
-            let matched = unambiguous
-                && reviewed.get_mut(&key).is_some_and(|count| {
-                    if *count == 0 {
-                        return false;
-                    }
-                    *count -= 1;
-                    true
-                });
-            if matched {
-                reused += 1;
-                matched_in_file += 1;
-                if let Some(count) = reviewed_anchors.get_mut(&anchor_key) {
-                    *count = count.saturating_sub(1);
-                }
-            } else {
-                *current_anchors.entry(anchor_key).or_default() += 1;
-                retained.push(hunk.text);
-            }
-        }
-        if retained.is_empty() {
-            if matched_in_file == 0 || hunk_count == 0 {
-                filtered.push(file.clone());
-            }
-            continue;
-        }
-        if retained.len() == hunk_count {
-            filtered.push(file.clone());
-            continue;
-        }
-        let mut diff = parsed.prefix.to_string();
-        for hunk in retained {
-            diff.push_str(hunk);
-        }
-        filtered.push(ReviewDiffFile {
-            path: file.path.clone(),
-            diff,
-            generated_header: file.generated_header.clone(),
-        });
-    }
-    let every_old_hunk_accounted_for = reviewed_anchors.into_iter().all(|(key, count)| {
-        count == 0
-            || (!key.2.is_empty() && current_anchors.get(&key).copied().unwrap_or(0) >= count)
-    });
-    if !every_old_hunk_accounted_for {
-        return (current.to_vec(), 0);
-    }
-    (filtered, reused)
-}
-
-fn reusable_diff(diff: &str) -> Option<ReusableDiff<'_>> {
-    let mut hunk_starts = Vec::new();
-    let mut offset = 0;
-    for line in diff.split_inclusive('\n') {
-        if line.starts_with("@@ ") {
-            hunk_starts.push(offset);
-        }
-        offset += line.len();
-    }
-    let first = hunk_starts.first().copied().unwrap_or(diff.len());
-    let prefix = &diff[..first];
-    let preimage = prefix.lines().find_map(|line| {
-        line.strip_prefix("index ")?
-            .split_once("..")
-            .map(|(preimage, _)| preimage.to_string())
-    })?;
-    let metadata = prefix
-        .lines()
-        .filter(|line| {
-            !line.starts_with("diff --git ")
-                && !line.starts_with("index ")
-                && !line.starts_with("--- ")
-                && !line.starts_with("+++ ")
-                && !line.is_empty()
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    let mut hunks = Vec::with_capacity(hunk_starts.len());
-    for (index, start) in hunk_starts.iter().copied().enumerate() {
-        let end = hunk_starts.get(index + 1).copied().unwrap_or(diff.len());
-        let text = &diff[start..end];
-        let (fingerprint, anchor, old_location, new_location) = complete_hunk_identity(text)?;
-        hunks.push(ReusableHunk {
-            text,
-            fingerprint,
-            anchor,
-            old_location: if preimage.bytes().all(|byte| byte == b'0') {
-                new_location
-            } else {
-                old_location
-            },
-        });
-    }
-    Some(ReusableDiff {
-        prefix,
-        metadata,
-        preimage,
-        hunks,
-    })
-}
-
-fn complete_hunk_identity(hunk: &str) -> Option<(String, String, u64, u64)> {
-    let (header, body) = hunk.split_once('\n').unwrap_or((hunk, ""));
-    let ranges = header.strip_prefix("@@ ")?;
-    let close = ranges.find(" @@")?;
-    let mut range_parts = ranges[..close].split_whitespace();
-    let (old_location, old_count) = diff_hunk_range(range_parts.next()?, '-')?;
-    let (new_location, new_count) = diff_hunk_range(range_parts.next()?, '+')?;
-    if range_parts.next().is_some() {
-        return None;
-    }
-    let suffix = &ranges[close + 3..];
-    let mut observed_old = 0_u64;
-    let mut observed_new = 0_u64;
-    let mut context = Vec::new();
-    for line in body.split_terminator('\n') {
-        match line.as_bytes().first().copied() {
-            Some(b' ') => {
-                observed_old += 1;
-                observed_new += 1;
-                context.push(line);
-            }
-            Some(b'-') => observed_old += 1,
-            Some(b'+') => observed_new += 1,
-            Some(b'\\') => {}
-            _ => return None,
-        }
-    }
-    if observed_old != old_count || observed_new != new_count {
-        return None;
-    }
-    let fingerprint = format!(
-        "{old_count}:{new_count}:{suffix}\n{}",
-        body.trim_end_matches('\n')
-    );
-    let anchor = if suffix.is_empty() && context.is_empty() {
-        String::new()
-    } else {
-        format!("{suffix}\n{}", context.join("\n"))
-    };
-    Some((fingerprint, anchor, old_location, new_location))
-}
-
-fn diff_hunk_range(range: &str, sigil: char) -> Option<(u64, u64)> {
-    let mut parts = range.strip_prefix(sigil)?.split(',');
-    let start = parts.next()?.parse::<u64>().ok()?;
-    let count = parts
-        .next()
-        .map(str::parse::<u64>)
-        .transpose()
-        .ok()?
-        .unwrap_or(1);
-    parts.next().is_none().then_some((start, count))
-}
-
 /// Byte budgets for model-facing review prompts. Defaults mirror the fixed
 /// constants that predate model-derived sizing; when every model a job can
 /// call reports a context window, the budgets scale from the smallest window
@@ -14400,18 +13627,6 @@ fn derived_review_prompt_budgets(smallest_context_window: Option<u64>) -> Review
         history_findings_max_bytes: scale(REVIEW_HISTORY_FINDINGS_MAX_BYTES),
         history_themes_max_bytes: scale(REVIEW_HISTORY_THEMES_MAX_BYTES),
         history_rejections_max_bytes: scale(REVIEW_HISTORY_CANDIDATE_REJECTIONS_MAX_BYTES),
-    }
-}
-
-fn build_effective_review_batches(
-    files: &[ReviewDiffFile],
-    reused_hunk_count: usize,
-    budgets: ReviewPromptBudgets,
-) -> Vec<ReviewBatch> {
-    if files.is_empty() && reused_hunk_count > 0 {
-        Vec::new()
-    } else {
-        build_review_batches(files, budgets)
     }
 }
 
@@ -14648,27 +13863,14 @@ fn selected_reviewer_count(
         .len()
 }
 
-fn no_candidate_review_summary(
-    reviewer_count: usize,
-    changed_file_count: usize,
-    reused_hunk_count: usize,
-) -> String {
-    if changed_file_count == 0 && reused_hunk_count > 0 && reviewer_count == 0 {
-        return "All relevant hunks were reused from the prior review; no persona review was run."
-            .into();
-    }
+fn no_candidate_review_summary(reviewer_count: usize, changed_file_count: usize) -> String {
     if reviewer_count == 0 {
         return format!(
             "No reviewer persona was selected for {changed_file_count} changed file(s); no persona review was run."
         );
     }
-    let reuse = if reused_hunk_count == 0 {
-        String::new()
-    } else {
-        format!(" after reusing {reused_hunk_count} unchanged hunk(s) from the prior review")
-    };
     format!(
-        "{reviewer_count} reviewer(s) examined {changed_file_count} changed file(s){reuse}; no actionable issues were confirmed."
+        "{reviewer_count} reviewer(s) examined {changed_file_count} changed file(s); no actionable issues were confirmed."
     )
 }
 
@@ -14990,12 +14192,7 @@ fn split_diff_chunks(diff: &str, limit: usize) -> Vec<&str> {
     chunks
 }
 
-fn review_batch_digest(
-    review_base_sha: &str,
-    head_sha: &str,
-    reused_hunk_count: usize,
-    batches: &[ReviewBatch],
-) -> String {
+fn review_batch_digest(review_base_sha: &str, head_sha: &str, batches: &[ReviewBatch]) -> String {
     fn add_field(hasher: &mut Sha256, value: &[u8]) {
         hasher.update((value.len() as u64).to_le_bytes());
         hasher.update(value);
@@ -15004,7 +14201,6 @@ fn review_batch_digest(
     let mut hasher = Sha256::new();
     add_field(&mut hasher, review_base_sha.as_bytes());
     add_field(&mut hasher, head_sha.as_bytes());
-    hasher.update((reused_hunk_count as u64).to_le_bytes());
     hasher.update((batches.len() as u64).to_le_bytes());
     for batch in batches {
         hasher.update((batch.paths.len() as u64).to_le_bytes());
@@ -15023,7 +14219,6 @@ fn reviewer_prompt(
     batch_index: usize,
     batch_count: usize,
     routing_reasons: &[CodeReviewRoutingReason],
-    reused_hunk_count: usize,
 ) -> String {
     let job = &record.job;
     let batch_identity = review_batch_identity(batch, batch_index, batch_count);
@@ -15041,13 +14236,6 @@ fn reviewer_prompt(
             })
         })
         .collect::<Vec<_>>();
-    let reuse_note = if reused_hunk_count == 0 {
-        String::new()
-    } else {
-        format!(
-            "\nHistory was rewritten. {reused_hunk_count} exactly equivalent textual hunk(s) from the prior reviewed PR diff were omitted; the supplied hunks are the new or changed remainder.\n"
-        )
-    };
     let evidence = serde_json::to_string_pretty(&serde_json::json!({
         "pull_request_title": &job.pull_title,
         "changed_paths": &batch.paths,
@@ -15059,7 +14247,7 @@ fn reviewer_prompt(
         "{batch_identity}\nReview pull request #{number} at immutable head {head}, compared with \
          base commit {base}. This is complete diff batch {batch_number} of {batch_count}. \
          \n\
-         {extra}{reuse_note}\nYou are the `{reviewer_name}` reviewer. Your focused mandate is:\n\
+         {extra}\nYou are the `{reviewer_name}` reviewer. Your focused mandate is:\n\
          {reviewer_instructions}\n\n{evidence_guidance}\n\nUntrusted pull-request evidence:\n\
          {evidence}\n\n\
          Review every supplied file or fragment. Inspect relevant unchanged callers, consumers, \
@@ -15091,7 +14279,6 @@ fn reviewer_prompt(
         batch_identity = batch_identity,
         evidence_guidance = UNTRUSTED_REVIEW_EVIDENCE_GUIDANCE,
         evidence = evidence,
-        reuse_note = reuse_note,
     )
 }
 
@@ -15107,7 +14294,6 @@ fn validation_prompt(
     prior_fix_context: &str,
     implementation_analysis: Option<&ImplementationAnalysis>,
     files: &[ReviewDiffFile],
-    reused_hunk_count: usize,
     budgets: ReviewPromptBudgets,
 ) -> Result<String> {
     let job = &record.job;
@@ -15201,13 +14387,6 @@ fn validation_prompt(
     };
     let previous_themes = compact_theme_history(previous_themes, budgets.history_themes_max_bytes)?;
     let external_comments = compact_external_review_comments(external_comments)?;
-    let reuse_note = if reused_hunk_count == 0 {
-        String::new()
-    } else {
-        format!(
-            "History was rewritten, and {reused_hunk_count} exactly equivalent textual hunk(s) from the prior reviewed PR diff were omitted. Do not resolve a prior finding solely because its unchanged hunk is absent from the supplied remainder.\n\n"
-        )
-    };
     let paths = files
         .iter()
         .map(|file| file.path.as_str())
@@ -15276,7 +14455,7 @@ fn validation_prompt(
          is low; publication policy is applied after consolidation. Preserve an outside-diff \
          anchor only when repository evidence shows this revision introduced the impact and the \
          unchanged head-revision line is the clearest location; otherwise move the finding to a \
-         commentable diff line or reject it. {reuse_note}Exact relevant diff context is \
+         commentable diff line or reject it. Exact relevant diff context is \
          supplied below; use tools only when surrounding unchanged code is necessary to settle \
          a concrete ambiguity. Do not add a finding merely because a \
          reviewer suggested it. Each retained finding must include every contributing \
@@ -15303,7 +14482,7 @@ fn validation_prompt(
          location and independently complete evidence. Also inspect the \
          previously published finding history. Include an id in `resolved_finding_ids` only \
          when its status is `open` and this revision demonstrably fixed it. A still-open \
-         finding whose fix landed before this round's diff window carries a \
+         finding whose fix no longer appears as a changed hunk in the cumulative branch diff carries a \
          `current_anchor_line` field in its history entry — the source line now at its anchor \
          in the head revision, or null when that line no longer exists. When you judge such a \
          finding fixed, add an entry to `resolved_findings` with its id and \
@@ -15391,7 +14570,6 @@ fn validation_prompt(
         external_fact_guidance = EXTERNAL_FACT_EVIDENCE_GUIDANCE,
         evidence_guidance = UNTRUSTED_REVIEW_EVIDENCE_GUIDANCE,
         evidence = evidence,
-        reuse_note = reuse_note,
         recurrence_guidance = recurrence_guidance,
         description_guidance = description_guidance,
         analysis_guidance = analysis_guidance,
@@ -17414,7 +16592,7 @@ fn in_diff_head_line(file: &ReviewDiffFile, target_old_line: u64) -> Option<u64>
 
 /// Map a finding's coordinate from the current review base to its head. A
 /// finding starts at its reporting head; each successful mapping is also
-/// recorded at the new head so later incremental rounds can continue from
+/// recorded at the new head so later review rounds can continue from
 /// that durable coordinate instead of reusing the original numeric line.
 fn historical_anchor_location(
     finding: &trouve_protocol::CodeReviewFinding,
@@ -17616,10 +16794,10 @@ fn carried_anchor_continuation_request(
         pull_body: record.pull_body.clone(),
         pull_url: job.pull_url.clone(),
         head_sha: job.head_sha.clone(),
-        review_base_sha: job.review_base_sha.clone(),
+        review_base_sha: job.base_ref.clone(),
         base_ref: job.base_ref.clone(),
         head_ref: job.head_ref.clone(),
-        scope: job.scope,
+        scope: trouve_protocol::CodeReviewJobScope::Full,
         trigger: "carried-anchor-continuation".into(),
         retry_of: Some(job.id.clone()),
         model: job.model.clone(),
@@ -17667,9 +16845,10 @@ fn carried_resolution_claim_is_verified(quote: &str, current: Option<&Option<Str
 /// finding whose anchor is present in this round's diff may resolve by id
 /// alone — the coordinator judged the exact location against changes it was
 /// shown. A carried blocking finding outside the window resolves only through
-/// a verified head-revision claim: that frees fixes whose commits scrolled out
-/// of the incremental window without letting a model hand-wave an open issue
-/// closed. Advisory findings keep the lenient by-id path — they never gate.
+/// a verified head-revision claim: that handles fixes which no longer appear
+/// as changed hunks in the cumulative branch diff without letting a model
+/// hand-wave an open issue closed. Advisory findings keep the lenient by-id
+/// path — they never gate.
 fn verified_resolution_ids(
     listed: Vec<String>,
     claims: &[ResolvedFindingClaim],
@@ -18227,157 +17406,6 @@ mod tests {
     }
 
     #[test]
-    fn thread_recheck_enqueue_rechecks_for_active_automatic_work_in_transaction() {
-        let store = crate::store::Store::open_in_memory().unwrap();
-        let automatic = enqueue_test_review_job(&store, "acme/widgets#42:automatic-active");
-        let mut request = test_review_job_request("acme/widgets#42:thread-recheck-race");
-        request.trigger = "thread-recheck".into();
-
-        assert!(
-            store
-                .enqueue_code_review_thread_recheck(&request, "state-a", &[], true, 3)
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(
-            store.claim_code_review_job().unwrap().unwrap().job.id,
-            automatic.id
-        );
-        store
-            .finish_code_review_job(&automatic.id, "succeeded", "review-url", "")
-            .unwrap();
-        assert!(
-            store
-                .enqueue_code_review_thread_recheck(&request, "state-a", &[], true, 3)
-                .unwrap()
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn deduped_thread_recheck_returns_the_covering_job() {
-        let store = crate::store::Store::open_in_memory().unwrap();
-        let mut request = test_review_job_request("acme/widgets#42:thread-recheck-dedupe");
-        request.trigger = "thread-recheck".into();
-        let state_key = "state-a";
-        let mut covering_request = request.clone();
-        covering_request.dedupe_key =
-            format!("{}:{state_key}:attempt:1", covering_request.dedupe_key);
-        let covering = store
-            .enqueue_code_review_job(&covering_request)
-            .unwrap()
-            .unwrap();
-
-        let returned = store
-            .enqueue_code_review_thread_recheck(&request, state_key, &[], true, 3)
-            .unwrap()
-            .expect("the deduped recheck must retain its covering job");
-
-        assert_eq!(returned.id, covering.id);
-    }
-
-    #[test]
-    fn thread_rechecks_retry_terminal_failures_without_looping_or_exceeding_the_cap() {
-        let store = crate::store::Store::open_in_memory().unwrap();
-        let mut request = test_review_job_request("acme/widgets#42:thread-recheck");
-        request.trigger = "thread-recheck".into();
-
-        let first = store
-            .enqueue_code_review_thread_recheck(&request, "state-a", &[], true, 3)
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            store.claim_code_review_job().unwrap().unwrap().job.id,
-            first.id
-        );
-        store
-            .finish_code_review_job(&first.id, "failed", "", "temporary failure")
-            .unwrap();
-
-        let retry = store
-            .enqueue_code_review_thread_recheck(&request, "state-a", &[], false, 3)
-            .unwrap()
-            .unwrap();
-        assert_ne!(retry.id, first.id);
-        assert_eq!(
-            store.claim_code_review_job().unwrap().unwrap().job.id,
-            retry.id
-        );
-        store
-            .finish_code_review_job(&retry.id, "succeeded", "review-url", "")
-            .unwrap();
-        assert!(
-            store
-                .enqueue_code_review_thread_recheck(&request, "state-a", &[], true, 3)
-                .unwrap()
-                .is_none()
-        );
-
-        let third = store
-            .enqueue_code_review_thread_recheck(&request, "state-b", &[], true, 3)
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            store.claim_code_review_job().unwrap().unwrap().job.id,
-            third.id
-        );
-        store
-            .finish_code_review_job(&third.id, "failed", "", "another failure")
-            .unwrap();
-        assert!(
-            store
-                .enqueue_code_review_thread_recheck(&request, "state-c", &[], true, 3)
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn published_thread_recheck_is_consumed_even_if_later_bookkeeping_fails() {
-        let store = crate::store::Store::open_in_memory().unwrap();
-        let mut request = test_review_job_request("acme/widgets#42:published-thread-recheck");
-        request.trigger = "thread-recheck".into();
-        let job = store
-            .enqueue_code_review_thread_recheck(&request, "state-published", &[], true, 3)
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            store.claim_code_review_job().unwrap().unwrap().job.id,
-            job.id
-        );
-        assert!(store.claim_code_review_publication(&job.id).unwrap());
-        store
-            .record_code_review_publication(
-                &job.id,
-                &job.repository,
-                job.pull_number,
-                &job.base_ref,
-                &job.head_sha,
-                "https://github.com/acme/widgets/pull/42#pullrequestreview-1",
-                false,
-                &[],
-            )
-            .unwrap();
-        assert!(
-            store
-                .code_review_job(&job.id)
-                .unwrap()
-                .unwrap()
-                .publication_accepted
-        );
-        store
-            .finish_code_review_job(&job.id, "failed", "", "post-publication failure")
-            .unwrap();
-
-        assert!(
-            store
-                .enqueue_code_review_thread_recheck(&request, "state-published", &[], false, 3,)
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[test]
     fn unpublished_job_findings_are_not_reused_as_previous_findings() {
         let store = crate::store::Store::open_in_memory().unwrap();
         let job = enqueue_test_review_job(&store, "acme/widgets#42:failed-findings");
@@ -18786,252 +17814,25 @@ mod tests {
     }
 
     #[test]
-    fn incremental_history_requires_a_proven_ancestry_result() {
-        let watermark = "1111111111111111111111111111111111111111";
-        let old_base = "2222222222222222222222222222222222222222";
-        let new_base = "3333333333333333333333333333333333333333";
-        assert_eq!(
-            classify_incremental_history(false, watermark, None),
-            IncrementalHistory::NotApplicable
-        );
-        assert_eq!(
-            classify_incremental_history(true, watermark, Some(watermark)),
-            IncrementalHistory::Linear
-        );
-        assert_eq!(
-            classify_incremental_history(
-                true,
-                watermark,
-                Some("2222222222222222222222222222222222222222")
-            ),
-            IncrementalHistory::Rewritten
-        );
-        assert_eq!(
-            classify_incremental_history(true, watermark, None),
-            IncrementalHistory::Unknown
-        );
-        assert!(incremental_diff_can_use_watermark(
-            IncrementalHistory::Linear,
-            old_base,
-            old_base
-        ));
-        assert!(!incremental_diff_can_use_watermark(
-            IncrementalHistory::Linear,
-            old_base,
-            new_base
-        ));
-    }
-
-    #[test]
     fn reviewer_batch_digest_covers_exact_effective_content() {
         let batches = vec![ReviewBatch {
             paths: vec!["src/lib.rs".into()],
             diff: "+reviewed line  \n".into(),
         }];
-        let digest = review_batch_digest("base", "head", 0, &batches);
-        assert_eq!(digest, review_batch_digest("base", "head", 0, &batches));
-        assert_ne!(digest, review_batch_digest("base", "head", 1, &batches));
+        let digest = review_batch_digest("base", "head", &batches);
+        assert_eq!(digest, review_batch_digest("base", "head", &batches));
         let changed = vec![ReviewBatch {
             paths: vec!["src/lib.rs".into()],
             diff: "+reviewed line\n".into(),
         }];
-        assert_ne!(digest, review_batch_digest("base", "head", 0, &changed));
+        assert_ne!(digest, review_batch_digest("base", "head", &changed));
     }
 
     #[test]
-    fn only_rewrite_reuse_turns_an_empty_diff_into_zero_batches() {
-        let unchanged_empty =
-            build_effective_review_batches(&[], 0, ReviewPromptBudgets::default());
+    fn empty_diff_still_produces_one_review_batch() {
+        let unchanged_empty = build_review_batches(&[], ReviewPromptBudgets::default());
         assert_eq!(unchanged_empty.len(), 1);
         assert!(unchanged_empty[0].diff.contains("No textual file changes"));
-        assert!(build_effective_review_batches(&[], 1, ReviewPromptBudgets::default()).is_empty());
-    }
-
-    #[test]
-    fn rewritten_history_retains_a_hunk_moved_within_the_same_preimage() {
-        let previous = vec![ReviewDiffFile {
-            path: "src/lib.rs".into(),
-            diff: "diff --git a/src/lib.rs b/src/lib.rs\nindex 111..222 100644\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -10 +10 @@\n-old\n+new\n"
-                .into(),
-            generated_header: None,
-        }];
-        let current = vec![ReviewDiffFile {
-            path: "src/lib.rs".into(),
-            diff: "diff --git a/src/lib.rs b/src/lib.rs\nindex 111..333 100644\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -30 +30 @@\n-old\n+new\n"
-                .into(),
-            generated_header: None,
-        }];
-
-        let (filtered, reused) = filter_previously_reviewed_hunks(&current, &previous);
-        assert_eq!(reused, 0);
-        assert_eq!(filtered, current);
-    }
-
-    #[test]
-    fn rewritten_history_retains_a_hunk_when_its_file_preimage_changed() {
-        let previous = vec![ReviewDiffFile {
-            path: "src/lib.rs".into(),
-            diff: "diff --git a/src/lib.rs b/src/lib.rs\nindex 111..222 100644\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -10 +10 @@\n-old\n+new\n"
-                .into(),
-            generated_header: None,
-        }];
-        let current = vec![ReviewDiffFile {
-            path: "src/lib.rs".into(),
-            diff: "diff --git a/src/lib.rs b/src/lib.rs\nindex 333..444 100644\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -10 +10 @@\n-old\n+new\n"
-                .into(),
-            generated_header: None,
-        }];
-
-        let (filtered, reused) = filter_previously_reviewed_hunks(&current, &previous);
-        assert_eq!(reused, 0);
-        assert_eq!(filtered, current);
-    }
-
-    #[test]
-    fn rewritten_history_reuses_an_exact_hunk_at_new_line_coordinates() {
-        let previous = vec![ReviewDiffFile {
-            path: "src/lib.rs".into(),
-            diff: "diff --git a/src/lib.rs b/src/lib.rs\nindex 111..222 100644\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -10,3 +10,3 @@ fn value() {\n context\n-old\n+new\n context\n"
-                .into(),
-            generated_header: None,
-        }];
-        let current = vec![ReviewDiffFile {
-            path: "src/lib.rs".into(),
-            diff: "diff --git a/src/lib.rs b/src/lib.rs\nindex 111..444 100644\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -10,3 +35,3 @@ fn value() {\n context\n-old\n+new\n context\n"
-                .into(),
-            generated_header: None,
-        }];
-
-        let (filtered, reused) = filter_previously_reviewed_hunks(&current, &previous);
-        assert_eq!(reused, 1);
-        assert!(filtered.is_empty());
-    }
-
-    #[test]
-    fn rewritten_history_reviews_only_new_or_changed_hunks() {
-        let previous = vec![ReviewDiffFile {
-            path: "src/lib.rs".into(),
-            diff: "diff --git a/src/lib.rs b/src/lib.rs\nindex 111..222 100644\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -10,3 +10,3 @@ fn value() {\n context\n-old\n+new\n context\n"
-                .into(),
-            generated_header: None,
-        }];
-        let current = vec![ReviewDiffFile {
-            path: "src/lib.rs".into(),
-            diff: "diff --git a/src/lib.rs b/src/lib.rs\nindex 111..555 100644\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -10,3 +35,3 @@ fn value() {\n context\n-old\n+new\n context\n@@ -50 +55 @@ fn added() {\n-before\n+after\n"
-                .into(),
-            generated_header: None,
-        }];
-
-        let (filtered, reused) = filter_previously_reviewed_hunks(&current, &previous);
-        assert_eq!(reused, 1);
-        assert_eq!(filtered.len(), 1);
-        assert!(!filtered[0].diff.contains("fn value"));
-        assert!(filtered[0].diff.contains("fn added"));
-        assert!(filtered[0].diff.contains("-before\n+after"));
-    }
-
-    #[test]
-    fn rewritten_history_keeps_a_modified_hunk_and_reuses_its_unchanged_siblings() {
-        let previous = vec![
-            ReviewDiffFile {
-                path: "src/a.rs".into(),
-                diff: "diff --git a/src/a.rs b/src/a.rs\nindex aaa..bbb 100644\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1,3 +1,3 @@ fn stable() {\n context\n-old\n+reviewed\n context\n"
-                    .into(),
-                generated_header: None,
-            },
-            ReviewDiffFile {
-                path: "src/b.rs".into(),
-                diff: "diff --git a/src/b.rs b/src/b.rs\nindex ccc..ddd 100644\n--- a/src/b.rs\n+++ b/src/b.rs\n@@ -1,3 +1,3 @@ fn changed() {\n context\n-old\n+first\n context\n"
-                    .into(),
-                generated_header: None,
-            },
-        ];
-        let current = vec![
-            previous[0].clone(),
-            ReviewDiffFile {
-                path: "src/b.rs".into(),
-                diff: "diff --git a/src/b.rs b/src/b.rs\nindex ccc..eee 100644\n--- a/src/b.rs\n+++ b/src/b.rs\n@@ -20,3 +20,3 @@ fn changed() {\n context\n-old\n+second\n context\n"
-                    .into(),
-                generated_header: None,
-            },
-        ];
-
-        let (filtered, reused) = filter_previously_reviewed_hunks(&current, &previous);
-        assert_eq!(reused, 1);
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].path, "src/b.rs");
-        assert!(filtered[0].diff.contains("+second"));
-    }
-
-    #[test]
-    fn rewritten_history_falls_back_when_a_reviewed_hunk_disappears() {
-        let current = vec![ReviewDiffFile {
-            path: "src/a.rs".into(),
-            diff: "diff --git a/src/a.rs b/src/a.rs\nindex aaa..bbb 100644\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1,3 +1,3 @@ fn stable() {\n context\n-old\n+reviewed\n context\n"
-                .into(),
-            generated_header: None,
-        }];
-        let mut previous = current.clone();
-        previous.push(ReviewDiffFile {
-            path: "src/removed.rs".into(),
-            diff: "diff --git a/src/removed.rs b/src/removed.rs\nindex ccc..ddd 100644\n--- a/src/removed.rs\n+++ b/src/removed.rs\n@@ -1,3 +1,3 @@ fn removed() {\n context\n-old\n+gone\n context\n"
-                .into(),
-            generated_header: None,
-        });
-
-        let (filtered, reused) = filter_previously_reviewed_hunks(&current, &previous);
-        assert_eq!(reused, 0);
-        assert_eq!(filtered, current);
-    }
-
-    #[test]
-    fn rewritten_history_falls_back_for_non_textual_prior_changes() {
-        let current = vec![ReviewDiffFile {
-            path: "src/a.rs".into(),
-            diff: "diff --git a/src/a.rs b/src/a.rs\nindex aaa..bbb 100644\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n-old\n+reviewed\n"
-                .into(),
-            generated_header: None,
-        }];
-        let mut previous = current.clone();
-        previous.push(ReviewDiffFile {
-            path: "image.png".into(),
-            diff: "diff --git a/image.png b/image.png\nBinary files a/image.png and b/image.png differ\n"
-                .into(),
-            generated_header: None,
-        });
-
-        let (filtered, reused) = filter_previously_reviewed_hunks(&current, &previous);
-        assert_eq!(reused, 0);
-        assert_eq!(filtered, current);
-    }
-
-    #[test]
-    fn rewritten_history_preserves_whitespace_changes_and_incomplete_hunks() {
-        let previous = vec![ReviewDiffFile {
-            path: "config.yml".into(),
-            diff: "diff --git a/config.yml b/config.yml\nindex aaa..bbb 100644\n--- a/config.yml\n+++ b/config.yml\n@@ -1 +1 @@\n-old\n+  value\n"
-                .into(),
-            generated_header: None,
-        }];
-        let current = vec![ReviewDiffFile {
-            path: "config.yml".into(),
-            diff: "diff --git a/config.yml b/config.yml\nindex aaa..ccc 100644\n--- a/config.yml\n+++ b/config.yml\n@@ -8 +8 @@\n-old\n+\tvalue\n"
-                .into(),
-            generated_header: None,
-        }];
-
-        let (filtered, reused) = filter_previously_reviewed_hunks(&current, &previous);
-        assert_eq!(reused, 0);
-        assert_eq!(filtered, current);
-
-        let incomplete = vec![ReviewDiffFile {
-            path: "config.yml".into(),
-            diff: "diff --git a/config.yml b/config.yml\nindex aaa..ddd 100644\n--- a/config.yml\n+++ b/config.yml\n@@ -1,2 +1,2 @@\n-old\n+\tvalue\n"
-                .into(),
-            generated_header: None,
-        }];
-        let (_, reused) = filter_previously_reviewed_hunks(&current, &incomplete);
-        assert_eq!(reused, 0);
     }
 
     struct RouterThinkingProvider {
@@ -20032,7 +18833,7 @@ mod tests {
     }
 
     #[test]
-    fn clean_incremental_review_keeps_prior_open_findings_visible() {
+    fn clean_review_keeps_prior_open_findings_visible() {
         let store = crate::store::Store::open_in_memory().unwrap();
         let queued = enqueue_test_review_job(&store, "acme/widgets#42:prior-open-lifecycle");
         store.claim_code_review_job().unwrap().unwrap();
@@ -20047,7 +18848,7 @@ mod tests {
 
         assert_eq!(review_open_issue_count(&detail.job), Some(2));
         assert_eq!(
-            review_check_conclusion(&detail.job.status, Some(2), false, false),
+            review_check_conclusion(&detail.job.status, Some(2), false),
             Some("neutral")
         );
         let body = render_lifecycle_comment(&detail, &[], false, &[]);
@@ -20058,16 +18859,9 @@ mod tests {
 
         detail.job.open_issue_count = Some(0);
         assert_eq!(
-            review_check_conclusion(&detail.job.status, Some(0), false, false),
+            review_check_conclusion(&detail.job.status, Some(0), false),
             Some("success")
         );
-        // Zero open blocking findings established by a partial round is
-        // pending, not settled; a full-coverage clean round renders settled.
-        assert!(
-            render_lifecycle_comment(&detail, &[], false, &[])
-                .starts_with("## 🟡 Trouve Code Review — Needs Attention")
-        );
-        detail.job.review_base_sha = detail.job.base_ref.clone();
         assert!(
             render_lifecycle_comment(&detail, &[], false, &[])
                 .starts_with("## ✅ Trouve Code Review — Succeeded")
@@ -20076,77 +18870,12 @@ mod tests {
         detail.job.open_issue_count = None;
         assert_eq!(review_open_issue_count(&detail.job), None);
         assert_eq!(
-            review_check_conclusion(&detail.job.status, None, false, false),
+            review_check_conclusion(&detail.job.status, None, false),
             Some("neutral")
         );
         let body = render_lifecycle_comment(&detail, &[], false, &[]);
         assert!(body.starts_with("## 🟡 Trouve Code Review — Needs Attention"));
         assert!(body.contains("PR-wide open issue status is unknown for this legacy review"));
-    }
-
-    #[test]
-    fn success_requires_the_newest_round_to_cover_the_full_branch() {
-        let store = crate::store::Store::open_in_memory().unwrap();
-        let queued = enqueue_test_review_job(&store, "acme/widgets#42:coverage-lifecycle");
-        store.claim_code_review_job().unwrap().unwrap();
-        store
-            .save_code_review_result(&queued.id, "No new issues.", "", 0, &[], &[])
-            .unwrap();
-        store
-            .finish_code_review_job(&queued.id, "succeeded", "https://example.test/review", "")
-            .unwrap();
-        let mut detail = store.code_review_job_detail(&queued.id).unwrap().unwrap();
-        detail.job.open_issue_count = Some(0);
-        // The helper enqueues an incremental job whose review base differs
-        // from the pull-request base: a partial round.
-        assert_ne!(detail.job.review_base_sha, detail.job.base_ref);
-        assert!(review_awaiting_full_coverage(&detail.job, Some(0)));
-        assert_eq!(
-            review_check_conclusion(&detail.job.status, Some(0), false, true),
-            Some("neutral")
-        );
-        let body = render_lifecycle_comment(&detail, &[], false, &[]);
-        assert!(body.starts_with("## 🟡 Trouve Code Review — Needs Attention"));
-        assert!(body.contains("### ⏳ Full-branch confirmation pending"));
-        assert!(body.contains("reviewed only the changes since the last review"));
-
-        // A first-round review is incremental from the pull-request base and
-        // therefore covers the whole branch: it may go green directly.
-        detail.job.review_base_sha = detail.job.base_ref.clone();
-        assert!(!review_awaiting_full_coverage(&detail.job, Some(0)));
-        assert_eq!(
-            review_check_conclusion(&detail.job.status, Some(0), false, false),
-            Some("success")
-        );
-        let body = render_lifecycle_comment(&detail, &[], false, &[]);
-        assert!(body.starts_with("## ✅ Trouve Code Review — Succeeded"));
-        assert!(!body.contains("Full-branch confirmation pending"));
-
-        // Full-scope rounds qualify regardless of their review base.
-        detail.job.review_base_sha = "9999999999999999999999999999999999999999".into();
-        detail.job.scope = trouve_protocol::CodeReviewJobScope::Full;
-        assert!(!review_awaiting_full_coverage(&detail.job, Some(0)));
-
-        // The recorded flag is authoritative over the sha comparison: a
-        // first review resolved to the merge base covers the whole branch
-        // even when the base branch advanced past the branch point (base tip
-        // != merge base), and a slice stays partial even if its shas happen
-        // to line up.
-        detail.job.scope = trouve_protocol::CodeReviewJobScope::Incremental;
-        assert_ne!(detail.job.review_base_sha, detail.job.base_ref);
-        detail.job.covered_full_branch = Some(true);
-        assert!(!review_awaiting_full_coverage(&detail.job, Some(0)));
-        detail.job.review_base_sha = detail.job.base_ref.clone();
-        detail.job.covered_full_branch = Some(false);
-        assert!(review_awaiting_full_coverage(&detail.job, Some(0)));
-        detail.job.covered_full_branch = None;
-        detail.job.review_base_sha = "9999999999999999999999999999999999999999".into();
-
-        // Open blocking findings dominate the presentation either way.
-        detail.job.open_issue_count = Some(3);
-        assert!(!review_awaiting_full_coverage(&detail.job, Some(3)));
-        let body = render_lifecycle_comment(&detail, &[], false, &[]);
-        assert!(body.starts_with("## 🟡 Trouve Code Review — Needs Attention"));
     }
 
     #[test]
@@ -21000,34 +19729,36 @@ rename to src/new.rs
     }
 
     #[test]
-    fn manual_review_commands_parse_scope() {
-        use trouve_protocol::CodeReviewJobScope::{Full, Incremental};
+    fn manual_review_commands_accept_the_legacy_full_alias() {
+        assert!(contains_manual_review_command("@trouve-ai review"));
+        assert!(contains_manual_review_command("@trouve-ai review full"));
+        assert!(contains_manual_review_command("@TROUVE-AI REVIEW FULL"));
+        assert!(!contains_manual_review_command("@trouve-ai review fuller"));
+        assert!(!contains_manual_review_command(
+            "@trouve-ai review full now"
+        ));
+        assert!(!contains_manual_review_command("please review"));
+        assert_eq!(manual_review_trigger_key(7), "manual:comment:7");
+    }
+
+    #[test]
+    fn legacy_carried_anchor_continuation_becomes_full_branch() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let legacy = enqueue_test_review_job(&store, "legacy-continuation");
         assert_eq!(
-            manual_review_command_scope("@trouve-ai review"),
-            Some(Incremental)
+            legacy.scope,
+            trouve_protocol::CodeReviewJobScope::Incremental
         );
+        let record = store.code_review_job(&legacy.id).unwrap().unwrap();
+
+        let continuation = carried_anchor_continuation_request(&record, &legacy);
+
         assert_eq!(
-            manual_review_command_scope("@trouve-ai review full"),
-            Some(Full)
+            continuation.scope,
+            trouve_protocol::CodeReviewJobScope::Full
         );
-        assert_eq!(
-            manual_review_command_scope("@TROUVE-AI REVIEW FULL"),
-            Some(Full)
-        );
-        assert_eq!(
-            manual_review_command_scope("@trouve-ai review fuller"),
-            None
-        );
-        assert_eq!(
-            manual_review_command_scope("@trouve-ai review full now"),
-            None
-        );
-        assert_eq!(manual_review_command_scope("please review"), None);
-        assert_eq!(
-            manual_review_trigger_key(7, Incremental),
-            "manual:comment:7"
-        );
-        assert_eq!(manual_review_trigger_key(7, Full), "manual:comment:7:full");
+        assert_eq!(continuation.review_base_sha, legacy.base_ref);
+        assert_eq!(continuation.retry_of.as_deref(), Some(legacy.id.as_str()));
     }
 
     #[test]
@@ -21451,7 +20182,6 @@ rename to src/new.rs
             "",
             None,
             &[],
-            0,
             ReviewPromptBudgets::default(),
         )
         .unwrap();
@@ -21504,7 +20234,6 @@ rename to src/new.rs
             "",
             None,
             &[],
-            0,
             ReviewPromptBudgets::default(),
         )
         .unwrap();
@@ -21522,7 +20251,6 @@ rename to src/new.rs
             "",
             None,
             &[],
-            0,
             ReviewPromptBudgets::default(),
         )
         .unwrap();
@@ -21554,7 +20282,6 @@ rename to src/new.rs
             "",
             None,
             &[],
-            0,
             ReviewPromptBudgets::default(),
         )
         .unwrap();
@@ -21573,7 +20300,6 @@ rename to src/new.rs
             "",
             None,
             &[],
-            0,
             ReviewPromptBudgets::default(),
         )
         .unwrap();
@@ -21652,7 +20378,6 @@ rename to src/new.rs
             "",
             Some(&analysis),
             &[],
-            0,
             ReviewPromptBudgets::default(),
         )
         .unwrap();
@@ -21672,7 +20397,6 @@ rename to src/new.rs
             "",
             None,
             &[],
-            0,
             ReviewPromptBudgets::default(),
         )
         .unwrap();
@@ -21720,11 +20444,11 @@ rename to src/new.rs
     fn check_actions_follow_server_final_editor_retry_eligibility() {
         let retryable = review_check_actions(true);
         assert_eq!(retryable[0]["identifier"], "retry_final_editor");
-        assert_eq!(retryable[1]["identifier"], "full_review");
+        assert_eq!(retryable.as_array().unwrap().len(), 1);
 
         let whole_review = review_check_actions(false);
         assert_eq!(whole_review[0]["identifier"], "retry");
-        assert_eq!(whole_review[1]["identifier"], "full_review");
+        assert_eq!(whole_review.as_array().unwrap().len(), 1);
     }
 
     #[test]
@@ -27370,7 +26094,6 @@ rename to src/new.rs
         for description in [
             RETRY_CHECK_ACTION_DESCRIPTION,
             RETRY_FINAL_EDITOR_CHECK_ACTION_DESCRIPTION,
-            FULL_REVIEW_CHECK_ACTION_DESCRIPTION,
         ] {
             assert!(description.chars().count() <= CHECK_ACTION_DESCRIPTION_MAX_CHARS);
         }
@@ -27895,17 +26618,6 @@ rename to src/new.rs
     }
 
     #[test]
-    fn full_round_scheduling_confirms_coverage_debt_only() {
-        // Clean ledger but no full-coverage round at this head yet: confirm.
-        assert!(thread_reconciliation_schedules_full_round(0, true));
-        // Open blocking findings: a fix or a maintainer dismissal moves
-        // them; no round runs just to re-litigate the ledger.
-        assert!(!thread_reconciliation_schedules_full_round(2, false));
-        // Clean ledger already confirmed by a full-coverage round: done.
-        assert!(!thread_reconciliation_schedules_full_round(0, false));
-    }
-
-    #[test]
     fn coordinator_adjudication_repair_is_narrow_and_requires_substantive_categories() {
         assert!(substantive_coordinator_rejection_reason(
             "false_positive: the named path is unreachable"
@@ -28201,7 +26913,7 @@ rename to src/new.rs
             diff: format!("+// {attack}\n"),
         };
         let reviewer = &record.reviewers[0];
-        let reviewer = reviewer_prompt(&record, reviewer, &batch, 0, 1, &[], 0);
+        let reviewer = reviewer_prompt(&record, reviewer, &batch, 0, 1, &[]);
         let router = semantic_routing_prompt(
             &record.job,
             &record.pull_body,
@@ -28229,7 +26941,6 @@ rename to src/new.rs
                 diff: format!("+// {attack}\n"),
                 generated_header: None,
             }],
-            0,
             ReviewPromptBudgets::default(),
         )
         .unwrap();
@@ -28571,7 +27282,7 @@ rename to src/new.rs
             paths: vec!["src/lib.rs".into()],
             diff: "+fn changed() {}\n".into(),
         };
-        let reviewer_prompt = reviewer_prompt(&record, reviewer, &batch, 0, 1, &[], 0);
+        let reviewer_prompt = reviewer_prompt(&record, reviewer, &batch, 0, 1, &[]);
         let coordinator_prompt = validation_prompt(
             &record,
             &[],
@@ -28583,7 +27294,6 @@ rename to src/new.rs
             "",
             None,
             &[],
-            0,
             ReviewPromptBudgets::default(),
         )
         .unwrap();
@@ -28807,19 +27517,6 @@ rename to src/new.rs
         assert!(should_terminate_duplicate_review_job("automatic", true));
         assert!(!should_terminate_duplicate_review_job("manual", true));
         assert!(!should_terminate_duplicate_review_job("retry", true));
-    }
-
-    #[test]
-    fn same_revision_manual_review_uses_the_pull_request_base() {
-        assert_eq!(incremental_review_base_sha("base", "head-2", ""), "base");
-        assert_eq!(
-            incremental_review_base_sha("base", "head-2", "head-1"),
-            "head-1"
-        );
-        assert_eq!(
-            incremental_review_base_sha("base", "head-2", "head-2"),
-            "base"
-        );
     }
 
     #[test]
@@ -30144,24 +28841,16 @@ rename to src/new.rs
         );
         assert_eq!(selected_reviewer_count(&decisions, reviewers.len()), 3);
         assert_eq!(
-            no_candidate_review_summary(3, 1, 0),
+            no_candidate_review_summary(3, 1),
             "3 reviewer(s) examined 1 changed file(s); no actionable issues were confirmed."
         );
         assert_eq!(
-            no_candidate_review_summary(0, 0, 2),
-            "All relevant hunks were reused from the prior review; no persona review was run."
+            no_candidate_review_summary(0, 0),
+            "No reviewer persona was selected for 0 changed file(s); no persona review was run."
         );
         assert_eq!(
-            no_candidate_review_summary(0, 1, 0),
+            no_candidate_review_summary(0, 1),
             "No reviewer persona was selected for 1 changed file(s); no persona review was run."
-        );
-        assert_eq!(
-            no_candidate_review_summary(0, 1, 2),
-            "No reviewer persona was selected for 1 changed file(s); no persona review was run."
-        );
-        assert_eq!(
-            no_candidate_review_summary(3, 1, 2),
-            "3 reviewer(s) examined 1 changed file(s) after reusing 2 unchanged hunk(s) from the prior review; no actionable issues were confirmed."
         );
     }
 
@@ -30474,7 +29163,7 @@ rename to src/new.rs
             paths: vec!["crates/core/src/store.rs".into()],
             diff: "+let covered = review_base_sha == base_ref;\n".into(),
         };
-        let prompt = reviewer_prompt(&record, &reviewer, &batch, 0, 1, &[], 0);
+        let prompt = reviewer_prompt(&record, &reviewer, &batch, 0, 1, &[]);
         assert!(prompt.contains("Cross-lifecycle assumption check"));
         assert!(prompt.contains("locate every writer of that state"));
         assert!(prompt.contains("correct under re-execution"));
@@ -30490,7 +29179,6 @@ rename to src/new.rs
             "",
             None,
             &[],
-            0,
             ReviewPromptBudgets::default(),
         )
         .unwrap();

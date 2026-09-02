@@ -1898,13 +1898,17 @@ pub struct UpdateCodeReviewRepositoryRequest {
     pub reviewer_overrides: Option<Vec<ReviewerOverride>>,
 }
 
-/// Whether a job reviews only changes since the last successfully published
-/// head, or the entire pull-request branch against its GitHub base.
+/// Historical review scope. All newly created jobs use `Full`; `Incremental`
+/// remains readable for durable rows created before protocol 8.0.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CodeReviewJobScope {
+    /// Legacy-only scope used by jobs created before full-branch review became
+    /// mandatory.
     #[default]
     Incremental,
+    /// Complete pull-request branch from its merge base through the exact
+    /// reviewed head.
     Full,
 }
 
@@ -2363,25 +2367,13 @@ pub struct CodeReviewJob {
     pub pull_title: String,
     pub pull_url: String,
     pub head_sha: String,
-    /// Commit used as the left side of this review's diff. For incremental
-    /// jobs this is normally the last successfully published head.
+    /// Pull-request merge base used as the left side of this review's diff.
+    /// Legacy jobs may expose an older incremental watermark here.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub review_base_sha: String,
-    /// Immutable commit from the last successfully published review. This is
-    /// the incremental watermark even when history rewriting makes the
-    /// effective `review_base_sha` fall back to the pull request merge base.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub review_watermark_sha: String,
-    /// Whether this round's diff spanned the entire branch, recorded at the
-    /// moment the diff base was resolved. `review_base_sha` can be refined to
-    /// the pull-request merge base during execution, so comparing it against
-    /// `base_ref` misclassifies full first reviews whenever the base branch
-    /// advanced past the branch point; this flag is authoritative. None on
-    /// rounds that predate it (clients fall back to the sha comparison).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub covered_full_branch: Option<bool>,
     pub base_ref: String,
     pub head_ref: String,
+    /// Historical scope retained for diagnostics. New jobs are always full.
     #[serde(default)]
     pub scope: CodeReviewJobScope,
     /// `automatic`, `manual`, or `retry`.
@@ -2521,16 +2513,12 @@ pub struct CodeReviewJobList {
     pub jobs: Vec<CodeReviewJob>,
 }
 
-/// Manual review request. Full scope always compares the current head with
-/// the pull request's GitHub base; incremental scope uses the saved watermark
-/// when it remains valid.
+/// Manual full-branch review request.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct RequestCodeReviewRequest {
     pub installation_id: u64,
     pub repository: String,
     pub pull_number: u64,
-    #[serde(default)]
-    pub scope: CodeReviewJobScope,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]

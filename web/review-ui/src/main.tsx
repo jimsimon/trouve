@@ -26,7 +26,6 @@ import {
   loginStatus,
   openJobEvents,
   openServerEvents,
-  requestReview,
   resetPersona,
   retryFinalEditor,
   retryJob,
@@ -645,31 +644,11 @@ function EmptyState({ title, body }: { title: string; body: string }) {
   );
 }
 
-type ReviewCoverageFields =
-  | "status"
-  | "open_issue_count"
-  | "scope"
-  | "review_base_sha"
-  | "base_ref"
-  | "covered_full_branch";
-
-function reviewAwaitingFullCoverage(job: Pick<ReviewJob, ReviewCoverageFields>): boolean {
-  return (
-    job.status === "succeeded" &&
-    job.open_issue_count === 0 &&
-    job.scope !== "full" &&
-    // The server records whether the round's diff spanned the whole branch;
-    // legacy rounds without the flag fall back to the sha comparison.
-    !(job.covered_full_branch ?? (job.review_base_sha ?? "") === job.base_ref)
-  );
-}
-
 function reviewJobAttentionState(
-  job: Pick<ReviewJob, ReviewCoverageFields>,
-): "open" | "awaiting-full" | "unknown" | null {
+  job: Pick<ReviewJob, "status" | "open_issue_count">,
+): "open" | "unknown" | null {
   if (job.status !== "succeeded") return null;
   if (job.open_issue_count != null && job.open_issue_count > 0) return "open";
-  if (reviewAwaitingFullCoverage(job)) return "awaiting-full";
   if (job.open_issue_count == null) return "unknown";
   return null;
 }
@@ -682,8 +661,6 @@ function JobRow({ job, now }: { job: ReviewJob; now: number }) {
     <button class="job-row" type="button" onClick={() => navigate("jobs", job.id)}>
       {attentionState === "open" ? (
         <span class="status warning">needs attention</span>
-      ) : attentionState === "awaiting-full" ? (
-        <span class="status warning">full review pending</span>
       ) : attentionState === "unknown" ? (
         <span class="status warning">status unknown</span>
       ) : (
@@ -1164,16 +1141,14 @@ function JobDetailPane({
     });
   }, [selectedTaskId]);
 
-  const act = async (action: "cancel" | "retry" | "full"): Promise<void> => {
+  const act = async (action: "cancel" | "retry"): Promise<void> => {
     if (!detail) return;
     setBusy(action);
     try {
       const replacement =
         action === "cancel"
           ? await cancelJob(detail.job.id)
-          : action === "retry"
-            ? await retryJob(detail.job.id)
-            : await requestReview(detail.job, "full");
+          : await retryJob(detail.job.id);
       onChanged();
       if (action !== "cancel") {
         if (replacement.id === detail.job.id) {
@@ -1466,8 +1441,6 @@ function JobDetailPane({
         <div>
           {attentionState === "open" ? (
             <span class="status warning">needs attention</span>
-          ) : attentionState === "awaiting-full" ? (
-            <span class="status warning">full review pending</span>
           ) : attentionState === "unknown" ? (
             <span class="status warning">status unknown</span>
           ) : (
@@ -1581,9 +1554,6 @@ function JobDetailPane({
             </button>
           </>
         )}
-        <button class="ghost" type="button" disabled={Boolean(busy)} onClick={() => void act("full")}>
-          {busy === "full" ? "Requesting…" : "Full branch review"}
-        </button>
       </div>
       {error && <div class="banner error">{error}</div>}
       {job.error && <div class="banner error">{job.error}</div>}
@@ -1599,7 +1569,7 @@ function JobDetailPane({
             {openIssueCount} blocking issue{openIssueCount === 1 ? " remains" : "s remain"} open across this pull request
           </strong>
           <p>
-            This round found {job.issue_count} new issue{job.issue_count === 1 ? "" : "s"}. A clean incremental result does not resolve findings from earlier rounds unless the final editor verifies their fixes.
+            This round found {job.issue_count} new issue{job.issue_count === 1 ? "" : "s"}. A clean full-branch result does not resolve findings from earlier rounds unless the final editor verifies their fixes.
           </p>
         </div>
       )}
@@ -1608,17 +1578,6 @@ function JobDetailPane({
           <strong>PR-wide open issue status is unknown</strong>
           <p>
             This legacy review predates PR-wide finding snapshots. It cannot establish that older findings are resolved, even when this round found no new issues.
-          </p>
-        </div>
-      )}
-      {reviewAwaitingFullCoverage(job) && (
-        <div class="banner warning stacked">
-          <strong>Full-branch confirmation pending</strong>
-          <p>
-            No blocking issues remain open, but this round reviewed only the changes since the
-            last review. The check reports success once a clean review covers the whole branch
-            as it now stands — resolve all review threads or request a full branch review to
-            run that round.
           </p>
         </div>
       )}

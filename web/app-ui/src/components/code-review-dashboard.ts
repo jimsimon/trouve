@@ -13,7 +13,6 @@ import {
   CODE_REVIEW_STATUS_FILTERS,
   codeReviewSettingsDraft,
   codeReviewSettingsRequest,
-  codeReviewAwaitingFullCoverage,
   codeReviewNeedsAttention,
   codeReviewStatusClass,
   codeReviewStatusLabel,
@@ -652,18 +651,12 @@ export class TrouveCodeReviewDashboard extends LitElement {
     const pending = this.#pendingAction?.jobId === job.id ? this.#pendingAction : undefined;
     const busy = this.#busyJobId === job.id;
     const needsAttention = codeReviewNeedsAttention(job);
-    const awaitingFullCoverage = codeReviewAwaitingFullCoverage(job);
     const outcomeLabel = !needsAttention
       ? codeReviewStatusLabel(job.status)
-      : awaitingFullCoverage
-        ? "Full review pending"
-        : "Needs attention";
-    // Pending confirmation is a waiting state, not a failure state.
+      : "Needs attention";
     const outcomeClass = !needsAttention
       ? codeReviewStatusClass(job.status)
-      : awaitingFullCoverage
-        ? "queued"
-        : "failed";
+      : "failed";
 
     return html`
       <article class="job-card" aria-label=${`${job.repository} pull request ${job.pull_number}, ${outcomeLabel}`}>

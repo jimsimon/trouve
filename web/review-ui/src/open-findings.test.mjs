@@ -9,7 +9,7 @@ const types = readFileSync(new URL("./types.ts", import.meta.url), "utf8");
 test("review jobs distinguish new findings from PR-wide open findings", () => {
   assert.match(types, /open_issue_count\?: number \| null/u);
   assert.match(source, /open across this pull request/u);
-  assert.match(source, /A clean incremental result does not resolve findings from earlier rounds/u);
+  assert.match(source, /A clean full-branch result does not resolve findings from earlier rounds/u);
   assert.match(source, /open across pull request/u);
   assert.match(source, /Open status unknown/u);
   assert.match(source, /legacy review predates PR-wide finding snapshots/u);
@@ -30,7 +30,7 @@ test("unknown PR-wide status is visually distinct from review failure", () => {
 test("attention replaces succeeded and job rows reserve its full width", () => {
   assert.match(
     source,
-    /attentionState === "open" \? \(\s*<span class="status warning">needs attention<\/span>\s*\) : attentionState === "awaiting-full"/u,
+    /attentionState === "open" \? \(\s*<span class="status warning">needs attention<\/span>\s*\) : attentionState === "unknown"/u,
   );
   assert.doesNotMatch(
     source,

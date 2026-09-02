@@ -2188,15 +2188,6 @@ export interface components {
             coordinator_elapsed_ms?: number;
             /** @description Thinking level snapshotted for the final coordinator/editor. */
             coordinator_thinking_level?: string | null;
-            /**
-             * @description Whether this round's diff spanned the entire branch, recorded at the
-             *     moment the diff base was resolved. `review_base_sha` can be refined to
-             *     the pull-request merge base during execution, so comparing it against
-             *     `base_ref` misclassifies full first reviews whenever the base branch
-             *     advanced past the branch point; this flag is authoritative. None on
-             *     rounds that predate it (clients fall back to the sha comparison).
-             */
-            covered_full_branch?: boolean | null;
             /** Format: date-time */
             created_at: string;
             error?: string;
@@ -2238,17 +2229,11 @@ export interface components {
             retried_by?: string | null;
             retry_of?: string | null;
             /**
-             * @description Commit used as the left side of this review's diff. For incremental
-             *     jobs this is normally the last successfully published head.
+             * @description Pull-request merge base used as the left side of this review's diff.
+             *     Legacy jobs may expose an older incremental watermark here.
              */
             review_base_sha?: string;
             review_url?: string;
-            /**
-             * @description Immutable commit from the last successfully published review. This is
-             *     the incremental watermark even when history rewriting makes the
-             *     effective `review_base_sha` fall back to the pull request merge base.
-             */
-            review_watermark_sha?: string;
             /** Format: int64 */
             reviewer_elapsed_ms?: number;
             /**
@@ -2268,6 +2253,7 @@ export interface components {
             routing_mode?: components["schemas"]["CodeReviewRoutingMode"];
             /** Format: int64 */
             running_elapsed_ms?: number;
+            /** @description Historical scope retained for diagnostics. New jobs are always full. */
             scope?: components["schemas"]["CodeReviewJobScope"];
             /**
              * @description Snapshotted Additive semantic-routing choice. Automatic jobs route
@@ -2310,8 +2296,8 @@ export interface components {
             jobs: components["schemas"]["CodeReviewJob"][];
         };
         /**
-         * @description Whether a job reviews only changes since the last successfully published
-         *     head, or the entire pull-request branch against its GitHub base.
+         * @description Historical review scope. All newly created jobs use `Full`; `Incremental`
+         *     remains readable for durable rows created before protocol 8.0.
          * @enum {string}
          */
         CodeReviewJobScope: "incremental" | "full";
@@ -4226,18 +4212,13 @@ export interface components {
         ReorderQueueRequest: {
             ids: string[];
         };
-        /**
-         * @description Manual review request. Full scope always compares the current head with
-         *     the pull request's GitHub base; incremental scope uses the saved watermark
-         *     when it remains valid.
-         */
+        /** @description Manual full-branch review request. */
         RequestCodeReviewRequest: {
             /** Format: int64 */
             installation_id: number;
             /** Format: int64 */
             pull_number: number;
             repository: string;
-            scope?: components["schemas"]["CodeReviewJobScope"];
         };
         ResolveApprovalRequest: {
             call_id: components["schemas"]["String"];

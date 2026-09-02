@@ -3756,7 +3756,6 @@ fn row_to_code_review_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<CodeReviewJ
         job_elapsed_ms(&status, created_at, started_at, completed_at);
     let base_ref: String = r.get(7)?;
     let review_base_sha: String = r.get(22)?;
-    let review_watermark_sha: String = r.get(50)?;
     let effective_review_base_sha = if review_base_sha.is_empty() {
         base_ref.clone()
     } else {
@@ -3772,12 +3771,6 @@ fn row_to_code_review_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<CodeReviewJ
             pull_url: r.get(5)?,
             head_sha: r.get(6)?,
             review_base_sha: effective_review_base_sha.clone(),
-            review_watermark_sha: if review_watermark_sha.is_empty() {
-                effective_review_base_sha
-            } else {
-                review_watermark_sha
-            },
-            covered_full_branch: r.get(62)?,
             base_ref,
             head_ref: r.get(8)?,
             scope: code_review_scope_from(&r.get::<_, String>(23)?),
@@ -9702,7 +9695,7 @@ impl Store {
                      (SELECT COALESCE(MAX(publication_generation), 0) + 1
                       FROM code_review_jobs
                       WHERE repository = ?4 AND pull_number = ?5 AND head_sha = ?8),
-                     ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?17, ?28, ?29, ?30)",
+                     ?21, ?22, ?23, ?24, ?25, ?26, ?27, '', ?28, ?29, ?30)",
             params![
                 id,
                 new_job.dedupe_key,
@@ -9766,140 +9759,6 @@ impl Store {
     ) -> Result<Option<trouve_protocol::CodeReviewJob>> {
         let conn = self.conn.lock().unwrap();
         Self::enqueue_code_review_job_conn(&conn, new_job)
-    }
-
-    pub(crate) fn enqueue_code_review_thread_recheck(
-        &self,
-        new_job: &NewCodeReviewJob,
-        state_key: &str,
-        finding_ids: &[&str],
-        allow_new_state: bool,
-        max_attempts: u64,
-    ) -> Result<Option<trouve_protocol::CodeReviewJob>> {
-        let conn = self.conn.lock().unwrap();
-        let tx = write_transaction(&conn)?;
-        let competing_job_exists: bool = tx.query_row(
-            "SELECT EXISTS(
-               SELECT 1 FROM code_review_jobs
-               WHERE repository = ?1 AND pull_number = ?2 AND head_sha = ?3
-                 AND status IN ('queued', 'running')
-                 AND trigger != 'thread-recheck'
-             )",
-            params![
-                new_job.repository,
-                new_job.pull_number as i64,
-                new_job.head_sha
-            ],
-            |row| row.get(0),
-        )?;
-        if competing_job_exists {
-            tx.commit()?;
-            return Ok(None);
-        }
-        let current: Option<(i64, String, bool)> = tx
-            .query_row(
-                "SELECT r.attempt_count, j.status, j.review_published
-                 FROM code_review_thread_rechecks r
-                 JOIN code_review_jobs j ON j.id = r.last_job_id
-                 WHERE r.repository = ?1 AND r.pull_number = ?2
-                   AND r.head_sha = ?3 AND r.state_key = ?4",
-                params![
-                    new_job.repository,
-                    new_job.pull_number as i64,
-                    new_job.head_sha,
-                    state_key
-                ],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .optional()?;
-        let used_attempts: i64 = tx.query_row(
-            "SELECT COALESCE(SUM(attempt_count), 0)
-             FROM code_review_thread_rechecks
-             WHERE repository = ?1 AND pull_number = ?2 AND head_sha = ?3",
-            params![
-                new_job.repository,
-                new_job.pull_number as i64,
-                new_job.head_sha
-            ],
-            |row| row.get(0),
-        )?;
-        let terminal_retry = current.as_ref().is_some_and(|(_, status, published)| {
-            !*published && matches!(status.as_str(), "failed" | "cancelled" | "stale")
-        });
-        let already_consumed = current.as_ref().is_some_and(|(_, status, published)| {
-            *published || matches!(status.as_str(), "queued" | "running" | "succeeded")
-        });
-        if current.is_none() && !allow_new_state {
-            for finding_id in finding_ids {
-                tx.execute(
-                    "UPDATE code_review_findings
-                     SET github_thread_recheck_pending = 0 WHERE id = ?1",
-                    params![finding_id],
-                )?;
-            }
-            tx.commit()?;
-            return Ok(None);
-        }
-        if already_consumed
-            || used_attempts >= max_attempts as i64
-            || (current.is_some() && !terminal_retry)
-        {
-            for finding_id in finding_ids {
-                tx.execute(
-                    "UPDATE code_review_findings
-                     SET github_thread_recheck_pending = 0 WHERE id = ?1",
-                    params![finding_id],
-                )?;
-            }
-            tx.commit()?;
-            return Ok(None);
-        }
-
-        let attempt = current.as_ref().map_or(1, |(count, _, _)| count + 1);
-        let mut request = new_job.clone();
-        request.dedupe_key = format!("{}:{state_key}:attempt:{attempt}", request.dedupe_key);
-        let inserted = Self::enqueue_code_review_job_conn(&tx, &request)?;
-        let job = if let Some(job) = inserted.as_ref() {
-            job.clone()
-        } else {
-            tx.query_row(
-                &format!(
-                    "SELECT {CODE_REVIEW_JOB_COLUMNS} FROM code_review_jobs WHERE dedupe_key = ?1"
-                ),
-                params![request.dedupe_key],
-                row_to_code_review_job,
-            )?
-            .job
-        };
-        let now = chrono::Utc::now().to_rfc3339();
-        tx.execute(
-            "INSERT INTO code_review_thread_rechecks
-                    (repository, pull_number, head_sha, state_key, attempt_count,
-                     last_job_id, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
-             ON CONFLICT(repository, pull_number, head_sha, state_key) DO UPDATE SET
-               attempt_count = excluded.attempt_count,
-               last_job_id = excluded.last_job_id,
-               updated_at = excluded.updated_at",
-            params![
-                new_job.repository,
-                new_job.pull_number as i64,
-                new_job.head_sha,
-                state_key,
-                attempt,
-                job.id,
-                now
-            ],
-        )?;
-        for finding_id in finding_ids {
-            tx.execute(
-                "UPDATE code_review_findings
-                 SET github_thread_recheck_pending = 0 WHERE id = ?1",
-                params![finding_id],
-            )?;
-        }
-        tx.commit()?;
-        Ok(Some(job))
     }
 
     pub fn supersede_code_review_jobs(
@@ -10354,17 +10213,12 @@ impl Store {
         Ok(())
     }
 
-    pub fn set_code_review_job_review_base(
-        &self,
-        id: &str,
-        review_base_sha: &str,
-        covered_full_branch: bool,
-    ) -> Result<bool> {
+    pub fn set_code_review_job_review_base(&self, id: &str, review_base_sha: &str) -> Result<bool> {
         Ok(self.conn.lock().unwrap().execute(
             "UPDATE code_review_jobs
-             SET review_base_sha = ?2, review_covered_full_branch = ?3
+             SET review_base_sha = ?2
              WHERE id = ?1 AND status = 'running'",
-            params![id, review_base_sha, covered_full_branch],
+            params![id, review_base_sha],
         )? > 0)
     }
 
@@ -12798,7 +12652,6 @@ impl Store {
         // the finding outright. No model re-adjudicates the decision; the
         // symmetric gesture (unresolving the thread) restores it.
         let dismissed_by_resolution = status == "open" && is_resolved;
-        let recheck_pending = previous_resolved == Some(true) && !is_resolved;
         let changed = state_changed
             || reopened_closed_finding
             || dismissed_by_resolution
@@ -12809,8 +12662,7 @@ impl Store {
                 "UPDATE code_review_findings
                  SET github_thread_id = ?2, github_thread_resolved = ?3,
                      github_thread_generation = ?4,
-                     github_thread_recheck_pending =
-                       CASE WHEN ?5 THEN 1 ELSE github_thread_recheck_pending END,
+                     github_thread_recheck_pending = 0,
                      collapse_pending = CASE
                        WHEN ?5 AND status IN ('fixed', 'dismissed') THEN 0
                        ELSE collapse_pending
@@ -12857,7 +12709,7 @@ impl Store {
                     thread_id,
                     is_resolved,
                     generation,
-                    recheck_pending,
+                    reopened_closed_finding,
                     dismissed_by_resolution,
                     chrono::Utc::now().to_rfc3339()
                 ],
@@ -14822,7 +14674,7 @@ impl Store {
                      WHERE generation.repository = ?4
                        AND generation.pull_number = ?5
                        AND generation.head_sha = ?8),
-                    ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?16, ?27, ?28, ?29)",
+                    ?20, ?21, ?22, ?23, ?24, ?25, ?26, '', ?27, ?28, ?29)",
             params![
                 new_id,
                 new_job.dedupe_key,
@@ -15389,42 +15241,6 @@ impl Store {
                              OR (review_url = lifecycle_comment_url AND review_url != ?2))))",
             params![id, url],
         )? > 0)
-    }
-
-    /// Whether the newest published round for this pull request at exactly
-    /// this head covered the full branch: full scope, or the coverage flag
-    /// recorded when the diff base was resolved. Rounds that predate the
-    /// flag fall back to the review-base/base-ref comparison. Pinning to the
-    /// head keeps a full round from an older revision from settling the
-    /// current revision's coverage debt. None when no round has published
-    /// for this head.
-    pub fn latest_published_code_review_round_covered_full_branch(
-        &self,
-        repository: &str,
-        pull_number: u64,
-        head_sha: &str,
-    ) -> Result<Option<bool>> {
-        Ok(self
-            .conn
-            .lock()
-            .unwrap()
-            .query_row(
-                "SELECT review_scope, review_covered_full_branch, review_base_sha, base_ref
-                 FROM code_review_jobs
-                 WHERE repository = ?1 AND pull_number = ?2 AND head_sha = ?3
-                   AND review_published = 1
-                 ORDER BY publication_order DESC, created_at DESC, id DESC
-                 LIMIT 1",
-                params![repository, pull_number as i64, head_sha],
-                |row| {
-                    let scope: String = row.get(0)?;
-                    let covered: Option<bool> = row.get(1)?;
-                    let review_base_sha: String = row.get(2)?;
-                    let base_ref: String = row.get(3)?;
-                    Ok(scope == "full" || covered.unwrap_or(review_base_sha == base_ref))
-                },
-            )
-            .optional()?)
     }
 
     /// Count of open blocking findings across all published rounds of a pull
@@ -21784,17 +21600,14 @@ mod tests {
         assert!(store.code_review_job_exists(&new_job.dedupe_key).unwrap());
         let running = store.claim_code_review_job().unwrap().unwrap();
         assert_eq!(running.job.id, queued.id);
-        assert_eq!(running.job.review_watermark_sha, queued.review_base_sha);
         let effective_base = "3333333333333333333333333333333333333333";
         assert!(
             store
-                .set_code_review_job_review_base(&queued.id, effective_base, true)
+                .set_code_review_job_review_base(&queued.id, effective_base)
                 .unwrap()
         );
         let rebased = store.code_review_job(&queued.id).unwrap().unwrap().job;
         assert_eq!(rebased.review_base_sha, effective_base);
-        assert_eq!(rebased.review_watermark_sha, queued.review_base_sha);
-        assert_eq!(rebased.covered_full_branch, Some(true));
         assert!(
             !store
                 .prepare_code_review_batch_snapshot(&queued.id, "digest-a")
@@ -23293,7 +23106,7 @@ mod tests {
             .find(|state| state.finding.id == dismissed.id)
             .unwrap();
         assert_eq!(state.finding.status, "open");
-        assert!(state.recheck_pending);
+        assert!(!state.recheck_pending);
 
         // Resolving both threads clears the blocking ledger and arms the
         // blocking-review cleanup on the newest published round.
@@ -23402,59 +23215,6 @@ mod tests {
             .refresh_code_review_pull_projection_counts("acme/widgets", 42)
             .unwrap();
         assert_eq!(refreshed.as_deref(), Some(job.id.as_str()));
-    }
-
-    #[test]
-    fn coverage_debt_is_pinned_to_the_reconciled_head() {
-        let store = Store::open_in_memory().unwrap();
-        let mut request = backoff_test_job_request();
-        request.scope = trouve_protocol::CodeReviewJobScope::Full;
-        let job = store.enqueue_code_review_job(&request).unwrap().unwrap();
-        assert_eq!(
-            store.claim_code_review_job().unwrap().unwrap().job.id,
-            job.id
-        );
-        store
-            .save_code_review_result(&job.id, "clean", "", 0, &[], &[])
-            .unwrap();
-        assert!(store.claim_code_review_publication(&job.id).unwrap());
-        store
-            .record_code_review_publication(
-                &job.id,
-                &job.repository,
-                job.pull_number,
-                &job.base_ref,
-                &job.head_sha,
-                "https://example/review",
-                false,
-                &[],
-            )
-            .unwrap();
-        store
-            .finish_code_review_job(&job.id, "succeeded", "", "")
-            .unwrap();
-        // The full round settles coverage only for the head it reviewed; a
-        // newer head has no published round and therefore no verdict.
-        assert_eq!(
-            store
-                .latest_published_code_review_round_covered_full_branch(
-                    "acme/widgets",
-                    42,
-                    &job.head_sha,
-                )
-                .unwrap(),
-            Some(true)
-        );
-        assert_eq!(
-            store
-                .latest_published_code_review_round_covered_full_branch(
-                    "acme/widgets",
-                    42,
-                    "9999999999999999999999999999999999999999",
-                )
-                .unwrap(),
-            None
-        );
     }
 
     #[test]
@@ -24453,7 +24213,7 @@ mod tests {
         assert_eq!(reopened.len(), 1);
         assert_eq!(reopened[0].finding.status, "open");
         assert_eq!(reopened[0].is_resolved, Some(false));
-        assert!(reopened[0].recheck_pending);
+        assert!(!reopened[0].recheck_pending);
         assert!(
             store
                 .pending_code_review_thread_collapses(
@@ -25175,7 +24935,7 @@ mod tests {
     }
 
     #[test]
-    fn ineligible_thread_recheck_still_consumes_reconciled_markers() {
+    fn recording_thread_state_clears_legacy_recheck_markers() {
         let store = Store::open_in_memory().unwrap();
         let job = enqueue_backoff_test_job(&store);
         assert_eq!(
@@ -25230,26 +24990,20 @@ mod tests {
         store
             .finish_code_review_job(&job.id, "succeeded", "", "")
             .unwrap();
-        let mut request = backoff_test_job_request();
-        request.dedupe_key = "acme/widgets#42:ineligible-thread-recheck".into();
-        request.trigger = "thread-recheck".into();
-
-        assert!(
-            store
-                .enqueue_code_review_thread_recheck(
-                    &request,
-                    "empty-state",
-                    &[&finding.id],
-                    false,
-                    3,
-                )
-                .unwrap()
-                .is_none()
-        );
-        let states = store
-            .reconcilable_code_review_findings(&job.repository, job.pull_number)
+        store
+            .record_code_review_thread_state(&finding.id, "thread-1", false)
             .unwrap();
-        assert!(!states[0].recheck_pending);
+        let pending: bool = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT github_thread_recheck_pending FROM code_review_findings WHERE id = ?1",
+                params![finding.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!pending);
     }
 
     #[test]
@@ -27621,7 +27375,17 @@ mod tests {
 
         let migrated = store.code_review_job(&job.id).unwrap().unwrap().job;
         assert_eq!(migrated.review_base_sha, fallback_base);
-        assert_eq!(migrated.review_watermark_sha, published_head);
+        let migrated_watermark: String = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT review_watermark_sha FROM code_review_jobs WHERE id = ?1",
+                params![job.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(migrated_watermark, published_head);
     }
 
     #[test]
