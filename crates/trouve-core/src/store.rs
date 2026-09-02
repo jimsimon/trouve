@@ -4948,6 +4948,12 @@ enum StoreMutation {
         attachments: Vec<(trouve_protocol::Attachment, String)>,
         staging_cleanup_claim: Option<ArtifactCleanupClaim>,
     },
+    AppendAttachments {
+        thread_id: String,
+        attachments: Vec<(trouve_protocol::Attachment, String)>,
+        verification_intents: Vec<SessionPrVerificationIntent>,
+        staging_cleanup_claim: Option<ArtifactCleanupClaim>,
+    },
 }
 
 /// One caller's event batch, in flight to the writer thread.
@@ -5517,6 +5523,55 @@ enum StoreMutationOutcome {
     CommitWithoutEvent,
 }
 
+fn upsert_session_pr_verification_intents(
+    conn: &Connection,
+    intents: &[SessionPrVerificationIntent],
+) -> Result<()> {
+    for intent in intents {
+        anyhow::ensure!(
+            !intent.branch.is_empty() && !intent.head_sha.is_empty(),
+            "pull request verification intent requires immutable branch and head evidence"
+        );
+        conn.execute(
+            "INSERT INTO session_pr_verification_intents
+               (session_id, host, owner, repository, pull_number, branch,
+                head_sha, attempts, last_failure_class, consecutive_failures,
+                next_attempt_at, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, '', 0, NULL, ?8)
+             ON CONFLICT(session_id, host, owner, repository, pull_number)
+             DO UPDATE SET
+               attempts = CASE
+                 WHEN branch = excluded.branch AND head_sha = excluded.head_sha
+                   THEN attempts ELSE 0 END,
+               last_failure_class = CASE
+                 WHEN branch = excluded.branch AND head_sha = excluded.head_sha
+                   THEN last_failure_class ELSE '' END,
+               consecutive_failures = CASE
+                 WHEN branch = excluded.branch AND head_sha = excluded.head_sha
+                   THEN consecutive_failures ELSE 0 END,
+               next_attempt_at = CASE
+                 WHEN branch = excluded.branch AND head_sha = excluded.head_sha
+                   THEN next_attempt_at ELSE NULL END,
+               created_at = CASE
+                 WHEN branch = excluded.branch AND head_sha = excluded.head_sha
+                   THEN created_at ELSE excluded.created_at END,
+               branch = excluded.branch,
+               head_sha = excluded.head_sha",
+            params![
+                intent.session_id,
+                intent.host,
+                intent.owner,
+                intent.repository,
+                intent.number as i64,
+                intent.branch,
+                intent.head_sha,
+                intent.created_at,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
 fn apply_store_mutation(
     conn: &Connection,
     mutation: &StoreMutation,
@@ -5656,48 +5711,7 @@ fn apply_store_mutation(
             delete_session_rows(conn, id)?;
         }
         StoreMutation::UpsertSessionPrVerificationIntents { intents } => {
-            for intent in intents {
-                anyhow::ensure!(
-                    !intent.branch.is_empty() && !intent.head_sha.is_empty(),
-                    "pull request verification intent requires immutable branch and head evidence"
-                );
-                conn.execute(
-                    "INSERT INTO session_pr_verification_intents
-                       (session_id, host, owner, repository, pull_number, branch,
-                        head_sha, attempts, last_failure_class, consecutive_failures,
-                        next_attempt_at, created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, '', 0, NULL, ?8)
-                     ON CONFLICT(session_id, host, owner, repository, pull_number)
-                     DO UPDATE SET
-                       attempts = CASE
-                         WHEN branch = excluded.branch AND head_sha = excluded.head_sha
-                           THEN attempts ELSE 0 END,
-                       last_failure_class = CASE
-                         WHEN branch = excluded.branch AND head_sha = excluded.head_sha
-                           THEN last_failure_class ELSE '' END,
-                       consecutive_failures = CASE
-                         WHEN branch = excluded.branch AND head_sha = excluded.head_sha
-                           THEN consecutive_failures ELSE 0 END,
-                       next_attempt_at = CASE
-                         WHEN branch = excluded.branch AND head_sha = excluded.head_sha
-                           THEN next_attempt_at ELSE NULL END,
-                       created_at = CASE
-                         WHEN branch = excluded.branch AND head_sha = excluded.head_sha
-                           THEN created_at ELSE excluded.created_at END,
-                       branch = excluded.branch,
-                       head_sha = excluded.head_sha",
-                    params![
-                        intent.session_id,
-                        intent.host,
-                        intent.owner,
-                        intent.repository,
-                        intent.number as i64,
-                        intent.branch,
-                        intent.head_sha,
-                        intent.created_at,
-                    ],
-                )?;
-            }
+            upsert_session_pr_verification_intents(conn, intents)?;
         }
         StoreMutation::CompleteSessionPrVerificationIntent { intent } => {
             let deleted = conn.execute(
@@ -5836,6 +5850,41 @@ fn apply_store_mutation(
                  )",
                 params![thread_id, payload],
             )?;
+            if let Some(claim) = staging_cleanup_claim {
+                let deleted = conn.execute(
+                    "DELETE FROM artifact_cleanup_jobs WHERE id = ?1 AND claim_token = ?2",
+                    params![claim.id, claim.token],
+                )?;
+                anyhow::ensure!(
+                    deleted == 1,
+                    "attachment staging claim {} is no longer owned",
+                    claim.id
+                );
+            }
+        }
+        StoreMutation::AppendAttachments {
+            thread_id,
+            attachments,
+            verification_intents,
+            staging_cleanup_claim,
+        } => {
+            for (attachment, path) in attachments {
+                conn.execute(
+                    "INSERT INTO attachments
+                       (id, thread_id, name, mime, size_bytes, path, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        attachment.id,
+                        thread_id,
+                        attachment.name,
+                        attachment.mime,
+                        attachment.size_bytes as i64,
+                        path,
+                        timestamp.to_rfc3339(),
+                    ],
+                )?;
+            }
+            upsert_session_pr_verification_intents(conn, verification_intents)?;
             if let Some(claim) = staging_cleanup_claim {
                 let deleted = conn.execute(
                     "DELETE FROM artifact_cleanup_jobs WHERE id = ?1 AND claim_token = ?2",
@@ -16405,6 +16454,31 @@ impl Store {
         Ok(())
     }
 
+    pub(crate) fn append_events_with_attachments(
+        &self,
+        scope: Scope,
+        events: Vec<Event>,
+        thread_id: &str,
+        attachments: Vec<(trouve_protocol::Attachment, String)>,
+        verification_intents: Vec<SessionPrVerificationIntent>,
+        staging_cleanup_claim: Option<ArtifactCleanupClaim>,
+    ) -> Result<()> {
+        let pending = serialize_lifecycle_events(
+            events
+                .into_iter()
+                .map(|event| (scope.clone(), event))
+                .collect(),
+            StoreMutation::AppendAttachments {
+                thread_id: thread_id.to_string(),
+                attachments,
+                verification_intents,
+                staging_cleanup_claim,
+            },
+        )?;
+        self.append_pending_events(pending)?;
+        Ok(())
+    }
+
     pub fn checkpoint_at(&self, session_id: &str, seq: i64) -> Result<Option<CheckpointRow>> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
@@ -19369,7 +19443,7 @@ mod tests {
                     result: serde_json::json!({"number": 42}),
                     execution_duration_ms: Some(1),
                 }],
-                vec![invalid_evidence],
+                vec![invalid_evidence.clone()],
             )
             .await
             .unwrap_err();
@@ -19377,6 +19451,48 @@ mod tests {
             error
                 .to_string()
                 .contains("immutable branch and head evidence")
+        );
+
+        let before = store
+            .events_after(&Scope::Thread(thread.id.clone()), 0)
+            .unwrap()
+            .len();
+        let attachment = trouve_protocol::Attachment {
+            id: "at_atomic_artifact".into(),
+            name: "tool-image-1.png".into(),
+            mime: "image/png".into(),
+            size_bytes: 5,
+        };
+        store
+            .append_events_with_attachments(
+                Scope::Thread(thread.id.clone()),
+                vec![
+                    Event::ToolCompleted {
+                        call_id: "call-atomic-artifact".into(),
+                        status: ToolStatus::Ok,
+                        result: serde_json::json!({}),
+                        execution_duration_ms: Some(1),
+                    },
+                    Event::AssistantArtifacts {
+                        turn: 1,
+                        call_id: Some("call-atomic-artifact".into()),
+                        attachments: vec![attachment.clone()],
+                    },
+                ],
+                &thread.id,
+                vec![(attachment.clone(), "/tmp/at_atomic_artifact.png".into())],
+                vec![invalid_evidence],
+                None,
+            )
+            .unwrap_err();
+        assert!(store.attachment(&attachment.id).unwrap().is_none());
+        assert_eq!(
+            store
+                .events_after(&Scope::Thread(thread.id.clone()), 0)
+                .unwrap()
+                .len(),
+            before,
+            "artifact rows, verification intents, and events must share one transaction"
         );
 
         store

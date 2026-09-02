@@ -5099,7 +5099,7 @@
       },
       "Attachment": {
         "type": "object",
-        "description": "A stored prompt attachment. Bytes are served at\n`GET /v1/attachments/{id}`.",
+        "description": "A stored transcript attachment. Bytes are served at\n`GET /v1/attachments/{id}`.",
         "required": [
           "id",
           "name",
@@ -8068,6 +8068,44 @@
                 "type": "string",
                 "enum": [
                   "assistant.message"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Durable files produced by the assistant or one of its tools. Bytes are\nserved through the same attachment endpoint as user uploads.",
+            "required": [
+              "turn",
+              "attachments",
+              "type"
+            ],
+            "properties": {
+              "attachments": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/Attachment"
+                }
+              },
+              "call_id": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/String"
+                  }
+                ]
+              },
+              "turn": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "assistant.artifacts"
                 ]
               }
             }
@@ -13222,6 +13260,44 @@
                 "type": "string",
                 "enum": [
                   "assistant"
+                ]
+              },
+              "turn": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Durable media/files produced by the assistant or one of its tools.",
+            "required": [
+              "turn",
+              "attachments",
+              "kind"
+            ],
+            "properties": {
+              "attachments": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/Attachment"
+                }
+              },
+              "call_id": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/String"
+                  }
+                ]
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "artifacts"
                 ]
               },
               "turn": {

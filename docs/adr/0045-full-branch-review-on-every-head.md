@@ -1,4 +1,4 @@
-# ADR 0044: Full-branch review on every head
+# ADR 0045: Full-branch review on every head
 
 Status: Accepted (2026-09)
 

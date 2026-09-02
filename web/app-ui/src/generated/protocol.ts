@@ -1787,7 +1787,7 @@ export interface components {
          */
         ApprovalDecision: "approve" | "always_approve" | "deny";
         /**
-         * @description A stored prompt attachment. Bytes are served at
+         * @description A stored transcript attachment. Bytes are served at
          *     `GET /v1/attachments/{id}`.
          */
         Attachment: {
@@ -2950,6 +2950,13 @@ export interface components {
             turn: number;
             /** @enum {string} */
             type: "assistant.message";
+        } | {
+            attachments: components["schemas"]["Attachment"][];
+            call_id?: null | components["schemas"]["String"];
+            /** Format: int64 */
+            turn: number;
+            /** @enum {string} */
+            type: "assistant.artifacts";
         } | {
             args: unknown;
             call_id: components["schemas"]["String"];
@@ -4744,6 +4751,13 @@ export interface components {
             content: string;
             /** @enum {string} */
             kind: "assistant";
+            /** Format: int64 */
+            turn: number;
+        } | {
+            attachments: components["schemas"]["Attachment"][];
+            call_id?: null | components["schemas"]["String"];
+            /** @enum {string} */
+            kind: "artifacts";
             /** Format: int64 */
             turn: number;
         } | {

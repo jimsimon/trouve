@@ -350,6 +350,20 @@ impl ThreadProjection {
                     });
                 }
             }
+            Event::AssistantArtifacts {
+                turn,
+                call_id,
+                attachments,
+            } => {
+                self.fail_open_compaction(*turn);
+                self.finish_progress(*turn);
+                self.finish_thinking();
+                self.push(ThreadViewItem::Artifacts {
+                    turn: *turn,
+                    call_id: call_id.clone(),
+                    attachments: attachments.clone(),
+                });
+            }
             Event::ToolRequested {
                 turn,
                 call_id,
@@ -811,6 +825,7 @@ impl ThreadProjection {
                 | ThreadViewItem::Steered { .. }
                 | ThreadViewItem::Subagent { .. }
                 | ThreadViewItem::Assistant { .. }
+                | ThreadViewItem::Artifacts { .. }
                 | ThreadViewItem::TodoUpdate { .. }
                 | ThreadViewItem::Compaction { .. } => {}
             }
@@ -955,6 +970,35 @@ mod tests {
                 background: true,
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn assistant_artifacts_fold_into_a_durable_transcript_item() {
+        let mut projection = ThreadProjection::default();
+        projection.apply(&envelope(
+            1,
+            0,
+            Event::AssistantArtifacts {
+                turn: 5,
+                call_id: Some("call_screenshot".into()),
+                attachments: vec![trouve_protocol::Attachment {
+                    id: "attachment_1".into(),
+                    name: "tool-image-1.png".into(),
+                    mime: "image/png".into(),
+                    size_bytes: 5,
+                }],
+            },
+        ));
+
+        assert!(matches!(
+            projection.snapshot.items.last(),
+            Some(ThreadViewItem::Artifacts {
+                turn: 5,
+                call_id: Some(call_id),
+                attachments,
+            }) if call_id == "call_screenshot"
+                && attachments[0].name == "tool-image-1.png"
         ));
     }
 

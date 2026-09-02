@@ -1,6 +1,6 @@
 # Durable code-review job artifacts and event streams
 
-Status: Partially superseded by ADR 0044 (2026-09)
+Status: Partially superseded by ADR 0045 (2026-09)
 
 ## Context
 

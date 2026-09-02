@@ -131,6 +131,13 @@ export type ThreadChatItem =
     }
   | {
       readonly id: string;
+      readonly kind: "artifacts";
+      readonly turn: number;
+      readonly callId?: string;
+      readonly attachments: readonly Attachment[];
+    }
+  | {
+      readonly id: string;
       readonly kind: "progress";
       readonly turn: number;
       content: string;
@@ -462,6 +469,14 @@ export class ThreadViewModel {
           turn: item.turn,
           content: item.content,
           complete: item.complete,
+        };
+      case "artifacts":
+        return {
+          id,
+          kind: "artifacts",
+          turn: item.turn,
+          ...(item.call_id == null ? {} : { callId: item.call_id }),
+          attachments: item.attachments,
         };
       case "progress":
         return {
@@ -835,6 +850,18 @@ export class ThreadViewModel {
         }
         return true;
       }
+      case "assistant.artifacts":
+        this.failOpenCompaction(envelope.turn);
+        this.finishProgress();
+        this.finishThinking();
+        this.appendItem({
+          id: this.nextItemId(`artifacts:${envelope.turn}`),
+          kind: "artifacts",
+          turn: envelope.turn,
+          ...(envelope.call_id == null ? {} : { callId: envelope.call_id }),
+          attachments: envelope.attachments,
+        });
+        return true;
       case "tool.requested":
         this.failOpenCompaction(envelope.turn);
         this.finishProgress();

@@ -345,6 +345,8 @@ pub use requests::*;
 // delayed deltas append to the correct lifecycle within an older turn.
 // 7.30: chat mentions no longer create session PR associations; the legacy
 // session.pr_mentioned event remains replay-only.
+// 7.31: assistant.artifacts events and folded artifact items expose durable
+// model/tool-produced files without embedding media bytes in the event log.
 // 8.0: code review always covers the complete pull-request branch at the
 // exact head. Manual requests no longer select a scope, and jobs no longer
 // expose incremental watermarks or raw coverage markers. Derived legacy

@@ -16912,10 +16912,14 @@ impl Engine {
         } else {
             (ToolResult::error("tool call cancelled"), None, None)
         };
-        // Peel vision content ("_images") out of the result: megabytes of
-        // base64 must not land in the event log or the text transcript —
-        // it becomes native image input on the tool-result message instead.
-        let images = take_tool_images(&mut outcome.result);
+        // Peel media bytes out of the result before it reaches the event log.
+        // Images remain native provider vision input; all accepted media also
+        // becomes a durable attachment-backed artifact row.
+        let (images, artifact_uploads) = take_tool_media(&mut outcome.result);
+        let mut prepared_artifacts =
+            prepare_tool_artifacts(&mut outcome.result, artifact_uploads, |uploads| {
+                self.prepare_attachments(uploads)
+            });
         let todos = self.persist_todos_from_result(
             &thread.id,
             &call.name,
@@ -16925,7 +16929,7 @@ impl Engine {
         )?;
         let model_result = outcome.result.to_string();
         let mut completion_events = vec![Event::ToolCompleted {
-            call_id,
+            call_id: call_id.clone(),
             status: outcome.status,
             result: outcome.result,
             execution_duration_ms,
@@ -16933,7 +16937,36 @@ impl Engine {
         if let Some(todos) = todos {
             completion_events.push(Event::TodosUpdated { todos });
         }
-        if let Some(intents) = verification {
+        if let Some((prepared, cleanup)) = prepared_artifacts.as_mut() {
+            let attachments = prepared
+                .iter()
+                .map(|(attachment, _)| attachment.clone())
+                .collect::<Vec<_>>();
+            let rows = prepared
+                .iter()
+                .map(|(attachment, path)| (attachment.clone(), path.to_string_lossy().into_owned()))
+                .collect();
+            completion_events.push(Event::AssistantArtifacts {
+                turn,
+                call_id: Some(call_id.clone()),
+                attachments,
+            });
+            self.store.append_events_with_attachments(
+                scope,
+                completion_events,
+                &thread.id,
+                rows,
+                verification.clone().unwrap_or_default(),
+                cleanup.claim(),
+            )?;
+            if verification
+                .as_ref()
+                .is_some_and(|intents| !intents.is_empty())
+            {
+                self.session_pr_verification_wake.notify_one();
+            }
+            cleanup.disarm();
+        } else if let Some(intents) = verification {
             self.store
                 .append_events_with_session_pr_verification_intents(
                     scope,
@@ -17791,30 +17824,203 @@ fn annotate_attachments(
     out
 }
 
-/// Remove the `_images` vision payload from a tool result, leaving a small
-/// summary in its place (the event log and text transcript stay lean; the
-/// images travel on the provider message as native vision content).
-fn take_tool_images(result: &mut serde_json::Value) -> Vec<trouve_providers::ToolImage> {
-    let Some(payload) = result.as_object_mut().and_then(|o| o.remove("_images")) else {
-        return Vec::new();
-    };
-    let images: Vec<trouve_providers::ToolImage> =
-        serde_json::from_value(payload).unwrap_or_default();
-    if !images.is_empty() {
-        result["images"] = serde_json::json!(
-            images
-                .iter()
-                .map(|img| {
-                    serde_json::json!({
-                        "mime": img.mime,
-                        // Base64 expands bytes 4:3; report the real size.
-                        "bytes": img.data.len() * 3 / 4,
-                    })
-                })
-                .collect::<Vec<_>>()
-        );
+fn artifact_extension(mime: &str) -> &'static str {
+    match mime.to_ascii_lowercase().as_str() {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "video/mp4" => "mp4",
+        "video/webm" => "webm",
+        "audio/mpeg" => "mp3",
+        "audio/wav" | "audio/x-wav" => "wav",
+        "audio/ogg" => "ogg",
+        "application/pdf" => "pdf",
+        _ => "bin",
     }
-    images
+}
+
+fn artifact_upload(
+    index: usize,
+    kind: &str,
+    mime: String,
+    data: String,
+) -> trouve_protocol::AttachmentUpload {
+    trouve_protocol::AttachmentUpload {
+        name: format!("tool-{kind}-{}.{}", index + 1, artifact_extension(&mime)),
+        mime,
+        data,
+    }
+}
+
+fn tool_media_persistence_failed(result: &mut serde_json::Value) {
+    const MESSAGE: &str =
+        "Agent-produced media could not be stored; the tool itself completed normally.";
+    match result {
+        serde_json::Value::Object(fields) => {
+            fields.insert(
+                "artifact_persistence_error".into(),
+                serde_json::Value::String(MESSAGE.into()),
+            );
+        }
+        serde_json::Value::Array(blocks) => blocks.push(serde_json::json!({
+            "type": "text",
+            "text": MESSAGE,
+            "artifact_persistence_error": true,
+        })),
+        other => {
+            *other = serde_json::json!({
+                "result": std::mem::take(other),
+                "artifact_persistence_error": MESSAGE,
+            });
+        }
+    }
+}
+
+/// Artifact storage is supplemental to an already-completed tool call. Keep
+/// the terminal result durable even when staging the media bytes fails.
+fn prepare_tool_artifacts<T>(
+    result: &mut serde_json::Value,
+    uploads: Vec<trouve_protocol::AttachmentUpload>,
+    prepare: impl FnOnce(Vec<trouve_protocol::AttachmentUpload>) -> Result<T, EngineError>,
+) -> Option<T> {
+    if uploads.is_empty() {
+        return None;
+    }
+    match prepare(uploads) {
+        Ok(prepared) => Some(prepared),
+        Err(error) => {
+            tracing::warn!(%error, "tool media could not be staged for durable presentation");
+            tool_media_persistence_failed(result);
+            None
+        }
+    }
+}
+
+fn accept_tool_media_upload(
+    uploads: &mut Vec<trouve_protocol::AttachmentUpload>,
+    upload: trouve_protocol::AttachmentUpload,
+) -> Result<(), String> {
+    uploads.push(upload);
+    if let Err(error) = validate_attachment_uploads(uploads) {
+        uploads.pop();
+        return Err(error.to_string());
+    }
+    Ok(())
+}
+
+/// Remove inline media bytes from a tool result. Images continue to travel to
+/// the provider as native vision content; every accepted media block is also
+/// returned as an attachment upload for durable UI presentation.
+fn take_tool_media(
+    result: &mut serde_json::Value,
+) -> (
+    Vec<trouve_providers::ToolImage>,
+    Vec<trouve_protocol::AttachmentUpload>,
+) {
+    let payload = result
+        .as_object_mut()
+        .and_then(|object| object.remove("_images"));
+    let mut images = Vec::new();
+    let mut uploads = Vec::new();
+    let mut image_summaries = Vec::new();
+    if let Some(payload) = payload {
+        let blocks = payload.as_array().cloned().unwrap_or_default();
+        for block in blocks {
+            let Ok(image) = serde_json::from_value::<trouve_providers::ToolImage>(block) else {
+                image_summaries.push(serde_json::json!({
+                    "media_omitted": true,
+                    "media_error": "invalid tool image metadata",
+                }));
+                continue;
+            };
+            let upload = artifact_upload(
+                uploads.len(),
+                "image",
+                image.mime.clone(),
+                image.data.clone(),
+            );
+            let rejection = accept_tool_media_upload(&mut uploads, upload).err();
+            let accepted = rejection.is_none();
+            image_summaries.push(serde_json::json!({
+                "mime": image.mime,
+                "bytes": image.data.len().saturating_mul(3) / 4,
+                "media_omitted": true,
+                "media_error": rejection,
+            }));
+            if accepted {
+                images.push(image);
+            }
+        }
+        if image_summaries.is_empty() {
+            image_summaries.push(serde_json::json!({
+                "media_omitted": true,
+                "media_error": "invalid tool image payload",
+            }));
+        }
+        result["images"] = serde_json::Value::Array(image_summaries);
+    }
+
+    if let Some(blocks) = result.as_array_mut() {
+        for block in blocks {
+            let Some(object) = block.as_object_mut() else {
+                continue;
+            };
+            let kind = object
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let source = if kind == "resource" {
+                object
+                    .get_mut("resource")
+                    .and_then(serde_json::Value::as_object_mut)
+            } else {
+                Some(&mut *object)
+            };
+            let Some(source) = source else {
+                continue;
+            };
+            let media_kind = match kind.as_str() {
+                "image" => "image",
+                "audio" => "audio",
+                "resource" if source.get("blob").is_some() => "artifact",
+                _ => continue,
+            };
+            let mime = source
+                .get("mimeType")
+                .or_else(|| source.get("mime_type"))
+                .or_else(|| source.get("mime"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("application/octet-stream")
+                .to_string();
+            let data_key = if kind == "resource" { "blob" } else { "data" };
+            let Some(data) = source
+                .get(data_key)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            let upload = artifact_upload(uploads.len(), media_kind, mime.clone(), data.clone());
+            let rejection = accept_tool_media_upload(&mut uploads, upload).err();
+            source.remove(data_key);
+            source.insert("media_omitted".into(), serde_json::Value::Bool(true));
+            source.insert(
+                "size_bytes".into(),
+                serde_json::json!(data.len().saturating_mul(3) / 4),
+            );
+            if let Some(error) = rejection {
+                source.insert("media_error".into(), serde_json::Value::String(error));
+            } else if media_kind == "image" {
+                images.push(trouve_providers::ToolImage {
+                    mime: mime.clone(),
+                    data,
+                });
+            }
+        }
+    }
+    (images, uploads)
 }
 
 /// Repository-local PR numbers found recursively in structured tool data.
@@ -19603,6 +19809,104 @@ mod tests {
                 background: false,
                 ..
             } if content == "User prompt"
+        ));
+    }
+
+    #[test]
+    fn tool_media_becomes_bounded_artifact_uploads_without_inline_bytes() {
+        let mut result = serde_json::json!([
+            {
+                "type": "image",
+                "mimeType": "image/png",
+                "data": "aGVsbG8="
+            },
+            {
+                "type": "audio",
+                "mimeType": "audio/mpeg",
+                "data": "d29ybGQ="
+            },
+            {
+                "type": "resource",
+                "resource": {
+                    "mimeType": "application/pdf",
+                    "blob": "IQ=="
+                }
+            }
+        ]);
+
+        let (images, uploads) = take_tool_media(&mut result);
+
+        assert_eq!(images.len(), 1);
+        assert_eq!(uploads.len(), 3);
+        assert_eq!(uploads[0].name, "tool-image-1.png");
+        assert_eq!(uploads[1].name, "tool-audio-2.mp3");
+        assert_eq!(uploads[2].name, "tool-artifact-3.pdf");
+        assert_eq!(result[0]["media_omitted"], true);
+        assert_eq!(result[1]["media_omitted"], true);
+        assert_eq!(result[2]["resource"]["media_omitted"], true);
+        assert!(result[0].get("data").is_none());
+        assert!(result[1].get("data").is_none());
+        assert!(result[2]["resource"].get("blob").is_none());
+    }
+
+    #[test]
+    fn first_party_tool_images_remain_provider_images_and_become_artifacts() {
+        let mut result = serde_json::json!({
+            "note": "screenshot",
+            "_images": [{ "mime": "image/png", "data": "aGVsbG8=" }]
+        });
+
+        let (images, uploads) = take_tool_media(&mut result);
+
+        assert_eq!(images.len(), 1);
+        assert_eq!(uploads.len(), 1);
+        assert_eq!(uploads[0].name, "tool-image-1.png");
+        assert!(result.get("_images").is_none());
+        assert_eq!(result["images"][0]["mime"], "image/png");
+    }
+
+    #[test]
+    fn rejected_tool_media_is_not_forwarded_or_persisted() {
+        let mut result = serde_json::json!([
+            {
+                "type": "image",
+                "mimeType": "not-a-mime",
+                "data": "aGVsbG8="
+            }
+        ]);
+
+        let (images, uploads) = take_tool_media(&mut result);
+
+        assert!(images.is_empty());
+        assert!(uploads.is_empty());
+        assert!(result[0].get("data").is_none());
+        assert_eq!(result[0]["media_omitted"], true);
+        assert!(result[0]["media_error"].as_str().is_some());
+    }
+
+    #[test]
+    fn artifact_staging_failure_preserves_a_terminal_tool_result() {
+        let upload = artifact_upload(0, "image", "image/png".into(), "aGVsbG8=".into());
+        let mut result = serde_json::json!({ "note": "tool finished" });
+
+        let prepared: Option<()> = prepare_tool_artifacts(&mut result, vec![upload], |_| {
+            Err(EngineError::Internal(anyhow!("injected staging failure")))
+        });
+        let terminal = Event::ToolCompleted {
+            call_id: "call_with_media".into(),
+            status: ToolStatus::Ok,
+            result,
+            execution_duration_ms: Some(1),
+        };
+
+        assert!(prepared.is_none());
+        assert!(matches!(
+            terminal,
+            Event::ToolCompleted {
+                status: ToolStatus::Ok,
+                result,
+                ..
+            } if result["artifact_persistence_error"].as_str().is_some()
         ));
     }
 
