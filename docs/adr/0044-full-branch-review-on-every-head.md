@@ -40,9 +40,10 @@ completed task when its persisted prompt and input digest are unchanged.
 Legacy database rows retain their historical scope, watermark, and coverage
 columns for migration compatibility. Protocol 8.0 removes the request scope
 and the obsolete watermark and raw coverage response fields while keeping the
-historical scope enum readable. A clean pre-8.0 partial result exposes one
-derived compatibility-pending state while reconciliation makes at most two
-full-branch attempts (the initial attempt and one automatic retry).
+historical scope enum readable. A clean pre-8.0 partial result exposes derived
+compatibility-pending or exhausted states while reconciliation makes at most
+two full-branch attempts (the initial attempt and one automatic retry). A
+published full-branch result clears both states on the historical row.
 
 This supersedes only ADR 0014's incremental-watermark diff-selection decision;
 its durable job, task, publication, and statistics decisions remain in force.
@@ -52,8 +53,8 @@ its durable job, task, publication, and statistics decisions remain in force.
 Diff selection and Check Run conclusions have one invariant, and a clean
 result requires one trusted round rather than an incremental pass followed by
 a full confirmation. Reconciliation and the user interfaces retain only the
-derived compatibility-pending state needed to settle already-persisted
-pre-8.0 partial results; it cannot arise for a newly created round.
+derived compatibility states needed to settle already-persisted pre-8.0
+partial results; they cannot arise for a newly created round.
 
 Review cost and latency now scale with total branch size on every pushed head,
 so large pull requests with frequent small pushes may consume more reviewer

@@ -24,6 +24,7 @@ export interface ReviewJobSummary {
   readonly open_issue_count?: number | null;
   readonly advisory_open_issue_count?: number | null;
   readonly legacy_coverage_pending?: boolean;
+  readonly legacy_coverage_exhausted?: boolean;
 }
 
 export interface ReviewJobGroup<T extends ReviewJobSummary = ReviewJobSummary> {
@@ -235,10 +236,17 @@ export const codeReviewStatusLabel = (status: string): string => {
 };
 
 export const codeReviewNeedsAttention = (
-  job: Pick<ReviewJobSummary, "status" | "open_issue_count" | "legacy_coverage_pending">,
+  job: Pick<
+    ReviewJobSummary,
+    "status" | "open_issue_count" | "legacy_coverage_pending" | "legacy_coverage_exhausted"
+  >,
 ): boolean =>
   job.status === "succeeded"
-  && (job.legacy_coverage_pending === true || job.open_issue_count !== 0);
+  && (
+    job.legacy_coverage_pending === true
+    || job.legacy_coverage_exhausted === true
+    || job.open_issue_count !== 0
+  );
 
 /** Only absolute, credential-free HTTPS links may cross the native boundary. */
 export const safeCodeReviewHref = (value: string | null | undefined): string | undefined => {

@@ -254,6 +254,8 @@ round with no open blocking findings makes the Check Run succeed immediately;
 there is no separate full-coverage confirmation round for current jobs. A
 clean pre-8.0 partial result remains visibly pending while reconciliation makes
 an initial full-branch compatibility attempt and at most one automatic retry.
+If both attempts end without publication, the dashboards mark the state as
+exhausted and offer a whole-review retry; a published full review clears it.
 
 Each job snapshots the effective review configuration when it is queued. Later
 settings changes apply to newly queued jobs without changing or cancelling

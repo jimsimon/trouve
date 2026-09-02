@@ -645,10 +645,14 @@ function EmptyState({ title, body }: { title: string; body: string }) {
 }
 
 function reviewJobAttentionState(
-  job: Pick<ReviewJob, "status" | "open_issue_count" | "legacy_coverage_pending">,
-): "coverage" | "open" | "unknown" | null {
+  job: Pick<
+    ReviewJob,
+    "status" | "open_issue_count" | "legacy_coverage_pending" | "legacy_coverage_exhausted"
+  >,
+): "coverage_exhausted" | "coverage_pending" | "open" | "unknown" | null {
   if (job.status !== "succeeded") return null;
-  if (job.legacy_coverage_pending) return "coverage";
+  if (job.legacy_coverage_exhausted) return "coverage_exhausted";
+  if (job.legacy_coverage_pending) return "coverage_pending";
   if (job.open_issue_count != null && job.open_issue_count > 0) return "open";
   if (job.open_issue_count == null) return "unknown";
   return null;
@@ -660,7 +664,9 @@ function JobRow({ job, now }: { job: ReviewJob; now: number }) {
   const attentionState = reviewJobAttentionState(job);
   return (
     <button class="job-row" type="button" onClick={() => navigate("jobs", job.id)}>
-      {attentionState === "coverage" ? (
+      {attentionState === "coverage_exhausted" ? (
+        <span class="status warning">full review required</span>
+      ) : attentionState === "coverage_pending" ? (
         <span class="status warning">full review pending</span>
       ) : attentionState === "open" ? (
         <span class="status warning">needs attention</span>
@@ -1442,7 +1448,9 @@ function JobDetailPane({
       </p>
       <header class="detail-header">
         <div>
-          {attentionState === "coverage" ? (
+          {attentionState === "coverage_exhausted" ? (
+            <span class="status warning">full review required</span>
+          ) : attentionState === "coverage_pending" ? (
             <span class="status warning">full review pending</span>
           ) : attentionState === "open" ? (
             <span class="status warning">needs attention</span>
@@ -1574,11 +1582,19 @@ function JobDetailPane({
         <ExternalLink href={job.check_run_url}>Open Check Run ↗</ExternalLink>
       </div>
       {job.check_sync_error && <p class="warning">Check sync: {job.check_sync_error}</p>}
+      {job.legacy_coverage_exhausted && (
+        <div class="banner warning stacked" role="alert">
+          <strong>Automatic full-branch compatibility attempts exhausted</strong>
+          <p>
+            This pre-8.0 partial result cannot establish branch coverage. Retry the whole review to run every selected reviewer against the full branch.
+          </p>
+        </div>
+      )}
       {job.legacy_coverage_pending && (
         <div class="banner warning stacked" role="alert">
           <strong>Full-branch compatibility review pending</strong>
           <p>
-            This successful result came from a pre-8.0 partial review. The server will run one bounded full-branch compatibility review before the revision can pass.
+            This successful result came from a pre-8.0 partial review. A full-branch compatibility result is still required before the revision can pass; the server schedules at most two automatic attempts.
           </p>
         </div>
       )}

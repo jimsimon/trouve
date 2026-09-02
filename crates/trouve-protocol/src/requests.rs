@@ -2382,6 +2382,11 @@ pub struct CodeReviewJob {
     /// migration state, not a scope option for newly created jobs.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub legacy_coverage_pending: bool,
+    /// A clean pre-8.0 partial review still lacks full-branch coverage after
+    /// both bounded automatic compatibility attempts ended. A manual whole-
+    /// review retry is required to establish coverage.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub legacy_coverage_exhausted: bool,
     /// `automatic`, `manual`, or `retry`.
     pub trigger: String,
     /// `queued`, `running`, `succeeded`, `failed`, `cancelled`, or `stale`.

@@ -2203,6 +2203,12 @@ export interface components {
             /** Format: int64 */
             issue_count?: number;
             /**
+             * @description A clean pre-8.0 partial review still lacks full-branch coverage after
+             *     both bounded automatic compatibility attempts ended. A manual whole-
+             *     review retry is required to establish coverage.
+             */
+            legacy_coverage_exhausted?: boolean;
+            /**
              * @description A successfully published pre-8.0 partial review is waiting for the
              *     bounded automatic full-branch compatibility review. This is a derived
              *     migration state, not a scope option for newly created jobs.

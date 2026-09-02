@@ -33,6 +33,11 @@ describe("code-review dashboard model", () => {
       open_issue_count: 0,
       legacy_coverage_pending: true,
     })).toBe(true);
+    expect(codeReviewNeedsAttention({
+      status: "succeeded",
+      open_issue_count: 0,
+      legacy_coverage_exhausted: true,
+    })).toBe(true);
     expect(codeReviewNeedsAttention({ status: "running", open_issue_count: 2 })).toBe(false);
   });
 

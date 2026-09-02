@@ -32,8 +32,9 @@ use crate::config::GithubReviewAppConfig;
 use crate::engine::{Engine, EngineError, ReviewWorkspaceRegistrationFence};
 use crate::store::{
     CodeReviewJobPhase, CodeReviewJobRecord, CodeReviewJobRetryOutcome, CodeReviewManualRequest,
-    CodeReviewModelTiming, CodeReviewTaskMetrics, NewCodeReviewFinding,
-    NewCodeReviewFindingDetails, NewCodeReviewJob, NewCodeReviewTask, NewCodeReviewTheme,
+    CodeReviewModelTiming, CodeReviewTaskMetrics, LEGACY_FULL_COVERAGE_MAX_ATTEMPTS,
+    NewCodeReviewFinding, NewCodeReviewFindingDetails, NewCodeReviewJob, NewCodeReviewTask,
+    NewCodeReviewTheme,
 };
 use crate::tools::{
     ReviewAnchor, ReviewDiffFileWithMetadata as ReviewDiffFile, ReviewRepositoryAnchors,
@@ -173,9 +174,6 @@ const REVIEW_TASK_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 const REVIEW_COORDINATOR_ADJUDICATION_REPAIR_TIMEOUT: Duration = Duration::from_secs(60);
 const REVIEW_PROJECTION_DEBOUNCE: Duration = Duration::from_millis(750);
 const REVIEW_PROJECTION_REPAIR_LIMIT: usize = 25;
-/// One initial compatibility review plus one automatic retry. Maintainers can
-/// still request another full review explicitly after both attempts fail.
-const LEGACY_FULL_COVERAGE_MAX_ATTEMPTS: usize = 2;
 const CHECK_ACTION_DESCRIPTION_MAX_CHARS: usize = 40;
 const CHECK_DETAILS_MAX_CHARS: usize = 60_000;
 const CHECK_DETAILS_TRUNCATION_MARKER: &str =
@@ -12169,8 +12167,10 @@ fn render_lifecycle_comment(
 ) -> String {
     let job = &detail.job;
     let open_issue_count = review_open_issue_count(job);
-    let succeeded_needing_attention =
-        job.status == "succeeded" && (open_issue_count != Some(0) || job.legacy_coverage_pending);
+    let succeeded_needing_attention = job.status == "succeeded"
+        && (open_issue_count != Some(0)
+            || job.legacy_coverage_pending
+            || job.legacy_coverage_exhausted);
     // Only terminal review outcomes expose coordinator-authored results. A
     // queued or running job may hold a staged result while its live revision
     // is revalidated; cancelled and stale jobs never accepted that result.
@@ -12194,7 +12194,13 @@ fn render_lifecycle_comment(
     let icon = match job.status.as_str() {
         "queued" => "⏳",
         "running" => "🔎",
-        "succeeded" if open_issue_count == Some(0) && !job.legacy_coverage_pending => "✅",
+        "succeeded"
+            if open_issue_count == Some(0)
+                && !job.legacy_coverage_pending
+                && !job.legacy_coverage_exhausted =>
+        {
+            "✅"
+        }
         "succeeded" => "🟡",
         "failed" if !detail.unadjudicated_candidates.is_empty() => "⚠️",
         "cancelled" | "stale" => "⏹️",
@@ -12238,9 +12244,13 @@ fn render_lifecycle_comment(
                 detail.findings.len()
             )),
         }
-        if job.legacy_coverage_pending {
+        if job.legacy_coverage_exhausted {
             body.push_str(
-                "**Coverage:** Full-branch compatibility review pending after this legacy partial result  \n",
+                "**Coverage:** Automatic full-branch compatibility attempts exhausted; run the review again to establish coverage  \n",
+            );
+        } else if job.legacy_coverage_pending {
+            body.push_str(
+                "**Coverage:** Full-branch compatibility review required; automatic attempts remain  \n",
             );
         }
     } else if job.status == "failed" && !detail.unadjudicated_candidates.is_empty() {
@@ -18320,8 +18330,15 @@ mod tests {
         let body = render_lifecycle_comment(&detail, &[], false, &[]);
 
         assert!(body.contains("## 🟡 Trouve Code Review — Needs Attention"));
-        assert!(body.contains("Full-branch compatibility review pending"));
+        assert!(body.contains("Full-branch compatibility review required"));
+        assert!(body.contains("automatic attempts remain"));
         assert!(!body.contains("## ✅ Trouve Code Review — Succeeded"));
+
+        detail.job.legacy_coverage_pending = false;
+        detail.job.legacy_coverage_exhausted = true;
+        let exhausted = render_lifecycle_comment(&detail, &[], false, &[]);
+        assert!(exhausted.contains("Automatic full-branch compatibility attempts exhausted"));
+        assert!(exhausted.contains("run the review again"));
     }
 
     #[tokio::test]

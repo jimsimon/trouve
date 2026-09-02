@@ -3677,6 +3677,8 @@ pub struct CodeReviewJobRecord {
     pub blocking_review_cleanup_pending: bool,
 }
 
+pub(crate) const LEGACY_FULL_COVERAGE_MAX_ATTEMPTS: usize = 2;
+
 pub(crate) fn code_review_round_covered_full_branch(
     scope: trouve_protocol::CodeReviewJobScope,
     covered_full_branch: Option<bool>,
@@ -3774,7 +3776,7 @@ fn row_to_code_review_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<CodeReviewJ
         .get::<_, Option<i64>>(56)?
         .map(|value| value.max(0) as u64);
     let covered_full_branch = r.get(62)?;
-    let legacy_coverage_pending = status == "succeeded"
+    let legacy_partial_clean = status == "succeeded"
         && open_issue_count == Some(0)
         && !code_review_round_covered_full_branch(
             scope,
@@ -3782,6 +3784,16 @@ fn row_to_code_review_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<CodeReviewJ
             &review_base_sha,
             &base_ref,
         );
+    let legacy_coverage_settled: bool = r.get(63)?;
+    let legacy_coverage_active: bool = r.get(64)?;
+    let legacy_coverage_attempts = r.get::<_, i64>(65)?.max(0) as usize;
+    let legacy_coverage_pending = legacy_partial_clean
+        && !legacy_coverage_settled
+        && (legacy_coverage_active || legacy_coverage_attempts < LEGACY_FULL_COVERAGE_MAX_ATTEMPTS);
+    let legacy_coverage_exhausted = legacy_partial_clean
+        && !legacy_coverage_settled
+        && !legacy_coverage_active
+        && legacy_coverage_attempts >= LEGACY_FULL_COVERAGE_MAX_ATTEMPTS;
     Ok(CodeReviewJobRecord {
         job: trouve_protocol::CodeReviewJob {
             id: r.get(0)?,
@@ -3796,6 +3808,7 @@ fn row_to_code_review_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<CodeReviewJ
             head_ref: r.get(8)?,
             scope,
             legacy_coverage_pending,
+            legacy_coverage_exhausted,
             trigger: r.get(9)?,
             status,
             retry_of: r.get(24)?,
@@ -3905,7 +3918,29 @@ const CODE_REVIEW_JOB_COLUMNS: &str = "id, installation_id, repository, pull_num
                 ) \
             ) \
           THEN 1 ELSE 0 END AS can_retry_final_editor, \
-     review_covered_full_branch";
+     review_covered_full_branch, \
+     EXISTS ( \
+       SELECT 1 FROM code_review_jobs AS settled \
+       WHERE settled.repository = code_review_jobs.repository \
+         AND settled.pull_number = code_review_jobs.pull_number \
+         AND settled.head_sha = code_review_jobs.head_sha \
+         AND settled.review_scope = 'full' \
+         AND settled.review_published != 0 \
+     ) AS legacy_coverage_settled, \
+     EXISTS ( \
+       SELECT 1 FROM code_review_jobs AS active \
+       WHERE active.repository = code_review_jobs.repository \
+         AND active.pull_number = code_review_jobs.pull_number \
+         AND active.head_sha = code_review_jobs.head_sha \
+         AND active.id != code_review_jobs.id \
+         AND active.status IN ('queued', 'running') \
+     ) AS legacy_coverage_active, \
+     (SELECT COUNT(*) FROM code_review_jobs AS attempt \
+      WHERE attempt.repository = code_review_jobs.repository \
+        AND attempt.pull_number = code_review_jobs.pull_number \
+        AND attempt.head_sha = code_review_jobs.head_sha \
+        AND attempt.trigger = 'legacy-full-coverage') \
+       AS legacy_coverage_attempts";
 
 /// Shared ownership predicate for accepting review results and claiming their
 /// publication. Keeping both transitions on one predicate prevents stale
@@ -28443,6 +28478,37 @@ mod tests {
         let projected = store.code_review_job(&partial.id).unwrap().unwrap().job;
         assert_eq!(projected.open_issue_count, Some(0));
         assert!(projected.legacy_coverage_pending);
+        assert!(!projected.legacy_coverage_exhausted);
+
+        for attempt in 1..=LEGACY_FULL_COVERAGE_MAX_ATTEMPTS {
+            let mut request = backoff_test_job_request();
+            request.dedupe_key = format!("acme/widgets#42:legacy-coverage-attempt-{attempt}");
+            request.scope = trouve_protocol::CodeReviewJobScope::Full;
+            request.trigger = "legacy-full-coverage".into();
+            let queued = store.enqueue_code_review_job(&request).unwrap().unwrap();
+            assert_eq!(
+                store.claim_code_review_job().unwrap().unwrap().job.id,
+                queued.id
+            );
+            store
+                .finish_code_review_job(&queued.id, "failed", "", "compatibility review failed")
+                .unwrap();
+        }
+        let exhausted = store.code_review_job(&partial.id).unwrap().unwrap().job;
+        assert!(!exhausted.legacy_coverage_pending);
+        assert!(exhausted.legacy_coverage_exhausted);
+
+        publish_leveled_test_round(
+            &store,
+            "acme/widgets#42:legacy-full-settlement",
+            "2222222222222222222222222222222222222222",
+            trouve_protocol::CodeReviewJobScope::Full,
+            &[],
+            &[],
+        );
+        let settled = store.code_review_job(&partial.id).unwrap().unwrap().job;
+        assert!(!settled.legacy_coverage_pending);
+        assert!(!settled.legacy_coverage_exhausted);
     }
 
     #[test]
