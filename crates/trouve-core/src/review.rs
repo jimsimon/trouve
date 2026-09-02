@@ -4548,13 +4548,11 @@ impl Engine {
                 .as_str()
                 .unwrap_or_default();
             if !external_id.is_empty()
-                && (action == "rerequested"
-                    || (action == "requested_action"
-                        && matches!(requested_action, "retry" | "retry_final_editor")))
+                && let Some(retry_action) = review_check_retry_action(action, requested_action)
             {
                 let engine = self.clone();
                 let job_id = external_id.to_owned();
-                let final_editor_only = requested_action == "retry_final_editor";
+                let final_editor_only = retry_action == ReviewCheckRetryAction::FinalEditor;
                 tokio::spawn(async move {
                     let result = if final_editor_only {
                         engine.retry_review_final_editor(&job_id).await.map(|_| ())
@@ -11348,6 +11346,27 @@ fn review_check_actions(final_editor_retryable: bool) -> serde_json::Value {
                 "identifier": "retry"
             }
         ])
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewCheckRetryAction {
+    WholeReview,
+    FinalEditor,
+}
+
+/// Accept the retired `full_review` identifier as an inbound alias while old
+/// Check Runs can still expose it. New Check Runs publish only `retry`.
+fn review_check_retry_action(
+    action: &str,
+    requested_action: &str,
+) -> Option<ReviewCheckRetryAction> {
+    match (action, requested_action) {
+        ("rerequested", _) | ("requested_action", "retry" | "full_review") => {
+            Some(ReviewCheckRetryAction::WholeReview)
+        }
+        ("requested_action", "retry_final_editor") => Some(ReviewCheckRetryAction::FinalEditor),
+        _ => None,
     }
 }
 
@@ -20473,6 +20492,32 @@ rename to src/new.rs
         let whole_review = review_check_actions(false);
         assert_eq!(whole_review[0]["identifier"], "retry");
         assert_eq!(whole_review.as_array().unwrap().len(), 1);
+        assert!(!retryable.to_string().contains("full_review"));
+        assert!(!whole_review.to_string().contains("full_review"));
+    }
+
+    #[test]
+    fn legacy_full_review_check_action_retries_the_whole_review() {
+        assert_eq!(
+            review_check_retry_action("requested_action", "full_review"),
+            Some(ReviewCheckRetryAction::WholeReview)
+        );
+        assert_eq!(
+            review_check_retry_action("requested_action", "retry"),
+            Some(ReviewCheckRetryAction::WholeReview)
+        );
+        assert_eq!(
+            review_check_retry_action("requested_action", "retry_final_editor"),
+            Some(ReviewCheckRetryAction::FinalEditor)
+        );
+        assert_eq!(
+            review_check_retry_action("rerequested", ""),
+            Some(ReviewCheckRetryAction::WholeReview)
+        );
+        assert_eq!(
+            review_check_retry_action("requested_action", "unknown"),
+            None
+        );
     }
 
     #[test]
