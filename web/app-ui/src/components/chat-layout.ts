@@ -7,7 +7,7 @@ import {
 
 export type AgentChatItem = Extract<
   ThreadChatItem,
-  { readonly kind: "assistant" | "steered" | "subagent" | "progress" | "thinking" | "compaction" | "todo" | "tool" | "questions" }
+  { readonly kind: "assistant" | "artifacts" | "steered" | "subagent" | "progress" | "thinking" | "compaction" | "todo" | "tool" | "questions" }
 >;
 
 export type AgentActivityItem = Extract<
@@ -45,6 +45,7 @@ export interface ChatLayout {
 
 const isAgentItem = (item: ThreadChatItem): item is AgentChatItem =>
   item.kind === "assistant"
+  || item.kind === "artifacts"
   || item.kind === "steered"
   || item.kind === "subagent"
   || item.kind === "progress"

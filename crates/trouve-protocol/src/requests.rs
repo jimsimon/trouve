@@ -436,6 +436,13 @@ pub enum ThreadViewItem {
         content: String,
         complete: bool,
     },
+    /// Durable media/files produced by the assistant or one of its tools.
+    Artifacts {
+        turn: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_id: Option<CallId>,
+        attachments: Vec<Attachment>,
+    },
     /// User-facing progress authored by the agent harness rather than model
     /// reasoning or final answer text.
     Progress {
@@ -690,7 +697,7 @@ pub struct AttachmentUpload {
     pub data: String,
 }
 
-/// A stored prompt attachment. Bytes are served at
+/// A stored transcript attachment. Bytes are served at
 /// `GET /v1/attachments/{id}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct Attachment {

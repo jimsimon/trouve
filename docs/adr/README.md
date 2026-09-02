@@ -53,3 +53,4 @@ sequentially.
 | [0041](0041-evidence-backed-review-churn-controls.md) | Evidence-backed review churn controls | Accepted |
 | [0042](0042-provider-governed-turn-admission.md) | Provider-governed turn admission | Accepted |
 | [0043](0043-background-jobs-release-mutation-lane.md) | Background jobs release the session mutation lane | Accepted |
+| [0044](0044-durable-assistant-produced-artifacts.md) | Durable assistant-produced artifacts | Accepted |

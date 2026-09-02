@@ -38,11 +38,13 @@ const entryLimit = mode === "desktop" ? 856_000 : 850_000;
 // option editors, exact model-option number preservation (including the
 // WebKit fallback), and the dedicated background-activity event. The combined
 // graphs emit 3,280,024 B for desktop and 3,265,169 B for PWA after combining
-// the durable PR-mention event with identity-aware reasoning lifecycle schemas;
-// preserve less than 2 kB of headroom for each. Entry,
+// the durable PR-mention event with identity-aware reasoning lifecycle schemas.
+// Durable assistant-artifact events and folded attachment items bring the
+// combined graphs to 3,287,832 B for desktop and 3,272,977 B for PWA; preserve
+// less than 2 kB of headroom for each. Entry,
 // worker, and largest-chunk budgets below still prevent one bundle from hiding
 // in the aggregate.
-const totalJavaScriptLimit = mode === "desktop" ? 3_281_000 : 3_266_000;
+const totalJavaScriptLimit = mode === "desktop" ? 3_289_000 : 3_274_000;
 // Version-check, transcript-search, compact navigation, and the sticky
 // multi-mode usage panel with thread/session model rows plus workspace
 // organization styling bring the clean artifact to 190,958 B. Preserve less
