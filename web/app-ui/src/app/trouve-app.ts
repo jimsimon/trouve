@@ -3579,70 +3579,12 @@ export class TrouveApp extends withSignalTracking(LitElement) {
           <form @submit=${this.#createSession}>
             <header>
               <div>
-                <h2 id="new-session-title">New session</h2>
+                <h2 id="new-session-title">New Session</h2>
                 <p>${this.#newSessionSetup.createRequest === undefined
-                  ? "Pick where to work, what to branch from, and how the agent should run."
+                  ? "What do you want to do today?"
                   : "Retrying the original session creation. Its workspace, title, and branch are fixed; you can still edit the first message."}</p>
               </div>
             </header>
-            <label class="new-session-workspace">
-              <span>Workspace</span>
-              <select
-                name="workspace_id"
-                required
-                .value=${this.#newSessionWorkspaceId}
-                @change=${this.#selectNewSessionWorkspace}
-                ?disabled=${this.#newSessionPending
-                  || this.#newSessionSetup.createRequest !== undefined}
-              >
-                ${orderedWorkspaces.map(
-                  (workspace) => html`<option value=${workspace.id}>${workspace.name}</option>`,
-                )}
-              </select>
-            </label>
-            <label class="new-session-branch">
-              <span>Base branch</span>
-              <select
-                name="base_ref"
-                .value=${this.#newSessionBaseRef}
-                @change=${(event: Event) => {
-                  this.#newSessionBaseRef = (event.currentTarget as HTMLSelectElement).value;
-                  this.#newSessionPreferredBaseRef = this.#newSessionBaseRef;
-                }}
-                ?disabled=${this.#newSessionPending
-                  || this.#newSessionBranchesPending
-                  || this.#newSessionSetup.createRequest !== undefined}
-              >
-                ${this.#newSessionBranchesPending
-                  ? html`<option value="">Loading branches…</option>`
-                  : nothing}
-                ${this.#newSessionBranches.map(
-                  (branch) => html`<option
-                    value=${branch}
-                    .selected=${live(branch === this.#newSessionBaseRef)}
-                  >${branch}</option>`,
-                )}
-              </select>
-            </label>
-            ${this.#newSessionBranchError === ""
-              ? nothing
-              : html`<p class="dialog-warning new-session-branch-warning" role="status">${this.#newSessionBranchError}</p>`}
-            <label class="dialog-checkbox">
-              ${this.#newSessionSetup.createRequest === undefined
-                ? html`<input
-                    name="fetch_latest"
-                    type="checkbox"
-                    checked
-                    ?disabled=${this.#newSessionPending}
-                  />`
-                : html`<input
-                    name="fetch_latest"
-                    type="checkbox"
-                    .checked=${this.#newSessionSetup.createRequest.fetchLatest}
-                    disabled
-                  />`}
-              <span>Use latest remote branch</span>
-            </label>
             ${this.#newSessionAttachments.length === 0
               ? nothing
               : html`<ul class="attachment-list pending-attachments" aria-label="Initial prompt attachments">
@@ -3675,13 +3617,13 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                   )}
                 </ul>`}
             <label class="new-session-prompt">
-              <span>First message</span>
+              <span>Prompt</span>
               <textarea
                 name="prompt"
                 maxlength="100000"
                 rows="1"
                 autocomplete="off"
-                placeholder="What should the agent do?  (Shift+Enter for a new line)"
+                placeholder="Message the agent…  (Shift+Enter for a new line)"
                 .value=${this.#newSessionPrompt}
                 ?disabled=${this.#newSessionPending}
                 @input=${this.#newSessionPromptChanged}
@@ -3706,8 +3648,47 @@ export class TrouveApp extends withSignalTracking(LitElement) {
               />
             </label>
             <div class="dialog-option-grid">
+              <label class="new-session-workspace">
+                <span>Workspace</span>
+                <select
+                  name="workspace_id"
+                  required
+                  .value=${this.#newSessionWorkspaceId}
+                  @change=${this.#selectNewSessionWorkspace}
+                  ?disabled=${this.#newSessionPending
+                    || this.#newSessionSetup.createRequest !== undefined}
+                >
+                  ${orderedWorkspaces.map(
+                    (workspace) => html`<option value=${workspace.id}>${workspace.name}</option>`,
+                  )}
+                </select>
+              </label>
+              <label class="new-session-branch">
+                <span>Branch</span>
+                <select
+                  name="base_ref"
+                  .value=${this.#newSessionBaseRef}
+                  @change=${(event: Event) => {
+                    this.#newSessionBaseRef = (event.currentTarget as HTMLSelectElement).value;
+                    this.#newSessionPreferredBaseRef = this.#newSessionBaseRef;
+                  }}
+                  ?disabled=${this.#newSessionPending
+                    || this.#newSessionBranchesPending
+                    || this.#newSessionSetup.createRequest !== undefined}
+                >
+                  ${this.#newSessionBranchesPending
+                    ? html`<option value="">Loading branches…</option>`
+                    : nothing}
+                  ${this.#newSessionBranches.map(
+                    (branch) => html`<option
+                      value=${branch}
+                      .selected=${live(branch === this.#newSessionBaseRef)}
+                    >${branch}</option>`,
+                  )}
+                </select>
+              </label>
               <label class="new-session-mode">
-                <span>Agent persona</span>
+                <span>Persona</span>
                 <select
                   name="mode"
                   .value=${this.#newSessionModeId}
@@ -3786,7 +3767,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                 ></trouve-model-picker>
               </div>
               <label class="new-session-permission">
-                <span class=${this.#newSessionPermissionMode === "yolo" ? "permission-yolo" : ""}>${this.#newSessionPermissionMode === "yolo" ? fontAwesomeIcon("triangle-exclamation") : nothing}Permission mode</span>
+                <span class=${this.#newSessionPermissionMode === "yolo" ? "permission-yolo" : ""}>${this.#newSessionPermissionMode === "yolo" ? fontAwesomeIcon("triangle-exclamation") : nothing}Permissions</span>
                 <select
                   name="permission_mode"
                   class=${this.#newSessionPermissionMode === "yolo" ? "permission-yolo" : ""}
@@ -3821,6 +3802,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                 ? nothing
                 : html`<trouve-model-options-editor
                     class="new-session-model-options"
+                    compact
                     .controls=${newSessionModelOptions}
                     .disabled=${this.#newSessionPending}
                     @trouve-model-option-changed=${(
@@ -3862,7 +3844,26 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                       this.requestUpdate();
                     }}
                   ></trouve-model-options-editor>`}
+              <label class="dialog-checkbox new-session-fetch">
+                ${this.#newSessionSetup.createRequest === undefined
+                  ? html`<input
+                      name="fetch_latest"
+                      type="checkbox"
+                      checked
+                      ?disabled=${this.#newSessionPending}
+                    />`
+                  : html`<input
+                      name="fetch_latest"
+                      type="checkbox"
+                      .checked=${this.#newSessionSetup.createRequest.fetchLatest}
+                      disabled
+                    />`}
+                <span>Use latest remote branch</span>
+              </label>
             </div>
+            ${this.#newSessionBranchError === ""
+              ? nothing
+              : html`<p class="dialog-warning new-session-branch-warning" role="status">${this.#newSessionBranchError}</p>`}
             ${this.#newSessionPermissionMode === "yolo"
               ? html`<div class="new-session-yolo-warning" role="note"><strong>${fontAwesomeIcon("triangle-exclamation")} Unattended execution (YOLO) is dangerous</strong><span>The agent can run commands and change or delete files without asking for approval.</span></div>`
               : nothing}
