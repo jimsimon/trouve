@@ -212,18 +212,27 @@ selected failed persona, then starts a fresh whole-job replacement so
 successful tasks from an older settings snapshot are not mixed with current
 settings. Every reviewer selected by the current policy runs again.
 
+`@trouve-ai review full` remains accepted as a compatibility alias for
+`@trouve-ai review`; both commands request the same full-branch review. New
+Check Runs expose only the ordinary retry action, which keeps the original
+job's exact base and head revision. Existing pre-8.0 Check Runs may still send
+the retired `full_review` action; that compatibility action instead requests a
+whole review of the pull request's current head.
+
 Each job fetches the exact base and head commits into a managed repository and
-creates an isolated trouve session at that head. The complete diff is enumerated
-by changed path and divided into bounded per-file batches. Manual sends every
-selected reviewer every batch. Additive and Automatic record a decision for
-every persona/batch candidate and dispatch only the selected combinations in
-the built-in read-only review mode, including files beyond the model-facing
-aggregate diff limit. Reviewer profiles, review/router models, router thinking
-level, routing mode, inclusion controls, and every typed routing reason are
-snapshotted durably with the job after repository overrides are applied.
-The dashboard exposes both the router task output and the complete
-selected/skipped decision matrix, which is also published on the job's
-persisted event stream.
+creates an isolated trouve session at that head. Every review covers the full
+branch diff from the Git merge base of the current base ref through the exact
+head; a previously reviewed head is not used as a diff watermark. The complete
+diff is enumerated by changed path and divided into bounded per-file batches.
+Manual sends every selected reviewer every batch. Additive and Automatic
+record a decision for every persona/batch candidate and dispatch only the
+selected combinations in the built-in read-only review mode, including files
+beyond the model-facing aggregate diff limit. Reviewer profiles, review/router
+models, router thinking level, routing mode, inclusion controls, and every
+typed routing reason are snapshotted durably with the job after repository
+overrides are applied. The dashboard exposes both the router task output and
+the complete selected/skipped decision matrix, which is also published on the
+job's persisted event stream.
 
 If semantic triage is disabled or its model response fails validation,
 Additive continues with its baseline and enabled core personas. Automatic
@@ -238,6 +247,19 @@ separate final editor pass then verifies them against the repository, removes
 false positives and findings not introduced by the revision, merges semantic
 duplicates, corrects line metadata, and produces the published summary. The
 result is checked against diff lines again before it is sent to GitHub.
+
+Later reviews receive bounded pull-request history: unresolved and dismissed
+findings, root-cause themes and recurrence evidence, prior candidate
+rejections, current external threads, and carried finding anchors. This
+structured history helps the review converge without suppressing reconsideration
+of code whose behavior changed. Reviewer output and a clean verdict from an
+older head are not reused as coverage of a future head. A successful published
+round with no open blocking findings makes the Check Run succeed immediately;
+there is no separate full-coverage confirmation round for current jobs. A
+clean pre-8.0 partial result remains visibly pending while reconciliation makes
+an initial full-branch compatibility attempt and at most one automatic retry.
+If both attempts end without publication, the dashboards mark the state as
+exhausted and offer a whole-review retry; a published full review clears it.
 
 Each job snapshots the effective review configuration when it is queued. Later
 settings changes apply to newly queued jobs without changing or cancelling

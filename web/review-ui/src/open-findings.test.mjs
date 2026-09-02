@@ -8,8 +8,10 @@ const types = readFileSync(new URL("./types.ts", import.meta.url), "utf8");
 
 test("review jobs distinguish new findings from PR-wide open findings", () => {
   assert.match(types, /open_issue_count\?: number \| null/u);
+  assert.match(types, /legacy_coverage_pending\?: boolean/u);
+  assert.match(types, /legacy_coverage_exhausted\?: boolean/u);
   assert.match(source, /open across this pull request/u);
-  assert.match(source, /A clean incremental result does not resolve findings from earlier rounds/u);
+  assert.match(source, /A clean full-branch result does not resolve findings from earlier rounds/u);
   assert.match(source, /open across pull request/u);
   assert.match(source, /Open status unknown/u);
   assert.match(source, /legacy review predates PR-wide finding snapshots/u);
@@ -27,10 +29,23 @@ test("unknown PR-wide status is visually distinct from review failure", () => {
   assert.doesNotMatch(source, /open_issue_count !== 0/u);
 });
 
+test("legacy partial success stays visibly pending until its full review", () => {
+  assert.match(source, /if \(job\.legacy_coverage_pending\) return "coverage_pending"/u);
+  assert.match(source, /<span class="status warning">full review pending<\/span>/u);
+  assert.match(source, /Full-branch compatibility review pending/u);
+  assert.match(source, /at most two automatic attempts/u);
+  assert.match(source, /if \(job\.legacy_coverage_exhausted\) return "coverage_exhausted"/u);
+  assert.match(source, /<span class="status warning">full review required<\/span>/u);
+  assert.match(source, /Automatic full-branch compatibility attempts exhausted/u);
+  assert.match(source, /requestReview\(detail\.job\)/u);
+  assert.match(source, /Run whole review/u);
+  assert.match(source, /role="status" aria-live="polite"/u);
+});
+
 test("attention replaces succeeded and job rows reserve its full width", () => {
   assert.match(
     source,
-    /attentionState === "open" \? \(\s*<span class="status warning">needs attention<\/span>\s*\) : attentionState === "awaiting-full"/u,
+    /attentionState === "open" \? \(\s*<span class="status warning">needs attention<\/span>\s*\) : attentionState === "unknown"/u,
   );
   assert.doesNotMatch(
     source,
@@ -51,6 +66,14 @@ test("multi-line review warnings use a stacked banner", () => {
   assert.match(
     source,
     /openIssueStatusUnknown && \(\s*<div class="banner warning stacked"/u,
+  );
+  assert.match(
+    source,
+    /job\.legacy_coverage_pending && \(\s*<div class="banner warning stacked"/u,
+  );
+  assert.match(
+    source,
+    /job\.legacy_coverage_exhausted && \(\s*<div class="banner warning stacked"/u,
   );
   assert.match(styles, /\.banner\.stacked \{ flex-direction: column;/u);
 });

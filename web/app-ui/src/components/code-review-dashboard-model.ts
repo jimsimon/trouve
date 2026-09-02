@@ -14,7 +14,7 @@ export const CODE_REVIEW_STATUS_FILTERS = [
 ] as const;
 
 export type CodeReviewStatusFilter = (typeof CODE_REVIEW_STATUS_FILTERS)[number];
-export type CodeReviewJobAction = "cancel" | "retry" | "final-editor";
+export type CodeReviewJobAction = "cancel" | "request" | "retry" | "final-editor";
 
 export interface ReviewJobSummary {
   readonly id: string;
@@ -23,10 +23,8 @@ export interface ReviewJobSummary {
   readonly created_at: string;
   readonly open_issue_count?: number | null;
   readonly advisory_open_issue_count?: number | null;
-  readonly scope?: string;
-  readonly review_base_sha?: string;
-  readonly base_ref?: string;
-  readonly covered_full_branch?: boolean | null;
+  readonly legacy_coverage_pending?: boolean;
+  readonly legacy_coverage_exhausted?: boolean;
 }
 
 export interface ReviewJobGroup<T extends ReviewJobSummary = ReviewJobSummary> {
@@ -237,31 +235,18 @@ export const codeReviewStatusLabel = (status: string): string => {
     : `${normalized[0]?.toUpperCase() ?? ""}${normalized.slice(1)}`;
 };
 
-type ReviewCoverageFields =
-  | "status"
-  | "open_issue_count"
-  | "scope"
-  | "review_base_sha"
-  | "base_ref"
-  | "covered_full_branch";
-
-/** Zero open blocking findings established by a partial round: the check
- * holds at neutral until a clean full-branch round confirms. The server
- * records whether the round's diff spanned the whole branch; legacy rounds
- * without the flag fall back to the sha comparison. */
-export const codeReviewAwaitingFullCoverage = (
-  job: Pick<ReviewJobSummary, ReviewCoverageFields>,
-): boolean =>
-  job.status === "succeeded" &&
-  job.open_issue_count === 0 &&
-  job.scope !== "full" &&
-  !(job.covered_full_branch ?? (job.review_base_sha ?? "") === (job.base_ref ?? ""));
-
 export const codeReviewNeedsAttention = (
-  job: Pick<ReviewJobSummary, ReviewCoverageFields>,
+  job: Pick<
+    ReviewJobSummary,
+    "status" | "open_issue_count" | "legacy_coverage_pending" | "legacy_coverage_exhausted"
+  >,
 ): boolean =>
-  job.status === "succeeded" &&
-  (job.open_issue_count !== 0 || codeReviewAwaitingFullCoverage(job));
+  job.status === "succeeded"
+  && (
+    job.legacy_coverage_pending === true
+    || job.legacy_coverage_exhausted === true
+    || job.open_issue_count !== 0
+  );
 
 /** Only absolute, credential-free HTTPS links may cross the native boundary. */
 export const safeCodeReviewHref = (value: string | null | undefined): string | undefined => {

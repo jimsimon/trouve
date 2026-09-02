@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "7.31"
+    "version": "8.0"
   },
   "paths": {
     "/v1/approvals": {
@@ -6016,13 +6016,6 @@
             ],
             "description": "Thinking level snapshotted for the final coordinator/editor."
           },
-          "covered_full_branch": {
-            "type": [
-              "boolean",
-              "null"
-            ],
-            "description": "Whether this round's diff spanned the entire branch, recorded at the\nmoment the diff base was resolved. `review_base_sha` can be refined to\nthe pull-request merge base during execution, so comparing it against\n`base_ref` misclassifies full first reviews whenever the base branch\nadvanced past the branch point; this flag is authoritative. None on\nrounds that predate it (clients fall back to the sha comparison)."
-          },
           "created_at": {
             "type": "string",
             "format": "date-time"
@@ -6065,6 +6058,14 @@
             "type": "integer",
             "format": "int64",
             "minimum": 0
+          },
+          "legacy_coverage_exhausted": {
+            "type": "boolean",
+            "description": "A clean pre-8.0 partial review still lacks full-branch coverage after\nboth bounded automatic compatibility attempts ended. A manual whole-\nreview retry is required to establish coverage."
+          },
+          "legacy_coverage_pending": {
+            "type": "boolean",
+            "description": "A successfully published pre-8.0 partial review is waiting for the\nbounded automatic full-branch compatibility review. This is a derived\nmigration state, not a scope option for newly created jobs."
           },
           "lifecycle_comment_url": {
             "type": "string"
@@ -6130,14 +6131,10 @@
           },
           "review_base_sha": {
             "type": "string",
-            "description": "Commit used as the left side of this review's diff. For incremental\njobs this is normally the last successfully published head."
+            "description": "Actual pull-request merge base used as the left side of this review's\ndiff. Omitted while a queued or early-running job is still preparing\nits repository. Legacy jobs may expose an incremental watermark here."
           },
           "review_url": {
             "type": "string"
-          },
-          "review_watermark_sha": {
-            "type": "string",
-            "description": "Immutable commit from the last successfully published review. This is\nthe incremental watermark even when history rewriting makes the\neffective `review_base_sha` fall back to the pull request merge base."
           },
           "reviewer_elapsed_ms": {
             "type": "integer",
@@ -6174,7 +6171,8 @@
             "minimum": 0
           },
           "scope": {
-            "$ref": "#/components/schemas/CodeReviewJobScope"
+            "$ref": "#/components/schemas/CodeReviewJobScope",
+            "description": "Historical scope retained for diagnostics. New jobs are always full."
           },
           "semantic_routing": {
             "type": "boolean",
@@ -6291,7 +6289,7 @@
       },
       "CodeReviewJobScope": {
         "type": "string",
-        "description": "Whether a job reviews only changes since the last successfully published\nhead, or the entire pull-request branch against its GitHub base.",
+        "description": "Historical review scope. All newly created jobs use `Full`; `Incremental`\nremains readable for durable rows created before protocol 8.0.",
         "enum": [
           "incremental",
           "full"
@@ -11978,7 +11976,7 @@
       },
       "RequestCodeReviewRequest": {
         "type": "object",
-        "description": "Manual review request. Full scope always compares the current head with\nthe pull request's GitHub base; incremental scope uses the saved watermark\nwhen it remains valid.",
+        "description": "Manual full-branch review request.",
         "required": [
           "installation_id",
           "repository",
@@ -11997,9 +11995,6 @@
           },
           "repository": {
             "type": "string"
-          },
-          "scope": {
-            "$ref": "#/components/schemas/CodeReviewJobScope"
           }
         }
       },

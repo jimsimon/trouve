@@ -23,7 +23,7 @@ sequentially.
 | [0011](0011-github-app-backed-code-review-service.md) | GitHub App-backed code review service | Accepted |
 | [0012](0012-single-version-monorepo-release-train.md) | Single-version monorepo release train | Accepted |
 | [0013](0013-preact-review-dashboard.md) | Preact application for the review dashboard | Accepted |
-| [0014](0014-durable-code-review-job-artifacts.md) | Durable code-review job artifacts and event streams | Accepted |
+| [0014](0014-durable-code-review-job-artifacts.md) | Durable code-review job artifacts and event streams | Partially superseded by 0045 |
 | [0015](0015-read-shared-turns-and-prioritized-capacity.md) | Read-shared turns and prioritized model capacity | Partially superseded by 0042 |
 | [0016](0016-catalog-backed-provider-transports.md) | Catalog-backed provider transports | Accepted |
 | [0017](0017-server-owned-session-title-model.md) | Server-owned session title model with heuristic fallback | Superseded by 0029 |
@@ -54,3 +54,4 @@ sequentially.
 | [0042](0042-provider-governed-turn-admission.md) | Provider-governed turn admission | Accepted |
 | [0043](0043-background-jobs-release-mutation-lane.md) | Background jobs release the session mutation lane | Accepted |
 | [0044](0044-durable-assistant-produced-artifacts.md) | Durable assistant-produced artifacts | Accepted |
+| [0045](0045-full-branch-review-on-every-head.md) | Full-branch review on every head | Accepted |

@@ -936,8 +936,8 @@ pub trait ToolExecutor: Send + Sync {
     ) -> Result<String, String> {
         Err("review repository merge-base is unavailable in this executor".into())
     }
-    /// Drop temporary per-job refs after rewritten-history comparison has
-    /// consumed the historical objects they kept reachable.
+    /// Drop temporary per-job refs after carried-anchor mapping has consumed
+    /// the historical objects they kept reachable.
     async fn cleanup_review_repository_history(
         &self,
         _request: &ReviewRepositoryHistoryCleanup,
@@ -1009,8 +1009,8 @@ pub struct ReviewRepositorySync {
     pub pull_number: u64,
     pub base_sha: String,
     pub head_sha: String,
-    /// Historical commits used only to reduce rewritten-history review
-    /// scope. Failure to fetch one must not prevent the current review.
+    /// Historical commits used only to map carried finding anchors into the
+    /// current head. Failure to fetch one must not narrow or prevent review.
     pub optional_shas: Vec<String>,
     pub token: String,
     pub cancel: tokio_util::sync::CancellationToken,
@@ -3080,7 +3080,7 @@ impl ToolExecutor for LocalToolExecutor {
                         job_id = %request.job_id,
                         %sha,
                         %error,
-                        "could not pin an already-present review-history commit; continuing with the full diff if reuse is unavailable"
+                        "could not pin an already-present review-history commit; continuing without carried-anchor reuse if necessary"
                     );
                 }
             } else {
@@ -3110,7 +3110,7 @@ impl ToolExecutor for LocalToolExecutor {
                     job_id = %request.job_id,
                     %sha,
                     %error,
-                    "optional review-history fetch failed; continuing with the full diff if reuse is unavailable"
+                    "optional review-history fetch failed; continuing without carried-anchor reuse if necessary"
                 );
             }
         }

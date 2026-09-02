@@ -12,7 +12,6 @@ import type {
   ProvidersResponse,
   Repository,
   ReviewJob,
-  ReviewScope,
   ReviewStats,
   ReviewTask,
   ReviewerProfile,
@@ -112,17 +111,13 @@ export const retryFinalEditor = (id: string): Promise<ReviewJob> =>
     method: "POST",
     body: "{}",
   });
-export const requestReview = (
-  job: ReviewJob,
-  scope: ReviewScope,
-): Promise<ReviewJob> =>
+export const requestReview = (job: ReviewJob): Promise<ReviewJob> =>
   api("/code-review/requests", {
     method: "POST",
     body: JSON.stringify({
       installation_id: job.installation_id,
       repository: job.repository,
       pull_number: job.pull_number,
-      scope,
     }),
   });
 export const saveRepository = (repository: Repository): Promise<Repository> =>

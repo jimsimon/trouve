@@ -136,6 +136,8 @@ export type ProtocolCodeReviewDashboard =
   ProtocolComponents["schemas"]["CodeReviewDashboard"];
 export type ProtocolCodeReviewJob =
   ProtocolComponents["schemas"]["CodeReviewJob"];
+export type ProtocolRequestCodeReviewRequest =
+  ProtocolComponents["schemas"]["RequestCodeReviewRequest"];
 export type ProtocolCodeReviewSettings =
   ProtocolComponents["schemas"]["CodeReviewSettings"];
 export type ProtocolSetCodeReviewSettingsRequest =
@@ -431,7 +433,7 @@ const MAX_PROTOCOL_ERROR_FIELD_LENGTH = 512;
 // unions. A newer schema can therefore add a value this bundle cannot decode
 // even when the server labels the change additive. Require the exact schema
 // version this client was generated and tested against.
-export const SUPPORTED_PROTOCOL_VERSION = "7.31";
+export const SUPPORTED_PROTOCOL_VERSION = "8.0";
 
 export const assertProtocolCompatibility = (version: string): void => {
   if (version !== SUPPORTED_PROTOCOL_VERSION) {
@@ -1239,6 +1241,19 @@ export class ProtocolClient {
 
   async refreshCodeReviews(): Promise<void> {
     await this.#mutation("/v1/code-review/refresh", "refresh code reviews", "POST");
+  }
+
+  requestCodeReview(
+    request: ProtocolRequestCodeReviewRequest,
+  ): Promise<ProtocolCodeReviewJob> {
+    return this.#validatedMutation(
+      "/v1/code-review/requests",
+      "request code review",
+      "POST",
+      "CodeReviewJob",
+      (loaded) => loaded.codeReviewJob,
+      request,
+    );
   }
 
   retryCodeReviewJob(jobId: string): Promise<ProtocolCodeReviewJob> {

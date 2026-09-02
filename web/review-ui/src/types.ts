@@ -84,8 +84,6 @@ export interface ReviewJob {
   pull_url: string;
   head_sha: string;
   review_base_sha?: string;
-  review_watermark_sha?: string;
-  covered_full_branch?: boolean | null;
   base_ref: string;
   head_ref: string;
   scope: ReviewScope;
@@ -118,6 +116,8 @@ export interface ReviewJob {
   fixed_issue_count: number;
   open_issue_count?: number | null;
   advisory_open_issue_count?: number | null;
+  legacy_coverage_pending?: boolean;
+  legacy_coverage_exhausted?: boolean;
   error: string;
   created_at: string;
   started_at?: string;

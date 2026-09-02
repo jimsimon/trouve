@@ -645,31 +645,16 @@ function EmptyState({ title, body }: { title: string; body: string }) {
   );
 }
 
-type ReviewCoverageFields =
-  | "status"
-  | "open_issue_count"
-  | "scope"
-  | "review_base_sha"
-  | "base_ref"
-  | "covered_full_branch";
-
-function reviewAwaitingFullCoverage(job: Pick<ReviewJob, ReviewCoverageFields>): boolean {
-  return (
-    job.status === "succeeded" &&
-    job.open_issue_count === 0 &&
-    job.scope !== "full" &&
-    // The server records whether the round's diff spanned the whole branch;
-    // legacy rounds without the flag fall back to the sha comparison.
-    !(job.covered_full_branch ?? (job.review_base_sha ?? "") === job.base_ref)
-  );
-}
-
 function reviewJobAttentionState(
-  job: Pick<ReviewJob, ReviewCoverageFields>,
-): "open" | "awaiting-full" | "unknown" | null {
+  job: Pick<
+    ReviewJob,
+    "status" | "open_issue_count" | "legacy_coverage_pending" | "legacy_coverage_exhausted"
+  >,
+): "coverage_exhausted" | "coverage_pending" | "open" | "unknown" | null {
   if (job.status !== "succeeded") return null;
+  if (job.legacy_coverage_exhausted) return "coverage_exhausted";
+  if (job.legacy_coverage_pending) return "coverage_pending";
   if (job.open_issue_count != null && job.open_issue_count > 0) return "open";
-  if (reviewAwaitingFullCoverage(job)) return "awaiting-full";
   if (job.open_issue_count == null) return "unknown";
   return null;
 }
@@ -680,10 +665,12 @@ function JobRow({ job, now }: { job: ReviewJob; now: number }) {
   const attentionState = reviewJobAttentionState(job);
   return (
     <button class="job-row" type="button" onClick={() => navigate("jobs", job.id)}>
-      {attentionState === "open" ? (
-        <span class="status warning">needs attention</span>
-      ) : attentionState === "awaiting-full" ? (
+      {attentionState === "coverage_exhausted" ? (
+        <span class="status warning">full review required</span>
+      ) : attentionState === "coverage_pending" ? (
         <span class="status warning">full review pending</span>
+      ) : attentionState === "open" ? (
+        <span class="status warning">needs attention</span>
       ) : attentionState === "unknown" ? (
         <span class="status warning">status unknown</span>
       ) : (
@@ -1164,16 +1151,16 @@ function JobDetailPane({
     });
   }, [selectedTaskId]);
 
-  const act = async (action: "cancel" | "retry" | "full"): Promise<void> => {
+  const act = async (action: "cancel" | "request" | "retry"): Promise<void> => {
     if (!detail) return;
     setBusy(action);
     try {
       const replacement =
         action === "cancel"
           ? await cancelJob(detail.job.id)
-          : action === "retry"
-            ? await retryJob(detail.job.id)
-            : await requestReview(detail.job, "full");
+          : action === "request"
+            ? await requestReview(detail.job)
+            : await retryJob(detail.job.id);
       onChanged();
       if (action !== "cancel") {
         if (replacement.id === detail.job.id) {
@@ -1464,10 +1451,12 @@ function JobDetailPane({
       </p>
       <header class="detail-header">
         <div>
-          {attentionState === "open" ? (
-            <span class="status warning">needs attention</span>
-          ) : attentionState === "awaiting-full" ? (
+          {attentionState === "coverage_exhausted" ? (
+            <span class="status warning">full review required</span>
+          ) : attentionState === "coverage_pending" ? (
             <span class="status warning">full review pending</span>
+          ) : attentionState === "open" ? (
+            <span class="status warning">needs attention</span>
           ) : attentionState === "unknown" ? (
             <span class="status warning">status unknown</span>
           ) : (
@@ -1529,7 +1518,13 @@ function JobDetailPane({
         <div>
           <dt>Revision</dt>
           <dd>
-            <code>{(job.review_base_sha || job.base_ref).slice(0, 8)}</code>…<code>{job.head_sha.slice(0, 8)}</code>
+            {job.review_base_sha ? (
+              <>
+                <code>{job.review_base_sha.slice(0, 8)}</code>…<code>{job.head_sha.slice(0, 8)}</code>
+              </>
+            ) : (
+              <>Preparing merge base for <code>{job.head_sha.slice(0, 8)}</code></>
+            )}
           </dd>
         </div>
         <div>
@@ -1576,14 +1571,17 @@ function JobDetailPane({
                 {busy === "final-editor" ? "Retrying…" : "Retry final editor"}
               </button>
             )}
-            <button type="button" disabled={Boolean(busy)} onClick={() => void act("retry")}>
-              {busy === "retry" ? "Retrying…" : unadjudicatedCandidates.length > 0 ? "Rerun all reviewers" : "Retry"}
-            </button>
+            {job.legacy_coverage_exhausted ? (
+              <button type="button" disabled={Boolean(busy)} onClick={() => void act("request")}>
+                {busy === "request" ? "Queueing…" : "Run whole review"}
+              </button>
+            ) : (
+              <button type="button" disabled={Boolean(busy)} onClick={() => void act("retry")}>
+                {busy === "retry" ? "Retrying…" : unadjudicatedCandidates.length > 0 ? "Rerun all reviewers" : "Retry"}
+              </button>
+            )}
           </>
         )}
-        <button class="ghost" type="button" disabled={Boolean(busy)} onClick={() => void act("full")}>
-          {busy === "full" ? "Requesting…" : "Full branch review"}
-        </button>
       </div>
       {error && <div class="banner error">{error}</div>}
       {job.error && <div class="banner error">{job.error}</div>}
@@ -1593,13 +1591,29 @@ function JobDetailPane({
         <ExternalLink href={job.check_run_url}>Open Check Run ↗</ExternalLink>
       </div>
       {job.check_sync_error && <p class="warning">Check sync: {job.check_sync_error}</p>}
+      {job.legacy_coverage_exhausted && (
+        <div class="banner warning stacked" role="alert">
+          <strong>Automatic full-branch compatibility attempts exhausted</strong>
+          <p>
+            This pre-8.0 partial result cannot establish branch coverage. Use Run whole review above to request the current head with every selected reviewer.
+          </p>
+        </div>
+      )}
+      {job.legacy_coverage_pending && (
+        <div class="banner warning stacked" role="status" aria-live="polite">
+          <strong>Full-branch compatibility review pending</strong>
+          <p>
+            This successful result came from a pre-8.0 partial review. A full-branch compatibility result is still required before the revision can pass; the server schedules at most two automatic attempts.
+          </p>
+        </div>
+      )}
       {hasOpenIssues && (
         <div class="banner warning stacked" role="alert">
           <strong>
             {openIssueCount} blocking issue{openIssueCount === 1 ? " remains" : "s remain"} open across this pull request
           </strong>
           <p>
-            This round found {job.issue_count} new issue{job.issue_count === 1 ? "" : "s"}. A clean incremental result does not resolve findings from earlier rounds unless the final editor verifies their fixes.
+            This round found {job.issue_count} new issue{job.issue_count === 1 ? "" : "s"}. A clean full-branch result does not resolve findings from earlier rounds unless the final editor verifies their fixes.
           </p>
         </div>
       )}
@@ -1608,17 +1622,6 @@ function JobDetailPane({
           <strong>PR-wide open issue status is unknown</strong>
           <p>
             This legacy review predates PR-wide finding snapshots. It cannot establish that older findings are resolved, even when this round found no new issues.
-          </p>
-        </div>
-      )}
-      {reviewAwaitingFullCoverage(job) && (
-        <div class="banner warning stacked">
-          <strong>Full-branch confirmation pending</strong>
-          <p>
-            No blocking issues remain open, but this round reviewed only the changes since the
-            last review. The check reports success once a clean review covers the whole branch
-            as it now stands — resolve all review threads or request a full branch review to
-            run that round.
           </p>
         </div>
       )}

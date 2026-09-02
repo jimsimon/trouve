@@ -4,6 +4,30 @@ All notable changes to this project are documented in this file. The format
 is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Full-branch review on every head**: automatic, manual, and retried reviews
+  now inspect the Git merge-base-to-head branch diff. A successfully published
+  clean round completes the Check Run immediately while durable finding,
+  dismissal, root-cause, rejection, external-thread, and carried-anchor history
+  continues to inform later rounds.
+- **Client/server compatibility**: protocol compatibility advances to 8.0.
+  Upgrade the desktop, PWA, review dashboard, and `trouve-server` together. A
+  derived compatibility-pending and exhausted states keep clean pre-8.0
+  partial results neutral while the server performs a bounded full-branch
+  migration review and surface when a manual retry is required.
+
+### Removed
+
+- **Incremental review coverage state**: review requests no longer select a
+  scope, and jobs no longer expose review watermarks or full-coverage flags.
+  New Check Runs no longer expose a separate full-review action, and new jobs
+  no longer need a coverage-confirmation round. Existing pre-8.0 `full_review`
+  actions remain accepted and request the pull request's current head;
+  `@trouve-ai review full` remains an alias for the standard command.
+
 ## [4.7.0] - 2026-09-01
 
 This release keeps pull requests and model reasoning connected to the sessions
