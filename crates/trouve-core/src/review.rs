@@ -18301,6 +18301,15 @@ mod tests {
         let mut first_request = test_review_job_request(&keys[0]);
         first_request.scope = trouve_protocol::CodeReviewJobScope::Full;
         first_request.trigger = "legacy-full-coverage".into();
+        let mut wrong_trigger = first_request.clone();
+        wrong_trigger.trigger = "manual".into();
+        assert_eq!(
+            store
+                .enqueue_legacy_full_coverage_job(&wrong_trigger)
+                .unwrap_err()
+                .to_string(),
+            "legacy coverage reservation requires its compatibility trigger"
+        );
         let first = store
             .enqueue_legacy_full_coverage_job(&first_request)
             .unwrap()

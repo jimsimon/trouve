@@ -23,8 +23,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **Incremental review coverage state**: review requests no longer select a
   scope, and jobs no longer expose review watermarks or full-coverage flags.
-  The separate full-review Check Run action and coverage-confirmation round are
-  removed; `@trouve-ai review full` remains an alias for the standard command.
+  New Check Runs no longer expose a separate full-review action, and new jobs
+  no longer need a coverage-confirmation round. Existing pre-8.0 `full_review`
+  actions remain accepted and request the pull request's current head;
+  `@trouve-ai review full` remains an alias for the standard command.
 
 ## [4.7.0] - 2026-09-01
 

@@ -26,6 +26,11 @@ through the exact head SHA. The service has one review command and one retry
 path; `@trouve-ai review full` remains an accepted alias for
 `@trouve-ai review`.
 
+New Check Runs expose only the ordinary retry action, which remains bound to
+the original job's exact base and head revision. During upgrades, the webhook
+handler still accepts the retired pre-8.0 `full_review` action identifier; that
+legacy action alone requests a whole review of the pull request's current head.
+
 A successfully published round at the exact head makes the Check Run succeed
 as soon as it has no open blocking findings. Newly created rounds have no
 incremental coverage debt and no separate full-coverage confirmation round.

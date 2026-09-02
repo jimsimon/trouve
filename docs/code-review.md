@@ -213,7 +213,11 @@ successful tasks from an older settings snapshot are not mixed with current
 settings. Every reviewer selected by the current policy runs again.
 
 `@trouve-ai review full` remains accepted as a compatibility alias for
-`@trouve-ai review`; both commands request the same full-branch review.
+`@trouve-ai review`; both commands request the same full-branch review. New
+Check Runs expose only the ordinary retry action, which keeps the original
+job's exact base and head revision. Existing pre-8.0 Check Runs may still send
+the retired `full_review` action; that compatibility action instead requests a
+whole review of the pull request's current head.
 
 Each job fetches the exact base and head commits into a managed repository and
 creates an isolated trouve session at that head. Every review covers the full
