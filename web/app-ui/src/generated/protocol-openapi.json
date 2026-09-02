@@ -6059,6 +6059,10 @@
             "format": "int64",
             "minimum": 0
           },
+          "legacy_coverage_pending": {
+            "type": "boolean",
+            "description": "A successfully published pre-8.0 partial review is waiting for the\nbounded automatic full-branch compatibility review. This is a derived\nmigration state, not a scope option for newly created jobs."
+          },
           "lifecycle_comment_url": {
             "type": "string"
           },

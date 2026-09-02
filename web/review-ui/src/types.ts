@@ -116,6 +116,7 @@ export interface ReviewJob {
   fixed_issue_count: number;
   open_issue_count?: number | null;
   advisory_open_issue_count?: number | null;
+  legacy_coverage_pending?: boolean;
   error: string;
   created_at: string;
   started_at?: string;

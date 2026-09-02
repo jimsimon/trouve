@@ -173,6 +173,9 @@ const REVIEW_TASK_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 const REVIEW_COORDINATOR_ADJUDICATION_REPAIR_TIMEOUT: Duration = Duration::from_secs(60);
 const REVIEW_PROJECTION_DEBOUNCE: Duration = Duration::from_millis(750);
 const REVIEW_PROJECTION_REPAIR_LIMIT: usize = 25;
+/// One initial compatibility review plus one automatic retry. Maintainers can
+/// still request another full review explicitly after both attempts fail.
+const LEGACY_FULL_COVERAGE_MAX_ATTEMPTS: usize = 2;
 const CHECK_ACTION_DESCRIPTION_MAX_CHARS: usize = 40;
 const CHECK_DETAILS_MAX_CHARS: usize = 60_000;
 const CHECK_DETAILS_TRUNCATION_MARKER: &str =
@@ -10276,10 +10279,11 @@ impl Engine {
         )))
     }
 
-    /// Settle a pre-8.0 clean incremental round with one full-branch job.
+    /// Settle a pre-8.0 clean incremental round with a full-branch job.
     ///
-    /// The stable dedupe key makes this a compatibility bridge rather than a
-    /// revived coverage-debt scheduler: every current job is already full.
+    /// A bounded sequence of stable dedupe keys permits one automatic retry
+    /// after a terminal unpublished attempt without reviving the unbounded
+    /// coverage-debt scheduler: every current job is already full.
     fn enqueue_legacy_full_coverage_review(
         &self,
         repository: &CodeReviewRepository,
@@ -10307,45 +10311,50 @@ impl Engine {
 
         let reviewers = self.reviewers_for_repository_policy(repository)?;
         let config_hash = Self::code_review_config_hash(repository, &reviewers)?;
-        let dedupe_key = format!(
-            "{}#{}:{}:{}:legacy-full-coverage:{config_hash}",
-            repository.repository, pull.number, pull.base.sha, pull.head.sha
-        );
-        let Some(job) = self.store.enqueue_code_review_job(&NewCodeReviewJob {
-            dedupe_key,
-            installation_id: repository.installation_id,
-            repository: repository.repository.clone(),
-            pull_number: pull.number,
-            pull_title: pull.title.clone(),
-            pull_body: bounded_review_pull_body(pull.body.as_deref()),
-            pull_url: pull.html_url.clone(),
-            head_sha: pull.head.sha.clone(),
-            review_base_sha: String::new(),
-            base_ref: pull.base.sha.clone(),
-            head_ref: pull.head.name.clone(),
-            scope: trouve_protocol::CodeReviewJobScope::Full,
-            trigger: "legacy-full-coverage".into(),
-            retry_of: None,
-            model: repository.model.clone(),
-            coordinator_thinking_level: repository.coordinator_thinking_level.clone(),
-            router_model: repository.router_model.clone(),
-            router_thinking_level: repository.router_thinking_level.clone(),
-            analyst_model: repository.analyst_model.clone(),
-            analyst_thinking_level: repository.analyst_thinking_level.clone(),
-            prompt: repository.prompt.clone(),
-            reviewers,
-            routing_mode: repository.routing_mode,
-            semantic_routing: repository.semantic_routing,
-            included_reviewer_ids: repository.included_reviewer_ids.clone(),
-            excluded_reviewer_ids: repository.excluded_reviewer_ids.clone(),
-            config_hash,
-        })?
-        else {
-            return Ok(false);
-        };
-        self.emit_code_review_updated(Some(job.id))?;
-        self.code_review.job_wake.notify_one();
-        Ok(true)
+        for dedupe_key in legacy_full_coverage_dedupe_keys(
+            &repository.repository,
+            pull.number,
+            &pull.base.sha,
+            &pull.head.sha,
+            &config_hash,
+        ) {
+            let Some(job) = self.store.enqueue_code_review_job(&NewCodeReviewJob {
+                dedupe_key,
+                installation_id: repository.installation_id,
+                repository: repository.repository.clone(),
+                pull_number: pull.number,
+                pull_title: pull.title.clone(),
+                pull_body: bounded_review_pull_body(pull.body.as_deref()),
+                pull_url: pull.html_url.clone(),
+                head_sha: pull.head.sha.clone(),
+                review_base_sha: String::new(),
+                base_ref: pull.base.sha.clone(),
+                head_ref: pull.head.name.clone(),
+                scope: trouve_protocol::CodeReviewJobScope::Full,
+                trigger: "legacy-full-coverage".into(),
+                retry_of: None,
+                model: repository.model.clone(),
+                coordinator_thinking_level: repository.coordinator_thinking_level.clone(),
+                router_model: repository.router_model.clone(),
+                router_thinking_level: repository.router_thinking_level.clone(),
+                analyst_model: repository.analyst_model.clone(),
+                analyst_thinking_level: repository.analyst_thinking_level.clone(),
+                prompt: repository.prompt.clone(),
+                reviewers: reviewers.clone(),
+                routing_mode: repository.routing_mode,
+                semantic_routing: repository.semantic_routing,
+                included_reviewer_ids: repository.included_reviewer_ids.clone(),
+                excluded_reviewer_ids: repository.excluded_reviewer_ids.clone(),
+                config_hash: config_hash.clone(),
+            })?
+            else {
+                continue;
+            };
+            self.emit_code_review_updated(Some(job.id))?;
+            self.code_review.job_wake.notify_one();
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     async fn reconcile_user_resolved_review_findings(
@@ -11430,11 +11439,33 @@ fn review_open_issue_count(job: &trouve_protocol::CodeReviewJob) -> Option<u64> 
 }
 
 fn review_round_covered_full_branch(record: &CodeReviewJobRecord) -> bool {
-    record.job.scope == trouve_protocol::CodeReviewJobScope::Full
-        || record.covered_full_branch.unwrap_or(
-            record.job.review_base_sha.is_empty()
-                || record.job.review_base_sha == record.job.base_ref,
-        )
+    crate::store::code_review_round_covered_full_branch(
+        record.job.scope,
+        record.covered_full_branch,
+        &record.job.review_base_sha,
+        &record.job.base_ref,
+    )
+}
+
+fn legacy_full_coverage_dedupe_keys(
+    repository: &str,
+    pull_number: u64,
+    base_sha: &str,
+    head_sha: &str,
+    config_hash: &str,
+) -> Vec<String> {
+    let base = format!(
+        "{repository}#{pull_number}:{base_sha}:{head_sha}:legacy-full-coverage:{config_hash}"
+    );
+    (1..=LEGACY_FULL_COVERAGE_MAX_ATTEMPTS)
+        .map(|attempt| {
+            if attempt == 1 {
+                base.clone()
+            } else {
+                format!("{base}:retry-{attempt}")
+            }
+        })
+        .collect()
 }
 
 fn legacy_round_requires_full_coverage(record: &CodeReviewJobRecord, head_sha: &str) -> bool {
@@ -12138,7 +12169,8 @@ fn render_lifecycle_comment(
 ) -> String {
     let job = &detail.job;
     let open_issue_count = review_open_issue_count(job);
-    let succeeded_needing_attention = job.status == "succeeded" && open_issue_count != Some(0);
+    let succeeded_needing_attention =
+        job.status == "succeeded" && (open_issue_count != Some(0) || job.legacy_coverage_pending);
     // Only terminal review outcomes expose coordinator-authored results. A
     // queued or running job may hold a staged result while its live revision
     // is revalidated; cancelled and stale jobs never accepted that result.
@@ -12162,7 +12194,7 @@ fn render_lifecycle_comment(
     let icon = match job.status.as_str() {
         "queued" => "⏳",
         "running" => "🔎",
-        "succeeded" if open_issue_count == Some(0) => "✅",
+        "succeeded" if open_issue_count == Some(0) && !job.legacy_coverage_pending => "✅",
         "succeeded" => "🟡",
         "failed" if !detail.unadjudicated_candidates.is_empty() => "⚠️",
         "cancelled" | "stale" => "⏹️",
@@ -12205,6 +12237,11 @@ fn render_lifecycle_comment(
                 "**Result:** {} new confirmed issue(s); PR-wide open issue status is unknown for this legacy review  \n",
                 detail.findings.len()
             )),
+        }
+        if job.legacy_coverage_pending {
+            body.push_str(
+                "**Coverage:** Full-branch compatibility review pending after this legacy partial result  \n",
+            );
         }
     } else if job.status == "failed" && !detail.unadjudicated_candidates.is_empty() {
         body.push_str(&format!(
@@ -18213,6 +18250,78 @@ mod tests {
             &record,
             "3333333333333333333333333333333333333333"
         ));
+    }
+
+    #[test]
+    fn legacy_full_coverage_bridge_retries_once_after_terminal_failure() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let keys = legacy_full_coverage_dedupe_keys(
+            "acme/widgets",
+            42,
+            "1111111111111111111111111111111111111111",
+            "2222222222222222222222222222222222222222",
+            "config",
+        );
+        assert_eq!(keys.len(), LEGACY_FULL_COVERAGE_MAX_ATTEMPTS);
+        assert_ne!(keys[0], keys[1]);
+
+        let mut first_request = test_review_job_request(&keys[0]);
+        first_request.scope = trouve_protocol::CodeReviewJobScope::Full;
+        first_request.trigger = "legacy-full-coverage".into();
+        let first = store
+            .enqueue_code_review_job(&first_request)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            first.id
+        );
+        store
+            .finish_code_review_job(&first.id, "failed", "", "review failed")
+            .unwrap();
+        assert!(
+            store
+                .enqueue_code_review_job(&first_request)
+                .unwrap()
+                .is_none()
+        );
+
+        let mut retry_request = first_request.clone();
+        retry_request.dedupe_key.clone_from(&keys[1]);
+        let retry = store
+            .enqueue_code_review_job(&retry_request)
+            .unwrap()
+            .unwrap();
+        assert_ne!(retry.id, first.id);
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            retry.id
+        );
+        store
+            .finish_code_review_job(&retry.id, "failed", "", "review failed again")
+            .unwrap();
+
+        for key in keys {
+            let mut consumed = first_request.clone();
+            consumed.dedupe_key = key;
+            assert!(store.enqueue_code_review_job(&consumed).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn lifecycle_comment_keeps_legacy_partial_success_pending() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let queued = enqueue_test_review_job(&store, "acme/widgets#42:legacy-lifecycle");
+        let mut detail = store.code_review_job_detail(&queued.id).unwrap().unwrap();
+        detail.job.status = "succeeded".into();
+        detail.job.open_issue_count = Some(0);
+        detail.job.legacy_coverage_pending = true;
+
+        let body = render_lifecycle_comment(&detail, &[], false, &[]);
+
+        assert!(body.contains("## 🟡 Trouve Code Review — Needs Attention"));
+        assert!(body.contains("Full-branch compatibility review pending"));
+        assert!(!body.contains("## ✅ Trouve Code Review — Succeeded"));
     }
 
     #[tokio::test]

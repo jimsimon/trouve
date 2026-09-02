@@ -251,7 +251,9 @@ structured history helps the review converge without suppressing reconsideration
 of code whose behavior changed. Reviewer output and a clean verdict from an
 older head are not reused as coverage of a future head. A successful published
 round with no open blocking findings makes the Check Run succeed immediately;
-there is no separate full-coverage confirmation round.
+there is no separate full-coverage confirmation round for current jobs. A
+clean pre-8.0 partial result remains visibly pending while reconciliation makes
+an initial full-branch compatibility attempt and at most one automatic retry.
 
 Each job snapshots the effective review configuration when it is queued. Later
 settings changes apply to newly queued jobs without changing or cancelling

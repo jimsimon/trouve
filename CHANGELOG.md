@@ -14,7 +14,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   dismissal, root-cause, rejection, external-thread, and carried-anchor history
   continues to inform later rounds.
 - **Client/server compatibility**: protocol compatibility advances to 8.0.
-  Upgrade the desktop, PWA, review dashboard, and `trouve-server` together.
+  Upgrade the desktop, PWA, review dashboard, and `trouve-server` together. A
+  derived compatibility-pending marker keeps clean pre-8.0 partial results
+  neutral while the server performs a bounded full-branch migration review.
 
 ### Removed
 

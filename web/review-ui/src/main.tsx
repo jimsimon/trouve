@@ -645,9 +645,10 @@ function EmptyState({ title, body }: { title: string; body: string }) {
 }
 
 function reviewJobAttentionState(
-  job: Pick<ReviewJob, "status" | "open_issue_count">,
-): "open" | "unknown" | null {
+  job: Pick<ReviewJob, "status" | "open_issue_count" | "legacy_coverage_pending">,
+): "coverage" | "open" | "unknown" | null {
   if (job.status !== "succeeded") return null;
+  if (job.legacy_coverage_pending) return "coverage";
   if (job.open_issue_count != null && job.open_issue_count > 0) return "open";
   if (job.open_issue_count == null) return "unknown";
   return null;
@@ -659,7 +660,9 @@ function JobRow({ job, now }: { job: ReviewJob; now: number }) {
   const attentionState = reviewJobAttentionState(job);
   return (
     <button class="job-row" type="button" onClick={() => navigate("jobs", job.id)}>
-      {attentionState === "open" ? (
+      {attentionState === "coverage" ? (
+        <span class="status warning">full review pending</span>
+      ) : attentionState === "open" ? (
         <span class="status warning">needs attention</span>
       ) : attentionState === "unknown" ? (
         <span class="status warning">status unknown</span>
@@ -1439,7 +1442,9 @@ function JobDetailPane({
       </p>
       <header class="detail-header">
         <div>
-          {attentionState === "open" ? (
+          {attentionState === "coverage" ? (
+            <span class="status warning">full review pending</span>
+          ) : attentionState === "open" ? (
             <span class="status warning">needs attention</span>
           ) : attentionState === "unknown" ? (
             <span class="status warning">status unknown</span>
@@ -1569,6 +1574,14 @@ function JobDetailPane({
         <ExternalLink href={job.check_run_url}>Open Check Run ↗</ExternalLink>
       </div>
       {job.check_sync_error && <p class="warning">Check sync: {job.check_sync_error}</p>}
+      {job.legacy_coverage_pending && (
+        <div class="banner warning stacked" role="alert">
+          <strong>Full-branch compatibility review pending</strong>
+          <p>
+            This successful result came from a pre-8.0 partial review. The server will run one bounded full-branch compatibility review before the revision can pass.
+          </p>
+        </div>
+      )}
       {hasOpenIssues && (
         <div class="banner warning stacked" role="alert">
           <strong>

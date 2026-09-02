@@ -8,6 +8,7 @@ const types = readFileSync(new URL("./types.ts", import.meta.url), "utf8");
 
 test("review jobs distinguish new findings from PR-wide open findings", () => {
   assert.match(types, /open_issue_count\?: number \| null/u);
+  assert.match(types, /legacy_coverage_pending\?: boolean/u);
   assert.match(source, /open across this pull request/u);
   assert.match(source, /A clean full-branch result does not resolve findings from earlier rounds/u);
   assert.match(source, /open across pull request/u);
@@ -25,6 +26,13 @@ test("unknown PR-wide status is visually distinct from review failure", () => {
   assert.match(source, /if \(job\.open_issue_count == null\) return "unknown"/u);
   assert.match(source, /<span class="status warning">status unknown<\/span>/u);
   assert.doesNotMatch(source, /open_issue_count !== 0/u);
+});
+
+test("legacy partial success stays visibly pending until its full review", () => {
+  assert.match(source, /if \(job\.legacy_coverage_pending\) return "coverage"/u);
+  assert.match(source, /<span class="status warning">full review pending<\/span>/u);
+  assert.match(source, /Full-branch compatibility review pending/u);
+  assert.match(source, /one bounded full-branch compatibility review/u);
 });
 
 test("attention replaces succeeded and job rows reserve its full width", () => {
@@ -51,6 +59,10 @@ test("multi-line review warnings use a stacked banner", () => {
   assert.match(
     source,
     /openIssueStatusUnknown && \(\s*<div class="banner warning stacked"/u,
+  );
+  assert.match(
+    source,
+    /job\.legacy_coverage_pending && \(\s*<div class="banner warning stacked"/u,
   );
   assert.match(styles, /\.banner\.stacked \{ flex-direction: column;/u);
 });

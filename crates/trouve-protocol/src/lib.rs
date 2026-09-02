@@ -347,8 +347,9 @@ pub use requests::*;
 // session.pr_mentioned event remains replay-only.
 // 8.0: code review always covers the complete pull-request branch at the
 // exact head. Manual requests no longer select a scope, and jobs no longer
-// expose incremental watermarks or full-coverage confirmation metadata
-// (breaking).
+// expose incremental watermarks or raw coverage markers. A derived legacy
+// compatibility-pending state remains available while pre-8.0 rows settle
+// through bounded full-branch reviews (breaking).
 pub const PROTOCOL_VERSION: &str = "8.0";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";

@@ -2377,6 +2377,11 @@ pub struct CodeReviewJob {
     /// Historical scope retained for diagnostics. New jobs are always full.
     #[serde(default)]
     pub scope: CodeReviewJobScope,
+    /// A successfully published pre-8.0 partial review is waiting for the
+    /// bounded automatic full-branch compatibility review. This is a derived
+    /// migration state, not a scope option for newly created jobs.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub legacy_coverage_pending: bool,
     /// `automatic`, `manual`, or `retry`.
     pub trigger: String,
     /// `queued`, `running`, `succeeded`, `failed`, `cancelled`, or `stale`.

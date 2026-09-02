@@ -3677,6 +3677,16 @@ pub struct CodeReviewJobRecord {
     pub blocking_review_cleanup_pending: bool,
 }
 
+pub(crate) fn code_review_round_covered_full_branch(
+    scope: trouve_protocol::CodeReviewJobScope,
+    covered_full_branch: Option<bool>,
+    review_base_sha: &str,
+    base_ref: &str,
+) -> bool {
+    scope == trouve_protocol::CodeReviewJobScope::Full
+        || covered_full_branch.unwrap_or(review_base_sha.is_empty() || review_base_sha == base_ref)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodeReviewPublicationAbsenceOutcome {
     /// Another worker already reconciled the publication, so the stale
@@ -3759,6 +3769,19 @@ fn row_to_code_review_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<CodeReviewJ
         job_elapsed_ms(&status, created_at, started_at, completed_at);
     let base_ref: String = r.get(7)?;
     let review_base_sha: String = r.get(22)?;
+    let scope = code_review_scope_from(&r.get::<_, String>(23)?);
+    let open_issue_count = r
+        .get::<_, Option<i64>>(56)?
+        .map(|value| value.max(0) as u64);
+    let covered_full_branch = r.get(62)?;
+    let legacy_coverage_pending = status == "succeeded"
+        && open_issue_count == Some(0)
+        && !code_review_round_covered_full_branch(
+            scope,
+            covered_full_branch,
+            &review_base_sha,
+            &base_ref,
+        );
     Ok(CodeReviewJobRecord {
         job: trouve_protocol::CodeReviewJob {
             id: r.get(0)?,
@@ -3771,7 +3794,8 @@ fn row_to_code_review_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<CodeReviewJ
             review_base_sha,
             base_ref,
             head_ref: r.get(8)?,
-            scope: code_review_scope_from(&r.get::<_, String>(23)?),
+            scope,
+            legacy_coverage_pending,
             trigger: r.get(9)?,
             status,
             retry_of: r.get(24)?,
@@ -3808,9 +3832,7 @@ fn row_to_code_review_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<CodeReviewJ
             candidate_issue_count: r.get::<_, i64>(33)? as u64,
             issue_count: r.get::<_, i64>(34)? as u64,
             fixed_issue_count: r.get::<_, i64>(35)? as u64,
-            open_issue_count: r
-                .get::<_, Option<i64>>(56)?
-                .map(|value| value.max(0) as u64),
+            open_issue_count,
             advisory_open_issue_count: r
                 .get::<_, Option<i64>>(60)?
                 .map(|value| value.max(0) as u64),
@@ -3826,7 +3848,7 @@ fn row_to_code_review_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<CodeReviewJ
             publication_elapsed_ms: r.get::<_, i64>(42)? as u64,
         },
         can_retry_final_editor: r.get(61)?,
-        covered_full_branch: r.get(62)?,
+        covered_full_branch,
         prompt: r.get(12)?,
         pull_body: r.get(57)?,
         config_hash: r.get(14)?,
@@ -10005,7 +10027,7 @@ impl Store {
     pub fn set_code_review_job_review_base(&self, id: &str, review_base_sha: &str) -> Result<bool> {
         Ok(self.conn.lock().unwrap().execute(
             "UPDATE code_review_jobs
-             SET review_base_sha = ?2
+             SET review_base_sha = ?2, review_covered_full_branch = 1
              WHERE id = ?1 AND status = 'running'",
             params![id, review_base_sha],
         )? > 0)
@@ -28404,6 +28426,52 @@ mod tests {
             .finish_code_review_job(&job.id, "succeeded", "https://example.test/review", "")
             .unwrap();
         (job, stored)
+    }
+
+    #[test]
+    fn legacy_partial_projection_exposes_derived_coverage_pending_state() {
+        let store = Store::open_in_memory().unwrap();
+        let (partial, _) = publish_leveled_test_round(
+            &store,
+            "acme/widgets#42:legacy-partial-projection",
+            "2222222222222222222222222222222222222222",
+            trouve_protocol::CodeReviewJobScope::Incremental,
+            &[],
+            &[],
+        );
+
+        let projected = store.code_review_job(&partial.id).unwrap().unwrap().job;
+        assert_eq!(projected.open_issue_count, Some(0));
+        assert!(projected.legacy_coverage_pending);
+    }
+
+    #[test]
+    fn upgraded_worker_marks_an_in_flight_legacy_job_as_full_coverage() {
+        let store = Store::open_in_memory().unwrap();
+        let mut request = backoff_test_job_request();
+        request.dedupe_key = "acme/widgets#42:upgraded-legacy-worker".into();
+        request.review_base_sha.clear();
+        request.base_ref = "3333333333333333333333333333333333333333".into();
+        let queued = store.enqueue_code_review_job(&request).unwrap().unwrap();
+        let claimed = store.claim_code_review_job().unwrap().unwrap();
+        assert_eq!(claimed.job.id, queued.id);
+        assert_eq!(claimed.covered_full_branch, None);
+
+        assert!(
+            store
+                .set_code_review_job_review_base(
+                    &queued.id,
+                    "1111111111111111111111111111111111111111",
+                )
+                .unwrap()
+        );
+
+        let updated = store.code_review_job(&queued.id).unwrap().unwrap();
+        assert_eq!(
+            updated.job.review_base_sha,
+            "1111111111111111111111111111111111111111"
+        );
+        assert_eq!(updated.covered_full_branch, Some(true));
     }
 
     #[test]

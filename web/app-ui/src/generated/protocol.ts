@@ -2202,6 +2202,12 @@ export interface components {
             installation_id: number;
             /** Format: int64 */
             issue_count?: number;
+            /**
+             * @description A successfully published pre-8.0 partial review is waiting for the
+             *     bounded automatic full-branch compatibility review. This is a derived
+             *     migration state, not a scope option for newly created jobs.
+             */
+            legacy_coverage_pending?: boolean;
             lifecycle_comment_url?: string;
             model?: string | null;
             /**
