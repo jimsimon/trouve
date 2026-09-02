@@ -39,10 +39,10 @@ use crate::store::{
     ReviewWorkspaceCleanupIntent, SessionPrVerificationIntent, Store,
 };
 use crate::tools::{
-    AttachmentMaterialization, AttachmentMaterializationFile, BackgroundMutationLease,
-    DeletedSessionCleanup, LocalToolExecutor, MaterializedAttachment, McpConfigMutation,
-    McpConfigMutationOutcome, McpConfigMutationRequest, SessionRepositoryDiff,
-    SessionRepositoryPush, ToolCtx, ToolExecutor, ToolResult, edit_strategy_for_model,
+    AttachmentMaterialization, AttachmentMaterializationFile, DeletedSessionCleanup,
+    LocalToolExecutor, MaterializedAttachment, McpConfigMutation, McpConfigMutationOutcome,
+    McpConfigMutationRequest, SessionRepositoryDiff, SessionRepositoryPush, ToolCtx, ToolExecutor,
+    ToolResult, edit_strategy_for_model,
 };
 use crate::{context, git, new_id, personas};
 
@@ -7470,9 +7470,8 @@ impl Engine {
             .collect())
     }
 
-    /// Mention-only associations are navigation evidence, not authorization
-    /// for GitHub mutations. Mutation targets must either have a durable
-    /// session-created link or a head commit verified in the session worktree.
+    /// Mutation targets must either have a durable session-created link or a
+    /// head commit verified in the session worktree.
     async fn session_pr_allows_mutation(
         &self,
         session_id: &str,
@@ -7488,14 +7487,9 @@ impl Engine {
         Ok(self.pr_has_locally_verified_head(session_id, pr).await)
     }
 
-    fn mentioned_session_prs(&self, session_id: &str) -> Result<HashSet<String>, EngineError> {
-        Ok(self.store.session_pr_mentions(session_id)?)
-    }
-
     /// Provider-neutral evidence tying GitHub activity to this session.
-    /// Explicit PR references work for any integration; successful tool args
-    /// and produced commit IDs preserve enough identity to discover a PR that
-    /// the user creates later in GitHub's UI.
+    /// Successful tool arguments and produced commit IDs preserve enough
+    /// identity to discover PRs created through provider-neutral tooling.
     fn session_pr_evidence(
         &self,
         session_id: &str,
@@ -7583,14 +7577,12 @@ impl Engine {
         for number in evidence.numbers {
             if seen.insert(number) {
                 let already_recorded = evidence.recorded_numbers.contains(&number);
-                let explicitly_mentioned = evidence.mentioned_numbers.contains(&number);
                 match github.pr(number).await {
                     Ok(pr)
                         if already_recorded
-                            || explicitly_mentioned
                             || self.pr_has_locally_verified_head(session_id, &pr).await =>
                     {
-                        if !already_recorded && !explicitly_mentioned {
+                        if !already_recorded {
                             self.record_session_pr_numbers(
                                 session_id,
                                 &repository,
@@ -7635,7 +7627,6 @@ impl Engine {
         candidates: impl IntoIterator<Item = &'a trouve_protocol::PrInfo>,
         session: &Session,
         linked_urls: &HashSet<String>,
-        mentioned_urls: &HashSet<String>,
     ) -> Vec<trouve_protocol::PrInfo> {
         let mut seen = HashSet::new();
         let mut prs = candidates
@@ -7643,7 +7634,6 @@ impl Engine {
             .filter(|pr| {
                 (pr.workspace_id == session.workspace_id && pr.head == session.branch)
                     || linked_urls.contains(&pr.url.trim_end_matches('/').to_ascii_lowercase())
-                    || mentioned_urls.contains(&pr.url.trim_end_matches('/').to_ascii_lowercase())
             })
             .filter(|pr| {
                 seen.insert((
@@ -7681,7 +7671,6 @@ impl Engine {
     ) -> Result<Vec<trouve_protocol::PrInfo>, EngineError> {
         let session = self.get_session(session_id)?;
         let linked_urls = self.recorded_session_pr_urls(session_id)?;
-        let mentioned_urls = self.mentioned_session_prs(session_id)?;
         let mut candidates = Vec::new();
         for (host, _) in self.github_hosts() {
             let Some(snapshot) = self.store.latest_github_pr_snapshot(&host)? else {
@@ -7693,7 +7682,6 @@ impl Engine {
             &candidates,
             &session,
             &linked_urls,
-            &mentioned_urls,
         ))
     }
 
@@ -7989,12 +7977,10 @@ impl Engine {
         let mut session_pull_requests = Vec::new();
         for session in self.list_sessions(None)? {
             let linked_urls = self.recorded_session_pr_urls(&session.id)?;
-            let mentioned_urls = self.mentioned_session_prs(&session.id)?;
             let prs = Self::project_session_pr_candidates(
                 account_prs.iter().copied(),
                 &session,
                 &linked_urls,
-                &mentioned_urls,
             );
             if !prs.is_empty() {
                 session_pull_requests.push(trouve_protocol::SessionPrProjection {
@@ -12605,7 +12591,6 @@ impl Engine {
             config_dir: self.config_dir.clone(),
             workspace_root: Some(PathBuf::from(&ws.path)),
             edit_strategy: edit_strategy_for_model(&thread.model),
-            background_mutation_lease: None,
         };
 
         let all_modes = self.resolve_personas(Some(Path::new(&ws.path)))?;
@@ -13973,7 +13958,6 @@ impl Engine {
             config_dir: self.config_dir.clone(),
             workspace_root: Some(PathBuf::from(&ws.path)),
             edit_strategy: edit_strategy_for_model(&thread.model),
-            background_mutation_lease: None,
         };
         Ok((session, thread, mode, ctx))
     }
@@ -16832,19 +16816,7 @@ impl Engine {
                 )
                 .await?;
             let executor = self.executor.clone();
-            let mut tool_ctx = ctx.clone();
-            if call.name == "shell"
-                && call
-                    .arguments
-                    .get("run_in_background")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false)
-                && let Some(ExecutionPermit::Write { guard }) = permit.as_mut()
-                && let Some(guard) = guard.take()
-            {
-                tool_ctx.background_mutation_lease =
-                    Some(Arc::new(BackgroundMutationLease::new(guard)));
-            }
+            let tool_ctx = ctx.clone();
             let tool_name = call.name.clone();
             let tool_arguments = call.arguments.clone();
             let execution_started = std::time::Instant::now();
@@ -18744,7 +18716,6 @@ fn requests_remote_ref_mutation(
 struct SessionPrEvidence {
     numbers: HashSet<u64>,
     recorded_numbers: HashSet<u64>,
-    mentioned_numbers: HashSet<u64>,
     successful_tool_args: Vec<String>,
     commit_ids: HashSet<String>,
 }
@@ -18754,13 +18725,12 @@ impl SessionPrEvidence {
     fn extend(&mut self, other: Self) {
         self.numbers.extend(other.numbers);
         self.recorded_numbers.extend(other.recorded_numbers);
-        self.mentioned_numbers.extend(other.mentioned_numbers);
         self.successful_tool_args.extend(other.successful_tool_args);
         self.commit_ids.extend(other.commit_ids);
     }
 }
 
-/// Collect PR references, successful branch activity, and commits from events.
+/// Collect successful PR creation, branch activity, and commits from events.
 fn pr_evidence_from_events(
     events: impl IntoIterator<Item = Event>,
     host: &str,
@@ -18772,27 +18742,6 @@ fn pr_evidence_from_events(
     let mut evidence = SessionPrEvidence::default();
     for event in events {
         match event {
-            Event::UserMessage {
-                content,
-                background: false,
-                ..
-            }
-            | Event::TurnSteered { content, .. }
-            | Event::AssistantMessage { content, .. } => {
-                let numbers = crate::github::pr_numbers_in_chat_text(&content, host, owner, repo);
-                evidence.numbers.extend(numbers.iter().copied());
-                evidence.mentioned_numbers.extend(numbers);
-            }
-            Event::AssistantProgress { text, .. } => {
-                let numbers = crate::github::pr_numbers_in_chat_text(&text, host, owner, repo);
-                evidence.numbers.extend(numbers.iter().copied());
-                evidence.mentioned_numbers.extend(numbers);
-            }
-            Event::SubagentSpawned { prompt, .. } => {
-                let numbers = crate::github::pr_numbers_in_chat_text(&prompt, host, owner, repo);
-                evidence.numbers.extend(numbers.iter().copied());
-                evidence.mentioned_numbers.extend(numbers);
-            }
             Event::ToolRequested {
                 call_id,
                 tool,
@@ -23983,7 +23932,7 @@ default_permission_mode = "ask"
         let local = engine.projected_session_prs(&session.id).unwrap();
         assert_eq!(
             local.iter().map(|pr| pr.number).collect::<Vec<_>>(),
-            vec![10, 11, 12]
+            vec![10, 11]
         );
 
         let (cursor, projection) = engine.server_projection_snapshot().unwrap();
@@ -23999,7 +23948,7 @@ default_permission_mode = "ask"
                 .iter()
                 .map(|pr| pr.number)
                 .collect::<Vec<_>>(),
-            vec![10, 11, 12]
+            vec![10, 11]
         );
     }
 
@@ -24192,8 +24141,7 @@ default_permission_mode = "ask"
             },
         ];
         let evidence = pr_evidence_from_events(events, "github.com", "o", "r");
-        assert_eq!(evidence.numbers, HashSet::from([73, 75]));
-        assert_eq!(evidence.mentioned_numbers, HashSet::from([73]));
+        assert_eq!(evidence.numbers, HashSet::from([75]));
         assert_eq!(evidence.successful_tool_args.len(), 2);
         assert!(
             evidence

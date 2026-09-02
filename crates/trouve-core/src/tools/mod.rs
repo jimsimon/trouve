@@ -584,38 +584,6 @@ async fn run_optional_review_fetches(
     Ok(failures)
 }
 
-/// One session mutation lane that a tool may transfer to a background task.
-///
-/// The engine installs this only for a background `shell` call. The shell
-/// waiter takes ownership after the process starts and holds the write guard
-/// until that process exits or is killed and reaped. If the executor rejects
-/// the call before taking it, the guard is released when the call context is
-/// dropped.
-pub struct BackgroundMutationLease {
-    guard: Mutex<Option<tokio::sync::OwnedRwLockWriteGuard<()>>>,
-}
-
-impl std::fmt::Debug for BackgroundMutationLease {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("BackgroundMutationLease")
-            .field("available", &self.guard.lock().unwrap().is_some())
-            .finish()
-    }
-}
-
-impl BackgroundMutationLease {
-    pub(crate) fn new(guard: tokio::sync::OwnedRwLockWriteGuard<()>) -> Self {
-        Self {
-            guard: Mutex::new(Some(guard)),
-        }
-    }
-
-    pub(crate) fn take(&self) -> Option<tokio::sync::OwnedRwLockWriteGuard<()>> {
-        self.guard.lock().unwrap().take()
-    }
-}
-
 /// Execution context: everything a tool may touch. Mutation paths resolve
 /// inside the session worktree; explicitly registered host resources are
 /// additionally available to read-only filesystem tools.
@@ -645,11 +613,6 @@ pub struct ToolCtx {
     /// Model-specific editing policy used for both tool advertisement and
     /// execution enforcement.
     pub edit_strategy: EditStrategy,
-    /// Engine-owned session write lease available only to a background shell
-    /// launch. Kept public for `ToolCtx` construction compatibility; custom
-    /// executors must leave it untouched.
-    #[doc(hidden)]
-    pub background_mutation_lease: Option<Arc<BackgroundMutationLease>>,
 }
 
 impl ToolCtx {
