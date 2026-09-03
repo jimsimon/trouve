@@ -14,17 +14,27 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   returns, the job is stopped, or its lifetime cap fires. It is reported in
   the tool result (`detached`, plus a `note`) and stopped when the session
   worktree is removed, even when it is handed over while the removal is in
-  progress (reported as `stopped_after_eviction` in that case). Descendants
-  that only leave the process group are still stopped with the call and are
-  now reported as `killed_escaped`. Platforms that cannot tell a detached
-  daemon from the rest of the tree (macOS) keep stopping everything, and the
-  tool description says so.
+  progress (reported as `stopped_after_eviction` in that case). Workers a
+  released daemon forks later are stopped with it: the tree's sentinel is
+  retained until the worktree is removed, and whatever holds it is found and
+  stopped then. Signals to released daemons go through a pidfd bound to the
+  recorded process where the kernel offers one, so a recycled pid is never
+  hit, and a live daemon is never dropped from the record however many are
+  released. Descendants that only leave the process group are still stopped
+  with the call and are now reported as `killed_escaped`. Platforms that
+  cannot tell a detached daemon from the rest of the tree (macOS) keep
+  stopping everything, and the tool description says so.
 - **Bounded process-tree cleanup**: a foreground call or background job whose
   process tree cannot be confirmed empty now reports the failure after three
   attempts instead of holding the session's mutation lane indefinitely.
+  `shell_kill` retries the same way and closes the job even when the
+  attempts are exhausted, so `shell_output` no longer reports it as running.
 - **No descriptor leaks into shell children**: process-tree spawns mark every
   inherited descriptor beyond stdio close-on-exec, so descriptors the desktop
-  host opens without `O_CLOEXEC` no longer reach child processes.
+  host opens without `O_CLOEXEC` no longer reach child processes. A spawn
+  that could only sanitize part of the descriptor table — no `close_range`,
+  no listable `/proc/self/fd`, and a soft `RLIMIT_NOFILE` above 2^20 — fails
+  with an error naming the limit instead of leaking the rest.
 
 ## [4.8.1] - 2026-09-03
 

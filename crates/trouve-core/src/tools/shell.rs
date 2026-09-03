@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use trouve_agents::process_env::{
-    DetachedProcess, ProcessTreeChild, TerminatedEscapee, spawn_process_tree,
+    DetachedProcess, ProcessTreeChild, ReleasedSentinel, TerminatedEscapee, spawn_process_tree,
 };
 
 use super::{Tool, ToolCtx, ToolResult};
@@ -36,8 +36,11 @@ const RELEASED_PIPE_DRAIN: Duration = Duration::from_millis(200);
 /// before it is killed.
 const DETACHED_EXIT_GRACE: Duration = Duration::from_secs(2);
 const DETACHED_EXIT_POLL: Duration = Duration::from_millis(50);
-/// Soft cap on remembered released daemons; dead entries are pruned first.
-const MAX_DETACHED: usize = 512;
+/// Remembered released daemons (or retained sentinels) above which the record
+/// is pruned of daemons that have exited and sentinels nobody holds. Live
+/// entries are never dropped: forgetting one would leave a daemon nobody
+/// stops at eviction.
+const DETACHED_PRUNE_THRESHOLD: usize = 512;
 /// Evictions remembered so that a daemon handed over late (its tree finished
 /// while the eviction ran) is stopped rather than kept. Late hand-overs can
 /// only come from calls and jobs that were in flight at eviction, so the
@@ -248,6 +251,26 @@ impl DetachedEntry {
     }
 }
 
+/// The sentinel of a tree whose daemons were released. Workers they fork
+/// later inherit it too, so eviction finds them through it although no
+/// record names them.
+struct RetainedTree {
+    sentinel: ReleasedSentinel,
+    worktree: PathBuf,
+    /// The command that started the tree, for logs.
+    command: String,
+}
+
+impl RetainedTree {
+    fn new(worktree: &Path, command: &str, sentinel: ReleasedSentinel) -> Self {
+        Self {
+            sentinel,
+            worktree: worktree.to_path_buf(),
+            command: command.to_string(),
+        }
+    }
+}
+
 /// Released daemons, keyed by the worktree whose eviction terminates them.
 ///
 /// A daemon changes hands in [`Self::adopt`], which records it only after
@@ -261,13 +284,27 @@ struct DetachedRegistry {
     state: Mutex<DetachedState>,
 }
 
-#[derive(Default)]
 struct DetachedState {
     entries: Vec<DetachedEntry>,
+    /// Sentinels of the trees behind `entries`, by worktree.
+    sentinels: Vec<RetainedTree>,
     /// Worktrees already evicted, oldest first. Managed worktree paths carry
     /// their session id and are never reused, so remembering one cannot stop
     /// a later session's daemons.
     evicted: VecDeque<PathBuf>,
+    /// Record size above which [`Self::prune`] runs.
+    prune_threshold: usize,
+}
+
+impl Default for DetachedState {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+            sentinels: Vec::new(),
+            evicted: VecDeque::new(),
+            prune_threshold: DETACHED_PRUNE_THRESHOLD,
+        }
+    }
 }
 
 impl DetachedRegistry {
@@ -282,9 +319,10 @@ impl DetachedRegistry {
         if remnants.detached.is_empty() {
             return remnants;
         }
+        let sentinel = child.release_sentinel();
         let mut state = self.state.lock().unwrap();
         if !state.evicted.iter().any(|evicted| evicted == worktree) {
-            state.register(worktree, command, &remnants.detached);
+            state.register(worktree, command, &remnants.detached, sentinel);
             return remnants;
         }
         drop(state);
@@ -293,6 +331,10 @@ impl DetachedRegistry {
             .stopped_after_eviction
             .iter()
             .map(|process| DetachedEntry::new(worktree, command, process))
+            .collect();
+        let late_trees: Vec<RetainedTree> = sentinel
+            .map(|sentinel| RetainedTree::new(worktree, command, sentinel))
+            .into_iter()
             .collect();
         for entry in &late {
             tracing::warn!(
@@ -304,7 +346,7 @@ impl DetachedRegistry {
             );
         }
         tokio::spawn(async move {
-            for failure in terminate_entries(late).await {
+            for failure in terminate_entries(late, late_trees).await {
                 tracing::warn!(
                     %failure,
                     "could not stop a process released after its worktree was evicted"
@@ -314,25 +356,37 @@ impl DetachedRegistry {
         remnants
     }
 
-    /// Terminate every daemon released by `worktree` and put the eviction on
-    /// record. Returns the failures.
+    /// Terminate every daemon released by `worktree`, and whatever those
+    /// daemons forked since, and put the eviction on record. Returns the
+    /// failures.
     async fn terminate_worktree(&self, worktree: &Path) -> Vec<String> {
-        let entries: Vec<DetachedEntry> = {
+        let (entries, trees) = {
             let mut state = self.state.lock().unwrap();
             state.remember_eviction(worktree);
-            let (mine, others) = state
+            let (mine, others): (Vec<DetachedEntry>, Vec<DetachedEntry>) = state
                 .entries
                 .drain(..)
                 .partition(|entry| entry.worktree == worktree);
             state.entries = others;
-            mine
+            let (my_trees, other_trees): (Vec<RetainedTree>, Vec<RetainedTree>) = state
+                .sentinels
+                .drain(..)
+                .partition(|tree| tree.worktree == worktree);
+            state.sentinels = other_trees;
+            (mine, my_trees)
         };
-        terminate_entries(entries).await
+        terminate_entries(entries, trees).await
     }
 }
 
 impl DetachedState {
-    fn register(&mut self, worktree: &Path, command: &str, processes: &[DetachedProcess]) {
+    fn register(
+        &mut self,
+        worktree: &Path,
+        command: &str,
+        processes: &[DetachedProcess],
+        sentinel: Option<ReleasedSentinel>,
+    ) {
         for process in processes {
             let known = self.entries.iter().any(|entry| {
                 entry.process.pid == process.pid && entry.process.start_time == process.start_time
@@ -350,11 +404,22 @@ impl DetachedState {
             self.entries
                 .push(DetachedEntry::new(worktree, command, process));
         }
-        if self.entries.len() > MAX_DETACHED {
-            self.entries.retain(|entry| entry.process.is_alive());
-            let excess = self.entries.len().saturating_sub(MAX_DETACHED);
-            self.entries.drain(..excess);
+        if let Some(sentinel) = sentinel {
+            self.sentinels
+                .push(RetainedTree::new(worktree, command, sentinel));
         }
+        if self.entries.len() > self.prune_threshold || self.sentinels.len() > self.prune_threshold
+        {
+            self.prune();
+        }
+    }
+
+    /// Forget daemons that have exited and sentinels nobody holds any more.
+    /// Nothing live is ever forgotten, whatever the record's size.
+    fn prune(&mut self) {
+        self.entries.retain(|entry| entry.process.is_alive());
+        self.sentinels
+            .retain(|tree| tree.sentinel.is_held().unwrap_or(true));
     }
 
     fn remember_eviction(&mut self, worktree: &Path) {
@@ -369,9 +434,37 @@ impl DetachedState {
 }
 
 /// Ask each daemon to exit, give it a short grace period, then kill the
-/// survivors. Returns the failures.
-async fn terminate_entries(entries: Vec<DetachedEntry>) -> Vec<String> {
+/// survivors. Whatever else holds a retained sentinel, such as a worker a
+/// daemon forked after the hand-over, is treated the same way. Returns the
+/// failures.
+async fn terminate_entries(
+    mut entries: Vec<DetachedEntry>,
+    trees: Vec<RetainedTree>,
+) -> Vec<String> {
     let mut failures = Vec::new();
+    for tree in &trees {
+        match tree.sentinel.holders() {
+            Ok(holders) => {
+                for holder in holders {
+                    let known = entries.iter().any(|entry| {
+                        entry.process.pid == holder.pid
+                            && entry.process.start_time == holder.start_time
+                    });
+                    if known {
+                        continue;
+                    }
+                    tracing::info!(
+                        pid = holder.pid,
+                        name = %holder.name,
+                        command = tree.command,
+                        "a process released by a shell call forked another after the hand-over; stopping it with the worktree"
+                    );
+                    entries.push(DetachedEntry::new(&tree.worktree, &tree.command, &holder));
+                }
+            }
+            Err(error) => failures.push(retained_tree_failure(tree, &error)),
+        }
+    }
     let mut pending = Vec::new();
     for entry in entries {
         match entry.process.request_exit() {
@@ -396,7 +489,50 @@ async fn terminate_entries(entries: Vec<DetachedEntry>) -> Vec<String> {
             failures.push(detached_failure(&entry, &error));
         }
     }
+    for tree in &trees {
+        failures.extend(sweep_retained_tree(tree).await);
+    }
     failures
+}
+
+/// A daemon may fork again while it is being stopped: kill whatever still
+/// holds the tree's sentinel until nothing does or the grace period is over.
+async fn sweep_retained_tree(tree: &RetainedTree) -> Vec<String> {
+    let mut failures = Vec::new();
+    let deadline = tokio::time::Instant::now() + DETACHED_EXIT_GRACE;
+    loop {
+        let holders = match tree.sentinel.holders() {
+            Ok(holders) => holders,
+            Err(error) => {
+                failures.push(retained_tree_failure(tree, &error));
+                return failures;
+            }
+        };
+        if holders.is_empty() {
+            return failures;
+        }
+        for holder in holders {
+            if let Err(error) = holder.kill() {
+                let entry = DetachedEntry::new(&tree.worktree, &tree.command, &holder);
+                failures.push(detached_failure(&entry, &error));
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            failures.push(format!(
+                "released process tree for `{}` still has holders after eviction",
+                tree.command
+            ));
+            return failures;
+        }
+        tokio::time::sleep(DETACHED_EXIT_POLL).await;
+    }
+}
+
+fn retained_tree_failure(tree: &RetainedTree, error: &std::io::Error) -> String {
+    format!(
+        "released process tree for `{}`: cannot list its holders: {error}",
+        tree.command
+    )
 }
 
 fn detached_failure(entry: &DetachedEntry, error: &std::io::Error) -> String {
@@ -409,10 +545,16 @@ fn detached_failure(entry: &DetachedEntry, error: &std::io::Error) -> String {
 impl Drop for DetachedRegistry {
     fn drop(&mut self) {
         // The sessions that owned these daemons are going away with the
-        // registry; ask them to exit without waiting.
+        // registry; ask them, and whatever they forked since, to exit
+        // without waiting.
         if let Ok(state) = self.state.get_mut() {
             for entry in state.entries.drain(..) {
                 let _ = entry.process.request_exit();
+            }
+            for tree in state.sentinels.drain(..) {
+                for holder in tree.sentinel.holders().unwrap_or_default() {
+                    let _ = holder.request_exit();
+                }
             }
         }
     }
@@ -489,18 +631,19 @@ async fn terminate_background_job(
     Ok(())
 }
 
-/// [`terminate_background_job`] for tasks with nobody to report to: retry
-/// an unacknowledged cleanup up to the bound, then close the job with a
-/// warning rather than retrying for as long as the unowned process lives.
+/// [`terminate_background_job`] for callers that cannot wait for as long as
+/// an unowned process lives: retry an unacknowledged cleanup up to the
+/// bound, then close the job with a warning. The warning is logged and
+/// recorded on the job, and returned for callers with someone to report to.
 async fn terminate_background_job_bounded(
     cleanup: &CleanupController,
     detached: &DetachedRegistry,
     job: &JobHandle,
-) {
+) -> Result<(), String> {
     let mut attempts = 0;
     let error = loop {
         match terminate_background_job(cleanup, detached, job).await {
-            Ok(()) => return,
+            Ok(()) => return Ok(()),
             Err(error) => {
                 attempts += 1;
                 if attempts >= CLEANUP_ACKNOWLEDGEMENT_ATTEMPTS {
@@ -519,7 +662,8 @@ async fn terminate_background_job_bounded(
     let mut output = job.output.lock().unwrap();
     output.killed = true;
     output.exit_code.get_or_insert(-1);
-    output.cleanup_warning = Some(warning);
+    output.cleanup_warning = Some(warning.clone());
+    Err(warning)
 }
 
 fn unacknowledged_cleanup_warning(error: &impl std::fmt::Display) -> String {
@@ -577,9 +721,12 @@ impl JobRegistry {
         };
         let mut failures = Vec::new();
         for (id, job) in jobs {
-            if let Err(error) = terminate_background_job(&self.cleanup, &self.detached, &job).await
+            // Bounded: the job is closed either way, so an unstoppable tree
+            // neither holds the eviction nor keeps a job slot forever.
+            if let Err(warning) =
+                terminate_background_job_bounded(&self.cleanup, &self.detached, &job).await
             {
-                failures.push(format!("{id}: {error}"));
+                failures.push(format!("{id}: {warning}"));
             }
         }
         // Jobs first: stopping one can release further daemons for this
@@ -1017,8 +1164,10 @@ impl Shell {
                         Err(_) => {
                             // A liveness-query failure must not leave an
                             // untracked descendant running behind a job that
-                            // looks finished.
-                            terminate_background_job_bounded(&cleanup, &detached, &job).await;
+                            // looks finished. Nobody to report to: the warning
+                            // is logged and recorded on the job.
+                            let _ =
+                                terminate_background_job_bounded(&cleanup, &detached, &job).await;
                             break;
                         }
                     }
@@ -1034,7 +1183,9 @@ impl Shell {
             tokio::spawn(async move {
                 tokio::time::sleep(lifetime).await;
                 if job.output.lock().unwrap().exit_code.is_none() {
-                    terminate_background_job_bounded(&cleanup, &detached, &job).await;
+                    // Nobody to report to; the warning is logged and recorded
+                    // on the job.
+                    let _ = terminate_background_job_bounded(&cleanup, &detached, &job).await;
                 }
             });
         }
@@ -1048,7 +1199,9 @@ impl Shell {
                 let cleanup = self.jobs.cleanup.clone();
                 let detached = self.jobs.detached.clone();
                 tokio::spawn(async move {
-                    terminate_background_job_bounded(&cleanup, &detached, &job).await;
+                    // Nobody to report to; the warning is logged and recorded
+                    // on the job.
+                    let _ = terminate_background_job_bounded(&cleanup, &detached, &job).await;
                 });
                 return ToolResult::error(e);
             }
@@ -1240,10 +1393,17 @@ impl Tool for ShellKill {
                 "already_finished": true,
             }));
         }
-        if let Err(e) =
-            terminate_background_job(&self.jobs.cleanup, &self.jobs.detached, &job).await
+        // A cleanup that cannot be acknowledged is retried up to the bound;
+        // after that the job is closed regardless, so `shell_output` stops
+        // reporting it as running, and the failure is reported here along
+        // with whatever the tree left behind.
+        if let Err(warning) =
+            terminate_background_job_bounded(&self.jobs.cleanup, &self.jobs.detached, &job).await
         {
-            return ToolResult::error(format!("cannot kill {id}: {e}"));
+            let mut result = ToolResult::error(format!("cannot kill {id}: {warning}"));
+            let remnants = job.output.lock().unwrap().remnants.clone();
+            remnants.annotate(&mut result.result, None);
+            return result;
         }
         let mut result = json!({
             "job_id": id,
@@ -1555,7 +1715,7 @@ mod tests {
             worktree: tmp.path().to_path_buf(),
             ..Default::default()
         };
-        let (shell, _, _) = tools();
+        let (shell, output, _) = tools();
         let first = shell
             .run(
                 &ctx,
@@ -1570,11 +1730,10 @@ mod tests {
             .await;
         let first_id = first.result["job_id"].as_str().unwrap();
         let second_id = second.result["job_id"].as_str().unwrap();
-        shell
-            .jobs
-            .cleanup
-            .injected_failures
-            .store(2, Ordering::SeqCst);
+        shell.jobs.cleanup.injected_failures.store(
+            2 * u64::from(CLEANUP_ACKNOWLEDGEMENT_ATTEMPTS),
+            Ordering::SeqCst,
+        );
 
         let error = shell.jobs.kill_worktree(tmp.path()).await.unwrap_err();
 
@@ -1586,6 +1745,21 @@ mod tests {
             error.contains(second_id),
             "second job was not attempted: {error}"
         );
+        assert!(
+            error.contains("not acknowledged after 3 attempts"),
+            "{error}"
+        );
+        // Both jobs were closed with the failure on record: a second eviction
+        // has nothing left to stop.
+        assert_eq!(
+            shell.jobs.cleanup.injected_failures.load(Ordering::SeqCst),
+            0
+        );
+        for id in [first_id, second_id] {
+            let output = output.run(&ctx, &json!({"job_id": id})).await;
+            assert_eq!(output.result["running"], false, "{:?}", output.result);
+            assert_eq!(output.result["killed"], true, "{:?}", output.result);
+        }
         shell.jobs.kill_worktree(tmp.path()).await.unwrap();
     }
 
@@ -1959,6 +2133,93 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn shell_kill_retries_an_unacknowledged_cleanup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ToolCtx {
+            worktree: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let (shell, output, kill) = tools();
+        let res = shell
+            .run(
+                &ctx,
+                &json!({"command": "sleep 60", "run_in_background": true}),
+            )
+            .await;
+        let id = res.result["job_id"].as_str().unwrap().to_string();
+        shell
+            .jobs
+            .cleanup
+            .injected_failures
+            .store(1, Ordering::SeqCst);
+
+        let res = kill.run(&ctx, &json!({"job_id": id})).await;
+        assert_eq!(
+            res.status,
+            trouve_protocol::ToolStatus::Ok,
+            "{:?}",
+            res.result
+        );
+        assert_eq!(res.result["killed"], true);
+
+        let state = output.run(&ctx, &json!({"job_id": id})).await;
+        assert_eq!(state.result["running"], false, "{:?}", state.result);
+        assert!(
+            state.result["cleanup_warning"].is_null(),
+            "{:?}",
+            state.result
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_kill_closes_the_job_after_the_acknowledgement_bound() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ToolCtx {
+            worktree: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let (shell, output, kill) = tools();
+        let res = shell
+            .run(
+                &ctx,
+                &json!({"command": "sleep 60", "run_in_background": true}),
+            )
+            .await;
+        let id = res.result["job_id"].as_str().unwrap().to_string();
+        shell.jobs.cleanup.injected_failures.store(
+            u64::from(CLEANUP_ACKNOWLEDGEMENT_ATTEMPTS),
+            Ordering::SeqCst,
+        );
+
+        let res = tokio::time::timeout(
+            Duration::from_secs(2),
+            kill.run(&ctx, &json!({"job_id": id})),
+        )
+        .await
+        .expect("an unacknowledged cleanup must not hold shell_kill indefinitely");
+        assert_eq!(res.status, trouve_protocol::ToolStatus::Error);
+        let error = res.result["error"].as_str().unwrap();
+        assert!(error.starts_with("cannot kill "), "{error}");
+        assert!(
+            error.contains("not acknowledged after 3 attempts"),
+            "{error}"
+        );
+
+        // The job is closed: nobody keeps polling a job that cannot be killed.
+        let state = output.run(&ctx, &json!({"job_id": id})).await;
+        assert_eq!(state.result["running"], false, "{:?}", state.result);
+        assert_eq!(state.result["killed"], true);
+        assert_eq!(state.result["exit_code"], -1);
+        assert!(
+            state.result["cleanup_warning"]
+                .as_str()
+                .is_some_and(|warning| warning.contains("not acknowledged after 3 attempts")),
+            "{:?}",
+            state.result
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn worktree_eviction_tolerates_a_released_daemon_that_already_exited() {
@@ -2053,6 +2314,100 @@ mod tests {
             child_pid
         };
         wait_for_process_exit(child_pid).await;
+    }
+
+    /// A released daemon keeps forking after the hand-over. Its workers are
+    /// on no record, but they hold the tree's sentinel, which the registry
+    /// retains for exactly this: eviction stops them too.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn worktree_eviction_stops_workers_forked_by_a_released_daemon() {
+        require_setsid();
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ToolCtx {
+            worktree: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let (shell, _, _) = tools();
+        let command = "setsid sh -c 'echo $$ > child.pid; sleep 0.3; sleep 60 & echo $! > worker.pid; wait' \
+            </dev/null >/dev/null 2>&1 & while [ ! -s child.pid ]; do sleep 0.01; done";
+        let res = shell
+            .run(&ctx, &json!({"command": command, "timeout_secs": 5}))
+            .await;
+        assert_eq!(
+            res.status,
+            trouve_protocol::ToolStatus::Ok,
+            "{:?}",
+            res.result
+        );
+        let daemon_pid = wait_for_pid_file(&tmp.path().join("child.pid")).await;
+        assert!(
+            reported_pids(&res.result, "detached").contains(&daemon_pid),
+            "{:?}",
+            res.result
+        );
+        let worker_pid = wait_for_pid_file(&tmp.path().join("worker.pid")).await;
+        assert!(process_exists(worker_pid));
+
+        shell.jobs.kill_worktree(tmp.path()).await.unwrap();
+        wait_for_process_exit(worker_pid).await;
+        wait_for_process_exit(daemon_pid).await;
+    }
+
+    /// Above its threshold the record is pruned of what has exited, never
+    /// trimmed: a daemon that is still alive stays until its worktree is
+    /// evicted.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn pruning_the_record_never_drops_a_live_daemon() {
+        require_setsid();
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ToolCtx {
+            worktree: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let (shell, _, _) = tools();
+        shell.jobs.detached.state.lock().unwrap().prune_threshold = 1;
+        let mut daemons = Vec::new();
+        for directory in ["a", "b"] {
+            // Braces keep the daemon's `&` from backgrounding the `cd` too.
+            let command =
+                format!("mkdir -p {directory} && cd {directory} && {{ {SETSID_DAEMON}; }}");
+            let res = shell
+                .run(&ctx, &json!({"command": command, "timeout_secs": 5}))
+                .await;
+            assert_eq!(
+                res.status,
+                trouve_protocol::ToolStatus::Ok,
+                "{:?}",
+                res.result
+            );
+            daemons.push(wait_for_pid_file(&tmp.path().join(directory).join("child.pid")).await);
+        }
+        {
+            let state = shell.jobs.detached.state.lock().unwrap();
+            let mut recorded: Vec<u32> = state
+                .entries
+                .iter()
+                .map(|entry| entry.process.pid as u32)
+                .collect();
+            recorded.sort_unstable();
+            let mut expected = daemons.clone();
+            expected.sort_unstable();
+            assert_eq!(
+                recorded, expected,
+                "a live daemon was dropped from the record"
+            );
+            assert_eq!(state.sentinels.len(), 2);
+        }
+        for pid in &daemons {
+            assert!(process_exists(*pid));
+        }
+
+        shell.jobs.kill_worktree(tmp.path()).await.unwrap();
+        for pid in daemons {
+            wait_for_process_exit(pid).await;
+        }
     }
 
     #[cfg(target_os = "linux")]

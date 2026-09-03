@@ -41,7 +41,25 @@ cgroup accounting files) that leaked into every child.
   worktree asks each of its daemons to exit (`SIGTERM`), waits up to two
   seconds, then kills the survivors, after the worktree's background jobs
   have been stopped. Dropping the registry asks every remaining daemon to
-  exit without waiting.
+  exit without waiting. The record is pruned of daemons that have exited
+  once it grows past a threshold; a live daemon is never forgotten, because
+  a forgotten daemon is one nobody stops.
+- **The tree's sentinel is retained with its daemons.** A released daemon
+  keeps forking: a build server spawns workers, a package manager spawns
+  helpers, and none of them is on any record. They do inherit the tree's
+  sentinel, so the registry keeps a duplicate of the sentinel reader for
+  every released tree and, at eviction, enumerates its holders alongside the
+  recorded daemons, stops them the same way, and keeps sweeping the holders
+  for the grace period so a daemon that forks while being stopped does not
+  leave a worker behind. The sentinel is dropped once the worktree is
+  evicted or nobody holds it any more.
+- **Signals are bound to the recorded incarnation.** Where the kernel offers
+  a pidfd (Linux 5.3+), every released daemon and every sentinel holder is
+  signalled through one opened while its start time was verified, so a pid
+  recycled between a liveness check and the signal is never hit and the
+  registry can tell a daemon that has exited from one that is merely
+  reparented. Where pidfds are unavailable or refused, the signal goes to
+  the pid after an identity check against `/proc`.
 - **Hand-over and eviction are atomic.** A daemon enters the registry only
   after the eviction record is checked under the registry lock, and eviction
   drains a worktree and records the eviction under the same lock. A daemon
@@ -55,12 +73,14 @@ cgroup accounting files) that leaked into every child.
   background jobs release detached descendants. Provider transports, MCP
   servers, git, and every other process-tree caller keep terminate-all
   semantics.
-- **Cleanup acknowledgement is bounded.** Foreground cleanup and the
-  background lifetime-cap path retry an unacknowledged termination three
-  times, each attempt bounded by the reap timeout, then report the failure
-  (`cleanup_warning`, or the error message of an interrupted call) and close
-  the call or job rather than retrying for the lifetime of a process trouve
-  cannot see.
+- **Cleanup acknowledgement is bounded.** Foreground cleanup, `shell_kill`,
+  worktree eviction, and the background lifetime-cap path retry an
+  unacknowledged termination three times, each attempt bounded by the reap
+  timeout, then report the failure (`cleanup_warning`, or the error message
+  of an interrupted call or a failed kill) and close the call or job rather
+  than retrying for the lifetime of a process trouve cannot see. A job whose
+  kill failed is closed all the same, so `shell_output` stops reporting it
+  as running.
 - **Release exists only where holders can be told apart.** Classifying a
   holder as detached needs its session id, which trouve reads from `/proc`
   on Linux and Android. Elsewhere (macOS, the BSDs) the shell tool keeps
@@ -86,12 +106,14 @@ cgroup accounting files) that leaked into every child.
   and exec: `close_range(CLOSE_RANGE_CLOEXEC)` where the kernel supports it
   (Linux 5.11+), otherwise the descriptor table listed from `/proc/self/fd`
   or `/dev/fd` — trusted only when it names both ends of the sentinel pipe —
-  and as a last resort a walk of every descriptor number up to the soft
-  `RLIMIT_NOFILE` or 2^20, whichever is smaller, logged once because it can
-  be slow. The ceiling exists because container runtimes hand out soft
-  limits in the billions, which would stall every spawn for minutes; the two
-  strategies ahead of the walk cover any descriptor number the parent can
-  hold.
+  and as a last resort a walk of every descriptor number below the soft
+  `RLIMIT_NOFILE`, logged once because it can be slow. The walk is complete
+  or it does not happen: when the soft limit is unlimited or above 2^20 —
+  container runtimes hand out limits in the billions, and walking one would
+  stall every spawn for minutes — and neither `close_range` nor a listing
+  is available, the spawn fails with an error naming the limit rather than
+  sanitize part of the table and leak the rest. Only a kernel older than
+  5.11 without a listable `/proc` or `/dev/fd` can reach that error.
 
 ## Consequences
 
@@ -109,6 +131,15 @@ cgroup accounting files) that leaked into every child.
 - An unacknowledged cleanup is now a reported failure instead of an
   indefinitely quarantined mutation lane. The abandoned tree receives a final
   best-effort kill when its handle is dropped.
+- Each released tree costs the host one retained descriptor, and each
+  released daemon one pidfd, until the worktree is evicted. When a pidfd
+  cannot be opened the daemon is still recorded and signalled by pid after
+  an identity check, so descriptor pressure degrades the pid-reuse guard,
+  never the stop at eviction.
+- The descriptor hygiene has one residual gap: a descriptor a process opened
+  above the soft `RLIMIT_NOFILE` before the limit was lowered survives the
+  walk, because the walk stops at the limit. The two strategies ahead of it
+  have no such gap, and the walk is never entered where either is available.
 - macOS and the BSDs do not release daemons. The call-scoped semantics they
   keep are the ones every platform had before this decision, with the
   bounded cleanup acknowledgement on top; the change there is that an
