@@ -2,7 +2,7 @@
 //! (the classic one-shot) or as a background job the model can poll with
 //! `shell_output` and stop with `shell_kill` — dev servers, long builds.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -38,6 +38,11 @@ const DETACHED_EXIT_GRACE: Duration = Duration::from_secs(2);
 const DETACHED_EXIT_POLL: Duration = Duration::from_millis(50);
 /// Soft cap on remembered released daemons; dead entries are pruned first.
 const MAX_DETACHED: usize = 512;
+/// Evictions remembered so that a daemon handed over late (its tree finished
+/// while the eviction ran) is stopped rather than kept. Late hand-overs can
+/// only come from calls and jobs that were in flight at eviction, so the
+/// record is bounded; the oldest entries are forgotten first.
+const MAX_EVICTED_WORKTREES: usize = 4096;
 
 #[derive(Default)]
 struct CleanupController {
@@ -89,8 +94,6 @@ struct TreeRemnants {
     /// Descendants that left the process group but not the session and were
     /// killed with the tree.
     terminated_escapees: Vec<TerminatedEscapee>,
-    /// The platform released sentinel holders it could not enumerate.
-    released_untracked: bool,
 }
 
 impl TreeRemnants {
@@ -98,17 +101,16 @@ impl TreeRemnants {
         Self {
             detached: child.take_detached(),
             terminated_escapees: child.take_terminated_escapees(),
-            released_untracked: child.released_untracked(),
         }
     }
 
     fn is_empty(&self) -> bool {
-        self.detached.is_empty() && self.terminated_escapees.is_empty() && !self.released_untracked
+        self.detached.is_empty() && self.terminated_escapees.is_empty()
     }
 
     /// Whether something outside the tree may still hold its stdio pipes.
     fn may_hold_pipes(&self) -> bool {
-        !self.detached.is_empty() || self.released_untracked
+        !self.detached.is_empty()
     }
 
     fn absorb(&mut self, other: Self) {
@@ -130,7 +132,6 @@ impl TreeRemnants {
                 self.terminated_escapees.push(escapee);
             }
         }
-        self.released_untracked |= other.released_untracked;
     }
 
     /// Add the structured fields and a human-readable `note` to a tool
@@ -166,13 +167,6 @@ impl TreeRemnants {
                 process_count(self.terminated_escapees.len(), "escaped"),
                 describe_processes(escapees),
             ));
-        }
-        if self.released_untracked {
-            note.push(
-                "Released descendants outside the process group without tracking them; they \
-                 are not stopped when the session worktree is removed."
-                    .to_string(),
-            );
         }
         if let Some(warning) = cleanup_warning {
             result.insert("cleanup_warning".into(), json!(warning));
@@ -213,17 +207,101 @@ struct DetachedEntry {
     command: String,
 }
 
+impl DetachedEntry {
+    fn new(worktree: &Path, command: &str, process: &DetachedProcess) -> Self {
+        Self {
+            process: process.clone(),
+            worktree: worktree.to_path_buf(),
+            command: command.to_string(),
+        }
+    }
+}
+
 /// Released daemons, keyed by the worktree whose eviction terminates them.
+///
+/// A daemon changes hands in [`Self::adopt`], which takes it from its process
+/// tree and records it under one lock acquisition; [`Self::terminate_worktree`]
+/// drains a worktree's daemons and puts the eviction on record under the same
+/// lock. A daemon is therefore either in the drained set or adopted after the
+/// eviction is on record, in which case it is stopped on the spot. Nothing is
+/// ever in flight between a tree and the registry while an eviction runs.
 #[derive(Default)]
 struct DetachedRegistry {
-    entries: Mutex<Vec<DetachedEntry>>,
+    state: Mutex<DetachedState>,
+}
+
+#[derive(Default)]
+struct DetachedState {
+    entries: Vec<DetachedEntry>,
+    /// Worktrees already evicted, oldest first. Managed worktree paths carry
+    /// their session id and are never reused, so remembering one cannot stop
+    /// a later session's daemons.
+    evicted: VecDeque<PathBuf>,
 }
 
 impl DetachedRegistry {
-    fn register(&self, worktree: &Path, command: &str, processes: &[DetachedProcess]) {
-        let mut entries = self.entries.lock().unwrap();
+    /// Take what `child` released or killed, hand the released daemons to
+    /// the registry under `worktree`, and return the remnants for the
+    /// caller's own report. Call with the tree's lock held so the hand-over
+    /// is atomic with respect to eviction. Daemons released for a worktree
+    /// that is already evicted are stopped in the background instead of kept.
+    fn adopt(&self, worktree: &Path, command: &str, child: &mut ProcessTreeChild) -> TreeRemnants {
+        let mut state = self.state.lock().unwrap();
+        let remnants = TreeRemnants::take_from(child);
+        if remnants.detached.is_empty() {
+            return remnants;
+        }
+        if !state.evicted.iter().any(|evicted| evicted == worktree) {
+            state.register(worktree, command, &remnants.detached);
+            return remnants;
+        }
+        drop(state);
+        let late: Vec<DetachedEntry> = remnants
+            .detached
+            .iter()
+            .map(|process| DetachedEntry::new(worktree, command, process))
+            .collect();
+        for entry in &late {
+            tracing::warn!(
+                pid = entry.process.pid,
+                name = %entry.process.name,
+                command,
+                worktree = %worktree.display(),
+                "shell call released a process after its worktree was evicted; stopping it"
+            );
+        }
+        tokio::spawn(async move {
+            for failure in terminate_entries(late).await {
+                tracing::warn!(
+                    %failure,
+                    "could not stop a process released after its worktree was evicted"
+                );
+            }
+        });
+        remnants
+    }
+
+    /// Terminate every daemon released by `worktree` and put the eviction on
+    /// record. Returns the failures.
+    async fn terminate_worktree(&self, worktree: &Path) -> Vec<String> {
+        let entries: Vec<DetachedEntry> = {
+            let mut state = self.state.lock().unwrap();
+            state.remember_eviction(worktree);
+            let (mine, others) = state
+                .entries
+                .drain(..)
+                .partition(|entry| entry.worktree == worktree);
+            state.entries = others;
+            mine
+        };
+        terminate_entries(entries).await
+    }
+}
+
+impl DetachedState {
+    fn register(&mut self, worktree: &Path, command: &str, processes: &[DetachedProcess]) {
         for process in processes {
-            let known = entries.iter().any(|entry| {
+            let known = self.entries.iter().any(|entry| {
                 entry.process.pid == process.pid && entry.process.start_time == process.start_time
             });
             if known {
@@ -236,57 +314,56 @@ impl DetachedRegistry {
                 worktree = %worktree.display(),
                 "released a detached process from a shell call"
             );
-            entries.push(DetachedEntry {
-                process: process.clone(),
-                worktree: worktree.to_path_buf(),
-                command: command.to_string(),
-            });
+            self.entries
+                .push(DetachedEntry::new(worktree, command, process));
         }
-        if entries.len() > MAX_DETACHED {
-            entries.retain(|entry| entry.process.is_alive());
-            let excess = entries.len().saturating_sub(MAX_DETACHED);
-            entries.drain(..excess);
+        if self.entries.len() > MAX_DETACHED {
+            self.entries.retain(|entry| entry.process.is_alive());
+            let excess = self.entries.len().saturating_sub(MAX_DETACHED);
+            self.entries.drain(..excess);
         }
     }
 
-    /// Terminate every daemon released by `worktree`: ask it to exit, give it
-    /// a short grace period, then kill the survivors. Returns the failures.
-    async fn terminate_worktree(&self, worktree: &Path) -> Vec<String> {
-        let entries: Vec<DetachedEntry> = {
-            let mut entries = self.entries.lock().unwrap();
-            let (mine, others) = entries
-                .drain(..)
-                .partition(|entry| entry.worktree == worktree);
-            *entries = others;
-            mine
-        };
-        let mut failures = Vec::new();
-        let mut pending = Vec::new();
-        for entry in entries {
-            match entry.process.request_exit() {
-                Ok(true) => pending.push(entry),
-                Ok(false) => {}
-                Err(error) => failures.push(detached_failure(&entry, &error)),
-            }
+    fn remember_eviction(&mut self, worktree: &Path) {
+        if self.evicted.iter().any(|evicted| evicted == worktree) {
+            return;
         }
-        let deadline = tokio::time::Instant::now() + DETACHED_EXIT_GRACE;
-        while !pending.is_empty() && tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(DETACHED_EXIT_POLL).await;
-            pending.retain(|entry| entry.process.is_alive());
+        self.evicted.push_back(worktree.to_path_buf());
+        if self.evicted.len() > MAX_EVICTED_WORKTREES {
+            self.evicted.pop_front();
         }
-        for entry in pending {
-            tracing::warn!(
-                pid = entry.process.pid,
-                name = %entry.process.name,
-                command = entry.command,
-                "released process ignored SIGTERM at worktree eviction; killing it"
-            );
-            if let Err(error) = entry.process.kill() {
-                failures.push(detached_failure(&entry, &error));
-            }
-        }
-        failures
     }
+}
+
+/// Ask each daemon to exit, give it a short grace period, then kill the
+/// survivors. Returns the failures.
+async fn terminate_entries(entries: Vec<DetachedEntry>) -> Vec<String> {
+    let mut failures = Vec::new();
+    let mut pending = Vec::new();
+    for entry in entries {
+        match entry.process.request_exit() {
+            Ok(true) => pending.push(entry),
+            Ok(false) => {}
+            Err(error) => failures.push(detached_failure(&entry, &error)),
+        }
+    }
+    let deadline = tokio::time::Instant::now() + DETACHED_EXIT_GRACE;
+    while !pending.is_empty() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(DETACHED_EXIT_POLL).await;
+        pending.retain(|entry| entry.process.is_alive());
+    }
+    for entry in pending {
+        tracing::warn!(
+            pid = entry.process.pid,
+            name = %entry.process.name,
+            command = entry.command,
+            "released process ignored SIGTERM at worktree eviction; killing it"
+        );
+        if let Err(error) = entry.process.kill() {
+            failures.push(detached_failure(&entry, &error));
+        }
+    }
+    failures
 }
 
 fn detached_failure(entry: &DetachedEntry, error: &std::io::Error) -> String {
@@ -300,8 +377,8 @@ impl Drop for DetachedRegistry {
     fn drop(&mut self) {
         // The sessions that owned these daemons are going away with the
         // registry; ask them to exit without waiting.
-        if let Ok(entries) = self.entries.get_mut() {
-            for entry in entries.drain(..) {
+        if let Ok(state) = self.state.get_mut() {
+            for entry in state.entries.drain(..) {
                 let _ = entry.process.request_exit();
             }
         }
@@ -320,19 +397,17 @@ struct JobHandle {
 }
 
 impl JobHandle {
-    /// Move what the tree released or killed into the job output and hand
-    /// released daemons to the session registry.
+    /// Hand what the tree released or killed to the session registry and
+    /// the job output.
     async fn collect_remnants(&self, registry: &DetachedRegistry) {
-        let remnants = TreeRemnants::take_from(&mut *self.child.lock().await);
-        self.record_remnants(registry, remnants);
+        let remnants = registry.adopt(&self.worktree, &self.command, &mut *self.child.lock().await);
+        self.record_remnants(remnants);
     }
 
-    fn record_remnants(&self, registry: &DetachedRegistry, remnants: TreeRemnants) {
-        if remnants.is_empty() {
-            return;
+    fn record_remnants(&self, remnants: TreeRemnants) {
+        if !remnants.is_empty() {
+            self.output.lock().unwrap().remnants.absorb(remnants);
         }
-        registry.register(&self.worktree, &self.command, &remnants.detached);
-        self.output.lock().unwrap().remnants.absorb(remnants);
     }
 }
 
@@ -592,6 +667,27 @@ async fn foreground_result(
     ToolResult::ok(result)
 }
 
+/// What the model is told about processes a command leaves behind. Daemons
+/// that detach into their own session are released only where the process
+/// tree can tell them apart from the rest of the tree.
+const SHELL_DESCRIPTION: &str = if trouve_agents::process_env::DETACHED_RELEASE_SUPPORTED {
+    "Run a shell command in the workspace root. Captures stdout/stderr (truncated at 32KB \
+     each); times out after 120s by default. Set run_in_background for long-running \
+     processes (dev servers, builds): it returns a job id immediately — poll it with \
+     shell_output and stop it with shell_kill. Processes the command leaves behind are \
+     stopped with it, except daemons that detach into their own session (build caches, \
+     package-manager daemons): those keep running, are reported in the result, and are \
+     stopped when the session worktree is removed."
+} else {
+    "Run a shell command in the workspace root. Captures stdout/stderr (truncated at 32KB \
+     each); times out after 120s by default. Set run_in_background for long-running \
+     processes (dev servers, builds): it returns a job id immediately — poll it with \
+     shell_output and stop it with shell_kill. Processes the command leaves behind are \
+     stopped with it; a daemon that detaches into its own session (build caches, \
+     package-manager daemons) cannot be released on this platform and keeps the call \
+     from completing until it exits or the timeout elapses."
+};
+
 pub struct Shell {
     pub jobs: Arc<JobRegistry>,
 }
@@ -602,13 +698,7 @@ impl Tool for Shell {
         "shell"
     }
     fn description(&self) -> &'static str {
-        "Run a shell command in the workspace root. Captures stdout/stderr (truncated at 32KB \
-         each); times out after 120s by default. Set run_in_background for long-running \
-         processes (dev servers, builds): it returns a job id immediately — poll it with \
-         shell_output and stop it with shell_kill. Processes the command leaves behind are \
-         stopped with it, except daemons that detach into their own session (build caches, \
-         package-manager daemons): those keep running, are reported in the result, and are \
-         stopped when the session worktree is removed."
+        SHELL_DESCRIPTION
     }
     fn parameters(&self) -> Value {
         json!({
@@ -776,21 +866,17 @@ impl Shell {
         }
     }
 
-    /// Drain what the tree released or killed and hand released daemons to
-    /// the session registry.
+    /// Hand what the tree released or killed to the session registry and
+    /// return it for the result.
     async fn collect_foreground_remnants(
         &self,
         ctx: &ToolCtx,
         command: &str,
         child: &Arc<tokio::sync::Mutex<ProcessTreeChild>>,
     ) -> TreeRemnants {
-        let remnants = TreeRemnants::take_from(&mut *child.lock().await);
-        if !remnants.detached.is_empty() {
-            self.jobs
-                .detached
-                .register(&ctx.worktree, command, &remnants.detached);
-        }
-        remnants
+        self.jobs
+            .detached
+            .adopt(&ctx.worktree, command, &mut *child.lock().await)
     }
 
     /// The error result of a call stopped before its command completed:
@@ -874,9 +960,10 @@ impl Shell {
                     let (status, remnants) = {
                         let mut child = job.child.lock().await;
                         let status = child.try_wait_tree();
-                        (status, TreeRemnants::take_from(&mut child))
+                        let remnants = detached.adopt(&job.worktree, &job.command, &mut child);
+                        (status, remnants)
                     };
-                    job.record_remnants(&detached, remnants);
+                    job.record_remnants(remnants);
                     match status {
                         Ok(Some(status)) => {
                             job.output
@@ -1865,6 +1952,36 @@ mod tests {
         wait_for_process_exit(child_pid).await;
 
         shell.jobs.kill_worktree(tmp.path()).await.unwrap();
+    }
+
+    /// A daemon handed over after its worktree was evicted (its tree was
+    /// still finishing while `kill_worktree` ran) is stopped rather than
+    /// left to outlive the session.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn daemon_released_after_worktree_eviction_is_stopped() {
+        require_setsid();
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ToolCtx {
+            worktree: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let (shell, _, _) = tools();
+        // Nothing to stop yet; this only puts the eviction on record.
+        shell.jobs.kill_worktree(tmp.path()).await.unwrap();
+
+        let res = shell
+            .run(&ctx, &json!({"command": SETSID_DAEMON, "timeout_secs": 5}))
+            .await;
+        assert_eq!(
+            res.status,
+            trouve_protocol::ToolStatus::Ok,
+            "{:?}",
+            res.result
+        );
+        let child_pid = wait_for_pid_file(&tmp.path().join("child.pid")).await;
+        assert_eq!(reported_pids(&res.result, "detached"), vec![child_pid]);
+        wait_for_process_exit(child_pid).await;
     }
 
     #[cfg(target_os = "linux")]

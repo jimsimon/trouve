@@ -25,15 +25,15 @@ const PROCESS_TREE_REAP_TIMEOUT: Duration = Duration::from_secs(5);
 /// most this often while it waits for a same-session holder to exit.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 const HOLDER_SCAN_INTERVAL: Duration = Duration::from_millis(250);
-/// Unix platforms without a holder query cannot tell a detached daemon from a
-/// dying group member. Under [`DetachedPolicy::Release`] they wait this long
-/// for the sentinel to close after the group emptied, then release whatever
-/// still holds it.
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
-const DETACHED_RELEASE_GRACE: Duration = Duration::from_millis(500);
-/// Upper bound for the per-descriptor close-on-exec fallback in `pre_exec`.
+/// Whether this platform can name the processes holding a tree's sentinel
+/// and therefore honour [`DetachedPolicy::Release`].
+pub const DETACHED_RELEASE_SUPPORTED: bool = cfg!(any(target_os = "linux", target_os = "android"));
+/// Bound for the brute-force close-on-exec walk in `pre_exec` when the
+/// `RLIMIT_NOFILE` soft limit is not a usable descriptor number (unlimited or
+/// unreadable). The walk is the last resort behind `close_range` and the
+/// descriptor-table listing, both of which cover any descriptor number.
 #[cfg(unix)]
-const MAX_INHERITABLE_DESCRIPTORS: libc::c_int = 65_536;
+const DESCRIPTOR_WALK_CEILING: libc::c_int = 1 << 20;
 #[cfg(windows)]
 const WINDOWS_PROCESS_TREE_CREATION_FLAGS: u32 =
     windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
@@ -105,6 +105,10 @@ pub fn apply_path_to_tokio(command: &mut tokio::process::Command) {
 /// the command that started it. [`Self::Terminate`] kills it with the rest of
 /// the tree; [`Self::Release`] hands it to the caller as a
 /// [`DetachedProcess`] so the session, not the call, decides when it ends.
+///
+/// Release needs a platform that can name every sentinel holder
+/// ([`DETACHED_RELEASE_SUPPORTED`]): a holder that cannot be named cannot be
+/// handed to anyone, so the other platforms keep terminating the whole tree.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum DetachedPolicy {
     /// Every sentinel holder dies with the tree.
@@ -217,9 +221,6 @@ pub struct ProcessTreeChild {
     /// Descendants that left the process group but stayed in the session and
     /// were killed with the tree.
     terminated_escapees: Vec<TerminatedEscapee>,
-    /// Set when a platform without a holder query released sentinel holders
-    /// it could not enumerate.
-    released_untracked: bool,
     #[cfg(unix)]
     process_group: i32,
     #[cfg(unix)]
@@ -228,9 +229,6 @@ pub struct ProcessTreeChild {
     /// whether a same-session holder still existed.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     holder_scan: Option<(Instant, bool)>,
-    /// When the group first emptied while the sentinel stayed open.
-    #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
-    release_grace_started: Option<Instant>,
     #[cfg(target_os = "macos")]
     process_group_signalled: bool,
     #[cfg(windows)]
@@ -388,8 +386,15 @@ impl ProcessTreeChild {
     /// Opt into [`DetachedPolicy::Release`]: descendants that move to their
     /// own session no longer keep this tree alive and are not killed with it.
     /// Collect them with [`Self::take_detached`] once the tree completes.
+    ///
+    /// Only platforms that can enumerate sentinel holders honour the request
+    /// ([`DETACHED_RELEASE_SUPPORTED`]); elsewhere the tree keeps
+    /// [`DetachedPolicy::Terminate`] rather than let go of processes nobody
+    /// could name, report, or stop later.
     pub fn release_detached_descendants(&mut self) {
-        self.detached_policy = DetachedPolicy::Release;
+        if DETACHED_RELEASE_SUPPORTED {
+            self.detached_policy = DetachedPolicy::Release;
+        }
     }
 
     pub fn detached_policy(&self) -> DetachedPolicy {
@@ -405,12 +410,6 @@ impl ProcessTreeChild {
     /// tree.
     pub fn take_terminated_escapees(&mut self) -> Vec<TerminatedEscapee> {
         std::mem::take(&mut self.terminated_escapees)
-    }
-
-    /// Whether sentinel holders were released without being enumerated. Only
-    /// Unix platforms without a per-process descriptor query report this.
-    pub fn released_untracked(&self) -> bool {
-        self.released_untracked
     }
 
     /// Reap the tree leader without terminating descendants.
@@ -642,15 +641,12 @@ fn spawn_process_tree_locked(
         detached_policy: DetachedPolicy::Terminate,
         detached: Vec::new(),
         terminated_escapees: Vec::new(),
-        released_untracked: false,
         #[cfg(unix)]
         process_group,
         #[cfg(unix)]
         descendant_sentinel,
         #[cfg(any(target_os = "linux", target_os = "android"))]
         holder_scan: None,
-        #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
-        release_grace_started: None,
         #[cfg(target_os = "macos")]
         process_group_signalled: false,
         #[cfg(windows)]
@@ -756,19 +752,19 @@ fn install_unix_descendant_sentinel(
     }
 
     let writer_fd = writer.as_raw_fd();
-    let descriptor_limit = inheritable_descriptor_limit();
+    let hygiene = DescriptorHygiene::detect([reader.as_raw_fd(), writer_fd]);
     // SAFETY: this closure only invokes async-signal-safe `close_range` and
-    // `fcntl` between fork and exec. The parent copy stays close-on-exec and
-    // is dropped immediately after spawn; the child copy deliberately survives
-    // exec and is inherited across forks and `setsid()` calls until the last
-    // descendant exits.
+    // `fcntl` between fork and exec and never allocates. The parent copy stays
+    // close-on-exec and is dropped immediately after spawn; the child copy
+    // deliberately survives exec and is inherited across forks and `setsid()`
+    // calls until the last descendant exits.
     unsafe {
         command.pre_exec(move || {
             // Libraries loaded into the desktop process (WebKitGTK, for one)
             // open descriptors without `O_CLOEXEC`. Nothing but stdio and the
             // sentinel should reach a child, so mark everything else first and
             // re-arm the sentinel afterwards.
-            mark_descriptors_close_on_exec(descriptor_limit);
+            hygiene.apply();
             let flags = libc::fcntl(writer_fd, libc::F_GETFD);
             if flags == -1 || libc::fcntl(writer_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) == -1
             {
@@ -780,53 +776,205 @@ fn install_unix_descendant_sentinel(
     Ok((reader, writer))
 }
 
-/// Highest descriptor number the per-descriptor close-on-exec fallback needs
-/// to visit, computed in the parent because `getrlimit` is not
-/// async-signal-safe.
+/// How `pre_exec` marks the parent's descriptors close-on-exec. Chosen in the
+/// parent, where `getrlimit`, allocation, and reading the descriptor table
+/// are allowed; applied in the child with nothing but `close_range` and
+/// `fcntl`, which are async-signal-safe.
 #[cfg(unix)]
-fn inheritable_descriptor_limit() -> libc::c_int {
+struct DescriptorHygiene {
+    strategy: DescriptorStrategy,
+    /// Bound for the brute-force walk, which also backs up `close_range`
+    /// should the call fail in the child after succeeding in the parent.
+    walk_limit: libc::c_int,
+}
+
+#[cfg(unix)]
+enum DescriptorStrategy {
+    /// `close_range(3, ~0, CLOSE_RANGE_CLOEXEC)` (Linux 5.11+) marks the
+    /// whole table in one call, including descriptors other threads open
+    /// between spawn preparation and `fork`.
+    CloseRange,
+    /// The parent's open descriptors above stdio, read from its descriptor
+    /// table. Exact for any descriptor number; the only gap is a descriptor
+    /// another thread opens without `O_CLOEXEC` after the listing.
+    Listed(Vec<libc::c_int>),
+    /// Every descriptor number below the `RLIMIT_NOFILE` soft limit, for
+    /// platforms with neither `close_range` nor a readable table.
+    Walk,
+}
+
+#[cfg(unix)]
+impl DescriptorHygiene {
+    /// `sentinel` holds both ends of the freshly created sentinel pipe; a
+    /// descriptor-table listing that misses either is incomplete and is not
+    /// trusted.
+    fn detect(sentinel: [libc::c_int; 2]) -> Self {
+        let (allow_close_range, allow_listing) = descriptor_hygiene_preferences();
+        let walk_limit = descriptor_walk_limit();
+        if allow_close_range && close_range_marks_close_on_exec() {
+            return Self {
+                strategy: DescriptorStrategy::CloseRange,
+                walk_limit,
+            };
+        }
+        if allow_listing && let Some(open) = open_descriptors_above_stdio(sentinel) {
+            return Self {
+                strategy: DescriptorStrategy::Listed(open),
+                walk_limit,
+            };
+        }
+        warn_descriptor_walk_once(walk_limit);
+        Self {
+            strategy: DescriptorStrategy::Walk,
+            walk_limit,
+        }
+    }
+
+    /// Runs between fork and exec.
+    fn apply(&self) {
+        match &self.strategy {
+            DescriptorStrategy::CloseRange => {
+                if !close_range_close_on_exec(3) {
+                    walk_descriptors_close_on_exec(self.walk_limit);
+                }
+            }
+            DescriptorStrategy::Listed(open) => {
+                for &descriptor in open {
+                    mark_descriptor_close_on_exec(descriptor);
+                }
+            }
+            DescriptorStrategy::Walk => walk_descriptors_close_on_exec(self.walk_limit),
+        }
+    }
+}
+
+/// Whether `close_range(CLOSE_RANGE_CLOEXEC)` works here, probed once. The
+/// probe asks for the top of the descriptor range only, which the kernel
+/// clamps to the table, so it changes nothing; kernels without the flag
+/// reject it.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn close_range_marks_close_on_exec() -> bool {
+    static SUPPORTED: OnceLock<bool> = OnceLock::new();
+    *SUPPORTED.get_or_init(|| close_range_close_on_exec(libc::c_uint::MAX))
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+fn close_range_marks_close_on_exec() -> bool {
+    false
+}
+
+/// Mark every descriptor from `first` up close-on-exec with one syscall.
+/// `CLOSE_RANGE_CLOEXEC` is Linux 5.11+; the raw syscall avoids relying on a
+/// libc wrapper that older glibc builds lack. Older kernels fail with ENOSYS
+/// or EINVAL.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn close_range_close_on_exec(first: libc::c_uint) -> bool {
+    const CLOSE_RANGE_CLOEXEC: libc::c_uint = 1 << 2;
+    unsafe {
+        libc::syscall(
+            libc::SYS_close_range,
+            first,
+            libc::c_uint::MAX,
+            CLOSE_RANGE_CLOEXEC,
+        ) == 0
+    }
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+fn close_range_close_on_exec(_first: libc::c_uint) -> bool {
+    false
+}
+
+/// The parent's open descriptors above stdio, or `None` when the descriptor
+/// table cannot be listed completely.
+#[cfg(unix)]
+fn open_descriptors_above_stdio(sentinel: [libc::c_int; 2]) -> Option<Vec<libc::c_int>> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    const DESCRIPTOR_TABLE: &str = "/proc/self/fd";
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    const DESCRIPTOR_TABLE: &str = "/dev/fd";
+
+    let mut open = Vec::new();
+    for entry in std::fs::read_dir(DESCRIPTOR_TABLE).ok()? {
+        let descriptor = entry
+            .ok()?
+            .file_name()
+            .to_str()?
+            .parse::<libc::c_int>()
+            .ok()?;
+        if descriptor >= 3 {
+            open.push(descriptor);
+        }
+    }
+    sentinel
+        .iter()
+        .all(|end| open.contains(end))
+        .then_some(open)
+}
+
+/// Highest descriptor number the brute-force walk visits: the `RLIMIT_NOFILE`
+/// soft limit, read in the parent because `getrlimit` is not
+/// async-signal-safe. A descriptor opened before the limit was lowered can
+/// sit above it, which is why the walk is the last resort.
+#[cfg(unix)]
+fn descriptor_walk_limit() -> libc::c_int {
     let mut limit = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,
     };
-    let soft = if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == 0 {
-        limit.rlim_cur
-    } else {
-        1024
-    };
-    libc::c_int::try_from(soft)
-        .unwrap_or(MAX_INHERITABLE_DESCRIPTORS)
-        .min(MAX_INHERITABLE_DESCRIPTORS)
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return DESCRIPTOR_WALK_CEILING;
+    }
+    libc::c_int::try_from(limit.rlim_cur).unwrap_or(DESCRIPTOR_WALK_CEILING)
 }
 
-/// Mark every descriptor above stdio close-on-exec. Runs between fork and
-/// exec, so it is restricted to async-signal-safe calls and never allocates.
 #[cfg(unix)]
-fn mark_descriptors_close_on_exec(descriptor_limit: libc::c_int) {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    {
-        // `CLOSE_RANGE_CLOEXEC` (Linux 5.11+). The raw syscall avoids relying
-        // on a libc wrapper that older glibc builds lack; on older kernels it
-        // fails with EINVAL/ENOSYS and the loop below takes over.
-        const CLOSE_RANGE_CLOEXEC: libc::c_uint = 1 << 2;
-        let marked = unsafe {
-            libc::syscall(
-                libc::SYS_close_range,
-                3 as libc::c_uint,
-                libc::c_uint::MAX,
-                CLOSE_RANGE_CLOEXEC,
-            )
-        };
-        if marked == 0 {
-            return;
-        }
+fn warn_descriptor_walk_once(limit: libc::c_int) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        tracing::warn!(
+            limit,
+            "cannot list open descriptors; children may inherit descriptors numbered above the RLIMIT_NOFILE soft limit"
+        );
+    });
+}
+
+/// Child-side only: one `fcntl` pair per descriptor number in `3..limit`.
+#[cfg(unix)]
+fn walk_descriptors_close_on_exec(limit: libc::c_int) {
+    for descriptor in 3..limit {
+        mark_descriptor_close_on_exec(descriptor);
     }
-    for descriptor in 3..descriptor_limit {
-        let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
-        if flags == -1 || flags & libc::FD_CLOEXEC != 0 {
-            continue;
-        }
-        unsafe { libc::fcntl(descriptor, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
+}
+
+/// Child-side only: async-signal-safe and allocation-free.
+#[cfg(unix)]
+fn mark_descriptor_close_on_exec(descriptor: libc::c_int) {
+    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+    if flags == -1 || flags & libc::FD_CLOEXEC != 0 {
+        return;
+    }
+    unsafe { libc::fcntl(descriptor, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
+}
+
+#[cfg(all(unix, test))]
+thread_local! {
+    /// Test hook: whether `close_range` and the descriptor-table listing may
+    /// be used, so each fallback can be exercised on a machine that has the
+    /// better option.
+    static DESCRIPTOR_HYGIENE_PREFERENCES: std::cell::Cell<(bool, bool)> =
+        const { std::cell::Cell::new((true, true)) };
+}
+
+#[cfg(unix)]
+fn descriptor_hygiene_preferences() -> (bool, bool) {
+    #[cfg(test)]
+    {
+        DESCRIPTOR_HYGIENE_PREFERENCES.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        (true, true)
     }
 }
 
@@ -958,21 +1106,19 @@ fn platform_process_tree_active(child: &mut ProcessTreeChild) -> std::io::Result
         return Ok(false);
     }
     let sentinel_active = unix_descendant_sentinel_active(&child.descendant_sentinel)?;
-    if sentinel_active && child.detached_policy == DetachedPolicy::Terminate {
-        return Ok(true);
-    }
     #[cfg(target_os = "macos")]
     let group_active =
         !child.process_group_signalled && unix_process_group_active(child.process_group)?;
     #[cfg(not(target_os = "macos"))]
     let group_active = unix_process_group_active(child.process_group)?;
-    if group_active || !sentinel_active {
-        return Ok(group_active);
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if sentinel_active && !group_active && child.detached_policy == DetachedPolicy::Release {
+        // Only processes outside the group still hold the sentinel. Keep the
+        // tree alive for those that stayed in the session; the rest are
+        // detached daemons the tree does not own.
+        return released_holders_remain(child);
     }
-    // Release policy with an empty group: only processes outside the group
-    // still hold the sentinel. Keep the tree alive for those that stayed in
-    // the session; the rest are detached daemons the tree does not own.
-    released_holders_remain(child)
+    Ok(sentinel_active || group_active)
 }
 
 /// Whether a same-session process still holds the sentinel of a tree whose
@@ -996,20 +1142,6 @@ fn released_holders_remain(child: &mut ProcessTreeChild) -> std::io::Result<bool
     }
     child.holder_scan = Some((Instant::now(), remain));
     Ok(remain)
-}
-
-/// Without a holder query this platform cannot separate a detached daemon
-/// from a group member that is still dying, so it grants the sentinel a short
-/// grace period after the group empties and then releases the remaining
-/// holders untracked.
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
-fn released_holders_remain(child: &mut ProcessTreeChild) -> std::io::Result<bool> {
-    let started = *child.release_grace_started.get_or_insert_with(Instant::now);
-    if started.elapsed() < DETACHED_RELEASE_GRACE {
-        return Ok(true);
-    }
-    child.released_untracked = true;
-    Ok(false)
 }
 
 #[cfg(windows)]
@@ -1356,9 +1488,8 @@ fn terminate_unix_sentinel_holders(
 ) -> std::io::Result<()> {
     // The inherited sentinel still prevents a false cleanup acknowledgement
     // on these platforms. Without a portable process-holder query, an escaped
-    // descendant remains quarantined until it exits (or, under
-    // `DetachedPolicy::Release`, until the release grace period elapses)
-    // rather than racing a new mutation.
+    // descendant remains quarantined until it exits rather than racing a new
+    // mutation; `DetachedPolicy::Release` is never enabled here.
     Ok(())
 }
 
@@ -2476,9 +2607,49 @@ mod tests {
         assert!(child.take_detached().is_empty());
     }
 
+    /// Raise the soft descriptor limit as far as the hard limit allows
+    /// (within reason, so the brute-force walk stays quick) and return the
+    /// highest descriptor number the process may then use.
     #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn spawned_children_do_not_inherit_non_cloexec_descriptors() {
+    fn raise_descriptor_limit() -> libc::c_int {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+            0
+        );
+        let target = limit.rlim_max.min(1 << 17);
+        if limit.rlim_cur < target {
+            let raised = libc::rlimit {
+                rlim_cur: target,
+                rlim_max: limit.rlim_max,
+            };
+            assert_eq!(
+                unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) },
+                0,
+                "{}",
+                std::io::Error::last_os_error()
+            );
+            limit.rlim_cur = target;
+        }
+        libc::c_int::try_from(limit.rlim_cur).unwrap() - 1
+    }
+
+    /// The descriptor tests share the process's descriptor table and its
+    /// limit, and all park their leaked descriptor at the highest number
+    /// the limit allows: run them one at a time.
+    #[cfg(target_os = "linux")]
+    static DESCRIPTOR_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Leave a descriptor inheritable at a low number and at the highest
+    /// number the limit allows (which a walk capped below the limit would
+    /// miss), spawn a child under the given hygiene preferences, and check
+    /// that neither copy reached it while the sentinel did.
+    #[cfg(target_os = "linux")]
+    async fn assert_children_do_not_inherit_descriptors(preferences: (bool, bool)) {
+        let _serialized = DESCRIPTOR_TEST_LOCK.lock().await;
         let directory = tempfile::tempdir().unwrap();
         let leaked_path = directory.path().join("leaked-descriptor");
         let leaked = std::fs::File::create(&leaked_path).unwrap();
@@ -2487,6 +2658,15 @@ mod tests {
             unsafe { libc::fcntl(leaked.as_raw_fd(), libc::F_SETFD, 0) },
             0
         );
+        let highest = raise_descriptor_limit();
+        // `dup2` never sets close-on-exec on the new descriptor.
+        assert_eq!(
+            unsafe { libc::dup2(leaked.as_raw_fd(), highest) },
+            highest,
+            "{}",
+            std::io::Error::last_os_error()
+        );
+        let high = unsafe { OwnedFd::from_raw_fd(highest) };
 
         let mut command = tokio::process::Command::new("/bin/sh");
         command
@@ -2494,7 +2674,10 @@ mod tests {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
-        let mut child = spawn_process_tree(&mut command).unwrap();
+        DESCRIPTOR_HYGIENE_PREFERENCES.with(|hygiene| hygiene.set(preferences));
+        let spawned = spawn_process_tree(&mut command);
+        DESCRIPTOR_HYGIENE_PREFERENCES.with(|hygiene| hygiene.set((true, true)));
+        let mut child = spawned.unwrap();
         let mut stdout = child.take_stdout().unwrap();
         let listing = async {
             use tokio::io::AsyncReadExt as _;
@@ -2507,7 +2690,7 @@ mod tests {
 
         assert!(
             !listing.contains(leaked_path.to_str().unwrap()),
-            "child inherited a descriptor the parent left inheritable:\n{listing}"
+            "child inherited a descriptor the parent left inheritable (highest {highest}):\n{listing}"
         );
         // The sentinel is a pipe above stdio; stdout itself is also a pipe.
         let sentinel_inherited = listing.lines().any(|line| {
@@ -2524,6 +2707,60 @@ mod tests {
             sentinel_inherited,
             "descriptor hygiene removed the descendant sentinel:\n{listing}"
         );
+        drop(high);
         drop(leaked);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn spawned_children_do_not_inherit_non_cloexec_descriptors() {
+        assert_children_do_not_inherit_descriptors((true, true)).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn descriptor_table_listing_covers_every_descriptor_number() {
+        assert_children_do_not_inherit_descriptors((false, true)).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn descriptor_walk_reaches_the_soft_limit() {
+        assert_children_do_not_inherit_descriptors((false, false)).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn close_range_probe_leaves_the_parent_table_untouched() {
+        let file = tempfile::tempfile().unwrap();
+        assert_eq!(
+            unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, 0) },
+            0
+        );
+        let _supported = close_range_close_on_exec(libc::c_uint::MAX);
+        assert_eq!(
+            unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0,
+            "the close_range probe marked a parent descriptor close-on-exec"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn descriptor_listing_is_trusted_only_when_it_contains_the_sentinel() {
+        let mut descriptors = [-1; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(descriptors.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        let reader = unsafe { OwnedFd::from_raw_fd(descriptors[0]) };
+        let writer = unsafe { OwnedFd::from_raw_fd(descriptors[1]) };
+        let open = open_descriptors_above_stdio(descriptors).expect("/proc/self/fd is listable");
+        assert!(open.contains(&reader.as_raw_fd()) && open.contains(&writer.as_raw_fd()));
+        assert!(open.iter().all(|descriptor| *descriptor >= 3));
+        assert!(
+            open_descriptors_above_stdio([libc::c_int::MAX - 1, libc::c_int::MAX]).is_none(),
+            "a listing that misses the sentinel must not be trusted"
+        );
     }
 }

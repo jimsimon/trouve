@@ -42,6 +42,14 @@ cgroup accounting files) that leaked into every child.
   seconds, then kills the survivors, after the worktree's background jobs
   have been stopped. Dropping the registry asks every remaining daemon to
   exit without waiting.
+- **Hand-over and eviction are atomic.** A daemon moves from its process tree
+  to the registry under the registry lock, and eviction drains a worktree and
+  records the eviction under the same lock. A daemon released by a call or
+  job that was still finishing while its worktree was evicted therefore
+  arrives after the eviction is on record and is stopped on the spot instead
+  of being kept for a worktree nobody will evict again. The eviction record
+  is bounded (the oldest of 4096 are forgotten first); late hand-overs can
+  only come from work that was in flight at eviction.
 - **Release is opt-in per spawn.** Only the shell tool's foreground calls and
   background jobs release detached descendants. Provider transports, MCP
   servers, git, and every other process-tree caller keep terminate-all
@@ -52,11 +60,17 @@ cgroup accounting files) that leaked into every child.
   (`cleanup_warning`, or the error message of an interrupted call) and close
   the call or job rather than retrying for the lifetime of a process trouve
   cannot see.
-- **Platforms that cannot enumerate holders release untracked.** Once the
-  process group is empty, such platforms wait at most 500 ms for the sentinel
-  to close, then treat the remaining holders as released and mark the result
-  `released_untracked`; those processes are not stopped at worktree eviction
-  and the result says so.
+- **Release exists only where holders can be told apart.** Classifying a
+  holder as detached needs its session id, which trouve reads from `/proc`
+  on Linux and Android. Elsewhere (macOS, the BSDs) the shell tool keeps
+  terminate-all semantics: a daemon in its own session keeps the tree alive
+  until it exits or the bounded cleanup gives up and reports it. Releasing
+  holders that cannot be named would have meant releasing same-session
+  escapees too, and promising an eviction-time stop the registry could not
+  keep. A macOS enumeration over libproc (`proc_listpids`,
+  `proc_pidfdinfo` with `PROC_PIDFDPIPEINFO` matched against the sentinel's
+  pipe identity, `getsid`) is the path to parity; the tool description says
+  which behaviour the platform has.
 - **Results report remnants.** A shell result gains `detached` (released
   daemons), `killed_escaped` (descendants that left the process group but not
   the session and were killed), and a human-readable `note` whenever either
@@ -64,7 +78,15 @@ cgroup accounting files) that leaked into every child.
 - **Children start with only the sentinel and stdio.** Process-tree spawns
   mark every descriptor from 3 upward close-on-exec before re-arming the
   sentinel writer, so descriptors opened without `O_CLOEXEC` elsewhere in the
-  host never reach a child.
+  host never reach a child. The strategy is chosen in the parent, where
+  allocation and logging are allowed, and only its result runs between fork
+  and exec: `close_range(CLOSE_RANGE_CLOEXEC)` where the kernel supports it
+  (Linux 5.11+), otherwise the descriptor table listed from `/proc/self/fd`
+  or `/dev/fd` — trusted only when it names both ends of the sentinel pipe —
+  and as a last resort a walk of every descriptor number up to the soft
+  `RLIMIT_NOFILE`, which is logged once because it can be slow. No cap
+  smaller than the process's own limit is applied: a descriptor the parent
+  can hold is a descriptor a child could inherit.
 
 ## Consequences
 
@@ -82,8 +104,13 @@ cgroup accounting files) that leaked into every child.
 - An unacknowledged cleanup is now a reported failure instead of an
   indefinitely quarantined mutation lane. The abandoned tree receives a final
   best-effort kill when its handle is dropped.
-- macOS behaviour is inferred from the Linux implementation and the platform
-  contract; CI does not exercise it.
+- macOS and the BSDs do not release daemons. The call-scoped semantics they
+  keep are the ones every platform had before this decision, with the
+  bounded cleanup acknowledgement on top; the change there is that an
+  unstoppable daemon now fails the call after three attempts instead of
+  holding it indefinitely. CI does not exercise these platforms; their
+  behaviour is inferred from the Linux implementation and the platform
+  contract.
 
 ## Alternatives rejected
 
