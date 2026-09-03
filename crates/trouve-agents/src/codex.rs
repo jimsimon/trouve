@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 
 use futures::StreamExt;
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::ChildStdin;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use trouve_protocol::{ModelInfo, TodoItem, TodoStatus, Usage};
@@ -43,6 +43,9 @@ use crate::{
 const COLLABORATOR_START_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 #[cfg(test)]
 const COLLABORATOR_START_GRACE: std::time::Duration = std::time::Duration::from_millis(25);
+const APP_SERVER_STDERR_TAIL_BYTES: usize = 8 * 1024;
+
+type AppServerStderrTail = Arc<std::sync::Mutex<VecDeque<u8>>>;
 
 pub struct CodexBackend {
     id: String,
@@ -3210,10 +3213,26 @@ async fn terminate_transport_parts(
         .map_err(BackendError::Io)
 }
 
-fn kill_and_reap_child(child: Arc<std::sync::Mutex<ProcessTreeChild>>) -> std::io::Result<()> {
+struct AppServerReapOutcome {
+    status: std::process::ExitStatus,
+    termination_requested: bool,
+}
+
+fn kill_and_reap_child(
+    child: Arc<std::sync::Mutex<ProcessTreeChild>>,
+) -> std::io::Result<AppServerReapOutcome> {
     let Ok(mut child) = child.lock() else {
         tracing::warn!("codex: app-server process lock is poisoned");
         return Err(std::io::Error::other("app-server process lock is poisoned"));
+    };
+    let termination_requested = match child.try_wait_leader() {
+        Ok(status) => status.is_none(),
+        Err(error) => {
+            // Failure to inspect the leader must not skip the existing
+            // best-effort termination and tree reaping path.
+            tracing::warn!("codex: failed to inspect app-server exit status: {error}");
+            true
+        }
     };
     let mut terminate_error = child.terminate_now().err();
     if let Some(error) = terminate_error.as_ref() {
@@ -3223,7 +3242,12 @@ fn kill_and_reap_child(child: Arc<std::sync::Mutex<ProcessTreeChild>>) -> std::i
     let mut retried_after_leader_exit = false;
     loop {
         match child.try_wait_tree() {
-            Ok(Some(_)) => return Ok(()),
+            Ok(Some(status)) => {
+                return Ok(AppServerReapOutcome {
+                    status,
+                    termination_requested,
+                });
+            }
             Ok(None) => {
                 if !retried_after_leader_exit {
                     match child.retry_termination_after_leader_exit() {
@@ -3263,6 +3287,30 @@ fn kill_and_reap_child(child: Arc<std::sync::Mutex<ProcessTreeChild>>) -> std::i
     }
 }
 
+async fn capture_app_server_stderr<R: AsyncRead + Unpin>(mut stderr: R, tail: AppServerStderrTail) {
+    let mut chunk = [0_u8; 1024];
+    loop {
+        let read = match stderr.read(&mut chunk).await {
+            Ok(0) => return,
+            Ok(read) => read,
+            Err(error) => {
+                tracing::warn!(%error, "codex: failed to read app-server stderr");
+                return;
+            }
+        };
+        let mut tail = tail.lock().unwrap();
+        tail.extend(&chunk[..read]);
+        while tail.len() > APP_SERVER_STDERR_TAIL_BYTES {
+            tail.pop_front();
+        }
+    }
+}
+
+fn app_server_stderr_tail(tail: &AppServerStderrTail) -> String {
+    let bytes = tail.lock().unwrap().iter().copied().collect::<Vec<_>>();
+    String::from_utf8_lossy(&bytes).trim().to_string()
+}
+
 fn start_kill_child_now(child: &std::sync::Mutex<ProcessTreeChild>) {
     match child.try_lock() {
         Ok(mut child) => {
@@ -3284,6 +3332,7 @@ struct ReaderTurnState {
     active_turns: Option<ActiveTurns>,
     completed_turns: Option<CompletedTurns>,
     turn_lifecycles: Option<TurnLifecycles>,
+    stderr_tail: Option<AppServerStderrTail>,
 }
 
 async fn read_stdout<R: AsyncRead + Unpin>(
@@ -3299,9 +3348,15 @@ async fn read_stdout<R: AsyncRead + Unpin>(
         active_turns,
         completed_turns,
         turn_lifecycles,
+        stderr_tail,
     } = turn_state;
     let mut lines = BufReader::new(stdout).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
+    let stdout_error = loop {
+        let line = match lines.next_line().await {
+            Ok(Some(line)) => line,
+            Ok(None) => break None,
+            Err(error) => break Some(error),
+        };
         let Ok(msg) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
@@ -3413,16 +3468,41 @@ async fn read_stdout<R: AsyncRead + Unpin>(
                 }
             }
         }
-    }
+    };
     // Dropping stdout means the app-server can never complete any
     // outstanding request or turn. Drop every sender it left behind so
     // request waiters and routed turn streams wake immediately instead of
     // remaining active forever.
+    let unexpected_close = !closed.load(Ordering::Relaxed);
     close_transport(&pending, &routing, active_turns.as_ref(), &closed).await;
     if let Some(child) = child.and_then(|child| child.upgrade()) {
         match tokio::task::spawn_blocking(move || kill_and_reap_child(child)).await {
-            Ok(Ok(())) => {}
+            Ok(Ok(outcome)) => {
+                if unexpected_close {
+                    let stderr = stderr_tail
+                        .as_ref()
+                        .map(app_server_stderr_tail)
+                        .unwrap_or_default();
+                    tracing::error!(
+                        status = %outcome.status,
+                        termination_requested = outcome.termination_requested,
+                        stdout_error = stdout_error.as_ref().map(std::string::ToString::to_string),
+                        stderr = %stderr,
+                        "codex: app-server stdout closed unexpectedly"
+                    );
+                }
+            }
             Ok(Err(error)) => {
+                let stderr = stderr_tail
+                    .as_ref()
+                    .map(app_server_stderr_tail)
+                    .unwrap_or_default();
+                tracing::error!(
+                    %error,
+                    stdout_error = stdout_error.as_ref().map(std::string::ToString::to_string),
+                    stderr = %stderr,
+                    "codex: app-server stdout closed and process cleanup failed"
+                );
                 tracing::warn!("codex: stdout EOF cleanup was not acknowledged: {error}");
             }
             Err(error) => {
@@ -3538,13 +3618,16 @@ impl AppServer {
             .arg("app-server")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
         let mut child = spawn_process_tree(&mut command_process).map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => BackendError::NotInstalled(command.to_string()),
             _ => BackendError::Io(e),
         })?;
         let stdin = Arc::new(Mutex::new(child.take_stdin().expect("stdin piped")));
         let stdout = child.take_stdout().expect("stdout piped");
+        let stderr = child.take_stderr().expect("stderr piped");
+        let stderr_tail = Arc::new(std::sync::Mutex::new(VecDeque::new()));
+        tokio::spawn(capture_app_server_stderr(stderr, stderr_tail.clone()));
         let (retired_response_tx, retired_response_rx) = mpsc::channel(ROUTE_EVENT_BUDGET);
 
         let server = Self {
@@ -3563,7 +3646,7 @@ impl AppServer {
             transport_cleanup_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         server.start_response_writer(retired_response_rx);
-        server.start_reader(stdout);
+        server.start_reader(stdout, stderr_tail);
         Ok(server)
     }
 
@@ -3699,7 +3782,7 @@ impl AppServer {
         let _ = kill_and_reap_child(self.child.clone());
     }
 
-    fn start_reader(&self, stdout: tokio::process::ChildStdout) {
+    fn start_reader(&self, stdout: tokio::process::ChildStdout, stderr_tail: AppServerStderrTail) {
         let closed = self.closed.clone();
         let pending = self.pending.clone();
         let routing = self.routing.clone();
@@ -3713,6 +3796,7 @@ impl AppServer {
                 active_turns: Some(active_turns),
                 completed_turns: Some(self.completed_turns.clone()),
                 turn_lifecycles: Some(self.turn_lifecycles.clone()),
+                stderr_tail: Some(stderr_tail),
             },
             self.retired_response_tx.clone(),
             closed,
@@ -6415,6 +6499,31 @@ for line in sys.stdin:
     }
 
     #[tokio::test]
+    async fn app_server_stderr_tail_is_bounded_and_keeps_latest_output() {
+        let tail = Arc::new(std::sync::Mutex::new(VecDeque::new()));
+        let (mut writer, reader) = tokio::io::duplex(1024);
+        let capture = tokio::spawn(capture_app_server_stderr(reader, tail.clone()));
+        let diagnostic = b"final app-server diagnostic";
+        writer
+            .write_all(&vec![b'x'; APP_SERVER_STDERR_TAIL_BYTES + 256])
+            .await
+            .unwrap();
+        writer.write_all(diagnostic).await.unwrap();
+        writer.shutdown().await.unwrap();
+        capture.await.unwrap();
+
+        let captured = tail.lock().unwrap();
+        assert_eq!(captured.len(), APP_SERVER_STDERR_TAIL_BYTES);
+        assert!(
+            captured
+                .iter()
+                .copied()
+                .collect::<Vec<_>>()
+                .ends_with(diagnostic)
+        );
+    }
+
+    #[tokio::test]
     async fn reader_eof_releases_pending_requests_and_turn_routes() {
         let deadline = std::time::Duration::from_secs(1);
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
@@ -6435,6 +6544,7 @@ for line in sys.stdin:
                 active_turns: None,
                 completed_turns: None,
                 turn_lifecycles: None,
+                stderr_tail: None,
             },
             retired_response_tx,
             closed.clone(),
@@ -6485,6 +6595,7 @@ for line in sys.stdin:
                 active_turns: Some(active_turns.clone()),
                 completed_turns: Some(completed_turns.clone()),
                 turn_lifecycles: Some(turn_lifecycles.clone()),
+                stderr_tail: None,
             },
             retired_response_tx,
             closed,
@@ -6618,6 +6729,7 @@ for line in sys.stdin:
                 active_turns: Some(active_turns.clone()),
                 completed_turns: Some(completed_turns),
                 turn_lifecycles: Some(turn_lifecycles),
+                stderr_tail: None,
             },
             retired_response_tx,
             closed,
@@ -7452,6 +7564,7 @@ cat > /dev/null
                 active_turns: None,
                 completed_turns: None,
                 turn_lifecycles: None,
+                stderr_tail: None,
             },
             retired_response_tx,
             closed.clone(),
