@@ -484,7 +484,9 @@ export function inspectToolCalls(frames, callbacks, expectedTools, expectToolErr
   const streamNames = sorted(
     new Set(toolMessages.map((message) => message.name).filter(Boolean)),
   );
-  const nativeToolNames = streamNames.filter(toolIsForbidden);
+  const nativeToolNames = streamNames.filter(
+    (name) => !expectedTools.includes(name) && toolIsForbidden(name),
+  );
   const nativeToolEventObserved = nativeToolNames.length > 0;
   if (nativeToolEventObserved) {
     throw new QualificationError(

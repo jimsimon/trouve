@@ -704,6 +704,27 @@ test("full qualification requires callback and stream ids to be one-to-one", () 
   assert.equal(Object.hasOwn(summary, "native_tools_present"), false);
 });
 
+test("full qualification accepts exact custom-tool stream names", () => {
+  const toolName = "trouve_qualification_read";
+  const callId = "call-read";
+  const frame = (status) => ({
+    sdkMessage: {
+      message: { type: "tool_call", name: toolName, call_id: callId, status },
+    },
+  });
+
+  const summary = inspectToolCalls(
+    [frame("started"), frame("completed")],
+    [{ toolName, toolCallId: callId }],
+    [toolName],
+    false,
+    "read turn",
+  );
+
+  assert.deepEqual(summary.stream_names, [toolName]);
+  assert.equal(summary.native_tool_event_observed, false);
+});
+
 test("full qualification rejects tool events without call ids in plan mode", () => {
   assert.throws(
     () => inspectToolCalls(
