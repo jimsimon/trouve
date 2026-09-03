@@ -3178,6 +3178,7 @@ impl RunProjection {
     }
 
     fn capture_frame_run_id(&mut self, frame: &Value) {
+        self.capture_run_id(frame);
         if let Some(message) = frame.pointer("/sdkMessage/message") {
             self.capture_run_id(message);
         }
@@ -3658,6 +3659,24 @@ mod tests {
             )
             .await;
         assert_eq!(result, Err(StreamStop::ConsumerClosed));
+    }
+
+    #[test]
+    fn projection_captures_run_ids_from_every_bridge_frame_shape() {
+        for (frame, expected) in [
+            (json!({ "runId": "top-level-camel" }), "top-level-camel"),
+            (json!({ "run_id": "top-level-snake" }), "top-level-snake"),
+            (
+                json!({ "sdkMessage": { "message": { "run_id": "message" } } }),
+                "message",
+            ),
+            (json!({ "result": { "runId": "result" } }), "result"),
+            (json!({ "done": { "runId": "done" } }), "done"),
+        ] {
+            let mut projection = RunProjection::default();
+            projection.capture_frame_run_id(&frame);
+            assert_eq!(projection.run_id.as_deref(), Some(expected));
+        }
     }
 
     #[test]
