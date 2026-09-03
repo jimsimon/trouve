@@ -237,16 +237,13 @@ fn process_count(count: usize, adjective: &str) -> String {
 struct DetachedEntry {
     process: DetachedProcess,
     worktree: PathBuf,
-    /// The command that started it, for logs.
-    command: String,
 }
 
 impl DetachedEntry {
-    fn new(worktree: &Path, command: &str, process: &DetachedProcess) -> Self {
+    fn new(worktree: &Path, process: &DetachedProcess) -> Self {
         Self {
             process: process.clone(),
             worktree: worktree.to_path_buf(),
-            command: command.to_string(),
         }
     }
 }
@@ -257,16 +254,22 @@ impl DetachedEntry {
 struct RetainedTree {
     sentinel: ReleasedSentinel,
     worktree: PathBuf,
-    /// The command that started the tree, for logs.
-    command: String,
+    /// The daemons released with the sentinel, by name and pid, for logs
+    /// and failure reports. The command line that started them is not
+    /// recorded anywhere but the caller's own result: it may carry secrets.
+    label: String,
 }
 
 impl RetainedTree {
-    fn new(worktree: &Path, command: &str, sentinel: ReleasedSentinel) -> Self {
+    fn new(worktree: &Path, processes: &[DetachedProcess], sentinel: ReleasedSentinel) -> Self {
         Self {
             sentinel,
             worktree: worktree.to_path_buf(),
-            command: command.to_string(),
+            label: describe_processes(
+                processes
+                    .iter()
+                    .map(|process| (process.pid, process.name.as_str())),
+            ),
         }
     }
 }
@@ -314,7 +317,7 @@ impl DetachedRegistry {
     /// is atomic with respect to eviction. Daemons released for a worktree
     /// that is already evicted are stopped in the background instead of
     /// kept, and reported as such.
-    fn adopt(&self, worktree: &Path, command: &str, child: &mut ProcessTreeChild) -> TreeRemnants {
+    fn adopt(&self, worktree: &Path, child: &mut ProcessTreeChild) -> TreeRemnants {
         let mut remnants = TreeRemnants::take_from(child);
         if remnants.detached.is_empty() {
             return remnants;
@@ -322,7 +325,7 @@ impl DetachedRegistry {
         let sentinel = child.release_sentinel();
         let mut state = self.state.lock().unwrap();
         if !state.evicted.iter().any(|evicted| evicted == worktree) {
-            state.register(worktree, command, &remnants.detached, sentinel);
+            state.register(worktree, &remnants.detached, sentinel);
             return remnants;
         }
         drop(state);
@@ -330,17 +333,16 @@ impl DetachedRegistry {
         let late: Vec<DetachedEntry> = remnants
             .stopped_after_eviction
             .iter()
-            .map(|process| DetachedEntry::new(worktree, command, process))
+            .map(|process| DetachedEntry::new(worktree, process))
             .collect();
         let late_trees: Vec<RetainedTree> = sentinel
-            .map(|sentinel| RetainedTree::new(worktree, command, sentinel))
+            .map(|sentinel| RetainedTree::new(worktree, &remnants.stopped_after_eviction, sentinel))
             .into_iter()
             .collect();
         for entry in &late {
             tracing::warn!(
                 pid = entry.process.pid,
                 name = %entry.process.name,
-                command,
                 worktree = %worktree.display(),
                 "shell call released a process after its worktree was evicted; stopping it"
             );
@@ -383,7 +385,6 @@ impl DetachedState {
     fn register(
         &mut self,
         worktree: &Path,
-        command: &str,
         processes: &[DetachedProcess],
         sentinel: Option<ReleasedSentinel>,
     ) {
@@ -397,16 +398,14 @@ impl DetachedState {
             tracing::info!(
                 pid = process.pid,
                 name = %process.name,
-                command,
                 worktree = %worktree.display(),
                 "released a detached process from a shell call"
             );
-            self.entries
-                .push(DetachedEntry::new(worktree, command, process));
+            self.entries.push(DetachedEntry::new(worktree, process));
         }
         if let Some(sentinel) = sentinel {
             self.sentinels
-                .push(RetainedTree::new(worktree, command, sentinel));
+                .push(RetainedTree::new(worktree, processes, sentinel));
         }
         if self.entries.len() > self.prune_threshold || self.sentinels.len() > self.prune_threshold
         {
@@ -456,10 +455,11 @@ async fn terminate_entries(
                     tracing::info!(
                         pid = holder.pid,
                         name = %holder.name,
-                        command = tree.command,
+                        released = %tree.label,
+                        worktree = %tree.worktree.display(),
                         "a process released by a shell call forked another after the hand-over; stopping it with the worktree"
                     );
-                    entries.push(DetachedEntry::new(&tree.worktree, &tree.command, &holder));
+                    entries.push(DetachedEntry::new(&tree.worktree, &holder));
                 }
             }
             Err(error) => failures.push(retained_tree_failure(tree, &error)),
@@ -482,7 +482,7 @@ async fn terminate_entries(
         tracing::warn!(
             pid = entry.process.pid,
             name = %entry.process.name,
-            command = entry.command,
+            worktree = %entry.worktree.display(),
             "released process ignored SIGTERM at worktree eviction; killing it"
         );
         if let Err(error) = entry.process.kill() {
@@ -513,14 +513,14 @@ async fn sweep_retained_tree(tree: &RetainedTree) -> Vec<String> {
         }
         for holder in holders {
             if let Err(error) = holder.kill() {
-                let entry = DetachedEntry::new(&tree.worktree, &tree.command, &holder);
+                let entry = DetachedEntry::new(&tree.worktree, &holder);
                 failures.push(detached_failure(&entry, &error));
             }
         }
         if tokio::time::Instant::now() >= deadline {
             failures.push(format!(
-                "released process tree for `{}` still has holders after eviction",
-                tree.command
+                "released process tree ({}) still has holders after eviction",
+                tree.label
             ));
             return failures;
         }
@@ -530,8 +530,8 @@ async fn sweep_retained_tree(tree: &RetainedTree) -> Vec<String> {
 
 fn retained_tree_failure(tree: &RetainedTree, error: &std::io::Error) -> String {
     format!(
-        "released process tree for `{}`: cannot list its holders: {error}",
-        tree.command
+        "released process tree ({}): cannot list its holders: {error}",
+        tree.label
     )
 }
 
@@ -568,6 +568,8 @@ struct JobHandle {
     output: Arc<Mutex<JobOutput>>,
     /// Worktree the job was started from; other sessions cannot touch it.
     worktree: PathBuf,
+    /// Returned with `shell_kill` results; never logged, as it may carry
+    /// secrets.
     command: String,
 }
 
@@ -575,7 +577,7 @@ impl JobHandle {
     /// Hand what the tree released or killed to the session registry and
     /// the job output.
     async fn collect_remnants(&self, registry: &DetachedRegistry) {
-        let remnants = registry.adopt(&self.worktree, &self.command, &mut *self.child.lock().await);
+        let remnants = registry.adopt(&self.worktree, &mut *self.child.lock().await);
         self.record_remnants(remnants);
     }
 
@@ -655,7 +657,7 @@ async fn terminate_background_job_bounded(
     };
     let warning = unacknowledged_cleanup_warning(&error);
     tracing::warn!(
-        command = job.command,
+        worktree = %job.worktree.display(),
         %warning,
         "closing a background shell job whose process-tree cleanup was not acknowledged"
     );
@@ -945,7 +947,7 @@ impl Tool for Shell {
                 let cleanup = self.cleanup_foreground_until_acknowledged(&child).await;
                 stdout.abort();
                 stderr.abort();
-                self.interrupted_result(ctx, command, &child, "command cancelled".to_string(), cleanup)
+                self.interrupted_result(ctx, &child, "command cancelled".to_string(), cleanup)
                     .await
             }
             outcome = tokio::time::timeout(timeout, wait) => match outcome {
@@ -954,13 +956,13 @@ impl Tool for Shell {
                 stdout.abort();
                 stderr.abort();
                 let message = format!("command timed out after {}s", timeout.as_secs());
-                self.interrupted_result(ctx, command, &child, message, cleanup).await
+                self.interrupted_result(ctx, &child, message, cleanup).await
             }
             Ok(Err(error)) => {
                 let completed_status = child.lock().await.leader_status();
                 let cleanup = self.cleanup_foreground_until_acknowledged(&child).await;
                 if let Some(status) = completed_status {
-                    let remnants = self.collect_foreground_remnants(ctx, command, &child).await;
+                    let remnants = self.collect_foreground_remnants(ctx, &child).await;
                     let (retry_error, cleanup_warning) = match &cleanup {
                         ForegroundCleanup::Acknowledged { retried_after, .. } => {
                             (retried_after.clone(), None)
@@ -992,10 +994,10 @@ impl Tool for Shell {
                     } => format!("shell failed: {error}; cleanup exit status: {status}"),
                     _ => format!("shell failed: {error}"),
                 };
-                self.interrupted_result(ctx, command, &child, message, cleanup).await
+                self.interrupted_result(ctx, &child, message, cleanup).await
             }
             Ok(Ok(status)) => {
-                let remnants = self.collect_foreground_remnants(ctx, command, &child).await;
+                let remnants = self.collect_foreground_remnants(ctx, &child).await;
                 foreground_result(status, stdout, stderr, &remnants, None).await
             }
             },
@@ -1051,12 +1053,11 @@ impl Shell {
     async fn collect_foreground_remnants(
         &self,
         ctx: &ToolCtx,
-        command: &str,
         child: &Arc<tokio::sync::Mutex<ProcessTreeChild>>,
     ) -> TreeRemnants {
         self.jobs
             .detached
-            .adopt(&ctx.worktree, command, &mut *child.lock().await)
+            .adopt(&ctx.worktree, &mut *child.lock().await)
     }
 
     /// The error result of a call stopped before its command completed:
@@ -1064,12 +1065,11 @@ impl Shell {
     async fn interrupted_result(
         &self,
         ctx: &ToolCtx,
-        command: &str,
         child: &Arc<tokio::sync::Mutex<ProcessTreeChild>>,
         message: String,
         cleanup: ForegroundCleanup,
     ) -> ToolResult {
-        let remnants = self.collect_foreground_remnants(ctx, command, child).await;
+        let remnants = self.collect_foreground_remnants(ctx, child).await;
         let message = match cleanup {
             ForegroundCleanup::Acknowledged {
                 retried_after: None,
@@ -1140,7 +1140,7 @@ impl Shell {
                     let (status, remnants) = {
                         let mut child = job.child.lock().await;
                         let status = child.try_wait_tree();
-                        let remnants = detached.adopt(&job.worktree, &job.command, &mut child);
+                        let remnants = detached.adopt(&job.worktree, &mut child);
                         (status, remnants)
                     };
                     job.record_remnants(remnants);
@@ -2352,6 +2352,138 @@ mod tests {
         shell.jobs.kill_worktree(tmp.path()).await.unwrap();
         wait_for_process_exit(worker_pid).await;
         wait_for_process_exit(daemon_pid).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    thread_local! {
+        /// Where [`RecordingSubscriber`] writes the current thread's records.
+        static CAPTURED_LOG: std::cell::RefCell<Option<Arc<Mutex<Vec<String>>>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Records every field of every tracing event and span emitted on a
+    /// capturing thread, one line per record. Installed as the process-wide
+    /// default: a thread-local default would leave a callsite first reached
+    /// by another test's thread cached as disabled.
+    #[cfg(target_os = "linux")]
+    struct RecordingSubscriber;
+
+    #[cfg(target_os = "linux")]
+    impl RecordingSubscriber {
+        /// Capture this thread's records until the returned lines are dropped.
+        fn capture() -> Arc<Mutex<Vec<String>>> {
+            static INSTALLED: std::sync::Once = std::sync::Once::new();
+            INSTALLED.call_once(|| {
+                let _ = tracing::subscriber::set_global_default(RecordingSubscriber);
+            });
+            let lines: Arc<Mutex<Vec<String>>> = Arc::default();
+            CAPTURED_LOG.with(|slot| *slot.borrow_mut() = Some(Arc::clone(&lines)));
+            lines
+        }
+
+        fn record(&self, fields: &dyn Fn(&mut dyn tracing::field::Visit)) {
+            struct Line(String);
+            impl tracing::field::Visit for Line {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    use std::fmt::Write as _;
+                    write!(self.0, " {}={value:?}", field.name()).unwrap();
+                }
+            }
+            CAPTURED_LOG.with(|slot| {
+                let Some(lines) = slot.borrow().as_ref().map(Arc::clone) else {
+                    return;
+                };
+                let mut line = Line(String::new());
+                fields(&mut line);
+                lines.lock().unwrap().push(line.0);
+            });
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl tracing::Subscriber for RecordingSubscriber {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            self.record(&|line| span.record(line));
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, values: &tracing::span::Record<'_>) {
+            self.record(&|line| values.record(line));
+        }
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            self.record(&|line| event.record(line));
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// The command line that started a daemon may carry secrets, and the
+    /// daemon's lifecycle is logged long after the call that saw the command
+    /// returned: at release, when a worker it forked is found, and at
+    /// eviction. None of those records carries the command.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn detached_lifecycle_logs_never_carry_the_command() {
+        require_setsid();
+        let lines = RecordingSubscriber::capture();
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ToolCtx {
+            worktree: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let (shell, _, _) = tools();
+        let secret = "hunter2-do-not-log";
+        // The daemon and its worker ignore SIGTERM so that eviction reaches
+        // the SIGKILL path too.
+        let command = format!(
+            "TOKEN={secret}; setsid sh -c 'trap \"\" TERM; echo $$ > child.pid; sleep 0.3; \
+             sleep 60 & echo $! > worker.pid; wait' </dev/null >/dev/null 2>&1 & \
+             while [ ! -s child.pid ]; do sleep 0.01; done"
+        );
+        let res = shell
+            .run(&ctx, &json!({"command": command, "timeout_secs": 5}))
+            .await;
+        assert_eq!(
+            res.status,
+            trouve_protocol::ToolStatus::Ok,
+            "{:?}",
+            res.result
+        );
+        let daemon_pid = wait_for_pid_file(&tmp.path().join("child.pid")).await;
+        let worker_pid = wait_for_pid_file(&tmp.path().join("worker.pid")).await;
+
+        shell.jobs.kill_worktree(tmp.path()).await.unwrap();
+        wait_for_process_exit(worker_pid).await;
+        wait_for_process_exit(daemon_pid).await;
+
+        CAPTURED_LOG.with(|slot| slot.borrow_mut().take());
+        let lines = lines.lock().unwrap();
+        for expected in [
+            "released a detached process from a shell call",
+            "forked another after the hand-over",
+            "ignored SIGTERM at worktree eviction",
+        ] {
+            assert!(
+                lines.iter().any(|line| line.contains(expected)),
+                "no record of {expected:?} in:\n{}",
+                lines.join("\n")
+            );
+        }
+        let leaks: Vec<&String> = lines.iter().filter(|line| line.contains(secret)).collect();
+        assert!(leaks.is_empty(), "the command reached the logs: {leaks:?}");
     }
 
     /// Above its threshold the record is pruned of what has exited, never

@@ -31,10 +31,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   attempts are exhausted, so `shell_output` no longer reports it as running.
 - **No descriptor leaks into shell children**: process-tree spawns mark every
   inherited descriptor beyond stdio close-on-exec, so descriptors the desktop
-  host opens without `O_CLOEXEC` no longer reach child processes. A spawn
-  that could only sanitize part of the descriptor table — no `close_range`,
-  no listable `/proc/self/fd`, and a soft `RLIMIT_NOFILE` above 2^20 — fails
+  host opens without `O_CLOEXEC` no longer reach child processes, including
+  one opened while the spawn was being prepared: without `close_range` the
+  child lists its own descriptor table between fork and exec. A spawn that
+  could only sanitize part of the descriptor table — no `close_range`, no
+  listable `/proc/self/fd`, and a soft `RLIMIT_NOFILE` above 2^20 — fails
   with an error naming the limit instead of leaking the rest.
+- **Released daemons are logged by pid and name only**: the command line
+  that started one stays out of the lifecycle logs and eviction failure
+  messages, which outlive the call and may otherwise retain secrets.
 
 ## [4.8.1] - 2026-09-03
 

@@ -35,15 +35,13 @@ pub const DETACHED_RELEASE_SUPPORTED: bool = cfg!(any(target_os = "linux", targe
 /// the spawn for minutes. A walk that stopped short instead would leave
 /// every descriptor above its stopping point inheritable, so a spawn whose
 /// only option is a walk past this bound fails rather than leak. The walk
-/// is the last resort behind `close_range` and the descriptor-table
-/// listing, both of which cover any descriptor number.
+/// is the last resort behind `close_range` and the child's own
+/// descriptor-table listing, both of which cover any descriptor number.
 #[cfg(unix)]
 const DESCRIPTOR_WALK_CEILING: libc::c_int = 1 << 20;
-/// Where the process's own descriptor table can be listed.
+/// Where a process's own descriptor table can be listed.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-const DESCRIPTOR_TABLE: &str = "/proc/self/fd";
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
-const DESCRIPTOR_TABLE: &str = "/dev/fd";
+const DESCRIPTOR_TABLE: &std::ffi::CStr = c"/proc/self/fd";
 #[cfg(windows)]
 const WINDOWS_PROCESS_TREE_CREATION_FLAGS: u32 =
     windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
@@ -857,12 +855,14 @@ fn install_unix_descendant_sentinel(
 
     let writer_fd = writer.as_raw_fd();
     let hygiene = DescriptorHygiene::detect([reader.as_raw_fd(), writer_fd])?;
-    // SAFETY: this closure only invokes async-signal-safe `close_range` and
-    // `fcntl` between fork and exec and never allocates; an error carries
-    // nothing but its `errno`. The parent copy stays close-on-exec and is
-    // dropped immediately after spawn; the child copy deliberately survives
-    // exec and is inherited across forks and `setsid()` calls until the last
-    // descendant exits.
+    #[cfg(test)]
+    run_after_descriptor_hygiene_detect_hook();
+    // SAFETY: this closure only invokes async-signal-safe `close_range`,
+    // `open`, `getdents64`, `fcntl`, and `close` between fork and exec and
+    // never allocates; an error carries nothing but its `errno`. The parent
+    // copy stays close-on-exec and is dropped immediately after spawn; the
+    // child copy deliberately survives exec and is inherited across forks
+    // and `setsid()` calls until the last descendant exits.
     unsafe {
         command.pre_exec(move || {
             // Libraries loaded into the desktop process (WebKitGTK, for one)
@@ -882,34 +882,40 @@ fn install_unix_descendant_sentinel(
 }
 
 /// How `pre_exec` marks the parent's descriptors close-on-exec. Chosen in the
-/// parent, where `getrlimit`, allocation, and reading the descriptor table
-/// are allowed; applied in the child with nothing but `close_range` and
-/// `fcntl`, which are async-signal-safe. Every option covers the complete
-/// descriptor table; when none is available the spawn fails rather than
-/// leave part of the table inheritable.
+/// parent, where `getrlimit`, allocation, and `read_dir` are allowed; applied
+/// in the child with nothing but async-signal-safe syscalls. Every option
+/// covers the descriptor table the child actually has, so a descriptor
+/// another thread opens while the spawn is being prepared is covered too;
+/// when no option is available the spawn fails rather than leave part of
+/// the table inheritable.
 #[cfg(unix)]
 enum DescriptorHygiene {
     /// `close_range(3, ~0, CLOSE_RANGE_CLOEXEC)` (Linux 5.11+) marks the
-    /// whole table in one call, including descriptors other threads open
-    /// between spawn preparation and `fork`. Should the call fail in the
-    /// child after succeeding in the parent, the walk backs it up when the
-    /// soft limit allows one.
+    /// whole table in one call. Should the call fail in the child after
+    /// succeeding in the parent, the walk backs it up when the soft limit
+    /// allows one.
     CloseRange { walk_bound: Option<libc::c_int> },
-    /// The parent's open descriptors above stdio, read from its descriptor
-    /// table. Exact for any descriptor number; the only gap is a descriptor
-    /// another thread opens without `O_CLOEXEC` after the listing.
-    Listed(Vec<libc::c_int>),
+    /// The child lists its own `/proc/self/fd` between fork and exec and
+    /// marks every entry above stdio. The child is single-threaded by then,
+    /// so the listing is exact; a listing that misses the sentinel writer is
+    /// treated as failed, and the walk backs the listing up when the soft
+    /// limit allows one.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    Listed {
+        sentinel_writer: libc::c_int,
+        walk_bound: Option<libc::c_int>,
+    },
     /// Every descriptor number below the `RLIMIT_NOFILE` soft limit, for
-    /// platforms with neither `close_range` nor a readable table. The bound
+    /// platforms with neither `close_range` nor a listable table. The bound
     /// is the soft limit itself, never something smaller.
     Walk(libc::c_int),
 }
 
 #[cfg(unix)]
 impl DescriptorHygiene {
-    /// `sentinel` holds both ends of the freshly created sentinel pipe; a
-    /// descriptor-table listing that misses either is incomplete and is not
-    /// trusted.
+    /// `sentinel` holds both ends of the freshly created sentinel pipe. The
+    /// parent's own listing must contain both before the child is trusted to
+    /// list its table; a `/proc` that is not this process's is not listable.
     fn detect(sentinel: [libc::c_int; 2]) -> std::io::Result<Self> {
         let (allow_close_range, allow_listing) = descriptor_hygiene_preferences();
         let soft_limit = descriptor_soft_limit();
@@ -918,9 +924,15 @@ impl DescriptorHygiene {
         if allow_close_range && close_range_marks_close_on_exec() {
             return Ok(Self::CloseRange { walk_bound });
         }
-        if allow_listing && let Some(open) = open_descriptors_above_stdio(sentinel) {
-            return Ok(Self::Listed(open));
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if allow_listing && descriptor_table_lists(sentinel) {
+            return Ok(Self::Listed {
+                sentinel_writer: sentinel[1],
+                walk_bound,
+            });
         }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let _ = (allow_listing, sentinel);
         let Some(bound) = walk_bound else {
             return Err(unbounded_descriptor_walk_error(soft_limit, ceiling));
         };
@@ -941,9 +953,16 @@ impl DescriptorHygiene {
                     None => return Err(error),
                 }
             }
-            Self::Listed(open) => {
-                for &descriptor in open {
-                    mark_descriptor_close_on_exec(descriptor);
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            Self::Listed {
+                sentinel_writer,
+                walk_bound,
+            } => {
+                if let Err(error) = list_descriptors_close_on_exec(*sentinel_writer) {
+                    match walk_bound {
+                        Some(bound) => walk_descriptors_close_on_exec(*bound),
+                        None => return Err(error),
+                    }
                 }
             }
             Self::Walk(bound) => walk_descriptors_close_on_exec(*bound),
@@ -989,26 +1008,132 @@ fn close_range_close_on_exec(_first: libc::c_uint) -> bool {
     false
 }
 
-/// The parent's open descriptors above stdio, or `None` when the descriptor
-/// table cannot be listed completely.
-#[cfg(unix)]
-fn open_descriptors_above_stdio(sentinel: [libc::c_int; 2]) -> Option<Vec<libc::c_int>> {
-    let mut open = Vec::new();
-    for entry in std::fs::read_dir(DESCRIPTOR_TABLE).ok()? {
-        let descriptor = entry
-            .ok()?
+/// Whether the parent's descriptor table is listable: `/proc/self/fd` exists
+/// and shows both ends of the sentinel pipe, so it is this process's own
+/// table rather than a stale or foreign `/proc`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn descriptor_table_lists(sentinel: [libc::c_int; 2]) -> bool {
+    let Ok(entries) = std::fs::read_dir(DESCRIPTOR_TABLE.to_str().unwrap()) else {
+        return false;
+    };
+    let mut seen = [false; 2];
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return false;
+        };
+        let Some(descriptor) = entry
             .file_name()
-            .to_str()?
-            .parse::<libc::c_int>()
-            .ok()?;
-        if descriptor >= 3 {
-            open.push(descriptor);
+            .to_str()
+            .and_then(|name| name.parse::<libc::c_int>().ok())
+        else {
+            return false;
+        };
+        for (end, seen) in sentinel.iter().zip(seen.iter_mut()) {
+            *seen |= descriptor == *end;
         }
     }
-    sentinel
+    seen.iter().all(|seen| *seen)
+}
+
+/// Child-side only: list the child's own `/proc/self/fd` with `getdents64`
+/// and mark every descriptor above stdio close-on-exec. Async-signal-safe
+/// and allocation-free; the entries are parsed off a stack buffer. Fails
+/// when the table cannot be read or the listing does not show the sentinel
+/// writer, which a complete listing of this child must.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn list_descriptors_close_on_exec(sentinel_writer: libc::c_int) -> std::io::Result<()> {
+    // `getdents64` records are 8-byte aligned; a `u64` buffer keeps them so.
+    let mut buffer = [0u64; 512];
+    let directory = unsafe {
+        libc::open(
+            DESCRIPTOR_TABLE.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if directory == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut sentinel_seen = false;
+    let outcome = loop {
+        let read = unsafe {
+            libc::syscall(
+                libc::SYS_getdents64,
+                directory,
+                buffer.as_mut_ptr(),
+                std::mem::size_of_val(&buffer),
+            )
+        };
+        let Ok(read) = usize::try_from(read) else {
+            break Err(std::io::Error::last_os_error());
+        };
+        if read == 0 {
+            break Ok(());
+        }
+        let records = buffer.as_ptr().cast::<u8>();
+        let mut offset = 0;
+        while offset < read {
+            let parsed = unsafe { parse_dirent64(records.add(offset), read - offset) };
+            let Some((descriptor, length)) = parsed else {
+                break;
+            };
+            offset += length;
+            let Some(descriptor) = descriptor else {
+                continue;
+            };
+            if descriptor < 3 || descriptor == directory {
+                continue;
+            }
+            sentinel_seen |= descriptor == sentinel_writer;
+            mark_descriptor_close_on_exec(descriptor);
+        }
+    };
+    unsafe { libc::close(directory) };
+    match outcome {
+        Ok(()) if sentinel_seen => Ok(()),
+        Ok(()) => Err(std::io::Error::from_raw_os_error(libc::EBADF)),
+        Err(error) => Err(error),
+    }
+}
+
+/// One `getdents64` record: the descriptor number its name spells (`None`
+/// for `.`, `..`, or anything else that is not a decimal number) and the
+/// record's length. `None` altogether when `available` bytes cannot hold a
+/// record, which ends the buffer.
+///
+/// # Safety
+/// `record` must point at `available` readable bytes starting at a record
+/// boundary of a `getdents64` result.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+unsafe fn parse_dirent64(
+    record: *const u8,
+    available: usize,
+) -> Option<(Option<libc::c_int>, usize)> {
+    let name_offset = std::mem::offset_of!(libc::dirent64, d_name);
+    if available < name_offset {
+        return None;
+    }
+    let entry = record.cast::<libc::dirent64>();
+    let length = usize::from(unsafe { std::ptr::addr_of!((*entry).d_reclen).read_unaligned() });
+    if length < name_offset || length > available {
+        return None;
+    }
+    let name = unsafe { std::slice::from_raw_parts(record.add(name_offset), length - name_offset) };
+    let name = &name[..name
         .iter()
-        .all(|end| open.contains(end))
-        .then_some(open)
+        .position(|byte| *byte == 0)
+        .unwrap_or(name.len())];
+    let descriptor = name
+        .iter()
+        .try_fold(None, |number: Option<libc::c_int>, byte| {
+            let digit = libc::c_int::from(byte.checked_sub(b'0').filter(|digit| *digit <= 9)?);
+            number
+                .unwrap_or(0)
+                .checked_mul(10)?
+                .checked_add(digit)
+                .map(Some)
+        })
+        .flatten();
+    Some((descriptor, length))
 }
 
 /// The `RLIMIT_NOFILE` soft limit, read in the parent because `getrlimit` is
@@ -1046,12 +1171,15 @@ fn unbounded_descriptor_walk_error(
         Some(soft) => soft.to_string(),
         None => "unknown".to_string(),
     };
-    std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        format!(
-            "cannot make inherited descriptors close-on-exec for the child: close_range is unavailable, {DESCRIPTOR_TABLE} cannot be listed, and the RLIMIT_NOFILE soft limit ({limit}) exceeds the {ceiling}-descriptor close-on-exec walk bound; lower the limit or make {DESCRIPTOR_TABLE} listable"
-        ),
-    )
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let message = format!(
+        "cannot make inherited descriptors close-on-exec for the child: close_range is unavailable, /proc/self/fd cannot be listed, and the RLIMIT_NOFILE soft limit ({limit}) exceeds the {ceiling}-descriptor close-on-exec walk bound; lower the limit or mount /proc"
+    );
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let message = format!(
+        "cannot make inherited descriptors close-on-exec for the child: the RLIMIT_NOFILE soft limit ({limit}) exceeds the {ceiling}-descriptor close-on-exec walk bound; lower the limit"
+    );
+    std::io::Error::new(std::io::ErrorKind::Unsupported, message)
 }
 
 #[cfg(unix)]
@@ -1094,6 +1222,17 @@ thread_local! {
     /// so a container-sized soft limit can be modelled without one.
     static DESCRIPTOR_WALK_CEILING_OVERRIDE: std::cell::Cell<Option<libc::c_int>> =
         const { std::cell::Cell::new(None) };
+    /// Test hook: runs once after the hygiene strategy is chosen and before
+    /// the spawn, standing in for whatever another thread does in that gap.
+    static AFTER_DESCRIPTOR_HYGIENE_DETECT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(unix, test))]
+fn run_after_descriptor_hygiene_detect_hook() {
+    if let Some(hook) = AFTER_DESCRIPTOR_HYGIENE_DETECT.with(|hook| hook.borrow_mut().take()) {
+        hook();
+    }
 }
 
 #[cfg(unix)]
@@ -3095,6 +3234,23 @@ mod tests {
         );
         let high = unsafe { OwnedFd::from_raw_fd(highest) };
 
+        let listing = descriptor_listing_of_a_child(preferences).await;
+        assert!(
+            !listing.contains(leaked_path.to_str().unwrap()),
+            "child inherited a descriptor the parent left inheritable (highest {highest}):\n{listing}"
+        );
+        assert!(
+            sentinel_listed(&listing),
+            "descriptor hygiene removed the descendant sentinel:\n{listing}"
+        );
+        drop(high);
+        drop(leaked);
+    }
+
+    /// `ls -l /proc/self/fd` as seen by a child spawned under the given
+    /// hygiene preferences.
+    #[cfg(target_os = "linux")]
+    async fn descriptor_listing_of_a_child(preferences: (bool, bool)) -> String {
         let mut command = tokio::process::Command::new("/bin/sh");
         command
             .args(["-c", "ls -l /proc/self/fd"])
@@ -3114,13 +3270,14 @@ mod tests {
         };
         let (status, listing) = tokio::join!(child.wait_and_cleanup(), listing);
         assert!(status.unwrap().success());
+        listing
+    }
 
-        assert!(
-            !listing.contains(leaked_path.to_str().unwrap()),
-            "child inherited a descriptor the parent left inheritable (highest {highest}):\n{listing}"
-        );
-        // The sentinel is a pipe above stdio; stdout itself is also a pipe.
-        let sentinel_inherited = listing.lines().any(|line| {
+    /// Whether the listing shows the sentinel: a pipe above stdio (stdout
+    /// itself is also a pipe).
+    #[cfg(target_os = "linux")]
+    fn sentinel_listed(listing: &str) -> bool {
+        listing.lines().any(|line| {
             line.split_once(" -> ").is_some_and(|(prefix, target)| {
                 target.starts_with("pipe:")
                     && prefix
@@ -3129,13 +3286,7 @@ mod tests {
                         .and_then(|descriptor| descriptor.parse::<i32>().ok())
                         .is_some_and(|descriptor| descriptor >= 3)
             })
-        });
-        assert!(
-            sentinel_inherited,
-            "descriptor hygiene removed the descendant sentinel:\n{listing}"
-        );
-        drop(high);
-        drop(leaked);
+        })
     }
 
     #[cfg(target_os = "linux")]
@@ -3232,6 +3383,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn close_range_probe_leaves_the_parent_table_untouched() {
+        let _serialized = DESCRIPTOR_TEST_LOCK.blocking_lock();
         let file = tempfile::tempfile().unwrap();
         assert_eq!(
             unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, 0) },
@@ -3245,22 +3397,139 @@ mod tests {
         );
     }
 
+    /// The child-side listing, run in this process: it marks the table it
+    /// finds, and a listing that does not show the sentinel writer fails
+    /// rather than pass for complete.
     #[cfg(target_os = "linux")]
     #[test]
-    fn descriptor_listing_is_trusted_only_when_it_contains_the_sentinel() {
+    fn descriptor_listing_marks_the_table_and_requires_the_sentinel() {
+        let _serialized = DESCRIPTOR_TEST_LOCK.blocking_lock();
         let mut descriptors = [-1; 2];
         assert_eq!(
             unsafe { libc::pipe2(descriptors.as_mut_ptr(), libc::O_CLOEXEC) },
             0
         );
-        let reader = unsafe { OwnedFd::from_raw_fd(descriptors[0]) };
+        let _reader = unsafe { OwnedFd::from_raw_fd(descriptors[0]) };
         let writer = unsafe { OwnedFd::from_raw_fd(descriptors[1]) };
-        let open = open_descriptors_above_stdio(descriptors).expect("/proc/self/fd is listable");
-        assert!(open.contains(&reader.as_raw_fd()) && open.contains(&writer.as_raw_fd()));
-        assert!(open.iter().all(|descriptor| *descriptor >= 3));
+        assert!(descriptor_table_lists(descriptors));
         assert!(
-            open_descriptors_above_stdio([libc::c_int::MAX - 1, libc::c_int::MAX]).is_none(),
-            "a listing that misses the sentinel must not be trusted"
+            !descriptor_table_lists([libc::c_int::MAX - 1, libc::c_int::MAX]),
+            "a parent listing that misses the sentinel must not be trusted"
         );
+        let leaked = tempfile::tempfile().unwrap();
+        assert_eq!(
+            unsafe { libc::fcntl(leaked.as_raw_fd(), libc::F_SETFD, 0) },
+            0
+        );
+
+        let error = list_descriptors_close_on_exec(libc::c_int::MAX)
+            .expect_err("a listing without the sentinel writer passed for complete");
+        assert_eq!(error.raw_os_error(), Some(libc::EBADF));
+        list_descriptors_close_on_exec(writer.as_raw_fd()).unwrap();
+        assert_ne!(
+            unsafe { libc::fcntl(leaked.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0,
+            "the listing left an inheritable descriptor alone"
+        );
+        for stdio in 0..3 {
+            let flags = unsafe { libc::fcntl(stdio, libc::F_GETFD) };
+            assert!(
+                flags == -1 || flags & libc::FD_CLOEXEC == 0,
+                "the listing marked stdio {stdio} close-on-exec"
+            );
+        }
+    }
+
+    /// `getdents64` records: numeric names become descriptors, `.` and `..`
+    /// are skipped, and a truncated or oversized record ends the buffer.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dirent64_records_are_parsed_by_name() {
+        fn record(name: &[u8]) -> Vec<u8> {
+            let name_offset = std::mem::offset_of!(libc::dirent64, d_name);
+            let length = (name_offset + name.len() + 1).next_multiple_of(8);
+            let mut bytes = vec![0; length];
+            let length_offset = std::mem::offset_of!(libc::dirent64, d_reclen);
+            bytes[length_offset..length_offset + 2]
+                .copy_from_slice(&u16::try_from(length).unwrap().to_ne_bytes());
+            bytes[name_offset..name_offset + name.len()].copy_from_slice(name);
+            bytes
+        }
+        for (name, expected) in [
+            (&b"17"[..], Some(17)),
+            (b".", None),
+            (b"..", None),
+            (b"0", Some(0)),
+            (b"2147483647", Some(libc::c_int::MAX)),
+            (b"2147483648", None),
+            (b"1a", None),
+            (b"", None),
+        ] {
+            let bytes = record(name);
+            let parsed = unsafe { parse_dirent64(bytes.as_ptr(), bytes.len()) };
+            assert_eq!(parsed, Some((expected, bytes.len())), "{name:?}");
+            assert_eq!(
+                unsafe { parse_dirent64(bytes.as_ptr(), bytes.len() - 1) },
+                None,
+                "{name:?} parsed from a truncated buffer"
+            );
+        }
+        let mut records = record(b"3");
+        records.extend(record(b"4"));
+        let second = unsafe { parse_dirent64(records.as_ptr(), records.len()) }.unwrap();
+        assert_eq!(second, (Some(3), records.len() / 2));
+        assert_eq!(
+            unsafe { parse_dirent64(records.as_ptr().add(second.1), records.len() - second.1) },
+            Some((Some(4), records.len() / 2))
+        );
+        assert_eq!(unsafe { parse_dirent64(records.as_ptr(), 8) }, None);
+    }
+
+    /// A descriptor another thread opens after the hygiene strategy is chosen
+    /// and before the spawn must not reach the child either: the child lists
+    /// its own table, not a snapshot the parent took earlier.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn descriptor_listing_covers_descriptors_opened_after_detection() {
+        let _serialized = DESCRIPTOR_TEST_LOCK.lock().await;
+        let directory = tempfile::tempdir().unwrap();
+        let leaked_path = directory.path().join("opened-after-detection");
+        let leaked: std::sync::Arc<std::sync::Mutex<Option<std::fs::File>>> =
+            std::sync::Arc::default();
+        let (hook_path, hook_slot) = (leaked_path.clone(), std::sync::Arc::clone(&leaked));
+        AFTER_DESCRIPTOR_HYGIENE_DETECT.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                // Another thread opens a descriptor without O_CLOEXEC while
+                // the spawn is being prepared.
+                let file = std::thread::spawn(move || {
+                    let file = std::fs::File::create(&hook_path).unwrap();
+                    assert_eq!(
+                        unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, 0) },
+                        0
+                    );
+                    file
+                })
+                .join()
+                .unwrap();
+                *hook_slot.lock().unwrap() = Some(file);
+            }));
+        });
+
+        let listing = descriptor_listing_of_a_child((false, true)).await;
+        let opened = leaked
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the hook ran before the spawn");
+        assert!(
+            !listing.contains(leaked_path.to_str().unwrap()),
+            "child inherited a descriptor opened after the hygiene strategy was chosen (descriptor {}):\n{listing}",
+            opened.as_raw_fd()
+        );
+        assert!(
+            sentinel_listed(&listing),
+            "descriptor hygiene removed the descendant sentinel:\n{listing}"
+        );
+        drop(opened);
     }
 }

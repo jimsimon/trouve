@@ -103,17 +103,34 @@ cgroup accounting files) that leaked into every child.
   sentinel writer, so descriptors opened without `O_CLOEXEC` elsewhere in the
   host never reach a child. The strategy is chosen in the parent, where
   allocation and logging are allowed, and only its result runs between fork
-  and exec: `close_range(CLOSE_RANGE_CLOEXEC)` where the kernel supports it
-  (Linux 5.11+), otherwise the descriptor table listed from `/proc/self/fd`
-  or `/dev/fd` — trusted only when it names both ends of the sentinel pipe —
+  and exec. Every strategy covers the table the child actually has, so a
+  descriptor another thread opens while the spawn is being prepared is
+  covered too: `close_range(CLOSE_RANGE_CLOEXEC)` where the kernel supports
+  it (Linux 5.11+); otherwise, on Linux and Android, the child lists its own
+  `/proc/self/fd` with `getdents64` between fork and exec — the child is
+  single-threaded by then, so the listing is exact, and one that fails to
+  show the sentinel writer is treated as failed — a strategy the parent
+  enables only after its own listing showed both ends of the sentinel pipe;
   and as a last resort a walk of every descriptor number below the soft
-  `RLIMIT_NOFILE`, logged once because it can be slow. The walk is complete
-  or it does not happen: when the soft limit is unlimited or above 2^20 —
+  `RLIMIT_NOFILE`, logged once because it can be slow. A parent-side
+  snapshot of the table was rejected because a descriptor opened between
+  the snapshot and `fork` would have escaped it. The walk is complete or
+  it does not happen: when the soft limit is unlimited or above 2^20 —
   container runtimes hand out limits in the billions, and walking one would
-  stall every spawn for minutes — and neither `close_range` nor a listing
-  is available, the spawn fails with an error naming the limit rather than
-  sanitize part of the table and leak the rest. Only a kernel older than
-  5.11 without a listable `/proc` or `/dev/fd` can reach that error.
+  stall every spawn for minutes — and neither `close_range` nor the
+  child-side listing is available, the spawn fails with an error naming the
+  limit rather than sanitize part of the table and leak the rest. On Linux
+  only a kernel older than 5.11 without a listable `/proc` can reach that
+  error; on macOS and the BSDs the walk is the only strategy, and their
+  soft limits are bounded by `OPEN_MAX`.
+- **Lifecycle records name processes, never commands.** A released daemon
+  is logged and reported — at release, when a worker it forked is found at
+  eviction, and when eviction has to escalate — by pid, process name, and
+  worktree only. The command line that started it is returned in the
+  result of the call that ran it and in `shell_kill` results, where the
+  caller already knows it, and nowhere else: it may carry tokens or
+  passwords, and the registry outlives the call by the length of the
+  session.
 
 ## Consequences
 
