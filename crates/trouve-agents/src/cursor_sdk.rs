@@ -96,6 +96,10 @@ const CURSOR_NATIVE_TOOL_DENYLIST: &[&str] = &[
 ];
 /// Most warm Cursor Bridge processes retained by one configured backend.
 const POOL_CAP: usize = 3;
+/// Turns allowed to retain per-thread admission state while the three Bridge
+/// execution lanes are occupied. Excess bursts fail before allocating a gate
+/// or lifecycle guard, keeping distinct-thread queues bounded.
+const PENDING_TURN_CAP: usize = 64;
 /// Warm Bridges are inexpensive to resume but large enough to reap when idle.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const REAP_INTERVAL: Duration = Duration::from_secs(60);
@@ -487,6 +491,7 @@ struct BridgePool {
     closed: AtomicBool,
     closing: CancellationToken,
     capacity: Arc<Semaphore>,
+    pending_turn_admission: Arc<Semaphore>,
     turn_admission: Arc<Semaphore>,
     available: Arc<Notify>,
     reaper_started: AtomicBool,
@@ -502,6 +507,7 @@ impl Default for BridgePool {
             closed: AtomicBool::new(false),
             closing: CancellationToken::new(),
             capacity: Arc::new(Semaphore::new(POOL_CAP)),
+            pending_turn_admission: Arc::new(Semaphore::new(PENDING_TURN_CAP)),
             turn_admission: Arc::new(Semaphore::new(POOL_CAP)),
             available: Arc::new(Notify::new()),
             reaper_started: AtomicBool::new(false),
@@ -692,6 +698,10 @@ impl BridgePool {
     }
 
     async fn reap_idle(&self) {
+        // Order the complete remove/terminate/restore transaction before the
+        // shutdown writer. If reaping wins, shutdown observes any process
+        // whose cleanup failed; if closure wins, reaping removes nothing.
+        let _lifecycle = self.lifecycle.read().await;
         if !self.is_open() {
             return;
         }
@@ -740,6 +750,7 @@ impl BridgePool {
         let drain_deadline = tokio::time::Instant::now() + SHUTDOWN_DRAIN_TIMEOUT;
         self.closed.store(true, Ordering::Release);
         self.capacity.close();
+        self.pending_turn_admission.close();
         self.turn_admission.close();
         notify_available(&self.available);
         let _lifecycle = match tokio::time::timeout_at(drain_deadline, self.lifecycle.write()).await
@@ -956,6 +967,31 @@ impl BridgePool {
         }
     }
 
+    fn acquire_pending_turn_admission(
+        &self,
+        cancel: &CancellationToken,
+        events: &BackendEventSender,
+    ) -> Result<OwnedSemaphorePermit, BackendError> {
+        if !self.is_open() {
+            return Err(Self::closed_error());
+        }
+        if cancel.is_cancelled() || events.is_closed() {
+            return Err(BackendError::Cancelled);
+        }
+        self.pending_turn_admission
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| {
+                if self.is_open() {
+                    BackendError::Protocol(
+                        "Cursor SDK Bridge pending-turn capacity is full; retry the turn".into(),
+                    )
+                } else {
+                    Self::closed_error()
+                }
+            })
+    }
+
     async fn evict_one(&self) -> Result<bool, BackendError> {
         let Some((thread_id, process, guard)) = self.take_evictable(None).await else {
             return Ok(false);
@@ -1101,6 +1137,18 @@ async fn run_sdk_turn(
         .then(|| turn.mcp_bridge.as_ref().map(|bridge| bridge.url.clone()))
         .flatten();
 
+    // Reject excess bursts before they create a per-thread gate or retain a
+    // lifecycle reader. This queue is distinct from the three execution
+    // permits below, so same-thread waiters still cannot reserve every active
+    // Bridge lane while waiting for their serial gate.
+    let pending_turn_admission = match pool.acquire_pending_turn_admission(&turn.cancel, events) {
+        Ok(permit) => permit,
+        Err(BackendError::Cancelled) if events.is_closed() => {
+            return Ok(TurnTerminal::ConsumerClosed);
+        }
+        Err(BackendError::Cancelled) => return Ok(TurnTerminal::Cancelled),
+        Err(error) => return Err(error),
+    };
     // Admit the thread lane first. Same-thread queues must not consume every
     // provider-wide permit while waiting for a serial Bridge they cannot yet
     // use, or unrelated threads would starve behind them.
@@ -1126,6 +1174,7 @@ async fn run_sdk_turn(
         Err(BackendError::Cancelled) => return Ok(TurnTerminal::Cancelled),
         Err(error) => return Err(error),
     };
+    drop(pending_turn_admission);
     let custom_tools = match mcp_url.as_deref() {
         Some(url) => tokio::select! {
             biased;
@@ -3809,6 +3858,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_turn_admission_rejects_excess_before_allocating_thread_state() {
+        let pool = BridgePool::default();
+        let (sender_tx, sender_rx) = tokio::sync::oneshot::channel();
+        let _stream = async_stream(move |events| async move {
+            let _ = sender_tx.send(events);
+            std::future::pending::<()>().await;
+        });
+        let events = sender_rx.await.unwrap();
+        let cancel = CancellationToken::new();
+        let _permits = (0..PENDING_TURN_CAP)
+            .map(|_| {
+                pool.acquire_pending_turn_admission(&cancel, &events)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let state = tempfile::tempdir().unwrap();
+        let turn = BackendTurn {
+            cancel,
+            thread_id: "excess-distinct-thread".into(),
+            worktree: "/tmp".into(),
+            session: None,
+            model: "composer-2".into(),
+            model_options: Map::new(),
+            prompt: "not reached".into(),
+            attachments: Vec::new(),
+            instructions: None,
+            permission: BackendPermission::Ask,
+            tool_free: true,
+            attach_background: false,
+            mcp_bridge: None,
+            mcp_servers: Vec::new(),
+        };
+
+        let error = match run_sdk_turn(
+            &pool,
+            "cursor",
+            "not-reached",
+            "secret",
+            state.path(),
+            turn,
+            &events,
+        )
+        .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("an excess turn bypassed pending-turn admission"),
+        };
+
+        assert!(error.to_string().contains("pending-turn capacity is full"));
+        assert!(
+            pool.thread_gates.lock().await.is_empty(),
+            "an excess turn allocated per-thread admission state"
+        );
+    }
+
+    #[tokio::test]
     async fn same_thread_queues_do_not_consume_global_turn_admission() {
         let pool = BridgePool::default();
         let (sender_tx, sender_rx) = tokio::sync::oneshot::channel();
@@ -3975,6 +4080,41 @@ mod tests {
 
         release.add_permits(1);
         assert!(retention.await.unwrap());
+        shutdown.await.unwrap().unwrap();
+        assert!(!pool.is_open());
+    }
+
+    #[tokio::test]
+    async fn idle_reaping_finishes_before_shutdown_can_drain_the_pool() {
+        let pool = Arc::new(BridgePool::default());
+        let processes = pool.processes.lock().await;
+        let reaping_pool = pool.clone();
+        let reaping = tokio::spawn(async move { reaping_pool.reap_idle().await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if pool.lifecycle.try_write().is_err() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("idle reaping did not acquire the lifecycle reader");
+
+        let shutting_pool = pool.clone();
+        let mut shutdown = tokio::spawn(async move { shutting_pool.shutdown().await });
+        while pool.is_open() {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut shutdown)
+                .await
+                .is_err(),
+            "shutdown crossed an in-flight idle reap"
+        );
+
+        drop(processes);
+        reaping.await.unwrap();
         shutdown.await.unwrap().unwrap();
         assert!(!pool.is_open());
     }

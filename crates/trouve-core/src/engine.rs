@@ -25706,11 +25706,18 @@ default_permission_mode = "ask"
         read_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
         read_state: Mutex<BlockingReadState>,
         read_state_changed: std::sync::Condvar,
+        reads_before_block: std::sync::atomic::AtomicUsize,
         block_once: std::sync::atomic::AtomicBool,
     }
 
     impl BlockingReadProviderSecretStore {
         fn new() -> (Self, tokio::sync::oneshot::Receiver<()>) {
+            Self::after_unblocked_reads(0)
+        }
+
+        fn after_unblocked_reads(
+            reads_before_block: usize,
+        ) -> (Self, tokio::sync::oneshot::Receiver<()>) {
             let (read_started_tx, read_started_rx) = tokio::sync::oneshot::channel();
             (
                 Self {
@@ -25718,6 +25725,7 @@ default_permission_mode = "ask"
                     read_started: Mutex::new(Some(read_started_tx)),
                     read_state: Mutex::new(BlockingReadState::default()),
                     read_state_changed: std::sync::Condvar::new(),
+                    reads_before_block: std::sync::atomic::AtomicUsize::new(reads_before_block),
                     block_once: std::sync::atomic::AtomicBool::new(true),
                 },
                 read_started_rx,
@@ -25753,9 +25761,18 @@ default_permission_mode = "ask"
 
     impl trouve_providers::secrets::SecretStore for BlockingReadProviderSecretStore {
         fn get(&self, key: &str) -> anyhow::Result<Option<String>> {
-            if self
-                .block_once
-                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            let deferred = self
+                .reads_before_block
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |remaining| remaining.checked_sub(1),
+                )
+                .is_ok();
+            if !deferred
+                && self
+                    .block_once
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
             {
                 if let Some(read_started) = self.read_started.lock().unwrap().take() {
                     let _ = read_started.send(());
@@ -31187,6 +31204,102 @@ default_permission_mode = "ask"
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_provider_publication_keeps_config_and_credentials_on_one_revision() {
+        const ID: &str = "cancelled-publication";
+        let data = tempfile::tempdir().unwrap();
+        let config_file = data.path().join("config.toml");
+        let mut config = Config::default();
+        config.providers.insert(
+            ID.into(),
+            ProviderConfig {
+                kind: "openai-compat".into(),
+                base_url: Some("https://old.example.test/v1".into()),
+                ..Default::default()
+            },
+        );
+        config.save_to(&config_file).unwrap();
+        // The first read snapshots the old credential for the transaction;
+        // block the second read while the detached publication rebuilds the
+        // live registry from the newly committed revision.
+        let (secret_store, mut read_started_rx) =
+            BlockingReadProviderSecretStore::after_unblocked_reads(1);
+        let api_key = trouve_providers::secrets::api_key_secret(ID);
+        secret_store
+            .values
+            .lock()
+            .unwrap()
+            .insert(api_key.clone(), "old-key".into());
+        let secret_store = Arc::new(secret_store);
+        let mut engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        )
+        .with_config_file(Some(config_file.clone()));
+        engine.secrets = secret_store.clone();
+        let engine = Arc::new(engine);
+        let mut update = tokio::spawn({
+            let engine = engine.clone();
+            async move {
+                engine
+                    .upsert_provider(
+                        ID,
+                        &UpsertProviderRequest {
+                            kind: "openai-compat".into(),
+                            base_url: Some("https://new.example.test/v1".into()),
+                            api_key: Some("new-key".into()),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            }
+        });
+
+        observe_blocked_secret_read(
+            &secret_store,
+            &mut read_started_rx,
+            &mut update,
+            "provider registry publication",
+        )
+        .await;
+        assert_eq!(
+            engine.config.lock().unwrap().providers[ID]
+                .base_url
+                .as_deref(),
+            Some("https://new.example.test/v1")
+        );
+        assert_eq!(
+            secret_store.values.lock().unwrap().get(&api_key),
+            Some(&"new-key".to_string())
+        );
+
+        update.abort();
+        assert!(update.await.unwrap_err().is_cancelled());
+        secret_store.release_read();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if engine.provider_transition_lock(ID).try_lock_owned().is_ok() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached provider publication did not finish after cancellation");
+
+        let persisted = Config::load_from(&config_file);
+        assert_eq!(
+            persisted.providers[ID].base_url.as_deref(),
+            Some("https://new.example.test/v1")
+        );
+        assert_eq!(
+            secret_store.values.lock().unwrap().get(&api_key),
+            Some(&"new-key".to_string())
+        );
+        assert!(engine.providers.read().unwrap().contains_key(ID));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn api_provider_refresh_runs_off_the_async_worker() {
         const ID: &str = "blocking-refresh";
         let data = tempfile::tempdir().unwrap();
@@ -32060,6 +32173,42 @@ default_permission_mode = "ask"
 
         let replacement = engine.backends.read().unwrap()["cursor"].clone();
         assert!(!Arc::ptr_eq(&replacement, &blocking));
+    }
+
+    #[tokio::test]
+    async fn dropped_runtime_retirement_republishes_the_configured_backend() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            "cursor".into(),
+            ProviderConfig {
+                kind: "cursor-sdk".into(),
+                ..Default::default()
+            },
+        );
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        ));
+        let previous = engine.backends.read().unwrap()["cursor"].clone();
+
+        let retirement = engine
+            .retire_config_backends_for_runtime(trouve_agents::install::CliId::CursorSdkBridge)
+            .await
+            .unwrap();
+        assert!(
+            engine.backend_for("cursor/composer-2").is_none(),
+            "retirement left the closing backend selectable"
+        );
+
+        // This is the cancellation window after detached teardown has handed
+        // ownership back to the runtime operation but before explicit publish.
+        drop(retirement);
+
+        let replacement = engine.backends.read().unwrap()["cursor"].clone();
+        assert!(!Arc::ptr_eq(&replacement, &previous));
+        assert!(engine.backend_for("cursor/composer-2").is_some());
     }
 
     #[tokio::test]
