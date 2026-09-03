@@ -89,11 +89,15 @@ impl CapturedOutput {
 /// What a process tree left behind once the part it owned was gone.
 #[derive(Clone, Debug, Default)]
 struct TreeRemnants {
-    /// Daemons that moved to their own session and were released.
+    /// Daemons that moved to their own session and were released; they keep
+    /// running until the session worktree is evicted.
     detached: Vec<DetachedProcess>,
     /// Descendants that left the process group but not the session and were
     /// killed with the tree.
     terminated_escapees: Vec<TerminatedEscapee>,
+    /// Daemons released after their worktree was already evicted; they are
+    /// being stopped instead of kept.
+    stopped_after_eviction: Vec<DetachedProcess>,
 }
 
 impl TreeRemnants {
@@ -101,28 +105,27 @@ impl TreeRemnants {
         Self {
             detached: child.take_detached(),
             terminated_escapees: child.take_terminated_escapees(),
+            stopped_after_eviction: Vec::new(),
         }
     }
 
     fn is_empty(&self) -> bool {
-        self.detached.is_empty() && self.terminated_escapees.is_empty()
+        self.detached.is_empty()
+            && self.terminated_escapees.is_empty()
+            && self.stopped_after_eviction.is_empty()
     }
 
     /// Whether something outside the tree may still hold its stdio pipes.
     fn may_hold_pipes(&self) -> bool {
-        !self.detached.is_empty()
+        !self.detached.is_empty() || !self.stopped_after_eviction.is_empty()
     }
 
     fn absorb(&mut self, other: Self) {
-        for process in other.detached {
-            let known = self
-                .detached
-                .iter()
-                .any(|known| known.pid == process.pid && known.start_time == process.start_time);
-            if !known {
-                self.detached.push(process);
-            }
-        }
+        merge_detached(&mut self.detached, other.detached);
+        merge_detached(
+            &mut self.stopped_after_eviction,
+            other.stopped_after_eviction,
+        );
         for escapee in other.terminated_escapees {
             if !self
                 .terminated_escapees
@@ -156,6 +159,21 @@ impl TreeRemnants {
                 },
             ));
         }
+        if !self.stopped_after_eviction.is_empty() {
+            let stopped = self
+                .stopped_after_eviction
+                .iter()
+                .map(|p| (p.pid, p.name.as_str()));
+            result.insert(
+                "stopped_after_eviction".into(),
+                process_list(stopped.clone()),
+            );
+            note.push(format!(
+                "Stopping {} ({}) released after the session worktree was removed.",
+                process_count(self.stopped_after_eviction.len(), "detached"),
+                describe_processes(stopped),
+            ));
+        }
         if !self.terminated_escapees.is_empty() {
             let escapees = self
                 .terminated_escapees
@@ -174,6 +192,19 @@ impl TreeRemnants {
         }
         if !note.is_empty() {
             result.insert("note".into(), json!(note.join(" ")));
+        }
+    }
+}
+
+/// Append the processes of `from` that `into` does not already know by
+/// `(pid, start_time)`.
+fn merge_detached(into: &mut Vec<DetachedProcess>, from: Vec<DetachedProcess>) {
+    for process in from {
+        let known = into
+            .iter()
+            .any(|known| known.pid == process.pid && known.start_time == process.start_time);
+        if !known {
+            into.push(process);
         }
     }
 }
@@ -219,12 +250,12 @@ impl DetachedEntry {
 
 /// Released daemons, keyed by the worktree whose eviction terminates them.
 ///
-/// A daemon changes hands in [`Self::adopt`], which takes it from its process
-/// tree and records it under one lock acquisition; [`Self::terminate_worktree`]
-/// drains a worktree's daemons and puts the eviction on record under the same
-/// lock. A daemon is therefore either in the drained set or adopted after the
-/// eviction is on record, in which case it is stopped on the spot. Nothing is
-/// ever in flight between a tree and the registry while an eviction runs.
+/// A daemon changes hands in [`Self::adopt`], which records it only after
+/// checking, under the registry lock, that its worktree is not evicted;
+/// [`Self::terminate_worktree`] drains a worktree's daemons and puts the
+/// eviction on record under the same lock. A daemon is therefore either in
+/// the drained set or adopted after the eviction is on record, in which case
+/// it is stopped on the spot.
 #[derive(Default)]
 struct DetachedRegistry {
     state: Mutex<DetachedState>,
@@ -244,20 +275,22 @@ impl DetachedRegistry {
     /// the registry under `worktree`, and return the remnants for the
     /// caller's own report. Call with the tree's lock held so the hand-over
     /// is atomic with respect to eviction. Daemons released for a worktree
-    /// that is already evicted are stopped in the background instead of kept.
+    /// that is already evicted are stopped in the background instead of
+    /// kept, and reported as such.
     fn adopt(&self, worktree: &Path, command: &str, child: &mut ProcessTreeChild) -> TreeRemnants {
-        let mut state = self.state.lock().unwrap();
-        let remnants = TreeRemnants::take_from(child);
+        let mut remnants = TreeRemnants::take_from(child);
         if remnants.detached.is_empty() {
             return remnants;
         }
+        let mut state = self.state.lock().unwrap();
         if !state.evicted.iter().any(|evicted| evicted == worktree) {
             state.register(worktree, command, &remnants.detached);
             return remnants;
         }
         drop(state);
+        remnants.stopped_after_eviction = std::mem::take(&mut remnants.detached);
         let late: Vec<DetachedEntry> = remnants
-            .detached
+            .stopped_after_eviction
             .iter()
             .map(|process| DetachedEntry::new(worktree, command, process))
             .collect();
@@ -1956,7 +1989,8 @@ mod tests {
 
     /// A daemon handed over after its worktree was evicted (its tree was
     /// still finishing while `kill_worktree` ran) is stopped rather than
-    /// left to outlive the session.
+    /// left to outlive the session, and the result says so instead of
+    /// claiming it keeps running.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn daemon_released_after_worktree_eviction_is_stopped() {
@@ -1980,7 +2014,17 @@ mod tests {
             res.result
         );
         let child_pid = wait_for_pid_file(&tmp.path().join("child.pid")).await;
-        assert_eq!(reported_pids(&res.result, "detached"), vec![child_pid]);
+        assert_eq!(
+            reported_pids(&res.result, "stopped_after_eviction"),
+            vec![child_pid]
+        );
+        assert!(res.result.get("detached").is_none(), "{:?}", res.result);
+        let note = res.result["note"].as_str().unwrap_or_default();
+        assert!(
+            note.starts_with("Stopping 1 detached process")
+                && note.contains("after the session worktree was removed"),
+            "{note}"
+        );
         wait_for_process_exit(child_pid).await;
     }
 

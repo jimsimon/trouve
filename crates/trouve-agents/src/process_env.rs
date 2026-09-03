@@ -28,10 +28,13 @@ const HOLDER_SCAN_INTERVAL: Duration = Duration::from_millis(250);
 /// Whether this platform can name the processes holding a tree's sentinel
 /// and therefore honour [`DetachedPolicy::Release`].
 pub const DETACHED_RELEASE_SUPPORTED: bool = cfg!(any(target_os = "linux", target_os = "android"));
-/// Bound for the brute-force close-on-exec walk in `pre_exec` when the
-/// `RLIMIT_NOFILE` soft limit is not a usable descriptor number (unlimited or
-/// unreadable). The walk is the last resort behind `close_range` and the
-/// descriptor-table listing, both of which cover any descriptor number.
+/// Bound for the brute-force close-on-exec walk in `pre_exec`. The walk
+/// visits the `RLIMIT_NOFILE` soft limit when that is a smaller usable
+/// descriptor number; container runtimes hand out soft limits in the
+/// billions, and a walk that long would stall every spawn for minutes
+/// between fork and exec. The walk is the last resort behind `close_range`
+/// and the descriptor-table listing, both of which cover any descriptor
+/// number.
 #[cfg(unix)]
 const DESCRIPTOR_WALK_CEILING: libc::c_int = 1 << 20;
 #[cfg(windows)]
@@ -914,8 +917,9 @@ fn open_descriptors_above_stdio(sentinel: [libc::c_int; 2]) -> Option<Vec<libc::
 
 /// Highest descriptor number the brute-force walk visits: the `RLIMIT_NOFILE`
 /// soft limit, read in the parent because `getrlimit` is not
-/// async-signal-safe. A descriptor opened before the limit was lowered can
-/// sit above it, which is why the walk is the last resort.
+/// async-signal-safe, bounded by [`DESCRIPTOR_WALK_CEILING`]. A descriptor
+/// opened before the limit was lowered can sit above it, which is why the
+/// walk is the last resort.
 #[cfg(unix)]
 fn descriptor_walk_limit() -> libc::c_int {
     let mut limit = libc::rlimit {
@@ -925,7 +929,16 @@ fn descriptor_walk_limit() -> libc::c_int {
     if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
         return DESCRIPTOR_WALK_CEILING;
     }
-    libc::c_int::try_from(limit.rlim_cur).unwrap_or(DESCRIPTOR_WALK_CEILING)
+    bounded_walk_limit(limit.rlim_cur)
+}
+
+/// `soft_limit` itself when it is a descriptor number below the ceiling;
+/// the ceiling for unlimited, unrepresentable, or container-sized limits.
+#[cfg(unix)]
+fn bounded_walk_limit(soft_limit: libc::rlim_t) -> libc::c_int {
+    libc::c_int::try_from(soft_limit).map_or(DESCRIPTOR_WALK_CEILING, |soft| {
+        soft.min(DESCRIPTOR_WALK_CEILING)
+    })
 }
 
 #[cfg(unix)]
@@ -934,7 +947,7 @@ fn warn_descriptor_walk_once(limit: libc::c_int) {
     WARNED.call_once(|| {
         tracing::warn!(
             limit,
-            "cannot list open descriptors; children may inherit descriptors numbered above the RLIMIT_NOFILE soft limit"
+            "cannot list open descriptors; children may inherit descriptors numbered at or above the close-on-exec walk limit"
         );
     });
 }
@@ -1106,6 +1119,12 @@ fn platform_process_tree_active(child: &mut ProcessTreeChild) -> std::io::Result
         return Ok(false);
     }
     let sentinel_active = unix_descendant_sentinel_active(&child.descendant_sentinel)?;
+    // Under terminate-all semantics every sentinel holder belongs to the
+    // tree, so a held sentinel settles liveness without the process-group
+    // query, which walks `/proc` on Linux.
+    if sentinel_active && child.detached_policy == DetachedPolicy::Terminate {
+        return Ok(true);
+    }
     #[cfg(target_os = "macos")]
     let group_active =
         !child.process_group_signalled && unix_process_group_active(child.process_group)?;
@@ -1331,6 +1350,16 @@ fn linux_process_state_is_active(state: char, parent_id: i32, owner_pid: i32) ->
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn unix_process_group_active(process_group: i32) -> std::io::Result<bool> {
+    // A group without a single member, zombie or otherwise, is gone without
+    // the `/proc` walk; anything else needs the reap-owner classification.
+    if unsafe { libc::kill(-process_group, 0) } == -1 {
+        let error = std::io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::ESRCH) => return Ok(false),
+            Some(libc::EPERM) => {}
+            _ => return Err(error),
+        }
+    }
     let own_pid = i32::try_from(std::process::id()).unwrap_or(-1);
     for process in std::fs::read_dir("/proc")? {
         let Ok(process) = process else { continue };
@@ -2727,6 +2756,20 @@ mod tests {
     #[tokio::test]
     async fn descriptor_walk_reaches_the_soft_limit() {
         assert_children_do_not_inherit_descriptors((false, false)).await;
+    }
+
+    /// Container runtimes hand out `RLIMIT_NOFILE` soft limits in the
+    /// billions; the walk must not follow them.
+    #[cfg(unix)]
+    #[test]
+    fn descriptor_walk_is_bounded_for_container_sized_limits() {
+        assert_eq!(bounded_walk_limit(1024), 1024);
+        assert_eq!(bounded_walk_limit(1 << 17), 1 << 17);
+        assert_eq!(bounded_walk_limit(1_073_741_816), DESCRIPTOR_WALK_CEILING);
+        assert_eq!(
+            bounded_walk_limit(libc::RLIM_INFINITY),
+            DESCRIPTOR_WALK_CEILING
+        );
     }
 
     #[cfg(target_os = "linux")]

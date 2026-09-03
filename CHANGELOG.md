@@ -14,10 +14,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   returns, the job is stopped, or its lifetime cap fires. It is reported in
   the tool result (`detached`, plus a `note`) and stopped when the session
   worktree is removed, even when it is handed over while the removal is in
-  progress. Descendants that only leave the process group are still stopped
-  with the call and are now reported as `killed_escaped`. Platforms that
-  cannot tell a detached daemon from the rest of the tree (macOS) keep
-  stopping everything, and the tool description says so.
+  progress (reported as `stopped_after_eviction` in that case). Descendants
+  that only leave the process group are still stopped with the call and are
+  now reported as `killed_escaped`. Platforms that cannot tell a detached
+  daemon from the rest of the tree (macOS) keep stopping everything, and the
+  tool description says so.
 - **Bounded process-tree cleanup**: a foreground call or background job whose
   process tree cannot be confirmed empty now reports the failure after three
   attempts instead of holding the session's mutation lane indefinitely.

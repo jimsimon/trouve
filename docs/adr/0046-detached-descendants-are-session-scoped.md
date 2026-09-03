@@ -42,14 +42,15 @@ cgroup accounting files) that leaked into every child.
   seconds, then kills the survivors, after the worktree's background jobs
   have been stopped. Dropping the registry asks every remaining daemon to
   exit without waiting.
-- **Hand-over and eviction are atomic.** A daemon moves from its process tree
-  to the registry under the registry lock, and eviction drains a worktree and
-  records the eviction under the same lock. A daemon released by a call or
-  job that was still finishing while its worktree was evicted therefore
-  arrives after the eviction is on record and is stopped on the spot instead
-  of being kept for a worktree nobody will evict again. The eviction record
-  is bounded (the oldest of 4096 are forgotten first); late hand-overs can
-  only come from work that was in flight at eviction.
+- **Hand-over and eviction are atomic.** A daemon enters the registry only
+  after the eviction record is checked under the registry lock, and eviction
+  drains a worktree and records the eviction under the same lock. A daemon
+  released by a call or job that was still finishing while its worktree was
+  evicted therefore arrives after the eviction is on record and is stopped
+  on the spot instead of being kept for a worktree nobody will evict again;
+  its result reports it as `stopped_after_eviction`, not as released. The
+  eviction record is bounded (the oldest of 4096 are forgotten first); late
+  hand-overs can only come from work that was in flight at eviction.
 - **Release is opt-in per spawn.** Only the shell tool's foreground calls and
   background jobs release detached descendants. Provider transports, MCP
   servers, git, and every other process-tree caller keep terminate-all
@@ -73,8 +74,10 @@ cgroup accounting files) that leaked into every child.
   which behaviour the platform has.
 - **Results report remnants.** A shell result gains `detached` (released
   daemons), `killed_escaped` (descendants that left the process group but not
-  the session and were killed), and a human-readable `note` whenever either
-  is non-empty. Results of commands that leave nothing behind are unchanged.
+  the session and were killed), `stopped_after_eviction` (daemons released
+  after their worktree was evicted and therefore being stopped), and a
+  human-readable `note` whenever any is non-empty. Results of commands that
+  leave nothing behind are unchanged.
 - **Children start with only the sentinel and stdio.** Process-tree spawns
   mark every descriptor from 3 upward close-on-exec before re-arming the
   sentinel writer, so descriptors opened without `O_CLOEXEC` elsewhere in the
@@ -84,9 +87,11 @@ cgroup accounting files) that leaked into every child.
   (Linux 5.11+), otherwise the descriptor table listed from `/proc/self/fd`
   or `/dev/fd` — trusted only when it names both ends of the sentinel pipe —
   and as a last resort a walk of every descriptor number up to the soft
-  `RLIMIT_NOFILE`, which is logged once because it can be slow. No cap
-  smaller than the process's own limit is applied: a descriptor the parent
-  can hold is a descriptor a child could inherit.
+  `RLIMIT_NOFILE` or 2^20, whichever is smaller, logged once because it can
+  be slow. The ceiling exists because container runtimes hand out soft
+  limits in the billions, which would stall every spawn for minutes; the two
+  strategies ahead of the walk cover any descriptor number the parent can
+  hold.
 
 ## Consequences
 
