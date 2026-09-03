@@ -6,6 +6,22 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **Daemons survive the shell call that started them**: a descendant of a
+  shell command that detaches into its own session (an `sccache` server, a
+  package-manager or build-tool daemon) is no longer killed when the call
+  returns, the job is stopped, or its lifetime cap fires. It is reported in
+  the tool result (`detached`, plus a `note`) and stopped when the session
+  worktree is removed. Descendants that only leave the process group are
+  still stopped with the call and are now reported as `killed_escaped`.
+- **Bounded process-tree cleanup**: a foreground call or background job whose
+  process tree cannot be confirmed empty now reports the failure after three
+  attempts instead of holding the session's mutation lane indefinitely.
+- **No descriptor leaks into shell children**: process-tree spawns mark every
+  inherited descriptor beyond stdio close-on-exec, so descriptors the desktop
+  host opens without `O_CLOEXEC` no longer reach child processes.
+
 ## [4.8.1] - 2026-09-03
 
 This patch release improves failure diagnostics for Codex-backed sessions and

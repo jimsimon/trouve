@@ -1,6 +1,8 @@
 # ADR 0043: Background jobs release the session mutation lane
 
-Status: Accepted (2026-09)
+Status: Partially superseded by ADR 0046 (2026-09) — descendants that detach
+into their own session are released from the job and owned by the session
+worktree instead of being reaped with the tree.
 
 ## Context
 

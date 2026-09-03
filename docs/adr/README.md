@@ -52,6 +52,7 @@ sequentially.
 | [0040](0040-durable-root-cause-history-for-code-review.md) | Durable root-cause history for code review | Accepted |
 | [0041](0041-evidence-backed-review-churn-controls.md) | Evidence-backed review churn controls | Accepted |
 | [0042](0042-provider-governed-turn-admission.md) | Provider-governed turn admission | Accepted |
-| [0043](0043-background-jobs-release-mutation-lane.md) | Background jobs release the session mutation lane | Accepted |
+| [0043](0043-background-jobs-release-mutation-lane.md) | Background jobs release the session mutation lane | Partially superseded by 0046 |
 | [0044](0044-durable-assistant-produced-artifacts.md) | Durable assistant-produced artifacts | Accepted |
 | [0045](0045-full-branch-review-on-every-head.md) | Full-branch review on every head | Accepted |
+| [0046](0046-detached-descendants-are-session-scoped.md) | Detached descendants of shell calls are session-scoped | Accepted |
