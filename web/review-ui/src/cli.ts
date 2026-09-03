@@ -12,6 +12,7 @@ export interface CliInfo {
 export interface CliInstallStatus {
   status: "none" | "pending" | "success" | "failed";
   version?: string;
+  warning?: string;
   error?: string;
   received_bytes: number;
   total_bytes: number;

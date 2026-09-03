@@ -1,16 +1,17 @@
 //! External agent backends: vendor coding agents (Codex, Cursor, Claude
-//! Code) driven through their sanctioned CLI/JSON interfaces, running inside
+//! Code) driven through their sanctioned runtime interfaces, running inside
 //! trouve's session worktrees.
 //!
 //! Unlike a `trouve_providers::Provider` (raw model inference inside
 //! trouve's own agent loop), an [`AgentBackend`] owns the whole turn: the
 //! vendor harness plans, calls its own tools, and edits files. Trouve
 //! translates its event stream into the trouve protocol and bridges its
-//! approval requests through the engine's permission layer. Subscription
-//! auth stays inside the vendor binary — we never touch vendor OAuth tokens.
+//! approval requests through the engine's permission layer. Credentials are
+//! passed only through each vendor's supported authentication surface.
 
 pub mod claude;
 pub mod codex;
+#[path = "cursor_sdk.rs"]
 pub mod cursor;
 pub mod install;
 mod login;
@@ -22,6 +23,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use futures::StreamExt as _;
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use trouve_protocol::{ModelInfo, Usage};
@@ -471,12 +473,20 @@ pub trait AgentBackend: Send + Sync {
 
     /// Live subscription usage (plan, metered allowance windows). Codex
     /// answers via its app-server, Claude Code via a stream-json `get_usage`
-    /// control request, and Cursor via the dashboard's undocumented usage
-    /// RPC (using the CLI's stored login). `None` means the vendor shares
-    /// nothing at all.
+    /// control request, and Cursor by exchanging its configured API key for
+    /// an ephemeral token and calling the dashboard's undocumented usage RPC.
+    /// `None` means the vendor shares nothing at all.
     async fn subscription_health(&self) -> Option<trouve_protocol::SubscriptionHealth> {
         None
     }
+
+    /// Stop and reap long-lived vendor processes owned by this backend.
+    /// Registry replacement awaits this hook before exposing a replacement
+    /// backend, so two harness instances never overlap the same durable state.
+    async fn shutdown(&self) -> Result<(), BackendError> {
+        Ok(())
+    }
+
     /// Report startup work the backend expects before it can accept this
     /// turn. The default keeps other adapters on the generic processing
     /// activity. This is advisory; the backend remains authoritative for
@@ -520,6 +530,253 @@ pub trait AgentBackend: Send + Sync {
     /// never be attached: without this, a backend that pins resources on
     /// pending background output would hold them forever. Default: no-op.
     async fn abandon_background_turns(&self, _thread_id: &str) {}
+}
+
+#[derive(Default)]
+struct BackendTurnActivityState {
+    retiring: bool,
+    active: usize,
+}
+
+#[derive(Default)]
+struct BackendTurnActivity {
+    state: Mutex<BackendTurnActivityState>,
+    idle: tokio::sync::Notify,
+}
+
+impl BackendTurnActivity {
+    fn enter(self: &Arc<Self>, backend_id: &str) -> Result<BackendTurnActivityGuard, BackendError> {
+        let mut state = self.state.lock().unwrap();
+        if state.retiring {
+            return Err(BackendError::Protocol(format!(
+                "{backend_id} is being replaced; retry the turn"
+            )));
+        }
+        state.active += 1;
+        drop(state);
+        Ok(BackendTurnActivityGuard {
+            activity: Arc::clone(self),
+        })
+    }
+
+    async fn begin_retirement(&self) {
+        loop {
+            let idle = self.idle.notified();
+            tokio::pin!(idle);
+            // `notify_waiters` stores no permit. Register this waiter before
+            // releasing the activity mutex so the last stream cannot signal
+            // in the gap between the active-count check and the await.
+            idle.as_mut().enable();
+            let active = {
+                let mut state = self.state.lock().unwrap();
+                state.retiring = true;
+                state.active
+            };
+            if active == 0 {
+                return;
+            }
+            idle.await;
+        }
+    }
+}
+
+struct BackendTurnActivityGuard {
+    activity: Arc<BackendTurnActivity>,
+}
+
+impl Drop for BackendTurnActivityGuard {
+    fn drop(&mut self) {
+        let mut state = self.activity.state.lock().unwrap();
+        debug_assert!(state.active > 0);
+        state.active = state.active.saturating_sub(1);
+        let idle = state.active == 0;
+        drop(state);
+        if idle {
+            self.activity.idle.notify_waiters();
+        }
+    }
+}
+
+/// Delegating backend wrapper that closes new turn admission during registry
+/// retirement and lets already-started turn streams drain before destructive
+/// vendor shutdown. Provider settings and runtime operations can therefore
+/// replace an instance without cancelling work that was already in progress.
+pub struct RetirementAwareBackend {
+    inner: Arc<dyn AgentBackend>,
+    activity: Arc<BackendTurnActivity>,
+}
+
+impl RetirementAwareBackend {
+    pub fn new(inner: Arc<dyn AgentBackend>) -> Self {
+        Self {
+            inner,
+            activity: Arc::new(BackendTurnActivity::default()),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl AgentBackend for RetirementAwareBackend {
+    fn id(&self) -> &str {
+        self.inner.id()
+    }
+
+    fn models(&self) -> Vec<ModelInfo> {
+        self.inner.models()
+    }
+
+    async fn list_models(&self) -> Vec<ModelInfo> {
+        self.inner.list_models().await
+    }
+
+    fn status(&self) -> BackendStatus {
+        self.inner.status()
+    }
+
+    fn supports_tool_free_turns(&self) -> bool {
+        self.inner.supports_tool_free_turns()
+    }
+
+    fn confines_read_only_turns(&self) -> bool {
+        self.inner.confines_read_only_turns()
+    }
+
+    async fn subscription_health(&self) -> Option<trouve_protocol::SubscriptionHealth> {
+        self.inner.subscription_health().await
+    }
+
+    async fn shutdown(&self) -> Result<(), BackendError> {
+        self.activity.begin_retirement().await;
+        self.inner.shutdown().await
+    }
+
+    async fn startup_activity(&self, turn: &BackendTurn) -> Option<BackendStartupActivity> {
+        self.inner.startup_activity(turn).await
+    }
+
+    fn supports_steering(&self) -> bool {
+        self.inner.supports_steering()
+    }
+
+    async fn steer_turn(&self, steer: BackendSteer) -> Result<(), BackendError> {
+        self.inner.steer_turn(steer).await
+    }
+
+    async fn start_login(&self) -> Result<BackendLogin, BackendError> {
+        self.inner.start_login().await
+    }
+
+    async fn run_turn(&self, turn: BackendTurn) -> Result<BackendEventStream, BackendError> {
+        let activity = self.activity.enter(self.id())?;
+        let stream = self.inner.run_turn(turn).await?;
+        Ok(Box::pin(
+            futures::stream::unfold(
+                (stream, Some(activity)),
+                |(mut stream, mut activity)| async move {
+                    match stream.next().await {
+                        Some(event) => Some((event, (stream, activity))),
+                        None => {
+                            // An exhausted stream may remain bound in its caller.
+                            // Release retirement admission at EOF rather than
+                            // waiting for that inert handle to be dropped.
+                            drop(activity.take());
+                            None
+                        }
+                    }
+                },
+            )
+            .fuse(),
+        ))
+    }
+
+    fn take_background_turn_signals(&self) -> Option<tokio::sync::mpsc::Receiver<String>> {
+        self.inner.take_background_turn_signals()
+    }
+
+    async fn abandon_background_turns(&self, thread_id: &str) {
+        self.inner.abandon_background_turns(thread_id).await;
+    }
+}
+
+/// Delegating backend wrapper that keeps the managed runtime generation used
+/// to construct `inner` leased for the wrapper's full lifetime. Registry
+/// replacement can then reclaim an old generation only after every delayed
+/// backend clone that might still launch it has drained.
+pub struct RuntimeLeasedBackend {
+    inner: Arc<dyn AgentBackend>,
+    _runtime: install::RuntimeLease,
+}
+
+impl RuntimeLeasedBackend {
+    pub fn new(inner: Arc<dyn AgentBackend>, runtime: install::RuntimeLease) -> Self {
+        Self {
+            inner,
+            _runtime: runtime,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl AgentBackend for RuntimeLeasedBackend {
+    fn id(&self) -> &str {
+        self.inner.id()
+    }
+
+    fn models(&self) -> Vec<ModelInfo> {
+        self.inner.models()
+    }
+
+    async fn list_models(&self) -> Vec<ModelInfo> {
+        self.inner.list_models().await
+    }
+
+    fn status(&self) -> BackendStatus {
+        self.inner.status()
+    }
+
+    fn supports_tool_free_turns(&self) -> bool {
+        self.inner.supports_tool_free_turns()
+    }
+
+    fn confines_read_only_turns(&self) -> bool {
+        self.inner.confines_read_only_turns()
+    }
+
+    async fn subscription_health(&self) -> Option<trouve_protocol::SubscriptionHealth> {
+        self.inner.subscription_health().await
+    }
+
+    async fn shutdown(&self) -> Result<(), BackendError> {
+        self.inner.shutdown().await
+    }
+
+    async fn startup_activity(&self, turn: &BackendTurn) -> Option<BackendStartupActivity> {
+        self.inner.startup_activity(turn).await
+    }
+
+    fn supports_steering(&self) -> bool {
+        self.inner.supports_steering()
+    }
+
+    async fn steer_turn(&self, steer: BackendSteer) -> Result<(), BackendError> {
+        self.inner.steer_turn(steer).await
+    }
+
+    async fn start_login(&self) -> Result<BackendLogin, BackendError> {
+        self.inner.start_login().await
+    }
+
+    async fn run_turn(&self, turn: BackendTurn) -> Result<BackendEventStream, BackendError> {
+        self.inner.run_turn(turn).await
+    }
+
+    fn take_background_turn_signals(&self) -> Option<tokio::sync::mpsc::Receiver<String>> {
+        self.inner.take_background_turn_signals()
+    }
+
+    async fn abandon_background_turns(&self, thread_id: &str) {
+        self.inner.abandon_background_turns(thread_id).await;
+    }
 }
 
 /// Locate a binary on PATH (absolute/relative paths pass through).
@@ -1096,11 +1353,6 @@ where
     })
 }
 
-/// Simple options-schema for backend models: vendors own the knobs.
-pub(crate) fn empty_schema() -> serde_json::Value {
-    serde_json::json!({"type": "object", "properties": {}})
-}
-
 /// "resets in 2h 10m" from a unix timestamp (seconds; tolerates millis).
 pub(crate) fn format_reset(at: i64) -> String {
     let at = if at > 100_000_000_000 { at / 1000 } else { at };
@@ -1121,25 +1373,118 @@ pub(crate) fn format_reset(at: i64) -> String {
     }
 }
 
-/// Build a ModelInfo for a backend model.
-pub(crate) fn model(backend_id: &str, name: &str, display: &str, context_window: u64) -> ModelInfo {
-    ModelInfo {
-        id: format!("{backend_id}/{name}"),
-        display_name: display.into(),
-        context_window,
-        supports_tools: true,
-        // Subscription-billed: no per-token prices.
-        input_price_per_mtok: None,
-        output_price_per_mtok: None,
-        options_schema: empty_schema(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use futures::StreamExt;
 
     use super::*;
+
+    struct DrainingTestBackend {
+        shutdowns: std::sync::atomic::AtomicUsize,
+        completes_immediately: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentBackend for DrainingTestBackend {
+        fn id(&self) -> &str {
+            "draining-test"
+        }
+
+        fn models(&self) -> Vec<ModelInfo> {
+            Vec::new()
+        }
+
+        fn status(&self) -> BackendStatus {
+            BackendStatus::default()
+        }
+
+        async fn shutdown(&self) -> Result<(), BackendError> {
+            self.shutdowns
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn start_login(&self) -> Result<BackendLogin, BackendError> {
+            Err(BackendError::Protocol(
+                "login is not used by this test".into(),
+            ))
+        }
+
+        async fn run_turn(&self, _turn: BackendTurn) -> Result<BackendEventStream, BackendError> {
+            if self.completes_immediately {
+                Ok(Box::pin(futures::stream::empty()))
+            } else {
+                Ok(Box::pin(futures::stream::pending()))
+            }
+        }
+    }
+
+    fn draining_test_turn() -> BackendTurn {
+        BackendTurn {
+            cancel: tokio_util::sync::CancellationToken::new(),
+            thread_id: "thread".into(),
+            worktree: PathBuf::new(),
+            session: None,
+            model: String::new(),
+            model_options: serde_json::Map::new(),
+            prompt: "test".into(),
+            attachments: Vec::new(),
+            instructions: None,
+            permission: BackendPermission::ReadOnly,
+            tool_free: true,
+            attach_background: false,
+            mcp_bridge: None,
+            mcp_servers: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn retirement_waits_for_active_turn_streams_before_shutdown() {
+        let inner = Arc::new(DrainingTestBackend {
+            shutdowns: std::sync::atomic::AtomicUsize::new(0),
+            completes_immediately: false,
+        });
+        let backend = Arc::new(RetirementAwareBackend::new(inner.clone()));
+        let stream = backend.run_turn(draining_test_turn()).await.unwrap();
+        let shutdown = tokio::spawn({
+            let backend = backend.clone();
+            async move { backend.shutdown().await }
+        });
+
+        tokio::task::yield_now().await;
+        assert!(!shutdown.is_finished());
+        assert_eq!(inner.shutdowns.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(1), shutdown)
+            .await
+            .expect("backend shutdown did not resume after its active turn drained")
+            .expect("backend shutdown task failed")
+            .expect("backend shutdown failed");
+        assert_eq!(inner.shutdowns.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(backend.run_turn(draining_test_turn()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn retirement_releases_an_exhausted_stream_before_its_handle_is_dropped() {
+        let inner = Arc::new(DrainingTestBackend {
+            shutdowns: std::sync::atomic::AtomicUsize::new(0),
+            completes_immediately: true,
+        });
+        let backend = Arc::new(RetirementAwareBackend::new(inner.clone()));
+        let mut exhausted = backend.run_turn(draining_test_turn()).await.unwrap();
+        assert!(exhausted.next().await.is_none());
+
+        tokio::time::timeout(Duration::from_secs(1), backend.shutdown())
+            .await
+            .expect("backend shutdown remained blocked behind an exhausted stream")
+            .expect("backend shutdown failed");
+        assert_eq!(inner.shutdowns.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Keep the exhausted handle alive through the assertion: EOF, not
+        // destruction of the wrapper, must release the activity guard.
+        assert!(exhausted.next().await.is_none());
+    }
 
     #[tokio::test]
     async fn coalesces_delta_kinds_without_reordering_controls() {

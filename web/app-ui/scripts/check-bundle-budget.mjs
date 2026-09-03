@@ -30,7 +30,8 @@ const entryLimit = mode === "desktop" ? 856_000 : 850_000;
 // review-history, churn-metrics, implementation-analyst configuration,
 // durable turn-phase, conditional-title, route-scoped new-session lifecycle,
 // outside-diff review, version-check, per-thread transcript-search, detailed
-// agent-activity, attachment-gallery, external-video, and PR-wide
+// agent-activity, attachment-gallery, external-video, managed-agent runtime
+// status, and PR-wide
 // review-state and workspace-organization additions, including lazy previews,
 // mobile playback notices, the route-scoped subscription/API/local usage
 // panel with its generated per-model usage schema and scope breakdowns, and

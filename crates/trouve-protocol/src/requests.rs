@@ -2993,18 +2993,19 @@ pub struct LoginStatus {
     pub error: Option<String>,
 }
 
-// --- vendor CLIs ------------------------------------------------------------
+// --- managed agent runtimes (legacy /v1/clis API name) ----------------------
 
-/// A vendor CLI trouve can download and manage (cursor-agent, claude,
-/// codex), with its current install state.
+/// A vendor agent runtime trouve can download and manage (Cursor Agent SDK
+/// Bridge, Claude Code CLI, Codex CLI), with its current install state.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CliInfo {
-    /// Stable id, also the binary name: "cursor-agent", "claude", "codex".
+    /// Stable artifact id, also the managed binary name:
+    /// "cursor-sdk-bridge", "claude", or "codex".
     pub id: String,
     pub display_name: String,
-    /// Provider kinds served by this CLI (e.g. ["cursor-cli"]).
+    /// Provider kinds served by this runtime (e.g. ["cursor-sdk"]).
     pub kinds: Vec<String>,
-    /// Version of the binary trouve would run, when one was resolved.
+    /// Version of the runtime binary trouve would run, when one was resolved.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub installed_version: Option<String>,
     /// Where that binary comes from: "managed" (trouve-installed),
@@ -3274,6 +3275,11 @@ pub struct CliInstallStatus {
     /// Version being (or just) installed, when known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    /// A non-fatal activation warning. When present with `status = "success"`,
+    /// the runtime is active but its crash durability could not be confirmed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+    /// The terminal error when `status = "failed"`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     /// Bytes downloaded so far (pending only).

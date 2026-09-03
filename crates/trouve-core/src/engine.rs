@@ -110,6 +110,15 @@ const MAX_ATTACHMENT_MIME_BYTES: usize = 255;
 const TOOL_CANCEL_CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 #[cfg(test)]
 const TOOL_CANCEL_CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+/// A defective backend must not hold the global provider transition forever.
+/// Cursor's own pool cleanup is bounded and has at most three warm processes;
+/// this outer aggregate budget leaves room for that normal path while fencing
+/// every backend implementation at the registry boundary.
+const BACKEND_RETIREMENT_TIMEOUT: Duration = Duration::from_secs(30);
+const BACKEND_RETIREMENT_RETRY_INITIAL: Duration = Duration::from_secs(1);
+const BACKEND_RETIREMENT_RETRY_MAX: Duration = Duration::from_secs(30);
+const RUNTIME_UNINSTALL_LEASE_RETRIES: usize = 4;
+const RUNTIME_UNINSTALL_LEASE_RETRY_DELAY: Duration = Duration::from_millis(25);
 
 type NativeToolCallResult = Result<(String, Vec<trouve_providers::ToolImage>)>;
 
@@ -2751,6 +2760,496 @@ fn automation_definition_matches(
         && left.enabled == right.enabled
 }
 
+struct ProviderReloadGuard {
+    _shared: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
+    _exclusive: Option<tokio::sync::OwnedRwLockWriteGuard<()>>,
+}
+
+impl ProviderReloadGuard {
+    fn shared(guard: tokio::sync::OwnedRwLockReadGuard<()>) -> Self {
+        Self {
+            _shared: Some(guard),
+            _exclusive: None,
+        }
+    }
+
+    fn exclusive(guard: tokio::sync::OwnedRwLockWriteGuard<()>) -> Self {
+        Self {
+            _shared: None,
+            _exclusive: Some(guard),
+        }
+    }
+}
+
+/// Owns the registry guards for one backend transition while the previous
+/// active instances are retired. Ordinary provider updates share the global
+/// reload barrier and serialize only the affected ids; runtime-wide changes
+/// retain exclusive admission. Once an active entry is detached, dropping an
+/// unpublished transition is the cancellation and error rollback path: it
+/// rebuilds the affected ids from durable configuration before releasing its
+/// guards. A transition that only retries an older retained owner leaves the
+/// still-active entry untouched on failure.
+struct BackendRetirement {
+    engine: Weak<Engine>,
+    target_ids: HashSet<String>,
+    rollback_on_drop: bool,
+    secret_transaction: Option<ProviderSecretTransaction>,
+    reload: Option<ProviderReloadGuard>,
+    _target_transitions: Vec<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl BackendRetirement {
+    fn new(
+        engine: &Arc<Engine>,
+        target_ids: HashSet<String>,
+        reload: ProviderReloadGuard,
+        target_transitions: Vec<tokio::sync::OwnedMutexGuard<()>>,
+        secret_transaction: Option<ProviderSecretTransaction>,
+    ) -> Self {
+        Self {
+            engine: Arc::downgrade(engine),
+            target_ids,
+            rollback_on_drop: false,
+            secret_transaction,
+            reload: Some(reload),
+            _target_transitions: target_transitions,
+        }
+    }
+
+    /// Publish replacements from the caller's now-current configuration and
+    /// release the serialized transition. Registry construction reads
+    /// keychains and resolves filesystem-backed runtimes, so the complete
+    /// transition moves to the blocking pool. Dropping the awaiting request
+    /// cannot release its guards early because the blocking task owns `self`.
+    async fn publish(self) -> Result<()> {
+        tokio::task::spawn_blocking(move || {
+            let mut retirement = self;
+            if let Some(transaction) = retirement.secret_transaction.take() {
+                transaction.commit();
+            }
+            retirement.rollback_on_drop = false;
+            if let Some(engine) = retirement.engine.upgrade() {
+                engine.replace_provider_registries_for_ids(&retirement.target_ids);
+            }
+        })
+        .await
+        .map_err(|error| anyhow!("provider registry publication task failed: {error}"))
+    }
+
+    /// Durable provider deletion no longer needs the runtime-wide barrier.
+    /// Provider-scoped transition ownership remains held until secret cleanup
+    /// and registry publication finish, preserving same-id serialization.
+    fn release_reload_barrier(&mut self) {
+        drop(self.reload.take());
+    }
+
+    fn arm_rollback(&mut self) {
+        self.rollback_on_drop = true;
+    }
+
+    /// Restore tentative credentials before an old durable definition can be
+    /// republished. Secret-store implementations may block on a keychain or
+    /// filesystem, so the detached retirement task performs that I/O on the
+    /// blocking pool while this owner retains the provider transition fence.
+    async fn rollback(mut self) -> Result<()> {
+        let rebuild = self.rollback_on_drop;
+        if let Some(mut transaction) = self.secret_transaction.take() {
+            let rollback = tokio::task::spawn_blocking(move || {
+                let result = transaction.try_rollback();
+                (transaction, result)
+            })
+            .await;
+            match rollback {
+                Ok((transaction, Ok(()))) => drop(transaction),
+                Ok((transaction, Err(error))) => {
+                    self.secret_transaction = Some(transaction);
+                    let retry_scheduled = self.schedule_secret_rollback_retry(rebuild);
+                    return if retry_scheduled {
+                        Err(error).context("provider secret rollback retry scheduled")
+                    } else {
+                        Err(error)
+                    };
+                }
+                Err(error) => {
+                    return Err(anyhow!("provider secret rollback task failed: {error}"));
+                }
+            }
+        }
+        self.rollback_on_drop = false;
+        if rebuild && let Some(engine) = self.engine.upgrade() {
+            engine.replace_provider_registries_for_ids(&self.target_ids);
+        }
+        Ok(())
+    }
+
+    /// Move a failed rollback and the locks that fence its provider ids into
+    /// a request-independent supervisor. The old backend is not republished
+    /// until the tentative credentials have been restored successfully.
+    fn schedule_secret_rollback_retry(&mut self, rebuild: bool) -> bool {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return false;
+        };
+        let Some(transaction) = self.secret_transaction.take() else {
+            return false;
+        };
+        // The provider-scoped transition guards are sufficient to keep the
+        // tentative credentials unpublished. Release the global reload
+        // barrier before a potentially unbounded secret-store recovery so
+        // unrelated refreshes and runtime operations can still make progress.
+        drop(self.reload.take());
+        let reconciliation = ProviderSecretRollbackReconciliation {
+            engine: self.engine.clone(),
+            target_ids: self.target_ids.clone(),
+            rebuild,
+            transaction,
+            _target_transitions: std::mem::take(&mut self._target_transitions),
+        };
+        self.rollback_on_drop = false;
+        runtime.spawn(reconciliation.run());
+        true
+    }
+}
+
+impl Drop for BackendRetirement {
+    fn drop(&mut self) {
+        let rebuild = self.rollback_on_drop;
+        if self.secret_transaction.is_some() {
+            if !self.schedule_secret_rollback_retry(rebuild) {
+                // BackendRetirement is created and dropped from async engine
+                // paths, so this can only occur after the runtime is already
+                // unavailable. The transaction field retains its final
+                // best-effort synchronous Drop fallback for that shutdown
+                // edge; ordinary Tokio workers never perform the I/O here.
+                tracing::error!(
+                    "provider secret rollback could not be transferred because no retry runtime is available"
+                );
+            }
+            return;
+        }
+        self.rollback_on_drop = false;
+        if rebuild && let Some(engine) = self.engine.upgrade() {
+            engine.replace_provider_registries_for_ids(&self.target_ids);
+        }
+    }
+}
+
+struct ProviderSecretRollbackReconciliation {
+    engine: Weak<Engine>,
+    target_ids: HashSet<String>,
+    rebuild: bool,
+    transaction: ProviderSecretTransaction,
+    _target_transitions: Vec<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl ProviderSecretRollbackReconciliation {
+    async fn run(self) {
+        let Self {
+            engine,
+            target_ids,
+            rebuild,
+            mut transaction,
+            _target_transitions,
+        } = self;
+        let mut retry_delay = None;
+        loop {
+            if let Some(delay) = retry_delay {
+                tokio::time::sleep(delay).await;
+            }
+            let rollback = tokio::task::spawn_blocking(move || {
+                let result = transaction.try_rollback();
+                (transaction, result)
+            })
+            .await;
+            let (returned, result) = match rollback {
+                Ok(result) => result,
+                Err(error) => {
+                    // A panicking blocking task unwinds and drops its
+                    // transaction, whose Drop path makes one final rollback
+                    // attempt before this fence is released.
+                    tracing::error!(
+                        %error,
+                        "provider secret rollback task failed"
+                    );
+                    return;
+                }
+            };
+            transaction = returned;
+            match result {
+                Ok(()) => {
+                    if rebuild && let Some(engine) = engine.upgrade() {
+                        engine.replace_provider_registries_for_ids(&target_ids);
+                    }
+                    return;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "retrying provider secret rollback after bounded backoff"
+                    );
+                    retry_delay = Some(
+                        retry_delay
+                            .map_or(BACKEND_RETIREMENT_RETRY_INITIAL, |delay| delay * 2)
+                            .min(BACKEND_RETIREMENT_RETRY_MAX),
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Finish a committed provider deletion independently of its HTTP request.
+/// The provider id remains fenced until blocking secret-store cleanup and
+/// registry publication have both completed, so cancellation cannot let a
+/// later upsert race with deletion of its new credentials.
+async fn supervise_provider_secret_deletion(
+    task: tokio::task::JoinHandle<()>,
+    retirement: BackendRetirement,
+    _provider_guard: tokio::sync::OwnedMutexGuard<()>,
+    completion: tokio::sync::oneshot::Sender<Result<()>>,
+) {
+    let deletion = task
+        .await
+        .map_err(|error| anyhow!("provider secret deletion task failed: {error}"));
+    let publication = retirement.publish().await;
+    let result = match (deletion, publication) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(deletion), Err(publication)) => Err(anyhow!(
+            "{deletion}; provider registry publication also failed: {publication}"
+        )),
+    };
+    let _ = completion.send(result);
+}
+
+struct ProviderSecretTransaction {
+    store: Arc<dyn trouve_providers::secrets::SecretStore>,
+    previous: Vec<(String, Option<String>)>,
+    committed: bool,
+}
+
+struct ProviderSecretWriteFailure {
+    error: anyhow::Error,
+    transaction: Option<ProviderSecretTransaction>,
+}
+
+type ProviderSecretWriteResult =
+    std::result::Result<ProviderSecretTransaction, ProviderSecretWriteFailure>;
+type ProviderSecretWriteTaskResult =
+    std::result::Result<ProviderSecretWriteResult, tokio::task::JoinError>;
+type ProviderSecretWriteCompletion = (
+    ProviderSecretWriteTaskResult,
+    tokio::sync::OwnedRwLockReadGuard<()>,
+    Vec<tokio::sync::OwnedMutexGuard<()>>,
+);
+
+impl ProviderSecretTransaction {
+    fn commit(mut self) {
+        self.committed = true;
+    }
+
+    fn try_rollback(&mut self) -> Result<()> {
+        restore_provider_secrets(self.store.as_ref(), &self.previous)?;
+        self.committed = true;
+        Ok(())
+    }
+}
+
+impl Drop for ProviderSecretTransaction {
+    fn drop(&mut self) {
+        if !self.committed
+            && let Err(error) = self.try_rollback()
+        {
+            tracing::error!(%error, "provider secret transaction rollback failed");
+        }
+    }
+}
+
+fn restore_provider_secrets(
+    store: &dyn trouve_providers::secrets::SecretStore,
+    previous: &[(String, Option<String>)],
+) -> Result<()> {
+    let rollback_errors = previous
+        .iter()
+        .rev()
+        .filter_map(|(key, value)| {
+            let result = match value {
+                Some(value) => store.set(key, value),
+                None => store.delete(key),
+            };
+            result.err().map(|error| format!("{key}: {error}"))
+        })
+        .collect::<Vec<_>>();
+    if rollback_errors.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow!(rollback_errors.join("; ")))
+    }
+}
+
+fn write_secrets_transactionally(
+    store: Arc<dyn trouve_providers::secrets::SecretStore>,
+    writes: Vec<(String, String)>,
+) -> ProviderSecretWriteResult {
+    let previous = writes
+        .iter()
+        .map(|(key, _)| store.get(key).map(|value| (key.clone(), value)))
+        .collect::<Result<Vec<_>>>()
+        .map_err(|error| ProviderSecretWriteFailure {
+            error,
+            transaction: None,
+        })?;
+    let mut transaction = ProviderSecretTransaction {
+        store,
+        previous,
+        committed: false,
+    };
+
+    for (key, value) in &writes {
+        if let Err(write_error) = transaction.store.set(key, value) {
+            if let Err(rollback_error) = transaction.try_rollback() {
+                return Err(ProviderSecretWriteFailure {
+                    error: anyhow!(
+                        "writing provider secret {key}: {write_error}; secret rollback failed: {rollback_error}"
+                    ),
+                    transaction: Some(transaction),
+                });
+            } else {
+                return Err(ProviderSecretWriteFailure {
+                    error: write_error.context(format!("writing provider secret {key}")),
+                    transaction: None,
+                });
+            }
+        }
+    }
+    Ok(transaction)
+}
+
+/// Keep the provider transition fenced while blocking secret I/O is in
+/// flight, even if the request future is cancelled. A completed transaction
+/// is returned to the live request; an abandoned one is rolled back here
+/// before another update for the same provider can begin.
+async fn supervise_provider_secret_write(
+    engine: Weak<Engine>,
+    target_ids: HashSet<String>,
+    task: tokio::task::JoinHandle<ProviderSecretWriteResult>,
+    reload: tokio::sync::OwnedRwLockReadGuard<()>,
+    target_transitions: Vec<tokio::sync::OwnedMutexGuard<()>>,
+    completion: tokio::sync::oneshot::Sender<ProviderSecretWriteCompletion>,
+) {
+    let result = task.await;
+    let Err((result, reload, target_transitions)) =
+        completion.send((result, reload, target_transitions))
+    else {
+        return;
+    };
+    // The provider-scoped transition remains sufficient to fence this id.
+    // Release the shared global barrier before potentially blocking rollback
+    // so unrelated provider and runtime operations can continue.
+    drop(reload);
+
+    let retry_transaction = match result {
+        Ok(Ok(mut transaction)) => {
+            let rollback = tokio::task::spawn_blocking(move || {
+                let result = transaction.try_rollback();
+                (transaction, result)
+            })
+            .await;
+            match rollback {
+                Ok((transaction, Ok(()))) => {
+                    drop(transaction);
+                    None
+                }
+                Ok((transaction, Err(error))) => {
+                    tracing::warn!(
+                        %error,
+                        "cancelled provider update secret rollback failed; retrying"
+                    );
+                    Some(transaction)
+                }
+                Err(error) => {
+                    tracing::error!(
+                        %error,
+                        "cancelled provider update secret rollback task failed"
+                    );
+                    None
+                }
+            }
+        }
+        Ok(Err(ProviderSecretWriteFailure { error, transaction })) => {
+            if transaction.is_some() {
+                tracing::warn!(
+                    %error,
+                    "cancelled provider update left a failed secret rollback; retrying"
+                );
+            }
+            transaction
+        }
+        Err(error) => {
+            tracing::error!(
+                %error,
+                "cancelled provider update secret transaction task failed"
+            );
+            None
+        }
+    };
+
+    if let Some(transaction) = retry_transaction {
+        // Provider-scoped transition guards remain held by reconciliation.
+        ProviderSecretRollbackReconciliation {
+            engine,
+            target_ids,
+            rebuild: false,
+            transaction,
+            _target_transitions: target_transitions,
+        }
+        .run()
+        .await;
+    }
+}
+
+type RetiringBackendBatch = Vec<(String, Arc<dyn AgentBackend>)>;
+
+/// Complete one detached cleanup batch and drop every backend owner before
+/// handing the transition back to a caller that may immediately remove the
+/// managed runtime those backends leased.
+async fn shutdown_retiring_backend_batch(
+    engine: &Engine,
+    retiring: RetiringBackendBatch,
+    deadline: tokio::time::Instant,
+) -> Vec<String> {
+    let mut failures = Vec::new();
+    // Poll every backend immediately under the same aggregate deadline. A
+    // stalled first entry must not prevent later independent owners from
+    // receiving their shutdown request and releasing their runtime leases.
+    let mut shutdowns = retiring
+        .into_iter()
+        .map(|(id, backend)| async move {
+            let result = tokio::time::timeout_at(deadline, backend.shutdown()).await;
+            (id, backend, result)
+        })
+        .collect::<futures::stream::FuturesUnordered<_>>();
+    while let Some((id, backend, result)) = shutdowns.next().await {
+        match result {
+            Ok(Ok(())) => {
+                engine.release_retiring_backend(&id, &backend);
+            }
+            Ok(Err(error)) => {
+                failures.push(format!("{id}: {error}"));
+            }
+            Err(_) => {
+                failures.push(format!(
+                    "{id}: backend shutdown exceeded the aggregate retirement deadline"
+                ));
+            }
+        }
+        // Drop the wrapper's runtime lease before the caller can proceed to
+        // uninstall. Timer registration and task-output cleanup are not relied
+        // upon for this ownership boundary.
+        drop(backend);
+    }
+    failures
+}
+
 pub struct Engine {
     pub(crate) store: Store,
     pub(crate) data_dir: PathBuf,
@@ -2774,9 +3273,17 @@ pub struct Engine {
     /// Providers registered programmatically (`with_provider`); preserved
     /// across config-driven registry reloads.
     injected_providers: Mutex<HashMap<String, Arc<dyn Provider>>>,
-    /// External agent backends (Codex app-server, cursor-agent, Claude Code
-    /// CLI), keyed by provider id like `providers`.
-    backends: RwLock<HashMap<String, Arc<dyn AgentBackend>>>,
+    /// External agent backends (Codex app-server, Cursor Agent SDK Bridge,
+    /// Claude Code CLI), keyed by provider id like `providers`.
+    backends: Arc<RwLock<HashMap<String, Arc<dyn AgentBackend>>>>,
+    /// Config-owned backends removed from admission while their asynchronous
+    /// shutdown is running, or retained after a failed shutdown for a later
+    /// retry. Keeping cleanup ownership separate prevents a closed instance
+    /// from remaining selectable without orphaning its vendor processes.
+    retiring_backends: Mutex<HashMap<String, Vec<Arc<dyn AgentBackend>>>>,
+    /// One supervised, bounded-backoff retry worker owns failed backend
+    /// shutdowns independently of later settings or runtime operations.
+    retiring_backend_retry_started: AtomicBool,
     /// Backends registered programmatically (`with_backend`); preserved
     /// across config-driven registry reloads.
     injected_backends: Mutex<HashMap<String, Arc<dyn AgentBackend>>>,
@@ -2874,7 +3381,14 @@ pub struct Engine {
     github_dashboard_publication: Mutex<()>,
     /// Serializes provider upserts and deletions across config, secret-store,
     /// and registry mutations without blocking unrelated provider ids.
-    provider_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    provider_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Serializes backend teardown for the same provider id while allowing
+    /// independent providers to retire concurrently.
+    provider_transition_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Coordinates targeted backend transitions with whole-registry refreshes
+    /// and managed-runtime removal. Targeted transitions take shared admission;
+    /// runtime-wide operations take exclusive admission.
+    provider_reload: Arc<tokio::sync::RwLock<()>>,
     /// Serializes persona-file mutations with durable deletion replay so a
     /// recreate cannot race a pending cleanup of the same user-level file.
     pub(crate) persona_mutations: Arc<tokio::sync::Mutex<()>>,
@@ -2894,6 +3408,12 @@ pub struct Engine {
     logins: Mutex<HashMap<String, LoginState>>,
     /// In-flight managed vendor-CLI installs, keyed by CLI id.
     cli_installs: Mutex<HashMap<String, CliInstallState>>,
+    #[cfg(test)]
+    test_cli_install_result: Mutex<Option<(String, trouve_agents::install::ActivationOutcome)>>,
+    /// Destructive managed-runtime operations, keyed by canonical CLI id.
+    /// Checked atomically with `cli_installs` so install and uninstall cannot
+    /// pass each other's preconditions concurrently.
+    cli_runtime_operations: Arc<Mutex<HashSet<String>>>,
     /// The llama-server sidecar behind the built-in "local" provider.
     local_manager: Arc<crate::local::LlamaManager>,
     /// A separate sidecar for session titles with independently configured
@@ -2946,6 +3466,19 @@ pub struct Engine {
     connectivity_probe: Option<crate::connectivity::Probe>,
 }
 
+/// Content returned to a vendor harness after a bridged ToolExecutor call.
+/// Images stay out of the durable tool-result event but can be projected as
+/// native MCP image blocks for harnesses that support them.
+pub struct BridgedToolResult {
+    pub content: String,
+    pub images: Vec<BridgedToolImage>,
+}
+
+pub struct BridgedToolImage {
+    pub mime: String,
+    pub data: String,
+}
+
 /// Keeps an idempotent session-create reservation alive with the detached
 /// worktree attempt. Field order is intentional: if the request awaiting the
 /// task is cancelled, the worktree receipt rolls back before the key guard is
@@ -2976,8 +3509,26 @@ enum CliInstallState {
         /// Byte progress + cancel flag, shared with the install task.
         progress: Arc<trouve_agents::install::Progress>,
     },
-    Success(String),
+    Success {
+        version: String,
+        warning: Option<String>,
+    },
     Failed(String),
+}
+
+/// Cancellation-safe reservation for a destructive managed-runtime operation.
+/// Installs reserve themselves in `cli_installs`; this separate set closes the
+/// inverse race by preventing an install from starting after uninstall has
+/// passed its pending-install check.
+struct CliRuntimeOperationGuard {
+    operations: Arc<Mutex<HashSet<String>>>,
+    id: String,
+}
+
+impl Drop for CliRuntimeOperationGuard {
+    fn drop(&mut self) {
+        self.operations.lock().unwrap().remove(&self.id);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -3013,36 +3564,75 @@ fn cli_version_matches(reported: &str, version: &str) -> bool {
             .any(|tok| tok == version || tok.strip_prefix('v') == Some(version))
 }
 
-/// The managed CLI serving a backend provider kind, if any.
+/// The managed agent runtime serving a backend provider kind, if any.
 fn cli_for_kind(kind: &str) -> Option<trouve_agents::install::CliId> {
     use trouve_agents::install::CliId;
     match kind {
-        "cursor-cli" => Some(CliId::CursorAgent),
+        "cursor-sdk" | "cursor-cli" => Some(CliId::CursorSdkBridge),
         "claude-cli" => Some(CliId::Claude),
         "codex-app-server" => Some(CliId::Codex),
         _ => None,
     }
 }
 
-/// Resolve the executable for a CLI-backed provider. An explicit command
-/// wins; otherwise a trouve-managed binary takes precedence over PATH.
-fn resolved_cli_command(kind: &str, command: Option<String>, data_dir: &Path) -> Option<String> {
-    command.or_else(|| {
-        cli_for_kind(kind)
-            .map(|cli| trouve_agents::install::managed_bin(data_dir, cli))
-            .filter(|bin| bin.exists())
-            .map(|bin| bin.to_string_lossy().into_owned())
-    })
+fn canonical_cli_runtime_id(id: &str) -> &str {
+    trouve_agents::install::CliId::parse(id).map_or(id, |runtime| runtime.as_str())
+}
+
+/// Resolve the executable for a managed agent runtime. An explicit command
+/// wins unless it is Trouve's retired stable path; otherwise the atomic
+/// managed-install pointer takes precedence over PATH.
+struct ResolvedRuntime {
+    command: Option<String>,
+    lease: Option<trouve_agents::install::RuntimeLease>,
+}
+
+fn resolved_runtime(kind: &str, command: Option<String>, data_dir: &Path) -> ResolvedRuntime {
+    let cli = cli_for_kind(kind);
+    if let Some(command) = command
+        && !cli
+            .is_some_and(|cli| Path::new(&command) == data_dir.join("cli/bin").join(cli.as_str()))
+    {
+        return ResolvedRuntime {
+            command: Some(command),
+            lease: None,
+        };
+    }
+    match cli.and_then(|cli| trouve_agents::install::installed_with_lease(data_dir, cli)) {
+        Some((install, lease)) => ResolvedRuntime {
+            command: Some(install.bin),
+            lease: Some(lease),
+        },
+        None => ResolvedRuntime {
+            command: None,
+            lease: None,
+        },
+    }
+}
+
+/// The old `cursor-cli` kind is retained only as an explicit migration state.
+/// Its command referred to `cursor-agent`, which must never be launched by the
+/// SDK adapter; runtime resolution therefore starts fresh at the managed
+/// Bridge/PATH layers while the backend asks the user for an SDK API key.
+fn configured_runtime_command(pc: &ProviderConfig) -> Option<String> {
+    if pc.kind == "cursor-cli" {
+        None
+    } else {
+        pc.command.clone()
+    }
 }
 
 /// Config kinds handled by the [`AgentBackend`] seam rather than a Provider.
 fn is_backend_kind(kind: &str) -> bool {
-    matches!(kind, "codex-app-server" | "cursor-cli" | "claude-cli")
+    matches!(
+        kind,
+        "codex-app-server" | "cursor-sdk" | "cursor-cli" | "claude-cli"
+    )
 }
 
 /// Config kinds whose auth lives in a vendor CLI.
 fn is_cli_auth_kind(kind: &str) -> bool {
-    is_backend_kind(kind)
+    matches!(kind, "codex-app-server" | "claude-cli")
 }
 
 /// Credential style for a configured provider: "cli" for vendor-CLI-backed
@@ -3057,13 +3647,11 @@ fn provider_auth_kind(pc: &ProviderConfig) -> String {
     ) {
         "gcp".into()
     } else if is_cli_auth_kind(&pc.kind) {
-        // cursor-cli works both ways: subscription login ("cursor" preset)
-        // or an API key ("cursor-api" preset, usage-based billing).
-        if pc.kind == "cursor-cli" && (pc.api_key.is_some() || pc.api_key_env.is_some()) {
-            "api-key".into()
-        } else {
-            "cli".into()
-        }
+        "cli".into()
+    } else if matches!(pc.kind.as_str(), "cursor-sdk" | "cursor-cli") {
+        // The legacy recovery state needs the API-key editor that completes
+        // migration to the Agent SDK; CLI login credentials are incompatible.
+        "api-key".into()
     } else if pc.oauth.is_some() && pc.api_key.is_none() {
         "oauth".into()
     } else if pc.api_key.is_none()
@@ -3105,8 +3693,20 @@ fn build_all_providers(
     secrets: &Arc<dyn trouve_providers::secrets::SecretStore>,
     catalog: &Arc<trouve_providers::models_dev::ModelsDevCatalog>,
 ) -> HashMap<String, Arc<dyn Provider>> {
+    build_providers_for_ids(config, secrets, catalog, None)
+}
+
+fn build_providers_for_ids(
+    config: &Config,
+    secrets: &Arc<dyn trouve_providers::secrets::SecretStore>,
+    catalog: &Arc<trouve_providers::models_dev::ModelsDevCatalog>,
+    target_ids: Option<&HashSet<String>>,
+) -> HashMap<String, Arc<dyn Provider>> {
     let mut providers: HashMap<String, Arc<dyn Provider>> = HashMap::new();
     for (id, pc) in &config.providers {
+        if target_ids.is_some_and(|target_ids| !target_ids.contains(id)) {
+            continue;
+        }
         if is_backend_kind(&pc.kind) {
             continue; // handled by build_all_backends
         }
@@ -3118,12 +3718,14 @@ fn build_all_providers(
         }
     }
     // Zero-config defaults from conventional env vars.
-    if !providers.contains_key("openai")
+    if target_ids.is_none_or(|target_ids| target_ids.contains("openai"))
+        && !providers.contains_key("openai")
         && let Ok(p) = trouve_providers::openai_compat::OpenAiCompatProvider::openai_from_env()
     {
         providers.insert("openai".into(), Arc::new(p.with_catalog(catalog.clone())));
     }
-    if !providers.contains_key("anthropic")
+    if target_ids.is_none_or(|target_ids| target_ids.contains("anthropic"))
+        && !providers.contains_key("anthropic")
         && let Ok(key) = std::env::var("ANTHROPIC_API_KEY")
     {
         providers.insert(
@@ -3148,19 +3750,35 @@ fn build_all_backends(
     data_dir: &Path,
     catalog: &Arc<trouve_providers::models_dev::ModelsDevCatalog>,
 ) -> HashMap<String, Arc<dyn AgentBackend>> {
+    build_backends_for_ids(config, secrets, data_dir, catalog, None)
+}
+
+/// Build only selected config-owned backends during a targeted registry
+/// transition. Avoid constructing and immediately dropping unrelated vendor
+/// pools and managed-runtime leases.
+fn build_backends_for_ids(
+    config: &Config,
+    secrets: &Arc<dyn trouve_providers::secrets::SecretStore>,
+    data_dir: &Path,
+    catalog: &Arc<trouve_providers::models_dev::ModelsDevCatalog>,
+    target_ids: Option<&HashSet<String>>,
+) -> HashMap<String, Arc<dyn AgentBackend>> {
     let mut backends: HashMap<String, Arc<dyn AgentBackend>> = HashMap::new();
     for (id, pc) in &config.providers {
+        if target_ids.is_some_and(|target_ids| !target_ids.contains(id)) {
+            continue;
+        }
         // Explicit command wins; otherwise a trouve-managed install beats
         // whatever is on PATH (distro packages lag behind vendor releases).
-        let command = resolved_cli_command(&pc.kind, pc.command.clone(), data_dir);
+        let runtime = resolved_runtime(&pc.kind, configured_runtime_command(pc), data_dir);
+        let command = runtime.command;
         let backend: Arc<dyn AgentBackend> = match pc.kind.as_str() {
             "codex-app-server" => Arc::new(
                 trouve_agents::codex::CodexBackend::new(id, command).with_catalog(catalog.clone()),
             ),
-            "cursor-cli" => {
+            "cursor-sdk" | "cursor-cli" => {
                 // Same precedence as native providers: inline key > env var >
-                // key saved through settings (secret store). Subscription
-                // login via the CLI still works when all are absent.
+                // key saved through settings (secret store).
                 let api_key = pc
                     .api_key
                     .clone()
@@ -3171,16 +3789,27 @@ fn build_all_backends(
                             .ok()
                             .flatten()
                     });
-                Arc::new(
-                    trouve_agents::cursor::CursorBackend::new(id, command, api_key)
-                        .with_catalog(catalog.clone()),
-                )
+                let backend = trouve_agents::cursor::CursorBackend::new(id, command, api_key)
+                    .with_state_root(data_dir.join("cursor-sdk"))
+                    .with_catalog(catalog.clone());
+                Arc::new(if pc.kind == "cursor-cli" {
+                    backend.requiring_legacy_cli_migration()
+                } else {
+                    backend
+                })
             }
             "claude-cli" => Arc::new(
                 trouve_agents::claude::ClaudeBackend::new(id, command)
                     .with_catalog(catalog.clone()),
             ),
             _ => continue,
+        };
+        let backend: Arc<dyn AgentBackend> = match runtime.lease {
+            Some(lease) => Arc::new(trouve_agents::RuntimeLeasedBackend::new(
+                Arc::new(trouve_agents::RetirementAwareBackend::new(backend)),
+                lease,
+            )),
+            None => Arc::new(trouve_agents::RetirementAwareBackend::new(backend)),
         };
         backends.insert(id.clone(), backend);
     }
@@ -3248,7 +3877,9 @@ impl Engine {
             model_catalog,
             providers: RwLock::new(providers),
             injected_providers: Mutex::new(injected_providers),
-            backends: RwLock::new(backends),
+            backends: Arc::new(RwLock::new(backends)),
+            retiring_backends: Mutex::new(HashMap::new()),
+            retiring_backend_retry_started: AtomicBool::new(false),
             injected_backends: Mutex::new(HashMap::new()),
             background_turn_intake: Mutex::new(Vec::new()),
             background_turn_intake_notify: Arc::new(tokio::sync::Notify::new()),
@@ -3278,6 +3909,8 @@ impl Engine {
             github_pr_detail_cache: Mutex::new(GithubPrDetailCache::default()),
             github_dashboard_publication: Mutex::new(()),
             provider_locks: Mutex::new(HashMap::new()),
+            provider_transition_locks: Mutex::new(HashMap::new()),
+            provider_reload: Arc::new(tokio::sync::RwLock::new(())),
             persona_mutations: Arc::new(tokio::sync::Mutex::new(())),
             config: Mutex::new(config.clone()),
             // No write-back by default: only a caller that loaded `config`
@@ -3299,6 +3932,9 @@ impl Engine {
             code_review: crate::review::CodeReviewRuntime::default(),
             logins: Mutex::new(HashMap::new()),
             cli_installs: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            test_cli_install_result: Mutex::new(None),
+            cli_runtime_operations: Arc::new(Mutex::new(HashSet::new())),
             local_manager,
             title_model,
             title_model_generation: tokio::sync::Mutex::new(None),
@@ -4043,7 +4679,7 @@ impl Engine {
                     settings: pc.settings.clone(),
                     has_credentials,
                     category: trouve_providers::catalog::provider_category(
-                        id,
+                        &pc.kind,
                         &auth,
                         pc.base_url.as_deref(),
                     ),
@@ -4110,7 +4746,11 @@ impl Engine {
                 .ok()
                 .flatten()
                 .is_some(),
-            // Key-authenticated agent backend (cursor-api): not in the
+            // A saved key does not silently opt a legacy CLI config into a
+            // different transport. Saving the Cursor SDK preset completes the
+            // migration and changes the kind deliberately.
+            _ if pc.kind == "cursor-cli" => false,
+            // Key-authenticated agent backend (such as Cursor): not in the
             // provider registry, so check the key channels directly.
             _ if is_backend_kind(&pc.kind) => {
                 pc.api_key.is_some()
@@ -4132,11 +4772,17 @@ impl Engine {
 
     /// Create or update a provider. The API key (when present) goes to the
     /// secret store; the config file only holds non-secret settings.
-    pub fn upsert_provider(
-        &self,
+    pub async fn upsert_provider(
+        self: &Arc<Self>,
         id: &str,
         req: &UpsertProviderRequest,
     ) -> Result<ProviderInfo, EngineError> {
+        if req.kind == "cursor-cli" {
+            return Err(EngineError::BadRequest(
+                "cursor-cli is a read-only legacy migration state; save Cursor as cursor-sdk with an API key"
+                    .into(),
+            ));
+        }
         if !matches!(
             req.kind.as_str(),
             "openai-compat"
@@ -4145,13 +4791,13 @@ impl Engine {
                 | "amazon-bedrock"
                 | "google-vertex"
                 | "google-vertex-anthropic"
-        ) && !is_cli_auth_kind(&req.kind)
+        ) && !is_backend_kind(&req.kind)
         {
             return Err(EngineError::BadRequest(format!(
                 "unknown provider kind {:?} (expected openai-compat, anthropic, \
                  azure-openai, amazon-bedrock, google-vertex, \
                  google-vertex-anthropic, codex-app-server, \
-                 cursor-cli, or claude-cli)",
+                 cursor-sdk (cursor-cli is a legacy migration state), or claude-cli)",
                 req.kind
             )));
         }
@@ -4161,25 +4807,103 @@ impl Engine {
             ));
         }
         let provider_lock = self.provider_lock(id);
-        let _provider_guard = provider_lock.lock().unwrap();
-        if let Some(key) = req.api_key.as_deref().filter(|k| !k.is_empty()) {
-            self.secrets
-                .set(&trouve_providers::secrets::api_key_secret(id), key)
-                .map_err(EngineError::Internal)?;
+        let _provider_guard = provider_lock.lock().await;
+        let target_ids = HashSet::from([id.to_string()]);
+        // Fence API-registry refreshes and same-provider transitions before
+        // the first tentative secret write. These guards move into backend
+        // retirement and, on rollback failure, its detached reconciliation.
+        let (reload, target_transitions) = self
+            .lock_provider_transitions_with_shared_reload(&target_ids)
+            .await;
+        let mut secret_writes = Vec::new();
+        if let Some(key) = req.api_key.as_deref().filter(|key| !key.is_empty()) {
+            secret_writes.push((
+                trouve_providers::secrets::api_key_secret(id),
+                key.to_string(),
+            ));
         }
         for (name, value) in req
             .secret_values
             .iter()
             .filter(|(_, value)| !value.is_empty())
         {
-            self.secrets
-                .set(&trouve_providers::secrets::provider_secret(id, name), value)
-                .map_err(EngineError::Internal)?;
+            secret_writes.push((
+                trouve_providers::secrets::provider_secret(id, name),
+                value.clone(),
+            ));
         }
+        // Validate and commit the secret-store transaction before disturbing
+        // a healthy backend. The guard restores the previous values if this
+        // future is cancelled or any later transition fails.
+        let secret_store = self.secrets.clone();
+        let secret_write = tokio::task::spawn_blocking(move || {
+            write_secrets_transactionally(secret_store, secret_writes)
+        });
+        let (secret_write_tx, secret_write_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(supervise_provider_secret_write(
+            Arc::downgrade(self),
+            target_ids.clone(),
+            secret_write,
+            reload,
+            target_transitions,
+            secret_write_tx,
+        ));
+        let (secret_write, reload, target_transitions) =
+            secret_write_rx.await.map_err(|error| {
+                EngineError::Internal(anyhow!(
+                    "provider secret transaction supervisor failed: {error}"
+                ))
+            })?;
+        let secret_write = secret_write.map_err(|error| {
+            EngineError::Internal(anyhow!("provider secret transaction task failed: {error}"))
+        })?;
+        let secret_transaction = match secret_write {
+            Ok(transaction) => transaction,
+            Err(ProviderSecretWriteFailure { error, transaction }) => {
+                if let Some(transaction) = transaction {
+                    let reconciliation = ProviderSecretRollbackReconciliation {
+                        engine: Arc::downgrade(self),
+                        target_ids,
+                        rebuild: false,
+                        transaction,
+                        _target_transitions: target_transitions,
+                    };
+                    // Provider-scoped guards keep refreshes from observing the
+                    // tentative values. Do not retain the shared global
+                    // barrier across an unbounded secret-store retry.
+                    drop(reload);
+                    tokio::spawn(reconciliation.run());
+                    return Err(EngineError::Internal(
+                        error.context("provider secret rollback retry scheduled"),
+                    ));
+                }
+                return Err(EngineError::Internal(error));
+            }
+        };
+        // Retire the previous backend before changing its durable definition.
+        // The retirement owns cleanup and registry rollback independently of
+        // this request future, so cancellation cannot expose a closing backend
+        // or lose the previous process tree.
+        let retirement = self
+            .retire_config_backends_matching_ids_locked(
+                &target_ids,
+                BACKEND_RETIREMENT_TIMEOUT,
+                ProviderReloadGuard::shared(reload),
+                target_transitions,
+                Some(secret_transaction),
+            )
+            .await?;
         {
             let mut config = self.config.lock().unwrap();
             let entry = config.providers.entry(id.to_string()).or_default();
+            let runtime_kind_changed = entry.kind != req.kind;
             entry.kind = req.kind.clone();
+            if runtime_kind_changed {
+                // Explicit commands speak one vendor transport. Carrying one
+                // across a kind change can launch a valid but incompatible
+                // executable (for example Codex as the Cursor SDK Bridge).
+                entry.command = None;
+            }
             if let Some(base_url) = req.base_url.clone().filter(|url| !url.is_empty()) {
                 entry.base_url = Some(base_url);
             }
@@ -4221,7 +4945,9 @@ impl Engine {
             }
             self.persist_config(&config);
         }
-        self.reload_providers();
+        // Keep the registry transition serialized until the new durable
+        // definition and its credentials are committed.
+        retirement.publish().await?;
         let config = self.config.lock().unwrap();
         let registry = self.providers.read().unwrap();
         let pc = config.providers.get(id).cloned().unwrap_or_default();
@@ -4234,9 +4960,9 @@ impl Engine {
             settings: pc.settings.clone(),
             has_credentials,
             category: trouve_providers::catalog::provider_category(
-                id,
+                &req.kind,
                 &auth,
-                req.base_url.as_deref(),
+                pc.base_url.as_deref(),
             ),
             auth,
             experimental: false,
@@ -4244,40 +4970,132 @@ impl Engine {
     }
 
     /// Remove a provider from the config and its stored API key.
-    pub fn delete_provider(&self, id: &str) -> Result<(), EngineError> {
+    pub async fn delete_provider(self: &Arc<Self>, id: &str) -> Result<(), EngineError> {
         let provider_lock = self.provider_lock(id);
-        let _provider_guard = provider_lock.lock().unwrap();
-        let secret_names = {
+        let provider_guard = provider_lock.lock_owned().await;
+        let secret_names = self
+            .config
+            .lock()
+            .unwrap()
+            .providers
+            .get(id)
+            .ok_or_else(|| EngineError::NotFound(format!("provider {id}")))?
+            .secret_names
+            .clone();
+        let target_ids = HashSet::from([id.to_string()]);
+        // Teardown is the only fallible part of the registry transition. Do it
+        // before deleting durable configuration or credentials so an error is
+        // reported only while the requested deletion is still uncommitted.
+        let mut retirement = self
+            .retire_config_backends_matching_ids(&target_ids)
+            .await?;
+        {
             let mut config = self.config.lock().unwrap();
-            let removed = config
-                .providers
-                .remove(id)
-                .ok_or_else(|| EngineError::NotFound(format!("provider {id}")))?;
+            config.providers.remove(id);
             self.persist_config(&config);
-            removed.secret_names
         };
-        let _ = self
-            .secrets
-            .delete(&trouve_providers::secrets::api_key_secret(id));
-        let _ = self
-            .secrets
-            .delete(&trouve_providers::secrets::oauth_secret(id));
-        for name in secret_names {
-            let _ = self
-                .secrets
-                .delete(&trouve_providers::secrets::provider_secret(id, &name));
-        }
-        self.reload_providers();
+        // API-backed providers have no backend instance for retirement to
+        // detach. Remove the live request path as soon as the durable config
+        // commit succeeds instead of leaving it callable during keychain I/O.
+        self.providers.write().unwrap().remove(id);
+        // The durable definition is now gone. Keep only the provider-scoped
+        // fences while slow keychain cleanup finishes so unrelated exclusive
+        // runtime transitions and registry refreshes can proceed.
+        retirement.release_reload_barrier();
+        let mut secret_keys = vec![
+            trouve_providers::secrets::api_key_secret(id),
+            trouve_providers::secrets::oauth_secret(id),
+        ];
+        secret_keys.extend(
+            secret_names
+                .into_iter()
+                .map(|name| trouve_providers::secrets::provider_secret(id, &name)),
+        );
+        let secret_store = self.secrets.clone();
+        let deletion = tokio::task::spawn_blocking(move || {
+            for key in secret_keys {
+                let _ = secret_store.delete(&key);
+            }
+        });
+        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(supervise_provider_secret_deletion(
+            deletion,
+            retirement,
+            provider_guard,
+            completion_tx,
+        ));
+        completion_rx.await.map_err(|error| {
+            EngineError::Internal(anyhow!(
+                "provider deletion supervisor failed before acknowledgement: {error}"
+            ))
+        })??;
         Ok(())
     }
 
-    fn provider_lock(&self, id: &str) -> Arc<Mutex<()>> {
+    fn provider_lock(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
         self.provider_locks
             .lock()
             .unwrap()
             .entry(id.to_string())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
+    }
+
+    fn provider_transition_lock(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.provider_transition_locks
+            .lock()
+            .unwrap()
+            .entry(id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    fn try_lock_provider_transitions(
+        &self,
+        target_ids: &HashSet<String>,
+    ) -> std::result::Result<Vec<tokio::sync::OwnedMutexGuard<()>>, String> {
+        let mut ids = target_ids.iter().cloned().collect::<Vec<_>>();
+        ids.sort_unstable();
+        let locks = ids
+            .into_iter()
+            .map(|id| {
+                let lock = self.provider_transition_lock(&id);
+                (id, lock)
+            })
+            .collect::<Vec<_>>();
+        let mut guards = Vec::with_capacity(locks.len());
+        for (id, lock) in locks {
+            match lock.try_lock_owned() {
+                Ok(guard) => guards.push(guard),
+                Err(_) => return Err(id),
+            }
+        }
+        Ok(guards)
+    }
+
+    /// Acquire provider-scoped transition locks without ever waiting for one
+    /// while retaining the shared global reload barrier. A failed credential
+    /// rollback may own a provider lock indefinitely; unrelated exclusive
+    /// refreshes must remain admissible throughout that recovery.
+    async fn lock_provider_transitions_with_shared_reload(
+        &self,
+        target_ids: &HashSet<String>,
+    ) -> (
+        tokio::sync::OwnedRwLockReadGuard<()>,
+        Vec<tokio::sync::OwnedMutexGuard<()>>,
+    ) {
+        let mut ids = target_ids.iter().cloned().collect::<Vec<_>>();
+        ids.sort_unstable();
+        let mut guards = Vec::with_capacity(ids.len());
+        for id in ids {
+            guards.push(self.provider_transition_lock(&id).lock_owned().await);
+        }
+        // Exclusive paths only probe provider locks while holding the global
+        // barrier; they never await them. Acquiring provider locks first is
+        // therefore deadlock-free and, critically, never pins the global
+        // barrier behind a stalled credential reconciliation.
+        let reload = self.provider_reload.clone().read_owned().await;
+        (reload, guards)
     }
 
     // --- OAuth login (subscription providers) ---------------------------------
@@ -4368,7 +5186,7 @@ impl Engine {
             let id = id.to_string();
             tokio::spawn(async move {
                 let result = oauth_flow::device_poll(&oauth, &device).await;
-                engine.finish_login(&id, result);
+                engine.finish_login(&id, result).await;
             });
             Ok(started)
         } else if oauth.authorization_url.is_some() {
@@ -4415,7 +5233,7 @@ impl Engine {
                         .await
                 }
                 .await;
-                engine.finish_login(&id, result);
+                engine.finish_login(&id, result).await;
             });
             Ok(started)
         } else {
@@ -4483,9 +5301,9 @@ impl Engine {
         Ok(started)
     }
 
-    // --- managed vendor CLIs ---------------------------------------------------
+    // --- managed agent runtimes ------------------------------------------------
 
-    /// Install state of every vendor CLI trouve can manage: the binary that
+    /// Install state of every vendor agent runtime trouve can manage: the binary that
     /// would run (managed install beats PATH), its version, and whether the
     /// vendor serves something newer (best-effort network check, cached).
     pub async fn list_clis(&self) -> trouve_protocol::CliList {
@@ -4501,7 +5319,7 @@ impl Engine {
                     .providers
                     .values()
                     .filter(|pc| cli_for_kind(&pc.kind) == Some(id))
-                    .find_map(|pc| pc.command.clone())
+                    .find_map(configured_runtime_command)
             };
             let managed = cli::installed(&self.data_dir, id);
             let (source, path, installed_version) = if let Some(cmd) = explicit {
@@ -4537,7 +5355,7 @@ impl Engine {
         trouve_protocol::CliList { clis }
     }
 
-    /// Latest vendor version for one CLI, cached for an hour; None when the
+    /// Latest vendor version for one managed runtime, cached for an hour; None when the
     /// lookup fails (offline is fine — the UI just can't offer updates).
     async fn cli_latest_version(&self, id: trouve_agents::install::CliId) -> Option<String> {
         const TTL: std::time::Duration = std::time::Duration::from_secs(3600);
@@ -4569,22 +5387,32 @@ impl Engine {
         latest
     }
 
-    /// Start downloading the newest build of a vendor CLI into trouve's
+    /// Start downloading the newest build of a vendor agent runtime into trouve's
     /// managed directory. Progress is reported by `cli_install_status`; on
     /// success the backend registry reloads so new turns use the new binary.
     pub fn start_cli_install(self: &Arc<Self>, id: &str) -> Result<(), EngineError> {
         let cli = trouve_agents::install::CliId::parse(id)
             .ok_or_else(|| EngineError::NotFound(format!("cli {id}")))?;
+        let state_id = cli.as_str();
         let progress = Arc::new(trouve_agents::install::Progress::default());
         {
+            let operations = self.cli_runtime_operations.lock().unwrap();
+            if operations.contains(state_id) {
+                return Err(EngineError::Conflict(format!(
+                    "an uninstall for {id} is already in progress"
+                )));
+            }
             let mut installs = self.cli_installs.lock().unwrap();
-            if matches!(installs.get(id), Some(CliInstallState::Pending { .. })) {
+            if matches!(
+                installs.get(state_id),
+                Some(CliInstallState::Pending { .. })
+            ) {
                 return Err(EngineError::Conflict(format!(
                     "an install for {id} is already in progress"
                 )));
             }
             installs.insert(
-                id.to_string(),
+                state_id.to_string(),
                 CliInstallState::Pending {
                     version: None,
                     progress: progress.clone(),
@@ -4592,12 +5420,30 @@ impl Engine {
             );
         }
         let engine = self.clone();
-        let id_owned = id.to_string();
+        let id_owned = state_id.to_string();
         tokio::spawn(async move {
             let result = async {
-                let version = trouve_agents::install::latest_version(cli)
-                    .await
-                    .map_err(|e| e.to_string())?;
+                #[cfg(test)]
+                let injected_install = engine.test_cli_install_result.lock().unwrap().take();
+                #[cfg(not(test))]
+                let injected_install: Option<(
+                    String,
+                    trouve_agents::install::ActivationOutcome,
+                )> = None;
+                let version = match injected_install.as_ref() {
+                    Some((version, _)) => version.clone(),
+                    None => {
+                        match trouve_agents::install::latest_version_for_install(cli, &progress)
+                            .await
+                        {
+                            Ok(version) => version,
+                            Err(trouve_agents::install::InstallError::Cancelled) => {
+                                return Ok(None);
+                            }
+                            Err(error) => return Err(error.to_string()),
+                        }
+                    }
+                };
                 engine.cli_installs.lock().unwrap().insert(
                     id_owned.clone(),
                     CliInstallState::Pending {
@@ -4605,23 +5451,99 @@ impl Engine {
                         progress: progress.clone(),
                     },
                 );
-                match trouve_agents::install::install(&engine.data_dir, cli, &version, &progress)
+                if cli == trouve_agents::install::CliId::CursorSdkBridge {
+                    // Download and verify without blocking provider settings or
+                    // disturbing any live backend. Only the short activation
+                    // transition needs serialization.
+                    let prepared = match trouve_agents::install::prepare_install(
+                        &engine.data_dir,
+                        cli,
+                        &version,
+                        &progress,
+                    )
                     .await
-                {
-                    Ok(_) => Ok(Some(version)),
-                    Err(trouve_agents::install::InstallError::Cancelled) => Ok(None),
-                    Err(e) => Err(e.to_string()),
+                    {
+                        Ok(prepared) => prepared,
+                        Err(trouve_agents::install::InstallError::Cancelled) => return Ok(None),
+                        Err(error) => return Err(error.to_string()),
+                    };
+
+                    // Cancellation remains responsive while another provider
+                    // transition or the previous backend's bounded teardown is
+                    // in progress. Once retirement starts, its detached task
+                    // completes cleanup and registry rollback independently.
+                    let retirement = engine.retire_config_backends_for_runtime(cli);
+                    tokio::pin!(retirement);
+                    let retirement = tokio::select! {
+                        result = &mut retirement => result.map_err(|error| {
+                            format!("stopping the active Cursor SDK runtime: {error}")
+                        })?,
+                        _ = async {
+                            while !progress.cancelled() {
+                                tokio::time::sleep(Duration::from_millis(25)).await;
+                            }
+                        } => return Ok(None),
+                    };
+                    if progress.cancelled() {
+                        return Ok(None);
+                    }
+
+                    let activation_progress = progress.clone();
+                    let activation = tokio::task::spawn_blocking(move || {
+                        prepared.activate_cancellable(&activation_progress)
+                    })
+                    .await;
+                    let install_result = match activation {
+                        Ok(Ok(outcome)) => {
+                            let (_, warning) = outcome.into_parts();
+                            Ok(Some((version, warning)))
+                        }
+                        Ok(Err(trouve_agents::install::InstallError::Cancelled)) => Ok(None),
+                        Ok(Err(error)) => Err(error.to_string()),
+                        Err(error) => Err(format!(
+                            "managed Cursor runtime activation task failed: {error}"
+                        )),
+                    };
+                    // Activation success, failure, and late cancellation all
+                    // replace the retired Cursor pools before releasing the
+                    // transition lock.
+                    retirement
+                        .publish()
+                        .await
+                        .map_err(|error| format!("publishing the Cursor runtime: {error}"))?;
+                    install_result
+                } else {
+                    let install = match injected_install {
+                        Some((_, outcome)) => Ok(outcome),
+                        None => {
+                            trouve_agents::install::install(
+                                &engine.data_dir,
+                                cli,
+                                &version,
+                                &progress,
+                            )
+                            .await
+                        }
+                    };
+                    match install {
+                        Ok(outcome) => {
+                            let (_, warning) = outcome.into_parts();
+                            let warning = engine
+                                .reload_after_committed_runtime_install(cli, &version, warning)
+                                .await;
+                            Ok(Some((version, warning)))
+                        }
+                        Err(trouve_agents::install::InstallError::Cancelled) => Ok(None),
+                        Err(error) => Err(error.to_string()),
+                    }
                 }
             }
             .await;
             let mut installs = engine.cli_installs.lock().unwrap();
             match result {
-                Ok(Some(version)) => {
-                    // The managed binary now exists; rebuild backends so it
-                    // takes over from any PATH resolution.
-                    engine.reload_providers();
+                Ok(Some((version, warning))) => {
                     engine.cli_latest.lock().unwrap().remove(id_owned.as_str());
-                    installs.insert(id_owned, CliInstallState::Success(version));
+                    installs.insert(id_owned, CliInstallState::Success { version, warning });
                 }
                 // Cancelled: back to "none", like it never started.
                 Ok(None) => {
@@ -4638,7 +5560,8 @@ impl Engine {
     /// Ask an in-flight install started with `start_cli_install` to stop.
     /// The task notices at its next chunk and clears the install state.
     pub fn cancel_cli_install(&self, id: &str) -> Result<(), EngineError> {
-        match self.cli_installs.lock().unwrap().get(id) {
+        let state_id = canonical_cli_runtime_id(id);
+        match self.cli_installs.lock().unwrap().get(state_id) {
             Some(CliInstallState::Pending { progress, .. }) => {
                 progress
                     .cancel
@@ -4653,37 +5576,86 @@ impl Engine {
 
     /// Remove the managed install of a CLI (PATH installs are untouched).
     /// For llama-server the sidecar is stopped first.
-    pub async fn uninstall_cli(&self, id: &str) -> Result<(), EngineError> {
+    pub async fn uninstall_cli(self: &Arc<Self>, id: &str) -> Result<(), EngineError> {
         let cli = trouve_agents::install::CliId::parse(id)
             .ok_or_else(|| EngineError::NotFound(format!("cli {id}")))?;
-        {
+        let state_id = cli.as_str();
+        let _runtime_operation = {
+            let mut operations = self.cli_runtime_operations.lock().unwrap();
+            if operations.contains(state_id) {
+                return Err(EngineError::Conflict(format!(
+                    "an uninstall for {id} is already in progress"
+                )));
+            }
             let installs = self.cli_installs.lock().unwrap();
-            if matches!(installs.get(id), Some(CliInstallState::Pending { .. })) {
+            if matches!(
+                installs.get(state_id),
+                Some(CliInstallState::Pending { .. })
+            ) {
                 return Err(EngineError::Conflict(format!(
                     "an install for {id} is in progress — cancel it first"
                 )));
             }
-        }
+            operations.insert(state_id.to_string());
+            CliRuntimeOperationGuard {
+                operations: self.cli_runtime_operations.clone(),
+                id: state_id.to_string(),
+            }
+        };
         if cli == trouve_agents::install::CliId::LlamaServer {
             self.local_manager.stop().await;
             self.title_model.stop().await;
         }
-        trouve_agents::install::uninstall(&self.data_dir, cli)
-            .map_err(|e| EngineError::Internal(e.into()))?;
+        let retirement = self.retire_config_backends_for_runtime(cli).await?;
+        // Runtime-specific teardown removes the registry's leased wrapper
+        // before returning. There is deliberately no await between detaching
+        // it and publishing its replacement: cancellation cannot strand a
+        // missing registry entry. Delayed turn clones remain protected by the
+        // install layer and surface a retryable conflict.
+        let mut lease_attempt = 0;
+        let uninstall = loop {
+            match trouve_agents::install::uninstall(&self.data_dir, cli) {
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && lease_attempt < RUNTIME_UNINSTALL_LEASE_RETRIES =>
+                {
+                    lease_attempt += 1;
+                    tokio::time::sleep(RUNTIME_UNINSTALL_LEASE_RETRY_DELAY).await;
+                }
+                result => break result,
+            }
+        }
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                EngineError::Conflict(format!(
+                    "managed {} runtime is still in use; retry uninstall after active turns finish",
+                    cli.display_name()
+                ))
+            } else {
+                EngineError::Internal(error.into())
+            }
+        });
         // Drop any stale success/failed state so status reads "none", and
         // rebuild backends so they fall back to PATH resolution (or none).
-        self.cli_installs.lock().unwrap().remove(id);
-        self.reload_providers();
+        if uninstall.is_ok() {
+            self.cli_installs.lock().unwrap().remove(state_id);
+        }
+        // Even on a filesystem error, replace the now-closed backend pool so
+        // the still-installed runtime can accept turns again.
+        retirement.publish().await?;
+        uninstall?;
         Ok(())
     }
 
     /// Report the state of an install started with `start_cli_install`.
     pub fn cli_install_status(&self, id: &str) -> trouve_protocol::CliInstallStatus {
-        match self.cli_installs.lock().unwrap().get(id) {
+        let state_id = canonical_cli_runtime_id(id);
+        match self.cli_installs.lock().unwrap().get(state_id) {
             None => trouve_protocol::CliInstallStatus {
                 status: "none".into(),
                 version: None,
                 error: None,
+                warning: None,
                 received_bytes: 0,
                 total_bytes: 0,
             },
@@ -4693,21 +5665,26 @@ impl Engine {
                     status: "pending".into(),
                     version: version.clone(),
                     error: None,
+                    warning: None,
                     received_bytes: progress.received.load(Relaxed),
                     total_bytes: progress.total.load(Relaxed),
                 }
             }
-            Some(CliInstallState::Success(version)) => trouve_protocol::CliInstallStatus {
-                status: "success".into(),
-                version: Some(version.clone()),
-                error: None,
-                received_bytes: 0,
-                total_bytes: 0,
-            },
+            Some(CliInstallState::Success { version, warning }) => {
+                trouve_protocol::CliInstallStatus {
+                    status: "success".into(),
+                    version: Some(version.clone()),
+                    error: None,
+                    warning: warning.clone(),
+                    received_bytes: 0,
+                    total_bytes: 0,
+                }
+            }
             Some(CliInstallState::Failed(e)) => trouve_protocol::CliInstallStatus {
                 status: "failed".into(),
                 version: None,
                 error: Some(e.clone()),
+                warning: None,
                 received_bytes: 0,
                 total_bytes: 0,
             },
@@ -6019,8 +6996,8 @@ impl Engine {
         Ok(self.login_status(id))
     }
 
-    fn finish_login(
-        &self,
+    async fn finish_login(
+        self: &Arc<Self>,
         id: &str,
         result: Result<trouve_providers::auth::OAuthTokens, trouve_providers::ProviderError>,
     ) {
@@ -6031,10 +7008,12 @@ impl Engine {
                     self.secrets
                         .set(&trouve_providers::secrets::oauth_secret(id), &raw)
                 }) {
-                Ok(()) => {
-                    self.reload_providers();
-                    LoginState::Success
-                }
+                Ok(()) => match self.reload_provider(id).await {
+                    Ok(()) => LoginState::Success,
+                    Err(error) => {
+                        LoginState::Failed(format!("reloading providers after login: {error}"))
+                    }
+                },
                 Err(e) => LoginState::Failed(format!("storing tokens: {e}")),
             },
             Err(e) => LoginState::Failed(e.to_string()),
@@ -6196,12 +7175,14 @@ impl Engine {
         self.title_model
             .start_install(move || {
                 if let Some(engine) = engine.upgrade() {
-                    engine.reload_providers();
                     engine
                         .cli_latest
                         .lock()
                         .unwrap()
                         .remove(trouve_agents::install::CliId::LlamaServer.as_str());
+                    tokio::spawn(async move {
+                        engine.refresh_api_provider_registry().await;
+                    });
                 }
             })
             .map_err(|error| EngineError::Conflict(error.to_string()))?;
@@ -6294,26 +7275,470 @@ impl Engine {
         }
     }
 
-    /// Rebuild the provider registry from the current config (after provider
-    /// CRUD), preserving programmatically injected providers.
-    fn reload_providers(&self) {
+    /// Retire only config-owned backends served by one managed runtime. Runtime
+    /// updates use this narrower scope so unrelated vendor backends stay live.
+    async fn retire_config_backends_for_runtime(
+        self: &Arc<Self>,
+        runtime: trouve_agents::install::CliId,
+    ) -> Result<BackendRetirement, EngineError> {
+        let reload = self.provider_reload.clone().write_owned().await;
+        let target_ids = self.configured_provider_ids_for_runtime(runtime);
+        let target_transitions = self
+            .try_lock_provider_transitions(&target_ids)
+            .map_err(|id| {
+                EngineError::Conflict(format!(
+                    "provider {id} is still reconciling credentials; retry the runtime operation after recovery"
+                ))
+            })?;
+        self.retire_config_backends_matching_ids_locked(
+            &target_ids,
+            BACKEND_RETIREMENT_TIMEOUT,
+            ProviderReloadGuard::exclusive(reload),
+            target_transitions,
+            None,
+        )
+        .await
+    }
+
+    fn configured_provider_ids_for_runtime(
+        &self,
+        runtime: trouve_agents::install::CliId,
+    ) -> HashSet<String> {
+        let retired_stable_command = self.data_dir.join("cli/bin").join(runtime.as_str());
+        self.config
+            .lock()
+            .unwrap()
+            .providers
+            .iter()
+            .filter(|(_, provider)| {
+                cli_for_kind(&provider.kind) == Some(runtime)
+                    && configured_runtime_command(provider)
+                        .is_none_or(|command| Path::new(&command) == retired_stable_command)
+            })
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    /// Retire a selected set of config-owned backends transactionally. Targets
+    /// leave the active registry before the first shutdown await, so new turns
+    /// cannot select a closing instance. The shutdown work owns the transition
+    /// lock in a detached task; request cancellation therefore cannot stop
+    /// cleanup or strand registry publication. Failed instances stay in the
+    /// retiring registry under a supervised bounded-backoff retry; a matching
+    /// user transition also retries them before detaching another generation.
+    async fn retire_config_backends_matching_ids(
+        self: &Arc<Self>,
+        target_ids: &HashSet<String>,
+    ) -> Result<BackendRetirement, EngineError> {
+        self.retire_config_backends_matching_ids_with_timeout(
+            target_ids,
+            BACKEND_RETIREMENT_TIMEOUT,
+        )
+        .await
+    }
+
+    async fn retire_config_backends_matching_ids_with_timeout(
+        self: &Arc<Self>,
+        target_ids: &HashSet<String>,
+        timeout: Duration,
+    ) -> Result<BackendRetirement, EngineError> {
+        let (reload, target_transitions) = self
+            .lock_provider_transitions_with_shared_reload(target_ids)
+            .await;
+        self.retire_config_backends_matching_ids_locked(
+            target_ids,
+            timeout,
+            ProviderReloadGuard::shared(reload),
+            target_transitions,
+            None,
+        )
+        .await
+    }
+
+    async fn retire_config_backends_matching_ids_locked(
+        self: &Arc<Self>,
+        target_ids: &HashSet<String>,
+        timeout: Duration,
+        reload: ProviderReloadGuard,
+        target_transitions: Vec<tokio::sync::OwnedMutexGuard<()>>,
+        secret_transaction: Option<ProviderSecretTransaction>,
+    ) -> Result<BackendRetirement, EngineError> {
+        let retirement = BackendRetirement::new(
+            self,
+            target_ids.clone(),
+            reload,
+            target_transitions,
+            secret_transaction,
+        );
+        let engine = Arc::clone(self);
+        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+        let _retirement_task = tokio::spawn(async move {
+            let deadline = tokio::time::Instant::now() + timeout;
+            let mut retirement = retirement;
+            let completion = loop {
+                let (retiring, detached_active) =
+                    engine.select_retiring_backends(&retirement.target_ids);
+                if detached_active {
+                    retirement.arm_rollback();
+                }
+                if retiring.is_empty() {
+                    break Ok(retirement);
+                }
+                let failures = shutdown_retiring_backend_batch(&engine, retiring, deadline).await;
+                if !failures.is_empty() {
+                    engine.ensure_retiring_backend_retry();
+                    let failure = failures.join("; ");
+                    break match retirement.rollback().await {
+                        Ok(()) => Err(EngineError::Internal(anyhow!(
+                            "backend retirement failed: {failure}"
+                        ))),
+                        Err(rollback) => Err(EngineError::Internal(anyhow!(
+                            "backend retirement failed: {failure}; provider secret rollback failed: {rollback}"
+                        ))),
+                    };
+                }
+            };
+            let _ = completion_tx.send(completion);
+        });
+        completion_rx.await.map_err(|error| {
+            EngineError::Internal(anyhow!(
+                "backend retirement task exited before reporting completion: {error}"
+            ))
+        })?
+    }
+
+    /// Retry previously failed owners before detaching the currently active
+    /// generation. This keeps at most one failed generation per provider even
+    /// when repeated reload/uninstall requests arrive during an outage.
+    fn select_retiring_backends(
+        &self,
+        target_ids: &HashSet<String>,
+    ) -> (RetiringBackendBatch, bool) {
+        let injected = self
+            .injected_backends
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut backends = self.backends.write().unwrap();
+        let mut retiring_backends = self.retiring_backends.lock().unwrap();
+        let mut selected = Vec::new();
+        let mut detached_active = false;
+        for id in target_ids {
+            if let Some(entries) = retiring_backends.get(id)
+                && !entries.is_empty()
+            {
+                selected.extend(entries.iter().cloned().map(|backend| (id.clone(), backend)));
+                continue;
+            }
+            let detach = backends.get(id).is_some_and(|backend| {
+                !injected
+                    .iter()
+                    .any(|candidate| Arc::ptr_eq(candidate, backend))
+            });
+            if detach && let Some(backend) = backends.remove(id) {
+                retiring_backends
+                    .entry(id.clone())
+                    .or_default()
+                    .push(backend.clone());
+                selected.push((id.clone(), backend));
+                detached_active = true;
+            }
+        }
+        (selected, detached_active)
+    }
+
+    /// Start at most one weakly owned cleanup supervisor. Permanent vendor
+    /// failures retain the process owner but neither grow generations nor keep
+    /// the Engine alive after its external owners are gone.
+    fn ensure_retiring_backend_retry(self: &Arc<Self>) {
+        if self
+            .retiring_backend_retry_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let engine = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let mut delay = BACKEND_RETIREMENT_RETRY_INITIAL;
+            loop {
+                tokio::time::sleep(delay).await;
+                let Some(engine) = engine.upgrade() else {
+                    return;
+                };
+                let target_ids = engine
+                    .retiring_backends
+                    .lock()
+                    .unwrap()
+                    .keys()
+                    .cloned()
+                    .collect::<HashSet<_>>();
+                if target_ids.is_empty() {
+                    break;
+                }
+                // Credential reconciliation may retain one provider lock for
+                // an extended recovery. Skip busy providers instead of holding
+                // every unrelated process owner behind that one lock.
+                let mut ids = target_ids.into_iter().collect::<Vec<_>>();
+                ids.sort_unstable();
+                let mut retry_ids = HashSet::with_capacity(ids.len());
+                let mut target_transitions = Vec::with_capacity(ids.len());
+                for id in ids {
+                    match engine.provider_transition_lock(&id).try_lock_owned() {
+                        Ok(guard) => {
+                            retry_ids.insert(id);
+                            target_transitions.push(guard);
+                        }
+                        Err(_) => {
+                            tracing::debug!(
+                                provider_id = %id,
+                                "deferring retained backend cleanup behind an active provider transition"
+                            );
+                        }
+                    }
+                }
+                if retry_ids.is_empty() {
+                    delay = (delay * 2).min(BACKEND_RETIREMENT_RETRY_MAX);
+                    continue;
+                }
+                let reload = engine.provider_reload.clone().read_owned().await;
+                let _reload = reload;
+                let _target_transitions = target_transitions;
+                let retiring = engine.retiring_backend_batch(&retry_ids);
+                if retiring.is_empty() {
+                    continue;
+                }
+                let deadline = tokio::time::Instant::now() + BACKEND_RETIREMENT_TIMEOUT;
+                let failures = shutdown_retiring_backend_batch(&engine, retiring, deadline).await;
+                if failures.is_empty() && engine.retiring_backends.lock().unwrap().is_empty() {
+                    break;
+                }
+                if !failures.is_empty() {
+                    tracing::warn!(
+                        failures = %failures.join("; "),
+                        "retrying retained backend shutdown after bounded backoff"
+                    );
+                }
+                delay = (delay * 2).min(BACKEND_RETIREMENT_RETRY_MAX);
+            }
+            if let Some(engine) = engine.upgrade() {
+                engine
+                    .retiring_backend_retry_started
+                    .store(false, Ordering::Release);
+                if !engine.retiring_backends.lock().unwrap().is_empty() {
+                    engine.ensure_retiring_backend_retry();
+                }
+            }
+        });
+    }
+
+    fn retiring_backend_batch(&self, target_ids: &HashSet<String>) -> RetiringBackendBatch {
+        self.retiring_backends
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(id, _)| target_ids.contains(*id))
+            .flat_map(|(id, entries)| {
+                entries
+                    .iter()
+                    .cloned()
+                    .map(|backend| (id.clone(), backend))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    fn release_retiring_backend(&self, id: &str, backend: &Arc<dyn AgentBackend>) {
+        let mut retiring = self.retiring_backends.lock().unwrap();
+        let remove_entry = if let Some(entries) = retiring.get_mut(id) {
+            entries.retain(|candidate| !Arc::ptr_eq(candidate, backend));
+            entries.is_empty()
+        } else {
+            false
+        };
+        if remove_entry {
+            retiring.remove(id);
+        }
+    }
+
+    /// Rebuild only selected provider/backend ids after their previous
+    /// config-owned backends have completed asynchronous teardown. Unrelated
+    /// instances keep their vendor sessions, process pools, and receivers.
+    fn replace_provider_registries_for_ids(&self, target_ids: &HashSet<String>) {
         let config = self.config.lock().unwrap().clone();
-        let mut rebuilt = build_all_providers(&config, &self.secrets, &self.model_catalog);
-        for (id, p) in self.injected_providers.lock().unwrap().iter() {
-            rebuilt.insert(id.clone(), p.clone());
+        let mut provider_replacements = build_providers_for_ids(
+            &config,
+            &self.secrets,
+            &self.model_catalog,
+            Some(target_ids),
+        );
+        let injected_providers = self.injected_providers.lock().unwrap().clone();
+        let mut providers = self.providers.write().unwrap();
+        for id in target_ids {
+            match injected_providers
+                .get(id)
+                .cloned()
+                .or_else(|| provider_replacements.remove(id))
+            {
+                Some(replacement) => {
+                    providers.insert(id.clone(), replacement);
+                }
+                None => {
+                    providers.remove(id);
+                }
+            }
         }
-        *self.providers.write().unwrap() = rebuilt;
-        let mut backends =
-            build_all_backends(&config, &self.secrets, &self.data_dir, &self.model_catalog);
-        for (id, b) in self.injected_backends.lock().unwrap().iter() {
-            backends.insert(id.clone(), b.clone());
+        drop(providers);
+
+        let mut backend_replacements = build_backends_for_ids(
+            &config,
+            &self.secrets,
+            &self.data_dir,
+            &self.model_catalog,
+            Some(target_ids),
+        );
+        let injected_backends = self.injected_backends.lock().unwrap().clone();
+        let mut backends = self.backends.write().unwrap();
+        for id in target_ids {
+            match injected_backends
+                .get(id)
+                .cloned()
+                .or_else(|| backend_replacements.remove(id))
+            {
+                Some(replacement) => {
+                    backends.insert(id.clone(), replacement);
+                }
+                None => {
+                    backends.remove(id);
+                }
+            }
         }
-        *self.backends.write().unwrap() = backends;
+        drop(backends);
         // Rebuilt backends carry fresh background-turn signal channels; hand
         // their receivers to the listener pump so autonomous-turn attachment
         // survives the reload (the old instances' forwarders end when their
         // senders drop).
         self.intake_background_turn_signals();
+    }
+
+    /// Refresh API-backed providers without touching long-lived vendor
+    /// backends. Local/title-model lifecycle changes historically refreshed
+    /// provider metadata, but they do not change any agent runtime.
+    async fn refresh_api_provider_registry(self: &Arc<Self>) {
+        let transition = self.provider_reload.clone().write_owned().await;
+        let engine = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            let _transition = transition;
+            engine.refresh_api_provider_registry_locked();
+        })
+        .await
+        .expect("API provider registry refresh task failed");
+    }
+
+    fn refresh_api_provider_registry_locked(&self) {
+        let config = self.config.lock().unwrap().clone();
+        let injected = self.injected_providers.lock().unwrap().clone();
+        let mut target_ids = config.providers.keys().cloned().collect::<HashSet<_>>();
+        target_ids.extend(self.providers.read().unwrap().keys().cloned());
+        target_ids.extend(injected.keys().cloned());
+        // Zero-config providers may enter or leave the registry when their
+        // conventional environment variables change.
+        target_ids.extend(["openai".to_string(), "anthropic".to_string()]);
+
+        // A detached credential reconciliation retains only its provider lock.
+        // Preserve that provider's published instance instead of either
+        // blocking the global refresh or rebuilding it from tentative secrets.
+        let mut ids = target_ids.into_iter().collect::<Vec<_>>();
+        ids.sort_unstable();
+        let mut refresh_ids = HashSet::with_capacity(ids.len());
+        let mut transition_guards = Vec::with_capacity(ids.len());
+        for id in ids {
+            let lock = self.provider_transition_lock(&id);
+            match lock.try_lock_owned() {
+                Ok(guard) => {
+                    refresh_ids.insert(id);
+                    transition_guards.push(guard);
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        provider_id = %id,
+                        "skipping API provider refresh while credential rollback is reconciling"
+                    );
+                }
+            }
+        }
+
+        let mut replacements = build_providers_for_ids(
+            &config,
+            &self.secrets,
+            &self.model_catalog,
+            Some(&refresh_ids),
+        );
+        let mut providers = self.providers.write().unwrap();
+        for id in &refresh_ids {
+            match injected
+                .get(id)
+                .cloned()
+                .or_else(|| replacements.remove(id))
+            {
+                Some(replacement) => {
+                    providers.insert(id.clone(), replacement);
+                }
+                None => {
+                    providers.remove(id);
+                }
+            }
+        }
+        drop(providers);
+        drop(transition_guards);
+    }
+
+    async fn reload_provider(self: &Arc<Self>, id: &str) -> Result<(), EngineError> {
+        let target_ids = HashSet::from([id.to_string()]);
+        let retirement = self
+            .retire_config_backends_matching_ids(&target_ids)
+            .await?;
+        retirement.publish().await?;
+        Ok(())
+    }
+
+    async fn reload_providers_for_runtime(
+        self: &Arc<Self>,
+        runtime: trouve_agents::install::CliId,
+    ) -> Result<(), EngineError> {
+        let retirement = self.retire_config_backends_for_runtime(runtime).await?;
+        retirement.publish().await?;
+        Ok(())
+    }
+
+    /// Refresh providers after the managed-runtime pointer has committed.
+    /// A teardown failure cannot roll that commit back, so preserve install
+    /// success and surface the registry recovery as an operational warning.
+    async fn reload_after_committed_runtime_install(
+        self: &Arc<Self>,
+        runtime: trouve_agents::install::CliId,
+        version: &str,
+        warning: Option<String>,
+    ) -> Option<String> {
+        let Err(error) = self.reload_providers_for_runtime(runtime).await else {
+            return warning;
+        };
+        tracing::warn!(
+            runtime = runtime.as_str(),
+            version,
+            %error,
+            "managed runtime committed but provider reload did not complete cleanly"
+        );
+        let reload_warning = format!(
+            "{} {version} is active, but its provider registry could not be reloaded cleanly: {error}; Trouve restored the registry from committed configuration",
+            runtime.display_name()
+        );
+        Some(match warning {
+            Some(warning) => format!("{warning}; {reload_warning}"),
+            None => reload_warning,
+        })
     }
 
     pub fn thread_usage(
@@ -8305,10 +9730,10 @@ impl Engine {
 
     /// Subscription usage for every configured subscription provider.
     /// Codex answers via its app-server, Claude Code via its CLI's
-    /// stream-json usage query, and Cursor via the dashboard's undocumented
-    /// usage RPC (read with the CLI's stored login). Kimi Code uses the key
-    /// stored for its provider preset against the same `/usages` endpoint as
-    /// Kimi's open-source CLI.
+    /// stream-json usage query, and Cursor by exchanging its configured API
+    /// key for an ephemeral token before calling the dashboard's undocumented
+    /// usage RPC. Kimi Code uses the key stored for its provider preset
+    /// against the same `/usages` endpoint as Kimi's open-source CLI.
     pub async fn subscription_health(&self) -> Vec<trouve_protocol::SubscriptionHealth> {
         let backends: Vec<(String, Arc<dyn AgentBackend>)> = {
             let map = self.backends.read().unwrap();
@@ -12529,6 +13954,8 @@ impl Engine {
         }
     }
 
+    /// Arm the hard tool-call boundary before an automated-review turn is
+    /// dispatched.
     pub(crate) fn begin_automated_review_tool_budget(
         &self,
         thread_id: &str,
@@ -12868,9 +14295,9 @@ impl Engine {
 
             let mut text = String::new();
             let mut tool_calls = Vec::new();
-            // Provider-native reasoning blocks (Anthropic signed thinking) to
-            // persist and replay verbatim — Anthropic rejects a follow-up
-            // tool-use turn whose thinking blocks aren't preserved.
+            // Provider-native reasoning blocks (for example Anthropic signed
+            // thinking and OpenAI encrypted reasoning items) to persist and
+            // replay verbatim across stateless tool-use turns.
             let mut reasoning: Vec<serde_json::Value> = Vec::new();
             let mut thinking = ProviderThinkingState::default();
             let mut pending_events = Vec::new();
@@ -13324,9 +14751,10 @@ impl Engine {
     /// MCP tool-bridge config for a backend turn. Claude Code and Codex use
     /// the full bridge by default so mutation-capable work crosses the same
     /// ToolExecutor and per-session execution lane as native provider calls.
-    /// Cursor receives a supplemental semantic-search bridge because ACP
-    /// cannot disable its native tools. An explicit `tool_bridge = false`
-    /// retains the vendor-native fallback where a full bridge is supported.
+    /// Cursor's Agent SDK always uses the full bridge: its explicit `mcp`
+    /// allowlist replaces every vendor-native tool with host-owned callbacks.
+    /// An explicit `tool_bridge = false` retains the vendor-native fallback
+    /// only where the backend architecture supports one.
     fn mcp_bridge_for(
         &self,
         model: &str,
@@ -13340,14 +14768,12 @@ impl Engine {
         };
         if !matches!(
             kind.as_str(),
-            "claude-cli" | "codex-app-server" | "cursor-cli"
+            "claude-cli" | "codex-app-server" | "cursor-sdk" | "cursor-cli"
         ) {
             return None;
         }
-        // Cursor cannot suppress its native ACP tools. Give it only the
-        // supplemental always-bridged search surface; Ask mode confines its
-        // native tools to read-only operations.
-        let bridge_tools = kind != "cursor-cli" && configured_bridge_tools;
+        let cursor_sdk = matches!(kind.as_str(), "cursor-sdk" | "cursor-cli");
+        let bridge_tools = cursor_sdk || configured_bridge_tools;
         let Some(base_url) = self.base_url.read().unwrap().clone() else {
             tracing::warn!(
                 "MCP bridge wanted for {backend_id} but the server base URL is unknown; \
@@ -13355,8 +14781,8 @@ impl Engine {
             );
             return None;
         };
-        // Codex and Cursor approvals are native RPCs; serving Claude's
-        // permission-gate tool would only tempt those models to call it.
+        // Codex approval RPCs and Cursor's host-owned tool callbacks do not
+        // need Claude's permission-gate MCP tool.
         let serve_approval = kind == "claude-cli";
         let claims = BridgeTicketClaims {
             bridge_tools,
@@ -13461,7 +14887,7 @@ impl Engine {
         thread_id: &str,
         name: &str,
         arguments: &serde_json::Value,
-    ) -> Result<String, EngineError> {
+    ) -> Result<BridgedToolResult, EngineError> {
         let cancel = self.active_bridge_cancel(thread_id)?;
         self.bridged_tool_call_for(thread_id, name, arguments, cancel)
             .await
@@ -13477,7 +14903,7 @@ impl Engine {
         vendor_call_id: Option<&str>,
         name: &str,
         arguments: &serde_json::Value,
-    ) -> Result<String, EngineError> {
+    ) -> Result<BridgedToolResult, EngineError> {
         let vendor_thread_id = vendor_thread_id
             .filter(|thread_id| !thread_id.is_empty())
             .ok_or_else(|| {
@@ -13602,7 +15028,7 @@ impl Engine {
         name: &str,
         arguments: &serde_json::Value,
         cancel: tokio_util::sync::CancellationToken,
-    ) -> Result<String, EngineError> {
+    ) -> Result<BridgedToolResult, EngineError> {
         let (session, thread, mode, ctx) =
             self.bridged_context_with_cancel(thread_id, cancel.clone())?;
         let turn = self.store.last_turn(thread_id)?;
@@ -13611,15 +15037,20 @@ impl Engine {
             name: name.to_string(),
             arguments: arguments.clone(),
         };
-        // Bridged responses are text-only (MCP content blocks could carry
-        // images, but no bridged vendor consumes them yet); the summary the
-        // engine leaves in place of "_images" still tells the model the
-        // image was read.
-        let (content, _images) = self
+        let (content, images) = self
             .handle_tool_call(&session, &thread, turn, &mode, &ctx, &call, &cancel)
             .await
             .map_err(EngineError::Internal)?;
-        Ok(content)
+        Ok(BridgedToolResult {
+            content,
+            images: images
+                .into_iter()
+                .map(|image| BridgedToolImage {
+                    mime: image.mime,
+                    data: image.data,
+                })
+                .collect(),
+        })
     }
 
     fn announce_trouve_bridge_wrapper(
@@ -23192,12 +24623,15 @@ default_permission_mode = "ask"
             .bridged_tool_owners
             .bind_vendor_thread(&parent.id, "vendor-audit", &audit_child.id)
             .unwrap();
-        let missing_owner = engine
+        let missing_owner = match engine
             .bridged_codex_tool_call(&parent.id, None, None, "read_file", &bridge_arguments)
             .await
-            .unwrap_err();
+        {
+            Ok(_) => panic!("missing owner metadata should be rejected"),
+            Err(error) => error,
+        };
         assert!(missing_owner.to_string().contains("_meta.threadId"));
-        let unknown_owner = engine
+        let unknown_owner = match engine
             .bridged_codex_tool_call(
                 &parent.id,
                 Some("vendor-external"),
@@ -23206,7 +24640,10 @@ default_permission_mode = "ask"
                 &bridge_arguments,
             )
             .await
-            .unwrap_err();
+        {
+            Ok(_) => panic!("unknown owner metadata should be rejected"),
+            Err(error) => error,
+        };
         assert!(unknown_owner.to_string().contains("unknown, external"));
         let thread_only_output = engine
             .bridged_codex_tool_call(
@@ -23218,7 +24655,7 @@ default_permission_mode = "ask"
             )
             .await
             .unwrap();
-        assert!(thread_only_output.contains("owned by the child"));
+        assert!(thread_only_output.content.contains("owned by the child"));
         {
             let projection = collaborators.get_mut("vendor-child").unwrap();
             assert!(engine.suppress_collaborator_bridge_wrapper(
@@ -23242,7 +24679,7 @@ default_permission_mode = "ask"
             )
             .await
             .unwrap();
-        assert!(bridge_output.contains("owned by the child"));
+        assert!(bridge_output.content.contains("owned by the child"));
         {
             let projection = collaborators.get_mut("vendor-child").unwrap();
             assert!(engine.suppress_collaborator_bridge_wrapper(
@@ -23370,7 +24807,7 @@ default_permission_mode = "ask"
             )
             .await
             .unwrap();
-        assert!(review_result.contains("not permitted in this mode"));
+        assert!(review_result.content.contains("not permitted in this mode"));
         assert_eq!(
             std::fs::read_to_string(data.path().join("metadata-owner.txt")).unwrap(),
             "written by interactive child"
@@ -24218,14 +25655,16 @@ default_permission_mode = "ask"
     }
 
     struct BlockingProviderSecretStore {
+        blocked_key: String,
         values: Mutex<HashMap<String, String>>,
         delete_started: std::sync::Barrier,
         allow_delete: std::sync::Barrier,
     }
 
     impl BlockingProviderSecretStore {
-        fn new() -> Self {
+        fn new(provider_id: &str) -> Self {
             Self {
+                blocked_key: trouve_providers::secrets::api_key_secret(provider_id),
                 values: Mutex::new(HashMap::new()),
                 delete_started: std::sync::Barrier::new(2),
                 allow_delete: std::sync::Barrier::new(2),
@@ -24247,13 +25686,334 @@ default_permission_mode = "ask"
         }
 
         fn delete(&self, key: &str) -> anyhow::Result<()> {
-            if key == trouve_providers::secrets::api_key_secret("serialized") {
+            if key == self.blocked_key {
                 self.delete_started.wait();
                 self.allow_delete.wait();
             }
             self.values.lock().unwrap().remove(key);
             Ok(())
         }
+    }
+
+    #[derive(Default)]
+    struct BlockingReadState {
+        started: bool,
+        allowed: bool,
+    }
+
+    struct BlockingReadProviderSecretStore {
+        values: Mutex<HashMap<String, String>>,
+        read_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        read_state: Mutex<BlockingReadState>,
+        read_state_changed: std::sync::Condvar,
+        block_once: std::sync::atomic::AtomicBool,
+    }
+
+    impl BlockingReadProviderSecretStore {
+        fn new() -> (Self, tokio::sync::oneshot::Receiver<()>) {
+            let (read_started_tx, read_started_rx) = tokio::sync::oneshot::channel();
+            (
+                Self {
+                    values: Mutex::new(HashMap::new()),
+                    read_started: Mutex::new(Some(read_started_tx)),
+                    read_state: Mutex::new(BlockingReadState::default()),
+                    read_state_changed: std::sync::Condvar::new(),
+                    block_once: std::sync::atomic::AtomicBool::new(true),
+                },
+                read_started_rx,
+            )
+        }
+
+        fn release_read(&self) {
+            self.read_state.lock().unwrap().allowed = true;
+            self.read_state_changed.notify_all();
+        }
+
+        fn release_read_after_progress(
+            &self,
+            progress: std::sync::mpsc::Receiver<()>,
+            timeout: Duration,
+        ) -> bool {
+            let mut state = self.read_state.lock().unwrap();
+            while !state.started && !state.allowed {
+                state = self.read_state_changed.wait(state).unwrap();
+            }
+            if state.allowed {
+                return false;
+            }
+            drop(state);
+            // A correctly offloaded read leaves the current-thread runtime
+            // free to send this signal. The timeout releases a synchronous
+            // regression without turning the test itself into a deadlock.
+            let progressed = progress.recv_timeout(timeout).is_ok();
+            self.release_read();
+            progressed
+        }
+    }
+
+    impl trouve_providers::secrets::SecretStore for BlockingReadProviderSecretStore {
+        fn get(&self, key: &str) -> anyhow::Result<Option<String>> {
+            if self
+                .block_once
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                if let Some(read_started) = self.read_started.lock().unwrap().take() {
+                    let _ = read_started.send(());
+                }
+                let mut state = self.read_state.lock().unwrap();
+                state.started = true;
+                self.read_state_changed.notify_all();
+                while !state.allowed {
+                    state = self.read_state_changed.wait(state).unwrap();
+                }
+            }
+            Ok(self.values.lock().unwrap().get(key).cloned())
+        }
+
+        fn set(&self, key: &str, value: &str) -> anyhow::Result<()> {
+            self.values
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), value.to_string());
+            Ok(())
+        }
+
+        fn delete(&self, key: &str) -> anyhow::Result<()> {
+            self.values.lock().unwrap().remove(key);
+            Ok(())
+        }
+    }
+
+    async fn observe_blocked_secret_read<T: std::fmt::Debug>(
+        secret_store: &BlockingReadProviderSecretStore,
+        read_started: &mut tokio::sync::oneshot::Receiver<()>,
+        task: &mut tokio::task::JoinHandle<T>,
+        operation: &str,
+    ) {
+        tokio::select! {
+            started = read_started => started.expect("secret-store read notification closed"),
+            result = &mut *task => {
+                secret_store.release_read();
+                panic!("{operation} finished before secret-store I/O was observed: {result:?}");
+            }
+            _ = tokio::time::sleep(Duration::from_secs(2)) => {
+                secret_store.release_read();
+                task.abort();
+                panic!("{operation} did not reach secret-store I/O");
+            }
+        }
+    }
+
+    struct RegistryObservingFailingSecretStore {
+        engine: Mutex<Weak<Engine>>,
+        saw_published_backend: std::sync::atomic::AtomicBool,
+    }
+
+    impl RegistryObservingFailingSecretStore {
+        fn new() -> Self {
+            Self {
+                engine: Mutex::new(Weak::new()),
+                saw_published_backend: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+    }
+
+    impl trouve_providers::secrets::SecretStore for RegistryObservingFailingSecretStore {
+        fn get(&self, _key: &str) -> anyhow::Result<Option<String>> {
+            Ok(None)
+        }
+
+        fn set(&self, _key: &str, _value: &str) -> anyhow::Result<()> {
+            if self
+                .engine
+                .lock()
+                .unwrap()
+                .upgrade()
+                .is_some_and(|engine| engine.backends.read().unwrap().contains_key("cursor"))
+            {
+                self.saw_published_backend
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            Err(anyhow!("injected secret-store failure"))
+        }
+
+        fn delete(&self, _key: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct PartiallyFailingProviderSecretStore {
+        values: Mutex<HashMap<String, String>>,
+        fail_key: String,
+    }
+
+    impl trouve_providers::secrets::SecretStore for PartiallyFailingProviderSecretStore {
+        fn get(&self, key: &str) -> anyhow::Result<Option<String>> {
+            Ok(self.values.lock().unwrap().get(key).cloned())
+        }
+
+        fn set(&self, key: &str, value: &str) -> anyhow::Result<()> {
+            self.values
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), value.to_string());
+            if key == self.fail_key {
+                return Err(anyhow!("injected partial secret-store failure"));
+            }
+            Ok(())
+        }
+
+        fn delete(&self, key: &str) -> anyhow::Result<()> {
+            self.values.lock().unwrap().remove(key);
+            Ok(())
+        }
+    }
+
+    struct TransientRollbackFailingProviderSecretStore {
+        rollback_key: String,
+        values: Mutex<HashMap<String, String>>,
+        reads: Mutex<Vec<(String, Option<String>)>>,
+        rollback_attempts: std::sync::atomic::AtomicUsize,
+    }
+
+    struct BlockingRollbackProviderSecretStore {
+        rollback_key: String,
+        values: Mutex<HashMap<String, String>>,
+        rollback_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        allow_rollback: std::sync::Barrier,
+    }
+
+    impl trouve_providers::secrets::SecretStore for BlockingRollbackProviderSecretStore {
+        fn get(&self, key: &str) -> anyhow::Result<Option<String>> {
+            Ok(self.values.lock().unwrap().get(key).cloned())
+        }
+
+        fn set(&self, key: &str, value: &str) -> anyhow::Result<()> {
+            if key == self.rollback_key && value == "old-key" {
+                if let Some(started) = self.rollback_started.lock().unwrap().take() {
+                    let _ = started.send(());
+                }
+                self.allow_rollback.wait();
+            }
+            self.values
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), value.to_string());
+            Ok(())
+        }
+
+        fn delete(&self, key: &str) -> anyhow::Result<()> {
+            self.values.lock().unwrap().remove(key);
+            Ok(())
+        }
+    }
+
+    impl trouve_providers::secrets::SecretStore for TransientRollbackFailingProviderSecretStore {
+        fn get(&self, key: &str) -> anyhow::Result<Option<String>> {
+            let value = self.values.lock().unwrap().get(key).cloned();
+            self.reads
+                .lock()
+                .unwrap()
+                .push((key.to_string(), value.clone()));
+            Ok(value)
+        }
+
+        fn set(&self, key: &str, value: &str) -> anyhow::Result<()> {
+            if key == self.rollback_key && value == "old-key" {
+                let attempt = self
+                    .rollback_attempts
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if attempt == 0 {
+                    return Err(anyhow!("injected transient rollback failure"));
+                }
+            }
+            self.values
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), value.to_string());
+            Ok(())
+        }
+
+        fn delete(&self, key: &str) -> anyhow::Result<()> {
+            self.values.lock().unwrap().remove(key);
+            Ok(())
+        }
+    }
+
+    struct RecoverableInitialWriteFailureSecretStore {
+        rollback_key: String,
+        forward_failure_key: String,
+        values: Mutex<HashMap<String, String>>,
+        reads: Mutex<Vec<(String, Option<String>)>>,
+        allow_rollback: std::sync::atomic::AtomicBool,
+        rollback_attempts: std::sync::atomic::AtomicUsize,
+    }
+
+    impl trouve_providers::secrets::SecretStore for RecoverableInitialWriteFailureSecretStore {
+        fn get(&self, key: &str) -> anyhow::Result<Option<String>> {
+            let value = self.values.lock().unwrap().get(key).cloned();
+            self.reads
+                .lock()
+                .unwrap()
+                .push((key.to_string(), value.clone()));
+            Ok(value)
+        }
+
+        fn set(&self, key: &str, value: &str) -> anyhow::Result<()> {
+            if key == self.rollback_key && value == "old-key" {
+                self.rollback_attempts
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if !self
+                    .allow_rollback
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    return Err(anyhow!("injected recoverable rollback failure"));
+                }
+            }
+            self.values
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), value.to_string());
+            if key == self.forward_failure_key && value == "new-team" {
+                return Err(anyhow!("injected later secret-write failure"));
+            }
+            Ok(())
+        }
+
+        fn delete(&self, key: &str) -> anyhow::Result<()> {
+            self.values.lock().unwrap().remove(key);
+            Ok(())
+        }
+    }
+
+    async fn wait_for_provider_secret_reconciliation(
+        engine: &Arc<Engine>,
+        store: &TransientRollbackFailingProviderSecretStore,
+        api_key: &str,
+    ) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let restored = store
+                    .values
+                    .lock()
+                    .unwrap()
+                    .get(api_key)
+                    .is_some_and(|value| value == "old-key");
+                let republished = engine.backends.read().unwrap().contains_key("cursor");
+                if restored
+                    && republished
+                    && store
+                        .rollback_attempts
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                        >= 2
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("provider secret rollback was not reconciled");
     }
 
     #[tokio::test]
@@ -26598,30 +28358,83 @@ default_permission_mode = "ask"
     }
 
     #[test]
-    fn cli_command_prefers_explicit_then_managed_binary() {
+    fn runtime_command_prefers_explicit_then_managed_binary() {
         let tmp = tempfile::tempdir().unwrap();
-        let managed =
-            trouve_agents::install::managed_bin(tmp.path(), trouve_agents::install::CliId::Codex);
+        let root = tmp.path().join("cli/codex");
+        let managed = root.join(".generations/runtime-current/codex");
         std::fs::create_dir_all(managed.parent().unwrap()).unwrap();
         std::fs::write(&managed, b"stub").unwrap();
+        let canonical_managed = std::fs::canonicalize(&managed).unwrap();
+        std::fs::write(
+            root.join("installed.json"),
+            serde_json::to_vec(&trouve_agents::install::InstalledCli {
+                version: "1.0.0".into(),
+                bin: managed.to_string_lossy().into_owned(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let obsolete_stable = tmp.path().join("cli/bin/codex");
+        std::fs::create_dir_all(obsolete_stable.parent().unwrap()).unwrap();
+        std::fs::write(&obsolete_stable, b"uncommitted").unwrap();
 
         assert_eq!(
-            resolved_cli_command("codex-app-server", None, tmp.path()),
-            Some(managed.to_string_lossy().into_owned())
+            resolved_runtime("codex-app-server", None, tmp.path()).command,
+            Some(canonical_managed.to_string_lossy().into_owned())
         );
         assert_eq!(
-            resolved_cli_command(
+            resolved_runtime(
+                "codex-app-server",
+                Some(obsolete_stable.to_string_lossy().into_owned()),
+                tmp.path()
+            )
+            .command,
+            Some(canonical_managed.to_string_lossy().into_owned())
+        );
+        assert_eq!(
+            resolved_runtime(
                 "codex-app-server",
                 Some("/opt/custom/codex".into()),
                 tmp.path()
             )
+            .command
             .as_deref(),
             Some("/opt/custom/codex")
         );
         assert_eq!(
-            resolved_cli_command("openai-compat", None, tmp.path()),
+            resolved_runtime("openai-compat", None, tmp.path()).command,
             None
         );
+
+        let legacy_cursor = ProviderConfig {
+            kind: "cursor-cli".into(),
+            command: Some("/opt/custom/cursor-agent".into()),
+            ..Default::default()
+        };
+        assert_eq!(configured_runtime_command(&legacy_cursor), None);
+        let cursor_sdk = ProviderConfig {
+            kind: "cursor-sdk".into(),
+            command: Some("/opt/custom/cursor-sdk-bridge".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            configured_runtime_command(&cursor_sdk).as_deref(),
+            Some("/opt/custom/cursor-sdk-bridge")
+        );
+    }
+
+    #[test]
+    fn legacy_cursor_runtime_id_maps_to_the_sdk_bridge() {
+        assert_eq!(
+            canonical_cli_runtime_id("cursor-agent"),
+            "cursor-sdk-bridge"
+        );
+        assert_eq!(
+            canonical_cli_runtime_id("cursor-sdk-bridge"),
+            "cursor-sdk-bridge"
+        );
+        assert_eq!(canonical_cli_runtime_id("unknown"), "unknown");
     }
 
     #[tokio::test]
@@ -28137,15 +29950,18 @@ default_permission_mode = "ask"
         config.providers.insert(
             "cursor".into(),
             ProviderConfig {
-                kind: "cursor-cli".into(),
+                kind: "cursor-sdk".into(),
+                // Cursor's SDK adapter always uses the full Trouve bridge;
+                // a stale opt-out must not re-enable vendor-native tools.
+                tool_bridge: Some(false),
                 ..Default::default()
             },
         );
-        let engine = Engine::new(
+        let engine = Arc::new(Engine::new(
             Store::open_in_memory().unwrap(),
             data.path().to_path_buf(),
             &config,
-        );
+        ));
         engine.set_base_url("http://127.0.0.1:4000");
         let _cancel = engine.register_cancel("th_1");
 
@@ -28217,8 +30033,8 @@ default_permission_mode = "ask"
         assert!(native.url.contains("tools=0"));
 
         let cursor = engine.mcp_bridge_for("cursor/model", "th_1").unwrap();
-        assert!(!cursor.bridge_tools);
-        assert!(cursor.url.contains("tools=0"));
+        assert!(cursor.bridge_tools);
+        assert!(cursor.url.contains("tools=1"));
         assert!(cursor.url.contains("approval=0"));
         assert!(cursor.disallowed_tools.is_empty());
         engine.clear_cancel("th_1");
@@ -28757,8 +30573,8 @@ default_permission_mode = "ask"
         unsafe { std::env::remove_var(ENV_ONLY) };
     }
 
-    #[test]
-    fn preset_upsert_preserves_existing_transport_templates_when_omitted() {
+    #[tokio::test]
+    async fn preset_upsert_preserves_existing_transport_templates_when_omitted() {
         let data = tempfile::tempdir().unwrap();
         let custom_base_url = "https://custom.azure.test/openai".to_string();
         let custom_headers =
@@ -28776,11 +30592,11 @@ default_permission_mode = "ask"
                 ..Default::default()
             },
         );
-        let engine = Engine::new(
+        let engine = Arc::new(Engine::new(
             Store::open_in_memory().unwrap(),
             data.path().to_path_buf(),
             &config,
-        );
+        ));
         engine
             .upsert_provider(
                 "azure",
@@ -28789,6 +30605,7 @@ default_permission_mode = "ask"
                     ..Default::default()
                 },
             )
+            .await
             .unwrap();
 
         let config = engine.config.lock().unwrap();
@@ -28796,6 +30613,2262 @@ default_permission_mode = "ask"
         assert_eq!(provider.base_url.as_deref(), Some(custom_base_url.as_str()));
         assert_eq!(provider.headers, custom_headers);
         assert_eq!(provider.query_params, custom_query);
+    }
+
+    #[tokio::test]
+    async fn partial_upsert_classifies_the_resulting_kimi_endpoint() {
+        const ID: &str = "custom-kimi";
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            ID.into(),
+            ProviderConfig {
+                kind: "openai-compat".into(),
+                base_url: Some(trouve_providers::kimi_usage::KIMI_CODE_BASE_URL.into()),
+                api_key: Some("test-key".into()),
+                ..Default::default()
+            },
+        );
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        ));
+
+        let updated = engine
+            .upsert_provider(
+                ID,
+                &UpsertProviderRequest {
+                    kind: "openai-compat".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(updated.category, "subscription");
+        let listed = engine
+            .list_providers()
+            .providers
+            .into_iter()
+            .find(|provider| provider.id == ID)
+            .unwrap();
+        assert_eq!(listed.category, updated.category);
+        assert_eq!(listed.base_url, updated.base_url);
+    }
+
+    #[tokio::test]
+    async fn cursor_sdk_migration_clears_the_legacy_acp_command() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            "cursor".into(),
+            ProviderConfig {
+                kind: "cursor-cli".into(),
+                command: Some("/legacy/bin/cursor-agent".into()),
+                ..Default::default()
+            },
+        );
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        ));
+
+        engine
+            .upsert_provider(
+                "cursor",
+                &UpsertProviderRequest {
+                    kind: "cursor-sdk".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let config = engine.config.lock().unwrap();
+        let provider = config.providers.get("cursor").unwrap();
+        assert_eq!(provider.kind, "cursor-sdk");
+        assert_eq!(provider.command, None);
+        assert_eq!(configured_runtime_command(provider), None);
+    }
+
+    #[tokio::test]
+    async fn provider_kind_change_clears_an_incompatible_runtime_command() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            "agent".into(),
+            ProviderConfig {
+                kind: "codex-app-server".into(),
+                command: Some("/opt/custom/bin/codex".into()),
+                ..Default::default()
+            },
+        );
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        ));
+
+        engine
+            .upsert_provider(
+                "agent",
+                &UpsertProviderRequest {
+                    kind: "cursor-sdk".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let config = engine.config.lock().unwrap();
+        let provider = config.providers.get("agent").unwrap();
+        assert_eq!(provider.kind, "cursor-sdk");
+        assert_eq!(provider.command, None);
+        assert_eq!(configured_runtime_command(provider), None);
+    }
+
+    #[tokio::test]
+    async fn public_provider_upsert_rejects_the_legacy_cursor_cli_kind() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            "cursor".into(),
+            ProviderConfig {
+                kind: "cursor-cli".into(),
+                command: Some("cursor-agent".into()),
+                ..Default::default()
+            },
+        );
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        ));
+
+        let error = engine
+            .upsert_provider(
+                "cursor",
+                &UpsertProviderRequest {
+                    kind: "cursor-cli".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("legacy migration state"));
+        let config = engine.config.lock().unwrap();
+        assert_eq!(config.providers["cursor"].kind, "cursor-cli");
+        assert_eq!(
+            config.providers["cursor"].command.as_deref(),
+            Some("cursor-agent")
+        );
+    }
+
+    #[test]
+    fn targeted_provider_rebuild_constructs_only_requested_api_providers() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        for id in ["target-api", "unrelated-api"] {
+            config.providers.insert(
+                id.into(),
+                ProviderConfig {
+                    kind: "openai-compat".into(),
+                    base_url: Some(format!("https://{id}.example.test/v1")),
+                    api_key: Some("test-key".into()),
+                    ..Default::default()
+                },
+            );
+        }
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        );
+        let replacements = build_providers_for_ids(
+            &config,
+            &engine.secrets,
+            &engine.model_catalog,
+            Some(&HashSet::from(["target-api".to_string()])),
+        );
+
+        assert_eq!(replacements.len(), 1);
+        assert!(replacements.contains_key("target-api"));
+    }
+
+    #[tokio::test]
+    async fn title_model_provider_refresh_waits_for_provider_transition() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            "old-api".into(),
+            ProviderConfig {
+                kind: "openai-compat".into(),
+                base_url: Some("https://old.example.test/v1".into()),
+                api_key: Some("test-key".into()),
+                ..Default::default()
+            },
+        );
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        ));
+        let transition = engine.provider_reload.clone().write_owned().await;
+        let refresh = {
+            let engine = engine.clone();
+            tokio::spawn(async move {
+                engine.refresh_api_provider_registry().await;
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(
+            !refresh.is_finished(),
+            "title-model refresh bypassed the provider transition"
+        );
+
+        {
+            let mut config = engine.config.lock().unwrap();
+            config.providers.remove("old-api");
+            config.providers.insert(
+                "new-api".into(),
+                ProviderConfig {
+                    kind: "openai-compat".into(),
+                    base_url: Some("https://new.example.test/v1".into()),
+                    api_key: Some("test-key".into()),
+                    ..Default::default()
+                },
+            );
+        }
+        engine.replace_provider_registries_for_ids(&HashSet::from([
+            "old-api".to_string(),
+            "new-api".to_string(),
+        ]));
+        drop(transition);
+        tokio::time::timeout(Duration::from_secs(3), refresh)
+            .await
+            .expect("serialized title-model refresh did not finish")
+            .unwrap();
+
+        let providers = engine.providers.read().unwrap();
+        assert!(!providers.contains_key("old-api"));
+        assert!(providers.contains_key("new-api"));
+    }
+
+    struct FailingShutdownBackend {
+        shutdowns: std::sync::atomic::AtomicUsize,
+    }
+
+    struct TransientShutdownBackend {
+        shutdowns: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentBackend for TransientShutdownBackend {
+        fn id(&self) -> &str {
+            "transient-shutdown"
+        }
+
+        fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
+            Vec::new()
+        }
+
+        fn status(&self) -> trouve_agents::BackendStatus {
+            trouve_agents::BackendStatus::default()
+        }
+
+        async fn shutdown(&self) -> Result<(), BackendError> {
+            let attempt = self
+                .shutdowns
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if attempt == 0 {
+                Err(BackendError::Protocol("transient shutdown failure".into()))
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn start_login(&self) -> Result<trouve_agents::BackendLogin, BackendError> {
+            Err(BackendError::Protocol("not used".into()))
+        }
+
+        async fn run_turn(
+            &self,
+            _turn: BackendTurn,
+        ) -> Result<trouve_agents::BackendEventStream, BackendError> {
+            Err(BackendError::Protocol("not used".into()))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AgentBackend for FailingShutdownBackend {
+        fn id(&self) -> &str {
+            "failing-shutdown"
+        }
+
+        fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
+            Vec::new()
+        }
+
+        fn status(&self) -> trouve_agents::BackendStatus {
+            trouve_agents::BackendStatus::default()
+        }
+
+        async fn shutdown(&self) -> Result<(), BackendError> {
+            self.shutdowns
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(BackendError::Protocol("injected shutdown failure".into()))
+        }
+
+        async fn start_login(&self) -> Result<trouve_agents::BackendLogin, BackendError> {
+            Err(BackendError::Protocol("not used".into()))
+        }
+
+        async fn run_turn(
+            &self,
+            _turn: BackendTurn,
+        ) -> Result<trouve_agents::BackendEventStream, BackendError> {
+            Err(BackendError::Protocol("not used".into()))
+        }
+    }
+
+    struct BlockingShutdownBackend {
+        entered: Arc<tokio::sync::Semaphore>,
+        release: Arc<tokio::sync::Semaphore>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentBackend for BlockingShutdownBackend {
+        fn id(&self) -> &str {
+            "blocking-shutdown"
+        }
+
+        fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
+            Vec::new()
+        }
+
+        fn status(&self) -> trouve_agents::BackendStatus {
+            trouve_agents::BackendStatus::default()
+        }
+
+        async fn shutdown(&self) -> Result<(), BackendError> {
+            self.entered.add_permits(1);
+            self.release.acquire().await.unwrap().forget();
+            Ok(())
+        }
+
+        async fn start_login(&self) -> Result<trouve_agents::BackendLogin, BackendError> {
+            Err(BackendError::Protocol("not used".into()))
+        }
+
+        async fn run_turn(
+            &self,
+            _turn: BackendTurn,
+        ) -> Result<trouve_agents::BackendEventStream, BackendError> {
+            Err(BackendError::Protocol("not used".into()))
+        }
+    }
+
+    #[test]
+    fn targeted_backend_build_skips_unrelated_vendor_runtimes() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        for (id, kind) in [("cursor", "cursor-sdk"), ("claude", "claude-cli")] {
+            config.providers.insert(
+                id.into(),
+                ProviderConfig {
+                    kind: kind.into(),
+                    ..Default::default()
+                },
+            );
+        }
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        );
+
+        let replacements = build_backends_for_ids(
+            &config,
+            &engine.secrets,
+            data.path(),
+            &engine.model_catalog,
+            Some(&HashSet::from(["cursor".to_string()])),
+        );
+
+        assert_eq!(replacements.len(), 1);
+        assert!(replacements.contains_key("cursor"));
+    }
+
+    #[tokio::test]
+    async fn provider_secret_failure_preserves_the_active_backend() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            "cursor".into(),
+            ProviderConfig {
+                kind: "cursor-sdk".into(),
+                ..Default::default()
+            },
+        );
+        let observing_store = Arc::new(RegistryObservingFailingSecretStore::new());
+        let mut engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        );
+        engine.secrets = observing_store.clone();
+        let engine = Arc::new(engine);
+        *observing_store.engine.lock().unwrap() = Arc::downgrade(&engine);
+        let entered = Arc::new(tokio::sync::Semaphore::new(0));
+        let active: Arc<dyn AgentBackend> = Arc::new(BlockingShutdownBackend {
+            entered: entered.clone(),
+            release: Arc::new(tokio::sync::Semaphore::new(1)),
+        });
+        engine
+            .backends
+            .write()
+            .unwrap()
+            .insert("cursor".into(), active.clone());
+
+        let result = engine
+            .upsert_provider(
+                "cursor",
+                &UpsertProviderRequest {
+                    kind: "cursor-sdk".into(),
+                    api_key: Some("replacement-key".into()),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert!(
+            observing_store
+                .saw_published_backend
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "the healthy backend was retired before the secret write succeeded"
+        );
+        assert_eq!(
+            entered.available_permits(),
+            0,
+            "secret-store rejection attempted backend shutdown"
+        );
+        assert!(Arc::ptr_eq(
+            &engine.backends.read().unwrap()["cursor"],
+            &active
+        ));
+        assert_eq!(
+            engine.config.lock().unwrap().providers["cursor"].kind,
+            "cursor-sdk"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn provider_secret_io_runs_off_the_async_worker() {
+        let data = tempfile::tempdir().unwrap();
+        let (secret_store, mut read_started_rx) = BlockingReadProviderSecretStore::new();
+        let secret_store = Arc::new(secret_store);
+        let mut engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &Config::default(),
+        );
+        engine.secrets = secret_store.clone();
+        let engine = Arc::new(engine);
+        let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+        let release = {
+            let secret_store = secret_store.clone();
+            std::thread::spawn(move || {
+                secret_store.release_read_after_progress(progress_rx, Duration::from_secs(2))
+            })
+        };
+        let mut update = tokio::spawn({
+            let engine = engine.clone();
+            async move {
+                engine
+                    .upsert_provider(
+                        "blocking-secret",
+                        &UpsertProviderRequest {
+                            kind: "openai-compat".into(),
+                            api_key: Some("test-key".into()),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            }
+        });
+
+        observe_blocked_secret_read(
+            &secret_store,
+            &mut read_started_rx,
+            &mut update,
+            "provider update",
+        )
+        .await;
+        let _ = progress_tx.send(());
+        let update_result = tokio::time::timeout(Duration::from_secs(3), update).await;
+        let async_worker_progressed = release.join().unwrap();
+        assert!(
+            async_worker_progressed,
+            "synchronous secret-store I/O blocked the async runtime worker"
+        );
+        update_result
+            .expect("provider update did not finish after secret I/O resumed")
+            .expect("provider update task failed")
+            .expect("provider update failed");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn provider_registry_publication_runs_off_the_async_worker() {
+        const ID: &str = "blocking-publication";
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            ID.into(),
+            ProviderConfig {
+                kind: "openai-compat".into(),
+                base_url: Some("https://old.example.test/v1".into()),
+                ..Default::default()
+            },
+        );
+        let (secret_store, mut read_started_rx) = BlockingReadProviderSecretStore::new();
+        let secret_store = Arc::new(secret_store);
+        let mut engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        );
+        engine.secrets = secret_store.clone();
+        let engine = Arc::new(engine);
+        let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+        let release = {
+            let secret_store = secret_store.clone();
+            std::thread::spawn(move || {
+                secret_store.release_read_after_progress(progress_rx, Duration::from_secs(2))
+            })
+        };
+        let mut update = tokio::spawn({
+            let engine = engine.clone();
+            async move {
+                engine
+                    .upsert_provider(
+                        ID,
+                        &UpsertProviderRequest {
+                            kind: "openai-compat".into(),
+                            base_url: Some("https://new.example.test/v1".into()),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            }
+        });
+
+        observe_blocked_secret_read(
+            &secret_store,
+            &mut read_started_rx,
+            &mut update,
+            "provider registry publication",
+        )
+        .await;
+        let _ = progress_tx.send(());
+        let update_result = tokio::time::timeout(Duration::from_secs(3), update).await;
+        let async_worker_progressed = release.join().unwrap();
+        assert!(
+            async_worker_progressed,
+            "registry construction blocked the async runtime worker"
+        );
+        update_result
+            .expect("provider update did not finish after registry construction resumed")
+            .expect("provider update task failed")
+            .expect("provider update failed");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn api_provider_refresh_runs_off_the_async_worker() {
+        const ID: &str = "blocking-refresh";
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            ID.into(),
+            ProviderConfig {
+                kind: "openai-compat".into(),
+                base_url: Some("https://example.test/v1".into()),
+                ..Default::default()
+            },
+        );
+        let (secret_store, mut read_started_rx) = BlockingReadProviderSecretStore::new();
+        let secret_store = Arc::new(secret_store);
+        let mut engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        );
+        engine.secrets = secret_store.clone();
+        let engine = Arc::new(engine);
+        let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+        let release = {
+            let secret_store = secret_store.clone();
+            std::thread::spawn(move || {
+                secret_store.release_read_after_progress(progress_rx, Duration::from_secs(2))
+            })
+        };
+        let mut refresh = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.refresh_api_provider_registry().await }
+        });
+
+        observe_blocked_secret_read(
+            &secret_store,
+            &mut read_started_rx,
+            &mut refresh,
+            "API provider refresh",
+        )
+        .await;
+        let _ = progress_tx.send(());
+        let refresh_result = tokio::time::timeout(Duration::from_secs(3), refresh).await;
+        let async_worker_progressed = release.join().unwrap();
+        assert!(
+            async_worker_progressed,
+            "API provider refresh blocked the async runtime worker"
+        );
+        refresh_result
+            .expect("API provider refresh did not finish after secret I/O resumed")
+            .expect("API provider refresh task failed");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_provider_secret_write_retains_transition_until_rollback() {
+        let data = tempfile::tempdir().unwrap();
+        let (secret_store, mut read_started_rx) = BlockingReadProviderSecretStore::new();
+        let secret_store = Arc::new(secret_store);
+        let mut engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &Config::default(),
+        );
+        engine.secrets = secret_store.clone();
+        let engine = Arc::new(engine);
+        let mut first = tokio::spawn({
+            let engine = engine.clone();
+            async move {
+                engine
+                    .upsert_provider(
+                        "cancelled-secret",
+                        &UpsertProviderRequest {
+                            kind: "openai-compat".into(),
+                            api_key: Some("cancelled-value".into()),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            }
+        });
+
+        observe_blocked_secret_read(
+            &secret_store,
+            &mut read_started_rx,
+            &mut first,
+            "cancelled provider update",
+        )
+        .await;
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+
+        let second = tokio::spawn({
+            let engine = engine.clone();
+            async move {
+                engine
+                    .upsert_provider(
+                        "cancelled-secret",
+                        &UpsertProviderRequest {
+                            kind: "openai-compat".into(),
+                            api_key: Some("durable-value".into()),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !second.is_finished(),
+            "a later provider update bypassed the cancelled write's transition guard"
+        );
+
+        secret_store.release_read();
+        tokio::time::timeout(Duration::from_secs(5), second)
+            .await
+            .expect("later provider update stayed fenced after rollback")
+            .expect("later provider update task failed")
+            .expect("later provider update failed");
+        assert_eq!(
+            secret_store
+                .values
+                .lock()
+                .unwrap()
+                .get(&trouve_providers::secrets::api_key_secret(
+                    "cancelled-secret"
+                ))
+                .map(String::as_str),
+            Some("durable-value")
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_upsert_rolls_back_partial_secret_writes() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            "cursor".into(),
+            ProviderConfig {
+                kind: "cursor-sdk".into(),
+                ..Default::default()
+            },
+        );
+        let api_key = trouve_providers::secrets::api_key_secret("cursor");
+        let fail_key = trouve_providers::secrets::provider_secret("cursor", "team");
+        let secret_store = Arc::new(PartiallyFailingProviderSecretStore {
+            values: Mutex::new(HashMap::from([(api_key.clone(), "old-key".into())])),
+            fail_key: fail_key.clone(),
+        });
+        let mut engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        );
+        engine.secrets = secret_store.clone();
+        let engine = Arc::new(engine);
+
+        let result = engine
+            .upsert_provider(
+                "cursor",
+                &UpsertProviderRequest {
+                    kind: "cursor-sdk".into(),
+                    api_key: Some("new-key".into()),
+                    secret_values: std::collections::BTreeMap::from([(
+                        "team".into(),
+                        "new-team".into(),
+                    )]),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        assert!(result.is_err());
+        let values = secret_store.values.lock().unwrap();
+        assert_eq!(values.get(&api_key).map(String::as_str), Some("old-key"));
+        assert!(!values.contains_key(&fail_key));
+        drop(values);
+        assert!(engine.backends.read().unwrap().contains_key("cursor"));
+    }
+
+    #[tokio::test]
+    async fn initial_secret_write_failure_retains_rollback_until_reconciled() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            "cursor".into(),
+            ProviderConfig {
+                kind: "openai-compat".into(),
+                base_url: Some("https://cursor.example.test/v1".into()),
+                ..Default::default()
+            },
+        );
+        let api_key = trouve_providers::secrets::api_key_secret("cursor");
+        let team_key = trouve_providers::secrets::provider_secret("cursor", "team");
+        let secret_store = Arc::new(RecoverableInitialWriteFailureSecretStore {
+            rollback_key: api_key.clone(),
+            forward_failure_key: team_key.clone(),
+            values: Mutex::new(HashMap::from([(api_key.clone(), "old-key".into())])),
+            reads: Mutex::new(Vec::new()),
+            allow_rollback: std::sync::atomic::AtomicBool::new(false),
+            rollback_attempts: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        );
+        engine.secrets = secret_store.clone();
+        let engine = Arc::new(engine);
+        engine.replace_provider_registries_for_ids(&HashSet::from(["cursor".to_string()]));
+        let published = engine.providers.read().unwrap()["cursor"].clone();
+
+        let result = engine
+            .upsert_provider(
+                "cursor",
+                &UpsertProviderRequest {
+                    kind: "openai-compat".into(),
+                    api_key: Some("new-key".into()),
+                    secret_values: std::collections::BTreeMap::from([(
+                        "team".into(),
+                        "new-team".into(),
+                    )]),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(result.is_err());
+        assert_eq!(
+            secret_store.values.lock().unwrap().get(&api_key),
+            Some(&"new-key".to_string())
+        );
+        assert!(!secret_store.values.lock().unwrap().contains_key(&team_key));
+
+        secret_store.reads.lock().unwrap().clear();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            engine.refresh_api_provider_registry(),
+        )
+        .await
+        .expect("an unrelated API registry refresh waited for secret reconciliation");
+        assert!(secret_store.reads.lock().unwrap().is_empty());
+        assert!(Arc::ptr_eq(
+            &engine.providers.read().unwrap()["cursor"],
+            &published
+        ));
+
+        secret_store
+            .allow_rollback
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if secret_store
+                    .values
+                    .lock()
+                    .unwrap()
+                    .get(&api_key)
+                    .is_some_and(|value| value == "old-key")
+                    && secret_store
+                        .rollback_attempts
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                        >= 2
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the retained initial-write transaction was not reconciled");
+    }
+
+    #[tokio::test]
+    async fn failed_retirement_retries_secret_rollback_before_republishing_the_old_backend() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            "cursor".into(),
+            ProviderConfig {
+                kind: "cursor-sdk".into(),
+                ..Default::default()
+            },
+        );
+        let api_key = trouve_providers::secrets::api_key_secret("cursor");
+        let secret_store = Arc::new(TransientRollbackFailingProviderSecretStore {
+            rollback_key: api_key.clone(),
+            values: Mutex::new(HashMap::from([(api_key.clone(), "old-key".into())])),
+            reads: Mutex::new(Vec::new()),
+            rollback_attempts: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        );
+        engine.secrets = secret_store.clone();
+        let engine = Arc::new(engine);
+        engine.backends.write().unwrap().insert(
+            "cursor".into(),
+            Arc::new(FailingShutdownBackend {
+                shutdowns: std::sync::atomic::AtomicUsize::new(0),
+            }),
+        );
+
+        let result = engine
+            .upsert_provider(
+                "cursor",
+                &UpsertProviderRequest {
+                    kind: "openai-compat".into(),
+                    base_url: Some("https://replacement.example.test/v1".into()),
+                    api_key: Some("new-key".into()),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        assert!(result.is_err());
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            engine.refresh_api_provider_registry(),
+        )
+        .await
+        .expect("API provider refresh waited for secret reconciliation");
+        wait_for_provider_secret_reconciliation(&engine, secret_store.as_ref(), &api_key).await;
+        assert_eq!(
+            secret_store.values.lock().unwrap().get(&api_key),
+            Some(&"old-key".to_string())
+        );
+        assert_eq!(
+            secret_store
+                .rollback_attempts
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+        let reads = secret_store.reads.lock().unwrap();
+        assert!(
+            reads
+                .iter()
+                .filter(|(key, _)| key == &api_key)
+                .all(|(_, value)| value.as_deref() != Some("new-key")),
+            "registry rebuild observed tentative credentials: {reads:?}"
+        );
+        drop(reads);
+        assert!(engine.backends.read().unwrap().contains_key("cursor"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_retirement_keeps_blocking_secret_rollback_off_the_runtime_worker() {
+        const ID: &str = "cursor";
+
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            ID.into(),
+            ProviderConfig {
+                kind: "cursor-sdk".into(),
+                ..Default::default()
+            },
+        );
+        let api_key = trouve_providers::secrets::api_key_secret(ID);
+        let (rollback_started, rollback_started_rx) = tokio::sync::oneshot::channel();
+        let secret_store = Arc::new(BlockingRollbackProviderSecretStore {
+            rollback_key: api_key.clone(),
+            values: Mutex::new(HashMap::from([(api_key.clone(), "old-key".into())])),
+            rollback_started: Mutex::new(Some(rollback_started)),
+            allow_rollback: std::sync::Barrier::new(2),
+        });
+        let mut engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        );
+        engine.secrets = secret_store.clone();
+        let engine = Arc::new(engine);
+        engine.backends.write().unwrap().insert(
+            ID.into(),
+            Arc::new(FailingShutdownBackend {
+                shutdowns: std::sync::atomic::AtomicUsize::new(0),
+            }),
+        );
+
+        let releaser = {
+            let secret_store = secret_store.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_secs(1));
+                secret_store.allow_rollback.wait();
+            })
+        };
+        let update = {
+            let engine = engine.clone();
+            tokio::spawn(async move {
+                engine
+                    .upsert_provider(
+                        ID,
+                        &UpsertProviderRequest {
+                            kind: "openai-compat".into(),
+                            api_key: Some("new-key".into()),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            })
+        };
+
+        let started = std::time::Instant::now();
+        rollback_started_rx.await.unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "blocking secret rollback stalled the current-thread runtime"
+        );
+
+        assert!(update.await.unwrap().is_err());
+        releaser.join().unwrap();
+        assert_eq!(
+            secret_store.values.lock().unwrap().get(&api_key),
+            Some(&"old-key".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn later_provider_upsert_writes_secrets_after_earlier_reconciliation() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            "cursor".into(),
+            ProviderConfig {
+                kind: "cursor-sdk".into(),
+                ..Default::default()
+            },
+        );
+        let api_key = trouve_providers::secrets::api_key_secret("cursor");
+        let secret_store = Arc::new(TransientRollbackFailingProviderSecretStore {
+            rollback_key: api_key.clone(),
+            values: Mutex::new(HashMap::from([(api_key.clone(), "old-key".into())])),
+            reads: Mutex::new(Vec::new()),
+            rollback_attempts: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        );
+        engine.secrets = secret_store.clone();
+        let engine = Arc::new(engine);
+        let shutdowns = Arc::new(TransientShutdownBackend {
+            shutdowns: std::sync::atomic::AtomicUsize::new(0),
+        });
+        engine
+            .backends
+            .write()
+            .unwrap()
+            .insert("cursor".into(), shutdowns.clone());
+
+        let first = engine
+            .upsert_provider(
+                "cursor",
+                &UpsertProviderRequest {
+                    kind: "openai-compat".into(),
+                    base_url: Some("https://first.example.test/v1".into()),
+                    api_key: Some("first-key".into()),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(first.is_err());
+
+        let second = {
+            let engine = engine.clone();
+            tokio::spawn(async move {
+                engine
+                    .upsert_provider(
+                        "cursor",
+                        &UpsertProviderRequest {
+                            kind: "openai-compat".into(),
+                            base_url: Some("https://second.example.test/v1".into()),
+                            api_key: Some("second-key".into()),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            })
+        };
+        let second = match tokio::time::timeout(Duration::from_secs(8), second).await {
+            Ok(second) => second.unwrap().unwrap(),
+            Err(_) => panic!(
+                "the later provider update remained blocked after reconciliation (rollbacks={}, shutdowns={}, retiring={})",
+                secret_store
+                    .rollback_attempts
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                shutdowns
+                    .shutdowns
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                engine.retiring_backends.lock().unwrap().len(),
+            ),
+        };
+
+        assert_eq!(
+            second.base_url.as_deref(),
+            Some("https://second.example.test/v1")
+        );
+        assert_eq!(
+            secret_store.values.lock().unwrap().get(&api_key),
+            Some(&"second-key".to_string())
+        );
+        assert_eq!(
+            engine.config.lock().unwrap().providers["cursor"]
+                .base_url
+                .as_deref(),
+            Some("https://second.example.test/v1")
+        );
+        assert!(engine.providers.read().unwrap().contains_key("cursor"));
+        assert_eq!(
+            secret_store
+                .reads
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .find(|(key, _)| key == &api_key)
+                .and_then(|(_, value)| value.as_deref()),
+            Some("second-key")
+        );
+    }
+
+    #[tokio::test]
+    async fn abandoned_retirement_retries_secret_rollback_before_republishing_the_old_backend() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            "cursor".into(),
+            ProviderConfig {
+                kind: "cursor-sdk".into(),
+                ..Default::default()
+            },
+        );
+        let api_key = trouve_providers::secrets::api_key_secret("cursor");
+        let secret_store = Arc::new(TransientRollbackFailingProviderSecretStore {
+            rollback_key: api_key.clone(),
+            values: Mutex::new(HashMap::from([(api_key.clone(), "old-key".into())])),
+            reads: Mutex::new(Vec::new()),
+            rollback_attempts: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        );
+        engine.secrets = secret_store.clone();
+        let engine = Arc::new(engine);
+        let entered = Arc::new(tokio::sync::Semaphore::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        engine.backends.write().unwrap().insert(
+            "cursor".into(),
+            Arc::new(BlockingShutdownBackend {
+                entered: entered.clone(),
+                release: release.clone(),
+            }),
+        );
+
+        let update = {
+            let engine = engine.clone();
+            tokio::spawn(async move {
+                engine
+                    .upsert_provider(
+                        "cursor",
+                        &UpsertProviderRequest {
+                            kind: "openai-compat".into(),
+                            base_url: Some("https://replacement.example.test/v1".into()),
+                            api_key: Some("new-key".into()),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            })
+        };
+        entered.acquire().await.unwrap().forget();
+        update.abort();
+        assert!(update.await.unwrap_err().is_cancelled());
+        release.add_permits(1);
+
+        wait_for_provider_secret_reconciliation(&engine, secret_store.as_ref(), &api_key).await;
+        let reads = secret_store.reads.lock().unwrap();
+        assert!(
+            reads
+                .iter()
+                .filter(|(key, _)| key == &api_key)
+                .all(|(_, value)| value.as_deref() != Some("new-key")),
+            "registry rebuild observed tentative credentials: {reads:?}"
+        );
+        drop(reads);
+        assert_eq!(
+            secret_store
+                .rollback_attempts
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_retirement_does_not_block_an_unrelated_provider_update() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            "cursor".into(),
+            ProviderConfig {
+                kind: "cursor-sdk".into(),
+                ..Default::default()
+            },
+        );
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        ));
+        let entered = Arc::new(tokio::sync::Semaphore::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        engine.backends.write().unwrap().insert(
+            "cursor".into(),
+            Arc::new(BlockingShutdownBackend {
+                entered: entered.clone(),
+                release: release.clone(),
+            }),
+        );
+        let retiring = {
+            let engine = engine.clone();
+            tokio::spawn(async move {
+                engine
+                    .retire_config_backends_matching_ids(&HashSet::from(["cursor".to_string()]))
+                    .await
+            })
+        };
+        entered.acquire().await.unwrap().forget();
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            engine.upsert_provider(
+                "unrelated",
+                &UpsertProviderRequest {
+                    kind: "openai-compat".into(),
+                    base_url: Some("https://unrelated.example.test/v1".into()),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .expect("an unrelated provider update waited for backend shutdown")
+        .unwrap();
+
+        release.add_permits(1);
+        retiring.await.unwrap().unwrap().publish().await.unwrap();
+        assert!(
+            engine
+                .config
+                .lock()
+                .unwrap()
+                .providers
+                .contains_key("unrelated")
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_retirement_selects_targets_after_transition_admission() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            "cursor".into(),
+            ProviderConfig {
+                kind: "cursor-sdk".into(),
+                ..Default::default()
+            },
+        );
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        ));
+        let shutdowns = Arc::new(FailingShutdownBackend {
+            shutdowns: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let backend: Arc<dyn AgentBackend> = shutdowns.clone();
+        engine
+            .backends
+            .write()
+            .unwrap()
+            .insert("cursor".into(), backend.clone());
+        let transition = engine.provider_reload.clone().write_owned().await;
+        let retiring = engine
+            .retire_config_backends_for_runtime(trouve_agents::install::CliId::CursorSdkBridge);
+        tokio::pin!(retiring);
+        assert!(futures::poll!(retiring.as_mut()).is_pending());
+        engine
+            .config
+            .lock()
+            .unwrap()
+            .providers
+            .get_mut("cursor")
+            .unwrap()
+            .kind = "claude-cli".into();
+        drop(transition);
+
+        retiring.await.unwrap().publish().await.unwrap();
+
+        assert_eq!(
+            shutdowns
+                .shutdowns
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert!(Arc::ptr_eq(
+            &engine.backends.read().unwrap()["cursor"],
+            &backend
+        ));
+    }
+
+    #[tokio::test]
+    async fn runtime_retirement_conflicts_with_provider_reconciliation_without_blocking_refresh() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            "cursor".into(),
+            ProviderConfig {
+                kind: "cursor-sdk".into(),
+                ..Default::default()
+            },
+        );
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        ));
+        let _reconciliation = engine.provider_transition_lock("cursor").lock_owned().await;
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            engine
+                .retire_config_backends_for_runtime(trouve_agents::install::CliId::CursorSdkBridge),
+        )
+        .await
+        .expect("runtime retirement waited on a provider-scoped reconciliation");
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("runtime retirement bypassed provider-scoped reconciliation"),
+        };
+        assert!(
+            matches!(error, EngineError::Conflict(message) if message.contains("reconciling credentials"))
+        );
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            engine.refresh_api_provider_registry(),
+        )
+        .await
+        .expect("API registry refresh was blocked by provider-scoped reconciliation");
+    }
+
+    #[tokio::test]
+    async fn install_cannot_start_while_uninstall_is_retiring_runtime() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            "cursor".into(),
+            ProviderConfig {
+                kind: "cursor-sdk".into(),
+                ..Default::default()
+            },
+        );
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        ));
+        let entered = Arc::new(tokio::sync::Semaphore::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        engine.backends.write().unwrap().insert(
+            "cursor".into(),
+            Arc::new(BlockingShutdownBackend {
+                entered: entered.clone(),
+                release: release.clone(),
+            }),
+        );
+        let uninstalling = {
+            let engine = engine.clone();
+            tokio::spawn(async move { engine.uninstall_cli("cursor-sdk-bridge").await })
+        };
+        entered.acquire().await.unwrap().forget();
+
+        let install = engine.start_cli_install("cursor-sdk-bridge");
+
+        assert!(
+            matches!(install, Err(EngineError::Conflict(message)) if message.contains("uninstall"))
+        );
+        assert!(
+            !engine
+                .cli_installs
+                .lock()
+                .unwrap()
+                .contains_key("cursor-sdk-bridge")
+        );
+        release.add_permits(1);
+        uninstalling.await.unwrap().unwrap();
+        assert!(engine.cli_runtime_operations.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelled_backend_teardown_retains_registry_ownership() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            "cursor".into(),
+            ProviderConfig {
+                kind: "cursor-sdk".into(),
+                ..Default::default()
+            },
+        );
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        ));
+        let entered = Arc::new(tokio::sync::Semaphore::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let blocking: Arc<dyn AgentBackend> = Arc::new(BlockingShutdownBackend {
+            entered: entered.clone(),
+            release: release.clone(),
+        });
+        engine
+            .backends
+            .write()
+            .unwrap()
+            .insert("cursor".into(), blocking.clone());
+
+        let transitioning = {
+            let engine = engine.clone();
+            tokio::spawn(async move {
+                engine
+                    .retire_config_backends_for_runtime(
+                        trouve_agents::install::CliId::CursorSdkBridge,
+                    )
+                    .await
+            })
+        };
+        entered.acquire().await.unwrap().forget();
+
+        assert!(engine.backend_for("cursor/test-model").is_none());
+        assert!(
+            engine.retiring_backends.lock().unwrap()["cursor"]
+                .iter()
+                .any(|backend| Arc::ptr_eq(backend, &blocking))
+        );
+
+        transitioning.abort();
+        let _ = transitioning.await;
+        release.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let retired = engine
+                    .retiring_backends
+                    .lock()
+                    .unwrap()
+                    .get("cursor")
+                    .is_some_and(|entries| {
+                        entries
+                            .iter()
+                            .any(|backend| Arc::ptr_eq(backend, &blocking))
+                    });
+                if !retired {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached retirement did not finish after cancellation");
+
+        let replacement = engine.backends.read().unwrap()["cursor"].clone();
+        assert!(!Arc::ptr_eq(&replacement, &blocking));
+    }
+
+    #[tokio::test]
+    async fn backend_retirement_timeout_releases_global_transition_and_retains_cleanup() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            "cursor".into(),
+            ProviderConfig {
+                kind: "cursor-sdk".into(),
+                ..Default::default()
+            },
+        );
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        ));
+        let entered = Arc::new(tokio::sync::Semaphore::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let blocking: Arc<dyn AgentBackend> = Arc::new(BlockingShutdownBackend {
+            entered: entered.clone(),
+            release: release.clone(),
+        });
+        engine
+            .backends
+            .write()
+            .unwrap()
+            .insert("cursor".into(), blocking.clone());
+
+        let result = engine
+            .retire_config_backends_matching_ids_with_timeout(
+                &HashSet::from(["cursor".to_string()]),
+                Duration::from_millis(25),
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(entered.available_permits(), 1);
+        assert!(
+            engine.retiring_backends.lock().unwrap()["cursor"]
+                .iter()
+                .any(|backend| Arc::ptr_eq(backend, &blocking))
+        );
+        assert!(engine.backend_for("cursor/test-model").is_some());
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            engine.refresh_api_provider_registry(),
+        )
+        .await
+        .expect("timed-out retirement retained the provider transition lock");
+
+        release.add_permits(1);
+        let retirement = engine
+            .retire_config_backends_matching_ids_with_timeout(
+                &HashSet::from(["cursor".to_string()]),
+                Duration::from_secs(1),
+            )
+            .await
+            .expect("a later transition could not retry retained cleanup");
+        retirement.publish().await.unwrap();
+        assert!(engine.retiring_backends.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn retirement_releases_each_backend_before_the_shared_deadline() {
+        let data = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &Config::default(),
+        ));
+        let slow_entered = Arc::new(tokio::sync::Semaphore::new(0));
+        let slow_release = Arc::new(tokio::sync::Semaphore::new(0));
+        let slow: Arc<dyn AgentBackend> = Arc::new(BlockingShutdownBackend {
+            entered: slow_entered.clone(),
+            release: slow_release.clone(),
+        });
+        let fast_entered = Arc::new(tokio::sync::Semaphore::new(0));
+        let fast: Arc<dyn AgentBackend> = Arc::new(BlockingShutdownBackend {
+            entered: fast_entered.clone(),
+            release: Arc::new(tokio::sync::Semaphore::new(1)),
+        });
+        engine
+            .retiring_backends
+            .lock()
+            .unwrap()
+            .insert("slow".into(), vec![slow.clone()]);
+        engine
+            .retiring_backends
+            .lock()
+            .unwrap()
+            .insert("fast".into(), vec![fast.clone()]);
+        let retirement = {
+            let engine = engine.clone();
+            let slow = slow.clone();
+            let fast = fast.clone();
+            tokio::spawn(async move {
+                shutdown_retiring_backend_batch(
+                    &engine,
+                    vec![("slow".into(), slow), ("fast".into(), fast)],
+                    tokio::time::Instant::now() + Duration::from_secs(1),
+                )
+                .await
+            })
+        };
+        slow_entered.acquire().await.unwrap().forget();
+        fast_entered.acquire().await.unwrap().forget();
+
+        tokio::time::timeout(Duration::from_millis(250), async {
+            loop {
+                if !engine
+                    .retiring_backends
+                    .lock()
+                    .unwrap()
+                    .contains_key("fast")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("successful retirement remained buffered behind the slow backend");
+        assert!(
+            engine
+                .retiring_backends
+                .lock()
+                .unwrap()
+                .contains_key("slow")
+        );
+        assert_eq!(Arc::strong_count(&fast), 1);
+        assert!(!retirement.is_finished());
+
+        slow_release.add_permits(1);
+        assert!(retirement.await.unwrap().is_empty());
+        assert!(engine.retiring_backends.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_backend_retirement_retries_without_another_user_transition() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            "cursor".into(),
+            ProviderConfig {
+                kind: "cursor-sdk".into(),
+                ..Default::default()
+            },
+        );
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        ));
+        let transient = Arc::new(TransientShutdownBackend {
+            shutdowns: std::sync::atomic::AtomicUsize::new(0),
+        });
+        engine
+            .backends
+            .write()
+            .unwrap()
+            .insert("cursor".into(), transient.clone());
+
+        assert!(
+            engine
+                .retire_config_backends_matching_ids(&HashSet::from(["cursor".to_string()]))
+                .await
+                .is_err()
+        );
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if engine.retiring_backends.lock().unwrap().is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("retained backend did not receive an autonomous retry");
+        assert_eq!(
+            transient
+                .shutdowns
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn retirement_retry_skips_a_locked_provider_and_cleans_up_others() {
+        let data = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &Config::default(),
+        ));
+        let locked: Arc<dyn AgentBackend> = Arc::new(FailingShutdownBackend {
+            shutdowns: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let ready = Arc::new(TransientShutdownBackend {
+            // This backend succeeds on its next attempt.
+            shutdowns: std::sync::atomic::AtomicUsize::new(1),
+        });
+        let ready_backend: Arc<dyn AgentBackend> = ready.clone();
+        engine.retiring_backends.lock().unwrap().extend([
+            ("locked".into(), vec![locked]),
+            ("ready".into(), vec![ready_backend]),
+        ]);
+        let locked_transition = engine.provider_transition_lock("locked").lock_owned().await;
+
+        engine.ensure_retiring_backend_retry();
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if !engine
+                    .retiring_backends
+                    .lock()
+                    .unwrap()
+                    .contains_key("ready")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("an unrelated provider lock blocked retained backend cleanup");
+        assert!(
+            engine
+                .retiring_backends
+                .lock()
+                .unwrap()
+                .contains_key("locked")
+        );
+        assert_eq!(ready.shutdowns.load(std::sync::atomic::Ordering::SeqCst), 2);
+        drop(locked_transition);
+    }
+
+    #[test]
+    fn retirement_retry_batch_excludes_ids_without_transition_locks() {
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &Config::default(),
+        );
+        let locked: Arc<dyn AgentBackend> = Arc::new(FailingShutdownBackend {
+            shutdowns: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let added_later: Arc<dyn AgentBackend> = Arc::new(FailingShutdownBackend {
+            shutdowns: std::sync::atomic::AtomicUsize::new(0),
+        });
+        engine.retiring_backends.lock().unwrap().extend([
+            ("locked".into(), vec![locked.clone()]),
+            ("added-later".into(), vec![added_later.clone()]),
+        ]);
+
+        let batch = engine.retiring_backend_batch(&HashSet::from(["locked".into()]));
+
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].0, "locked");
+        assert!(Arc::ptr_eq(&batch[0].1, &locked));
+        assert!(!Arc::ptr_eq(&batch[0].1, &added_later));
+    }
+
+    #[tokio::test]
+    async fn repeated_failed_retirement_does_not_detach_another_generation() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            "cursor".into(),
+            ProviderConfig {
+                kind: "cursor-sdk".into(),
+                ..Default::default()
+            },
+        );
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        ));
+        let failing: Arc<dyn AgentBackend> = Arc::new(FailingShutdownBackend {
+            shutdowns: std::sync::atomic::AtomicUsize::new(0),
+        });
+        engine
+            .backends
+            .write()
+            .unwrap()
+            .insert("cursor".into(), failing);
+        let targets = HashSet::from(["cursor".to_string()]);
+
+        assert!(
+            engine
+                .retire_config_backends_matching_ids(&targets)
+                .await
+                .is_err()
+        );
+        let active_after_first = engine.backends.read().unwrap()["cursor"].clone();
+        assert!(
+            engine
+                .retire_config_backends_matching_ids(&targets)
+                .await
+                .is_err()
+        );
+
+        assert!(Arc::ptr_eq(
+            &active_after_first,
+            &engine.backends.read().unwrap()["cursor"]
+        ));
+        assert_eq!(engine.retiring_backends.lock().unwrap()["cursor"].len(), 1);
+    }
+
+    #[tokio::test]
+    async fn runtime_teardown_only_stops_matching_config_backends() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        for (id, kind) in [
+            ("cursor", "cursor-sdk"),
+            ("claude", "claude-cli"),
+            ("codex", "codex-app-server"),
+        ] {
+            config.providers.insert(
+                id.into(),
+                ProviderConfig {
+                    kind: kind.into(),
+                    ..Default::default()
+                },
+            );
+        }
+        config.providers.insert(
+            "cursor-custom".into(),
+            ProviderConfig {
+                kind: "cursor-sdk".into(),
+                command: Some("/opt/custom/cursor-sdk-bridge".into()),
+                ..Default::default()
+            },
+        );
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        ));
+        let cursor = Arc::new(FailingShutdownBackend {
+            shutdowns: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let claude = Arc::new(FailingShutdownBackend {
+            shutdowns: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let codex = Arc::new(FailingShutdownBackend {
+            shutdowns: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let cursor_custom = Arc::new(FailingShutdownBackend {
+            shutdowns: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let cursor_backend: Arc<dyn AgentBackend> = cursor.clone();
+        let claude_backend: Arc<dyn AgentBackend> = claude.clone();
+        let codex_backend: Arc<dyn AgentBackend> = codex.clone();
+        let cursor_custom_backend: Arc<dyn AgentBackend> = cursor_custom.clone();
+        {
+            let mut backends = engine.backends.write().unwrap();
+            backends.insert("cursor".into(), cursor_backend.clone());
+            backends.insert("claude".into(), claude_backend.clone());
+            backends.insert("codex".into(), codex_backend.clone());
+            backends.insert("cursor-custom".into(), cursor_custom_backend.clone());
+        }
+
+        let result = engine
+            .retire_config_backends_for_runtime(trouve_agents::install::CliId::CursorSdkBridge)
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            cursor.shutdowns.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            claude.shutdowns.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(codex.shutdowns.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            cursor_custom
+                .shutdowns
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        let backends = engine.backends.read().unwrap();
+        assert!(!Arc::ptr_eq(&cursor_backend, &backends["cursor"]));
+        assert!(Arc::ptr_eq(&claude_backend, &backends["claude"]));
+        assert!(Arc::ptr_eq(&codex_backend, &backends["codex"]));
+        assert!(Arc::ptr_eq(
+            &cursor_custom_backend,
+            &backends["cursor-custom"]
+        ));
+        drop(backends);
+        assert!(
+            engine.retiring_backends.lock().unwrap()["cursor"]
+                .iter()
+                .any(|backend| Arc::ptr_eq(backend, &cursor_backend))
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_backend_teardown_rebuilds_successes_and_retains_failures() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        for id in ["cursor-success", "cursor-failure"] {
+            config.providers.insert(
+                id.into(),
+                ProviderConfig {
+                    kind: "cursor-sdk".into(),
+                    ..Default::default()
+                },
+            );
+        }
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        ));
+        let success_entered = Arc::new(tokio::sync::Semaphore::new(0));
+        let success: Arc<dyn AgentBackend> = Arc::new(BlockingShutdownBackend {
+            entered: success_entered.clone(),
+            release: Arc::new(tokio::sync::Semaphore::new(1)),
+        });
+        let failure_count = Arc::new(FailingShutdownBackend {
+            shutdowns: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let failure: Arc<dyn AgentBackend> = failure_count.clone();
+        {
+            let mut backends = engine.backends.write().unwrap();
+            backends.insert("cursor-success".into(), success.clone());
+            backends.insert("cursor-failure".into(), failure.clone());
+        }
+
+        let result = engine
+            .retire_config_backends_for_runtime(trouve_agents::install::CliId::CursorSdkBridge)
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(success_entered.available_permits(), 1);
+        assert_eq!(
+            failure_count
+                .shutdowns
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        let retiring = engine.retiring_backends.lock().unwrap();
+        assert!(retiring.get("cursor-success").is_none_or(|entries| {
+            entries
+                .iter()
+                .all(|backend| !Arc::ptr_eq(backend, &success))
+        }));
+        assert!(
+            retiring["cursor-failure"]
+                .iter()
+                .any(|backend| Arc::ptr_eq(backend, &failure))
+        );
+        drop(retiring);
+        let backends = engine.backends.read().unwrap();
+        assert!(!Arc::ptr_eq(&backends["cursor-success"], &success));
+        assert!(!Arc::ptr_eq(&backends["cursor-failure"], &failure));
+    }
+
+    #[tokio::test]
+    async fn unrelated_api_upsert_preserves_every_vendor_backend_instance() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        for (id, kind) in [
+            ("cursor", "cursor-sdk"),
+            ("claude", "claude-cli"),
+            ("codex", "codex-app-server"),
+        ] {
+            config.providers.insert(
+                id.into(),
+                ProviderConfig {
+                    kind: kind.into(),
+                    ..Default::default()
+                },
+            );
+        }
+        config.providers.insert(
+            "custom".into(),
+            ProviderConfig {
+                kind: "openai-compat".into(),
+                base_url: Some("https://old.example.test/v1".into()),
+                api_key: Some("test-key".into()),
+                ..Default::default()
+            },
+        );
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        ));
+        let mut tracked = Vec::new();
+        for id in ["cursor", "claude", "codex"] {
+            let concrete = Arc::new(FailingShutdownBackend {
+                shutdowns: std::sync::atomic::AtomicUsize::new(0),
+            });
+            let backend: Arc<dyn AgentBackend> = concrete.clone();
+            engine
+                .backends
+                .write()
+                .unwrap()
+                .insert(id.into(), backend.clone());
+            tracked.push((id, concrete, backend));
+        }
+
+        engine
+            .upsert_provider(
+                "custom",
+                &UpsertProviderRequest {
+                    kind: "openai-compat".into(),
+                    base_url: Some("https://new.example.test/v1".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let backends = engine.backends.read().unwrap();
+        for (id, concrete, backend) in tracked {
+            assert_eq!(
+                concrete.shutdowns.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "unrelated upsert shut down {id}"
+            );
+            assert!(Arc::ptr_eq(&backends[id], &backend));
+        }
+    }
+
+    #[tokio::test]
+    async fn committed_runtime_reload_failure_is_an_install_warning() {
+        let data = tempfile::tempdir().unwrap();
+        let runtime_root = data.path().join("cli/codex");
+        let runtime_bin = runtime_root
+            .join(".generations/runtime-test/bin")
+            .join("codex");
+        std::fs::create_dir_all(runtime_bin.parent().unwrap()).unwrap();
+        std::fs::write(&runtime_bin, "codex fixture").unwrap();
+        let installed = trouve_agents::install::InstalledCli {
+            version: "1.2.3".into(),
+            bin: runtime_bin.to_string_lossy().into_owned(),
+        };
+        std::fs::write(
+            runtime_root.join("installed.json"),
+            serde_json::to_string(&installed).unwrap(),
+        )
+        .unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            "codex".into(),
+            ProviderConfig {
+                kind: "codex-app-server".into(),
+                ..Default::default()
+            },
+        );
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        ));
+        engine.backends.write().unwrap().insert(
+            "codex".into(),
+            Arc::new(FailingShutdownBackend {
+                shutdowns: std::sync::atomic::AtomicUsize::new(0),
+            }),
+        );
+        engine.test_cli_install_result.lock().unwrap().replace((
+            installed.version.clone(),
+            trouve_agents::install::ActivationOutcome::Durable(installed),
+        ));
+
+        engine.start_cli_install("codex").unwrap();
+        let status = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let status = engine.cli_install_status("codex");
+                if status.status != "pending" {
+                    break status;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("managed install completed");
+        assert_eq!(status.status, "success");
+        assert_eq!(status.version.as_deref(), Some("1.2.3"));
+        assert!(status.error.is_none());
+        let warning = status.warning.expect("reload warning");
+        assert!(warning.contains("is active"), "{warning}");
+        assert!(warning.contains("provider registry"), "{warning}");
+        assert_eq!(
+            trouve_agents::install::installed(data.path(), trouve_agents::install::CliId::Codex,)
+                .expect("committed runtime remains installed")
+                .version,
+            "1.2.3"
+        );
+    }
+
+    #[tokio::test]
+    async fn uninstall_drops_the_registry_runtime_lease_before_removal() {
+        let data = tempfile::tempdir().unwrap();
+        let runtime_root = data.path().join("cli").join("cursor-sdk-bridge");
+        let generation = runtime_root.join(".generations").join("runtime-test");
+        let bin = generation.join("bin").join("cursor-sdk-bridge");
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::write(&bin, "bridge").unwrap();
+        std::fs::write(
+            runtime_root.join("installed.json"),
+            serde_json::to_string(&trouve_agents::install::InstalledCli {
+                version: "test".into(),
+                bin: bin.to_string_lossy().into_owned(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut config = Config::default();
+        config.providers.insert(
+            "cursor".into(),
+            ProviderConfig {
+                kind: "cursor-sdk".into(),
+                api_key: Some("test-key".into()),
+                ..Default::default()
+            },
+        );
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        ));
+
+        let blocked = trouve_agents::install::uninstall(
+            data.path(),
+            trouve_agents::install::CliId::CursorSdkBridge,
+        )
+        .unwrap_err();
+        assert_eq!(blocked.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(bin.is_file());
+
+        let delayed_turn_backend = engine.backends.read().unwrap()["cursor"].clone();
+        let blocked = engine.uninstall_cli("cursor-sdk-bridge").await.unwrap_err();
+        assert!(matches!(blocked, EngineError::Conflict(_)));
+        assert!(bin.is_file());
+        assert_eq!(Arc::strong_count(&delayed_turn_backend), 1);
+
+        drop(delayed_turn_backend);
+        engine.uninstall_cli("cursor-sdk-bridge").await.unwrap();
+        assert!(!runtime_root.exists());
+    }
+
+    #[tokio::test]
+    async fn teardown_failure_preserves_uncommitted_provider_state_and_ownership() {
+        const ID: &str = "reload-consistency";
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            ID.into(),
+            ProviderConfig {
+                kind: "openai-compat".into(),
+                base_url: Some("https://old.example.test/v1".into()),
+                api_key: Some("test-key".into()),
+                ..Default::default()
+            },
+        );
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        ));
+
+        let failing = Arc::new(FailingShutdownBackend {
+            shutdowns: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let failing_backend: Arc<dyn AgentBackend> = failing.clone();
+        engine
+            .backends
+            .write()
+            .unwrap()
+            .insert(ID.into(), failing_backend.clone());
+        let upsert = engine
+            .upsert_provider(
+                ID,
+                &UpsertProviderRequest {
+                    kind: "openai-compat".into(),
+                    base_url: Some("https://new.example.test/v1".into()),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(upsert.is_err());
+        assert_eq!(
+            failing.shutdowns.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            engine.config.lock().unwrap().providers[ID]
+                .base_url
+                .as_deref(),
+            Some("https://old.example.test/v1")
+        );
+        assert!(engine.providers.read().unwrap().contains_key(ID));
+        assert!(
+            engine
+                .backends
+                .read()
+                .unwrap()
+                .get(ID)
+                .is_none_or(|backend| !Arc::ptr_eq(backend, &failing_backend))
+        );
+        assert!(
+            engine.retiring_backends.lock().unwrap()[ID]
+                .iter()
+                .any(|backend| Arc::ptr_eq(backend, &failing_backend))
+        );
+        let delete = engine.delete_provider(ID).await;
+        assert!(delete.is_err());
+        assert_eq!(
+            failing.shutdowns.load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+        assert!(engine.config.lock().unwrap().providers.contains_key(ID));
+        assert!(engine.providers.read().unwrap().contains_key(ID));
+        assert!(
+            engine
+                .backends
+                .read()
+                .unwrap()
+                .get(ID)
+                .is_none_or(|backend| !Arc::ptr_eq(backend, &failing_backend))
+        );
+        assert!(
+            engine.retiring_backends.lock().unwrap()[ID]
+                .iter()
+                .any(|backend| Arc::ptr_eq(backend, &failing_backend))
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn provider_delete_keeps_blocking_secret_io_off_the_runtime_worker() {
+        const ID: &str = "slow-delete";
+
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            ID.into(),
+            ProviderConfig {
+                kind: "openai-compat".into(),
+                ..Default::default()
+            },
+        );
+        let secret_store = Arc::new(BlockingProviderSecretStore::new(ID));
+        let mut engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        );
+        engine.secrets = secret_store.clone();
+        let engine = Arc::new(engine);
+
+        let (delete_started_tx, delete_started_rx) = tokio::sync::oneshot::channel();
+        let releaser = {
+            let secret_store = secret_store.clone();
+            std::thread::spawn(move || {
+                secret_store.delete_started.wait();
+                let _ = delete_started_tx.send(());
+                std::thread::sleep(Duration::from_secs(1));
+                secret_store.allow_delete.wait();
+            })
+        };
+        let deleting = {
+            let engine = engine.clone();
+            tokio::spawn(async move { engine.delete_provider(ID).await })
+        };
+
+        let started = std::time::Instant::now();
+        delete_started_rx.await.unwrap();
+        assert!(!engine.config.lock().unwrap().providers.contains_key(ID));
+        assert!(
+            !engine.providers.read().unwrap().contains_key(ID),
+            "deleted API provider remained callable during secret cleanup"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "blocking secret deletion stalled the current-thread runtime"
+        );
+        assert!(!deleting.is_finished());
+        let unrelated_exclusive_transition_progressed = match tokio::time::timeout(
+            Duration::from_millis(250),
+            engine.provider_reload.clone().write_owned(),
+        )
+        .await
+        {
+            Ok(guard) => {
+                drop(guard);
+                true
+            }
+            Err(_) => false,
+        };
+
+        deleting.await.unwrap().unwrap();
+        releaser.join().unwrap();
+        assert!(
+            unrelated_exclusive_transition_progressed,
+            "secret deletion retained the global provider reload barrier"
+        );
+        assert!(!engine.config.lock().unwrap().providers.contains_key(ID));
     }
 
     #[test]
@@ -28815,7 +32888,7 @@ default_permission_mode = "ask"
                 ..Default::default()
             },
         );
-        let secret_store = Arc::new(BlockingProviderSecretStore::new());
+        let secret_store = Arc::new(BlockingProviderSecretStore::new(ID));
         secret_store
             .values
             .lock()
@@ -28831,7 +32904,13 @@ default_permission_mode = "ask"
 
         let deleting = {
             let engine = engine.clone();
-            std::thread::spawn(move || engine.delete_provider(ID))
+            std::thread::spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(engine.delete_provider(ID))
+            })
         };
         secret_store.delete_started.wait();
 
@@ -28841,15 +32920,19 @@ default_permission_mode = "ask"
             let engine = engine.clone();
             std::thread::spawn(move || {
                 started_tx.send(()).unwrap();
-                let result = engine.upsert_provider(
-                    ID,
-                    &UpsertProviderRequest {
-                        kind: "openai-compat".into(),
-                        base_url: Some("https://new.example.test/v1".into()),
-                        api_key: Some("new".into()),
-                        ..Default::default()
-                    },
-                );
+                let result = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(engine.upsert_provider(
+                        ID,
+                        &UpsertProviderRequest {
+                            kind: "openai-compat".into(),
+                            base_url: Some("https://new.example.test/v1".into()),
+                            api_key: Some("new".into()),
+                            ..Default::default()
+                        },
+                    ));
                 done_tx.send(result).unwrap();
             })
         };

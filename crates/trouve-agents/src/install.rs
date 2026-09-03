@@ -1,33 +1,97 @@
-//! Managed vendor CLI installs.
+//! Managed vendor agent-runtime installs.
 //!
-//! Downloads the official vendor CLI builds (the same artifacts their
-//! install scripts fetch) into trouve's data directory, so users don't
-//! depend on system packages that may lag behind — e.g. the ACP mode of
-//! `cursor-agent` needs a newer build than most distro packages ship.
+//! Downloads official vendor builds into trouve's data directory, so users
+//! don't depend on system packages that may lag behind. The legacy `/v1/clis`
+//! API name covers both CLIs and Cursor's standalone Agent SDK Bridge.
 //!
 //! Layout under `<data_dir>/cli/`:
-//! - `<id>/<version>/…`       — one directory per installed version
+//! - `<id>/.generations/…`    — immutable runtime generations
 //! - `<id>/installed.json`    — pointer to the active version + binary
-//! - `bin/<id>`               — stable symlink backends resolve at spawn
+//! - `bin/<id>`               — rolling compatibility executable for older processes
+//! - `.leases/<id>/…`         — filesystem-wide generation lifetime locks
 //!
-//! Sources (no custom mirrors, no version pinning by us):
-//! - cursor-agent: `downloads.cursor.com/lab/<ver>/<os>/<arch>/agent-cli-package.tar.gz`
-//!   (version discovered from the official install script)
+//! `installed.json` is the single source used by both discovery and process
+//! launches. Activation atomically replaces it only after a complete immutable
+//! generation has been published.
+//!
+//! Sources (no custom mirrors):
+//! - cursor-sdk-bridge: one independently reviewed GitHub `cursor/sdk-bridge`
+//!   release whose per-platform digests are pinned below; the release's
+//!   `SHA256SUMS.txt` is checked as corroborating metadata, not trusted alone
 //! - claude: `downloads.claude.ai/claude-code-releases` (`latest` + manifest
 //!   with sha256 checksums; single static binary)
 //! - codex: GitHub `openai/codex` latest release tarball (musl build on Linux)
 
 use std::fmt::Write as _;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 
-/// A vendor CLI trouve knows how to install. `id` doubles as the binary
-/// name and the API path segment.
+const MAX_TEXT_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_RUNTIME_DOWNLOAD_BYTES: usize = 512 * 1024 * 1024;
+const MAX_RUNTIME_EXTRACTED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const MAX_RUNTIME_ARCHIVE_ENTRIES: usize = 100_000;
+const MAX_RUNTIME_OPERATION_EPOCH_BYTES: u64 = 128;
+// Downloads are retained in memory through checksum verification and archive
+// extraction. Serialize preparation process-wide so independently managed
+// runtime IDs cannot multiply the 512 MiB per-artifact ceiling.
+static RUNTIME_INSTALL_RESOURCE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+/// Failed publication-directory syncs retain every generation that could still be
+/// named by the last durable pointer. Refuse another publication once this
+/// safety set reaches a fixed bound instead of allowing an outage to grow it
+/// without limit.
+const MAX_RETAINED_RUNTIME_GENERATIONS: usize = 8;
+const CANCEL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+const CURSOR_SDK_BRIDGE_REVIEWED_VERSION: &str = "1.0.28";
+
+fn cursor_sdk_bridge_reviewed_checksum(version: &str, asset: &str) -> Option<&'static str> {
+    if version != CURSOR_SDK_BRIDGE_REVIEWED_VERSION {
+        return None;
+    }
+    match asset {
+        "cursor-sdk-bridge-standalone-darwin-arm64.tar.gz" => {
+            Some("52ebfdab4e7806270122bea6c8f972646516297343c483e6700b37d444515af5")
+        }
+        "cursor-sdk-bridge-standalone-darwin-x64.tar.gz" => {
+            Some("ba59c6eaad62338118e59ceb6d24006e06f7c75b28e32dbc13950c4027511c3c")
+        }
+        "cursor-sdk-bridge-standalone-linux-arm64.tar.gz" => {
+            Some("0222f5c60c88b82063a0547bd938945c777c2a470def69de6464c04470ae0560")
+        }
+        "cursor-sdk-bridge-standalone-linux-x64.tar.gz" => {
+            Some("5357a42d3faa668a3ef25c6669fe576544b032dd17fabbbfa515355cd8d33c19")
+        }
+        "cursor-sdk-bridge-standalone-win32-x64.tar.gz" => {
+            Some("8af767f8b60f48ccf9147ce89085cd1956a5a1b8c66d26ff078cc1bd193f2ebb")
+        }
+        _ => None,
+    }
+}
+
+fn verify_cursor_sdk_bridge_digests(
+    asset: &str,
+    reviewed: &str,
+    manifest: &str,
+    actual: &str,
+) -> Result<(), InstallError> {
+    if manifest != reviewed {
+        return Err(InstallError::Checksum(format!(
+            "{asset} release manifest did not match Trouve's reviewed digest"
+        )));
+    }
+    if actual != reviewed {
+        return Err(InstallError::Checksum(asset.into()));
+    }
+    Ok(())
+}
+
+/// A vendor agent runtime trouve knows how to install. `id` doubles as the
+/// binary name and the legacy API path segment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CliId {
-    CursorAgent,
+    CursorSdkBridge,
     Claude,
     Codex,
     /// llama.cpp's `llama-server` — the local-inference runtime behind the
@@ -37,12 +101,14 @@ pub enum CliId {
     LlamaServer,
 }
 
-pub const ALL_CLIS: [CliId; 3] = [CliId::CursorAgent, CliId::Claude, CliId::Codex];
+pub const ALL_CLIS: [CliId; 3] = [CliId::CursorSdkBridge, CliId::Claude, CliId::Codex];
 
 impl CliId {
     pub fn parse(id: &str) -> Option<Self> {
         match id {
-            "cursor-agent" => Some(Self::CursorAgent),
+            // Keep the pre-SDK route as an input alias so older clients can
+            // manage the replacement runtime through the compatibility API.
+            "cursor-agent" | "cursor-sdk-bridge" => Some(Self::CursorSdkBridge),
             "claude" => Some(Self::Claude),
             "codex" => Some(Self::Codex),
             "llama-server" => Some(Self::LlamaServer),
@@ -52,7 +118,7 @@ impl CliId {
 
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::CursorAgent => "cursor-agent",
+            Self::CursorSdkBridge => "cursor-sdk-bridge",
             Self::Claude => "claude",
             Self::Codex => "codex",
             Self::LlamaServer => "llama-server",
@@ -61,17 +127,17 @@ impl CliId {
 
     pub fn display_name(&self) -> &'static str {
         match self {
-            Self::CursorAgent => "Cursor CLI",
+            Self::CursorSdkBridge => "Cursor Agent SDK",
             Self::Claude => "Claude Code",
             Self::Codex => "Codex CLI",
             Self::LlamaServer => "llama.cpp",
         }
     }
 
-    /// Provider kinds this CLI serves (for surfacing next to providers).
+    /// Provider kinds this runtime serves (for surfacing next to providers).
     pub fn provider_kinds(&self) -> &'static [&'static str] {
         match self {
-            Self::CursorAgent => &["cursor-cli"],
+            Self::CursorSdkBridge => &["cursor-sdk"],
             Self::Claude => &["claude-cli"],
             Self::Codex => &["codex-app-server"],
             Self::LlamaServer => &["local"],
@@ -110,28 +176,152 @@ impl Progress {
     }
 }
 
-/// The active managed install of one CLI, persisted as `installed.json`.
+/// The active managed install of one runtime, persisted as `installed.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstalledCli {
     pub version: String,
-    /// Absolute path of the executable inside the version directory.
+    /// Absolute path of the executable inside the runtime generation.
     pub bin: String,
+}
+
+/// Result of atomically publishing a managed runtime pointer.
+///
+/// Directory sync is necessarily after the pointer rename. A failure at that
+/// boundary cannot be reported as an ordinary uncommitted install error:
+/// readers already observe the new runtime, but crash durability is unknown.
+#[derive(Debug)]
+#[must_use = "activation durability must be surfaced to the caller"]
+pub enum ActivationOutcome {
+    Durable(InstalledCli),
+    CommittedNotDurable {
+        installed: InstalledCli,
+        warning: String,
+    },
+}
+
+impl ActivationOutcome {
+    pub fn into_parts(self) -> (InstalledCli, Option<String>) {
+        match self {
+            Self::Durable(installed) => (installed, None),
+            Self::CommittedNotDurable { installed, warning } => (installed, Some(warning)),
+        }
+    }
+}
+
+/// Keeps one resolved managed runtime generation alive for as long as a
+/// backend can still use the executable it selected. The shared filesystem
+/// lock is visible to every Trouve process using the same data directory.
+#[derive(Debug)]
+pub struct RuntimeLease {
+    _runtime: PathBuf,
+    _lock: std::fs::File,
+}
+
+impl Drop for RuntimeLease {
+    fn drop(&mut self) {
+        // Closing a locked descriptor is not enough when a concurrent fork
+        // inherited the same open-file description before exec. Explicitly
+        // unlock so backend retirement cannot leave uninstall transiently
+        // blocked by an otherwise unrelated child launch.
+        if let Err(error) = fs4::fs_std::FileExt::unlock(&self._lock) {
+            tracing::warn!(
+                runtime = %self._runtime.display(),
+                %error,
+                "failed to release managed runtime lease"
+            );
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum RuntimeContainerKind {
+    Generation,
+    Legacy,
+}
+
+impl RuntimeContainerKind {
+    fn lease_directory(self) -> &'static str {
+        match self {
+            Self::Generation => "generations",
+            Self::Legacy => "legacy",
+        }
+    }
 }
 
 fn cli_root(data_dir: &Path, id: CliId) -> PathBuf {
     data_dir.join("cli").join(id.as_str())
 }
 
-/// Stable path of the managed binary (a symlink), whether or not it exists.
-pub fn managed_bin(data_dir: &Path, id: CliId) -> PathBuf {
+fn legacy_managed_bin_path(data_dir: &Path, id: CliId) -> PathBuf {
     data_dir.join("cli").join("bin").join(id.as_str())
+}
+
+fn normalized_absolute_path(path: &Path) -> std::io::Result<PathBuf> {
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        return Ok(canonical);
+    }
+    let absolute = std::path::absolute(path)?;
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    Ok(normalized)
+}
+
+fn installed_unlocked(data_dir: &Path, id: CliId) -> Option<InstalledCli> {
+    let raw = std::fs::read_to_string(cli_root(data_dir, id).join("installed.json")).ok()?;
+    let mut info: InstalledCli = serde_json::from_str(&raw).ok()?;
+    // Releases before absolute publication could persist a path relative to
+    // the process working directory. Normalize that legacy value on read so
+    // callers still receive the documented absolute path and lease lookup can
+    // classify it beneath an absolute managed root.
+    let bin = normalized_absolute_path(Path::new(&info.bin)).ok()?;
+    if !bin.exists() {
+        return None;
+    }
+    info.bin = bin.to_string_lossy().into_owned();
+    Some(info)
 }
 
 /// The managed install of `id`, if one is active and its binary exists.
 pub fn installed(data_dir: &Path, id: CliId) -> Option<InstalledCli> {
-    let raw = std::fs::read_to_string(cli_root(data_dir, id).join("installed.json")).ok()?;
-    let info: InstalledCli = serde_json::from_str(&raw).ok()?;
-    Path::new(&info.bin).exists().then_some(info)
+    installed_unlocked(data_dir, id)
+}
+
+/// Resolve the active managed install and lease its executable generation.
+/// The activation lock makes pointer selection and shared-lease acquisition
+/// atomic with publication, reclamation, and uninstall in every process.
+pub fn installed_with_lease(data_dir: &Path, id: CliId) -> Option<(InstalledCli, RuntimeLease)> {
+    // Activation publishes absolute executable paths even when callers pass a
+    // relative data directory. Use that same normalized root when locating the
+    // active generation and its lease, or strip_prefix cannot relate the two.
+    let data_dir = normalized_absolute_path(data_dir).ok()?;
+    let _activation_lock = lock_runtime_activation(&data_dir, id).ok()?;
+    let info = installed_unlocked(&data_dir, id)?;
+    let bin = PathBuf::from(&info.bin);
+    let (kind, runtime) = managed_runtime_container(&data_dir, id, &bin)?;
+    let lock = open_runtime_lease_file(&data_dir, id, kind, &runtime).ok()?;
+    fs4::fs_std::FileExt::lock_shared(&lock).ok()?;
+    Some((
+        info,
+        RuntimeLease {
+            _runtime: runtime,
+            _lock: lock,
+        },
+    ))
+}
+
+/// Legacy probe path. Launch generation-backed installs with
+/// [`installed_with_lease`] so reclamation cannot invalidate the executable.
+#[deprecated(note = "use installed_with_lease when launching a managed runtime")]
+pub fn managed_bin(data_dir: &Path, id: CliId) -> PathBuf {
+    legacy_managed_bin_path(data_dir, id)
 }
 
 fn http() -> Result<reqwest::Client, InstallError> {
@@ -143,47 +333,118 @@ fn http() -> Result<reqwest::Client, InstallError> {
         .map_err(|e| InstallError::Download(e.to_string()))
 }
 
-async fn get_text(url: &str) -> Result<String, InstallError> {
-    let resp = http()?
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| InstallError::Download(format!("{url}: {e}")))?;
+async fn get_text_with_progress(url: &str, progress: &Progress) -> Result<String, InstallError> {
+    get_text_controlled(url, Some(progress)).await
+}
+
+async fn wait_for_install_cancel(progress: Option<&Progress>) {
+    let Some(progress) = progress else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    loop {
+        if progress.cancelled() {
+            return;
+        }
+        tokio::time::sleep(CANCEL_POLL_INTERVAL).await;
+    }
+}
+
+async fn acquire_runtime_install_resource<'a>(
+    admission: &'a tokio::sync::Semaphore,
+    progress: &Progress,
+) -> Result<tokio::sync::SemaphorePermit<'a>, InstallError> {
+    let permit = admission.acquire();
+    tokio::pin!(permit);
+    tokio::select! {
+        biased;
+        _ = wait_for_install_cancel(Some(progress)) => Err(InstallError::Cancelled),
+        permit = &mut permit => Ok(permit
+            .expect("the runtime installation semaphore is never closed")),
+    }
+}
+
+async fn get_response(
+    url: &str,
+    progress: Option<&Progress>,
+) -> Result<reqwest::Response, InstallError> {
+    if progress.is_some_and(Progress::cancelled) {
+        return Err(InstallError::Cancelled);
+    }
+    let request = http()?.get(url).send();
+    let resp = tokio::select! {
+        biased;
+        _ = wait_for_install_cancel(progress) => return Err(InstallError::Cancelled),
+        resp = request => resp.map_err(|e| InstallError::Download(format!("{url}: {e}")))?,
+    };
     if !resp.status().is_success() {
         return Err(InstallError::Download(format!("{url}: {}", resp.status())));
     }
-    resp.text()
-        .await
-        .map_err(|e| InstallError::Download(format!("{url}: {e}")))
+    Ok(resp)
 }
 
-/// Download `url` fully into memory (CLI artifacts are tens of MB),
+async fn get_text_controlled(
+    url: &str,
+    progress: Option<&Progress>,
+) -> Result<String, InstallError> {
+    use futures::TryStreamExt as _;
+
+    let resp = get_response(url, progress).await?;
+    let mut out = Vec::new();
+    let mut stream = resp.bytes_stream();
+    loop {
+        let next = tokio::select! {
+            biased;
+            _ = wait_for_install_cancel(progress) => return Err(InstallError::Cancelled),
+            next = stream.try_next() => next
+                .map_err(|e| InstallError::Download(format!("{url}: {e}")))?,
+        };
+        let Some(chunk) = next else {
+            break;
+        };
+        if out.len().saturating_add(chunk.len()) > MAX_TEXT_RESPONSE_BYTES {
+            return Err(InstallError::Download(format!(
+                "{url}: response exceeded {MAX_TEXT_RESPONSE_BYTES} bytes"
+            )));
+        }
+        out.extend_from_slice(&chunk);
+    }
+    String::from_utf8(out)
+        .map_err(|e| InstallError::Download(format!("{url}: response was not UTF-8: {e}")))
+}
+
+/// Download `url` fully into memory (runtime artifacts are tens of MB),
 /// streaming chunks so `progress` stays live and cancellation can land
 /// mid-transfer.
-async fn get_bytes(url: &str, progress: &Progress) -> Result<Vec<u8>, InstallError> {
+async fn get_bytes(url: &str, progress: &Progress, limit: usize) -> Result<Vec<u8>, InstallError> {
     use futures::TryStreamExt as _;
     use std::sync::atomic::Ordering::Relaxed;
 
-    let resp = http()?
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| InstallError::Download(format!("{url}: {e}")))?;
-    if !resp.status().is_success() {
-        return Err(InstallError::Download(format!("{url}: {}", resp.status())));
-    }
+    let resp = get_response(url, Some(progress)).await?;
     if let Some(len) = resp.content_length() {
+        if len > limit as u64 {
+            return Err(InstallError::Download(format!(
+                "{url}: response exceeded {limit} bytes"
+            )));
+        }
         progress.total.store(len, Relaxed);
     }
     let mut out = Vec::new();
     let mut stream = resp.bytes_stream();
-    while let Some(chunk) = stream
-        .try_next()
-        .await
-        .map_err(|e| InstallError::Download(format!("{url}: {e}")))?
-    {
-        if progress.cancelled() {
-            return Err(InstallError::Cancelled);
+    loop {
+        let next = tokio::select! {
+            biased;
+            _ = wait_for_install_cancel(Some(progress)) => return Err(InstallError::Cancelled),
+            next = stream.try_next() => next
+                .map_err(|e| InstallError::Download(format!("{url}: {e}")))?,
+        };
+        let Some(chunk) = next else {
+            break;
+        };
+        if out.len().saturating_add(chunk.len()) > limit {
+            return Err(InstallError::Download(format!(
+                "{url}: response exceeded {limit} bytes"
+            )));
         }
         out.extend_from_slice(&chunk);
         progress.received.fetch_add(chunk.len() as u64, Relaxed);
@@ -195,15 +456,34 @@ async fn get_bytes(url: &str, progress: &Progress) -> Result<Vec<u8>, InstallErr
 
 /// The newest version the vendor currently serves.
 pub async fn latest_version(id: CliId) -> Result<String, InstallError> {
+    latest_version_controlled(id, None).await
+}
+
+/// The newest version for an interactive managed-runtime install. Unlike the
+/// background update check, release metadata lookup observes the same cancel
+/// flag as the subsequent artifact download.
+pub async fn latest_version_for_install(
+    id: CliId,
+    progress: &Progress,
+) -> Result<String, InstallError> {
+    latest_version_controlled(id, Some(progress)).await
+}
+
+async fn latest_version_controlled(
+    id: CliId,
+    progress: Option<&Progress>,
+) -> Result<String, InstallError> {
     match id {
-        CliId::CursorAgent => {
-            let script = get_text("https://cursor.com/install").await?;
-            parse_cursor_install_version(&script).ok_or_else(|| {
-                InstallError::Download("cursor install script had no version".into())
-            })
-        }
+        // Managed execution stays on a release whose bytes were reviewed
+        // independently of Cursor's mutable release assets. A newer Bridge is
+        // promoted by updating this pin and its platform digests together.
+        CliId::CursorSdkBridge => Ok(CURSOR_SDK_BRIDGE_REVIEWED_VERSION.into()),
         CliId::Claude => {
-            let v = get_text("https://downloads.claude.ai/claude-code-releases/latest").await?;
+            let v = get_text_controlled(
+                "https://downloads.claude.ai/claude-code-releases/latest",
+                progress,
+            )
+            .await?;
             let v = v.trim().to_string();
             if v.chars().next().is_none_or(|c| !c.is_ascii_digit()) {
                 return Err(InstallError::Download(format!(
@@ -213,21 +493,34 @@ pub async fn latest_version(id: CliId) -> Result<String, InstallError> {
             Ok(v)
         }
         CliId::Codex => {
-            let tag = github_latest_tag("openai/codex").await?;
+            let tag = github_latest_tag("openai/codex", progress).await?;
             Ok(tag.trim_start_matches("rust-v").to_string())
         }
         // llama.cpp publishes binary builds as prereleases ("b9957"). Its
         // `/releases/latest` entry is now a metadata-only nightly marker, so
         // resolve the newest release that actually carries build artifacts.
-        CliId::LlamaServer => latest_llama_release_tag(fetch_llama_release_page).await,
+        CliId::LlamaServer => {
+            latest_llama_release_tag(|page| fetch_llama_release_page(page, progress)).await
+        }
     }
 }
 
-async fn github_latest_tag(repo: &str) -> Result<String, InstallError> {
-    let body = get_text(&format!(
-        "https://api.github.com/repos/{repo}/releases/latest"
-    ))
-    .await?;
+async fn github_latest_tag(
+    repo: &str,
+    progress: Option<&Progress>,
+) -> Result<String, InstallError> {
+    github_latest_tag_url(
+        &format!("https://api.github.com/repos/{repo}/releases/latest"),
+        progress,
+    )
+    .await
+}
+
+async fn github_latest_tag_url(
+    url: &str,
+    progress: Option<&Progress>,
+) -> Result<String, InstallError> {
+    let body = get_text_controlled(url, progress).await?;
     let json: serde_json::Value = serde_json::from_str(&body)
         .map_err(|e| InstallError::Download(format!("github release json: {e}")))?;
     json["tag_name"]
@@ -238,10 +531,16 @@ async fn github_latest_tag(repo: &str) -> Result<String, InstallError> {
 
 const LLAMA_RELEASE_PAGE_LIMIT: usize = 5;
 
-async fn fetch_llama_release_page(page: usize) -> Result<String, InstallError> {
-    get_text(&format!(
-        "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=100&page={page}"
-    ))
+async fn fetch_llama_release_page(
+    page: usize,
+    progress: Option<&Progress>,
+) -> Result<String, InstallError> {
+    get_text_controlled(
+        &format!(
+            "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=100&page={page}"
+        ),
+        progress,
+    )
     .await
 }
 
@@ -289,15 +588,6 @@ fn parse_llama_release_tag(body: &str) -> Result<Option<String>, InstallError> {
         }))
 }
 
-/// Pull the pinned version out of the official cursor install script
-/// (`…downloads.cursor.com/lab/<version>/<os>/<arch>/…`).
-fn parse_cursor_install_version(script: &str) -> Option<String> {
-    let idx = script.find("downloads.cursor.com/lab/")?;
-    let rest = &script[idx + "downloads.cursor.com/lab/".len()..];
-    let version: String = rest.chars().take_while(|c| *c != '/').collect();
-    (!version.is_empty()).then_some(version)
-}
-
 // --- platform mapping --------------------------------------------------------
 
 fn cursor_platform() -> Result<(&'static str, &'static str), InstallError> {
@@ -307,6 +597,31 @@ fn cursor_platform() -> Result<(&'static str, &'static str), InstallError> {
         other => return Err(InstallError::Unsupported(other.into())),
     };
     let arch = match std::env::consts::ARCH {
+        "x86_64" => "x64",
+        "aarch64" => "arm64",
+        other => return Err(InstallError::Unsupported(other.into())),
+    };
+    Ok((os, arch))
+}
+
+fn cursor_sdk_bridge_platform() -> Result<(&'static str, &'static str), InstallError> {
+    cursor_sdk_bridge_platform_for(std::env::consts::OS, std::env::consts::ARCH)
+}
+
+fn cursor_sdk_bridge_platform_for(
+    operating_system: &str,
+    architecture: &str,
+) -> Result<(&'static str, &'static str), InstallError> {
+    if operating_system == "windows" && architecture == "aarch64" {
+        return Err(InstallError::Unsupported("windows/aarch64".into()));
+    }
+    let os = match operating_system {
+        "linux" => "linux",
+        "macos" => "darwin",
+        "windows" => "win32",
+        other => return Err(InstallError::Unsupported(other.into())),
+    };
+    let arch = match architecture {
         "x86_64" => "x64",
         "aarch64" => "arm64",
         other => return Err(InstallError::Unsupported(other.into())),
@@ -378,31 +693,606 @@ fn codex_triple() -> Result<String, InstallError> {
 
 // --- install -----------------------------------------------------------------
 
-/// Download and activate `version` of `id` under `data_dir`. Returns the
-/// activated install. Idempotent: re-installing the active version just
-/// re-downloads and re-points the symlink. Byte progress lands in
-/// `progress`, which also carries the cancel flag.
-pub async fn install(
+/// A verified runtime artifact that has been downloaded and unpacked without
+/// changing the active managed runtime. Dropping it before activation removes
+/// its staging directory.
+#[derive(Debug)]
+pub struct PreparedInstall {
+    data_dir: PathBuf,
+    id: CliId,
+    version: String,
+    stage: PathBuf,
+    bin_rel: PathBuf,
+    operation_epoch: String,
+}
+
+impl PreparedInstall {
+    /// Move the prepared runtime into an immutable generation, then atomically
+    /// publish the metadata pointer used by both discovery and launches.
+    pub fn activate(self) -> Result<ActivationOutcome, InstallError> {
+        self.activate_with_checkpoint(|_| Ok(()))
+    }
+
+    /// Activate only if the originating install is still live at the pointer
+    /// commit boundary. Preparation can finish concurrently with a late cancel,
+    /// so checking inside the activation lock is what prevents a cancelled
+    /// operation from publishing `installed.json`.
+    pub fn activate_cancellable(
+        self,
+        progress: &Progress,
+    ) -> Result<ActivationOutcome, InstallError> {
+        self.activate_with_checkpoint(|_| {
+            if progress.cancelled() {
+                Err(InstallError::Cancelled)
+            } else {
+                Ok(())
+            }
+        })
+    }
+
+    fn activate_with_checkpoint(
+        self,
+        mut checkpoint: impl FnMut(ActivationCheckpoint) -> Result<(), InstallError>,
+    ) -> Result<ActivationOutcome, InstallError> {
+        self.activate_with_checkpoint_and_sync(&mut checkpoint, sync_runtime_path)
+    }
+
+    fn activate_with_checkpoint_and_sync(
+        self,
+        checkpoint: &mut impl FnMut(ActivationCheckpoint) -> Result<(), InstallError>,
+        mut sync_path: impl FnMut(&Path) -> std::io::Result<()>,
+    ) -> Result<ActivationOutcome, InstallError> {
+        // Persisted executable paths and Unix compatibility symlink targets
+        // must not depend on the process working directory. Public callers may
+        // supply a relative data directory, so normalize both owned paths at
+        // the activation boundary before constructing publication artifacts.
+        let data_dir = normalized_absolute_path(&self.data_dir)?;
+        let stage = normalized_absolute_path(&self.stage)?;
+        let root = cli_root(&data_dir, self.id);
+        let mut activation_lock = lock_runtime_activation(&data_dir, self.id)?;
+        if read_runtime_operation_epoch(&mut activation_lock)? != self.operation_epoch {
+            return Err(InstallError::Download(format!(
+                "prepared {} {} install was invalidated by a later uninstall; retry installation",
+                self.id.as_str(),
+                self.version
+            )));
+        }
+        let staged_bin = stage.join(&self.bin_rel);
+        if !stage.is_dir() || !staged_bin.is_file() {
+            return Err(InstallError::Download(format!(
+                "prepared {} {} artifact is no longer available",
+                self.id.as_str(),
+                self.version
+            )));
+        }
+
+        // A generation is never replaced in place. Therefore an interrupted
+        // activation always leaves the old pointer's runtime intact, and the
+        // final pointer rename can serve as the single commit point.
+        let generations = root.join(".generations");
+        std::fs::create_dir_all(&generations)?;
+        ensure_runtime_generation_capacity(
+            &data_dir,
+            self.id,
+            &root,
+            &generations,
+            &mut sync_path,
+        )?;
+        let generation = unique_runtime_path(&generations, &format!("runtime-{}", self.version))?;
+        let bin = generation.join(&self.bin_rel);
+        let info = InstalledCli {
+            version: self.version.clone(),
+            bin: bin.to_string_lossy().into_owned(),
+        };
+        // Establish the stable external lease inode before publication. A
+        // committed pointer must never name a generation that another process
+        // cannot protect from reclamation.
+        drop(open_runtime_lease_file(
+            &data_dir,
+            self.id,
+            RuntimeContainerKind::Generation,
+            &generation,
+        )?);
+        let pointer = root.join("installed.json");
+
+        // Build and flush the sole publication candidate before changing live
+        // state. Until its atomic replacement, both discovery and launches
+        // continue resolving the complete previous generation.
+        let pointer_candidate = unique_runtime_path(&root, "installed.json.candidate")?;
+        let _pointer_candidate_cleanup = PathCleanup::new(pointer_candidate.clone());
+        let mut pointer_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&pointer_candidate)?;
+        std::io::Write::write_all(
+            &mut pointer_file,
+            serde_json::to_string_pretty(&info).unwrap().as_bytes(),
+        )?;
+        pointer_file.sync_all()?;
+        drop(pointer_file);
+
+        let mut generation_cleanup = PathCleanup::new(generation.clone());
+        replace_runtime_file(&stage, &generation, false)?;
+        // The pointer must never be reported durable while the runtime it
+        // names exists only in volatile cache. Flush files before directories,
+        // then flush the rename into the generations directory.
+        sync_runtime_tree(&generation, &mut sync_path)?;
+        sync_path(&generations)?;
+
+        // The filesystem-wide activation lock couples the last pointer read,
+        // publication, and reclamation to lease acquisition. A backend in any
+        // process can therefore never select a generation in the gap before
+        // an activation removes it.
+        let previous = installed_unlocked(&data_dir, self.id);
+        let previous_generation = previous
+            .as_ref()
+            .and_then(|install| runtime_container(&generations, Path::new(&install.bin)));
+        let previous_legacy = previous.as_ref().and_then(|install| {
+            runtime_container(&root, Path::new(&install.bin)).filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| !name.starts_with('.'))
+            })
+        });
+        let replacing_pointer = path_exists(&pointer)?;
+        checkpoint(ActivationCheckpoint::BeforePointer)?;
+        replace_runtime_file(&pointer_candidate, &pointer, replacing_pointer)?;
+
+        // installed.json is the one atomically replaced commit marker. Disarm
+        // generation cleanup immediately: a later directory-sync error cannot
+        // roll the commit back or remove the runtime now named by the pointer.
+        generation_cleanup.disarm();
+        // Releases before generation-backed launches resolved this stable path
+        // for every child spawn. Keep it atomically pointed at the new active
+        // generation so a rolling older Trouve process remains functional.
+        // If compatibility publication fails, retain all generations just as
+        // for a directory-sync failure: the previous stable path may still
+        // name the prior generation.
+        let compatibility_error = publish_legacy_managed_bin(&data_dir, self.id, &bin)
+            .map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "publishing rolling compatibility executable {}: {error}",
+                        legacy_managed_bin_path(&data_dir, self.id).display()
+                    ),
+                )
+            })
+            .err();
+        let publication_sync_error =
+            sync_runtime_publication(&data_dir, &root, &mut sync_path).err();
+        let durability_error = compatibility_error.or(publication_sync_error);
+        if durability_error.is_none() {
+            // Reclamation is safe only after the new pointer is known durable.
+            // Across one or more failed root syncs, the last durable pointer may
+            // lag behind the visible pointer by multiple generations.
+            prune_runtime_generations(
+                &data_dir,
+                self.id,
+                &generations,
+                &generation,
+                previous_generation.as_deref(),
+            );
+            prune_old_versions(&data_dir, self.id, &root, previous_legacy.as_deref());
+        }
+        match durability_error {
+            None => Ok(ActivationOutcome::Durable(info)),
+            Some(error) => {
+                let warning = format!(
+                    "{} {} is active, but crash durability could not be confirmed: {error}; previous runtime generations were retained",
+                    self.id.display_name(),
+                    self.version
+                );
+                tracing::warn!(
+                    runtime = self.id.as_str(),
+                    path = %root.display(),
+                    %error,
+                    "managed runtime committed but its publication directories could not be synced"
+                );
+                Ok(ActivationOutcome::CommittedNotDurable {
+                    installed: info,
+                    warning,
+                })
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ActivationCheckpoint {
+    BeforePointer,
+}
+
+struct PathCleanup(Option<PathBuf>);
+
+impl PathCleanup {
+    fn new(path: PathBuf) -> Self {
+        Self(Some(path))
+    }
+
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for PathCleanup {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.as_ref() {
+            let _ = remove_path(path);
+        }
+    }
+}
+
+fn path_exists(path: &Path) -> std::io::Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+/// Return the immediate child of `root` containing `bin`, if the recorded
+/// executable is actually beneath that managed root.
+fn runtime_container(root: &Path, bin: &Path) -> Option<PathBuf> {
+    let relative = bin.strip_prefix(root).ok()?;
+    let Component::Normal(name) = relative.components().next()? else {
+        return None;
+    };
+    Some(root.join(name))
+}
+
+fn managed_runtime_container(
+    data_dir: &Path,
+    id: CliId,
+    bin: &Path,
+) -> Option<(RuntimeContainerKind, PathBuf)> {
+    let root = cli_root(data_dir, id);
+    let generations = root.join(".generations");
+    if let Some(generation) = runtime_container(&generations, bin) {
+        return Some((RuntimeContainerKind::Generation, generation));
+    }
+    runtime_container(&root, bin)
+        .filter(|runtime| {
+            runtime
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| !name.starts_with('.'))
+        })
+        .map(|runtime| (RuntimeContainerKind::Legacy, runtime))
+}
+
+#[cfg(not(windows))]
+fn replace_runtime_file(
+    replacement: &Path,
+    destination: &Path,
+    _replacing_existing: bool,
+) -> std::io::Result<()> {
+    std::fs::rename(replacement, destination)
+}
+
+#[cfg(windows)]
+fn replace_runtime_file(
+    replacement: &Path,
+    destination: &Path,
+    replacing_existing: bool,
+) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_WRITE_THROUGH, MoveFileExW, REPLACEFILE_WRITE_THROUGH, ReplaceFileW,
+    };
+
+    let replacement = replacement
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let destination = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let replaced = unsafe {
+        if replacing_existing {
+            ReplaceFileW(
+                destination.as_ptr(),
+                replacement.as_ptr(),
+                std::ptr::null(),
+                REPLACEFILE_WRITE_THROUGH,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        } else {
+            MoveFileExW(
+                replacement.as_ptr(),
+                destination.as_ptr(),
+                MOVEFILE_WRITE_THROUGH,
+            )
+        }
+    };
+    if replaced == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn sync_runtime_path(path: &Path) -> std::io::Result<()> {
+    std::fs::File::open(path)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_runtime_path(path: &Path) -> std::io::Result<()> {
+    if path.is_file() {
+        std::fs::File::open(path)?.sync_all()
+    } else {
+        // Windows directory publication uses MOVEFILE_WRITE_THROUGH /
+        // REPLACEFILE_WRITE_THROUGH; regular-file contents are still flushed
+        // explicitly above.
+        Ok(())
+    }
+}
+
+fn sync_runtime_tree(
+    path: &Path,
+    sync_path: &mut impl FnMut(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        // Never follow archive-created links while traversing the managed
+        // generation. Their directory entries are covered by the containing
+        // directory sync.
+        return Ok(());
+    }
+    if metadata.is_dir() {
+        for entry in std::fs::read_dir(path)? {
+            sync_runtime_tree(&entry?.path(), sync_path)?;
+        }
+        sync_path(path)
+    } else if metadata.is_file() {
+        sync_path(path)
+    } else {
+        Ok(())
+    }
+}
+
+fn sync_runtime_publication(
+    data_dir: &Path,
+    root: &Path,
+    sync_path: &mut impl FnMut(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    sync_path(root)?;
+    let runtime_parent = root
+        .parent()
+        .ok_or_else(|| std::io::Error::other("managed runtime root has no parent"))?;
+    sync_path(&runtime_parent.join("bin"))?;
+    sync_path(runtime_parent)?;
+    if runtime_parent != data_dir {
+        sync_path(data_dir)?;
+    }
+    Ok(())
+}
+
+fn runtime_generation_count(generations: &Path) -> std::io::Result<usize> {
+    let mut retained = 0usize;
+    for entry in std::fs::read_dir(generations)? {
+        if entry?.file_type()?.is_dir() {
+            retained += 1;
+        }
+    }
+    Ok(retained)
+}
+
+fn ensure_runtime_generation_capacity(
+    data_dir: &Path,
+    id: CliId,
+    root: &Path,
+    generations: &Path,
+    sync_path: &mut impl FnMut(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let retained = runtime_generation_count(generations)?;
+    if retained < MAX_RETAINED_RUNTIME_GENERATIONS {
+        return Ok(());
+    }
+
+    // Every generation published by this transaction has already had its
+    // contents and `.generations` entry flushed. If the final root sync later
+    // failed, retry durability for the currently visible pointer before
+    // reclaiming anything. Once that succeeds, no crash can select an older
+    // generation, although live backends may still retain one through leases.
+    let active_install = installed_unlocked(data_dir, id).ok_or_else(|| {
+        std::io::Error::other(format!(
+            "managed runtime retains {retained} recovery generations without a recoverable active pointer"
+        ))
+    })?;
+    let active = runtime_container(generations, Path::new(&active_install.bin)).ok_or_else(|| {
+            std::io::Error::other(format!(
+                "managed runtime retains {retained} recovery generations without a recoverable active pointer"
+            ))
+        })?;
+    sync_runtime_tree(&active, sync_path)?;
+    sync_path(generations)?;
+    // Compatibility publication can fail independently after installed.json
+    // commits. Repair it before pruning, otherwise the stable Unix symlink may
+    // keep naming an older generation that this recovery pass removes.
+    publish_legacy_managed_bin(data_dir, id, Path::new(&active_install.bin))?;
+    sync_runtime_publication(data_dir, root, sync_path)?;
+    prune_runtime_generations(data_dir, id, generations, &active, None);
+    sync_path(generations)?;
+
+    let retained = runtime_generation_count(generations)?;
+    if retained >= MAX_RETAINED_RUNTIME_GENERATIONS {
+        Err(std::io::Error::other(format!(
+            "managed runtime retains {retained} leased recovery generations; refusing another activation until their users stop"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+fn remove_path(path: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => std::fs::remove_dir_all(path),
+        Ok(_) => std::fs::remove_file(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn unique_runtime_path(parent: &Path, label: &str) -> std::io::Result<PathBuf> {
+    for _ in 0..8 {
+        let path = parent.join(format!(".{label}-{}", uuid::Uuid::new_v4().simple()));
+        match std::fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(path),
+            Ok(_) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!("could not reserve a unique runtime path for {label}"),
+    ))
+}
+
+fn runtime_activation_lock_path(data_dir: &Path, id: CliId) -> PathBuf {
+    data_dir
+        .join("cli")
+        .join(".locks")
+        .join(format!("{}.lock", id.as_str()))
+}
+
+fn runtime_lease_directory(data_dir: &Path, id: CliId, kind: RuntimeContainerKind) -> PathBuf {
+    data_dir
+        .join("cli")
+        .join(".leases")
+        .join(id.as_str())
+        .join(kind.lease_directory())
+}
+
+fn open_runtime_lease_file(
+    data_dir: &Path,
+    id: CliId,
+    kind: RuntimeContainerKind,
+    runtime: &Path,
+) -> std::io::Result<std::fs::File> {
+    let path = runtime_lease_path(data_dir, id, kind, runtime)?;
+    std::fs::create_dir_all(path.parent().expect("runtime lease has a parent"))?;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+}
+
+fn runtime_lease_path(
+    data_dir: &Path,
+    id: CliId,
+    kind: RuntimeContainerKind,
+    runtime: &Path,
+) -> std::io::Result<PathBuf> {
+    let runtime_name = runtime.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "managed runtime has no generation name: {}",
+                runtime.display()
+            ),
+        )
+    })?;
+    let directory = runtime_lease_directory(data_dir, id, kind);
+    let mut lease_name = runtime_name.to_os_string();
+    lease_name.push(".lock");
+    Ok(directory.join(lease_name))
+}
+
+fn lock_runtime_activation(data_dir: &Path, id: CliId) -> std::io::Result<std::fs::File> {
+    use fs4::fs_std::FileExt as _;
+
+    let lock_path = runtime_activation_lock_path(data_dir, id);
+    std::fs::create_dir_all(lock_path.parent().expect("runtime lock has a parent"))?;
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(lock_path)?;
+    lock.lock_exclusive()?;
+    Ok(lock)
+}
+
+fn read_runtime_operation_epoch(lock: &mut std::fs::File) -> std::io::Result<String> {
+    let length = lock.metadata()?.len();
+    if length > MAX_RUNTIME_OPERATION_EPOCH_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "managed runtime operation epoch is invalid",
+        ));
+    }
+    std::io::Seek::seek(lock, std::io::SeekFrom::Start(0))?;
+    let mut epoch = String::with_capacity(length as usize);
+    std::io::Read::read_to_string(lock, &mut epoch)?;
+    Ok(epoch)
+}
+
+fn invalidate_prepared_installs(lock: &mut std::fs::File) -> std::io::Result<()> {
+    let epoch = uuid::Uuid::new_v4().simple().to_string();
+    lock.set_len(0)?;
+    std::io::Seek::seek(lock, std::io::SeekFrom::Start(0))?;
+    std::io::Write::write_all(lock, epoch.as_bytes())?;
+    lock.sync_all()
+}
+
+impl Drop for PreparedInstall {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.stage);
+    }
+}
+
+fn create_install_stage(root: &Path, version: &str) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(root)?;
+    let stage = root.join(format!(
+        ".stage-{version}-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    // A UUID collision or externally created path is an error, never a path
+    // this attempt is allowed to delete and claim.
+    std::fs::create_dir(&stage)?;
+    Ok(stage)
+}
+
+/// Download and verify `version` of `id` into a staging directory without
+/// changing the active managed runtime. Call [`PreparedInstall::activate`]
+/// only after any runtime-specific teardown is complete.
+pub async fn prepare_install(
     data_dir: &Path,
     id: CliId,
     version: &str,
     progress: &Progress,
-) -> Result<InstalledCli, InstallError> {
+) -> Result<PreparedInstall, InstallError> {
     // `version` is scraped from vendor endpoints and also joined into
     // filesystem paths (version dir, staging dir, download URLs). A crafted
     // or compromised endpoint returning `1/../../../etc` would otherwise let
     // `remove_dir_all`/`rename` touch an arbitrary directory. Constrain it to
     // a strict, path-safe allowlist before it reaches the filesystem.
-    validate_version(version)?;
-    let root = cli_root(data_dir, id);
-    let version_dir = root.join(version);
-    // Stage into a temp sibling so a failed install never half-replaces an
-    // existing version directory.
-    let stage = root.join(format!(".stage-{version}"));
-    let _ = std::fs::remove_dir_all(&stage);
-    std::fs::create_dir_all(&stage)?;
+    let version = normalized_version(id, version).to_string();
+    validate_version(&version)?;
+    let _resource_admission =
+        acquire_runtime_install_resource(&RUNTIME_INSTALL_RESOURCE, progress).await?;
+    // Resolve one canonical namespace before creating the stage. The same
+    // spelling is then used for activation locks, leases, publication, and
+    // uninstall even when callers include symlinks, `.` or `..`.
+    std::fs::create_dir_all(data_dir)?;
+    let data_dir = normalized_absolute_path(data_dir)?;
+    let root = cli_root(&data_dir, id);
+    let mut activation_lock = lock_runtime_activation(&data_dir, id)?;
+    let operation_epoch = read_runtime_operation_epoch(&mut activation_lock)?;
+    // Stage into a unique sibling so failed or overlapping installs never
+    // half-replace the active version or clean up another attempt's files.
+    let stage = create_install_stage(&root, &version)?;
+    drop(activation_lock);
 
-    let result = install_into(&stage, id, version, progress).await;
+    let result = install_into(&stage, id, &version, progress).await;
     let bin_rel = match result {
         Ok(rel) => rel,
         Err(e) => {
@@ -411,59 +1301,122 @@ pub async fn install(
         }
     };
 
-    let _ = std::fs::remove_dir_all(&version_dir);
-    std::fs::rename(&stage, &version_dir)?;
-    let bin = version_dir.join(&bin_rel);
-
-    let info = InstalledCli {
-        version: version.to_string(),
-        bin: bin.to_string_lossy().into_owned(),
-    };
-    // Write the pointer atomically: a crash mid-write would otherwise leave
-    // a truncated installed.json that parses as "not installed" even though
-    // the binary is present.
-    let pointer = root.join("installed.json");
-    let tmp = root.join(".installed.json.tmp");
-    std::fs::write(
-        &tmp,
-        serde_json::to_string_pretty(&info).unwrap().as_bytes(),
-    )?;
-    std::fs::rename(&tmp, &pointer)?;
-
-    let link = managed_bin(data_dir, id);
-    std::fs::create_dir_all(link.parent().unwrap())?;
-    #[cfg(unix)]
-    {
-        let _ = std::fs::remove_file(&link);
-        std::os::unix::fs::symlink(&bin, &link)?;
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = std::fs::remove_file(&link);
-        std::fs::copy(&bin, &link)?;
-    }
-
-    // Keep at most one older version around for rollback; drop the rest.
-    prune_old_versions(&root, version);
-    Ok(info)
+    Ok(PreparedInstall {
+        data_dir,
+        id,
+        version,
+        stage,
+        bin_rel,
+        operation_epoch,
+    })
 }
 
-/// Remove the managed install of `id` entirely: every version directory,
-/// the pointer, and the stable symlink. Binaries found on PATH are
-/// untouched — trouve only manages its own copies.
+/// Download and activate `version` of `id` under `data_dir`. Returns the
+/// activated install. Idempotent: re-installing the active version just
+/// re-downloads and atomically replaces the active pointer. Byte progress lands in
+/// `progress`, which also carries the cancel flag.
+pub async fn install(
+    data_dir: &Path,
+    id: CliId,
+    version: &str,
+    progress: &Arc<Progress>,
+) -> Result<ActivationOutcome, InstallError> {
+    let prepared = prepare_install(data_dir, id, version, progress).await?;
+    let progress = Arc::clone(progress);
+    tokio::task::spawn_blocking(move || prepared.activate_cancellable(&progress))
+        .await
+        .map_err(|error| {
+            InstallError::Download(format!("managed runtime activation task failed: {error}"))
+        })?
+}
+
+/// Remove the managed install of `id` entirely, including legacy stable-path
+/// artifacts. Binaries found on PATH are untouched — trouve only manages its
+/// own copies.
 pub fn uninstall(data_dir: &Path, id: CliId) -> std::io::Result<()> {
-    let link = managed_bin(data_dir, id);
+    let data_dir = normalized_absolute_path(data_dir)?;
+    let mut activation_lock = lock_runtime_activation(&data_dir, id)?;
+    // Lease files live outside the runtime root, so they remain lockable while
+    // that root is removed (including on Windows). Refuse the whole operation
+    // before changing any path when another process can still use a runtime.
+    let _runtime_leases = lock_all_runtime_leases_exclusive(&data_dir, id)?;
+    // An installer may be downloading outside this process while uninstall
+    // runs. Advance the filesystem-backed epoch before removing live state so
+    // every preparation linearized before this uninstall fails closed later.
+    invalidate_prepared_installs(&mut activation_lock)?;
+    let link = legacy_managed_bin_path(&data_dir, id);
     if link.symlink_metadata().is_ok() {
         std::fs::remove_file(&link)?;
     }
-    let root = cli_root(data_dir, id);
+    let root = cli_root(&data_dir, id);
     if root.exists() {
         std::fs::remove_dir_all(&root)?;
     }
+    drop(_runtime_leases);
+    remove_path(&data_dir.join("cli").join(".leases").join(id.as_str()))?;
     Ok(())
 }
 
-/// Fetch and unpack one CLI into `dir`; returns the executable's path
+fn lock_all_runtime_leases_exclusive(
+    data_dir: &Path,
+    id: CliId,
+) -> std::io::Result<Vec<std::fs::File>> {
+    let mut leases = Vec::new();
+    for kind in [
+        RuntimeContainerKind::Generation,
+        RuntimeContainerKind::Legacy,
+    ] {
+        let directory = runtime_lease_directory(data_dir, id, kind);
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        for entry in entries {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let lease = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(entry.path())?;
+            if !fs4::fs_std::FileExt::try_lock_exclusive(&lease)? {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    format!("managed {} runtime is still in use", id.as_str()),
+                ));
+            }
+            leases.push(lease);
+        }
+    }
+    Ok(leases)
+}
+
+fn publish_legacy_managed_bin(data_dir: &Path, id: CliId, bin: &Path) -> std::io::Result<()> {
+    let destination = legacy_managed_bin_path(data_dir, id);
+    let directory = destination
+        .parent()
+        .ok_or_else(|| std::io::Error::other("compatibility executable has no parent"))?;
+    std::fs::create_dir_all(directory)?;
+    let candidate = unique_runtime_path(directory, &format!("{}.candidate", id.as_str()))?;
+    let mut cleanup = PathCleanup::new(candidate.clone());
+
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(bin, &candidate)?;
+    #[cfg(not(unix))]
+    {
+        std::fs::copy(bin, &candidate)?;
+        std::fs::File::open(&candidate)?.sync_all()?;
+    }
+
+    let replacing_existing = path_exists(&destination)?;
+    replace_runtime_file(&candidate, &destination, replacing_existing)?;
+    cleanup.disarm();
+    Ok(())
+}
+
+/// Fetch and unpack one runtime into `dir`; returns the executable's path
 /// relative to `dir`.
 async fn install_into(
     dir: &Path,
@@ -472,28 +1425,64 @@ async fn install_into(
     progress: &Progress,
 ) -> Result<PathBuf, InstallError> {
     match id {
-        CliId::CursorAgent => {
-            let (os, arch) = cursor_platform()?;
-            let url = format!(
-                "https://downloads.cursor.com/lab/{version}/{os}/{arch}/agent-cli-package.tar.gz"
+        CliId::CursorSdkBridge => {
+            let (os, arch) = cursor_sdk_bridge_platform()?;
+            let asset = format!("cursor-sdk-bridge-standalone-{os}-{arch}.tar.gz");
+            let reviewed =
+                cursor_sdk_bridge_reviewed_checksum(version, &asset).ok_or_else(|| {
+                    InstallError::Unsupported(format!(
+                        "Cursor SDK Bridge {version} ({asset}) has no independently reviewed digest"
+                    ))
+                })?;
+            let base = format!("https://github.com/cursor/sdk-bridge/releases/download/v{version}");
+            let sums = get_text_with_progress(&format!("{base}/SHA256SUMS.txt"), progress).await?;
+            let url = format!("{base}/{asset}");
+            let bytes = get_bytes(&url, progress, MAX_RUNTIME_DOWNLOAD_BYTES).await?;
+            let manifest = checksum_for_asset(&sums, &asset).ok_or_else(|| {
+                InstallError::Download(format!("SHA256SUMS.txt had no entry for {asset}"))
+            })?;
+            let actual = sha2::Sha256::digest(&bytes).iter().fold(
+                String::with_capacity(64),
+                |mut output, byte| {
+                    write!(output, "{byte:02x}").expect("writing to String cannot fail");
+                    output
+                },
             );
-            let bytes = get_bytes(&url, progress).await?;
+            verify_cursor_sdk_bridge_digests(&asset, reviewed, &manifest, &actual)?;
             untar_gz(bytes, dir).await?;
-            let rel = PathBuf::from("dist-package").join("cursor-agent");
+            let executable = if cfg!(windows) {
+                "cursor-sdk-bridge.exe"
+            } else {
+                "cursor-sdk-bridge"
+            };
+            let rel = PathBuf::from("bin").join(executable);
+            if !dir.join(&rel).exists() {
+                return Err(InstallError::Download(format!(
+                    "{asset} had no {}",
+                    rel.display()
+                )));
+            }
             make_executable(&dir.join(&rel))?;
             Ok(rel)
         }
         CliId::Claude => {
             let platform = claude_platform()?;
             let base = "https://downloads.claude.ai/claude-code-releases";
-            let manifest = get_text(&format!("{base}/{version}/manifest.json")).await?;
+            let manifest =
+                get_text_with_progress(&format!("{base}/{version}/manifest.json"), progress)
+                    .await?;
             let manifest: serde_json::Value = serde_json::from_str(&manifest)
                 .map_err(|e| InstallError::Download(format!("claude manifest: {e}")))?;
             let expected = manifest["platforms"][&platform]["checksum"]
                 .as_str()
                 .ok_or_else(|| InstallError::Unsupported(platform.clone()))?
                 .to_string();
-            let bytes = get_bytes(&format!("{base}/{version}/{platform}/claude"), progress).await?;
+            let bytes = get_bytes(
+                &format!("{base}/{version}/{platform}/claude"),
+                progress,
+                MAX_RUNTIME_DOWNLOAD_BYTES,
+            )
+            .await?;
             let actual = sha2::Sha256::digest(&bytes).iter().fold(
                 String::with_capacity(64),
                 |mut output, byte| {
@@ -514,7 +1503,7 @@ async fn install_into(
             let url = format!(
                 "https://github.com/openai/codex/releases/download/rust-v{version}/codex-{triple}.tar.gz"
             );
-            let bytes = get_bytes(&url, progress).await?;
+            let bytes = get_bytes(&url, progress, MAX_RUNTIME_DOWNLOAD_BYTES).await?;
             untar_gz(bytes, dir).await?;
             let rel = PathBuf::from("codex");
             std::fs::rename(dir.join(format!("codex-{triple}")), dir.join(&rel))?;
@@ -526,7 +1515,7 @@ async fn install_into(
             let url = format!(
                 "https://github.com/ggml-org/llama.cpp/releases/download/{version}/llama-{version}-bin-{platform}.tar.gz"
             );
-            let bytes = get_bytes(&url, progress).await?;
+            let bytes = get_bytes(&url, progress, MAX_RUNTIME_DOWNLOAD_BYTES).await?;
             untar_gz(bytes, dir).await?;
             // The tarball unpacks to `llama-<version>/` with llama-server and
             // its shared libraries side by side (rpath $ORIGIN).
@@ -539,6 +1528,28 @@ async fn install_into(
             make_executable(&dir.join(&rel))?;
             Ok(rel)
         }
+    }
+}
+
+fn checksum_for_asset(sums: &str, asset: &str) -> Option<String> {
+    sums.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        let checksum = fields.next()?;
+        let name = fields.next()?.trim_start_matches('*');
+        (name.rsplit('/').next() == Some(asset)
+            && checksum.len() == 64
+            && checksum
+                .chars()
+                .all(|character| character.is_ascii_hexdigit()))
+        .then(|| checksum.to_ascii_lowercase())
+    })
+}
+
+fn normalized_version(id: CliId, version: &str) -> &str {
+    if id == CliId::CursorSdkBridge {
+        version.strip_prefix('v').unwrap_or(version)
+    } else {
+        version
     }
 }
 
@@ -574,16 +1585,50 @@ fn path_is_contained(path: &Path) -> bool {
 /// target escapes are refused — otherwise a crafted archive could plant a
 /// symlink and then write through it to an arbitrary location (tar-slip).
 async fn untar_gz(bytes: Vec<u8>, dir: &Path) -> Result<(), InstallError> {
+    untar_gz_with_limits(
+        bytes,
+        dir,
+        MAX_RUNTIME_EXTRACTED_BYTES,
+        MAX_RUNTIME_ARCHIVE_ENTRIES,
+    )
+    .await
+}
+
+async fn untar_gz_with_limits(
+    bytes: Vec<u8>,
+    dir: &Path,
+    max_extracted_bytes: u64,
+    max_entries: usize,
+) -> Result<(), InstallError> {
     let dir = dir.to_path_buf();
-    tokio::task::spawn_blocking(move || -> Result<(), InstallError> {
+    let extraction_dir = dir.clone();
+    let extraction = tokio::task::spawn_blocking(move || -> Result<(), InstallError> {
         let decoder = flate2::read::GzDecoder::new(std::io::Cursor::new(bytes));
         let mut archive = tar::Archive::new(decoder);
+        let mut extracted_bytes = 0_u64;
+        let mut entry_count = 0_usize;
         for entry in archive
             .entries()
             .map_err(|e| InstallError::Download(format!("reading archive: {e}")))?
         {
             let mut entry =
                 entry.map_err(|e| InstallError::Download(format!("archive entry: {e}")))?;
+            entry_count = entry_count
+                .checked_add(1)
+                .ok_or_else(|| InstallError::Download("archive entry count overflowed".into()))?;
+            if entry_count > max_entries {
+                return Err(InstallError::Download(format!(
+                    "archive exceeded the {max_entries}-entry extraction limit"
+                )));
+            }
+            extracted_bytes = extracted_bytes.checked_add(entry.size()).ok_or_else(|| {
+                InstallError::Download("archive expanded byte count overflowed".into())
+            })?;
+            if extracted_bytes > max_extracted_bytes {
+                return Err(InstallError::Download(format!(
+                    "archive exceeded the {max_extracted_bytes}-byte expanded extraction limit"
+                )));
+            }
             let path = entry
                 .path()
                 .map_err(|e| InstallError::Download(format!("archive entry path: {e}")))?
@@ -633,7 +1678,18 @@ async fn untar_gz(bytes: Vec<u8>, dir: &Path) -> Result<(), InstallError> {
         Ok(())
     })
     .await
-    .map_err(|e| InstallError::Download(format!("unpack task: {e}")))??;
+    .map_err(|e| InstallError::Download(format!("unpack task: {e}")))
+    .and_then(|result| result);
+    if let Err(error) = extraction {
+        if let Err(cleanup) = std::fs::remove_dir_all(&extraction_dir)
+            && extraction_dir.exists()
+        {
+            return Err(InstallError::Download(format!(
+                "{error}; removing rejected archive stage: {cleanup}"
+            )));
+        }
+        return Err(error);
+    }
     Ok(())
 }
 
@@ -647,26 +1703,84 @@ fn make_executable(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Remove all version directories except the active one and the
-/// lexicographically greatest other (a cheap "previous version" heuristic).
-fn prune_old_versions(root: &Path, active: &str) {
+fn try_lock_runtime_exclusive(
+    data_dir: &Path,
+    id: CliId,
+    kind: RuntimeContainerKind,
+    runtime: &Path,
+) -> std::io::Result<Option<std::fs::File>> {
+    let lock = open_runtime_lease_file(data_dir, id, kind, runtime)?;
+    if fs4::fs_std::FileExt::try_lock_exclusive(&lock)? {
+        Ok(Some(lock))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Keep the active immutable generation, the exact previously active
+/// generation, and every retired generation still leased by a backend. Orphans
+/// are collected on a later activation after their last consumer drains.
+fn prune_runtime_generations(
+    data_dir: &Path,
+    id: CliId,
+    generations: &Path,
+    active: &Path,
+    previous: Option<&Path>,
+) {
+    let Ok(entries) = std::fs::read_dir(generations) else {
+        return;
+    };
+    for generation in entries.flatten().map(|entry| entry.path()) {
+        if !generation.is_dir() || generation == active || previous == Some(generation.as_path()) {
+            continue;
+        }
+        // The activation lock prevents new shared leases while this exclusive
+        // guard is held. A busy or unreadable lease is conservatively kept.
+        let Ok(Some(lease)) =
+            try_lock_runtime_exclusive(data_dir, id, RuntimeContainerKind::Generation, &generation)
+        else {
+            continue;
+        };
+        let lease_path =
+            runtime_lease_path(data_dir, id, RuntimeContainerKind::Generation, &generation);
+        if std::fs::remove_dir_all(&generation).is_ok() {
+            drop(lease);
+            if let Ok(lease_path) = lease_path {
+                let _ = std::fs::remove_file(lease_path);
+            }
+        }
+    }
+}
+
+/// During migration, keep only the exact legacy directory selected by the
+/// previous pointer. Once both current and previous installs are generations,
+/// all legacy version directories can be removed.
+fn prune_old_versions(data_dir: &Path, id: CliId, root: &Path, previous: Option<&Path>) {
     let Ok(entries) = std::fs::read_dir(root) else {
         return;
     };
-    let mut others: Vec<PathBuf> = entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| {
-            p.is_dir()
-                && p.file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|n| n != active && !n.starts_with('.'))
-                    .unwrap_or(false)
-        })
-        .collect();
-    others.sort();
-    for dir in others.iter().rev().skip(1) {
-        let _ = std::fs::remove_dir_all(dir);
+    for directory in entries.flatten().map(|entry| entry.path()) {
+        if !directory.is_dir()
+            || directory
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_none_or(|name| name.starts_with('.'))
+            || previous == Some(directory.as_path())
+        {
+            continue;
+        }
+        let Ok(Some(lease)) =
+            try_lock_runtime_exclusive(data_dir, id, RuntimeContainerKind::Legacy, &directory)
+        else {
+            continue;
+        };
+        let lease_path = runtime_lease_path(data_dir, id, RuntimeContainerKind::Legacy, &directory);
+        if std::fs::remove_dir_all(&directory).is_ok() {
+            drop(lease);
+            if let Ok(lease_path) = lease_path {
+                let _ = std::fs::remove_file(lease_path);
+            }
+        }
     }
 }
 
@@ -677,7 +1791,7 @@ pub fn find_on_path(command: &str) -> Option<PathBuf> {
 }
 
 /// Best-effort `<bin> --version` (first line, trimmed), for reporting the
-/// version of CLIs found on PATH.
+/// version of runtimes found on PATH.
 pub async fn binary_version(command: &str) -> Option<String> {
     let mut command = crate::process_env::tokio_command(command);
     command
@@ -704,16 +1818,124 @@ pub async fn binary_version(command: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn runtime_install_resource_bounds_concurrency_and_keeps_waits_cancellable() {
+        let admission = tokio::sync::Semaphore::new(1);
+        let held = admission.acquire().await.unwrap();
+        let progress = Progress::default();
+        let waiting = acquire_runtime_install_resource(&admission, &progress);
+        tokio::pin!(waiting);
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), waiting.as_mut())
+                .await
+                .is_err(),
+            "a second install bypassed the resource admission"
+        );
+        progress
+            .cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), waiting)
+                .await
+                .expect("cancelled installation admission did not wake"),
+            Err(InstallError::Cancelled)
+        ));
+        drop(held);
+    }
+
     #[test]
-    fn parses_cursor_version_from_install_script() {
-        let script = r#"
-DOWNLOAD_URL="https://downloads.cursor.com/lab/2026.07.01-41b2de7/${OS}/${ARCH}/agent-cli-package.tar.gz"
+    fn parses_cursor_sdk_release_checksum() {
+        let sums = r#"
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  cursor-sdk-bridge-standalone-linux-x64.tar.gz
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bridge-standalone-darwin-arm64.tar.gz
 "#;
         assert_eq!(
-            parse_cursor_install_version(script).as_deref(),
-            Some("2026.07.01-41b2de7")
+            checksum_for_asset(sums, "cursor-sdk-bridge-standalone-linux-x64.tar.gz").as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
         );
-        assert_eq!(parse_cursor_install_version("nothing here"), None);
+        assert_eq!(checksum_for_asset(sums, "missing.tar.gz"), None);
+    }
+
+    #[tokio::test]
+    async fn release_metadata_fetch_observes_install_cancellation_before_headers() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let request_received = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let handler_received = request_received.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new().route(
+                    "/release",
+                    axum::routing::get(move || {
+                        let handler_received = handler_received.clone();
+                        async move {
+                            handler_received.add_permits(1);
+                            std::future::pending::<&'static str>().await
+                        }
+                    }),
+                ),
+            )
+            .await
+        });
+        let progress = std::sync::Arc::new(Progress::default());
+        let request_progress = progress.clone();
+        let request = tokio::spawn(async move {
+            github_latest_tag_url(
+                &format!("http://{address}/release"),
+                Some(&request_progress),
+            )
+            .await
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            request_received.acquire(),
+        )
+        .await
+        .expect("release-metadata request never reached the fixture")
+        .unwrap()
+        .forget();
+        progress
+            .cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), request)
+            .await
+            .expect("cancelled release-metadata request stayed pending")
+            .unwrap();
+        assert!(matches!(result, Err(InstallError::Cancelled)));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn runtime_download_enforces_the_streaming_byte_budget() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new().route(
+                    "/runtime",
+                    axum::routing::get(|| async {
+                        axum::body::Body::from_stream(futures::stream::iter([
+                            Ok::<_, std::convert::Infallible>(bytes::Bytes::from_static(b"123")),
+                            Ok(bytes::Bytes::from_static(b"45")),
+                        ]))
+                    }),
+                ),
+            )
+            .await
+        });
+        let progress = Progress::default();
+        let error = get_bytes(&format!("http://{address}/runtime"), &progress, 4)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("exceeded 4 bytes"));
+        server.abort();
     }
 
     #[test]
@@ -802,12 +2024,87 @@ DOWNLOAD_URL="https://downloads.cursor.com/lab/2026.07.01-41b2de7/${OS}/${ARCH}/
     }
 
     #[test]
+    fn cursor_sdk_versions_accept_one_release_tag_prefix() {
+        assert_eq!(
+            normalized_version(CliId::CursorSdkBridge, "v1.0.28"),
+            "1.0.28"
+        );
+        assert_eq!(
+            normalized_version(CliId::Codex, "rust-v0.5.0"),
+            "rust-v0.5.0"
+        );
+    }
+
+    #[test]
     fn tar_entry_containment_checks() {
-        assert!(path_is_contained(Path::new("dist-package/cursor-agent")));
+        assert!(path_is_contained(Path::new("bin/cursor-sdk-bridge")));
         assert!(path_is_contained(Path::new("libllama.so.1")));
         assert!(!path_is_contained(Path::new("../escape")));
         assert!(!path_is_contained(Path::new("/etc/passwd")));
         assert!(!path_is_contained(Path::new("a/../../b")));
+    }
+
+    fn gzipped_tar(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut tar = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar);
+            for (path, contents) in entries {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(contents.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder.append_data(&mut header, path, *contents).unwrap();
+            }
+            builder.finish().unwrap();
+        }
+        let mut gz = Vec::new();
+        {
+            use std::io::Write as _;
+            let mut encoder =
+                flate2::write::GzEncoder::new(&mut gz, flate2::Compression::default());
+            encoder.write_all(&tar).unwrap();
+            encoder.finish().unwrap();
+        }
+        gz
+    }
+
+    #[tokio::test]
+    async fn untar_enforces_expanded_byte_and_entry_budgets() {
+        let byte_stage = tempfile::tempdir().unwrap();
+        let byte_stage_path = byte_stage.path().to_path_buf();
+        let byte_error = untar_gz_with_limits(
+            gzipped_tar(&[("large", b"123456789")]),
+            &byte_stage_path,
+            8,
+            10,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(byte_error, InstallError::Download(message) if message.contains("expanded extraction limit"))
+        );
+        assert!(
+            !byte_stage_path.exists(),
+            "a rejected expanded archive left its staging directory behind"
+        );
+
+        let entry_stage = tempfile::tempdir().unwrap();
+        let entry_stage_path = entry_stage.path().to_path_buf();
+        let entry_error = untar_gz_with_limits(
+            gzipped_tar(&[("one", b""), ("two", b"")]),
+            &entry_stage_path,
+            1,
+            1,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(entry_error, InstallError::Download(message) if message.contains("entry extraction limit"))
+        );
+        assert!(
+            !entry_stage_path.exists(),
+            "an archive with too many entries left its staging directory behind"
+        );
     }
 
     #[tokio::test]
@@ -849,9 +2146,50 @@ DOWNLOAD_URL="https://downloads.cursor.com/lab/2026.07.01-41b2de7/${OS}/${ARCH}/
             Some(CliId::LlamaServer)
         );
         assert_eq!(CliId::parse("unknown"), None);
+        assert_eq!(CliId::parse("cursor-agent"), Some(CliId::CursorSdkBridge));
     }
 
     #[test]
+    fn cursor_sdk_rejects_windows_arm64_without_constructing_an_asset() {
+        assert!(matches!(
+            cursor_sdk_bridge_platform_for("windows", "aarch64"),
+            Err(InstallError::Unsupported(platform)) if platform == "windows/aarch64"
+        ));
+        assert_eq!(
+            cursor_sdk_bridge_platform_for("windows", "x86_64").unwrap(),
+            ("win32", "x64")
+        );
+    }
+
+    #[test]
+    fn cursor_sdk_execution_trusts_only_reviewed_release_digests() {
+        let asset = "cursor-sdk-bridge-standalone-linux-x64.tar.gz";
+        let reviewed =
+            cursor_sdk_bridge_reviewed_checksum(CURSOR_SDK_BRIDGE_REVIEWED_VERSION, asset);
+        assert_eq!(
+            reviewed,
+            Some("5357a42d3faa668a3ef25c6669fe576544b032dd17fabbbfa515355cd8d33c19")
+        );
+        assert!(matches!(
+            verify_cursor_sdk_bridge_digests(asset, reviewed.unwrap(), "00", reviewed.unwrap()),
+            Err(InstallError::Checksum(_))
+        ));
+        assert!(matches!(
+            verify_cursor_sdk_bridge_digests(asset, reviewed.unwrap(), reviewed.unwrap(), "00"),
+            Err(InstallError::Checksum(_))
+        ));
+        assert_eq!(cursor_sdk_bridge_reviewed_checksum("1.0.29", asset), None);
+        assert_eq!(
+            cursor_sdk_bridge_reviewed_checksum(
+                CURSOR_SDK_BRIDGE_REVIEWED_VERSION,
+                "cursor-sdk-bridge-standalone-plan9-x64.tar.gz"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    #[allow(deprecated)]
     fn installed_reads_pointer_when_binary_exists() {
         let tmp = tempfile::tempdir().unwrap();
         let root = cli_root(tmp.path(), CliId::Codex);
@@ -867,13 +2205,628 @@ DOWNLOAD_URL="https://downloads.cursor.com/lab/2026.07.01-41b2de7/${OS}/${ARCH}/
             .unwrap(),
         )
         .unwrap();
+        let retired = legacy_managed_bin_path(tmp.path(), CliId::Codex);
+        std::fs::create_dir_all(retired.parent().unwrap()).unwrap();
+        std::fs::write(&retired, "obsolete runtime").unwrap();
 
         let info = installed(tmp.path(), CliId::Codex).unwrap();
         assert_eq!(info.version, "1.0.0");
+        assert_eq!(managed_bin(tmp.path(), CliId::Codex), retired);
 
         // Pointer with a missing binary reports not installed.
         std::fs::remove_file(&bin).unwrap();
         assert!(installed(tmp.path(), CliId::Codex).is_none());
+        assert_eq!(managed_bin(tmp.path(), CliId::Codex), retired);
+    }
+
+    #[test]
+    fn prepared_install_publishes_pointer_and_rolling_compatibility_path_together() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = normalized_absolute_path(tmp.path()).unwrap();
+        let root = cli_root(&data_dir, CliId::Codex);
+        let stage = root.join(".stage-2.0.0");
+        let bin_rel = PathBuf::from("codex");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::write(stage.join(&bin_rel), "new runtime").unwrap();
+        let prepared = PreparedInstall {
+            data_dir: data_dir.clone(),
+            id: CliId::Codex,
+            version: "2.0.0".into(),
+            stage,
+            bin_rel,
+            operation_epoch: String::new(),
+        };
+
+        assert!(installed(&data_dir, CliId::Codex).is_none());
+        let legacy_stable = legacy_managed_bin_path(&data_dir, CliId::Codex);
+        std::fs::create_dir_all(legacy_stable.parent().unwrap()).unwrap();
+        std::fs::write(&legacy_stable, "obsolete runtime").unwrap();
+
+        let ActivationOutcome::Durable(activated) = prepared.activate().unwrap() else {
+            panic!("ordinary activation unexpectedly lacked durability");
+        };
+
+        assert_eq!(activated.version, "2.0.0");
+        assert!(Path::new(&activated.bin).starts_with(root.join(".generations")));
+        assert_eq!(
+            std::fs::read_to_string(&activated.bin).unwrap(),
+            "new runtime"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&legacy_stable).unwrap(),
+            "new runtime"
+        );
+        assert_eq!(installed(&data_dir, CliId::Codex).unwrap().version, "2.0.0");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relative_data_dir_publishes_absolute_runtime_paths() {
+        let current_dir = std::env::current_dir().unwrap();
+        let tmp = tempfile::tempdir_in(&current_dir).unwrap();
+        let data_dir = tmp
+            .path()
+            .strip_prefix(&current_dir)
+            .expect("temporary directory is beneath the current directory")
+            .to_path_buf();
+        assert!(!data_dir.is_absolute());
+
+        let root = cli_root(&data_dir, CliId::Codex);
+        let stage = root.join(".stage-2.0.0");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::write(stage.join("codex"), "new runtime").unwrap();
+        let prepared = PreparedInstall {
+            data_dir: data_dir.clone(),
+            id: CliId::Codex,
+            version: "2.0.0".into(),
+            stage,
+            bin_rel: PathBuf::from("codex"),
+            operation_epoch: String::new(),
+        };
+
+        let ActivationOutcome::Durable(activated) = prepared.activate().unwrap() else {
+            panic!("ordinary activation unexpectedly lacked durability");
+        };
+        assert!(Path::new(&activated.bin).is_absolute());
+        let (leased, lease) = installed_with_lease(&data_dir, CliId::Codex)
+            .expect("relative data directory should acquire the active runtime lease");
+        assert_eq!(leased.version, activated.version);
+        assert_eq!(leased.bin, activated.bin);
+        drop(lease);
+
+        let compatibility = legacy_managed_bin_path(&data_dir, CliId::Codex);
+        let target = std::fs::read_link(&compatibility).unwrap();
+        assert!(target.is_absolute());
+        assert_eq!(
+            std::fs::read_to_string(compatibility).unwrap(),
+            "new runtime"
+        );
+    }
+
+    #[test]
+    fn equivalent_relative_data_dirs_share_runtime_leases_and_uninstall_locking() {
+        let current_dir = std::env::current_dir().unwrap();
+        let tmp = tempfile::tempdir_in(&current_dir).unwrap();
+        let data_dir = tmp.path().strip_prefix(&current_dir).unwrap().to_path_buf();
+        std::fs::create_dir(data_dir.join("spelling")).unwrap();
+        let equivalent = data_dir.join("spelling").join("..");
+        let root = cli_root(&equivalent, CliId::Codex);
+        let stage = create_install_stage(&root, "2.0.0").unwrap();
+        std::fs::write(stage.join("codex"), "new runtime").unwrap();
+        let prepared = PreparedInstall {
+            data_dir: equivalent.clone(),
+            id: CliId::Codex,
+            version: "2.0.0".into(),
+            stage,
+            bin_rel: PathBuf::from("codex"),
+            operation_epoch: String::new(),
+        };
+
+        let ActivationOutcome::Durable(_) = prepared.activate().unwrap() else {
+            panic!("ordinary activation unexpectedly lacked durability");
+        };
+        let (_, lease) = installed_with_lease(&data_dir, CliId::Codex)
+            .expect("equivalent data-directory spelling lost the runtime lease");
+        let error = uninstall(&equivalent, CliId::Codex).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        drop(lease);
+
+        uninstall(&equivalent, CliId::Codex).unwrap();
+        assert!(installed(&data_dir, CliId::Codex).is_none());
+    }
+
+    #[test]
+    fn legacy_relative_runtime_pointer_is_normalized_before_leasing() {
+        let current_dir = std::env::current_dir().unwrap();
+        let tmp = tempfile::tempdir_in(&current_dir).unwrap();
+        let data_dir = tmp
+            .path()
+            .strip_prefix(&current_dir)
+            .expect("temporary directory is beneath the current directory")
+            .to_path_buf();
+        let generation = cli_root(&data_dir, CliId::Codex)
+            .join(".generations")
+            .join("runtime-1.0.0");
+        let bin = generation.join("codex");
+        std::fs::create_dir_all(&generation).unwrap();
+        std::fs::write(&bin, "legacy runtime").unwrap();
+        std::fs::write(
+            cli_root(&data_dir, CliId::Codex).join("installed.json"),
+            serde_json::to_string_pretty(&InstalledCli {
+                version: "1.0.0".into(),
+                bin: bin.to_string_lossy().into_owned(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let (installed, lease) = installed_with_lease(&data_dir, CliId::Codex)
+            .expect("legacy relative pointer should acquire a generation lease");
+        assert_eq!(
+            PathBuf::from(&installed.bin),
+            std::path::absolute(bin).unwrap()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&installed.bin).unwrap(),
+            "legacy runtime"
+        );
+        drop(lease);
+    }
+
+    #[test]
+    fn dropping_prepared_install_removes_staged_runtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = cli_root(tmp.path(), CliId::Codex);
+        let stage_a = create_install_stage(&root, "2.0.0").unwrap();
+        let stage_b = create_install_stage(&root, "2.0.0").unwrap();
+        assert_ne!(stage_a, stage_b);
+        let prepared_a = PreparedInstall {
+            data_dir: tmp.path().to_path_buf(),
+            id: CliId::Codex,
+            version: "2.0.0".into(),
+            stage: stage_a.clone(),
+            bin_rel: PathBuf::from("codex"),
+            operation_epoch: String::new(),
+        };
+        let prepared_b = PreparedInstall {
+            data_dir: tmp.path().to_path_buf(),
+            id: CliId::Codex,
+            version: "2.0.0".into(),
+            stage: stage_b.clone(),
+            bin_rel: PathBuf::from("codex"),
+            operation_epoch: String::new(),
+        };
+
+        drop(prepared_b);
+
+        assert!(!stage_b.exists());
+        assert!(stage_a.exists());
+        drop(prepared_a);
+        assert!(!stage_a.exists());
+    }
+
+    #[test]
+    fn missing_prepared_artifact_preserves_same_version_runtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = cli_root(tmp.path(), CliId::Codex);
+        let version_dir = root.join("2.0.0");
+        let active_bin = version_dir.join("codex");
+        std::fs::create_dir_all(&version_dir).unwrap();
+        std::fs::write(&active_bin, "active runtime").unwrap();
+        std::fs::write(
+            root.join("installed.json"),
+            serde_json::to_string(&InstalledCli {
+                version: "2.0.0".into(),
+                bin: active_bin.to_string_lossy().into_owned(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let stage = create_install_stage(&root, "2.0.0").unwrap();
+        std::fs::write(stage.join("codex"), "prepared runtime").unwrap();
+        let prepared = PreparedInstall {
+            data_dir: tmp.path().to_path_buf(),
+            id: CliId::Codex,
+            version: "2.0.0".into(),
+            stage: stage.clone(),
+            bin_rel: PathBuf::from("codex"),
+            operation_epoch: String::new(),
+        };
+        std::fs::remove_dir_all(stage).unwrap();
+
+        assert!(prepared.activate().is_err());
+        assert_eq!(
+            std::fs::read_to_string(&active_bin).unwrap(),
+            "active runtime"
+        );
+        assert_eq!(
+            installed(tmp.path(), CliId::Codex).unwrap().version,
+            "2.0.0"
+        );
+    }
+
+    #[test]
+    fn failure_before_pointer_keeps_previous_runtime_authoritative() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = normalized_absolute_path(tmp.path()).unwrap();
+        let root = cli_root(&data_dir, CliId::Codex);
+        let version_dir = root.join("2.0.0");
+        let active_bin = version_dir.join("codex");
+        std::fs::create_dir_all(&version_dir).unwrap();
+        std::fs::write(&active_bin, "active runtime").unwrap();
+        let previous_pointer = serde_json::to_string_pretty(&InstalledCli {
+            version: "2.0.0".into(),
+            bin: active_bin.to_string_lossy().into_owned(),
+        })
+        .unwrap();
+        std::fs::write(root.join("installed.json"), &previous_pointer).unwrap();
+
+        let stage = create_install_stage(&root, "2.0.0").unwrap();
+        std::fs::write(stage.join("codex"), "prepared runtime").unwrap();
+        let prepared = PreparedInstall {
+            data_dir: data_dir.clone(),
+            id: CliId::Codex,
+            version: "2.0.0".into(),
+            stage,
+            bin_rel: PathBuf::from("codex"),
+            operation_epoch: String::new(),
+        };
+
+        let result = prepared.activate_with_checkpoint(|checkpoint| {
+            assert_eq!(checkpoint, ActivationCheckpoint::BeforePointer);
+            let visible = installed(&data_dir, CliId::Codex).unwrap();
+            assert_eq!(visible.bin, active_bin.to_string_lossy());
+            assert_eq!(
+                std::fs::read_to_string(&visible.bin).unwrap(),
+                "active runtime"
+            );
+            Err(InstallError::Io(std::io::Error::other(
+                "injected publication failure",
+            )))
+        });
+
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read_to_string(&active_bin).unwrap(),
+            "active runtime"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("installed.json")).unwrap(),
+            previous_pointer
+        );
+        assert_eq!(installed(&data_dir, CliId::Codex).unwrap().version, "2.0.0");
+        assert_eq!(
+            std::fs::read_dir(root.join(".generations"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn runtime_contents_are_synced_before_pointer_publication() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = normalized_absolute_path(tmp.path()).unwrap();
+        let root = cli_root(&data_dir, CliId::Codex);
+        let generations = root.join(".generations");
+        let stage = create_install_stage(&root, "2.0.0").unwrap();
+        std::fs::create_dir_all(stage.join("lib")).unwrap();
+        std::fs::write(stage.join("codex"), "runtime").unwrap();
+        std::fs::write(stage.join("lib").join("helper"), "helper").unwrap();
+        let prepared = PreparedInstall {
+            data_dir: data_dir.clone(),
+            id: CliId::Codex,
+            version: "2.0.0".into(),
+            stage,
+            bin_rel: PathBuf::from("codex"),
+            operation_epoch: String::new(),
+        };
+        let synced = std::cell::RefCell::new(Vec::<PathBuf>::new());
+        let mut checkpoint = |checkpoint| {
+            assert_eq!(checkpoint, ActivationCheckpoint::BeforePointer);
+            let synced = synced.borrow();
+            let generation = synced
+                .iter()
+                .find(|path| {
+                    path.parent() == Some(generations.as_path())
+                        && path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|name| name.starts_with(".runtime-2.0.0-"))
+                })
+                .expect("generation directory was not synced before publication");
+            for path in [
+                generation.join("codex"),
+                generation.join("lib").join("helper"),
+                generation.join("lib"),
+                generation.clone(),
+                generations.clone(),
+            ] {
+                assert!(
+                    synced.contains(&path),
+                    "{} was not synced before publication",
+                    path.display()
+                );
+            }
+            assert!(!synced.contains(&root));
+            Ok(())
+        };
+
+        assert!(matches!(
+            prepared.activate_with_checkpoint_and_sync(&mut checkpoint, |path| {
+                synced.borrow_mut().push(path.to_path_buf());
+                Ok(())
+            }),
+            Ok(ActivationOutcome::Durable(_))
+        ));
+        let synced = synced.into_inner();
+        for path in [
+            root.clone(),
+            root.parent().unwrap().join("bin"),
+            root.parent().unwrap().to_path_buf(),
+            data_dir,
+        ] {
+            assert!(
+                synced.contains(&path),
+                "{} was not synced after pointer publication",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn directory_sync_failure_after_pointer_reports_degraded_commit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = normalized_absolute_path(tmp.path()).unwrap();
+        let root = cli_root(&data_dir, CliId::Codex);
+        let runtime_parent = root.parent().unwrap().to_path_buf();
+        let stage = create_install_stage(&root, "2.0.0").unwrap();
+        std::fs::write(stage.join("codex"), "committed runtime").unwrap();
+        let prepared = PreparedInstall {
+            data_dir: data_dir.clone(),
+            id: CliId::Codex,
+            version: "2.0.0".into(),
+            stage,
+            bin_rel: PathBuf::from("codex"),
+            operation_epoch: String::new(),
+        };
+
+        let mut checkpoint = |_| Ok(());
+        let outcome = prepared
+            .activate_with_checkpoint_and_sync(&mut checkpoint, |path| {
+                if path == runtime_parent {
+                    Err(std::io::Error::other(
+                        "injected runtime-parent sync failure",
+                    ))
+                } else {
+                    Ok(())
+                }
+            })
+            .expect("the installed pointer already committed");
+        let ActivationOutcome::CommittedNotDurable {
+            installed: activated,
+            warning,
+        } = outcome
+        else {
+            panic!("the injected root sync failure was not surfaced");
+        };
+
+        assert_eq!(activated.version, "2.0.0");
+        assert!(warning.contains("crash durability could not be confirmed"));
+        let visible = installed(&data_dir, CliId::Codex).unwrap();
+        assert_eq!(visible.bin, activated.bin);
+        assert_eq!(
+            std::fs::read_to_string(visible.bin).unwrap(),
+            "committed runtime"
+        );
+    }
+
+    #[test]
+    fn recovery_generation_bound_blocks_growth_and_recovers_after_sync_returns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = normalized_absolute_path(tmp.path()).unwrap();
+        let root = cli_root(&data_dir, CliId::Codex);
+        let generations = root.join(".generations");
+
+        for index in 0..MAX_RETAINED_RUNTIME_GENERATIONS {
+            let version = format!("1.0.{index}");
+            let stage = create_install_stage(&root, &version).unwrap();
+            std::fs::write(stage.join("codex"), &version).unwrap();
+            let prepared = PreparedInstall {
+                data_dir: data_dir.clone(),
+                id: CliId::Codex,
+                version,
+                stage,
+                bin_rel: PathBuf::from("codex"),
+                operation_epoch: String::new(),
+            };
+            let mut checkpoint = |_| Ok(());
+            assert!(matches!(
+                prepared.activate_with_checkpoint_and_sync(&mut checkpoint, |path| {
+                    if path == root {
+                        Err(std::io::Error::other("injected root sync failure"))
+                    } else {
+                        Ok(())
+                    }
+                }),
+                Ok(ActivationOutcome::CommittedNotDurable { .. })
+            ));
+        }
+
+        let retained = std::fs::read_dir(&generations)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>();
+        assert_eq!(retained.len(), MAX_RETAINED_RUNTIME_GENERATIONS);
+        assert!(
+            retained
+                .iter()
+                .all(|generation| generation.join("codex").is_file())
+        );
+
+        let stage = create_install_stage(&root, "blocked").unwrap();
+        std::fs::write(stage.join("codex"), "blocked").unwrap();
+        let staged_path = stage.clone();
+        let prepared = PreparedInstall {
+            data_dir: data_dir.clone(),
+            id: CliId::Codex,
+            version: "blocked".into(),
+            stage,
+            bin_rel: PathBuf::from("codex"),
+            operation_epoch: String::new(),
+        };
+        let mut checkpoint = |_| Ok(());
+        let error = prepared
+            .activate_with_checkpoint_and_sync(&mut checkpoint, |path| {
+                if path == root {
+                    Err(std::io::Error::other("root sync is still unavailable"))
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("root sync is still unavailable"));
+        assert!(!staged_path.exists());
+        assert_eq!(
+            std::fs::read_dir(&generations).unwrap().count(),
+            MAX_RETAINED_RUNTIME_GENERATIONS
+        );
+
+        let stage = create_install_stage(&root, "recovered").unwrap();
+        std::fs::write(stage.join("codex"), "recovered").unwrap();
+        let prepared = PreparedInstall {
+            data_dir: data_dir.clone(),
+            id: CliId::Codex,
+            version: "recovered".into(),
+            stage,
+            bin_rel: PathBuf::from("codex"),
+            operation_epoch: String::new(),
+        };
+        let mut checkpoint = |_| Ok(());
+        let outcome = prepared
+            .activate_with_checkpoint_and_sync(&mut checkpoint, |_| Ok(()))
+            .unwrap();
+        assert!(matches!(outcome, ActivationOutcome::Durable(_)));
+        assert!(std::fs::read_dir(&generations).unwrap().count() <= 2);
+        assert_eq!(
+            installed(&data_dir, CliId::Codex).unwrap().version,
+            "recovered"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capacity_recovery_repairs_compatibility_symlink_before_pruning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = normalized_absolute_path(tmp.path()).unwrap();
+        let root = cli_root(&data_dir, CliId::Codex);
+        let generations = root.join(".generations");
+        std::fs::create_dir_all(&generations).unwrap();
+
+        let mut runtimes = Vec::new();
+        for index in 0..MAX_RETAINED_RUNTIME_GENERATIONS {
+            let runtime = generations.join(format!("runtime-{index}"));
+            std::fs::create_dir(&runtime).unwrap();
+            std::fs::write(runtime.join("codex"), format!("runtime-{index}")).unwrap();
+            runtimes.push(runtime);
+        }
+        let active_bin = runtimes.last().unwrap().join("codex");
+        std::fs::write(
+            root.join("installed.json"),
+            serde_json::to_string_pretty(&InstalledCli {
+                version: "active".into(),
+                bin: active_bin.to_string_lossy().into_owned(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let stale_bin = runtimes.first().unwrap().join("codex");
+        publish_legacy_managed_bin(&data_dir, CliId::Codex, &stale_bin).unwrap();
+
+        ensure_runtime_generation_capacity(
+            &data_dir,
+            CliId::Codex,
+            &root,
+            &generations,
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+
+        let compatibility = legacy_managed_bin_path(&data_dir, CliId::Codex);
+        assert_eq!(std::fs::read_link(&compatibility).unwrap(), active_bin);
+        assert!(compatibility.is_file());
+        assert!(!runtimes.first().unwrap().exists());
+    }
+
+    #[test]
+    fn cancellation_at_activation_commit_preserves_previous_runtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = cli_root(tmp.path(), CliId::Codex);
+        let previous = root.join("1.0.0");
+        let previous_bin = previous.join("codex");
+        std::fs::create_dir_all(&previous).unwrap();
+        std::fs::write(&previous_bin, "previous runtime").unwrap();
+        std::fs::write(
+            root.join("installed.json"),
+            serde_json::to_string_pretty(&InstalledCli {
+                version: "1.0.0".into(),
+                bin: previous_bin.to_string_lossy().into_owned(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let stage = create_install_stage(&root, "2.0.0").unwrap();
+        std::fs::write(stage.join("codex"), "prepared runtime").unwrap();
+        let prepared = PreparedInstall {
+            data_dir: tmp.path().to_path_buf(),
+            id: CliId::Codex,
+            version: "2.0.0".into(),
+            stage,
+            bin_rel: PathBuf::from("codex"),
+            operation_epoch: String::new(),
+        };
+        let progress = Progress::default();
+        progress
+            .cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        assert!(matches!(
+            prepared.activate_cancellable(&progress),
+            Err(InstallError::Cancelled)
+        ));
+        let active = installed(tmp.path(), CliId::Codex).unwrap();
+        assert_eq!(active.version, "1.0.0");
+        assert_eq!(
+            std::fs::read_to_string(active.bin).unwrap(),
+            "previous runtime"
+        );
+        assert_eq!(
+            std::fs::read_dir(root.join(".generations"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn runtime_activation_lock_serializes_independent_openers() {
+        use fs4::fs_std::FileExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let first = lock_runtime_activation(tmp.path(), CliId::Codex).unwrap();
+        let second = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(runtime_activation_lock_path(tmp.path(), CliId::Codex))
+            .unwrap();
+
+        assert!(!second.try_lock_exclusive().unwrap());
+        fs4::fs_std::FileExt::unlock(&first).unwrap();
+        assert!(second.try_lock_exclusive().unwrap());
+        fs4::fs_std::FileExt::unlock(&second).unwrap();
     }
 
     #[test]
@@ -892,34 +2845,361 @@ DOWNLOAD_URL="https://downloads.cursor.com/lab/2026.07.01-41b2de7/${OS}/${ARCH}/
             .unwrap(),
         )
         .unwrap();
-        let link = managed_bin(tmp.path(), CliId::Codex);
+        let link = legacy_managed_bin_path(tmp.path(), CliId::Codex);
         std::fs::create_dir_all(link.parent().unwrap()).unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink(&bin, &link).unwrap();
+        drop(
+            open_runtime_lease_file(
+                tmp.path(),
+                CliId::Codex,
+                RuntimeContainerKind::Legacy,
+                &root.join("1.0.0"),
+            )
+            .unwrap(),
+        );
 
         uninstall(tmp.path(), CliId::Codex).unwrap();
         assert!(installed(tmp.path(), CliId::Codex).is_none());
         assert!(!root.exists());
         assert!(link.symlink_metadata().is_err());
+        assert!(!tmp.path().join("cli/.leases/codex").exists());
 
         // Uninstalling again is a no-op, not an error.
         uninstall(tmp.path(), CliId::Codex).unwrap();
     }
 
     #[test]
-    fn prune_keeps_active_and_one_previous() {
+    fn uninstall_invalidates_an_earlier_cross_process_preparation() {
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().to_path_buf();
-        for v in ["1.0.0", "1.1.0", "1.2.0", "2.0.0"] {
+        let root = cli_root(tmp.path(), CliId::Codex);
+        let stage = create_install_stage(&root, "2.0.0").unwrap();
+        std::fs::write(stage.join("codex"), "prepared runtime").unwrap();
+        let prepared = PreparedInstall {
+            data_dir: tmp.path().to_path_buf(),
+            id: CliId::Codex,
+            version: "2.0.0".into(),
+            stage: stage.clone(),
+            bin_rel: PathBuf::from("codex"),
+            operation_epoch: String::new(),
+        };
+
+        uninstall(tmp.path(), CliId::Codex).unwrap();
+        // Model a downloader in another process finishing after uninstall
+        // removed its staging tree. Even if the bytes reappear, its old epoch
+        // cannot republish the runtime.
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::write(stage.join("codex"), "late prepared runtime").unwrap();
+        let error = prepared.activate().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("invalidated by a later uninstall")
+        );
+        assert!(installed(tmp.path(), CliId::Codex).is_none());
+    }
+
+    #[test]
+    fn uninstall_refuses_to_remove_a_leased_runtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = cli_root(tmp.path(), CliId::Codex);
+        let version_dir = root.join("1.0.0");
+        let bin = version_dir.join("codex");
+        std::fs::create_dir_all(&version_dir).unwrap();
+        std::fs::write(&bin, "runtime").unwrap();
+        std::fs::write(
+            root.join("installed.json"),
+            serde_json::to_string(&InstalledCli {
+                version: "1.0.0".into(),
+                bin: bin.to_string_lossy().into_owned(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let (_, lease) = installed_with_lease(tmp.path(), CliId::Codex).unwrap();
+
+        let error = uninstall(tmp.path(), CliId::Codex).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(bin.is_file());
+        assert!(root.join("installed.json").is_file());
+
+        drop(lease);
+        uninstall(tmp.path(), CliId::Codex).unwrap();
+        assert!(!root.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_runtime_lease_unlocks_an_inherited_descriptor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = cli_root(tmp.path(), CliId::Codex);
+        let runtime = root.join(".generations").join("runtime-test");
+        let bin = runtime.join("codex");
+        std::fs::create_dir_all(&runtime).unwrap();
+        std::fs::write(&bin, "codex").unwrap();
+        std::fs::write(
+            root.join("installed.json"),
+            serde_json::to_string(&InstalledCli {
+                version: "test".into(),
+                bin: bin.to_string_lossy().into_owned(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let (_, lease) = installed_with_lease(tmp.path(), CliId::Codex).unwrap();
+        let inherited = lease._lock.try_clone().unwrap();
+        drop(lease);
+
+        let contender = open_runtime_lease_file(
+            tmp.path(),
+            CliId::Codex,
+            RuntimeContainerKind::Generation,
+            &runtime,
+        )
+        .unwrap();
+        assert!(fs4::fs_std::FileExt::try_lock_exclusive(&contender).unwrap());
+        fs4::fs_std::FileExt::unlock(&contender).unwrap();
+        drop(inherited);
+    }
+
+    #[test]
+    fn cursor_sdk_uninstall_preserves_legacy_runtime_for_older_processes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sdk_root = cli_root(tmp.path(), CliId::CursorSdkBridge);
+        let sdk_bin = sdk_root
+            .join("1.0.28")
+            .join("bin")
+            .join("cursor-sdk-bridge");
+        std::fs::create_dir_all(sdk_bin.parent().unwrap()).unwrap();
+        std::fs::write(&sdk_bin, "bridge").unwrap();
+        std::fs::write(
+            sdk_root.join("installed.json"),
+            serde_json::to_string(&InstalledCli {
+                version: "1.0.28".into(),
+                bin: sdk_bin.to_string_lossy().into_owned(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let sdk_link = legacy_managed_bin_path(tmp.path(), CliId::CursorSdkBridge);
+        std::fs::create_dir_all(sdk_link.parent().unwrap()).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&sdk_bin, &sdk_link).unwrap();
+
+        let legacy_root = tmp.path().join("cli").join("cursor-agent");
+        std::fs::create_dir_all(&legacy_root).unwrap();
+        std::fs::write(legacy_root.join("installed.json"), "legacy").unwrap();
+        let legacy_link = tmp.path().join("cli").join("bin").join("cursor-agent");
+        std::fs::write(&legacy_link, "legacy").unwrap();
+        let legacy_windows_link = tmp.path().join("cli").join("bin").join("cursor-agent.exe");
+        std::fs::write(&legacy_windows_link, "legacy windows").unwrap();
+        let external = tmp.path().join("system-cursor-agent");
+        std::fs::write(&external, "outside trouve's managed layout").unwrap();
+
+        uninstall(tmp.path(), CliId::CursorSdkBridge).unwrap();
+
+        assert!(!sdk_root.exists());
+        assert!(sdk_link.symlink_metadata().is_err());
+        assert!(legacy_root.exists());
+        assert!(legacy_link.exists());
+        assert!(legacy_windows_link.exists());
+        assert!(external.exists());
+    }
+
+    #[test]
+    fn cursor_sdk_uninstall_does_not_touch_a_legacy_runtime_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sdk_root = cli_root(tmp.path(), CliId::CursorSdkBridge);
+        std::fs::create_dir_all(&sdk_root).unwrap();
+        let legacy_root = tmp.path().join("cli").join("cursor-agent");
+        std::fs::write(&legacy_root, "not a directory").unwrap();
+
+        uninstall(tmp.path(), CliId::CursorSdkBridge).unwrap();
+
+        assert!(!sdk_root.exists());
+        assert!(legacy_root.is_file());
+    }
+
+    #[test]
+    fn legacy_prune_keeps_the_exact_previous_runtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = cli_root(tmp.path(), CliId::Codex);
+        for v in ["1.0.0", "1.1.0", "1.2.0"] {
             std::fs::create_dir_all(root.join(v)).unwrap();
         }
-        prune_old_versions(&root, "2.0.0");
+        let previous = root.join("1.1.0");
+        prune_old_versions(tmp.path(), CliId::Codex, &root, Some(&previous));
         let mut left: Vec<String> = std::fs::read_dir(&root)
             .unwrap()
             .flatten()
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
         left.sort();
-        assert_eq!(left, vec!["1.2.0", "2.0.0"]);
+        assert_eq!(left, vec!["1.1.0"]);
+    }
+
+    #[test]
+    fn generation_prune_keeps_active_and_one_previous() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = cli_root(tmp.path(), CliId::Codex);
+        let generations = root.join(".generations");
+        std::fs::create_dir_all(&generations).unwrap();
+        let active = generations.join("runtime-active");
+        let previous = generations.join("runtime-previous");
+        for generation in ["runtime-oldest", "runtime-previous", "runtime-active"] {
+            std::fs::create_dir(generations.join(generation)).unwrap();
+        }
+
+        prune_runtime_generations(
+            tmp.path(),
+            CliId::Codex,
+            &generations,
+            &active,
+            Some(&previous),
+        );
+
+        let remaining = std::fs::read_dir(&generations)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>();
+        assert_eq!(remaining.len(), 2);
+        assert!(active.is_dir());
+        assert!(previous.is_dir());
+        assert!(!generations.join("runtime-oldest").exists());
+        assert!(
+            !runtime_lease_path(
+                tmp.path(),
+                CliId::Codex,
+                RuntimeContainerKind::Generation,
+                &generations.join("runtime-oldest"),
+            )
+            .unwrap()
+            .exists()
+        );
+    }
+
+    #[test]
+    fn leased_generation_survives_two_later_activations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = cli_root(tmp.path(), CliId::Codex);
+
+        let activate = |version: &str| {
+            let stage = create_install_stage(&root, version).unwrap();
+            std::fs::write(stage.join("codex"), version).unwrap();
+            let outcome = PreparedInstall {
+                data_dir: tmp.path().to_path_buf(),
+                id: CliId::Codex,
+                version: version.into(),
+                stage,
+                bin_rel: PathBuf::from("codex"),
+                operation_epoch: String::new(),
+            }
+            .activate()
+            .unwrap();
+            let ActivationOutcome::Durable(installed) = outcome else {
+                panic!("ordinary activation unexpectedly lacked durability");
+            };
+            installed
+        };
+
+        let first = activate("1.0.0");
+        let (_, lease) = installed_with_lease(tmp.path(), CliId::Codex).unwrap();
+        activate("2.0.0");
+        activate("3.0.0");
+
+        assert!(Path::new(&first.bin).is_file());
+        drop(lease);
+        activate("4.0.0");
+        assert!(!Path::new(&first.bin).exists());
+    }
+
+    const TEST_RUNTIME_LEASE_DATA_DIR_ENV: &str = "TROUVE_TEST_RUNTIME_LEASE_DATA_DIR";
+    const TEST_RUNTIME_LEASE_MARKER_ENV: &str = "TROUVE_TEST_RUNTIME_LEASE_MARKER";
+    const TEST_RUNTIME_LEASE_RELEASE_ENV: &str = "TROUVE_TEST_RUNTIME_LEASE_RELEASE";
+
+    #[test]
+    fn runtime_lease_process_helper() {
+        let Some(data_dir) = std::env::var_os(TEST_RUNTIME_LEASE_DATA_DIR_ENV) else {
+            return;
+        };
+        let marker = PathBuf::from(std::env::var_os(TEST_RUNTIME_LEASE_MARKER_ENV).unwrap());
+        let release = PathBuf::from(std::env::var_os(TEST_RUNTIME_LEASE_RELEASE_ENV).unwrap());
+        let data_dir = PathBuf::from(data_dir);
+        let (runtime, lease) = installed_with_lease(&data_dir, CliId::Codex).unwrap();
+        std::fs::write(&marker, "leased").unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !release.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            release.exists(),
+            "parent never released runtime lease helper"
+        );
+        assert_eq!(std::fs::read_to_string(&runtime.bin).unwrap(), "1.0.0");
+        drop(lease);
+    }
+
+    #[test]
+    fn cross_process_lease_survives_two_later_activations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = cli_root(tmp.path(), CliId::Codex);
+        let activate = |version: &str| {
+            let stage = create_install_stage(&root, version).unwrap();
+            std::fs::write(stage.join("codex"), version).unwrap();
+            let outcome = PreparedInstall {
+                data_dir: tmp.path().to_path_buf(),
+                id: CliId::Codex,
+                version: version.into(),
+                stage,
+                bin_rel: PathBuf::from("codex"),
+                operation_epoch: String::new(),
+            }
+            .activate()
+            .unwrap();
+            let ActivationOutcome::Durable(installed) = outcome else {
+                panic!("ordinary activation unexpectedly lacked durability");
+            };
+            installed
+        };
+
+        let first = activate("1.0.0");
+        let marker = tmp.path().join("lease-held");
+        let release = tmp.path().join("lease-release");
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .arg("--exact")
+            .arg("install::tests::runtime_lease_process_helper")
+            .arg("--nocapture")
+            .env(TEST_RUNTIME_LEASE_DATA_DIR_ENV, tmp.path())
+            .env(TEST_RUNTIME_LEASE_MARKER_ENV, &marker)
+            .env(TEST_RUNTIME_LEASE_RELEASE_ENV, &release)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let mut holder = trouve_process::spawn(&mut command).unwrap();
+
+        let marker_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !marker.exists() && std::time::Instant::now() < marker_deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if !marker.exists() {
+            let _ = std::fs::write(&release, "release");
+            let _ = holder.wait();
+            panic!("runtime lease helper did not acquire its shared lease");
+        }
+
+        activate("2.0.0");
+        activate("3.0.0");
+        let survived = Path::new(&first.bin).is_file();
+        std::fs::write(&release, "release").unwrap();
+        let status = holder.wait().unwrap();
+
+        assert!(status.success());
+        assert!(survived, "another process pruned the leased generation");
+        activate("4.0.0");
+        assert!(!Path::new(&first.bin).exists());
     }
 }
