@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 
 use futures::StreamExt;
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::ChildStdin;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use trouve_protocol::{ModelInfo, TodoItem, TodoStatus, Usage};
@@ -43,6 +43,11 @@ use crate::{
 const COLLABORATOR_START_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 #[cfg(test)]
 const COLLABORATOR_START_GRACE: std::time::Duration = std::time::Duration::from_millis(25);
+const APP_SERVER_STDERR_TAIL_BYTES: usize = 8 * 1024;
+const APP_SERVER_STDERR_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+const SENSITIVE_APP_SERVER_STDERR_ENV: &str = "TROUVE_LOG_SENSITIVE_APP_SERVER_STDERR";
+
+type AppServerStderrTail = Arc<std::sync::Mutex<VecDeque<u8>>>;
 
 pub struct CodexBackend {
     id: String,
@@ -3210,10 +3215,28 @@ async fn terminate_transport_parts(
         .map_err(BackendError::Io)
 }
 
-fn kill_and_reap_child(child: Arc<std::sync::Mutex<ProcessTreeChild>>) -> std::io::Result<()> {
+/// Exit details retained after the complete app-server process tree is reaped.
+struct AppServerReapOutcome {
+    status: std::process::ExitStatus,
+    termination_requested: bool,
+}
+
+/// Terminates an unusable app-server tree and reports how its leader exited.
+fn kill_and_reap_child(
+    child: Arc<std::sync::Mutex<ProcessTreeChild>>,
+) -> std::io::Result<AppServerReapOutcome> {
     let Ok(mut child) = child.lock() else {
         tracing::warn!("codex: app-server process lock is poisoned");
         return Err(std::io::Error::other("app-server process lock is poisoned"));
+    };
+    let termination_requested = match child.try_wait_leader() {
+        Ok(status) => status.is_none(),
+        Err(error) => {
+            // Failure to inspect the leader must not skip the existing
+            // best-effort termination and tree reaping path.
+            tracing::warn!("codex: failed to inspect app-server exit status: {error}");
+            true
+        }
     };
     let mut terminate_error = child.terminate_now().err();
     if let Some(error) = terminate_error.as_ref() {
@@ -3223,7 +3246,12 @@ fn kill_and_reap_child(child: Arc<std::sync::Mutex<ProcessTreeChild>>) -> std::i
     let mut retried_after_leader_exit = false;
     loop {
         match child.try_wait_tree() {
-            Ok(Some(_)) => return Ok(()),
+            Ok(Some(status)) => {
+                return Ok(AppServerReapOutcome {
+                    status,
+                    termination_requested,
+                });
+            }
             Ok(None) => {
                 if !retried_after_leader_exit {
                     match child.retry_termination_after_leader_exit() {
@@ -3263,6 +3291,99 @@ fn kill_and_reap_child(child: Arc<std::sync::Mutex<ProcessTreeChild>>) -> std::i
     }
 }
 
+/// Owns the stderr drain task until shutdown diagnostics have consumed it.
+struct AppServerStderrCapture {
+    tail: AppServerStderrTail,
+    task: tokio::task::JoinHandle<()>,
+    diagnostics_ready: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for AppServerStderrCapture {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Drains app-server stderr into a bounded rolling buffer.
+async fn capture_app_server_stderr<R: AsyncRead + Unpin>(mut stderr: R, tail: AppServerStderrTail) {
+    let mut chunk = [0_u8; 1024];
+    loop {
+        let read = match stderr.read(&mut chunk).await {
+            Ok(0) => return,
+            Ok(read) => read,
+            Err(error) => {
+                tracing::warn!(%error, "codex: failed to read app-server stderr");
+                return;
+            }
+        };
+        let mut tail = tail.lock().unwrap();
+        tail.extend(&chunk[..read]);
+        while tail.len() > APP_SERVER_STDERR_TAIL_BYTES {
+            tail.pop_front();
+        }
+    }
+}
+
+/// Starts a lifecycle-owned stderr capture for an app-server pipe.
+fn start_app_server_stderr_capture<R>(stderr: R) -> AppServerStderrCapture
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    let tail = Arc::new(std::sync::Mutex::new(VecDeque::new()));
+    let diagnostics_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let task = tokio::spawn(capture_app_server_stderr(stderr, tail.clone()));
+    AppServerStderrCapture {
+        tail,
+        task,
+        diagnostics_ready,
+    }
+}
+
+/// Waits briefly for the final stderr bytes after process cleanup.
+async fn finish_app_server_stderr_capture(
+    mut capture: Option<AppServerStderrCapture>,
+) -> Option<AppServerStderrTail> {
+    let capture = capture.as_mut()?;
+    match tokio::time::timeout(APP_SERVER_STDERR_DRAIN_TIMEOUT, &mut capture.task).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::warn!(%error, "codex: app-server stderr capture task failed"),
+        Err(_) => {
+            tracing::warn!(
+                "codex: app-server stderr did not close within {}s after process cleanup",
+                APP_SERVER_STDERR_DRAIN_TIMEOUT.as_secs()
+            );
+            capture.task.abort();
+            let _ = (&mut capture.task).await;
+        }
+    }
+    capture.diagnostics_ready.store(true, Ordering::Release);
+    Some(capture.tail.clone())
+}
+
+/// Formats stderr for logs without exposing arbitrary child output by default.
+fn app_server_stderr_for_log(tail: Option<&AppServerStderrTail>, expose_sensitive: bool) -> String {
+    let Some(tail) = tail else {
+        return String::new();
+    };
+    let bytes = tail.lock().unwrap().iter().copied().collect::<Vec<_>>();
+    if bytes.is_empty() {
+        return String::new();
+    }
+    if expose_sensitive {
+        String::from_utf8_lossy(&bytes).trim().to_string()
+    } else {
+        format!(
+            "[{} bytes redacted; set {SENSITIVE_APP_SERVER_STDERR_ENV}=1 to include sensitive app-server stderr]",
+            bytes.len()
+        )
+    }
+}
+
+/// Returns whether the operator explicitly opted into sensitive stderr logs.
+fn sensitive_app_server_stderr_logging_enabled() -> bool {
+    std::env::var(SENSITIVE_APP_SERVER_STDERR_ENV).as_deref() == Ok("1")
+}
+
 fn start_kill_child_now(child: &std::sync::Mutex<ProcessTreeChild>) {
     match child.try_lock() {
         Ok(mut child) => {
@@ -3280,12 +3401,15 @@ fn start_kill_child_now(child: &std::sync::Mutex<ProcessTreeChild>) {
     }
 }
 
+/// Shared turn state and diagnostics owned by the stdout router task.
 struct ReaderTurnState {
     active_turns: Option<ActiveTurns>,
     completed_turns: Option<CompletedTurns>,
     turn_lifecycles: Option<TurnLifecycles>,
+    stderr_capture: Option<AppServerStderrCapture>,
 }
 
+/// Routes app-server stdout until closure, then completes transport diagnostics.
 async fn read_stdout<R: AsyncRead + Unpin>(
     stdout: R,
     pending: Pending,
@@ -3299,9 +3423,15 @@ async fn read_stdout<R: AsyncRead + Unpin>(
         active_turns,
         completed_turns,
         turn_lifecycles,
+        stderr_capture,
     } = turn_state;
     let mut lines = BufReader::new(stdout).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
+    let stdout_error = loop {
+        let line = match lines.next_line().await {
+            Ok(Some(line)) => line,
+            Ok(None) => break None,
+            Err(error) => break Some(error),
+        };
         let Ok(msg) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
@@ -3413,16 +3543,39 @@ async fn read_stdout<R: AsyncRead + Unpin>(
                 }
             }
         }
-    }
+    };
     // Dropping stdout means the app-server can never complete any
     // outstanding request or turn. Drop every sender it left behind so
     // request waiters and routed turn streams wake immediately instead of
     // remaining active forever.
+    let unexpected_close = !closed.load(Ordering::Relaxed);
     close_transport(&pending, &routing, active_turns.as_ref(), &closed).await;
     if let Some(child) = child.and_then(|child| child.upgrade()) {
-        match tokio::task::spawn_blocking(move || kill_and_reap_child(child)).await {
-            Ok(Ok(())) => {}
+        let cleanup = tokio::task::spawn_blocking(move || kill_and_reap_child(child)).await;
+        let stderr_tail = finish_app_server_stderr_capture(stderr_capture).await;
+        let stderr = app_server_stderr_for_log(
+            stderr_tail.as_ref(),
+            sensitive_app_server_stderr_logging_enabled(),
+        );
+        match cleanup {
+            Ok(Ok(outcome)) => {
+                if unexpected_close {
+                    tracing::error!(
+                        status = %outcome.status,
+                        termination_requested = outcome.termination_requested,
+                        stdout_error = stdout_error.as_ref().map(std::string::ToString::to_string),
+                        stderr = %stderr,
+                        "codex: app-server stdout closed unexpectedly"
+                    );
+                }
+            }
             Ok(Err(error)) => {
+                tracing::error!(
+                    %error,
+                    stdout_error = stdout_error.as_ref().map(std::string::ToString::to_string),
+                    stderr = %stderr,
+                    "codex: app-server stdout closed and process cleanup failed"
+                );
                 tracing::warn!("codex: stdout EOF cleanup was not acknowledged: {error}");
             }
             Err(error) => {
@@ -3504,6 +3657,10 @@ struct AppServer {
     retired_response_tx: mpsc::Sender<Value>,
     closed: Arc<std::sync::atomic::AtomicBool>,
     transport_cleanup_started: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    stderr_tail: AppServerStderrTail,
+    #[cfg(test)]
+    stderr_diagnostics_ready: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Drop for AppServer {
@@ -3532,19 +3689,22 @@ impl Drop for TransportWriteGuard<'_> {
 }
 
 impl AppServer {
+    /// Spawns one multiplexed Codex app-server and its owned I/O tasks.
     async fn spawn(command: &str) -> Result<Self, BackendError> {
         let mut command_process = crate::process_env::tokio_command(command);
         command_process
             .arg("app-server")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
         let mut child = spawn_process_tree(&mut command_process).map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => BackendError::NotInstalled(command.to_string()),
             _ => BackendError::Io(e),
         })?;
         let stdin = Arc::new(Mutex::new(child.take_stdin().expect("stdin piped")));
         let stdout = child.take_stdout().expect("stdout piped");
+        let stderr = child.take_stderr().expect("stderr piped");
+        let stderr_capture = start_app_server_stderr_capture(stderr);
         let (retired_response_tx, retired_response_rx) = mpsc::channel(ROUTE_EVENT_BUDGET);
 
         let server = Self {
@@ -3561,9 +3721,13 @@ impl AppServer {
             retired_response_tx,
             closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             transport_cleanup_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(test)]
+            stderr_tail: stderr_capture.tail.clone(),
+            #[cfg(test)]
+            stderr_diagnostics_ready: stderr_capture.diagnostics_ready.clone(),
         };
         server.start_response_writer(retired_response_rx);
-        server.start_reader(stdout);
+        server.start_reader(stdout, stderr_capture);
         Ok(server)
     }
 
@@ -3699,7 +3863,12 @@ impl AppServer {
         let _ = kill_and_reap_child(self.child.clone());
     }
 
-    fn start_reader(&self, stdout: tokio::process::ChildStdout) {
+    /// Starts the stdout router with ownership of the matching stderr drain.
+    fn start_reader(
+        &self,
+        stdout: tokio::process::ChildStdout,
+        stderr_capture: AppServerStderrCapture,
+    ) {
         let closed = self.closed.clone();
         let pending = self.pending.clone();
         let routing = self.routing.clone();
@@ -3713,6 +3882,7 @@ impl AppServer {
                 active_turns: Some(active_turns),
                 completed_turns: Some(self.completed_turns.clone()),
                 turn_lifecycles: Some(self.turn_lifecycles.clone()),
+                stderr_capture: Some(stderr_capture),
             },
             self.retired_response_tx.clone(),
             closed,
@@ -6091,6 +6261,8 @@ for line in sys.stdin:
     if method == "turn/start" and first_process:
         while not os.path.exists(close_path):
             time.sleep(0.005)
+        sys.stderr.write("last-moment app-server crash diagnostic\n")
+        sys.stderr.flush()
         os.close(1)
         time.sleep(60)
 "#,
@@ -6187,6 +6359,24 @@ for line in sys.stdin:
         assert!(
             !std::path::Path::new(&format!("/proc/{first_pid}")).exists(),
             "cancelled replacement acquisition returned before stale reap"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !first.stderr_diagnostics_ready.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("stdout cleanup did not finish the stderr drain");
+        assert!(
+            first
+                .stderr_tail
+                .lock()
+                .unwrap()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>()
+                .ends_with(b"last-moment app-server crash diagnostic\n"),
+            "shutdown diagnostics omitted stderr written immediately before stdout EOF"
         );
         assert!(
             !overlap_marker.exists(),
@@ -6415,6 +6605,66 @@ for line in sys.stdin:
     }
 
     #[tokio::test]
+    async fn app_server_stderr_tail_is_bounded_and_keeps_latest_output() {
+        let (mut writer, reader) = tokio::io::duplex(1024);
+        let capture = start_app_server_stderr_capture(reader);
+        let diagnostic = b"final app-server diagnostic";
+        writer
+            .write_all(&vec![b'x'; APP_SERVER_STDERR_TAIL_BYTES + 256])
+            .await
+            .unwrap();
+        writer.write_all(diagnostic).await.unwrap();
+        writer.shutdown().await.unwrap();
+        let tail = finish_app_server_stderr_capture(Some(capture))
+            .await
+            .unwrap();
+
+        let captured = tail.lock().unwrap();
+        assert_eq!(captured.len(), APP_SERVER_STDERR_TAIL_BYTES);
+        assert!(
+            captured
+                .iter()
+                .copied()
+                .collect::<Vec<_>>()
+                .ends_with(diagnostic)
+        );
+    }
+
+    #[tokio::test]
+    async fn stderr_capture_waits_for_output_written_immediately_before_shutdown() {
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let capture = start_app_server_stderr_capture(reader);
+        let diagnostic = b"last-moment crash diagnostic";
+        let write = tokio::spawn(async move {
+            writer.write_all(diagnostic).await.unwrap();
+            writer.shutdown().await.unwrap();
+        });
+
+        let tail = finish_app_server_stderr_capture(Some(capture))
+            .await
+            .unwrap();
+        write.await.unwrap();
+
+        assert_eq!(
+            tail.lock().unwrap().iter().copied().collect::<Vec<_>>(),
+            diagnostic
+        );
+    }
+
+    #[test]
+    fn app_server_stderr_is_redacted_without_explicit_sensitive_logging_opt_in() {
+        let secret = "credential=secret-token private prompt contents";
+        let tail = Arc::new(std::sync::Mutex::new(secret.bytes().collect()));
+
+        let diagnostic = app_server_stderr_for_log(Some(&tail), false);
+
+        assert!(!diagnostic.contains("secret-token"));
+        assert!(!diagnostic.contains("private prompt"));
+        assert!(diagnostic.contains("bytes redacted"));
+        assert!(diagnostic.contains(SENSITIVE_APP_SERVER_STDERR_ENV));
+    }
+
+    #[tokio::test]
     async fn reader_eof_releases_pending_requests_and_turn_routes() {
         let deadline = std::time::Duration::from_secs(1);
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
@@ -6435,6 +6685,7 @@ for line in sys.stdin:
                 active_turns: None,
                 completed_turns: None,
                 turn_lifecycles: None,
+                stderr_capture: None,
             },
             retired_response_tx,
             closed.clone(),
@@ -6485,6 +6736,7 @@ for line in sys.stdin:
                 active_turns: Some(active_turns.clone()),
                 completed_turns: Some(completed_turns.clone()),
                 turn_lifecycles: Some(turn_lifecycles.clone()),
+                stderr_capture: None,
             },
             retired_response_tx,
             closed,
@@ -6618,6 +6870,7 @@ for line in sys.stdin:
                 active_turns: Some(active_turns.clone()),
                 completed_turns: Some(completed_turns),
                 turn_lifecycles: Some(turn_lifecycles),
+                stderr_capture: None,
             },
             retired_response_tx,
             closed,
@@ -7452,6 +7705,7 @@ cat > /dev/null
                 active_turns: None,
                 completed_turns: None,
                 turn_lifecycles: None,
+                stderr_capture: None,
             },
             retired_response_tx,
             closed.clone(),
