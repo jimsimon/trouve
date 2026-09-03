@@ -14824,9 +14824,21 @@ fn prioritized_finding_history(
     let mut selected = findings
         .iter()
         .rev()
-        .filter(|finding| finding.status == "open")
+        .filter(|finding| {
+            finding.status == "open" && finding_is_blocking(&finding.severity, &finding.confidence)
+        })
         .cloned()
         .collect::<Vec<_>>();
+    selected.extend(
+        findings
+            .iter()
+            .rev()
+            .filter(|finding| {
+                finding.status == "open"
+                    && !finding_is_blocking(&finding.severity, &finding.confidence)
+            })
+            .cloned(),
+    );
     selected.extend(
         findings
             .iter()
@@ -14836,7 +14848,10 @@ fn prioritized_finding_history(
             .cloned(),
     );
     // compact_finding_history and prior_fix_diff_context iterate in reverse,
-    // so leave the highest-priority/newest record at the end.
+    // so leave blocking open findings at the end, followed by advisory open
+    // findings and then bounded closed history. This prevents newer advisory
+    // debt from consuming the byte budget before an older check-gating issue
+    // can be assessed for resolution.
     selected.reverse();
     selected
 }
@@ -24603,6 +24618,44 @@ rename to src/new.rs
         assert!(selected.iter().any(|finding| {
             finding.id == format!("fixed-{}", REVIEW_HISTORY_MAX_FINDINGS + 49)
         }));
+    }
+
+    #[test]
+    fn coordinator_history_budget_prioritizes_blockers_before_advisory_debt() {
+        let finding = |id: String, severity: &str, confidence: &str| {
+            serde_json::from_value::<trouve_protocol::CodeReviewFinding>(serde_json::json!({
+                "id": id,
+                "job_id": "rvj-history",
+                "path": "src/lib.rs",
+                "line": 3,
+                "side": "RIGHT",
+                "severity": severity,
+                "confidence": confidence,
+                "title": "History finding",
+                "body": "x".repeat(REVIEW_HISTORY_TEXT_MAX_BYTES),
+                "status": "open"
+            }))
+            .unwrap()
+        };
+        let mut findings = vec![finding("blocking-oldest".into(), "medium", "medium")];
+        findings.extend((0..100).map(|index| finding(format!("advisory-{index}"), "low", "high")));
+
+        let selected = prioritized_finding_history(&findings);
+        assert_eq!(selected.last().unwrap().id, "blocking-oldest");
+        let compact = compact_finding_history(
+            &selected,
+            REVIEW_HISTORY_FINDINGS_MAX_BYTES,
+            &HashMap::new(),
+        )
+        .unwrap();
+
+        assert!(
+            compact
+                .iter()
+                .any(|finding| finding["id"] == "blocking-oldest"),
+            "the check-gating finding must survive history byte pressure"
+        );
+        assert!(compact.len() < findings.len());
     }
 
     #[test]
