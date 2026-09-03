@@ -6,6 +6,23 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [4.8.1] - 2026-09-03
+
+This patch release improves failure diagnostics for Codex-backed sessions and
+keeps blocking review findings visible when prior review history reaches its
+size limit.
+
+### Fixed
+
+- **Protected Codex crash diagnostics**: unexpected app-server shutdowns now
+  retain the final bounded stderr tail and exit status for operators, wait for
+  late diagnostic bytes, and redact arbitrary child output unless sensitive
+  logging is explicitly enabled.
+- **Blocking review history under pressure**: check-gating findings are
+  prioritized ahead of advisory debt when compacting prior review context, so
+  older blockers remain available for resolution even when the history byte
+  budget is full.
+
 ## [4.8.0] - 2026-09-02
 
 This release preserves model-produced media in conversations, adds faster and
@@ -1123,6 +1140,7 @@ semble ([BENCHMARKS.md](BENCHMARKS.md)):
 - Incremental reindex (1 file touched): 0.86 s vs ~3 min (212x)
 - Warm query: 0.55 s vs 7.2 s (13x)
 
+[4.8.1]: https://github.com/jimsimon/trouve/compare/v4.8.0...v4.8.1
 [4.8.0]: https://github.com/jimsimon/trouve/compare/v4.7.0...v4.8.0
 [4.7.0]: https://github.com/jimsimon/trouve/compare/v4.6.0...v4.7.0
 [4.6.0]: https://github.com/jimsimon/trouve/compare/v4.5.0...v4.6.0
