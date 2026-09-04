@@ -138,7 +138,9 @@ pub struct DetachedProcess {
     /// Kernel start time of the pid when it was released; with the pid it
     /// names one process incarnation in reports and records.
     pub start_time: u64,
-    /// The process's short command name (`/proc/<pid>/comm`).
+    /// The process's short command name (`/proc/<pid>/comm`), reduced to
+    /// printable ASCII of at most 15 characters: the process chooses it, and
+    /// it reaches logs and results that outlive the call.
     pub name: String,
     /// A pidfd bound to that incarnation of the pid (Linux 5.3+): liveness
     /// checks and signals through it cannot reach a successor to the pid.
@@ -1745,11 +1747,34 @@ fn parse_linux_process_stat(stat: &str) -> Option<LinuxProcessStat> {
     })
 }
 
+/// Longest process name the kernel stores (`TASK_COMM_LEN` minus the NUL).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const LINUX_PROCESS_NAME_LEN: usize = 15;
+
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn linux_process_name(pid: i32) -> String {
     std::fs::read_to_string(format!("/proc/{pid}/comm"))
-        .map(|name| name.trim().to_string())
+        .map(|name| sanitize_process_name(&name))
         .unwrap_or_default()
+}
+
+/// Reduces a process name the process chose for itself (`prctl(PR_SET_NAME)`)
+/// to printable ASCII of bounded length before it reaches logs and results
+/// that outlive the call: anything else is replaced with `?`, so a name
+/// carrying control characters cannot forge log lines or terminal escapes.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn sanitize_process_name(name: &str) -> String {
+    name.trim()
+        .chars()
+        .take(LINUX_PROCESS_NAME_LEN)
+        .map(|c| {
+            if c == ' ' || c.is_ascii_graphic() {
+                c
+            } else {
+                '?'
+            }
+        })
+        .collect()
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -2433,6 +2458,28 @@ mod tests {
             !linux_process_state_is_active('Z', 1, own_pid),
             "an inert zombie owned by another reaper cannot quarantine the tree"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_names_reach_records_as_bounded_printable_ascii() {
+        assert_eq!(sanitize_process_name("sccache\n"), "sccache");
+        assert_eq!(sanitize_process_name("Web Content\n"), "Web Content");
+        assert_eq!(
+            sanitize_process_name("a\x1b[31mb\r\nc\td\u{7f}é"),
+            "a?[31mb??c?d??"
+        );
+        assert_eq!(
+            sanitize_process_name("0123456789abcdefghij"),
+            "0123456789abcde"
+        );
+        assert_eq!(sanitize_process_name("  \n"), "");
+
+        let own_pid = i32::try_from(std::process::id()).unwrap();
+        let own = linux_process_name(own_pid);
+        assert!(!own.is_empty());
+        assert!(own.len() <= LINUX_PROCESS_NAME_LEN);
+        assert!(own.chars().all(|c| c == ' ' || c.is_ascii_graphic()));
     }
 
     #[cfg(target_os = "linux")]
