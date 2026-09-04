@@ -2708,6 +2708,114 @@ mod tests {
         assert!(leaks.is_empty(), "the command reached the logs: {leaks:?}");
     }
 
+    /// A daemon chooses the name it shows in `/proc/<pid>/comm` and could
+    /// put inherited secrets there. Results and lifecycle records name it
+    /// by its executable instead. A script run through its shebang gets the
+    /// script's file name as its `comm`, which plants the name without a
+    /// helper that calls `prctl`.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn results_and_logs_never_carry_the_name_a_daemon_chose() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        require_setsid();
+        let lines = RecordingSubscriber::capture();
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ToolCtx {
+            worktree: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let (shell, _, _) = tools();
+        let secret = "hunter2-secret";
+        let script = tmp.path().join(secret);
+        // The daemon ignores SIGTERM so that eviction logs the escalation,
+        // which names the process too.
+        std::fs::write(
+            &script,
+            "#!/bin/sh\ntrap \"\" TERM\necho $$ > child.pid\nsleep 60\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let res = shell
+            .run(
+                &ctx,
+                &json!({
+                    "command": format!(
+                        "setsid ./{secret} </dev/null >/dev/null 2>&1 & \
+                         while [ ! -s child.pid ]; do sleep 0.01; done"
+                    ),
+                    "timeout_secs": 5,
+                }),
+            )
+            .await;
+        assert_eq!(
+            res.status,
+            trouve_protocol::ToolStatus::Ok,
+            "{:?}",
+            res.result
+        );
+        let daemon_pid = wait_for_pid_file(&tmp.path().join("child.pid")).await;
+        let comm = std::fs::read_to_string(format!("/proc/{daemon_pid}/comm")).unwrap();
+        assert_eq!(comm.trim(), secret, "fixture did not plant its name");
+        let interpreter = std::fs::read_link(format!("/proc/{daemon_pid}/exe")).unwrap();
+        let interpreter = interpreter.file_name().unwrap().to_str().unwrap();
+
+        assert!(
+            reported_pids(&res.result, "detached").contains(&daemon_pid),
+            "{:?}",
+            res.result
+        );
+        let names: Vec<&str> = res.result["detached"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|process| process["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&interpreter), "{names:?}");
+        let rendered = res.result.to_string();
+        assert!(
+            !rendered.contains(secret),
+            "the chosen name reached the result: {rendered}"
+        );
+        assert!(
+            res.result["note"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("{interpreter} pid {daemon_pid}")),
+            "{:?}",
+            res.result["note"]
+        );
+
+        shell.jobs.kill_worktree(tmp.path()).await.unwrap();
+        wait_for_process_exit(daemon_pid).await;
+
+        CAPTURED_LOG.with(|slot| slot.borrow_mut().take());
+        let lines = lines.lock().unwrap();
+        for expected in [
+            "released a detached process from a shell call",
+            "ignored SIGTERM at worktree eviction",
+        ] {
+            assert!(
+                lines.iter().any(|line| line.contains(expected)),
+                "no record of {expected:?} in:\n{}",
+                lines.join("\n")
+            );
+        }
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains(&format!("name={interpreter}"))),
+            "no record names the daemon by its executable in:\n{}",
+            lines.join("\n")
+        );
+        let leaks: Vec<&String> = lines.iter().filter(|line| line.contains(secret)).collect();
+        assert!(
+            leaks.is_empty(),
+            "the chosen name reached the logs: {leaks:?}"
+        );
+    }
+
     /// Above its threshold the record is pruned of what has exited, never
     /// trimmed: a daemon that is still alive stays until its worktree is
     /// evicted.
