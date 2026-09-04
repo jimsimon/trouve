@@ -1020,16 +1020,19 @@ fn blocking_finding_levels_predicate(alias: &str) -> String {
 }
 
 /// Blocking-tier predicate for one findings row under the given SQL alias:
-/// the severity/confidence cutoff plus the scope verdict (legacy rows carry
-/// no verdict and block as before). Every blocking count, listing, and
-/// backfill interpolates this single definition so the policy cannot diverge
-/// between code paths; the advisory tier is its negation. This is the SQL
-/// twin of `review::finding_is_blocking` combined with
-/// `review::finding_scope_blocks`.
+/// the severity/confidence cutoff, the scope verdict (legacy rows carry no
+/// verdict and block as before), and an origin this pull request answers
+/// for — a finding an earlier round missed on untouched code, or a design
+/// question raised by a requested fix, is visible but never gates. Every
+/// blocking count, listing, and backfill interpolates this single definition
+/// so the policy cannot diverge between code paths; the advisory tier is
+/// its negation. This is the SQL twin of `review::finding_is_blocking`
+/// combined with `review::finding_gates`.
 fn blocking_finding_predicate(alias: &str) -> String {
     format!(
         "{levels} \
-         AND COALESCE(json_extract({alias}.evidence, '$.change_scope'), '') != 'unverified'",
+         AND COALESCE(json_extract({alias}.evidence, '$.change_scope'), '') != 'unverified' \
+         AND {alias}.origin NOT IN ('previously_missed', 'fix_regression')",
         levels = blocking_finding_levels_predicate(alias)
     )
 }
@@ -25647,6 +25650,104 @@ mod tests {
     }
 
     #[test]
+    fn previously_missed_and_fix_regression_findings_stay_open_without_gating() {
+        use trouve_protocol::CodeReviewFindingOrigin::{
+            FixRegression, NewChange, PreviouslyMissed,
+        };
+        let store = Store::open_in_memory().unwrap();
+        let finding = |path: &str| NewCodeReviewFinding {
+            path: path.into(),
+            line: 7,
+            side: "RIGHT".into(),
+            severity: "high".into(),
+            confidence: "high".into(),
+            title: "Blocking-level symptom".into(),
+            body: "The state leaks.".into(),
+            prompt_for_agents: "Scope the state.".into(),
+            sources: Vec::new(),
+        };
+        let details = |origin| NewCodeReviewFindingDetails {
+            origin,
+            evidence: trouve_protocol::CodeReviewFindingEvidence {
+                change_scope: "verified".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let job = enqueue_backoff_test_job(&store);
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            job.id
+        );
+        let findings = store
+            .save_code_review_result_with_themes(
+                &job.id,
+                "summary",
+                "fix the root cause",
+                3,
+                &[
+                    finding("src/new.rs"),
+                    finding("src/missed.rs"),
+                    finding("src/regression.rs"),
+                ],
+                &[
+                    details(NewChange),
+                    details(PreviouslyMissed),
+                    details(FixRegression),
+                ],
+                &[],
+                &[],
+            )
+            .unwrap();
+        // All three meet the severity/confidence bar, so none is advisory
+        // and every one is a confirmed issue of this round.
+        assert!(findings.iter().all(|finding| finding.status == "open"));
+        assert_eq!(
+            store
+                .code_review_job(&job.id)
+                .unwrap()
+                .unwrap()
+                .job
+                .issue_count,
+            3
+        );
+        assert!(store.claim_code_review_publication(&job.id).unwrap());
+        store
+            .record_code_review_publication(
+                &job.id,
+                &job.repository,
+                job.pull_number,
+                &job.base_ref,
+                &job.head_sha,
+                "https://example/review",
+                false,
+                &[],
+            )
+            .unwrap();
+        // Only the new-change finding gates: the pull-level blocking count
+        // excludes the origins this pull request is not answering for, and
+        // they surface in the non-gating tier instead.
+        let job = store.code_review_job(&job.id).unwrap().unwrap().job;
+        assert_eq!(job.open_issue_count, Some(1));
+        assert_eq!(job.advisory_open_issue_count, Some(2));
+        // They remain open findings for the coordinator to carry and for
+        // the pull request to resolve, not advisory ledger entries.
+        assert_eq!(
+            store
+                .open_code_review_findings(&job.repository, job.pull_number)
+                .unwrap()
+                .len(),
+            3
+        );
+        assert!(
+            store
+                .advisory_code_review_findings(&job.repository, job.pull_number)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn legacy_publication_grouping_ignores_links_owned_by_later_jobs() {
         let store = Store::open_in_memory().unwrap();
         let original_job = enqueue_backoff_test_job(&store);
@@ -28856,7 +28957,9 @@ mod tests {
                 )
                 .unwrap()
         };
-        assert_eq!(publication_open_issue_count(&first.id), Some(3));
+        // Only the recurrence gates: fix-regression and previously-missed
+        // findings stay open but are excluded from the blocking count.
+        assert_eq!(publication_open_issue_count(&first.id), Some(1));
         assert_eq!(publication_open_issue_count(&second.id), Some(0));
         assert_eq!(
             store
@@ -28865,7 +28968,7 @@ mod tests {
                 .unwrap()
                 .job
                 .open_issue_count,
-            Some(3)
+            Some(1)
         );
         assert_eq!(
             store

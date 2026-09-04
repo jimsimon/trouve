@@ -161,6 +161,20 @@ const REVIEW_ANCHOR_BLOB_MAX_BYTES: usize = 2 * 1024 * 1024;
 const REVIEW_ANCHOR_ERROR_MAX_BYTES: usize = 2 * 1024;
 const REVIEW_ANCHOR_BLOBS_MAX_BYTES: usize = 16 * 1024 * 1024;
 const INVALID_OUTSIDE_ANCHOR_REJECTION: &str = "insufficient_evidence: final finding anchor does not identify a validated line in a tracked regular file at the immutable review head";
+/// Paths whose changes never warrant an automatic re-review on their own:
+/// prose and licensing. Lockfiles are deliberately absent — dependency
+/// changes are reviewable. Globs use `*` within one path segment and `**`
+/// for any prefix; a bare `*.ext` pattern matches the file name at any depth.
+const NON_REVIEWABLE_REVIEW_PATHS: &[&str] = &[
+    "*.md",
+    "*.mdx",
+    "*.rst",
+    "*.txt",
+    "docs/**",
+    "CHANGELOG*",
+    "LICENSE*",
+    "NOTICE*",
+];
 const MANUAL_REVIEW_MENTION: &str = "@trouve-ai";
 const REVIEW_COMMENT_PAGE_SIZE: usize = 100;
 const REVIEW_COMMENT_MAX_PAGES: u64 = 10;
@@ -5687,13 +5701,91 @@ impl Engine {
             cache.insert(diff_cache_key, loaded.clone());
             loaded
         };
+        // The inter-round diff — last reviewed head to this head — is what
+        // this push actually changed. It advances carried finding anchors,
+        // decides whether an automatic round has anything reviewable at all,
+        // and separates findings this push introduced from ones an earlier
+        // round missed. `None` on the first round or when git cannot
+        // produce it; both fall back to the conservative full-range view.
+        let last_reviewed_head_sha = previous_pull_state.last_reviewed_head_sha.clone();
+        let inter_round_files: Option<Arc<Vec<ReviewDiffFile>>> =
+            if validate_sha(&last_reviewed_head_sha).is_err() {
+                None
+            } else if last_reviewed_head_sha == job.head_sha {
+                Some(Arc::new(Vec::new()))
+            } else if last_reviewed_head_sha == job.review_base_sha {
+                Some(Arc::clone(&diff_files))
+            } else {
+                let loaded = self
+                    .executor
+                    .review_repository_diff(&ReviewRepositoryDiff {
+                        managed_root: self.data_dir.join("worktrees"),
+                        worktree: session.worktree_path.clone().into(),
+                        base_sha: last_reviewed_head_sha.clone(),
+                        head_sha: job.head_sha.clone(),
+                        cancel: superseded.clone(),
+                        max_bytes: REVIEW_DIFF_CACHE_MAX_BYTES,
+                    })
+                    .await;
+                // Best-effort for ordinary git failures, but cancellation
+                // remains authoritative: a superseded review must not turn
+                // into a warning followed by work on stale state.
+                ensure_review_current(superseded)?;
+                match loaded {
+                    Ok(files) => Some(Arc::new(
+                        files
+                            .into_iter()
+                            .map(|file| ReviewDiffFile {
+                                path: file.path,
+                                diff: file.diff,
+                                generated_header: None,
+                            })
+                            .collect(),
+                    )),
+                    Err(error) => {
+                        tracing::warn!(
+                            job_id = %job.id,
+                            last_reviewed_head = %last_reviewed_head_sha,
+                            head = %job.head_sha,
+                            %error,
+                            "could not diff from the prior reviewed head; retaining conservative \
+                             review-range verification"
+                        );
+                        None
+                    }
+                }
+            };
+        // An automatic round for a push that changed only documentation has
+        // nothing for a reviewer persona to examine: the code at head is the
+        // code the previous round already reviewed. Finish it as a clean
+        // round with no tasks so the head still gets its check run and the
+        // pull-level ledger carries forward; manual requests always run.
+        let skipped_push_summary = if job.trigger == "automatic" {
+            inter_round_files
+                .as_deref()
+                .and_then(|files| non_reviewable_push_summary(&last_reviewed_head_sha, files))
+        } else {
+            None
+        };
+        if let Some(summary) = &skipped_push_summary {
+            tracing::info!(
+                job_id = %job.id,
+                last_reviewed_head = %last_reviewed_head_sha,
+                head = %job.head_sha,
+                "{summary}"
+            );
+        }
         let reviewers = if record.reviewers.is_empty() {
             self.resolve_code_review_reviewers(&crate::reviewers::default_reviewer_ids())?
         } else {
             record.reviewers.clone()
         };
         let prompt_budgets = self.review_prompt_budgets(&job, &reviewers).await;
-        let batches = build_review_batches(&diff_files, prompt_budgets);
+        let batches = if skipped_push_summary.is_some() {
+            Vec::new()
+        } else {
+            build_review_batches(&diff_files, prompt_budgets)
+        };
         let batch_digest = review_batch_digest(&job.review_base_sha, &job.head_sha, &batches);
         let snapshot = self
             .store
@@ -6059,7 +6151,11 @@ impl Engine {
             let worktree_path = session.worktree_path.clone();
             let cancel = analysis_cancel.clone();
             let active_threads = Arc::clone(active_threads);
+            let skipped = skipped_push_summary.is_some();
             async move {
+                if skipped {
+                    return None;
+                }
                 engine
                     .run_implementation_analysis(
                         &job,
@@ -6151,8 +6247,13 @@ impl Engine {
             .into_iter()
             .filter(|finding| finding.job_id != job.id)
             .collect::<Vec<_>>();
+        // A skipped push has no candidates by construction; open findings it
+        // carries cannot have been fixed by a documentation-only change, so
+        // the coordinator has nothing to adjudicate either.
+        let coordinator_skipped = coordinator_candidates.is_empty()
+            && (previous_findings.is_empty() || skipped_push_summary.is_some());
         let load_external_comments = async {
-            if coordinator_candidates.is_empty() && previous_findings.is_empty() {
+            if coordinator_skipped {
                 Vec::new()
             } else {
                 self.external_review_comments(&job).await
@@ -6163,39 +6264,38 @@ impl Engine {
             load_external_comments,
         );
         let coordinator_started = Instant::now();
-        let implementation_analysis =
-            if coordinator_candidates.is_empty() && previous_findings.is_empty() {
-                // Full shutdown ladder for the unused analysis. First a
-                // cooperative grace: signalling the token and polling the
-                // future lets its cancellation branch finalize the durable
-                // analyst task (marking it cancelled) and release the vendor
-                // turn cleanly. Only then abort — the non-cooperative last
-                // resort for a stage ignoring its token — and reap the abort
-                // with a short second grace. A non-yielding stage cannot be
-                // preempted by any means Tokio offers; in that irreducible
-                // case we log and proceed rather than let a finished clean
-                // review block behind unused work.
-                analysis_cancel.cancel();
-                let mut analysis_handle = analysis_handle;
-                if tokio::time::timeout(Duration::from_secs(10), &mut analysis_handle)
+        let implementation_analysis = if coordinator_skipped {
+            // Full shutdown ladder for the unused analysis. First a
+            // cooperative grace: signalling the token and polling the
+            // future lets its cancellation branch finalize the durable
+            // analyst task (marking it cancelled) and release the vendor
+            // turn cleanly. Only then abort — the non-cooperative last
+            // resort for a stage ignoring its token — and reap the abort
+            // with a short second grace. A non-yielding stage cannot be
+            // preempted by any means Tokio offers; in that irreducible
+            // case we log and proceed rather than let a finished clean
+            // review block behind unused work.
+            analysis_cancel.cancel();
+            let mut analysis_handle = analysis_handle;
+            if tokio::time::timeout(Duration::from_secs(10), &mut analysis_handle)
+                .await
+                .is_err()
+            {
+                analysis_handle.abort();
+                if tokio::time::timeout(Duration::from_secs(2), &mut analysis_handle)
                     .await
                     .is_err()
                 {
-                    analysis_handle.abort();
-                    if tokio::time::timeout(Duration::from_secs(2), &mut analysis_handle)
-                        .await
-                        .is_err()
-                    {
-                        tracing::warn!(
-                            job_id = %job.id,
-                            "aborted implementation analysis did not terminate; proceeding"
-                        );
-                    }
+                    tracing::warn!(
+                        job_id = %job.id,
+                        "aborted implementation analysis did not terminate; proceeding"
+                    );
                 }
-                None
-            } else {
-                analysis_handle.await.ok().flatten()
-            };
+            }
+            None
+        } else {
+            analysis_handle.await.ok().flatten()
+        };
         let mut carried_anchor_has_more = false;
         let carried_finding_ids = previous_findings
             .iter()
@@ -6211,54 +6311,24 @@ impl Engine {
         let mut carried_base_anchors = self
             .store
             .code_review_carried_finding_anchors(&carried_finding_ids, &carried_mapping_base_sha)?;
-        if !previous_findings.is_empty() && preferred_carried_base_sha != carried_mapping_base_sha {
-            let preferred_diff = if preferred_carried_base_sha == job.head_sha {
-                Ok(Vec::new())
-            } else {
-                self.executor
-                    .review_repository_diff(&ReviewRepositoryDiff {
-                        managed_root: self.data_dir.join("worktrees"),
-                        worktree: session.worktree_path.clone().into(),
-                        base_sha: preferred_carried_base_sha.clone(),
-                        head_sha: job.head_sha.clone(),
-                        cancel: superseded.clone(),
-                        max_bytes: REVIEW_DIFF_CACHE_MAX_BYTES,
-                    })
-                    .await
-            };
-            // The auxiliary mapping diff is best-effort for ordinary git
-            // failures, but cancellation remains authoritative. Do not turn a
-            // superseded full review into a warning followed by coordinator
-            // work on stale state.
-            ensure_review_current(superseded)?;
-            match preferred_diff {
-                Ok(files) => {
-                    carried_mapping_base_sha = preferred_carried_base_sha;
-                    carried_mapping_files = Arc::new(
-                        files
-                            .into_iter()
-                            .map(|file| ReviewDiffFile {
-                                path: file.path,
-                                diff: file.diff,
-                                generated_header: None,
-                            })
-                            .collect(),
-                    );
-                    carried_base_anchors = self.store.code_review_carried_finding_anchors(
-                        &carried_finding_ids,
-                        &carried_mapping_base_sha,
-                    )?;
-                }
-                Err(error) => tracing::warn!(
-                    job_id = %job.id,
-                    carried_base = %preferred_carried_base_sha,
-                    head = %job.head_sha,
-                    %error,
-                    "could not advance carried finding anchors from the prior reviewed head; \
-                     retaining conservative review-range verification"
-                ),
-            }
+        // The inter-round diff was loaded (or failed, with a warning) before
+        // reviewer dispatch; an unavailable one keeps the conservative
+        // review-range mapping.
+        if !previous_findings.is_empty()
+            && preferred_carried_base_sha != carried_mapping_base_sha
+            && let Some(files) = &inter_round_files
+        {
+            carried_mapping_base_sha = preferred_carried_base_sha;
+            carried_mapping_files = Arc::clone(files);
+            carried_base_anchors = self.store.code_review_carried_finding_anchors(
+                &carried_finding_ids,
+                &carried_mapping_base_sha,
+            )?;
         }
+        let inter_round_changed = inter_round_files
+            .as_deref()
+            .map(|files| inter_round_changed_lines(files))
+            .unwrap_or_default();
         let carried_diff_contents = diff_line_contents(&carried_mapping_files);
         let carried_mapping = CarriedAnchorMappingContext {
             files: &carried_mapping_files,
@@ -6266,7 +6336,7 @@ impl Engine {
             review_base_sha: &carried_mapping_base_sha,
             base_anchors: &carried_base_anchors,
         };
-        let parsed = if coordinator_candidates.is_empty() && previous_findings.is_empty() {
+        let mut parsed = if coordinator_skipped {
             if let Some(task) = queued_coordinator.take() {
                 let skipped = self
                     .store
@@ -6278,7 +6348,9 @@ impl Engine {
                 self.emit_code_review_task(&job.id, skipped)?;
             }
             ReviewOutput {
-                summary: no_candidate_review_summary(selected_reviewer_count, diff_files.len()),
+                summary: skipped_push_summary.clone().unwrap_or_else(|| {
+                    no_candidate_review_summary(selected_reviewer_count, diff_files.len())
+                }),
                 findings: Vec::new(),
                 rejected_candidates: invalid_candidate_anchor_ids
                     .into_iter()
@@ -6664,6 +6736,13 @@ impl Engine {
                     finding.origin,
                     has_historical_support,
                     has_resolved_support,
+                    finding_touches_inter_round_change(
+                        &finding.path,
+                        finding.line,
+                        &finding.side,
+                        &finding.evidence,
+                        &inter_round_changed,
+                    ),
                 );
                 NewCodeReviewFindingDetails {
                     evidence: finding.evidence.clone(),
@@ -6676,6 +6755,11 @@ impl Engine {
                 }
             })
             .collect::<Vec<_>>();
+        // The resolved origin, not the coordinator's request, decides whether
+        // a finding gates; the agent-facing prompt must label it accordingly.
+        for (finding, details) in parsed.findings.iter_mut().zip(&finding_details) {
+            finding.origin = details.origin;
+        }
         let stored_themes = parsed
             .themes
             .iter()
@@ -9259,7 +9343,7 @@ impl Engine {
             .into_iter()
             .filter(|finding| {
                 finding_is_blocking(&finding.severity, &finding.confidence)
-                    && finding_scope_blocks(&finding.evidence)
+                    && finding_gates(&finding.evidence, finding.origin)
             })
             .collect::<Vec<_>>();
         let lifecycle_body = render_lifecycle_comment(
@@ -12371,7 +12455,7 @@ fn render_lifecycle_comment(
             // surfaces is enforced where the rendering happens.
             !round_ids.contains(finding.id.as_str())
                 && finding_is_blocking(&finding.severity, &finding.confidence)
-                && finding_scope_blocks(&finding.evidence)
+                && finding_gates(&finding.evidence, finding.origin)
         })
         .collect::<Vec<_>>();
     let lifecycle_prompt = lifecycle_prompt_for_agents(
@@ -12473,16 +12557,17 @@ fn render_lifecycle_comment(
         }
     };
     // Findings whose severity and confidence would block, but whose
-    // causation this change could not be mechanically tied to. They are
-    // surfaced for awareness — real signal, visible on the pull request —
-    // without gating it, so an autonomous agent working the blocking ledger
-    // is never forced into code its change did not break.
+    // causation this change could not be mechanically tied to — or whose
+    // origin (previously missed, fix regression) exempts them from gating.
+    // They are surfaced for awareness — real signal, visible on the pull
+    // request — without gating it, so an autonomous agent working the
+    // blocking ledger is never forced into code its change did not break.
     let noticed_findings = result_findings
         .iter()
         .filter(|finding| {
             finding.status == "open"
                 && finding_is_blocking(&finding.severity, &finding.confidence)
-                && !finding_scope_blocks(&finding.evidence)
+                && !finding_gates(&finding.evidence, finding.origin)
         })
         .collect::<Vec<_>>();
     const NOTICED_HEADING: &str = "### Noticed beyond this change\n\nReal issues in code this \
@@ -13193,8 +13278,9 @@ fn review_prompt_for_agents(
     if findings.is_empty() && carried_findings.is_empty() {
         return String::new();
     }
-    let tier_note = |evidence: &trouve_protocol::CodeReviewFindingEvidence| {
-        if !finding_scope_blocks(evidence) {
+    let tier_note = |evidence: &trouve_protocol::CodeReviewFindingEvidence,
+                     origin: trouve_protocol::CodeReviewFindingOrigin| {
+        if !finding_gates(evidence, origin) {
             " [beyond this change — do not fix in this pull request]"
         } else {
             ""
@@ -13217,7 +13303,7 @@ fn review_prompt_for_agents(
                 &finding.body,
                 &finding.evidence,
             );
-            let note = tier_note(&finding.evidence);
+            let note = tier_note(&finding.evidence, finding.origin);
             if !note.is_empty() {
                 entry = entry.replacen('\n', &format!("{note}\n"), 1);
             }
@@ -13241,7 +13327,7 @@ fn review_prompt_for_agents(
                 &finding.body,
                 &finding.evidence,
             );
-            let note = tier_note(&finding.evidence);
+            let note = tier_note(&finding.evidence, finding.origin);
             if !note.is_empty() {
                 entry = entry.replacen('\n', &format!("{note}\n"), 1);
             }
@@ -15261,15 +15347,26 @@ fn coordinator_validated_findings(
         .collect()
 }
 
+/// Resolve a finding's origin from the coordinator's request, the durable
+/// history that supports it, and — when `touches_inter_round_change` is
+/// `Some` — whether the push since the last reviewed head actually changed
+/// the code the finding is rooted in. Code no push touched since the last
+/// review cannot have been introduced by this round: such a finding is
+/// `previously_missed` regardless of the request, so a documentation push
+/// never turns an earlier round's oversight into a blocking "new change".
 fn finding_origin_with_history(
     requested: trouve_protocol::CodeReviewFindingOrigin,
     has_historical_support: bool,
     has_resolved_support: bool,
+    touches_inter_round_change: Option<bool>,
 ) -> trouve_protocol::CodeReviewFindingOrigin {
     use trouve_protocol::CodeReviewFindingOrigin::{
         FixRegression, NewChange, PreviouslyMissed, Recurrence,
     };
 
+    if touches_inter_round_change == Some(false) {
+        return PreviouslyMissed;
+    }
     if !has_historical_support {
         return NewChange;
     }
@@ -16455,7 +16552,7 @@ impl CodeReviewFindingPublicationExt for trouve_protocol::CodeReviewFinding {
     fn is_publishable(&self) -> bool {
         self.has_inline_location()
             && finding_levels_meet_publication_threshold(&self.severity, &self.confidence)
-            && finding_scope_blocks(&self.evidence)
+            && finding_gates(&self.evidence, self.origin)
     }
 }
 
@@ -16868,6 +16965,144 @@ fn finding_scope_blocks(evidence: &trouve_protocol::CodeReviewFindingEvidence) -
     evidence.change_scope != "unverified"
 }
 
+/// Whether a blocking-level finding may gate the review: its scope verdict
+/// must tie it to this change, and its origin must not be one this pull
+/// request is being asked to answer for retroactively. A `previously_missed`
+/// finding sits on code no push since the last review touched; a
+/// `fix_regression` finding is a design question about a fix the review
+/// itself requested. Both stay visible without blocking. The SQL twin is
+/// `store::blocking_finding_predicate`.
+fn finding_gates(
+    evidence: &trouve_protocol::CodeReviewFindingEvidence,
+    origin: trouve_protocol::CodeReviewFindingOrigin,
+) -> bool {
+    use trouve_protocol::CodeReviewFindingOrigin::{FixRegression, PreviouslyMissed};
+    finding_scope_blocks(evidence) && !matches!(origin, PreviouslyMissed | FixRegression)
+}
+
+/// Whether one changed path matches a `NON_REVIEWABLE_REVIEW_PATHS` glob.
+fn non_reviewable_review_path(path: &str) -> bool {
+    let path = path.trim().trim_start_matches("./").to_ascii_lowercase();
+    let name = path.rsplit('/').next().unwrap_or(path.as_str());
+    NON_REVIEWABLE_REVIEW_PATHS.iter().any(|pattern| {
+        let pattern = pattern.to_ascii_lowercase();
+        if let Some(prefix) = pattern.strip_suffix("/**") {
+            path == prefix || path.starts_with(&format!("{prefix}/"))
+        } else if let Some(suffix) = pattern.strip_prefix('*') {
+            name.ends_with(suffix)
+        } else if let Some(prefix) = pattern.strip_suffix('*') {
+            name.starts_with(prefix)
+        } else {
+            name == pattern
+        }
+    })
+}
+
+/// Whether a push touching exactly `changed_paths` contains anything a
+/// reviewer persona could act on. Documentation-only pushes do not; an empty
+/// path list is treated as reviewable so callers never skip on missing data.
+fn push_is_reviewable(changed_paths: &[String]) -> bool {
+    changed_paths.is_empty()
+        || changed_paths
+            .iter()
+            .any(|path| !non_reviewable_review_path(path))
+}
+
+/// Summary for an automatic round that skips reviewer and coordinator work
+/// because the push since the last reviewed head changed only non-reviewable
+/// paths. `None` when the round must run.
+fn non_reviewable_push_summary(
+    previous_head_sha: &str,
+    inter_round_files: &[ReviewDiffFile],
+) -> Option<String> {
+    if inter_round_files.is_empty() {
+        return None;
+    }
+    let paths = inter_round_files
+        .iter()
+        .map(|file| file.path.clone())
+        .collect::<Vec<_>>();
+    if push_is_reviewable(&paths) {
+        return None;
+    }
+    let short = previous_head_sha.get(..8).unwrap_or(previous_head_sha);
+    Some(format!(
+        "No reviewable changes since {short}: only documentation paths changed."
+    ))
+}
+
+/// `(path, line, left-side)` for every line the diff since the last reviewed
+/// head added or removed — context lines excluded, unlike
+/// `diff_line_contents`. A finding anchored (and causally rooted) entirely
+/// outside this set was missed by an earlier round rather than introduced by
+/// this push.
+fn inter_round_changed_lines(files: &[ReviewDiffFile]) -> HashSet<(String, u64, bool)> {
+    let mut changed = HashSet::new();
+    for file in files {
+        let old_path = review_diff_renamed_from(file).unwrap_or_else(|| file.path.clone());
+        let mut old_line = 0;
+        let mut new_line = 0;
+        let mut in_hunk = false;
+        for line in file.diff.lines() {
+            if line.starts_with("@@ ") {
+                let mut ranges = line.split_whitespace();
+                let _marker = ranges.next();
+                old_line = ranges
+                    .next()
+                    .and_then(|range| diff_range_start(range, '-'))
+                    .unwrap_or(0);
+                new_line = ranges
+                    .next()
+                    .and_then(|range| diff_range_start(range, '+'))
+                    .unwrap_or(0);
+                in_hunk = old_line > 0 || new_line > 0;
+                continue;
+            }
+            if !in_hunk || line.starts_with("\\ No newline at end of file") {
+                continue;
+            }
+            match line.as_bytes().first().copied() {
+                Some(b'+') => {
+                    changed.insert((file.path.clone(), new_line, false));
+                    new_line += 1;
+                }
+                Some(b'-') => {
+                    changed.insert((old_path.clone(), old_line, true));
+                    old_line += 1;
+                }
+                Some(b' ') => {
+                    old_line += 1;
+                    new_line += 1;
+                }
+                _ => in_hunk = false,
+            }
+        }
+    }
+    changed
+}
+
+/// Whether a finding's anchor or any causal waypoint lies on a line the
+/// inter-round diff changed. An empty set (first round, same head, or an
+/// unavailable diff) is "unknown" and never forces an origin.
+fn finding_touches_inter_round_change(
+    path: &str,
+    line: u64,
+    side: &str,
+    evidence: &trouve_protocol::CodeReviewFindingEvidence,
+    inter_round_changed: &HashSet<(String, u64, bool)>,
+) -> Option<bool> {
+    if inter_round_changed.is_empty() {
+        return None;
+    }
+    let left = side.eq_ignore_ascii_case("LEFT");
+    Some(
+        inter_round_changed.contains(&(path.to_owned(), line, left))
+            || evidence.causal_waypoints.iter().any(|waypoint| {
+                inter_round_changed.contains(&(waypoint.path.clone(), waypoint.line, false))
+            }),
+    )
+}
+
 /// A zero line is a durable transition proving that the old-side anchor had
 /// no right-side line. It is never registered as an object-read target.
 const CARRIED_ANCHOR_ABSENT_LINE: u64 = 0;
@@ -17087,7 +17322,7 @@ fn finding_requires_head_verification(
     location: &HistoricalAnchorLocation,
 ) -> bool {
     finding_is_blocking(&finding.severity, &finding.confidence)
-        && finding_scope_blocks(&finding.evidence)
+        && finding_gates(&finding.evidence, finding.origin)
         && !matches!(location, HistoricalAnchorLocation::InDiff { .. })
 }
 
@@ -17101,7 +17336,7 @@ fn carried_anchor_positions(
             finding.status == "open"
                 && finding.line > 0
                 && finding_is_blocking(&finding.severity, &finding.confidence)
-                && finding_scope_blocks(&finding.evidence)
+                && finding_gates(&finding.evidence, finding.origin)
         })
         .filter_map(|finding| {
             let location = historical_anchor_location(finding, mapping);
@@ -25707,15 +25942,15 @@ rename to src/new.rs
         };
 
         assert_eq!(
-            finding_origin_with_history(FixRegression, true, true),
+            finding_origin_with_history(FixRegression, true, true, None),
             FixRegression
         );
         assert_eq!(
-            finding_origin_with_history(PreviouslyMissed, true, false),
+            finding_origin_with_history(PreviouslyMissed, true, false, None),
             PreviouslyMissed
         );
         assert_eq!(
-            finding_origin_with_history(NewChange, true, true),
+            finding_origin_with_history(NewChange, true, true, None),
             NewChange
         );
     }
@@ -25727,13 +25962,180 @@ rename to src/new.rs
         };
 
         assert_eq!(
-            finding_origin_with_history(FixRegression, false, false),
+            finding_origin_with_history(FixRegression, false, false, None),
             NewChange
         );
         assert_eq!(
-            finding_origin_with_history(Recurrence, true, false),
+            finding_origin_with_history(Recurrence, true, false, None),
             PreviouslyMissed
         );
+    }
+
+    #[test]
+    fn finding_origins_are_forced_to_previously_missed_on_untouched_code() {
+        use trouve_protocol::CodeReviewFindingOrigin::{
+            FixRegression, NewChange, PreviouslyMissed, Recurrence,
+        };
+
+        // The push since the last reviewed head did not touch the finding's
+        // code: no request, with or without history, survives.
+        assert_eq!(
+            finding_origin_with_history(NewChange, false, false, Some(false)),
+            PreviouslyMissed
+        );
+        assert_eq!(
+            finding_origin_with_history(FixRegression, true, true, Some(false)),
+            PreviouslyMissed
+        );
+        assert_eq!(
+            finding_origin_with_history(Recurrence, true, true, Some(false)),
+            PreviouslyMissed
+        );
+        // The push touched the anchor or a waypoint: ordinary resolution.
+        assert_eq!(
+            finding_origin_with_history(NewChange, false, false, Some(true)),
+            NewChange
+        );
+        assert_eq!(
+            finding_origin_with_history(FixRegression, true, true, Some(true)),
+            FixRegression
+        );
+        // First round (no last reviewed head): unknown, never forced.
+        assert_eq!(
+            finding_origin_with_history(NewChange, false, false, None),
+            NewChange
+        );
+    }
+
+    #[test]
+    fn inter_round_change_detection_covers_anchor_side_and_waypoints() {
+        let files = vec![ReviewDiffFile {
+            path: "src/lib.rs".into(),
+            diff: "diff --git a/src/lib.rs b/src/lib.rs\n\
+                   --- a/src/lib.rs\n\
+                   +++ b/src/lib.rs\n\
+                   @@ -3,4 +3,4 @@\n \
+                   context\n\
+                   -removed\n\
+                   +added\n \
+                   context\n"
+                .into(),
+            generated_header: None,
+        }];
+        let changed = inter_round_changed_lines(&files);
+        assert_eq!(
+            changed,
+            HashSet::from([
+                ("src/lib.rs".to_owned(), 4, false),
+                ("src/lib.rs".to_owned(), 4, true),
+            ]),
+            "context lines are not changes"
+        );
+        let touches = |path: &str, line: u64, side: &str, waypoint: Option<(&str, u64)>| {
+            let evidence = trouve_protocol::CodeReviewFindingEvidence {
+                causal_waypoints: waypoint
+                    .map(|(path, line)| {
+                        vec![trouve_protocol::CodeReviewCausalWaypoint {
+                            path: path.into(),
+                            line,
+                            ..Default::default()
+                        }]
+                    })
+                    .unwrap_or_default(),
+                ..Default::default()
+            };
+            finding_touches_inter_round_change(path, line, side, &evidence, &changed)
+        };
+        assert_eq!(touches("src/lib.rs", 4, "RIGHT", None), Some(true));
+        assert_eq!(touches("src/lib.rs", 4, "LEFT", None), Some(true));
+        assert_eq!(touches("src/lib.rs", 3, "RIGHT", None), Some(false));
+        assert_eq!(touches("src/other.rs", 4, "RIGHT", None), Some(false));
+        assert_eq!(
+            touches("src/other.rs", 40, "RIGHT", Some(("src/lib.rs", 4))),
+            Some(true)
+        );
+        assert_eq!(
+            touches("src/other.rs", 40, "RIGHT", Some(("src/lib.rs", 3))),
+            Some(false)
+        );
+        assert_eq!(
+            finding_touches_inter_round_change(
+                "src/lib.rs",
+                4,
+                "RIGHT",
+                &Default::default(),
+                &HashSet::new()
+            ),
+            None,
+            "an unavailable inter-round diff never forces an origin"
+        );
+    }
+
+    #[test]
+    fn push_reviewability_ignores_documentation_only_changes() {
+        let paths = |paths: &[&str]| {
+            paths
+                .iter()
+                .map(|path| (*path).to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert!(!push_is_reviewable(&paths(&["CHANGELOG.md"])));
+        assert!(!push_is_reviewable(&paths(&[
+            "README.md",
+            "docs/guide/setup.mdx",
+            "docs/index.html",
+            "LICENSE",
+            "NOTICE.txt",
+            "crates/trouve-core/README.rst",
+            "notes.TXT",
+        ])));
+        assert!(push_is_reviewable(&paths(&["CHANGELOG.md", "src/lib.rs"])));
+        assert!(push_is_reviewable(&paths(&["Cargo.lock"])));
+        assert!(push_is_reviewable(&paths(&["package-lock.json"])));
+        assert!(push_is_reviewable(&paths(&["docs-site/build.rs"])));
+        assert!(push_is_reviewable(&paths(&["mkdocs.yml"])));
+        assert!(
+            push_is_reviewable(&[]),
+            "missing path data must not skip a review"
+        );
+
+        let file = |path: &str| ReviewDiffFile {
+            path: path.into(),
+            diff: String::new(),
+            generated_header: None,
+        };
+        assert_eq!(
+            non_reviewable_push_summary("0123456789abcdef", &[file("CHANGELOG.md")]).as_deref(),
+            Some("No reviewable changes since 01234567: only documentation paths changed.")
+        );
+        assert_eq!(
+            non_reviewable_push_summary(
+                "0123456789abcdef",
+                &[file("CHANGELOG.md"), file("src/a.rs")]
+            ),
+            None
+        );
+        assert_eq!(
+            non_reviewable_push_summary("0123456789abcdef", &[]),
+            None,
+            "an empty inter-round diff is a re-review of the same code, not a documentation push"
+        );
+    }
+
+    #[test]
+    fn finding_gating_excludes_previously_missed_and_fix_regression_origins() {
+        use trouve_protocol::CodeReviewFindingOrigin::{
+            FixRegression, NewChange, PreviouslyMissed, Recurrence,
+        };
+        let evidence = |scope: &str| trouve_protocol::CodeReviewFindingEvidence {
+            change_scope: scope.into(),
+            ..Default::default()
+        };
+        assert!(finding_gates(&evidence("verified"), NewChange));
+        assert!(finding_gates(&evidence(""), Recurrence));
+        assert!(!finding_gates(&evidence("verified"), PreviouslyMissed));
+        assert!(!finding_gates(&evidence("verified"), FixRegression));
+        assert!(!finding_gates(&evidence("unverified"), NewChange));
     }
 
     #[test]
