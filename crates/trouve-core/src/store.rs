@@ -1000,11 +1000,17 @@ const MIGRATIONS: &[&str] = &[
 /// the severity/confidence cutoff plus the scope verdict (legacy rows carry
 /// no verdict and block as before). Every blocking count, listing, and
 /// backfill interpolates this single definition so the policy cannot diverge
-/// between code paths; the advisory tier is its negation.
+/// between code paths; the advisory tier is its negation. This is the SQL
+/// twin of `review::finding_is_blocking` — high severity with at least
+/// medium confidence, or medium severity with high confidence — with the
+/// same canonicalization (unknown levels read as `medium`), so `NOT IN
+/// ('high', 'low')` is how "medium" is spelled here.
 fn blocking_finding_predicate(alias: &str) -> String {
     format!(
-        "(lower(trim({alias}.severity)) = 'high' OR (lower(trim({alias}.severity)) != 'low' \
-         AND lower(trim({alias}.confidence)) != 'low')) \
+        "((lower(trim({alias}.severity)) = 'high' \
+           AND lower(trim({alias}.confidence)) IN ('high', 'medium')) \
+          OR (lower(trim({alias}.severity)) NOT IN ('high', 'low') \
+           AND lower(trim({alias}.confidence)) = 'high')) \
          AND COALESCE(json_extract({alias}.evidence, '$.change_scope'), '') != 'unverified'"
     )
 }
@@ -28902,8 +28908,9 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let incremental = trouve_protocol::CodeReviewJobScope::Incremental;
 
-        // A mixed round: one blocking finding, two advisory (low severity,
-        // and medium with weak evidence).
+        // A mixed round: one blocking finding, four advisory (low severity,
+        // medium with weak or merely medium evidence, and a high-severity
+        // guess the evidence cannot support).
         let (round1, _) = publish_leveled_test_round(
             &store,
             "acme/widgets#42:tier-round-1",
@@ -28913,6 +28920,8 @@ mod tests {
                 ("crates/core/src/engine.rs", "high", "high"),
                 ("scripts/qualify.mjs", "low", "high"),
                 ("scripts/qualify.mjs", "medium", "low"),
+                ("scripts/qualify.mjs", "medium", "medium"),
+                ("crates/core/src/engine.rs", "high", "low"),
             ],
             &[],
         );
@@ -28924,7 +28933,7 @@ mod tests {
         );
         assert_eq!(
             job.advisory_open_issue_count,
-            Some(2),
+            Some(4),
             "advisory debt is tracked"
         );
 
@@ -28950,7 +28959,7 @@ mod tests {
         );
         assert_eq!(
             job.advisory_open_issue_count,
-            Some(5),
+            Some(7),
             "debt keeps accruing"
         );
     }

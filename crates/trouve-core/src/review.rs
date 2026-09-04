@@ -15727,23 +15727,25 @@ fn normalize_finding(
     Some(())
 }
 
-/// Always publish high-severity findings because their potential impact
-/// outweighs low confidence. Medium severity needs at least medium confidence,
-/// while low severity needs high confidence.
-/// The blocking gate. Blocking findings count toward the PR-wide open total
-/// and hold the check run out of `success`; advisory findings — low severity,
-/// or medium severity that the evidence only weakly supports — are durable
-/// engineering debt: retained and visible in trouve, but never posted to
-/// GitHub and never merge-blocking. This is the structural form of the
-/// per-repository "tooling findings are advisory" instruction: calibrating
-/// severity alone changed presentation while every open finding still pinned
-/// the check, so convergence has to be a gate, not a phrasing.
+/// The blocking gate. High severity needs at least medium confidence and
+/// medium severity needs high confidence; everything else — low severity,
+/// low confidence, or a medium/medium pairing — is advisory. Blocking
+/// findings count toward the PR-wide open total and hold the check run out of
+/// `success`; advisory findings are durable engineering debt: retained in
+/// trouve's ledger, but never posted to GitHub and never merge-blocking. This
+/// is the structural form of the per-repository "tooling findings are
+/// advisory" instruction: calibrating severity alone changed presentation
+/// while every open finding still pinned the check, so convergence has to be
+/// a gate, not a phrasing. Low confidence never blocks regardless of severity:
+/// a high-impact guess that the evidence cannot support caused most of the
+/// fix/regression churn this gate exists to prevent. The SQL twin lives in
+/// `store::blocking_finding_predicate`; keep the two in lockstep.
 fn finding_is_blocking(severity: &str, confidence: &str) -> bool {
     let severity = canonical_finding_level(severity);
     let confidence = canonical_finding_level(confidence);
     matches!(
         (severity, confidence),
-        ("high", _) | ("medium", "high" | "medium")
+        ("high", "high" | "medium") | ("medium", "high")
     )
 }
 
@@ -26862,20 +26864,20 @@ rename to src/new.rs
             source_candidate_ids: vec!["candidate".into()],
         };
 
-        for (severity, confidence) in [
-            ("high", "high"),
-            ("high", "medium"),
-            ("high", "low"),
-            ("medium", "high"),
-            ("medium", "medium"),
-        ] {
+        for (severity, confidence) in [("high", "high"), ("high", "medium"), ("medium", "high")]
+        {
             let finding = finding(severity, confidence);
             assert!(finding_levels_meet_publication_threshold(
                 &finding.severity,
                 &finding.confidence
             ));
         }
+        // Low confidence never publishes or blocks, whatever the severity:
+        // a high-impact guess the evidence cannot support is exactly the
+        // finding that used to pin the check and trigger fix/regression churn.
         for (severity, confidence) in [
+            ("high", "low"),
+            ("medium", "medium"),
             ("medium", "low"),
             ("low", "high"),
             ("low", "medium"),
@@ -26887,15 +26889,24 @@ rename to src/new.rs
                 &finding.confidence
             ));
         }
-        assert!(finding_levels_meet_publication_threshold(" HIGH ", "LOW"));
-        assert!(finding_levels_meet_publication_threshold(
+        assert!(finding_levels_meet_publication_threshold(" HIGH ", "MEDIUM"));
+        assert!(!finding_levels_meet_publication_threshold(" HIGH ", "LOW"));
+        // Unknown levels canonicalize to medium, so an unrecognised pair sits
+        // below the bar and an unrecognised severity needs high confidence.
+        assert!(!finding_levels_meet_publication_threshold(
             "unsupported",
             "UNKNOWN"
+        ));
+        assert!(finding_levels_meet_publication_threshold(
+            "unsupported",
+            "high"
         ));
         assert!(!finding_levels_meet_publication_threshold("low", "unknown"));
         // The same cutoff is the blocking gate: advisory findings are debt,
         // not merge blockers.
-        assert!(finding_is_blocking("medium", "medium"));
+        assert!(finding_is_blocking("medium", "high"));
+        assert!(!finding_is_blocking("medium", "medium"));
+        assert!(!finding_is_blocking("high", "low"));
         assert!(!finding_is_blocking("low", "high"));
         assert!(!finding_is_blocking("medium", "low"));
     }
