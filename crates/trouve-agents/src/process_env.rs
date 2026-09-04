@@ -138,9 +138,10 @@ pub struct DetachedProcess {
     /// Kernel start time of the pid when it was released; with the pid it
     /// names one process incarnation in reports and records.
     pub start_time: u64,
-    /// The process's short command name (`/proc/<pid>/comm`), reduced to
-    /// printable ASCII of at most 15 characters: the process chooses it, and
-    /// it reaches logs and results that outlive the call.
+    /// The file name of the process's executable, reduced to printable ASCII
+    /// of at most 15 characters. Never the name the process set for itself
+    /// (`/proc/<pid>/comm`): this reaches logs and results that outlive the
+    /// call, and a daemon could plant inherited secrets in a name it chooses.
     pub name: String,
     /// A pidfd bound to that incarnation of the pid (Linux 5.3+): liveness
     /// checks and signals through it cannot reach a successor to the pid.
@@ -1747,24 +1748,42 @@ fn parse_linux_process_stat(stat: &str) -> Option<LinuxProcessStat> {
     })
 }
 
-/// Longest process name the kernel stores (`TASK_COMM_LEN` minus the NUL).
+/// Longest process name that reaches a record (`TASK_COMM_LEN` minus the
+/// NUL, the length of the names `ps` shows).
 #[cfg(any(target_os = "linux", target_os = "android"))]
 const LINUX_PROCESS_NAME_LEN: usize = 15;
 
+/// Name recorded for a process whose executable cannot be read.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const UNNAMED_PROCESS: &str = "process";
+
+/// The name a process is recorded under: the file name of its executable
+/// (`/proc/<pid>/exe`), never `/proc/<pid>/comm`. The process sets `comm`
+/// itself with `prctl(PR_SET_NAME)`, and the name reaches logs and results
+/// that outlive the call, so a daemon could plant inherited secrets there;
+/// the executable link changes only through `execve` (or with
+/// `CAP_SYS_RESOURCE`), and a binary's file name is already on disk. A
+/// process whose link cannot be read — one that dropped dumpability, such
+/// as a setuid binary, or has exited — is recorded as [`UNNAMED_PROCESS`].
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn linux_process_name(pid: i32) -> String {
-    std::fs::read_to_string(format!("/proc/{pid}/comm"))
-        .map(|name| sanitize_process_name(&name))
-        .unwrap_or_default()
+    std::fs::read_link(format!("/proc/{pid}/exe"))
+        .ok()
+        .and_then(|exe| Some(sanitize_process_name(exe.file_name()?.to_str()?)))
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| UNNAMED_PROCESS.to_string())
 }
 
-/// Reduces a process name the process chose for itself (`prctl(PR_SET_NAME)`)
-/// to printable ASCII of bounded length before it reaches logs and results
-/// that outlive the call: anything else is replaced with `?`, so a name
-/// carrying control characters cannot forge log lines or terminal escapes.
+/// Reduces an executable's file name to printable ASCII of bounded length
+/// before it reaches logs and results that outlive the call: the kernel's
+/// ` (deleted)` marker on an unlinked executable is dropped, and anything
+/// that is not printable ASCII is replaced with `?`, so a name carrying
+/// control characters cannot forge log lines or terminal escapes.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn sanitize_process_name(name: &str) -> String {
-    name.trim()
+    name.strip_suffix(" (deleted)")
+        .unwrap_or(name)
+        .trim()
         .chars()
         .take(LINUX_PROCESS_NAME_LEN)
         .map(|c| {
@@ -2464,6 +2483,7 @@ mod tests {
     #[test]
     fn process_names_reach_records_as_bounded_printable_ascii() {
         assert_eq!(sanitize_process_name("sccache\n"), "sccache");
+        assert_eq!(sanitize_process_name("sccache (deleted)"), "sccache");
         assert_eq!(sanitize_process_name("Web Content\n"), "Web Content");
         assert_eq!(
             sanitize_process_name("a\x1b[31mb\r\nc\td\u{7f}é"),
@@ -2480,6 +2500,39 @@ mod tests {
         assert!(!own.is_empty());
         assert!(own.len() <= LINUX_PROCESS_NAME_LEN);
         assert!(own.chars().all(|c| c == ' ' || c.is_ascii_graphic()));
+        assert_eq!(linux_process_name(i32::MAX), UNNAMED_PROCESS);
+    }
+
+    /// A process can put anything in the name it sets for itself; the
+    /// recorded name comes from its executable instead. Rust names a thread
+    /// with `prctl(PR_SET_NAME)`, and `/proc/<tid>` answers for a thread
+    /// like `/proc/<pid>` does for a process, so a planted name can be
+    /// tested without a helper binary.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recorded_process_name_ignores_the_name_the_process_chose() {
+        const PLANTED: &str = "hunter2-secret";
+        let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let planted = std::thread::Builder::new()
+            .name(PLANTED.into())
+            .spawn(move || {
+                tid_tx.send(unsafe { libc::gettid() }).unwrap();
+                let _ = release_rx.recv();
+            })
+            .unwrap();
+        let tid = tid_rx.recv().unwrap();
+
+        let comm = std::fs::read_to_string(format!("/proc/{tid}/comm")).unwrap();
+        assert_eq!(comm.trim(), PLANTED, "fixture did not plant its name");
+        let executable = std::env::current_exe().unwrap();
+        let expected = sanitize_process_name(executable.file_name().unwrap().to_str().unwrap());
+        let recorded = linux_process_name(tid);
+        assert_eq!(recorded, expected);
+        assert!(!recorded.contains("hunter2"));
+
+        drop(release_tx);
+        planted.join().unwrap();
     }
 
     #[cfg(target_os = "linux")]

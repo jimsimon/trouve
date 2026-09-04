@@ -141,7 +141,14 @@ cgroup accounting files) that leaked into every child.
   result of the call that ran it and in `shell_kill` results, where the
   caller already knows it, and nowhere else: it may carry tokens or
   passwords, and the registry outlives the call by the length of the
-  session.
+  session. The process name is the file name of the executable
+  (`/proc/<pid>/exe`), reduced to printable ASCII of at most fifteen
+  characters, never the name the process set for itself
+  (`/proc/<pid>/comm`, `prctl(PR_SET_NAME)`): a daemon could plant
+  inherited secrets in a name it chooses, whereas its executable changes
+  only through `execve` and its file name is already on disk. A process
+  whose executable cannot be read — one that dropped dumpability — is
+  recorded as `process`.
 
 ## Consequences
 

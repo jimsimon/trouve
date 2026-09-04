@@ -47,8 +47,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Released daemons are logged by pid and name only**: the command line
   that started one stays out of the lifecycle logs and eviction failure
   messages, which outlive the call and may otherwise retain secrets. The
-  name, which the process chooses for itself, is reduced to printable ASCII
-  of at most 15 characters before it reaches those records.
+  name is the file name of the process's executable, reduced to printable
+  ASCII of at most 15 characters — never the name the process set for
+  itself, which a daemon could fill with inherited secrets.
 
 ## [4.8.1] - 2026-09-03
 
