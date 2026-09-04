@@ -953,7 +953,9 @@ impl DescriptorHygiene {
         Ok(Self::Walk(bound))
     }
 
-    /// Runs between fork and exec.
+    /// Runs between fork and exec. Fails when a descriptor could not be
+    /// marked, which leaves the spawn failed rather than exec with an
+    /// inheritable descriptor.
     fn apply(&self) -> std::io::Result<()> {
         match self {
             Self::CloseRange { walk_bound } => {
@@ -963,24 +965,22 @@ impl DescriptorHygiene {
                 let error = std::io::Error::last_os_error();
                 match walk_bound {
                     Some(bound) => walk_descriptors_close_on_exec(*bound),
-                    None => return Err(error),
+                    None => Err(error),
                 }
             }
             #[cfg(any(target_os = "linux", target_os = "android"))]
             Self::Listed {
                 sentinel_writer,
                 walk_bound,
-            } => {
-                if let Err(error) = list_descriptors_close_on_exec(*sentinel_writer) {
-                    match walk_bound {
-                        Some(bound) => walk_descriptors_close_on_exec(*bound),
-                        None => return Err(error),
-                    }
-                }
-            }
+            } => match list_descriptors_close_on_exec(*sentinel_writer) {
+                Ok(()) => Ok(()),
+                Err(error) => match walk_bound {
+                    Some(bound) => walk_descriptors_close_on_exec(*bound),
+                    None => Err(error),
+                },
+            },
             Self::Walk(bound) => walk_descriptors_close_on_exec(*bound),
         }
-        Ok(())
     }
 }
 
@@ -1051,8 +1051,9 @@ fn descriptor_table_lists(sentinel: [libc::c_int; 2]) -> bool {
 /// Child-side only: list the child's own `/proc/self/fd` with `getdents64`
 /// and mark every descriptor above stdio close-on-exec. Async-signal-safe
 /// and allocation-free; the entries are parsed off a stack buffer. Fails
-/// when the table cannot be read or the listing does not show the sentinel
-/// writer, which a complete listing of this child must.
+/// when the table cannot be read, a descriptor refuses the mark, or the
+/// listing does not show the sentinel writer, which a complete listing of
+/// this child must.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn list_descriptors_close_on_exec(sentinel_writer: libc::c_int) -> std::io::Result<()> {
     // `getdents64` records are 8-byte aligned; a `u64` buffer keeps them so.
@@ -1067,7 +1068,7 @@ fn list_descriptors_close_on_exec(sentinel_writer: libc::c_int) -> std::io::Resu
         return Err(std::io::Error::last_os_error());
     }
     let mut sentinel_seen = false;
-    let outcome = loop {
+    let outcome = 'listing: loop {
         let read = unsafe {
             libc::syscall(
                 libc::SYS_getdents64,
@@ -1097,7 +1098,9 @@ fn list_descriptors_close_on_exec(sentinel_writer: libc::c_int) -> std::io::Resu
                 continue;
             }
             sentinel_seen |= descriptor == sentinel_writer;
-            mark_descriptor_close_on_exec(descriptor);
+            if let Err(error) = mark_descriptor_close_on_exec(descriptor) {
+                break 'listing Err(error);
+            }
         }
     };
     unsafe { libc::close(directory) };
@@ -1206,22 +1209,92 @@ fn warn_descriptor_walk_once(bound: libc::c_int) {
     });
 }
 
-/// Child-side only: one `fcntl` pair per descriptor number in `3..bound`.
+/// Child-side only: one `fcntl` pair per descriptor number in `3..bound`,
+/// stopping at the first descriptor that refuses the mark.
 #[cfg(unix)]
-fn walk_descriptors_close_on_exec(bound: libc::c_int) {
-    for descriptor in 3..bound {
-        mark_descriptor_close_on_exec(descriptor);
+fn walk_descriptors_close_on_exec(bound: libc::c_int) -> std::io::Result<()> {
+    (3..bound).try_for_each(mark_descriptor_close_on_exec)
+}
+
+/// Child-side only: async-signal-safe and allocation-free. A descriptor
+/// that is not open (`EBADF`) needs no mark; any other refusal is an error,
+/// because a descriptor left inheritable reaches the program the child
+/// execs. An interrupted `fcntl` is retried.
+#[cfg(unix)]
+fn mark_descriptor_close_on_exec(descriptor: libc::c_int) -> std::io::Result<()> {
+    let flags = loop {
+        match descriptor_flags(descriptor) {
+            Ok(flags) => break flags,
+            Err(DescriptorFlagRefusal::Interrupted) => continue,
+            Err(DescriptorFlagRefusal::NotOpen) => return Ok(()),
+            Err(DescriptorFlagRefusal::Refused(error)) => return Err(error),
+        }
+    };
+    if flags & libc::FD_CLOEXEC != 0 {
+        return Ok(());
+    }
+    loop {
+        match set_descriptor_flags(descriptor, flags | libc::FD_CLOEXEC) {
+            Ok(()) => return Ok(()),
+            Err(DescriptorFlagRefusal::Interrupted) => continue,
+            Err(DescriptorFlagRefusal::NotOpen) => return Ok(()),
+            Err(DescriptorFlagRefusal::Refused(error)) => return Err(error),
+        }
     }
 }
 
-/// Child-side only: async-signal-safe and allocation-free.
+/// Why a descriptor-flag `fcntl` failed.
 #[cfg(unix)]
-fn mark_descriptor_close_on_exec(descriptor: libc::c_int) {
-    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
-    if flags == -1 || flags & libc::FD_CLOEXEC != 0 {
-        return;
+enum DescriptorFlagRefusal {
+    /// `EINTR`: the call was interrupted and may be repeated.
+    Interrupted,
+    /// `EBADF`: the number is not an open descriptor, so there is nothing
+    /// to mark.
+    NotOpen,
+    /// Anything else, a policy that forbids the call for one.
+    Refused(std::io::Error),
+}
+
+#[cfg(unix)]
+impl DescriptorFlagRefusal {
+    fn last_os_error() -> Self {
+        let error = std::io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::EINTR) => Self::Interrupted,
+            Some(libc::EBADF) => Self::NotOpen,
+            _ => Self::Refused(error),
+        }
     }
-    unsafe { libc::fcntl(descriptor, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
+}
+
+/// `fcntl(F_GETFD)`.
+#[cfg(unix)]
+fn descriptor_flags(descriptor: libc::c_int) -> Result<libc::c_int, DescriptorFlagRefusal> {
+    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+    if flags == -1 {
+        return Err(DescriptorFlagRefusal::last_os_error());
+    }
+    Ok(flags)
+}
+
+/// `fcntl(F_SETFD)`, with a test hook that refuses one descriptor.
+#[cfg(unix)]
+fn set_descriptor_flags(
+    descriptor: libc::c_int,
+    flags: libc::c_int,
+) -> Result<(), DescriptorFlagRefusal> {
+    #[cfg(test)]
+    if let Some((refused, errno)) = DESCRIPTOR_FLAG_REFUSAL.with(std::cell::Cell::get)
+        && refused == descriptor
+    {
+        return Err(DescriptorFlagRefusal::Refused(
+            std::io::Error::from_raw_os_error(errno),
+        ));
+    }
+    if unsafe { libc::fcntl(descriptor, libc::F_SETFD, flags) } == -1 {
+        return Err(DescriptorFlagRefusal::last_os_error());
+    }
+    Ok(())
 }
 
 #[cfg(all(unix, test))]
@@ -1239,6 +1312,11 @@ thread_local! {
     /// the spawn, standing in for whatever another thread does in that gap.
     static AFTER_DESCRIPTOR_HYGIENE_DETECT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
+    /// Test hook: a descriptor number whose `F_SETFD` fails with the given
+    /// `errno`, standing in for a syscall policy that forbids the call. Read
+    /// in the forked child too, which inherits this thread's copy.
+    static DESCRIPTOR_FLAG_REFUSAL: std::cell::Cell<Option<(libc::c_int, libc::c_int)>> =
+        const { std::cell::Cell::new(None) };
 }
 
 #[cfg(all(any(target_os = "linux", target_os = "android"), test))]
@@ -3604,6 +3682,91 @@ mod tests {
         );
         drop(high);
         drop(leaked);
+    }
+
+    /// A descriptor that refuses the close-on-exec mark fails the spawn,
+    /// under the listing and under the walk alike: the alternative is to
+    /// exec with the descriptor inheritable.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn spawn_fails_rather_than_exec_with_a_descriptor_that_refused_the_mark() {
+        let _serialized = DESCRIPTOR_TEST_LOCK.lock().await;
+        let leaked = tempfile::tempfile().unwrap();
+        assert_eq!(
+            unsafe { libc::fcntl(leaked.as_raw_fd(), libc::F_SETFD, 0) },
+            0
+        );
+        for preferences in [(false, true), (false, false)] {
+            let mut command = tokio::process::Command::new("/bin/sh");
+            command
+                .args(["-c", "true"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            DESCRIPTOR_HYGIENE_PREFERENCES.with(|hygiene| hygiene.set(preferences));
+            DESCRIPTOR_FLAG_REFUSAL
+                .with(|refusal| refusal.set(Some((leaked.as_raw_fd(), libc::EPERM))));
+            let spawned = spawn_process_tree(&mut command);
+            DESCRIPTOR_FLAG_REFUSAL.with(|refusal| refusal.set(None));
+            DESCRIPTOR_HYGIENE_PREFERENCES.with(|hygiene| hygiene.set((true, true)));
+
+            let error = match spawned {
+                Ok(_) => panic!(
+                    "spawn {preferences:?} succeeded although a descriptor could not be marked close-on-exec"
+                ),
+                Err(error) => error,
+            };
+            assert_eq!(error.raw_os_error(), Some(libc::EPERM), "{error}");
+            assert_eq!(
+                unsafe { libc::fcntl(leaked.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+                0,
+                "a refused spawn must leave the parent's descriptors alone"
+            );
+        }
+        drop(leaked);
+    }
+
+    /// The child-side mark, run in this process: a number that is not open
+    /// needs nothing, a descriptor that takes the mark gets it, and one that
+    /// refuses it is an error carrying the refusal.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn descriptor_mark_reports_refusals_and_skips_closed_numbers() {
+        let _serialized = DESCRIPTOR_TEST_LOCK.blocking_lock();
+        mark_descriptor_close_on_exec(libc::c_int::MAX).unwrap();
+
+        let marked = tempfile::tempfile().unwrap();
+        assert_eq!(
+            unsafe { libc::fcntl(marked.as_raw_fd(), libc::F_SETFD, 0) },
+            0
+        );
+        mark_descriptor_close_on_exec(marked.as_raw_fd()).unwrap();
+        assert_ne!(
+            unsafe { libc::fcntl(marked.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0
+        );
+
+        let refused = tempfile::tempfile().unwrap();
+        assert_eq!(
+            unsafe { libc::fcntl(refused.as_raw_fd(), libc::F_SETFD, 0) },
+            0
+        );
+        DESCRIPTOR_FLAG_REFUSAL
+            .with(|refusal| refusal.set(Some((refused.as_raw_fd(), libc::EACCES))));
+        let error = mark_descriptor_close_on_exec(refused.as_raw_fd())
+            .expect_err("a refused mark passed for applied");
+        assert_eq!(error.raw_os_error(), Some(libc::EACCES));
+        let walk = walk_descriptors_close_on_exec(refused.as_raw_fd() + 1)
+            .expect_err("the walk passed over a refused mark");
+        assert_eq!(walk.raw_os_error(), Some(libc::EACCES));
+        // Already marked: nothing to set, so nothing to refuse.
+        mark_descriptor_close_on_exec(marked.as_raw_fd()).unwrap();
+        DESCRIPTOR_FLAG_REFUSAL.with(|refusal| refusal.set(None));
+        assert_eq!(
+            unsafe { libc::fcntl(refused.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0
+        );
+        mark_descriptor_close_on_exec(refused.as_raw_fd()).unwrap();
     }
 
     #[cfg(target_os = "linux")]

@@ -137,7 +137,12 @@ cgroup accounting files) that leaked into every child.
   limit rather than sanitize part of the table and leak the rest. On Linux
   only a kernel older than 5.11 without a listable `/proc` can reach that
   error; on macOS and the BSDs the walk is the only strategy, and their
-  soft limits are bounded by `OPEN_MAX`.
+  soft limits are bounded by `OPEN_MAX`. The same rule holds per
+  descriptor: when the listing or the walk finds a descriptor that refuses
+  the close-on-exec mark — a syscall policy forbidding `fcntl(F_SETFD)`,
+  say — the spawn fails with that refusal rather than exec with the
+  descriptor inheritable; only a number that is not open is skipped, and
+  an interrupted `fcntl` is retried.
 - **Lifecycle records name processes, never commands.** A released daemon
   is logged and reported — at release, when a worker it forked is found at
   eviction, and when eviction has to escalate — by pid, process name, and
