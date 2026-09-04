@@ -64,7 +64,11 @@ cgroup accounting files) that leaked into every child.
   recent the identity check, would race a successor to the pid; keeping the
   daemon in the tree costs at most the behaviour every call had before this
   decision. Only tree members, which are signalled while the tree still
-  holds them, fall back from a pidfd to their pid.
+  holds them, fall back from a pidfd to their pid, and only after a fresh
+  read of the pid's start time shows it still names the process the scan
+  found; the window that leaves is the one the process-group signal has
+  always had, and a kernel without pidfds could otherwise not stop an
+  escapee at all.
 - **Hand-over and eviction are atomic.** A daemon enters the registry only
   after the eviction record is checked under the registry lock, and eviction
   drains a worktree and records the eviction under the same lock. A daemon

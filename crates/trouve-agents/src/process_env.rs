@@ -1689,14 +1689,17 @@ fn signal_linux_process_handle(handle: &OwnedFd, signal: libc::c_int) -> std::io
 
 /// Signal a process the tree still owns: through its pidfd where there is
 /// one, so a pid recycled since the scan is never hit; by pid only where the
-/// kernel offers no pidfd or a sandbox refuses the syscall. Tree members
-/// are signalled right after the scan that found them, which is as close
-/// to their identity check as a signal by number can get; released
-/// processes, which are signalled much later, never take this route.
+/// kernel offers no pidfd or a sandbox refuses the syscall. The signal by
+/// number is preceded by a fresh read of the pid's start time, so it is
+/// skipped when the holder found by the scan has already been replaced;
+/// the window left is the one between that read and the `kill`, the same
+/// one the group signal has. Released processes, which are signalled long
+/// after their scan, never take this route.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn signal_linux_process(
     pid: i32,
     handle: Option<&OwnedFd>,
+    start_time: u64,
     signal: libc::c_int,
 ) -> std::io::Result<bool> {
     if let Some(handle) = handle {
@@ -1705,7 +1708,10 @@ fn signal_linux_process(
             outcome => return outcome,
         }
     }
-    signal_unix_process(pid, signal)
+    match linux_process_stat(pid) {
+        Some(current) if current.start_time == start_time => signal_unix_process(pid, signal),
+        _ => Ok(false),
+    }
 }
 
 /// The `/proc/<pid>/stat` fields the process-tree code relies on.
@@ -1956,7 +1962,7 @@ fn record_detached(detached: &mut Vec<DetachedProcess>, process: DetachedProcess
 /// safely later. Holders outside the process group that were killed are
 /// reported in `terminated`. Each holder is signalled through its pidfd
 /// where the kernel offers one, so a pid recycled since the scan is never
-/// hit.
+/// hit; without one, by number only once its start time has been re-read.
 ///
 /// Session membership is compared against trouve's own session: the leader
 /// was spawned with a new process group but never a new session, so every
@@ -1979,7 +1985,12 @@ fn terminate_unix_sentinel_holders(
             record_detached(detached, process);
             continue;
         }
-        match signal_linux_process(holder.pid, holder.handle.as_deref(), libc::SIGKILL) {
+        match signal_linux_process(
+            holder.pid,
+            holder.handle.as_deref(),
+            holder.stat.start_time,
+            libc::SIGKILL,
+        ) {
             Ok(true) => {}
             Ok(false) => continue,
             Err(error) => {
@@ -2501,6 +2512,20 @@ mod tests {
         assert!(own.len() <= LINUX_PROCESS_NAME_LEN);
         assert!(own.chars().all(|c| c == ' ' || c.is_ascii_graphic()));
         assert_eq!(linux_process_name(i32::MAX), UNNAMED_PROCESS);
+    }
+
+    /// Without a pidfd a tree member is signalled by number, but only once a
+    /// fresh read of its start time shows the pid still names the process the
+    /// scan found; a stale start time means the pid was recycled and nothing
+    /// is signalled.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn numeric_signal_is_skipped_when_the_pid_no_longer_names_the_scanned_process() {
+        let own_pid = i32::try_from(std::process::id()).unwrap();
+        let own = linux_process_stat(own_pid).expect("own /proc stat");
+        assert!(signal_linux_process(own_pid, None, own.start_time, 0).unwrap());
+        assert!(!signal_linux_process(own_pid, None, own.start_time.wrapping_add(1), 0).unwrap());
+        assert!(!signal_linux_process(i32::MAX, None, own.start_time, 0).unwrap());
     }
 
     /// A process can put anything in the name it sets for itself; the
