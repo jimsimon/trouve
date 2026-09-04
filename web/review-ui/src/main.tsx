@@ -1338,9 +1338,11 @@ function JobDetailPane({
         <CopyButton text={finding.prompt_for_agents} />
         {finding.status !== "advisory" && (
           <ExternalLink href={finding.github_comment_url}>
-            {finding.github_comment_id != null
-              ? "Open inline comment ↗"
-              : "Open review comment ↗"}
+            {finding.github_comment_id == null
+              ? "Open review comment ↗"
+              : finding.origin === "fix_regression"
+                ? "Open thread reply ↗"
+                : "Open inline comment ↗"}
           </ExternalLink>
         )}
       </div>

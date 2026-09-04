@@ -1586,6 +1586,8 @@ struct PublishedReviewComment {
     id: u64,
     html_url: String,
     body: String,
+    #[serde(default)]
+    in_reply_to_id: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -9179,6 +9181,13 @@ impl Engine {
                 &orphaned,
                 trouve_protocol::CodeReviewFindingPublicationStatus::Failed,
             );
+            // A pending row does not prove the reply never landed: the
+            // earlier attempt may have timed out after GitHub accepted it or
+            // failed only to record the outcome. Adopt any reply already on
+            // the thread rather than posting a duplicate.
+            let replies = self
+                .adopt_posted_origin_thread_replies(api, job, replies)
+                .await;
             self.post_origin_thread_replies(api, job, &replies).await;
         }
         self.emit_code_review_job_updated(&job.id)?;
@@ -11548,6 +11557,87 @@ impl Engine {
         Ok(())
     }
 
+    /// Records the fix-regression replies that already exist on GitHub —
+    /// found by their finding marker among the pull request's review
+    /// comments, newest first — and returns the replies still to post. When
+    /// the listing fails nothing is adopted and every reply stays pending
+    /// rather than being reposted on a guess.
+    async fn adopt_posted_origin_thread_replies(
+        &self,
+        api: &GithubApi,
+        job: &trouve_protocol::CodeReviewJob,
+        mut replies: Vec<OriginThreadReply>,
+    ) -> Vec<OriginThreadReply> {
+        if replies.is_empty() {
+            return replies;
+        }
+        let mut posted = HashMap::<String, PublishedReviewComment>::new();
+        for page in 1..=REVIEW_COMMENT_MAX_PAGES {
+            let response: Result<(Vec<PublishedReviewComment>, _)> = api
+                .get(&format!(
+                    "/repos/{}/pulls/{}/comments?sort=created&direction=desc\
+                     &per_page={REVIEW_COMMENT_PAGE_SIZE}&page={page}",
+                    job.repository, job.pull_number
+                ))
+                .await;
+            let (page_comments, rate) = match response {
+                Ok(response) => response,
+                Err(error) => {
+                    tracing::warn!(
+                        job_id = %job.id,
+                        page,
+                        %error,
+                        "listing pull request comments for pending fix-regression replies failed; \
+                         the replies stay pending"
+                    );
+                    return Vec::new();
+                }
+            };
+            self.record_review_rate(rate);
+            let count = page_comments.len();
+            for reply in &replies {
+                if posted.contains_key(&reply.finding_id) {
+                    continue;
+                }
+                let marker = format!("trouve-code-review finding:{}", reply.finding_id);
+                if let Some(comment) = page_comments.iter().find(|comment| {
+                    comment.body.contains(&marker)
+                        && comment
+                            .in_reply_to_id
+                            .is_none_or(|parent| parent == reply.original_comment_id)
+                }) {
+                    posted.insert(reply.finding_id.clone(), comment.clone());
+                }
+            }
+            if posted.len() == replies.len() || count < REVIEW_COMMENT_PAGE_SIZE {
+                break;
+            }
+        }
+        replies.retain(|reply| {
+            let Some(comment) = posted.get(&reply.finding_id) else {
+                return true;
+            };
+            match self.store.update_code_review_finding_publication(
+                &reply.finding_id,
+                Some(comment.id),
+                &comment.html_url,
+                reply.original_thread_id.as_deref(),
+            ) {
+                Ok(_) => false,
+                Err(error) => {
+                    tracing::warn!(
+                        job_id = %job.id,
+                        finding_id = %reply.finding_id,
+                        %error,
+                        "recording an already posted fix-regression reply failed"
+                    );
+                    false
+                }
+            }
+        });
+        replies
+    }
+
     /// Posts fix regressions as replies on the threads of the findings they
     /// regressed, after the round's review is accepted. Each reply's outcome
     /// is recorded on its own finding: the reply comment on success, a
@@ -11650,7 +11740,9 @@ impl Engine {
                 error = %compact_api_error(&body),
                 "GitHub rejected a fix-regression reply"
             );
-            if status.is_client_error() {
+            // Rate limiting is a 4xx but says nothing about the reply
+            // itself; leave it pending for the next reconciliation.
+            if status.is_client_error() && status != reqwest::StatusCode::TOO_MANY_REQUESTS {
                 self.persist_publication_status_best_effort(
                     &job.id,
                     &[reply.finding_id.as_str()],
@@ -17293,6 +17385,10 @@ fn apply_change_scope_verdict(
     // line is kept for audit. The snapped line may itself be a diff line,
     // which is exactly how the chain is meant to reach the change.
     for waypoint in &mut finding.evidence.causal_waypoints {
+        // Waypoint paths follow the finding-path contract (no diff prefix,
+        // no surrounding whitespace) so the diff, the prefetched head files,
+        // and the inter-round change set all key them the same way.
+        waypoint.path = normalized_finding_path(&waypoint.path);
         waypoint.line_claimed = None;
         if waypoint.quote.len() > REVIEW_QUOTE_MAX_BYTES {
             continue;
@@ -21204,6 +21300,18 @@ rename to src/new.rs
         assert_eq!(snapped.evidence.causal_waypoints[1].line, 2);
         assert_eq!(snapped.evidence.causal_waypoints[1].line_claimed, Some(1));
 
+        // Waypoint paths are normalized like finding paths before lookup, so
+        // a diff-prefixed or padded path still finds its file and diff line.
+        let mut prefixed = finding(
+            true,
+            "introduced",
+            vec![waypoint(" b/src/api.rs ", 8, "register(handler);")],
+        );
+        apply_change_scope_verdict(&mut prefixed, &contents, &object_lines);
+        assert_eq!(prefixed.evidence.change_scope, "verified");
+        assert_eq!(prefixed.evidence.causal_waypoints[0].path, "src/api.rs");
+        assert_eq!(prefixed.evidence.causal_waypoints[0].line, 10);
+
         // A pre-existing classification, a missing claim, and an unknown
         // claim are honest non-blocking dispositions, wherever anchored.
         for causation in ["pre_existing", "", "somehow"] {
@@ -22582,11 +22690,24 @@ rename to src/new.rs
         tokio::task::JoinHandle<()>,
         std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     ) {
+        recording_github_server_with_statuses(
+            listener,
+            bodies.into_iter().map(|body| (200, body)).collect(),
+        )
+    }
+
+    fn recording_github_server_with_statuses(
+        listener: tokio::net::TcpListener,
+        responses: Vec<(u16, String)>,
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
         let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let recorded = requests.clone();
         let handle = tokio::spawn(async move {
-            for body in bodies {
+            for (status, body) in responses {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut request = Vec::new();
                 let mut buffer = [0_u8; 4096];
@@ -22612,8 +22733,13 @@ rename to src/new.rs
                     .lock()
                     .unwrap()
                     .push(String::from_utf8_lossy(&request).into_owned());
+                let reason = match status {
+                    200 => "OK",
+                    429 => "Too Many Requests",
+                    _ => "Error",
+                };
                 let response = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                     body.len()
                 );
                 stream.write_all(response.as_bytes()).await.unwrap();
@@ -22837,6 +22963,153 @@ rename to src/new.rs
         assert!(manifest.iter().any(|(finding_id, _, representation)| {
             finding_id == &regression.id && representation == "thread_reply"
         }));
+    }
+
+    /// A pending reply whose earlier attempt is ambiguous: GitHub already
+    /// has the reply (recorded from the thread listing, never reposted), or
+    /// answers the repost with a rate limit (stays pending, never failed).
+    #[tokio::test]
+    async fn pending_fix_regression_replies_are_adopted_or_retried_not_duplicated() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let job = enqueue_test_review_job(&store, "acme/widgets#42:regression-retry");
+        store.claim_code_review_job().unwrap().unwrap();
+        let findings = store
+            .save_code_review_result_with_themes(
+                &job.id,
+                "Two regressions.",
+                "Decide the trade-offs.",
+                2,
+                &[
+                    NewCodeReviewFinding {
+                        path: "src/lib.rs".into(),
+                        line: 12,
+                        side: "RIGHT".into(),
+                        severity: "high".into(),
+                        confidence: "high".into(),
+                        title: "Ownership is now unbounded".into(),
+                        body: "Handle the error.".into(),
+                        prompt_for_agents: "Handle the error and test it.".into(),
+                        sources: Vec::new(),
+                    },
+                    NewCodeReviewFinding {
+                        path: "src/lib.rs".into(),
+                        line: 30,
+                        side: "RIGHT".into(),
+                        severity: "high".into(),
+                        confidence: "high".into(),
+                        title: "Secret derived from basename".into(),
+                        body: "Derive it elsewhere.".into(),
+                        prompt_for_agents: "Derive the secret elsewhere.".into(),
+                        sources: Vec::new(),
+                    },
+                ],
+                &[
+                    NewCodeReviewFindingDetails {
+                        origin: trouve_protocol::CodeReviewFindingOrigin::FixRegression,
+                        ..Default::default()
+                    },
+                    NewCodeReviewFindingDetails {
+                        origin: trouve_protocol::CodeReviewFindingOrigin::FixRegression,
+                        ..Default::default()
+                    },
+                ],
+                &[],
+                &[],
+            )
+            .unwrap();
+        let reply =
+            |finding: &trouve_protocol::CodeReviewFinding, comment_id: u64| OriginThreadReply {
+                finding_id: finding.id.clone(),
+                original_finding_id: format!("rvf-original-{comment_id}"),
+                original_comment_id: comment_id,
+                original_thread_id: None,
+                body: format!("reply\n<!-- trouve-code-review finding:{} -->", finding.id),
+            };
+        let replies = vec![reply(&findings[0], 9001), reply(&findings[1], 9002)];
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (server, requests) = recording_github_server_with_statuses(
+            listener,
+            vec![
+                // The thread listing shows the first reply already landed.
+                (
+                    200,
+                    serde_json::json!([
+                        {
+                            "id": 9555,
+                            "in_reply_to_id": 9001,
+                            "html_url": "https://github.com/acme/widgets/pull/42#discussion_r9555",
+                            "body": format!("reply\n<!-- trouve-code-review finding:{} -->", findings[0].id),
+                        },
+                        {
+                            "id": 9001,
+                            "html_url": "https://github.com/acme/widgets/pull/42#discussion_r9001",
+                            "body": "<!-- trouve-code-review finding:rvf-original-9001 -->",
+                        }
+                    ])
+                    .to_string(),
+                ),
+                // Reposting the second one is rate limited.
+                (
+                    429,
+                    r#"{"message":"API rate limit exceeded"}"#.into(),
+                ),
+            ],
+        );
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(
+            store,
+            data.path().to_path_buf(),
+            &crate::config::Config::default(),
+        );
+        let api = GithubApi::with_base_url(
+            "Bearer installation-token".into(),
+            format!("http://{address}"),
+            "installation:7".into(),
+        )
+        .unwrap();
+
+        let remaining = engine
+            .adopt_posted_origin_thread_replies(&api, &job, replies)
+            .await;
+        assert_eq!(
+            remaining
+                .iter()
+                .map(|reply| reply.finding_id.as_str())
+                .collect::<Vec<_>>(),
+            [findings[1].id.as_str()]
+        );
+        engine
+            .post_origin_thread_replies(&api, &job, &remaining)
+            .await;
+        server.await.unwrap();
+        let requests = requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].starts_with("GET /repos/acme/widgets/pulls/42/comments?"));
+        assert!(
+            requests[1].starts_with("POST /repos/acme/widgets/pulls/42/comments/9002/replies ")
+        );
+
+        let stored = engine.store.code_review_findings(&job.id).unwrap();
+        let adopted = stored
+            .iter()
+            .find(|finding| finding.id == findings[0].id)
+            .unwrap();
+        assert_eq!(
+            adopted.github_publication_status,
+            trouve_protocol::CodeReviewFindingPublicationStatus::Published
+        );
+        assert_eq!(adopted.github_comment_id, Some(9555));
+        let rate_limited = stored
+            .iter()
+            .find(|finding| finding.id == findings[1].id)
+            .unwrap();
+        assert_eq!(
+            rate_limited.github_publication_status,
+            trouve_protocol::CodeReviewFindingPublicationStatus::Pending
+        );
+        assert_eq!(rate_limited.github_comment_id, None);
     }
 
     #[test]

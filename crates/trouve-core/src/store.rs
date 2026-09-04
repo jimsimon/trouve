@@ -698,6 +698,20 @@ const CARRIED_ANCHOR_TARGET_BACKFILL_MIGRATION: &str = "carried-anchor-target-ba
 const ADVISORY_FINDING_STATUS_BACKFILL_MIGRATION: &str =
     "code-review-advisory-finding-status-backfill-v1";
 
+/// How many of a pull request's most recently resolved, posted findings a
+/// fix-regression thread lookup considers.
+const FIXED_FINDING_THREAD_LOOKUP_LIMIT: usize = 500;
+
+/// Which of a pull request's published findings a lookup returns.
+struct PullFindingSelection<'a> {
+    status: Option<&'a str>,
+    /// Extra SQL appended to the finding predicate; `f` is the findings table.
+    extra_predicate: &'a str,
+    /// Return only this many rows, newest resolution first, instead of the
+    /// whole history in round order.
+    newest_resolved_limit: Option<usize>,
+}
+
 // This repair runs once inside the same transaction as its completion marker.
 // It can therefore resume after an interrupted column migration without
 // imposing history-sized work on every later store open. Each affected thread
@@ -1106,10 +1120,12 @@ fn backfill_code_review_two_tier_issue_counts(conn: &Connection) -> Result<()> {
 
 /// Findings below the blocking bar used to stay `open` and were merely
 /// suppressed at publication; they now carry status `advisory` from
-/// creation. Move the existing open below-bar rows (and anything the
-/// publication policy already suppressed) to `advisory` once, then recount
-/// every pull's tier snapshot under the current predicate so check runs
-/// reflect the tightened gate right after upgrade.
+/// creation. Move the existing open below-bar rows to `advisory` once, then
+/// recount every pull's tier snapshot under the current predicate so check
+/// runs reflect the tightened gate right after upgrade. Only the
+/// severity/confidence levels decide: a blocking-level row the publication
+/// policy suppressed for an unverified scope or an exempt origin stays
+/// `open` and non-gating, exactly as a new one would.
 fn backfill_code_review_advisory_finding_status(conn: &Connection) -> Result<()> {
     let transaction = write_transaction(conn)?;
     let complete = transaction.query_row(
@@ -1124,9 +1140,7 @@ fn backfill_code_review_advisory_finding_status(conn: &Connection) -> Result<()>
     transaction.execute(
         &format!(
             "UPDATE code_review_findings SET status = 'advisory'
-             WHERE status = 'open'
-               AND (github_publication_status = 'suppressed_by_policy'
-                    OR NOT {levels})",
+             WHERE status = 'open' AND NOT {levels}",
             levels = blocking_finding_levels_predicate("code_review_findings")
         ),
         [],
@@ -3460,7 +3474,9 @@ fn resolve_code_review_themes_in_transaction(
              JOIN code_review_jobs j ON j.id = f.job_id
              LEFT JOIN code_review_jobs link_job ON link_job.id = ft.linked_by_job_id
              WHERE ft.theme_id = code_review_themes.id
-               AND f.status IN ('open', 'advisory') AND j.review_published != 0
+               AND (f.status = 'open'
+                    OR (f.status = 'advisory' AND f.resolved_by_job_id = ''))
+               AND j.review_published != 0
                AND (ft.linked_by_job_id = '' OR link_job.review_published != 0)
            )",
         params![repository, pull_number as i64, resolved_head, resolved_at],
@@ -12468,7 +12484,18 @@ impl Store {
         repository: &str,
         pull_number: u64,
     ) -> Result<Vec<trouve_protocol::CodeReviewFinding>> {
-        self.code_review_findings_for_pull_with_status(repository, pull_number, Some("fixed"))
+        // Only findings that reached GitHub have a thread to reply on, and a
+        // regression of something fixed long ago is rare enough that the
+        // newest resolutions bound the lookup on long-lived pull requests.
+        self.select_code_review_findings_for_pull(
+            repository,
+            pull_number,
+            PullFindingSelection {
+                status: Some("fixed"),
+                extra_predicate: " AND f.github_comment_id IS NOT NULL",
+                newest_resolved_limit: Some(FIXED_FINDING_THREAD_LOOKUP_LIMIT),
+            },
+        )
     }
 
     fn code_review_findings_for_pull_with_status(
@@ -12477,12 +12504,47 @@ impl Store {
         pull_number: u64,
         status: Option<&str>,
     ) -> Result<Vec<trouve_protocol::CodeReviewFinding>> {
+        self.select_code_review_findings_for_pull(
+            repository,
+            pull_number,
+            PullFindingSelection {
+                status,
+                extra_predicate: "",
+                newest_resolved_limit: None,
+            },
+        )
+    }
+
+    fn select_code_review_findings_for_pull(
+        &self,
+        repository: &str,
+        pull_number: u64,
+        selection: PullFindingSelection<'_>,
+    ) -> Result<Vec<trouve_protocol::CodeReviewFinding>> {
+        let PullFindingSelection {
+            status,
+            extra_predicate,
+            newest_resolved_limit,
+        } = selection;
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
-        let status_filter = if status.is_some() {
-            " AND f.status = ?3"
-        } else {
-            ""
+        let status_filter = format!(
+            "{}{extra_predicate}",
+            if status.is_some() {
+                " AND f.status = ?3"
+            } else {
+                ""
+            }
+        );
+        let (order, limit) = match newest_resolved_limit {
+            Some(limit) => (
+                "f.resolved_at DESC, f.id".to_string(),
+                format!(" LIMIT {limit}"),
+            ),
+            None => (
+                "j.completed_at, f.job_id, f.path, f.line, f.id".to_string(),
+                String::new(),
+            ),
         };
         let query_params = || {
             let mut values = vec![
@@ -12506,7 +12568,7 @@ impl Store {
                  JOIN code_review_jobs j ON j.id = f.job_id
                  WHERE j.repository = ?1 AND j.pull_number = ?2
                    AND j.review_published = 1{status_filter}
-                 ORDER BY j.completed_at, f.job_id, f.path, f.line, f.id"
+                 ORDER BY {order}{limit}"
             ))?;
             stmt.query_map(rusqlite::params_from_iter(query_params()), |row| {
                 Ok(trouve_protocol::CodeReviewFinding {
@@ -25633,6 +25695,50 @@ mod tests {
         assert_eq!(job.open_issue_count, Some(2));
         assert_eq!(job.advisory_open_issue_count, Some(0));
 
+        // Round three fixes both open findings: the superseded advisory row
+        // still shares the theme but no longer keeps it open.
+        let mut third_request = backoff_test_job_request();
+        third_request.dedupe_key = "acme/widgets#42:advisory-theme-resolution".into();
+        third_request.head_sha = "4444444444444444444444444444444444444444".into();
+        let third = store
+            .enqueue_code_review_job(&third_request)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            third.id
+        );
+        store
+            .save_code_review_result_with_themes(&third.id, "summary", "", 0, &[], &[], &[], &[])
+            .unwrap();
+        assert!(store.claim_code_review_publication(&third.id).unwrap());
+        store
+            .record_code_review_publication(
+                &third.id,
+                &third.repository,
+                third.pull_number,
+                &third.base_ref,
+                &third.head_sha,
+                "https://example/review",
+                false,
+                &[blocking.id.as_str(), promoted[0].id.as_str()],
+            )
+            .unwrap();
+        store
+            .finish_code_review_job(&third.id, "succeeded", "https://example/review", "")
+            .unwrap();
+        let themes = store
+            .code_review_themes_for_pull(&third.repository, third.pull_number)
+            .unwrap();
+        assert_eq!(themes.len(), 1);
+        assert_eq!(themes[0].status, "resolved");
+        assert!(
+            store
+                .open_code_review_findings(&third.repository, third.pull_number)
+                .unwrap()
+                .is_empty()
+        );
+
         // Replaying the save releases the promotion before re-claiming it.
         store
             .conn
@@ -29392,6 +29498,121 @@ mod tests {
                 .job
                 .open_issue_count,
             Some(7)
+        );
+    }
+
+    #[test]
+    fn advisory_status_backfill_only_demotes_below_bar_levels() {
+        let store = Store::open_in_memory().unwrap();
+        let (round, stored) = publish_leveled_test_round(
+            &store,
+            "acme/widgets#42:advisory-backfill",
+            "2222222222222222222222222222222222222222",
+            trouve_protocol::CodeReviewJobScope::Incremental,
+            &[
+                ("crates/core/src/engine.rs", "high", "high"),
+                ("crates/core/src/scope.rs", "high", "high"),
+                ("scripts/qualify.mjs", "low", "low"),
+            ],
+            &[],
+        );
+        // Simulate the pre-`advisory` database: every retained finding was
+        // `open`, and the publication policy suppressed both the below-bar
+        // row and a blocking-level row whose change scope was unverified.
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE code_review_findings SET status = 'open' WHERE job_id = ?1",
+                params![round.id],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE code_review_findings
+                 SET github_publication_status = 'suppressed_by_policy'
+                 WHERE id IN (?1, ?2)",
+                params![stored[1].id, stored[2].id],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE code_review_findings
+                 SET evidence = '{\"change_scope\":\"unverified\"}'
+                 WHERE id = ?1",
+                params![stored[1].id],
+            )
+            .unwrap();
+            conn.execute(
+                "DELETE FROM data_migrations WHERE name = ?1",
+                [ADVISORY_FINDING_STATUS_BACKFILL_MIGRATION],
+            )
+            .unwrap();
+            backfill_code_review_advisory_finding_status(&conn).unwrap();
+        }
+
+        let statuses = store
+            .code_review_findings(&round.id)
+            .unwrap()
+            .into_iter()
+            .map(|finding| (finding.path, finding.status))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            statuses,
+            vec![
+                ("crates/core/src/engine.rs".to_string(), "open".to_string()),
+                ("crates/core/src/scope.rs".to_string(), "open".to_string()),
+                ("scripts/qualify.mjs".to_string(), "advisory".to_string()),
+            ]
+        );
+        // The recount sees one gating finding; the unverified-scope row and
+        // the demoted one both count as advisory debt.
+        let migrated = store.code_review_job(&round.id).unwrap().unwrap().job;
+        assert_eq!(migrated.open_issue_count, Some(1));
+        assert_eq!(migrated.advisory_open_issue_count, Some(2));
+    }
+
+    #[test]
+    fn fixed_finding_thread_lookup_returns_only_posted_fixed_findings() {
+        let store = Store::open_in_memory().unwrap();
+        let (_, first) = publish_leveled_test_round(
+            &store,
+            "acme/widgets#42:fixed-lookup-1",
+            "2222222222222222222222222222222222222222",
+            trouve_protocol::CodeReviewJobScope::Incremental,
+            &[
+                ("crates/core/src/engine.rs", "high", "high"),
+                ("crates/core/src/scope.rs", "high", "high"),
+                ("crates/core/src/still-open.rs", "high", "high"),
+            ],
+            &[],
+        );
+        // Only the first finding reached GitHub; the second was suppressed.
+        assert!(
+            store
+                .update_code_review_finding_publication(
+                    &first[0].id,
+                    Some(9001),
+                    "https://github.com/acme/widgets/pull/42#discussion_r9001",
+                    Some("T1"),
+                )
+                .unwrap()
+        );
+        publish_leveled_test_round(
+            &store,
+            "acme/widgets#42:fixed-lookup-2",
+            "3333333333333333333333333333333333333333",
+            trouve_protocol::CodeReviewJobScope::Incremental,
+            &[],
+            &[&first[0].id, &first[1].id],
+        );
+
+        let fixed = store
+            .fixed_code_review_findings("acme/widgets", 42)
+            .unwrap()
+            .into_iter()
+            .map(|finding| (finding.id, finding.status, finding.github_comment_id))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            fixed,
+            vec![(first[0].id.clone(), "fixed".to_string(), Some(9001))]
         );
     }
 
