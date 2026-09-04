@@ -42,9 +42,10 @@ const DETACHED_EXIT_POLL: Duration = Duration::from_millis(50);
 /// stops at eviction.
 const DETACHED_PRUNE_THRESHOLD: usize = 512;
 /// Evictions remembered so that a daemon handed over late (its tree finished
-/// while the eviction ran) is stopped rather than kept. Late hand-overs can
-/// only come from calls and jobs that were in flight at eviction, so the
-/// record is bounded; the oldest entries are forgotten first.
+/// while the eviction ran) is stopped rather than kept. An eviction stays on
+/// record for as long as a call or job started from the worktree is in
+/// flight, whatever the record's size; beyond that the record is bounded
+/// and the oldest evictions are forgotten first.
 const MAX_EVICTED_WORKTREES: usize = 4096;
 
 #[derive(Default)]
@@ -281,7 +282,10 @@ impl RetainedTree {
 /// [`Self::terminate_worktree`] drains a worktree's daemons and puts the
 /// eviction on record under the same lock. A daemon is therefore either in
 /// the drained set or adopted after the eviction is on record, in which case
-/// it is stopped on the spot.
+/// it is stopped on the spot. Every call and job holds an [`InFlightCall`]
+/// from before its spawn until after its last hand-over, and an eviction
+/// stays on record while one is held for its worktree, so a hand-over
+/// however late always finds the eviction.
 #[derive(Default)]
 struct DetachedRegistry {
     state: Mutex<DetachedState>,
@@ -295,8 +299,13 @@ struct DetachedState {
     /// their session id and are never reused, so remembering one cannot stop
     /// a later session's daemons.
     evicted: VecDeque<PathBuf>,
+    /// Calls and jobs in flight, by worktree: the ones that may still hand
+    /// a daemon over.
+    in_flight: HashMap<PathBuf, usize>,
     /// Record size above which [`Self::prune`] runs.
     prune_threshold: usize,
+    /// Evictions kept beyond the in-flight ones.
+    evicted_limit: usize,
 }
 
 impl Default for DetachedState {
@@ -305,7 +314,41 @@ impl Default for DetachedState {
             entries: Vec::new(),
             sentinels: Vec::new(),
             evicted: VecDeque::new(),
+            in_flight: HashMap::new(),
             prune_threshold: DETACHED_PRUNE_THRESHOLD,
+            evicted_limit: MAX_EVICTED_WORKTREES,
+        }
+    }
+}
+
+/// A call or job that may still hand daemons over for its worktree. Held
+/// from before the spawn until nothing can call [`DetachedRegistry::adopt`]
+/// for it any more.
+struct InFlightCall {
+    registry: Arc<DetachedRegistry>,
+    worktree: PathBuf,
+}
+
+impl InFlightCall {
+    fn begin(registry: &Arc<DetachedRegistry>, worktree: &Path) -> Self {
+        let mut state = registry.state.lock().unwrap();
+        *state.in_flight.entry(worktree.to_path_buf()).or_insert(0) += 1;
+        Self {
+            registry: registry.clone(),
+            worktree: worktree.to_path_buf(),
+        }
+    }
+}
+
+impl Drop for InFlightCall {
+    fn drop(&mut self) {
+        let mut state = self.registry.state.lock().unwrap();
+        if let Some(count) = state.in_flight.get_mut(&self.worktree) {
+            *count -= 1;
+            if *count == 0 {
+                state.in_flight.remove(&self.worktree);
+                state.trim_evictions();
+            }
         }
     }
 }
@@ -426,8 +469,22 @@ impl DetachedState {
             return;
         }
         self.evicted.push_back(worktree.to_path_buf());
-        if self.evicted.len() > MAX_EVICTED_WORKTREES {
-            self.evicted.pop_front();
+        self.trim_evictions();
+    }
+
+    /// Forget the oldest evictions beyond the limit, except those with a
+    /// call or job still in flight: a hand-over for one of those must find
+    /// the eviction however many others have been recorded since.
+    fn trim_evictions(&mut self) {
+        while self.evicted.len() > self.evicted_limit {
+            let Some(oldest) = self
+                .evicted
+                .iter()
+                .position(|worktree| !self.in_flight.contains_key(worktree))
+            else {
+                return;
+            };
+            self.evicted.remove(oldest);
         }
     }
 }
@@ -571,6 +628,9 @@ struct JobHandle {
     /// Returned with `shell_kill` results; never logged, as it may carry
     /// secrets.
     command: String,
+    /// Keeps the worktree's eviction on record for as long as any holder
+    /// of the job can still hand a daemon over.
+    _in_flight: Arc<InFlightCall>,
 }
 
 impl JobHandle {
@@ -605,6 +665,9 @@ struct JobOutput {
     /// Set when the process tree could not be cleaned up within the
     /// acknowledgement bound and the job was closed regardless.
     cleanup_warning: Option<String>,
+    /// The job was closed without its process tree being proven empty;
+    /// worktree eviction tries again. Cleared once a cleanup succeeds.
+    cleanup_pending: bool,
 }
 
 /// Shared by the three shell tools; owns every background job and every
@@ -630,6 +693,7 @@ async fn terminate_background_job(
     let mut output = job.output.lock().unwrap();
     output.killed = true;
     output.exit_code.get_or_insert(status.code().unwrap_or(-1));
+    output.cleanup_pending = false;
     Ok(())
 }
 
@@ -637,6 +701,8 @@ async fn terminate_background_job(
 /// an unowned process lives: retry an unacknowledged cleanup up to the
 /// bound, then close the job with a warning. The warning is logged and
 /// recorded on the job, and returned for callers with someone to report to.
+/// The job stays eligible for another attempt at worktree eviction: closing
+/// it does not prove its tree empty.
 async fn terminate_background_job_bounded(
     cleanup: &CleanupController,
     detached: &DetachedRegistry,
@@ -665,6 +731,7 @@ async fn terminate_background_job_bounded(
     output.killed = true;
     output.exit_code.get_or_insert(-1);
     output.cleanup_warning = Some(warning.clone());
+    output.cleanup_pending = true;
     Err(warning)
 }
 
@@ -688,20 +755,30 @@ enum ForegroundCleanup {
 }
 
 impl JobRegistry {
-    /// Drop finished jobs (oldest first) until a slot is free; running jobs
-    /// are never evicted. Errors when every slot holds a running job.
+    /// Drop finished jobs until a slot is free; running jobs are never
+    /// evicted. A job closed without its tree being proven empty goes only
+    /// when no other finished job can, so eviction keeps its chance to
+    /// retry it. Errors when every slot holds a running job.
     fn make_room(&self, jobs: &mut HashMap<String, Job>) -> Result<(), String> {
         if jobs.len() < MAX_JOBS {
             return Ok(());
         }
-        let finished: Vec<String> = jobs
-            .iter()
-            .filter(|(_, j)| j.handle.output.lock().unwrap().exit_code.is_some())
-            .map(|(id, _)| id.clone())
-            .collect();
-        match finished.first() {
+        let mut acknowledged = None;
+        let mut pending = None;
+        for (id, job) in jobs.iter() {
+            let output = job.handle.output.lock().unwrap();
+            if output.exit_code.is_none() {
+                continue;
+            }
+            if output.cleanup_pending {
+                pending.get_or_insert_with(|| id.clone());
+            } else {
+                acknowledged.get_or_insert_with(|| id.clone());
+            }
+        }
+        match acknowledged.or(pending) {
             Some(id) => {
-                jobs.remove(id);
+                jobs.remove(&id);
                 Ok(())
             }
             None => Err(format!(
@@ -711,13 +788,18 @@ impl JobRegistry {
     }
 
     /// Stop every running job, and every daemon released from a shell call,
-    /// belonging to a worktree being removed.
+    /// belonging to a worktree being removed. A job closed without its
+    /// tree being proven empty counts as running here: closing it spared
+    /// the caller a wait, not the tree an eviction.
     pub async fn kill_worktree(&self, worktree: &Path) -> Result<(), String> {
         let jobs: Vec<(String, JobHandle)> = {
             let jobs = self.jobs.lock().unwrap();
             jobs.iter()
                 .filter(|(_, job)| job.handle.worktree == worktree)
-                .filter(|(_, job)| job.handle.output.lock().unwrap().exit_code.is_none())
+                .filter(|(_, job)| {
+                    let output = job.handle.output.lock().unwrap();
+                    output.exit_code.is_none() || output.cleanup_pending
+                })
                 .map(|(id, job)| (id.clone(), job.handle.clone()))
                 .collect()
         };
@@ -925,6 +1007,9 @@ impl Tool for Shell {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
+        // Held until this call has handed over whatever its tree leaves
+        // behind, so an eviction in the meantime stays on record.
+        let _in_flight = InFlightCall::begin(&self.jobs.detached, &ctx.worktree);
         let mut child = match spawn_process_tree(&mut command_process) {
             Ok(child) => child,
             Err(e) => return ToolResult::error(format!("failed to spawn: {e}")),
@@ -1111,6 +1196,7 @@ impl Shell {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
+        let in_flight = Arc::new(InFlightCall::begin(&self.jobs.detached, &ctx.worktree));
         let mut child = match spawn_process_tree(&mut command_process) {
             Ok(c) => c,
             Err(e) => return ToolResult::error(format!("failed to spawn: {e}")),
@@ -1125,6 +1211,7 @@ impl Shell {
             output,
             worktree: ctx.worktree.clone(),
             command: command.to_string(),
+            _in_flight: in_flight,
         };
         // Waiter: the job is complete only when the leader and every
         // descendant it still owns has exited. Process-tree ownership remains
@@ -2287,6 +2374,141 @@ mod tests {
             "{note}"
         );
         wait_for_process_exit(child_pid).await;
+    }
+
+    /// An eviction stays on record while a call started from the worktree
+    /// is in flight, however many other worktrees are evicted meanwhile:
+    /// the daemon that call hands over at its end is stopped, not kept.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn eviction_stays_on_record_while_a_call_is_in_flight() {
+        require_setsid();
+        let tmp = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let ctx = ToolCtx {
+            worktree: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let (shell, _, _) = tools();
+        let jobs = shell.jobs.clone();
+        // One remembered eviction: the next one would push ours out.
+        jobs.detached.state.lock().unwrap().evicted_limit = 1;
+
+        // The call starts its daemon only once told to, so the evictions
+        // are on record before the hand-over.
+        let command = format!("while [ ! -e go ]; do sleep 0.01; done; {SETSID_DAEMON}");
+        let call = tokio::spawn(async move {
+            shell
+                .run(&ctx, &json!({"command": command, "timeout_secs": 5}))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !jobs
+                .detached
+                .state
+                .lock()
+                .unwrap()
+                .in_flight
+                .contains_key(tmp.path())
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the call never went in flight");
+
+        jobs.kill_worktree(tmp.path()).await.unwrap();
+        jobs.kill_worktree(other.path()).await.unwrap();
+        {
+            let state = jobs.detached.state.lock().unwrap();
+            let evicted: Vec<&Path> = state.evicted.iter().map(PathBuf::as_path).collect();
+            assert_eq!(
+                evicted,
+                vec![tmp.path()],
+                "in-flight eviction was forgotten"
+            );
+        }
+
+        std::fs::write(tmp.path().join("go"), b"").unwrap();
+        let res = tokio::time::timeout(Duration::from_secs(5), call)
+            .await
+            .expect("the call did not finish")
+            .unwrap();
+        assert_eq!(
+            res.status,
+            trouve_protocol::ToolStatus::Ok,
+            "{:?}",
+            res.result
+        );
+        let child_pid = wait_for_pid_file(&tmp.path().join("child.pid")).await;
+        assert_eq!(
+            reported_pids(&res.result, "stopped_after_eviction"),
+            vec![child_pid]
+        );
+        assert!(res.result.get("detached").is_none(), "{:?}", res.result);
+        wait_for_process_exit(child_pid).await;
+
+        // With nothing in flight the record is trimmed to the limit again.
+        assert!(
+            jobs.detached.state.lock().unwrap().in_flight.is_empty(),
+            "the finished call is still in flight"
+        );
+        jobs.kill_worktree(other.path()).await.unwrap();
+        let state = jobs.detached.state.lock().unwrap();
+        assert_eq!(state.evicted.len(), 1);
+        assert_eq!(state.evicted[0], other.path());
+    }
+
+    /// A job closed after its cleanup went unacknowledged is not skipped at
+    /// worktree eviction: its tree was never proven empty, and eviction is
+    /// the last chance to stop it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn worktree_eviction_retries_a_job_closed_without_acknowledgement() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ToolCtx {
+            worktree: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let (shell, output, kill) = tools();
+        let res = shell
+            .run(
+                &ctx,
+                &json!({"command": "exec sleep 60", "run_in_background": true}),
+            )
+            .await;
+        let id = res.result["job_id"].as_str().unwrap().to_string();
+        let leader_pid = res.result["pid"].as_u64().unwrap() as u32;
+        shell.jobs.cleanup.injected_failures.store(
+            u64::from(CLEANUP_ACKNOWLEDGEMENT_ATTEMPTS),
+            Ordering::SeqCst,
+        );
+        let res = kill.run(&ctx, &json!({"job_id": id})).await;
+        assert_eq!(res.status, trouve_protocol::ToolStatus::Error);
+        let state = output.run(&ctx, &json!({"job_id": id})).await;
+        assert_eq!(state.result["running"], false, "{:?}", state.result);
+        assert!(
+            process_exists(leader_pid),
+            "the injected failures killed the tree"
+        );
+
+        shell.jobs.kill_worktree(tmp.path()).await.unwrap();
+        wait_for_process_exit(leader_pid).await;
+        let job = shell.jobs.jobs.lock().unwrap()[&id].handle.clone();
+        assert!(!job.output.lock().unwrap().cleanup_pending);
+
+        // Nothing left to retry: another eviction leaves the job alone.
+        shell
+            .jobs
+            .cleanup
+            .injected_failures
+            .store(1, Ordering::SeqCst);
+        shell.jobs.kill_worktree(tmp.path()).await.unwrap();
+        assert_eq!(
+            shell.jobs.cleanup.injected_failures.load(Ordering::SeqCst),
+            1,
+            "an acknowledged job was terminated again"
+        );
     }
 
     #[cfg(target_os = "linux")]

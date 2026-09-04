@@ -17,10 +17,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   progress (reported as `stopped_after_eviction` in that case). Workers a
   released daemon forks later are stopped with it: the tree's sentinel is
   retained until the worktree is removed, and whatever holds it is found and
-  stopped then. Signals to released daemons go through a pidfd bound to the
-  recorded process where the kernel offers one, so a recycled pid is never
-  hit, and a live daemon is never dropped from the record however many are
-  released. Descendants that only leave the process group are still stopped
+  stopped then. A daemon is released only once it is bound to a pidfd, and
+  every signal to it goes through that pidfd, so a recycled pid is never
+  hit; where no pidfd can be opened the daemon stays in the tree and is
+  stopped with it. A live daemon is never dropped from the record however
+  many are released, and a worktree's removal stays on record for as long
+  as a call or job started there is still running, so a daemon handed over
+  late is always stopped. Descendants that only leave the process group are still stopped
   with the call and are now reported as `killed_escaped`. Platforms that
   cannot tell a detached daemon from the rest of the tree (macOS) keep
   stopping everything, and the tool description says so.
@@ -28,7 +31,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   process tree cannot be confirmed empty now reports the failure after three
   attempts instead of holding the session's mutation lane indefinitely.
   `shell_kill` retries the same way and closes the job even when the
-  attempts are exhausted, so `shell_output` no longer reports it as running.
+  attempts are exhausted, so `shell_output` no longer reports it as running;
+  removing the worktree retries such a job once more before it is forgotten.
 - **No descriptor leaks into shell children**: process-tree spawns mark every
   inherited descriptor beyond stdio close-on-exec, so descriptors the desktop
   host opens without `O_CLOEXEC` no longer reach child processes, including

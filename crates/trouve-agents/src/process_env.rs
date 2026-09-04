@@ -127,18 +127,23 @@ pub enum DetachedPolicy {
 }
 
 /// A descendant that left the tree's session and was released from it.
+///
+/// On Linux a released process is always bound to a pidfd: a holder the
+/// kernel offers no pidfd for is not released at all but kept in the tree
+/// and stopped with it, so no signal to a released process ever goes by
+/// pid number.
 #[derive(Clone, Debug)]
 pub struct DetachedProcess {
     pub pid: i32,
-    /// Kernel start time of the pid when it was released. Every later signal
-    /// re-checks it so a recycled pid is never signalled by mistake.
+    /// Kernel start time of the pid when it was released; with the pid it
+    /// names one process incarnation in reports and records.
     pub start_time: u64,
     /// The process's short command name (`/proc/<pid>/comm`).
     pub name: String,
     /// A pidfd bound to that incarnation of the pid (Linux 5.3+): liveness
     /// checks and signals through it cannot reach a successor to the pid.
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    handle: Option<std::sync::Arc<OwnedFd>>,
+    handle: std::sync::Arc<OwnedFd>,
 }
 
 impl PartialEq for DetachedProcess {
@@ -162,9 +167,7 @@ impl DetachedProcess {
     pub fn is_alive(&self) -> bool {
         #[cfg(any(target_os = "linux", target_os = "android"))]
         {
-            if let Some(handle) = &self.handle
-                && let Some(exited) = linux_process_handle_exited(handle)
-            {
+            if let Some(exited) = linux_process_handle_exited(&self.handle) {
                 return !exited;
             }
             linux_process_stat(self.pid).is_some_and(|stat| {
@@ -210,7 +213,9 @@ impl DetachedProcess {
         }
         #[cfg(any(target_os = "linux", target_os = "android"))]
         {
-            signal_linux_process(self.pid, self.handle.as_deref(), signal)
+            // Through the pidfd only: a signal by number could land on a
+            // successor to the pid, however recent the identity check.
+            signal_linux_process_handle(&self.handle, signal)
         }
         #[cfg(not(any(target_os = "linux", target_os = "android")))]
         {
@@ -246,13 +251,18 @@ impl ReleasedSentinel {
     }
 
     /// Every live process holding the sentinel right now, trouve itself
-    /// excluded, each bound to its current incarnation.
+    /// excluded, each bound to its current incarnation. Fails when a holder
+    /// cannot be bound to a pidfd: the caller is going to signal what it
+    /// gets back, and a signal by pid number has no place here.
     pub fn holders(&self) -> std::io::Result<Vec<DetachedProcess>> {
         #[cfg(any(target_os = "linux", target_os = "android"))]
         {
             let mut holders = Vec::new();
             for holder in linux_sentinel_holders(&self.sentinel, self.tree_leader)? {
-                record_detached(&mut holders, &holder);
+                match holder.released() {
+                    Some(process) => record_detached(&mut holders, process),
+                    None => return Err(unbound_holder_error(&holder)),
+                }
             }
             Ok(holders)
         }
@@ -1228,6 +1238,13 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+#[cfg(all(any(target_os = "linux", target_os = "android"), test))]
+thread_local! {
+    /// Test hook: pretend the kernel offers no pidfds, standing in for a
+    /// pre-5.3 kernel or a full descriptor table.
+    static PIDFD_UNAVAILABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 #[cfg(all(unix, test))]
 fn run_after_descriptor_hygiene_detect_hook() {
     if let Some(hook) = AFTER_DESCRIPTOR_HYGIENE_DETECT.with(|hook| hook.borrow_mut().take()) {
@@ -1410,8 +1427,10 @@ fn platform_process_tree_active(child: &mut ProcessTreeChild) -> std::io::Result
     Ok(sentinel_active || group_active)
 }
 
-/// Whether a same-session process still holds the sentinel of a tree whose
-/// process group is already empty. Detached holders are recorded as a side
+/// Whether a process the tree still owns holds the sentinel of a tree whose
+/// process group is already empty: one that stayed in the session, or one
+/// in another session that could not be bound to a pidfd and is therefore
+/// kept rather than released. Released holders are recorded as a side
 /// effect.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn released_holders_remain(child: &mut ProcessTreeChild) -> std::io::Result<bool> {
@@ -1425,8 +1444,18 @@ fn released_holders_remain(child: &mut ProcessTreeChild) -> std::io::Result<bool
     for holder in linux_sentinel_holders(&child.descendant_sentinel, child.process_group)? {
         if holder.stat.session == own_session {
             remain = true;
-        } else {
-            record_detached(&mut child.detached, &holder);
+            continue;
+        }
+        match holder.released() {
+            Some(process) => record_detached(&mut child.detached, process),
+            None => {
+                tracing::debug!(
+                    pid = holder.pid,
+                    name = %holder.name,
+                    "detached descendant has no pidfd; keeping it in the tree"
+                );
+                remain = true;
+            }
         }
     }
     child.holder_scan = Some((Instant::now(), remain));
@@ -1586,6 +1615,10 @@ fn signal_unix_process(pid: i32, signal: libc::c_int) -> std::io::Result<bool> {
 /// `Err` when `pid` is already gone.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn linux_process_handle(pid: i32) -> std::io::Result<Option<OwnedFd>> {
+    #[cfg(test)]
+    if PIDFD_UNAVAILABLE.with(std::cell::Cell::get) {
+        return Ok(None);
+    }
     let flags: libc::c_uint = 0;
     let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, flags) };
     if let Ok(descriptor) = libc::c_int::try_from(descriptor)
@@ -1651,9 +1684,12 @@ fn signal_linux_process_handle(handle: &OwnedFd, signal: libc::c_int) -> std::io
     }
 }
 
-/// Signal one process incarnation: through its pidfd where there is one, so
-/// a pid recycled since the caller's identity check is never hit; by pid
-/// only where the kernel offers no pidfd or a sandbox refuses the syscall.
+/// Signal a process the tree still owns: through its pidfd where there is
+/// one, so a pid recycled since the scan is never hit; by pid only where the
+/// kernel offers no pidfd or a sandbox refuses the syscall. Tree members
+/// are signalled right after the scan that found them, which is as close
+/// to their identity check as a signal by number can get; released
+/// processes, which are signalled much later, never take this route.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn signal_linux_process(
     pid: i32,
@@ -1835,27 +1871,48 @@ fn linux_sentinel_holders(
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn record_detached(detached: &mut Vec<DetachedProcess>, holder: &SentinelHolder) {
+impl SentinelHolder {
+    /// The holder as a released process, if it can be bound to a pidfd.
+    /// Without one it stays in the tree: nothing could signal it safely
+    /// once the scan that found it is history.
+    fn released(&self) -> Option<DetachedProcess> {
+        Some(DetachedProcess {
+            pid: self.pid,
+            start_time: self.stat.start_time,
+            name: self.name.clone(),
+            handle: self.handle.clone()?,
+        })
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn unbound_holder_error(holder: &SentinelHolder) -> std::io::Error {
+    std::io::Error::other(format!(
+        "{} (pid {}) holds the sentinel but cannot be bound to a pidfd",
+        holder.name, holder.pid
+    ))
+}
+
+/// Add `process` to `detached` unless that incarnation is already there.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn record_detached(detached: &mut Vec<DetachedProcess>, process: DetachedProcess) {
     if detached
         .iter()
-        .any(|known| known.pid == holder.pid && known.start_time == holder.stat.start_time)
+        .any(|known| known.pid == process.pid && known.start_time == process.start_time)
     {
         return;
     }
-    detached.push(DetachedProcess {
-        pid: holder.pid,
-        start_time: holder.stat.start_time,
-        name: holder.name.clone(),
-        handle: holder.handle.clone(),
-    });
+    detached.push(process);
 }
 
 /// Kill the processes still holding the tree's sentinel. Under
 /// [`DetachedPolicy::Release`] a holder in another session is recorded in
-/// `detached` instead of being signalled. Holders outside the process group
-/// that were killed are reported in `terminated`. Each holder is signalled
-/// through its pidfd where the kernel offers one, so a pid recycled since
-/// the scan is never hit.
+/// `detached` instead of being signalled, provided it is bound to a pidfd;
+/// one that is not is killed like the rest, as nothing could signal it
+/// safely later. Holders outside the process group that were killed are
+/// reported in `terminated`. Each holder is signalled through its pidfd
+/// where the kernel offers one, so a pid recycled since the scan is never
+/// hit.
 ///
 /// Session membership is compared against trouve's own session: the leader
 /// was spawned with a new process group but never a new session, so every
@@ -1871,8 +1928,11 @@ fn terminate_unix_sentinel_holders(
     let own_session = unsafe { libc::getsid(0) };
     let mut first_error = None;
     for holder in linux_sentinel_holders(sentinel, tree_leader)? {
-        if policy == DetachedPolicy::Release && holder.stat.session != own_session {
-            record_detached(detached, &holder);
+        if policy == DetachedPolicy::Release
+            && holder.stat.session != own_session
+            && let Some(process) = holder.released()
+        {
+            record_detached(detached, process);
             continue;
         }
         match signal_linux_process(holder.pid, holder.handle.as_deref(), libc::SIGKILL) {
@@ -3014,12 +3074,9 @@ mod tests {
         let detached = child.take_detached();
         assert_eq!(detached.len(), 1, "unexpected detached set: {detached:?}");
         let daemon = &detached[0];
-        let handle = daemon
-            .handle
-            .as_ref()
-            .expect("a released process carries a pidfd");
         let info =
-            std::fs::read_to_string(format!("/proc/self/fdinfo/{}", handle.as_raw_fd())).unwrap();
+            std::fs::read_to_string(format!("/proc/self/fdinfo/{}", daemon.handle.as_raw_fd()))
+                .unwrap();
         let bound_pid = info
             .lines()
             .find_map(|line| line.strip_prefix("Pid:"))
@@ -3040,6 +3097,50 @@ mod tests {
         .await
         .expect("the pidfd never reported the killed daemon gone");
         assert!(!daemon.kill().unwrap());
+    }
+
+    /// A daemon the kernel offers no pidfd for is not released: it stays in
+    /// the tree, keeps the tree alive, and is stopped with it. Releasing it
+    /// would leave only its pid number to signal it by at eviction, and a
+    /// pid number may belong to someone else by then.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn release_policy_keeps_a_daemon_it_cannot_bind_to_a_pidfd() {
+        struct RestorePidfds;
+        impl Drop for RestorePidfds {
+            fn drop(&mut self) {
+                PIDFD_UNAVAILABLE.with(|unavailable| unavailable.set(false));
+            }
+        }
+        PIDFD_UNAVAILABLE.with(|unavailable| unavailable.set(true));
+        let _restore = RestorePidfds;
+
+        let directory = tempfile::tempdir().unwrap();
+        let pid_path = directory.path().join("setsid-descendant.pid");
+        let mut child = setsid_daemon_fixture(&pid_path);
+        let descendant = spawned_descendant_pid(&pid_path).await;
+        wait_for_process_name(descendant, "sleep").await;
+        wait_for_leader_exit(&mut child).await;
+
+        // Long enough for the throttled holder scan to run more than once.
+        let deadline = Instant::now() + HOLDER_SCAN_INTERVAL * 3;
+        while Instant::now() < deadline {
+            assert!(
+                child.try_wait_tree().unwrap().is_none(),
+                "a daemon without a pidfd was released"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(child.take_detached().is_empty());
+        assert!(child.tree_active);
+
+        child.terminate_and_reap().await.unwrap();
+        assert_process_tree_member_stopped(descendant).await;
+        assert!(child.take_detached().is_empty());
+        let escapees = child.take_terminated_escapees();
+        assert_eq!(escapees.len(), 1, "unexpected escapee set: {escapees:?}");
+        assert_eq!(escapees[0].pid, descendant as i32);
+        assert_eq!(escapees[0].name, "sleep");
     }
 
     #[cfg(target_os = "linux")]

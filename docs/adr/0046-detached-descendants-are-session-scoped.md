@@ -53,13 +53,18 @@ cgroup accounting files) that leaked into every child.
   for the grace period so a daemon that forks while being stopped does not
   leave a worker behind. The sentinel is dropped once the worktree is
   evicted or nobody holds it any more.
-- **Signals are bound to the recorded incarnation.** Where the kernel offers
-  a pidfd (Linux 5.3+), every released daemon and every sentinel holder is
-  signalled through one opened while its start time was verified, so a pid
-  recycled between a liveness check and the signal is never hit and the
-  registry can tell a daemon that has exited from one that is merely
-  reparented. Where pidfds are unavailable or refused, the signal goes to
-  the pid after an identity check against `/proc`.
+- **A daemon is released only once it is bound to a pidfd.** Every released
+  daemon is signalled through a pidfd (Linux 5.3+) opened while its start
+  time was verified, so a pid recycled between a liveness check and the
+  signal is never hit and the registry can tell a daemon that has exited
+  from one that is merely reparented. A detached holder that cannot be
+  bound — the kernel predates pidfds, or the descriptor table is full — is
+  not released: it keeps the tree alive, is killed with the tree, and is
+  reported as an escapee. Signalling a released daemon by number, however
+  recent the identity check, would race a successor to the pid; keeping the
+  daemon in the tree costs at most the behaviour every call had before this
+  decision. Only tree members, which are signalled while the tree still
+  holds them, fall back from a pidfd to their pid.
 - **Hand-over and eviction are atomic.** A daemon enters the registry only
   after the eviction record is checked under the registry lock, and eviction
   drains a worktree and records the eviction under the same lock. A daemon
@@ -67,8 +72,14 @@ cgroup accounting files) that leaked into every child.
   evicted therefore arrives after the eviction is on record and is stopped
   on the spot instead of being kept for a worktree nobody will evict again;
   its result reports it as `stopped_after_eviction`, not as released. The
-  eviction record is bounded (the oldest of 4096 are forgotten first); late
-  hand-overs can only come from work that was in flight at eviction.
+  eviction record is bounded (the oldest of 4096 are forgotten first), but
+  a worktree stays on it for as long as any call or job started in that
+  worktree is in flight: late hand-overs can only come from work that was
+  in flight at eviction, and forgetting the eviction while such work is
+  still running would register its daemon for a worktree nobody will evict
+  again. Eviction also retries a job that an earlier stop closed without
+  acknowledgement, so a tree the bounded cleanup gave up on gets another
+  chance to be stopped before its worktree is forgotten.
 - **Release is opt-in per spawn.** Only the shell tool's foreground calls and
   background jobs release detached descendants. Provider transports, MCP
   servers, git, and every other process-tree caller keep terminate-all
@@ -150,9 +161,9 @@ cgroup accounting files) that leaked into every child.
   best-effort kill when its handle is dropped.
 - Each released tree costs the host one retained descriptor, and each
   released daemon one pidfd, until the worktree is evicted. When a pidfd
-  cannot be opened the daemon is still recorded and signalled by pid after
-  an identity check, so descriptor pressure degrades the pid-reuse guard,
-  never the stop at eviction.
+  cannot be opened the daemon is not released at all: descriptor pressure
+  degrades the release (the call waits for, and then stops, its daemon as
+  every call did before this decision), never the pid-reuse guard.
 - The descriptor hygiene has one residual gap: a descriptor a process opened
   above the soft `RLIMIT_NOFILE` before the limit was lowered survives the
   walk, because the walk stops at the limit. The two strategies ahead of it
