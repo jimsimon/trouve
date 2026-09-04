@@ -41,8 +41,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and exec, and macOS and the BSDs walk every descriptor number below the
   soft `RLIMIT_NOFILE`. A spawn that
   could only sanitize part of the descriptor table — no `close_range`, no
-  listable `/proc/self/fd`, and a soft `RLIMIT_NOFILE` above 2^20 — fails
-  with an error naming the limit instead of leaking the rest.
+  listable `/proc/self/fd`, and a soft `RLIMIT_NOFILE` that is unlimited or
+  above 2^20 — fails with an error naming the limit instead of leaking the
+  rest.
 - **Released daemons are logged by pid and name only**: the command line
   that started one stays out of the lifecycle logs and eviction failure
   messages, which outlive the call and may otherwise retain secrets.
