@@ -6376,10 +6376,9 @@ impl Engine {
                 }
             };
             let (mut turn, mut validated) = turn;
-            let anchor_object_lines = self
-                .prefetch_anchor_object_lines(
+            let anchor_object_files = self
+                .prefetch_anchor_object_files(
                     &validated.findings,
-                    &diff_files,
                     repository_path.as_path(),
                     &job.head_sha,
                     superseded,
@@ -6389,7 +6388,7 @@ impl Engine {
                 std::mem::take(&mut validated.findings),
                 &coordinator_candidates,
                 &diff_files,
-                &anchor_object_lines,
+                &anchor_object_files,
             );
             let missing_adjudications =
                 unadjudicated_candidate_ids(&validated, &coordinator_candidates);
@@ -6420,10 +6419,9 @@ impl Engine {
                             merge_review_task_metrics(&mut turn.metrics, &repaired.metrics);
                             match parse_review_output(&repaired.output) {
                                 Ok(mut repaired_output) => {
-                                    let repaired_anchor_lines = self
-                                        .prefetch_anchor_object_lines(
+                                    let repaired_anchor_files = self
+                                        .prefetch_anchor_object_files(
                                             &repaired_output.findings,
-                                            &diff_files,
                                             repository_path.as_path(),
                                             &job.head_sha,
                                             superseded,
@@ -6433,7 +6431,7 @@ impl Engine {
                                         std::mem::take(&mut repaired_output.findings),
                                         &coordinator_candidates,
                                         &diff_files,
-                                        &repaired_anchor_lines,
+                                        &repaired_anchor_files,
                                     );
                                     merge_coordinator_adjudication_repair(
                                         &mut validated,
@@ -10701,22 +10699,24 @@ impl Engine {
         Ok((lines, has_more))
     }
 
-    async fn prefetch_anchor_object_lines(
+    /// Read the head-revision text of every file a coordinator finding or
+    /// causal waypoint anchors to, RIGHT side only (LEFT anchors quote the
+    /// base, which is not read). Whole files rather than single lines: a
+    /// misnumbered anchor re-anchors by searching the file for its quote,
+    /// and diff files are included because the diff carries hunk lines only.
+    /// Bounded by the same blob budget as structural anchor validation;
+    /// paths beyond it stay unread and their anchors stay unchecked.
+    async fn prefetch_anchor_object_files(
         &self,
         findings: &[ReviewFinding],
-        diff_files: &[ReviewDiffFile],
         repository_path: &std::path::Path,
         head_sha: &str,
         cancel: &CancellationToken,
-    ) -> HashMap<(String, u64), String> {
-        let diff_contents = diff_line_contents(diff_files);
-        // Anchor lines for RIGHT-side findings, plus every bounded causal
-        // waypoint: waypoints always quote the head revision, and their
-        // verification needs the same object reads as outside-diff anchors.
-        let mut targets = Vec::new();
+    ) -> AnchorObjectFiles {
+        let mut paths = Vec::new();
         for finding in findings {
-            if !finding.side.eq_ignore_ascii_case("left") {
-                targets.push((finding.path.clone(), finding.line));
+            if !finding.side.trim().eq_ignore_ascii_case("left") {
+                paths.push(normalized_finding_path(&finding.path));
             }
             for waypoint in finding
                 .evidence
@@ -10724,54 +10724,65 @@ impl Engine {
                 .iter()
                 .take(CAUSAL_WAYPOINT_MAX)
             {
-                targets.push((waypoint.path.clone(), waypoint.line));
+                paths.push(normalized_finding_path(&waypoint.path));
             }
         }
-        let mut lines = HashMap::new();
-        for key in targets {
-            let (path, line) = key.clone();
-            if lines.contains_key(&key) || diff_contents.contains_key(&(path.clone(), line, false))
-            {
+        let mut files = AnchorObjectFiles::new();
+        let mut total_bytes = 0usize;
+        for path in paths {
+            if files.contains_key(&path) {
                 continue;
+            }
+            if files.len() >= REVIEW_ANCHOR_MAX_DISTINCT_BLOBS {
+                tracing::debug!(
+                    %path,
+                    "anchor object budget exhausted; further anchors stay unchecked"
+                );
+                break;
             }
             // Structural validation rejects unsafe paths later; the guard
             // here just avoids handing them to git at all.
             let relative = std::path::Path::new(&path);
-            if relative.is_absolute()
+            if path.is_empty()
+                || relative.is_absolute()
                 || relative
                     .components()
                     .any(|component| !matches!(component, std::path::Component::Normal(_)))
             {
                 continue;
             }
+            let max_bytes = REVIEW_ANCHOR_BLOB_MAX_BYTES
+                .min(REVIEW_ANCHOR_BLOBS_MAX_BYTES.saturating_sub(total_bytes));
+            if max_bytes == 0 {
+                break;
+            }
             match self
                 .executor
-                .review_repository_object_line(&crate::tools::ReviewRepositoryObjectLine {
+                .review_repository_object_text(&crate::tools::ReviewRepositoryObjectText {
                     managed_root: self.data_dir.join("review-repositories"),
                     worktree: repository_path.to_path_buf(),
                     head_sha: head_sha.to_owned(),
                     path: path.clone(),
-                    line,
-                    max_bytes: REVIEW_ANCHOR_BLOB_MAX_BYTES,
+                    max_bytes,
                     cancel: cancel.clone(),
                 })
                 .await
             {
-                Ok(Some(content)) => {
-                    lines.insert(key, content);
+                Ok(Some(text)) => {
+                    total_bytes += text.len();
+                    files.insert(path, text.lines().map(str::to_owned).collect());
                 }
                 Ok(None) => {}
                 Err(error) => {
                     tracing::debug!(
                         %path,
-                        line,
                         %error,
-                        "anchor object line unavailable; anchor stays unchecked"
+                        "anchor object unavailable; anchors stay unchecked"
                     );
                 }
             }
         }
-        lines
+        files
     }
 
     /// Authoritative effective-permission check for a commenter: only
@@ -15168,18 +15179,22 @@ fn coordinator_diff_context(
     }
 }
 
+/// Validate the coordinator's findings against the diff and the prefetched
+/// head-revision files: structural anchor checks (with quote re-anchoring),
+/// candidate provenance, mechanical anchor verification, and the scope
+/// verdict, in that order, so every later step sees the corrected anchor.
 fn coordinator_validated_findings(
     findings: Vec<ReviewFinding>,
     candidates: &[CandidateFinding],
     files: &[ReviewDiffFile],
-    object_lines: &HashMap<(String, u64), String>,
+    object_files: &AnchorObjectFiles,
 ) -> Vec<ReviewFinding> {
     let candidate_ids = candidates
         .iter()
         .map(|candidate| candidate.candidate_id.as_str())
         .collect::<HashSet<_>>();
     let diff_contents = diff_line_contents(files);
-    structurally_valid_findings(findings, files)
+    structurally_valid_findings(findings, files, object_files)
         .into_iter()
         .filter_map(|mut finding| {
             let mut seen = HashSet::new();
@@ -15197,8 +15212,8 @@ fn coordinator_validated_findings(
             .into_iter()
             .all(|value| !value.trim().is_empty());
             if !finding.source_candidate_ids.is_empty() && has_evidence {
-                apply_verification_derived_confidence(&mut finding, &diff_contents, object_lines);
-                apply_change_scope_verdict(&mut finding, &diff_contents, object_lines);
+                apply_verification_derived_confidence(&mut finding, &diff_contents, object_files);
+                apply_change_scope_verdict(&mut finding, &diff_contents, object_files);
                 Some(finding)
             } else {
                 None
@@ -15629,7 +15644,7 @@ fn structurally_valid_candidates(
     candidates
         .into_iter()
         .filter_map(|mut candidate| {
-            normalize_finding(&mut candidate.finding, &valid)?;
+            normalize_finding(&mut candidate.finding, &valid, &AnchorObjectFiles::new())?;
             let key = finding_key(&candidate.finding);
             seen.insert(key).then_some(candidate)
         })
@@ -15639,13 +15654,14 @@ fn structurally_valid_candidates(
 fn structurally_valid_findings(
     findings: Vec<ReviewFinding>,
     files: &[ReviewDiffFile],
+    object_files: &AnchorObjectFiles,
 ) -> Vec<ReviewFinding> {
     let valid = diff_comment_lines(files);
     let mut seen = HashSet::new();
     findings
         .into_iter()
         .filter_map(|mut finding| {
-            normalize_finding(&mut finding, &valid)?;
+            normalize_finding(&mut finding, &valid, object_files)?;
             let key = finding_key(&finding);
             seen.insert(key).then_some(finding)
         })
@@ -15666,17 +15682,29 @@ fn finding_key(finding: &ReviewFinding) -> (String, u64, String, String) {
     )
 }
 
+/// A model-reported path as a repository-relative path: trimmed, without the
+/// `a/`/`b/` diff-header prefixes models habitually copy.
+fn normalized_finding_path(path: &str) -> String {
+    let path = path.trim();
+    path.strip_prefix("a/")
+        .or_else(|| path.strip_prefix("b/"))
+        .unwrap_or(path)
+        .to_string()
+}
+
+/// Canonicalize a finding's anchor, levels, and text, rejecting anything
+/// structurally unusable. When the head-revision file is available and the
+/// coordinator quoted the anchor line, a misnumbered RIGHT-side anchor is
+/// re-anchored to where the quote actually appears before the diff-side
+/// classification runs: the coordinator quotes accurately but miscounts
+/// lines, and without this the misplaced anchor would fail verification,
+/// cap confidence, and land the GitHub comment on the wrong line.
 fn normalize_finding(
     finding: &mut ReviewFinding,
     valid: &HashSet<(String, u64, bool)>,
+    object_files: &AnchorObjectFiles,
 ) -> Option<()> {
-    finding.path = finding
-        .path
-        .trim()
-        .strip_prefix("a/")
-        .or_else(|| finding.path.trim().strip_prefix("b/"))
-        .unwrap_or(finding.path.trim())
-        .to_string();
+    finding.path = normalized_finding_path(&finding.path);
     finding.body = finding.body.trim().chars().take(4_000).collect();
     finding.title = finding
         .title
@@ -15696,6 +15724,17 @@ fn normalize_finding(
         return None;
     }
     let requested_side = finding.side.trim().to_ascii_uppercase();
+    // Server-derived: a model-provided value is never trusted.
+    finding.evidence.anchor_line_claimed = None;
+    if requested_side != "LEFT"
+        && finding.evidence.anchor_quote.len() <= REVIEW_QUOTE_MAX_BYTES
+        && let Some(lines) = object_files.get(&finding.path)
+        && let Some(line) = reanchor_line(&finding.evidence.anchor_quote, finding.line, lines)
+        && line != finding.line
+    {
+        finding.evidence.anchor_line_claimed = Some(finding.line);
+        finding.line = line;
+    }
     let mut left = requested_side == "LEFT";
     if valid.contains(&(finding.path.clone(), finding.line, left)) {
         finding.outside_diff = false;
@@ -16519,15 +16558,65 @@ fn review_diff_renamed_from(file: &ReviewDiffFile) -> Option<String> {
     String::from_utf8(decoded).ok()
 }
 
+/// Head-revision file contents keyed by repository path, split into lines,
+/// prefetched through the executor's audited git boundary for every path a
+/// coordinator finding or causal waypoint anchors to. Validation is pure
+/// over this map: anchor quotes verify against it and misnumbered anchors
+/// re-anchor within it.
+type AnchorObjectFiles = HashMap<String, Vec<String>>;
+
+/// One prefetched head-revision line (1-based), when the path was read.
+fn anchor_object_line<'a>(files: &'a AnchorObjectFiles, path: &str, line: u64) -> Option<&'a str> {
+    let index = usize::try_from(line).ok()?.checked_sub(1)?;
+    files.get(path)?.get(index).map(String::as_str)
+}
+
+/// Lines within which an ambiguous quote may snap to the claimed line's
+/// nearest occurrence. Coordinator miscounts observed in practice are
+/// off by a handful of lines up to a few dozen; beyond this, a repeated
+/// generic line (`}`) is more likely coincidence than a miscount.
+const REANCHOR_WINDOW_LINES: u64 = 40;
+
+/// Where `quote` actually appears in `lines`, given the line the
+/// coordinator claimed. The claimed line wins when it matches; otherwise a
+/// unique occurrence wins outright, an ambiguous quote snaps to the
+/// occurrence nearest the claim if one lies within
+/// [`REANCHOR_WINDOW_LINES`], and anything else is `None`. Matching is
+/// exact after trimming, the same contract as anchor verification, so a
+/// snapped anchor always verifies as `matched`.
+fn reanchor_line(quote: &str, claimed: u64, lines: &[String]) -> Option<u64> {
+    let quote = quote.trim();
+    if quote.is_empty() {
+        return None;
+    }
+    let matches = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.trim() == quote)
+        .map(|(index, _)| index as u64 + 1)
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [] => None,
+        [only] => Some(*only),
+        _ if matches.contains(&claimed) => Some(claimed),
+        _ => matches
+            .iter()
+            .map(|line| (line.abs_diff(claimed), *line))
+            .filter(|(distance, _)| *distance <= REANCHOR_WINDOW_LINES)
+            .min()
+            .map(|(_, line)| line),
+    }
+}
+
 /// The source line a finding anchors to: from the diff when the anchor is a
-/// diff line, otherwise from the prefetched immutable-object lines (RIGHT
-/// side only; LEFT anchors outside the diff have no locally available base
-/// content). Object lines are read through the executor's audited git
+/// diff line, otherwise from the prefetched head-revision files (RIGHT side
+/// only; LEFT anchors outside the diff have no locally available base
+/// content). Object files are read through the executor's audited git
 /// boundary before validation, so this lookup is pure.
 fn finding_anchor_content(
     finding: &ReviewFinding,
     diff_contents: &HashMap<(String, u64, bool), String>,
-    object_lines: &HashMap<(String, u64), String>,
+    object_files: &AnchorObjectFiles,
 ) -> Option<String> {
     let left = finding.side.eq_ignore_ascii_case("left");
     if let Some(content) = diff_contents.get(&(finding.path.clone(), finding.line, left)) {
@@ -16536,9 +16625,7 @@ fn finding_anchor_content(
     if left {
         return None;
     }
-    object_lines
-        .get(&(finding.path.clone(), finding.line))
-        .cloned()
+    anchor_object_line(object_files, &finding.path, finding.line).map(str::to_owned)
 }
 
 /// Mechanical verdict for a coordinator-quoted anchor line against the
@@ -16629,7 +16716,7 @@ const CAUSAL_WAYPOINT_MAX: usize = 4;
 fn change_scope_verdict(
     finding: &ReviewFinding,
     diff_contents: &HashMap<(String, u64, bool), String>,
-    object_lines: &HashMap<(String, u64), String>,
+    object_files: &AnchorObjectFiles,
 ) -> &'static str {
     if finding.evidence.change_causation.trim() != "introduced" {
         return "unverified";
@@ -16651,10 +16738,11 @@ fn change_scope_verdict(
         let on_diff_line = diff_contents.contains_key(&diff_key);
         let actual = diff_contents
             .get(&diff_key)
-            .or_else(|| object_lines.get(&(waypoint.path.clone(), waypoint.line)));
+            .map(String::as_str)
+            .or_else(|| anchor_object_line(object_files, &waypoint.path, waypoint.line));
         // Exact equality after trimming, matching the anchor-quote contract:
         // containment would let a generic fragment pass as verified.
-        match actual.map(|actual| actual.trim()) {
+        match actual.map(str::trim) {
             Some(actual) if !actual.is_empty() && actual == quote => {}
             _ => return "unverified",
         }
@@ -16667,23 +16755,41 @@ fn change_scope_verdict(
     }
 }
 
-/// Normalize the coordinator's causation record, derive the server-owned
-/// scope verdict, and bound the persisted chain. The verdict is computed
-/// against the unbounded claim (an oversized chain or quote is unverified,
-/// never silently truncated into a passing one), then the stored copy is
-/// clipped so the record stays inspection-sized.
+/// Normalize the coordinator's causation record, re-anchor misnumbered
+/// waypoints, derive the server-owned scope verdict, and bound the persisted
+/// chain. The verdict is computed against the unbounded claim (an oversized
+/// chain or quote is unverified, never silently truncated into a passing
+/// one), then the stored copy is clipped so the record stays
+/// inspection-sized.
 fn apply_change_scope_verdict(
     finding: &mut ReviewFinding,
     diff_contents: &HashMap<(String, u64, bool), String>,
-    object_lines: &HashMap<(String, u64), String>,
+    object_files: &AnchorObjectFiles,
 ) {
     finding.evidence.change_causation = match finding.evidence.change_causation.trim() {
         "introduced" => "introduced".to_owned(),
         "pre_existing" => "pre_existing".to_owned(),
         _ => String::new(),
     };
+    // Waypoints quote the head revision, so a miscounted line snaps to
+    // where the quote actually is before the chain is checked; the claimed
+    // line is kept for audit. The snapped line may itself be a diff line,
+    // which is exactly how the chain is meant to reach the change.
+    for waypoint in &mut finding.evidence.causal_waypoints {
+        waypoint.line_claimed = None;
+        if waypoint.quote.len() > REVIEW_QUOTE_MAX_BYTES {
+            continue;
+        }
+        if let Some(lines) = object_files.get(&waypoint.path)
+            && let Some(line) = reanchor_line(&waypoint.quote, waypoint.line, lines)
+            && line != waypoint.line
+        {
+            waypoint.line_claimed = Some(waypoint.line);
+            waypoint.line = line;
+        }
+    }
     finding.evidence.change_scope =
-        change_scope_verdict(finding, diff_contents, object_lines).to_owned();
+        change_scope_verdict(finding, diff_contents, object_files).to_owned();
     finding
         .evidence
         .causal_waypoints
@@ -17152,7 +17258,7 @@ fn verified_resolution_ids(
 fn apply_verification_derived_confidence(
     finding: &mut ReviewFinding,
     diff_contents: &HashMap<(String, u64, bool), String>,
-    object_lines: &HashMap<(String, u64), String>,
+    object_files: &AnchorObjectFiles,
 ) {
     // The persisted record must reproduce the verdict: a quote too large to
     // store verbatim is never verified, so `matched` always refers to the
@@ -17163,7 +17269,7 @@ fn apply_verification_derived_confidence(
             bounded_utf8(&finding.evidence.anchor_quote, REVIEW_QUOTE_MAX_BYTES, "…");
         finding.evidence.anchor_match = "unchecked".to_owned();
     } else {
-        let actual = finding_anchor_content(finding, diff_contents, object_lines);
+        let actual = finding_anchor_content(finding, diff_contents, object_files);
         finding.evidence.anchor_match =
             anchor_match_verdict(&finding.evidence.anchor_quote, actual.as_deref()).to_owned();
     }
@@ -19526,18 +19632,16 @@ mod tests {
             source_candidate_ids: vec!["c-1".into()],
         };
         let contents = HashMap::new();
-        // Object lines come from the executor's audited git boundary, keyed
-        // by (path, line); verification itself is pure.
-        let object_lines = HashMap::from([(
-            ("src/config.rs".to_owned(), 2),
-            "let retries = 5;".to_owned(),
-        )]);
+        // Object files come from the executor's audited git boundary, keyed
+        // by path; verification itself is pure.
+        let object_files =
+            anchor_object_files(&[("src/config.rs", "line one\nlet retries = 5;\nline three\n")]);
         let mut matched = finding("let retries = 5;");
-        apply_verification_derived_confidence(&mut matched, &contents, &object_lines);
+        apply_verification_derived_confidence(&mut matched, &contents, &object_files);
         assert_eq!(matched.evidence.anchor_match, "matched");
         assert_eq!(matched.confidence, "high");
         let mut mismatched = finding("let retries = 3;");
-        apply_verification_derived_confidence(&mut mismatched, &contents, &object_lines);
+        apply_verification_derived_confidence(&mut mismatched, &contents, &object_files);
         assert_eq!(mismatched.evidence.anchor_match, "mismatched");
         assert_eq!(mismatched.confidence, "low");
 
@@ -19545,7 +19649,7 @@ mod tests {
         // able to reproduce the verdict, so it degrades to unchecked and the
         // stored quote is truncated.
         let mut oversized = finding(&"x".repeat(700));
-        apply_verification_derived_confidence(&mut oversized, &contents, &object_lines);
+        apply_verification_derived_confidence(&mut oversized, &contents, &object_files);
         assert_eq!(oversized.evidence.anchor_match, "unchecked");
         assert!(oversized.evidence.anchor_quote.len() <= 512 + '…'.len_utf8());
         assert_eq!(oversized.confidence, "medium");
@@ -19554,8 +19658,146 @@ mod tests {
         // the prefetch refused, or LEFT-side anchors — stay unchecked.
         let mut unknown = finding("anything");
         unknown.path = "src/not_committed.rs".into();
-        apply_verification_derived_confidence(&mut unknown, &contents, &object_lines);
+        apply_verification_derived_confidence(&mut unknown, &contents, &object_files);
         assert_eq!(unknown.evidence.anchor_match, "unchecked");
+    }
+
+    /// Build the prefetched head-revision map tests hand to validation.
+    fn anchor_object_files(files: &[(&str, &str)]) -> AnchorObjectFiles {
+        files
+            .iter()
+            .map(|(path, text)| {
+                (
+                    (*path).to_owned(),
+                    text.lines().map(str::to_owned).collect::<Vec<_>>(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn reanchoring_snaps_misnumbered_quotes_to_their_source_line() {
+        let lines = "fn a() {\n    retry();\n}\nfn b() {\n    retry();\n}\nlet unique = 1;\n"
+            .lines()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        // A unique quote wins regardless of how far off the claim is.
+        assert_eq!(reanchor_line("let unique = 1;", 1, &lines), Some(7));
+        assert_eq!(reanchor_line("  let unique = 1;  ", 500, &lines), Some(7));
+        // A correct claim on an ambiguous quote is left alone.
+        assert_eq!(reanchor_line("retry();", 5, &lines), Some(5));
+        // An ambiguous quote snaps to the nearest occurrence within the
+        // window, and nowhere when every occurrence is out of range.
+        assert_eq!(reanchor_line("retry();", 4, &lines), Some(5));
+        assert_eq!(reanchor_line("retry();", 1, &lines), Some(2));
+        assert_eq!(reanchor_line("retry();", 5 + 41, &lines), None);
+        // Absent quotes and empty quotes never re-anchor.
+        assert_eq!(reanchor_line("nope();", 2, &lines), None);
+        assert_eq!(reanchor_line("   ", 2, &lines), None);
+        assert_eq!(reanchor_line("retry();", 2, &[]), None);
+    }
+
+    #[test]
+    fn misnumbered_anchors_reanchor_before_verification_and_dedup() {
+        let files = vec![ReviewDiffFile {
+            path: "src/lib.rs".into(),
+            diff: "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -4,2 +4,3 @@\n context\n+let token = compare(a, b);\n context\n"
+                .into(),
+            generated_header: None,
+        }];
+        let head =
+            "one\ntwo\nthree\ncontext\nlet token = compare(a, b);\ncontext\nlet secret = load();\n";
+        let object_files = anchor_object_files(&[("src/lib.rs", head)]);
+        let candidate = |id: &str, line: u64, quote: &str, body: &str| CandidateFinding {
+            candidate_id: id.into(),
+            task_id: "rt_test".into(),
+            reviewer_id: "correctness".into(),
+            reviewer_name: "Correctness".into(),
+            finding: ReviewFinding {
+                path: "b/src/lib.rs".into(),
+                line,
+                side: "RIGHT".into(),
+                outside_diff: false,
+                severity: "high".into(),
+                confidence: "high".into(),
+                title: "Test issue".into(),
+                body: body.into(),
+                evidence: trouve_protocol::CodeReviewFindingEvidence {
+                    anchor_quote: quote.into(),
+                    anchor_line_claimed: Some(999),
+                    execution_path_verification: "verified".into(),
+                    counterexample_search: "searched".into(),
+                    ..test_review_evidence()
+                },
+                origin: Default::default(),
+                source_candidate_ids: vec![id.into()],
+            },
+        };
+        let candidates = [
+            candidate(
+                "c-off-by-one",
+                4,
+                "let token = compare(a, b);",
+                "Timing leak",
+            ),
+            candidate(
+                "c-duplicate",
+                6,
+                "let token = compare(a, b);",
+                "Timing leak",
+            ),
+            candidate("c-outside", 2, "let secret = load();", "Secret at rest"),
+            candidate(
+                "c-correct",
+                5,
+                "let token = compare(a, b);",
+                "Correct claim",
+            ),
+            candidate("c-left", 1, "let secret = load();", "Base-side anchor"),
+        ];
+        let mut left = candidates[4].finding.clone();
+        left.side = "LEFT".into();
+        let findings = coordinator_validated_findings(
+            candidates
+                .iter()
+                .take(4)
+                .map(|candidate| candidate.finding.clone())
+                .chain([left])
+                .collect(),
+            &candidates,
+            &files,
+            &object_files,
+        );
+        let by_id = |id: &str| {
+            findings
+                .iter()
+                .find(|finding| finding.source_candidate_ids == [id.to_owned()])
+        };
+        // The misnumbered anchor snaps onto the diff line, verifies, keeps
+        // its confidence, and records the claimed line; the model-provided
+        // audit value is discarded.
+        let snapped = by_id("c-off-by-one").unwrap();
+        assert_eq!(snapped.line, 5);
+        assert!(!snapped.outside_diff);
+        assert_eq!(snapped.evidence.anchor_match, "matched");
+        assert_eq!(snapped.confidence, "high");
+        assert_eq!(snapped.evidence.anchor_line_claimed, Some(4));
+        // Re-anchoring runs before duplicate suppression: two findings that
+        // meant the same line collapse into one.
+        assert!(by_id("c-duplicate").is_none());
+        // Outside-diff anchors snap within the head file too.
+        let outside = by_id("c-outside").unwrap();
+        assert_eq!(outside.line, 7);
+        assert!(outside.outside_diff);
+        assert_eq!(outside.evidence.anchor_match, "matched");
+        assert_eq!(outside.evidence.anchor_line_claimed, Some(2));
+        // A correct claim is untouched and carries no audit value.
+        let correct = by_id("c-correct").unwrap();
+        assert_eq!(correct.line, 5);
+        assert_eq!(correct.evidence.anchor_line_claimed, None);
+        // LEFT-side anchors quote the base revision and are never moved;
+        // a LEFT claim that names no removed line is rejected as before.
+        assert!(by_id("c-left").is_none());
     }
 
     fn open_history_finding(
@@ -20236,6 +20478,7 @@ rename to src/new.rs
                 path: path.into(),
                 line,
                 quote: quote.into(),
+                line_claimed: None,
             };
         let finding =
             |outside_diff: bool,
@@ -20264,16 +20507,43 @@ rename to src/new.rs
             ("src/api.rs".to_owned(), 10, false),
             "register(handler);".to_owned(),
         )]);
-        // Head-revision lines outside the diff.
-        let object_lines = HashMap::from([(
-            ("src/config.rs".to_owned(), 2),
-            "let retries = 5;".to_owned(),
-        )]);
+        // Head-revision files, including the diff file's full text.
+        let object_lines = anchor_object_files(&[
+            ("src/config.rs", "line one\nlet retries = 5;\nline three\n"),
+            (
+                "src/api.rs",
+                &format!(
+                    "{}    let handler = build();\n    register(handler);\n}}\n",
+                    "// header\n".repeat(8)
+                ),
+            ),
+        ]);
 
         // An in-diff anchor corroborates its own introduced claim.
         let mut in_diff = finding(false, "introduced", Vec::new());
         apply_change_scope_verdict(&mut in_diff, &contents, &object_lines);
         assert_eq!(in_diff.evidence.change_scope, "verified");
+
+        // A misnumbered waypoint re-anchors to its quote; when the snapped
+        // line is a diff line the chain reaches the change, and the claimed
+        // line is kept for audit while a model-provided value is discarded.
+        let mut snapped = finding(
+            true,
+            "introduced",
+            vec![
+                trouve_protocol::CodeReviewCausalWaypoint {
+                    line_claimed: Some(77),
+                    ..waypoint("src/api.rs", 8, "register(handler);")
+                },
+                waypoint("src/config.rs", 1, "let retries = 5;"),
+            ],
+        );
+        apply_change_scope_verdict(&mut snapped, &contents, &object_lines);
+        assert_eq!(snapped.evidence.change_scope, "verified");
+        assert_eq!(snapped.evidence.causal_waypoints[0].line, 10);
+        assert_eq!(snapped.evidence.causal_waypoints[0].line_claimed, Some(8));
+        assert_eq!(snapped.evidence.causal_waypoints[1].line, 2);
+        assert_eq!(snapped.evidence.causal_waypoints[1].line_claimed, Some(1));
 
         // A pre-existing classification, a missing claim, and an unknown
         // claim are honest non-blocking dispositions, wherever anchored.
@@ -24768,7 +25038,9 @@ rename to src/new.rs
         )
         .unwrap();
         let valid = HashSet::from([("src/lib.rs".into(), 3, false)]);
-        assert!(normalize_finding(&mut review.findings[0], &valid).is_none());
+        assert!(
+            normalize_finding(&mut review.findings[0], &valid, &AnchorObjectFiles::new()).is_none()
+        );
     }
 
     #[test]
@@ -26864,8 +27136,7 @@ rename to src/new.rs
             source_candidate_ids: vec!["candidate".into()],
         };
 
-        for (severity, confidence) in [("high", "high"), ("high", "medium"), ("medium", "high")]
-        {
+        for (severity, confidence) in [("high", "high"), ("high", "medium"), ("medium", "high")] {
             let finding = finding(severity, confidence);
             assert!(finding_levels_meet_publication_threshold(
                 &finding.severity,
@@ -26889,7 +27160,9 @@ rename to src/new.rs
                 &finding.confidence
             ));
         }
-        assert!(finding_levels_meet_publication_threshold(" HIGH ", "MEDIUM"));
+        assert!(finding_levels_meet_publication_threshold(
+            " HIGH ", "MEDIUM"
+        ));
         assert!(!finding_levels_meet_publication_threshold(" HIGH ", "LOW"));
         // Unknown levels canonicalize to medium, so an unrecognised pair sits
         // below the bar and an unrecognised severity needs high confidence.

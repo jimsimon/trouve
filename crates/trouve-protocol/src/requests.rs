@@ -2178,6 +2178,12 @@ pub struct CodeReviewCausalWaypoint {
     /// Verbatim source line at `path:line`, from the head revision.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub quote: String,
+    /// The line the coordinator originally claimed when the server
+    /// re-anchored `line` to where `quote` actually appears in the head
+    /// revision. Absent when the claim was correct or no re-anchoring was
+    /// possible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_claimed: Option<u64>,
 }
 
 /// Concrete evidence that makes a confirmed finding independently verifiable.
@@ -2202,6 +2208,12 @@ pub struct CodeReviewFindingEvidence {
     /// or `unchecked`. Model-provided values are overwritten.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub anchor_match: String,
+    /// The line the coordinator originally claimed for the finding when the
+    /// server re-anchored it to where `anchor_quote` actually appears in the
+    /// head revision. Absent when the claim was correct or no re-anchoring
+    /// was possible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_line_claimed: Option<u64>,
     /// The coordinator's grade of how much of `execution_path` it verified
     /// against the repository: `verified`, `partial`, or `unverified`.
     #[serde(default, skip_serializing_if = "String::is_empty")]

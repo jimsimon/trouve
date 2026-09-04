@@ -3431,15 +3431,37 @@ pub fn diff_between(
 
 /// One line of an immutable object at `revision:path`, or None when the
 /// object does not exist at that revision, exceeds `max_bytes`, or has no
-/// such line. Replacement-ref indirection is disabled so the read is pinned
-/// to the exact reviewed object even in a repository carrying hostile
-/// `refs/replace` entries, and the object's size is checked before any
-/// content is buffered.
+/// such line. See [`review_object_text`] for the read guarantees.
 pub fn review_object_line(
     repo: &Path,
     revision: &str,
     path: &str,
     line: u64,
+    max_bytes: usize,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<Option<String>> {
+    let Some(text) = review_object_text(repo, revision, path, max_bytes, cancel)? else {
+        return Ok(None);
+    };
+    let Some(index) = usize::try_from(line)
+        .ok()
+        .and_then(|line| line.checked_sub(1))
+    else {
+        return Ok(None);
+    };
+    Ok(text.lines().nth(index).map(str::to_owned))
+}
+
+/// The full text of an immutable object at `revision:path`, or None when the
+/// object does not exist at that revision, exceeds `max_bytes`, or is not
+/// valid UTF-8. Replacement-ref indirection is disabled so the read is pinned
+/// to the exact reviewed object even in a repository carrying hostile
+/// `refs/replace` entries, and the object's size is checked before any
+/// content is buffered.
+pub fn review_object_text(
+    repo: &Path,
+    revision: &str,
+    path: &str,
     max_bytes: usize,
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<Option<String>> {
@@ -3482,16 +3504,7 @@ pub fn review_object_line(
     // Strict decoding: lossy replacement would let a quote containing
     // U+FFFD "match" bytes that are absent from the immutable object. A
     // non-UTF-8 blob is simply not verifiable.
-    let Ok(text) = String::from_utf8(output.stdout.bytes) else {
-        return Ok(None);
-    };
-    let Some(index) = usize::try_from(line)
-        .ok()
-        .and_then(|line| line.checked_sub(1))
-    else {
-        return Ok(None);
-    };
-    Ok(text.lines().nth(index).map(str::to_owned))
+    Ok(String::from_utf8(output.stdout.bytes).ok())
 }
 
 /// URL of the named remote (usually "origin"), if configured.
@@ -3927,6 +3940,17 @@ line three
         );
         assert_eq!(
             review_object_line(repo.path(), &reviewed, "src/config.rs", 2, 8, &cancel).unwrap(),
+            None
+        );
+        // The whole-object read shares the pinning and the byte cap.
+        assert_eq!(
+            review_object_text(repo.path(), &reviewed, "src/config.rs", 64 * 1024, &cancel)
+                .unwrap()
+                .as_deref(),
+            Some("line one\nlet retries = 5;\nline three\n"),
+        );
+        assert_eq!(
+            review_object_text(repo.path(), &reviewed, "src/config.rs", 8, &cancel).unwrap(),
             None
         );
 
