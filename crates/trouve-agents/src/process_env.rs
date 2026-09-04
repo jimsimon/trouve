@@ -20,6 +20,28 @@ use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 const PATH_MARKER: &str = "__TROUVE_LOGIN_SHELL_PATH__";
 const PATH_CAPTURE_TIMEOUT: Duration = Duration::from_secs(3);
 const PROCESS_TREE_REAP_TIMEOUT: Duration = Duration::from_secs(5);
+/// Enumerating sentinel holders walks every `/proc/*/fd` directory. Under
+/// [`DetachedPolicy::Release`] a tree whose group is already empty re-scans at
+/// most this often while it waits for a same-session holder to exit.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const HOLDER_SCAN_INTERVAL: Duration = Duration::from_millis(250);
+/// Whether this platform can name the processes holding a tree's sentinel
+/// and therefore honour [`DetachedPolicy::Release`].
+pub const DETACHED_RELEASE_SUPPORTED: bool = cfg!(any(target_os = "linux", target_os = "android"));
+/// Largest `RLIMIT_NOFILE` soft limit the brute-force close-on-exec walk in
+/// `pre_exec` accepts. The walk marks every descriptor number below the soft
+/// limit, one `fcntl` pair each, between fork and exec; container runtimes
+/// hand out soft limits in the billions, and a walk that long would stall
+/// the spawn for minutes. A walk that stopped short instead would leave
+/// every descriptor above its stopping point inheritable, so a spawn whose
+/// only option is a walk past this bound fails rather than leak. The walk
+/// is the last resort behind `close_range` and the child's own
+/// descriptor-table listing, both of which cover any descriptor number.
+#[cfg(unix)]
+const DESCRIPTOR_WALK_CEILING: libc::c_int = 1 << 20;
+/// Where a process's own descriptor table can be listed.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const DESCRIPTOR_TABLE: &std::ffi::CStr = c"/proc/self/fd";
 #[cfg(windows)]
 const WINDOWS_PROCESS_TREE_CREATION_FLAGS: u32 =
     windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
@@ -83,14 +105,185 @@ pub fn apply_path_to_tokio(command: &mut tokio::process::Command) {
     }
 }
 
+/// How a process tree treats a descendant that left the leader's session.
+///
+/// A descendant inherits the tree's sentinel across `fork`, `exec`, and
+/// `setsid()`. One that calls `setsid()` (build caches, package-manager
+/// daemons, anything started with `detached: true`) is designed to outlive
+/// the command that started it. [`Self::Terminate`] kills it with the rest of
+/// the tree; [`Self::Release`] hands it to the caller as a
+/// [`DetachedProcess`] so the session, not the call, decides when it ends.
+///
+/// Release needs a platform that can name every sentinel holder
+/// ([`DETACHED_RELEASE_SUPPORTED`]): a holder that cannot be named cannot be
+/// handed to anyone, so the other platforms keep terminating the whole tree.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DetachedPolicy {
+    /// Every sentinel holder dies with the tree.
+    #[default]
+    Terminate,
+    /// Holders in another session keep running and are reported instead.
+    Release,
+}
+
+/// A descendant that left the tree's session and was released from it.
+///
+/// On Linux a released process is always bound to a pidfd: a holder the
+/// kernel offers no pidfd for is not released at all but kept in the tree
+/// and stopped with it, so no signal to a released process ever goes by
+/// pid number.
+#[derive(Clone, Debug)]
+pub struct DetachedProcess {
+    pub pid: i32,
+    /// Kernel start time of the pid when it was released; with the pid it
+    /// names one process incarnation in reports and records.
+    pub start_time: u64,
+    /// The file name of the process's executable, reduced to printable ASCII
+    /// of at most 15 characters. Never the name the process set for itself
+    /// (`/proc/<pid>/comm`): this reaches logs and results that outlive the
+    /// call, and a daemon could plant inherited secrets in a name it chooses.
+    pub name: String,
+    /// A pidfd bound to that incarnation of the pid (Linux 5.3+): liveness
+    /// checks and signals through it cannot reach a successor to the pid.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    handle: std::sync::Arc<OwnedFd>,
+}
+
+impl PartialEq for DetachedProcess {
+    fn eq(&self, other: &Self) -> bool {
+        self.pid == other.pid && self.start_time == other.start_time && self.name == other.name
+    }
+}
+
+impl Eq for DetachedProcess {}
+
+/// A descendant that left the tree's process group but not its session and
+/// was therefore terminated with the tree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TerminatedEscapee {
+    pub pid: i32,
+    pub name: String,
+}
+
+impl DetachedProcess {
+    /// Whether the released process still exists under the same identity.
+    pub fn is_alive(&self) -> bool {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            if let Some(exited) = linux_process_handle_exited(&self.handle) {
+                return !exited;
+            }
+            linux_process_stat(self.pid).is_some_and(|stat| {
+                stat.start_time == self.start_time && !matches!(stat.state, 'Z' | 'X')
+            })
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        {
+            false
+        }
+    }
+
+    /// Ask the process to exit (`SIGTERM`). `Ok(false)` means it was already
+    /// gone or its pid has been recycled.
+    pub fn request_exit(&self) -> std::io::Result<bool> {
+        #[cfg(unix)]
+        {
+            self.signal(libc::SIGTERM)
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(false)
+        }
+    }
+
+    /// Kill the process (`SIGKILL`). `Ok(false)` means it was already gone or
+    /// its pid has been recycled.
+    pub fn kill(&self) -> std::io::Result<bool> {
+        #[cfg(unix)]
+        {
+            self.signal(libc::SIGKILL)
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(false)
+        }
+    }
+
+    #[cfg(unix)]
+    fn signal(&self, signal: libc::c_int) -> std::io::Result<bool> {
+        if !self.is_alive() {
+            return Ok(false);
+        }
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            // Through the pidfd only: a signal by number could land on a
+            // successor to the pid, however recent the identity check.
+            signal_linux_process_handle(&self.handle, signal)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        {
+            signal_unix_process(self.pid, signal)
+        }
+    }
+}
+
+/// A copy of a tree's descendant sentinel, kept by whoever adopted the
+/// tree's released daemons. A daemon forks its workers with the sentinel
+/// still open, so a holder found through it later is a descendant nobody
+/// recorded at the hand-over; the adopter stops such holders when it stops
+/// the daemons.
+#[derive(Debug)]
+pub struct ReleasedSentinel {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    sentinel: OwnedFd,
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    tree_leader: i32,
+}
+
+impl ReleasedSentinel {
+    /// Whether any process still holds the sentinel.
+    pub fn is_held(&self) -> std::io::Result<bool> {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            unix_descendant_sentinel_active(&self.sentinel)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        {
+            Ok(false)
+        }
+    }
+
+    /// Every live process holding the sentinel right now, trouve itself
+    /// excluded, each bound to its current incarnation. Fails when a holder
+    /// cannot be bound to a pidfd: the caller is going to signal what it
+    /// gets back, and a signal by pid number has no place here.
+    pub fn holders(&self) -> std::io::Result<Vec<DetachedProcess>> {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            let mut holders = Vec::new();
+            for holder in linux_sentinel_holders(&self.sentinel, self.tree_leader)? {
+                match holder.released() {
+                    Some(process) => record_detached(&mut holders, process),
+                    None => return Err(unbound_holder_error(&holder)),
+                }
+            }
+            Ok(holders)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        {
+            Ok(Vec::new())
+        }
+    }
+}
+
 /// A Tokio child whose descendants share an owned operating-system process
 /// tree boundary.
 ///
 /// On Unix the child leads a new process group and inherits a private lifetime
-/// sentinel, so descendants that call `setsid()` remain owned. On Windows it
-/// is assigned to a kill-on-close Job Object. Call
-/// [`Self::terminate_and_reap`] on normal cleanup paths; `Drop` still signals
-/// the complete tree as a last resort.
+/// sentinel, so descendants that call `setsid()` remain owned unless the tree
+/// opted into [`DetachedPolicy::Release`]. On Windows it is assigned to a
+/// kill-on-close Job Object. Call [`Self::terminate_and_reap`] on normal
+/// cleanup paths; `Drop` still signals the complete tree as a last resort.
 /// This wrapper deliberately accepts an already-configured `Command`, so
 /// callers can set argv, environment, cwd, and stdio without invoking a shell.
 pub struct ProcessTreeChild {
@@ -102,10 +295,24 @@ pub struct ProcessTreeChild {
     /// tree. The flag prevents Drop from signalling a reused numeric Unix
     /// process-group id after the group and inherited sentinel are empty.
     tree_active: bool,
+    detached_policy: DetachedPolicy,
+    /// Descendants released under [`DetachedPolicy::Release`], in discovery
+    /// order and without duplicates.
+    detached: Vec<DetachedProcess>,
+    /// Descendants that left the process group but stayed in the session and
+    /// were killed with the tree.
+    terminated_escapees: Vec<TerminatedEscapee>,
     #[cfg(unix)]
     process_group: i32,
     #[cfg(unix)]
     descendant_sentinel: OwnedFd,
+    /// Last holder classification while the group was empty: when it ran and
+    /// whether a same-session holder still existed.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    holder_scan: Option<(Instant, bool)>,
+    /// Whether [`Self::release_sentinel`] already handed the sentinel over.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    sentinel_released: bool,
     #[cfg(target_os = "macos")]
     process_group_signalled: bool,
     #[cfg(windows)]
@@ -258,6 +465,64 @@ impl ProcessTreeChild {
     /// acknowledgement failure that happened after the command completed.
     pub fn leader_status(&self) -> Option<std::process::ExitStatus> {
         self.leader_status
+    }
+
+    /// Opt into [`DetachedPolicy::Release`]: descendants that move to their
+    /// own session no longer keep this tree alive and are not killed with it.
+    /// Collect them with [`Self::take_detached`] once the tree completes.
+    ///
+    /// Only platforms that can enumerate sentinel holders honour the request
+    /// ([`DETACHED_RELEASE_SUPPORTED`]); elsewhere the tree keeps
+    /// [`DetachedPolicy::Terminate`] rather than let go of processes nobody
+    /// could name, report, or stop later.
+    pub fn release_detached_descendants(&mut self) {
+        if DETACHED_RELEASE_SUPPORTED {
+            self.detached_policy = DetachedPolicy::Release;
+        }
+    }
+
+    pub fn detached_policy(&self) -> DetachedPolicy {
+        self.detached_policy
+    }
+
+    /// Descendants released so far under [`DetachedPolicy::Release`].
+    pub fn take_detached(&mut self) -> Vec<DetachedProcess> {
+        std::mem::take(&mut self.detached)
+    }
+
+    /// Hand over a copy of the tree's sentinel so the adopter of its released
+    /// descendants can find workers they fork later. Only once, and only
+    /// under [`DetachedPolicy::Release`]: a terminated tree leaves nothing
+    /// behind to find.
+    pub fn release_sentinel(&mut self) -> Option<ReleasedSentinel> {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            if self.detached_policy != DetachedPolicy::Release || self.sentinel_released {
+                return None;
+            }
+            let sentinel = match self.descendant_sentinel.try_clone() {
+                Ok(sentinel) => sentinel,
+                Err(error) => {
+                    tracing::warn!(%error, "cannot retain the sentinel of a released process tree");
+                    return None;
+                }
+            };
+            self.sentinel_released = true;
+            Some(ReleasedSentinel {
+                sentinel,
+                tree_leader: self.process_group,
+            })
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        {
+            None
+        }
+    }
+
+    /// Descendants that escaped the process group and were killed with the
+    /// tree.
+    pub fn take_terminated_escapees(&mut self) -> Vec<TerminatedEscapee> {
+        std::mem::take(&mut self.terminated_escapees)
     }
 
     /// Reap the tree leader without terminating descendants.
@@ -486,10 +751,17 @@ fn spawn_process_tree_locked(
         child,
         leader_status: None,
         tree_active: true,
+        detached_policy: DetachedPolicy::Terminate,
+        detached: Vec::new(),
+        terminated_escapees: Vec::new(),
         #[cfg(unix)]
         process_group,
         #[cfg(unix)]
         descendant_sentinel,
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        holder_scan: None,
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        sentinel_released: false,
         #[cfg(target_os = "macos")]
         process_group_signalled: false,
         #[cfg(windows)]
@@ -595,12 +867,22 @@ fn install_unix_descendant_sentinel(
     }
 
     let writer_fd = writer.as_raw_fd();
-    // SAFETY: this closure only invokes async-signal-safe `fcntl` between fork
-    // and exec. The parent copy stays close-on-exec and is dropped immediately
-    // after spawn; the child copy deliberately survives exec and is inherited
-    // across forks and `setsid()` calls until the last descendant exits.
+    let hygiene = DescriptorHygiene::detect([reader.as_raw_fd(), writer_fd])?;
+    #[cfg(test)]
+    run_after_descriptor_hygiene_detect_hook();
+    // SAFETY: this closure only invokes async-signal-safe `close_range`,
+    // `open`, `getdents64`, `fcntl`, and `close` between fork and exec and
+    // never allocates; an error carries nothing but its `errno`. The parent
+    // copy stays close-on-exec and is dropped immediately after spawn; the
+    // child copy deliberately survives exec and is inherited across forks
+    // and `setsid()` calls until the last descendant exits.
     unsafe {
         command.pre_exec(move || {
+            // Libraries loaded into the desktop process (WebKitGTK, for one)
+            // open descriptors without `O_CLOEXEC`. Nothing but stdio and the
+            // sentinel should reach a child, so mark everything else first and
+            // re-arm the sentinel afterwards.
+            hygiene.apply()?;
             let flags = libc::fcntl(writer_fd, libc::F_GETFD);
             if flags == -1 || libc::fcntl(writer_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) == -1
             {
@@ -610,6 +892,471 @@ fn install_unix_descendant_sentinel(
         });
     }
     Ok((reader, writer))
+}
+
+/// How `pre_exec` marks the parent's descriptors close-on-exec. Chosen in the
+/// parent, where `getrlimit`, allocation, and `read_dir` are allowed; applied
+/// in the child with nothing but async-signal-safe syscalls. Every option
+/// covers the descriptor table the child actually has, so a descriptor
+/// another thread opens while the spawn is being prepared is covered too;
+/// when no option is available the spawn fails rather than leave part of
+/// the table inheritable.
+#[cfg(unix)]
+enum DescriptorHygiene {
+    /// `close_range(3, ~0, CLOSE_RANGE_CLOEXEC)` (Linux 5.11+) marks the
+    /// whole table in one call. Should the call fail in the child after
+    /// succeeding in the parent, the walk backs it up when the soft limit
+    /// allows one.
+    CloseRange { walk_bound: Option<libc::c_int> },
+    /// The child lists its own `/proc/self/fd` between fork and exec and
+    /// marks every entry above stdio. The child is single-threaded by then,
+    /// so the listing is exact; a listing that misses the sentinel writer is
+    /// treated as failed, and the walk backs the listing up when the soft
+    /// limit allows one.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    Listed {
+        sentinel_writer: libc::c_int,
+        walk_bound: Option<libc::c_int>,
+    },
+    /// Every descriptor number below the `RLIMIT_NOFILE` soft limit, for
+    /// platforms with neither `close_range` nor a listable table. The bound
+    /// is the soft limit itself, never something smaller.
+    Walk(libc::c_int),
+}
+
+#[cfg(unix)]
+impl DescriptorHygiene {
+    /// `sentinel` holds both ends of the freshly created sentinel pipe. The
+    /// parent's own listing must contain both before the child is trusted to
+    /// list its table; a `/proc` that is not this process's is not listable.
+    fn detect(sentinel: [libc::c_int; 2]) -> std::io::Result<Self> {
+        let (allow_close_range, allow_listing) = descriptor_hygiene_preferences();
+        let soft_limit = descriptor_soft_limit();
+        let ceiling = descriptor_walk_ceiling();
+        let walk_bound = soft_limit.and_then(|soft| walk_bound_for_soft_limit(soft, ceiling));
+        if allow_close_range && close_range_marks_close_on_exec() {
+            return Ok(Self::CloseRange { walk_bound });
+        }
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if allow_listing && descriptor_table_lists(sentinel) {
+            return Ok(Self::Listed {
+                sentinel_writer: sentinel[1],
+                walk_bound,
+            });
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let _ = (allow_listing, sentinel);
+        let Some(bound) = walk_bound else {
+            return Err(unbounded_descriptor_walk_error(soft_limit, ceiling));
+        };
+        warn_descriptor_walk_once(bound);
+        Ok(Self::Walk(bound))
+    }
+
+    /// Runs between fork and exec. Fails when a descriptor could not be
+    /// marked, which leaves the spawn failed rather than exec with an
+    /// inheritable descriptor.
+    fn apply(&self) -> std::io::Result<()> {
+        match self {
+            Self::CloseRange { walk_bound } => {
+                if close_range_close_on_exec(3) {
+                    return Ok(());
+                }
+                let error = std::io::Error::last_os_error();
+                match walk_bound {
+                    Some(bound) => walk_descriptors_close_on_exec(*bound),
+                    None => Err(error),
+                }
+            }
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            Self::Listed {
+                sentinel_writer,
+                walk_bound,
+            } => match list_descriptors_close_on_exec(*sentinel_writer) {
+                Ok(()) => Ok(()),
+                Err(error) => match walk_bound {
+                    Some(bound) => walk_descriptors_close_on_exec(*bound),
+                    None => Err(error),
+                },
+            },
+            Self::Walk(bound) => walk_descriptors_close_on_exec(*bound),
+        }
+    }
+}
+
+/// Whether `close_range(CLOSE_RANGE_CLOEXEC)` works here, probed once. The
+/// probe asks for the top of the descriptor range only, which the kernel
+/// clamps to the table, so it changes nothing; kernels without the flag
+/// reject it.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn close_range_marks_close_on_exec() -> bool {
+    static SUPPORTED: OnceLock<bool> = OnceLock::new();
+    *SUPPORTED.get_or_init(|| close_range_close_on_exec(libc::c_uint::MAX))
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+fn close_range_marks_close_on_exec() -> bool {
+    false
+}
+
+/// Mark every descriptor from `first` up close-on-exec with one syscall.
+/// `CLOSE_RANGE_CLOEXEC` is Linux 5.11+; the raw syscall avoids relying on a
+/// libc wrapper that older glibc builds lack. Older kernels fail with ENOSYS
+/// or EINVAL.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn close_range_close_on_exec(first: libc::c_uint) -> bool {
+    const CLOSE_RANGE_CLOEXEC: libc::c_uint = 1 << 2;
+    unsafe {
+        libc::syscall(
+            libc::SYS_close_range,
+            first,
+            libc::c_uint::MAX,
+            CLOSE_RANGE_CLOEXEC,
+        ) == 0
+    }
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+fn close_range_close_on_exec(_first: libc::c_uint) -> bool {
+    false
+}
+
+/// Whether the parent's descriptor table is listable: `/proc/self/fd` exists
+/// and shows both ends of the sentinel pipe, so it is this process's own
+/// table rather than a stale or foreign `/proc`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn descriptor_table_lists(sentinel: [libc::c_int; 2]) -> bool {
+    let Ok(entries) = std::fs::read_dir(DESCRIPTOR_TABLE.to_str().unwrap()) else {
+        return false;
+    };
+    let mut seen = [false; 2];
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return false;
+        };
+        let Some(descriptor) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<libc::c_int>().ok())
+        else {
+            return false;
+        };
+        for (end, seen) in sentinel.iter().zip(seen.iter_mut()) {
+            *seen |= descriptor == *end;
+        }
+    }
+    seen.iter().all(|seen| *seen)
+}
+
+/// Child-side only: list the child's own `/proc/self/fd` with `getdents64`
+/// and mark every descriptor above stdio close-on-exec. Async-signal-safe
+/// and allocation-free; the entries are parsed off a stack buffer. Fails
+/// when the table cannot be read, a descriptor refuses the mark, or the
+/// listing does not show the sentinel writer, which a complete listing of
+/// this child must.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn list_descriptors_close_on_exec(sentinel_writer: libc::c_int) -> std::io::Result<()> {
+    // `getdents64` records are 8-byte aligned; a `u64` buffer keeps them so.
+    let mut buffer = [0u64; 512];
+    let directory = unsafe {
+        libc::open(
+            DESCRIPTOR_TABLE.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if directory == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut sentinel_seen = false;
+    let outcome = 'listing: loop {
+        let read = unsafe {
+            libc::syscall(
+                libc::SYS_getdents64,
+                directory,
+                buffer.as_mut_ptr(),
+                std::mem::size_of_val(&buffer),
+            )
+        };
+        let Ok(read) = usize::try_from(read) else {
+            break Err(std::io::Error::last_os_error());
+        };
+        if read == 0 {
+            break Ok(());
+        }
+        let records = buffer.as_ptr().cast::<u8>();
+        let mut offset = 0;
+        while offset < read {
+            let parsed = unsafe { parse_dirent64(records.add(offset), read - offset) };
+            let Some((descriptor, length)) = parsed else {
+                break;
+            };
+            offset += length;
+            let Some(descriptor) = descriptor else {
+                continue;
+            };
+            if descriptor < 3 || descriptor == directory {
+                continue;
+            }
+            sentinel_seen |= descriptor == sentinel_writer;
+            if let Err(error) = mark_descriptor_close_on_exec(descriptor) {
+                break 'listing Err(error);
+            }
+        }
+    };
+    unsafe { libc::close(directory) };
+    match outcome {
+        Ok(()) if sentinel_seen => Ok(()),
+        Ok(()) => Err(std::io::Error::from_raw_os_error(libc::EBADF)),
+        Err(error) => Err(error),
+    }
+}
+
+/// One `getdents64` record: the descriptor number its name spells (`None`
+/// for `.`, `..`, or anything else that is not a decimal number) and the
+/// record's length. `None` altogether when `available` bytes cannot hold a
+/// record, which ends the buffer.
+///
+/// # Safety
+/// `record` must point at `available` readable bytes starting at a record
+/// boundary of a `getdents64` result.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+unsafe fn parse_dirent64(
+    record: *const u8,
+    available: usize,
+) -> Option<(Option<libc::c_int>, usize)> {
+    let name_offset = std::mem::offset_of!(libc::dirent64, d_name);
+    if available < name_offset {
+        return None;
+    }
+    let entry = record.cast::<libc::dirent64>();
+    let length = usize::from(unsafe { std::ptr::addr_of!((*entry).d_reclen).read_unaligned() });
+    if length < name_offset || length > available {
+        return None;
+    }
+    let name = unsafe { std::slice::from_raw_parts(record.add(name_offset), length - name_offset) };
+    let name = &name[..name
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(name.len())];
+    let descriptor = name
+        .iter()
+        .try_fold(None, |number: Option<libc::c_int>, byte| {
+            let digit = libc::c_int::from(byte.checked_sub(b'0').filter(|digit| *digit <= 9)?);
+            number
+                .unwrap_or(0)
+                .checked_mul(10)?
+                .checked_add(digit)
+                .map(Some)
+        })
+        .flatten();
+    Some((descriptor, length))
+}
+
+/// The `RLIMIT_NOFILE` soft limit, read in the parent because `getrlimit` is
+/// not async-signal-safe. Descriptors open at exec time are numbered below
+/// it, except for one opened before an ancestor lowered the limit.
+#[cfg(unix)]
+fn descriptor_soft_limit() -> Option<libc::rlim_t> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    (unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == 0).then_some(limit.rlim_cur)
+}
+
+/// The soft limit as a walk bound, provided walking it is affordable; `None`
+/// for unlimited, unrepresentable, or container-sized limits, which the
+/// walk must not silently stop short of.
+#[cfg(unix)]
+fn walk_bound_for_soft_limit(
+    soft_limit: libc::rlim_t,
+    ceiling: libc::c_int,
+) -> Option<libc::c_int> {
+    libc::c_int::try_from(soft_limit)
+        .ok()
+        .filter(|soft| *soft <= ceiling)
+}
+
+#[cfg(unix)]
+fn unbounded_descriptor_walk_error(
+    soft_limit: Option<libc::rlim_t>,
+    ceiling: libc::c_int,
+) -> std::io::Error {
+    let limit = match soft_limit {
+        Some(libc::RLIM_INFINITY) => "unlimited".to_string(),
+        Some(soft) => soft.to_string(),
+        None => "unknown".to_string(),
+    };
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let message = format!(
+        "cannot make inherited descriptors close-on-exec for the child: close_range is unavailable, /proc/self/fd cannot be listed, and the RLIMIT_NOFILE soft limit ({limit}) exceeds the {ceiling}-descriptor close-on-exec walk bound; lower the limit or mount /proc"
+    );
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let message = format!(
+        "cannot make inherited descriptors close-on-exec for the child: the RLIMIT_NOFILE soft limit ({limit}) exceeds the {ceiling}-descriptor close-on-exec walk bound; lower the limit"
+    );
+    std::io::Error::new(std::io::ErrorKind::Unsupported, message)
+}
+
+#[cfg(unix)]
+fn warn_descriptor_walk_once(bound: libc::c_int) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        tracing::warn!(
+            bound,
+            "cannot list open descriptors; each child marks every descriptor number below the RLIMIT_NOFILE soft limit close-on-exec before exec"
+        );
+    });
+}
+
+/// Child-side only: one `fcntl` pair per descriptor number in `3..bound`,
+/// stopping at the first descriptor that refuses the mark.
+#[cfg(unix)]
+fn walk_descriptors_close_on_exec(bound: libc::c_int) -> std::io::Result<()> {
+    (3..bound).try_for_each(mark_descriptor_close_on_exec)
+}
+
+/// Child-side only: async-signal-safe and allocation-free. A descriptor
+/// that is not open (`EBADF`) needs no mark; any other refusal is an error,
+/// because a descriptor left inheritable reaches the program the child
+/// execs. An interrupted `fcntl` is retried.
+#[cfg(unix)]
+fn mark_descriptor_close_on_exec(descriptor: libc::c_int) -> std::io::Result<()> {
+    let flags = loop {
+        match descriptor_flags(descriptor) {
+            Ok(flags) => break flags,
+            Err(DescriptorFlagRefusal::Interrupted) => continue,
+            Err(DescriptorFlagRefusal::NotOpen) => return Ok(()),
+            Err(DescriptorFlagRefusal::Refused(error)) => return Err(error),
+        }
+    };
+    if flags & libc::FD_CLOEXEC != 0 {
+        return Ok(());
+    }
+    loop {
+        match set_descriptor_flags(descriptor, flags | libc::FD_CLOEXEC) {
+            Ok(()) => return Ok(()),
+            Err(DescriptorFlagRefusal::Interrupted) => continue,
+            Err(DescriptorFlagRefusal::NotOpen) => return Ok(()),
+            Err(DescriptorFlagRefusal::Refused(error)) => return Err(error),
+        }
+    }
+}
+
+/// Why a descriptor-flag `fcntl` failed.
+#[cfg(unix)]
+enum DescriptorFlagRefusal {
+    /// `EINTR`: the call was interrupted and may be repeated.
+    Interrupted,
+    /// `EBADF`: the number is not an open descriptor, so there is nothing
+    /// to mark.
+    NotOpen,
+    /// Anything else, a policy that forbids the call for one.
+    Refused(std::io::Error),
+}
+
+#[cfg(unix)]
+impl DescriptorFlagRefusal {
+    fn last_os_error() -> Self {
+        let error = std::io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::EINTR) => Self::Interrupted,
+            Some(libc::EBADF) => Self::NotOpen,
+            _ => Self::Refused(error),
+        }
+    }
+}
+
+/// `fcntl(F_GETFD)`.
+#[cfg(unix)]
+fn descriptor_flags(descriptor: libc::c_int) -> Result<libc::c_int, DescriptorFlagRefusal> {
+    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+    if flags == -1 {
+        return Err(DescriptorFlagRefusal::last_os_error());
+    }
+    Ok(flags)
+}
+
+/// `fcntl(F_SETFD)`, with a test hook that refuses one descriptor.
+#[cfg(unix)]
+fn set_descriptor_flags(
+    descriptor: libc::c_int,
+    flags: libc::c_int,
+) -> Result<(), DescriptorFlagRefusal> {
+    #[cfg(test)]
+    if let Some((refused, errno)) = DESCRIPTOR_FLAG_REFUSAL.with(std::cell::Cell::get)
+        && refused == descriptor
+    {
+        return Err(DescriptorFlagRefusal::Refused(
+            std::io::Error::from_raw_os_error(errno),
+        ));
+    }
+    if unsafe { libc::fcntl(descriptor, libc::F_SETFD, flags) } == -1 {
+        return Err(DescriptorFlagRefusal::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(all(unix, test))]
+thread_local! {
+    /// Test hook: whether `close_range` and the descriptor-table listing may
+    /// be used, so each fallback can be exercised on a machine that has the
+    /// better option.
+    static DESCRIPTOR_HYGIENE_PREFERENCES: std::cell::Cell<(bool, bool)> =
+        const { std::cell::Cell::new((true, true)) };
+    /// Test hook: a walk bound standing in for [`DESCRIPTOR_WALK_CEILING`],
+    /// so a container-sized soft limit can be modelled without one.
+    static DESCRIPTOR_WALK_CEILING_OVERRIDE: std::cell::Cell<Option<libc::c_int>> =
+        const { std::cell::Cell::new(None) };
+    /// Test hook: runs once after the hygiene strategy is chosen and before
+    /// the spawn, standing in for whatever another thread does in that gap.
+    static AFTER_DESCRIPTOR_HYGIENE_DETECT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+    /// Test hook: a descriptor number whose `F_SETFD` fails with the given
+    /// `errno`, standing in for a syscall policy that forbids the call. Read
+    /// in the forked child too, which inherits this thread's copy.
+    static DESCRIPTOR_FLAG_REFUSAL: std::cell::Cell<Option<(libc::c_int, libc::c_int)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(all(any(target_os = "linux", target_os = "android"), test))]
+thread_local! {
+    /// Test hook: pretend the kernel offers no pidfds, standing in for a
+    /// pre-5.3 kernel or a full descriptor table.
+    static PIDFD_UNAVAILABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(all(unix, test))]
+fn run_after_descriptor_hygiene_detect_hook() {
+    if let Some(hook) = AFTER_DESCRIPTOR_HYGIENE_DETECT.with(|hook| hook.borrow_mut().take()) {
+        hook();
+    }
+}
+
+#[cfg(unix)]
+fn descriptor_hygiene_preferences() -> (bool, bool) {
+    #[cfg(test)]
+    {
+        DESCRIPTOR_HYGIENE_PREFERENCES.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        (true, true)
+    }
+}
+
+#[cfg(unix)]
+fn descriptor_walk_ceiling() -> libc::c_int {
+    #[cfg(test)]
+    {
+        DESCRIPTOR_WALK_CEILING_OVERRIDE
+            .with(std::cell::Cell::get)
+            .unwrap_or(DESCRIPTOR_WALK_CEILING)
+    }
+    #[cfg(not(test))]
+    {
+        DESCRIPTOR_WALK_CEILING
+    }
 }
 
 fn wait_for_blocking_process_tree_exit_until(
@@ -663,7 +1410,15 @@ fn terminate_blocking_process_tree(child: &mut BlockingProcessTreeChild) -> std:
         return Ok(());
     }
     let group = signal_unix_process_group(child.process_group);
-    let escaped = terminate_unix_sentinel_holders(&child.descendant_sentinel, child.process_group);
+    // Blocking trees back synchronous subsystems (Git, MCP config) that never
+    // intentionally leave a daemon behind; they keep terminating everything.
+    let escaped = terminate_unix_sentinel_holders(
+        &child.descendant_sentinel,
+        child.process_group,
+        DetachedPolicy::Terminate,
+        &mut Vec::new(),
+        &mut Vec::new(),
+    );
     group.and(escaped)
 }
 
@@ -701,7 +1456,7 @@ fn terminate_blocking_process_tree(_child: &mut BlockingProcessTreeChild) -> std
     Ok(())
 }
 
-async fn wait_for_platform_process_tree_exit(child: &ProcessTreeChild) -> std::io::Result<()> {
+async fn wait_for_platform_process_tree_exit(child: &mut ProcessTreeChild) -> std::io::Result<()> {
     wait_for_platform_process_tree_exit_until(
         child,
         tokio::time::Instant::now() + PROCESS_TREE_REAP_TIMEOUT,
@@ -710,7 +1465,7 @@ async fn wait_for_platform_process_tree_exit(child: &ProcessTreeChild) -> std::i
 }
 
 async fn wait_for_platform_process_tree_exit_until(
-    child: &ProcessTreeChild,
+    child: &mut ProcessTreeChild,
     deadline: tokio::time::Instant,
 ) -> std::io::Result<()> {
     while platform_process_tree_active(child)? {
@@ -727,21 +1482,69 @@ async fn wait_for_platform_process_tree_exit_until(
 }
 
 #[cfg(unix)]
-fn platform_process_tree_active(child: &ProcessTreeChild) -> std::io::Result<bool> {
+fn platform_process_tree_active(child: &mut ProcessTreeChild) -> std::io::Result<bool> {
     if !child.tree_active {
         return Ok(false);
     }
     let sentinel_active = unix_descendant_sentinel_active(&child.descendant_sentinel)?;
+    // Under terminate-all semantics every sentinel holder belongs to the
+    // tree, so a held sentinel settles liveness without the process-group
+    // query, which walks `/proc` on Linux.
+    if sentinel_active && child.detached_policy == DetachedPolicy::Terminate {
+        return Ok(true);
+    }
     #[cfg(target_os = "macos")]
     let group_active =
         !child.process_group_signalled && unix_process_group_active(child.process_group)?;
     #[cfg(not(target_os = "macos"))]
     let group_active = unix_process_group_active(child.process_group)?;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if sentinel_active && !group_active && child.detached_policy == DetachedPolicy::Release {
+        // Only processes outside the group still hold the sentinel. Keep the
+        // tree alive for those that stayed in the session; the rest are
+        // detached daemons the tree does not own.
+        return released_holders_remain(child);
+    }
     Ok(sentinel_active || group_active)
 }
 
+/// Whether a process the tree still owns holds the sentinel of a tree whose
+/// process group is already empty: one that stayed in the session, or one
+/// in another session that could not be bound to a pidfd and is therefore
+/// kept rather than released. Released holders are recorded as a side
+/// effect.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn released_holders_remain(child: &mut ProcessTreeChild) -> std::io::Result<bool> {
+    if let Some((scanned_at, remain)) = child.holder_scan
+        && scanned_at.elapsed() < HOLDER_SCAN_INTERVAL
+    {
+        return Ok(remain);
+    }
+    let own_session = unsafe { libc::getsid(0) };
+    let mut remain = false;
+    for holder in linux_sentinel_holders(&child.descendant_sentinel, child.process_group)? {
+        if holder.stat.session == own_session {
+            remain = true;
+            continue;
+        }
+        match holder.released() {
+            Some(process) => record_detached(&mut child.detached, process),
+            None => {
+                tracing::debug!(
+                    pid = holder.pid,
+                    name = %holder.name,
+                    "detached descendant has no pidfd; keeping it in the tree"
+                );
+                remain = true;
+            }
+        }
+    }
+    child.holder_scan = Some((Instant::now(), remain));
+    Ok(remain)
+}
+
 #[cfg(windows)]
-fn platform_process_tree_active(child: &ProcessTreeChild) -> std::io::Result<bool> {
+fn platform_process_tree_active(child: &mut ProcessTreeChild) -> std::io::Result<bool> {
     windows_job_active(&child.job)
 }
 
@@ -772,7 +1575,7 @@ fn windows_job_active(job: &std::os::windows::io::OwnedHandle) -> std::io::Resul
 }
 
 #[cfg(not(any(unix, windows)))]
-fn platform_process_tree_active(child: &ProcessTreeChild) -> std::io::Result<bool> {
+fn platform_process_tree_active(child: &mut ProcessTreeChild) -> std::io::Result<bool> {
     Ok(child.tree_active && child.leader_status.is_none())
 }
 
@@ -782,7 +1585,19 @@ fn terminate_platform_process_tree(child: &mut ProcessTreeChild) -> std::io::Res
         return Ok(());
     }
     let group = signal_unix_process_group(child.process_group);
-    let escaped = terminate_unix_sentinel_holders(&child.descendant_sentinel, child.process_group);
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        // Holders killed here should be re-checked on the next liveness poll
+        // rather than after the throttle interval.
+        child.holder_scan = None;
+    }
+    let escaped = terminate_unix_sentinel_holders(
+        &child.descendant_sentinel,
+        child.process_group,
+        child.detached_policy,
+        &mut child.detached,
+        &mut child.terminated_escapees,
+    );
     group.and(escaped)
 }
 
@@ -861,20 +1676,208 @@ fn signal_unix_process_group(process_group: i32) -> std::io::Result<()> {
     }
 }
 
+/// Signal one process by pid. `Ok(false)` when it is already gone.
+#[cfg(unix)]
+fn signal_unix_process(pid: i32, signal: libc::c_int) -> std::io::Result<bool> {
+    if unsafe { libc::kill(pid, signal) } == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(false)
+    } else {
+        Err(error)
+    }
+}
+
+/// Open a pidfd for `pid` (Linux 5.3+). The descriptor names this one
+/// incarnation of the pid, however often the number is recycled afterwards.
+/// `Ok(None)` when the kernel offers none or the descriptor table is full;
+/// `Err` when `pid` is already gone.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn linux_process_stat(pid: i32) -> Option<(char, i32, i32)> {
+fn linux_process_handle(pid: i32) -> std::io::Result<Option<OwnedFd>> {
+    #[cfg(test)]
+    if PIDFD_UNAVAILABLE.with(std::cell::Cell::get) {
+        return Ok(None);
+    }
+    let flags: libc::c_uint = 0;
+    let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, flags) };
+    if let Ok(descriptor) = libc::c_int::try_from(descriptor)
+        && descriptor >= 0
+    {
+        return Ok(Some(unsafe { OwnedFd::from_raw_fd(descriptor) }));
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Err(error)
+    } else {
+        Ok(None)
+    }
+}
+
+/// Whether the process behind a pidfd has exited: the descriptor becomes
+/// readable once the whole thread group is gone, zombie included. `None`
+/// when the kernel cannot say.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn linux_process_handle_exited(handle: &OwnedFd) -> Option<bool> {
+    let mut descriptor = libc::pollfd {
+        fd: handle.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        let ready = unsafe { libc::poll(std::ptr::from_mut(&mut descriptor), 1, 0) };
+        if ready > 0 {
+            return (descriptor.revents & libc::POLLNVAL == 0)
+                .then_some(descriptor.revents & libc::POLLIN != 0);
+        }
+        if ready == 0 {
+            return Some(false);
+        }
+        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return None;
+        }
+    }
+}
+
+/// Signal the process behind a pidfd. `Ok(false)` once it has been reaped;
+/// a zombie still accepts the signal.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn signal_linux_process_handle(handle: &OwnedFd, signal: libc::c_int) -> std::io::Result<bool> {
+    let flags: libc::c_uint = 0;
+    let sent = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            handle.as_raw_fd(),
+            signal,
+            std::ptr::null::<libc::siginfo_t>(),
+            flags,
+        )
+    };
+    if sent == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(false)
+    } else {
+        Err(error)
+    }
+}
+
+/// Signal a process the tree still owns: through its pidfd where there is
+/// one, so a pid recycled since the scan is never hit; by pid only where the
+/// kernel offers no pidfd or a sandbox refuses the syscall. The signal by
+/// number is preceded by a fresh read of the pid's start time, so it is
+/// skipped when the holder found by the scan has already been replaced;
+/// the window left is the one between that read and the `kill`, the same
+/// one the group signal has. Released processes, which are signalled long
+/// after their scan, never take this route.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn signal_linux_process(
+    pid: i32,
+    handle: Option<&OwnedFd>,
+    start_time: u64,
+    signal: libc::c_int,
+) -> std::io::Result<bool> {
+    if let Some(handle) = handle {
+        match signal_linux_process_handle(handle, signal) {
+            Err(error) if matches!(error.raw_os_error(), Some(libc::ENOSYS | libc::EPERM)) => {}
+            outcome => return outcome,
+        }
+    }
+    match linux_process_stat(pid) {
+        Some(current) if current.start_time == start_time => signal_unix_process(pid, signal),
+        _ => Ok(false),
+    }
+}
+
+/// The `/proc/<pid>/stat` fields the process-tree code relies on.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LinuxProcessStat {
+    state: char,
+    parent_id: i32,
+    process_group: i32,
+    session: i32,
+    /// Start time in clock ticks since boot; with the pid it identifies one
+    /// process incarnation.
+    start_time: u64,
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn linux_process_stat(pid: i32) -> Option<LinuxProcessStat> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    parse_linux_process_stat(&stat)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn parse_linux_process_stat(stat: &str) -> Option<LinuxProcessStat> {
+    // The command name (field 2) is parenthesised and may itself contain
+    // spaces or parentheses, so split after its closing parenthesis.
     let (_, tail) = stat.rsplit_once(") ")?;
     let mut fields = tail.split_whitespace();
     let state = fields.next()?.chars().next()?;
     let parent_id = fields.next()?.parse().ok()?;
     let process_group = fields.next()?.parse().ok()?;
-    Some((state, parent_id, process_group))
+    let session = fields.next()?.parse().ok()?;
+    // Fields 7 (tty_nr) through 21 (itrealvalue) precede starttime (22).
+    let start_time = fields.nth(15)?.parse().ok()?;
+    Some(LinuxProcessStat {
+        state,
+        parent_id,
+        process_group,
+        session,
+        start_time,
+    })
 }
 
+/// Longest process name that reaches a record (`TASK_COMM_LEN` minus the
+/// NUL, the length of the names `ps` shows).
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn linux_process_parent_id(pid: i32) -> Option<i32> {
-    linux_process_stat(pid).map(|(_, parent_id, _)| parent_id)
+const LINUX_PROCESS_NAME_LEN: usize = 15;
+
+/// Name recorded for a process whose executable cannot be read.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const UNNAMED_PROCESS: &str = "process";
+
+/// The name a process is recorded under: the file name of its executable
+/// (`/proc/<pid>/exe`), never `/proc/<pid>/comm`. The process sets `comm`
+/// itself with `prctl(PR_SET_NAME)`, and the name reaches logs and results
+/// that outlive the call, so a daemon could plant inherited secrets there;
+/// the executable link changes only through `execve` (or with
+/// `CAP_SYS_RESOURCE`), and a binary's file name is already on disk. A
+/// process whose link cannot be read — one that dropped dumpability, such
+/// as a setuid binary, or has exited — is recorded as [`UNNAMED_PROCESS`].
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn linux_process_name(pid: i32) -> String {
+    std::fs::read_link(format!("/proc/{pid}/exe"))
+        .ok()
+        .and_then(|exe| Some(sanitize_process_name(exe.file_name()?.to_str()?)))
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| UNNAMED_PROCESS.to_string())
+}
+
+/// Reduces an executable's file name to printable ASCII of bounded length
+/// before it reaches logs and results that outlive the call: the kernel's
+/// ` (deleted)` marker on an unlinked executable is dropped, and anything
+/// that is not printable ASCII is replaced with `?`, so a name carrying
+/// control characters cannot forge log lines or terminal escapes.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn sanitize_process_name(name: &str) -> String {
+    name.strip_suffix(" (deleted)")
+        .unwrap_or(name)
+        .trim()
+        .chars()
+        .take(LINUX_PROCESS_NAME_LEN)
+        .map(|c| {
+            if c == ' ' || c.is_ascii_graphic() {
+                c
+            } else {
+                '?'
+            }
+        })
+        .collect()
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -884,6 +1887,16 @@ fn linux_process_state_is_active(state: char, parent_id: i32, owner_pid: i32) ->
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn unix_process_group_active(process_group: i32) -> std::io::Result<bool> {
+    // A group without a single member, zombie or otherwise, is gone without
+    // the `/proc` walk; anything else needs the reap-owner classification.
+    if unsafe { libc::kill(-process_group, 0) } == -1 {
+        let error = std::io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::ESRCH) => return Ok(false),
+            Some(libc::EPERM) => {}
+            _ => return Err(error),
+        }
+    }
     let own_pid = i32::try_from(std::process::id()).unwrap_or(-1);
     for process in std::fs::read_dir("/proc")? {
         let Ok(process) = process else { continue };
@@ -894,8 +1907,9 @@ fn unix_process_group_active(process_group: i32) -> std::io::Result<bool> {
         else {
             continue;
         };
-        if linux_process_stat(pid).is_some_and(|(state, parent_id, group)| {
-            group == process_group && linux_process_state_is_active(state, parent_id, own_pid)
+        if linux_process_stat(pid).is_some_and(|stat| {
+            stat.process_group == process_group
+                && linux_process_state_is_active(stat.state, stat.parent_id, own_pid)
         }) {
             return Ok(true);
         }
@@ -903,11 +1917,26 @@ fn unix_process_group_active(process_group: i32) -> std::io::Result<bool> {
     Ok(false)
 }
 
+/// A live process that still holds a tree's inherited sentinel.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn terminate_unix_sentinel_holders(sentinel: &OwnedFd, tree_leader: i32) -> std::io::Result<()> {
+struct SentinelHolder {
+    pid: i32,
+    name: String,
+    stat: LinuxProcessStat,
+    /// A pidfd bound to this incarnation of `pid`, where the kernel offers one.
+    handle: Option<std::sync::Arc<OwnedFd>>,
+}
+
+/// Enumerate the processes holding `sentinel`, excluding trouve itself and
+/// unrelated direct children that inherited the writer mid-spawn.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn linux_sentinel_holders(
+    sentinel: &OwnedFd,
+    tree_leader: i32,
+) -> std::io::Result<Vec<SentinelHolder>> {
     let sentinel_target = std::fs::read_link(format!("/proc/self/fd/{}", sentinel.as_raw_fd()))?;
     let own_pid = i32::try_from(std::process::id()).unwrap_or(-1);
-    let mut first_error = None;
+    let mut holders = Vec::new();
     for process in std::fs::read_dir("/proc")? {
         let Ok(process) = process else { continue };
         let Some(pid) = process
@@ -929,6 +1958,11 @@ fn terminate_unix_sentinel_holders(sentinel: &OwnedFd, tree_leader: i32) -> std:
         if !holds_sentinel {
             continue;
         }
+        // The holder can exit between the descriptor scan and this read; it
+        // then no longer needs terminating or reporting.
+        let Some(stat) = linux_process_stat(pid) else {
+            continue;
+        };
         // Every sentinel writer is close-on-exec in the owner. A different
         // process-tree spawn can nevertheless fork while this writer is still
         // present in the shared parent, briefly inheriting it before exec
@@ -938,14 +1972,119 @@ fn terminate_unix_sentinel_holders(sentinel: &OwnedFd, tree_leader: i32) -> std:
         // The actual tree leader remains eligible even though it is also a
         // direct child; its descendants either name that leader as their
         // parent or have already been reparented after escaping the group.
-        if pid != tree_leader && linux_process_parent_id(pid) == Some(own_pid) {
+        if pid != tree_leader && stat.parent_id == own_pid {
             continue;
         }
-        if unsafe { libc::kill(pid, libc::SIGKILL) } != 0 {
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() != Some(libc::ESRCH) && first_error.is_none() {
-                first_error = Some(error);
+        // Bind the record to this incarnation of the pid. Re-reading the
+        // stat after opening the pidfd proves the descriptor names the
+        // process just classified rather than a successor to its pid.
+        let (stat, handle) = match linux_process_handle(pid) {
+            Ok(Some(handle)) => match linux_process_stat(pid) {
+                Some(again) if again.start_time == stat.start_time => {
+                    (again, Some(std::sync::Arc::new(handle)))
+                }
+                _ => continue,
+            },
+            Ok(None) => (stat, None),
+            Err(_) => continue,
+        };
+        holders.push(SentinelHolder {
+            pid,
+            name: linux_process_name(pid),
+            stat,
+            handle,
+        });
+    }
+    Ok(holders)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+impl SentinelHolder {
+    /// The holder as a released process, if it can be bound to a pidfd.
+    /// Without one it stays in the tree: nothing could signal it safely
+    /// once the scan that found it is history.
+    fn released(&self) -> Option<DetachedProcess> {
+        Some(DetachedProcess {
+            pid: self.pid,
+            start_time: self.stat.start_time,
+            name: self.name.clone(),
+            handle: self.handle.clone()?,
+        })
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn unbound_holder_error(holder: &SentinelHolder) -> std::io::Error {
+    std::io::Error::other(format!(
+        "{} (pid {}) holds the sentinel but cannot be bound to a pidfd",
+        holder.name, holder.pid
+    ))
+}
+
+/// Add `process` to `detached` unless that incarnation is already there.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn record_detached(detached: &mut Vec<DetachedProcess>, process: DetachedProcess) {
+    if detached
+        .iter()
+        .any(|known| known.pid == process.pid && known.start_time == process.start_time)
+    {
+        return;
+    }
+    detached.push(process);
+}
+
+/// Kill the processes still holding the tree's sentinel. Under
+/// [`DetachedPolicy::Release`] a holder in another session is recorded in
+/// `detached` instead of being signalled, provided it is bound to a pidfd;
+/// one that is not is killed like the rest, as nothing could signal it
+/// safely later. Holders outside the process group that were killed are
+/// reported in `terminated`. Each holder is signalled through its pidfd
+/// where the kernel offers one, so a pid recycled since the scan is never
+/// hit; without one, by number only once its start time has been re-read.
+///
+/// Session membership is compared against trouve's own session: the leader
+/// was spawned with a new process group but never a new session, so every
+/// descendant shares trouve's session until one of them calls `setsid()`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn terminate_unix_sentinel_holders(
+    sentinel: &OwnedFd,
+    tree_leader: i32,
+    policy: DetachedPolicy,
+    detached: &mut Vec<DetachedProcess>,
+    terminated: &mut Vec<TerminatedEscapee>,
+) -> std::io::Result<()> {
+    let own_session = unsafe { libc::getsid(0) };
+    let mut first_error = None;
+    for holder in linux_sentinel_holders(sentinel, tree_leader)? {
+        if policy == DetachedPolicy::Release
+            && holder.stat.session != own_session
+            && let Some(process) = holder.released()
+        {
+            record_detached(detached, process);
+            continue;
+        }
+        match signal_linux_process(
+            holder.pid,
+            holder.handle.as_deref(),
+            holder.stat.start_time,
+            libc::SIGKILL,
+        ) {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(error) => {
+                first_error.get_or_insert(error);
+                continue;
             }
+        }
+        // Group members die with the group signal; only a holder that left
+        // the group is worth telling the caller about.
+        if holder.stat.process_group != tree_leader
+            && !terminated.iter().any(|known| known.pid == holder.pid)
+        {
+            terminated.push(TerminatedEscapee {
+                pid: holder.pid,
+                name: holder.name,
+            });
         }
     }
     first_error.map_or(Ok(()), Err)
@@ -955,11 +2094,17 @@ fn terminate_unix_sentinel_holders(sentinel: &OwnedFd, tree_leader: i32) -> std:
     unix,
     not(any(target_os = "linux", target_os = "android", target_os = "macos"))
 ))]
-fn terminate_unix_sentinel_holders(_sentinel: &OwnedFd, _tree_leader: i32) -> std::io::Result<()> {
+fn terminate_unix_sentinel_holders(
+    _sentinel: &OwnedFd,
+    _tree_leader: i32,
+    _policy: DetachedPolicy,
+    _detached: &mut Vec<DetachedProcess>,
+    _terminated: &mut Vec<TerminatedEscapee>,
+) -> std::io::Result<()> {
     // The inherited sentinel still prevents a false cleanup acknowledgement
     // on these platforms. Without a portable process-holder query, an escaped
     // descendant remains quarantined until it exits rather than racing a new
-    // mutation.
+    // mutation; `DetachedPolicy::Release` is never enabled here.
     Ok(())
 }
 
@@ -1425,6 +2570,100 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn process_names_reach_records_as_bounded_printable_ascii() {
+        assert_eq!(sanitize_process_name("sccache\n"), "sccache");
+        assert_eq!(sanitize_process_name("sccache (deleted)"), "sccache");
+        assert_eq!(sanitize_process_name("Web Content\n"), "Web Content");
+        assert_eq!(
+            sanitize_process_name("a\x1b[31mb\r\nc\td\u{7f}é"),
+            "a?[31mb??c?d??"
+        );
+        assert_eq!(
+            sanitize_process_name("0123456789abcdefghij"),
+            "0123456789abcde"
+        );
+        assert_eq!(sanitize_process_name("  \n"), "");
+
+        let own_pid = i32::try_from(std::process::id()).unwrap();
+        let own = linux_process_name(own_pid);
+        assert!(!own.is_empty());
+        assert!(own.len() <= LINUX_PROCESS_NAME_LEN);
+        assert!(own.chars().all(|c| c == ' ' || c.is_ascii_graphic()));
+        assert_eq!(linux_process_name(i32::MAX), UNNAMED_PROCESS);
+    }
+
+    /// Without a pidfd a tree member is signalled by number, but only once a
+    /// fresh read of its start time shows the pid still names the process the
+    /// scan found; a stale start time means the pid was recycled and nothing
+    /// is signalled.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn numeric_signal_is_skipped_when_the_pid_no_longer_names_the_scanned_process() {
+        let own_pid = i32::try_from(std::process::id()).unwrap();
+        let own = linux_process_stat(own_pid).expect("own /proc stat");
+        assert!(signal_linux_process(own_pid, None, own.start_time, 0).unwrap());
+        assert!(!signal_linux_process(own_pid, None, own.start_time.wrapping_add(1), 0).unwrap());
+        assert!(!signal_linux_process(i32::MAX, None, own.start_time, 0).unwrap());
+    }
+
+    /// A process can put anything in the name it sets for itself; the
+    /// recorded name comes from its executable instead. Rust names a thread
+    /// with `prctl(PR_SET_NAME)`, and `/proc/<tid>` answers for a thread
+    /// like `/proc/<pid>` does for a process, so a planted name can be
+    /// tested without a helper binary.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recorded_process_name_ignores_the_name_the_process_chose() {
+        const PLANTED: &str = "hunter2-secret";
+        let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let planted = std::thread::Builder::new()
+            .name(PLANTED.into())
+            .spawn(move || {
+                tid_tx.send(unsafe { libc::gettid() }).unwrap();
+                let _ = release_rx.recv();
+            })
+            .unwrap();
+        let tid = tid_rx.recv().unwrap();
+
+        let comm = std::fs::read_to_string(format!("/proc/{tid}/comm")).unwrap();
+        assert_eq!(comm.trim(), PLANTED, "fixture did not plant its name");
+        let executable = std::env::current_exe().unwrap();
+        let expected = sanitize_process_name(executable.file_name().unwrap().to_str().unwrap());
+        let recorded = linux_process_name(tid);
+        assert_eq!(recorded, expected);
+        assert!(!recorded.contains("hunter2"));
+
+        drop(release_tx);
+        planted.join().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_stat_parser_reads_session_and_start_time_past_an_awkward_comm() {
+        let stat = "4242 (sh -c (nested) name) S 4100 4242 3999 34817 4242 4194304 \
+                    120 0 0 0 5 3 0 0 20 0 1 0 987654 2334720 210 18446744073709551615 \
+                    1 1 0 0 0 0 0 0 65538 1 0 0 17 3 0 0 0 0 0 0 0 0 0 0 0 0 0";
+        assert_eq!(
+            parse_linux_process_stat(stat),
+            Some(LinuxProcessStat {
+                state: 'S',
+                parent_id: 4100,
+                process_group: 4242,
+                session: 3999,
+                start_time: 987_654,
+            })
+        );
+        assert_eq!(parse_linux_process_stat("4242 (truncated) S 1"), None);
+
+        let own_pid = i32::try_from(std::process::id()).unwrap();
+        let own = linux_process_stat(own_pid).expect("own /proc stat");
+        assert_eq!(own.session, unsafe { libc::getsid(0) });
+        assert_eq!(own.process_group, unsafe { libc::getpgid(0) });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn timed_out_capture_reaps_the_shell_process_group() {
         let directory = tempfile::tempdir().unwrap();
         let pid_path = directory.path().join("descendant.pid");
@@ -1526,7 +2765,14 @@ mod tests {
         drop(writer);
         assert!(unix_descendant_sentinel_active(&sentinel).unwrap());
 
-        terminate_unix_sentinel_holders(&sentinel, i32::MAX).unwrap();
+        terminate_unix_sentinel_holders(
+            &sentinel,
+            i32::MAX,
+            DetachedPolicy::Terminate,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .unwrap();
 
         std::thread::sleep(Duration::from_millis(50));
         assert!(
@@ -1803,7 +3049,7 @@ mod tests {
 
         assert!(child.try_wait().unwrap().is_none());
         assert!(child.tree_active, "live process group must remain armed");
-        assert!(platform_process_tree_active(&child).unwrap());
+        assert!(platform_process_tree_active(&mut child).unwrap());
 
         member.wait().unwrap();
         let status = tokio::time::timeout(Duration::from_secs(2), async {
@@ -1906,5 +3152,773 @@ mod tests {
 
         child.terminate_and_reap().await.unwrap();
         assert_process_tree_member_stopped(descendant).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn wait_for_process_name(pid: u32, name: &str) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while linux_process_name(pid as i32) != name {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("process {pid} never became {name}"));
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn wait_for_leader_exit(child: &mut ProcessTreeChild) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if child.try_wait_leader().unwrap().is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("process-tree leader did not exit");
+    }
+
+    /// A leader that starts a `setsid` daemon and exits, under
+    /// [`DetachedPolicy::Release`]; the daemon publishes its pid at `pid_path`.
+    #[cfg(target_os = "linux")]
+    fn setsid_daemon_fixture(pid_path: &Path) -> ProcessTreeChild {
+        assert!(find_executable("setsid").is_some(), "setsid is required");
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                r#"setsid /bin/sh -c 'echo $$ > "$1"; exec /bin/sleep 60' detached "$1" </dev/null >/dev/null 2>&1 &"#,
+                "trouve-process-tree-test",
+            ])
+            .arg(pid_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = spawn_process_tree(&mut command).unwrap();
+        child.release_detached_descendants();
+        child
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn wait_for_tree_exit(child: &mut ProcessTreeChild) -> std::process::ExitStatus {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(status) = child.try_wait_tree().unwrap() {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a released setsid descendant kept the tree alive")
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn release_policy_leaves_setsid_descendant_running_and_records_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let pid_path = directory.path().join("setsid-descendant.pid");
+        let mut child = setsid_daemon_fixture(&pid_path);
+        let descendant = spawned_descendant_pid(&pid_path).await;
+        wait_for_process_name(descendant, "sleep").await;
+        wait_for_leader_exit(&mut child).await;
+
+        let status = wait_for_tree_exit(&mut child).await;
+        assert!(status.success());
+        assert!(!child.tree_active, "released tree must be disarmed");
+        assert!(
+            process_state(descendant)
+                .unwrap()
+                .is_some_and(|state| state != 'Z'),
+            "release policy terminated the detached descendant"
+        );
+        let detached = child.take_detached();
+        assert_eq!(detached.len(), 1, "unexpected detached set: {detached:?}");
+        assert_eq!(detached[0].pid, descendant as i32);
+        assert_eq!(detached[0].name, "sleep");
+        assert!(detached[0].is_alive());
+        assert!(child.take_detached().is_empty(), "take_detached must drain");
+        assert!(child.take_terminated_escapees().is_empty());
+
+        // Drop must not reach into a session the tree no longer owns.
+        drop(child);
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(detached[0].is_alive());
+
+        assert!(detached[0].request_exit().unwrap());
+        assert_process_tree_member_stopped(descendant).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while detached[0].is_alive() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("detached process identity survived its exit");
+        assert!(!detached[0].kill().unwrap());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn released_process_is_signalled_through_a_pidfd() {
+        let own_pid = i32::try_from(std::process::id()).unwrap();
+        if !matches!(linux_process_handle(own_pid), Ok(Some(_))) {
+            eprintln!("skipping: this kernel offers no pidfds");
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let pid_path = directory.path().join("setsid-descendant.pid");
+        let mut child = setsid_daemon_fixture(&pid_path);
+        let descendant = spawned_descendant_pid(&pid_path).await;
+        wait_for_process_name(descendant, "sleep").await;
+        wait_for_leader_exit(&mut child).await;
+        assert!(wait_for_tree_exit(&mut child).await.success());
+
+        let detached = child.take_detached();
+        assert_eq!(detached.len(), 1, "unexpected detached set: {detached:?}");
+        let daemon = &detached[0];
+        let info =
+            std::fs::read_to_string(format!("/proc/self/fdinfo/{}", daemon.handle.as_raw_fd()))
+                .unwrap();
+        let bound_pid = info
+            .lines()
+            .find_map(|line| line.strip_prefix("Pid:"))
+            .map(|pid| pid.trim().parse::<u32>().unwrap());
+        assert_eq!(
+            bound_pid,
+            Some(descendant),
+            "pidfd names another process:\n{info}"
+        );
+
+        assert!(daemon.kill().unwrap());
+        assert_process_tree_member_stopped(descendant).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while daemon.is_alive() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the pidfd never reported the killed daemon gone");
+        assert!(!daemon.kill().unwrap());
+    }
+
+    /// A daemon the kernel offers no pidfd for is not released: it stays in
+    /// the tree, keeps the tree alive, and is stopped with it. Releasing it
+    /// would leave only its pid number to signal it by at eviction, and a
+    /// pid number may belong to someone else by then.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn release_policy_keeps_a_daemon_it_cannot_bind_to_a_pidfd() {
+        struct RestorePidfds;
+        impl Drop for RestorePidfds {
+            fn drop(&mut self) {
+                PIDFD_UNAVAILABLE.with(|unavailable| unavailable.set(false));
+            }
+        }
+        PIDFD_UNAVAILABLE.with(|unavailable| unavailable.set(true));
+        let _restore = RestorePidfds;
+
+        let directory = tempfile::tempdir().unwrap();
+        let pid_path = directory.path().join("setsid-descendant.pid");
+        let mut child = setsid_daemon_fixture(&pid_path);
+        let descendant = spawned_descendant_pid(&pid_path).await;
+        wait_for_process_name(descendant, "sleep").await;
+        wait_for_leader_exit(&mut child).await;
+
+        // Long enough for the throttled holder scan to run more than once.
+        let deadline = Instant::now() + HOLDER_SCAN_INTERVAL * 3;
+        while Instant::now() < deadline {
+            assert!(
+                child.try_wait_tree().unwrap().is_none(),
+                "a daemon without a pidfd was released"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(child.take_detached().is_empty());
+        assert!(child.tree_active);
+
+        child.terminate_and_reap().await.unwrap();
+        assert_process_tree_member_stopped(descendant).await;
+        assert!(child.take_detached().is_empty());
+        let escapees = child.take_terminated_escapees();
+        assert_eq!(escapees.len(), 1, "unexpected escapee set: {escapees:?}");
+        assert_eq!(escapees[0].pid, descendant as i32);
+        assert_eq!(escapees[0].name, "sleep");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn released_sentinel_finds_workers_forked_after_the_tree_completed() {
+        assert!(find_executable("setsid").is_some(), "setsid is required");
+        let directory = tempfile::tempdir().unwrap();
+        let daemon_path = directory.path().join("daemon.pid");
+        let worker_path = directory.path().join("worker.pid");
+        let mut command = tokio::process::Command::new("/bin/sh");
+        // The daemon forks its worker only after the tree has been handed
+        // over, so no record taken at the hand-over can name the worker.
+        command
+            .args([
+                "-c",
+                r#"setsid /bin/sh -c 'echo $$ > "$1"; /bin/sleep 0.3; /bin/sleep 60 & echo $! > "$2"; wait' detached "$1" "$2" </dev/null >/dev/null 2>&1 &"#,
+                "trouve-process-tree-test",
+            ])
+            .arg(&daemon_path)
+            .arg(&worker_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = spawn_process_tree(&mut command).unwrap();
+        child.release_detached_descendants();
+        let daemon = spawned_descendant_pid(&daemon_path).await;
+        wait_for_leader_exit(&mut child).await;
+        assert!(wait_for_tree_exit(&mut child).await.success());
+        let detached = child.take_detached();
+        assert!(
+            detached.iter().any(|process| process.pid == daemon as i32),
+            "unexpected detached set: {detached:?}"
+        );
+
+        let sentinel = child
+            .release_sentinel()
+            .expect("a released tree hands over its sentinel");
+        assert!(
+            child.release_sentinel().is_none(),
+            "the sentinel is handed over once"
+        );
+        drop(child);
+
+        let worker = spawned_descendant_pid(&worker_path).await;
+        assert!(sentinel.is_held().unwrap());
+        let mut holders: Vec<i32> = sentinel
+            .holders()
+            .unwrap()
+            .iter()
+            .map(|holder| holder.pid)
+            .collect();
+        holders.sort_unstable();
+        let mut expected = vec![daemon as i32, worker as i32];
+        expected.sort_unstable();
+        assert_eq!(holders, expected);
+
+        for holder in sentinel.holders().unwrap() {
+            assert!(holder.kill().unwrap(), "{holder:?} was already gone");
+        }
+        assert_process_tree_member_stopped(daemon).await;
+        assert_process_tree_member_stopped(worker).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while sentinel.is_held().unwrap() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the sentinel outlived its holders");
+        assert!(sentinel.holders().unwrap().is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn terminate_policy_keeps_its_sentinel() {
+        let directory = tempfile::tempdir().unwrap();
+        let pid_path = directory.path().join("descendant.pid");
+        let mut child = process_tree_fixture(&pid_path);
+        let descendant = spawned_descendant_pid(&pid_path).await;
+        assert!(
+            child.release_sentinel().is_none(),
+            "only released trees hand over their sentinel"
+        );
+        child.terminate_and_reap().await.unwrap();
+        assert_process_tree_member_stopped(descendant).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn release_policy_still_terminates_same_session_escapee() {
+        assert!(find_executable("bash").is_some(), "bash is required");
+        let directory = tempfile::tempdir().unwrap();
+        let pid_path = directory.path().join("escapee.pid");
+        let mut command = tokio::process::Command::new("bash");
+        // Job control moves the background job into its own process group
+        // without starting a new session.
+        command
+            .args([
+                "-c",
+                r#"set -m; sleep 60 & echo $! > "$1"; wait"#,
+                "trouve-process-tree-test",
+            ])
+            .arg(&pid_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = spawn_process_tree(&mut command).unwrap();
+        child.release_detached_descendants();
+        let descendant = spawned_descendant_pid(&pid_path).await;
+        let stat = linux_process_stat(descendant as i32).expect("escapee stat");
+        assert_ne!(
+            stat.process_group, child.process_group,
+            "fixture escapee did not leave the process group"
+        );
+        assert_eq!(
+            stat.session,
+            unsafe { libc::getsid(0) },
+            "fixture escapee unexpectedly left the session"
+        );
+
+        child.terminate_and_reap().await.unwrap();
+
+        assert_process_tree_member_stopped(descendant).await;
+        let terminated = child.take_terminated_escapees();
+        assert_eq!(
+            terminated,
+            vec![TerminatedEscapee {
+                pid: descendant as i32,
+                name: "sleep".to_string(),
+            }]
+        );
+        assert!(child.take_detached().is_empty());
+    }
+
+    /// Raise the soft descriptor limit as far as the hard limit allows
+    /// (within reason, so the brute-force walk stays quick) and return the
+    /// highest descriptor number the process may then use.
+    #[cfg(target_os = "linux")]
+    fn raise_descriptor_limit() -> libc::c_int {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+            0
+        );
+        let target = limit.rlim_max.min(1 << 17);
+        if limit.rlim_cur < target {
+            let raised = libc::rlimit {
+                rlim_cur: target,
+                rlim_max: limit.rlim_max,
+            };
+            assert_eq!(
+                unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) },
+                0,
+                "{}",
+                std::io::Error::last_os_error()
+            );
+            limit.rlim_cur = target;
+        }
+        libc::c_int::try_from(limit.rlim_cur).unwrap() - 1
+    }
+
+    /// The descriptor tests share the process's descriptor table and its
+    /// limit, and all park their leaked descriptor at the highest number
+    /// the limit allows: run them one at a time.
+    #[cfg(target_os = "linux")]
+    static DESCRIPTOR_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Leave a descriptor inheritable at a low number and at the highest
+    /// number the limit allows (which a walk capped below the limit would
+    /// miss), spawn a child under the given hygiene preferences, and check
+    /// that neither copy reached it while the sentinel did.
+    #[cfg(target_os = "linux")]
+    async fn assert_children_do_not_inherit_descriptors(preferences: (bool, bool)) {
+        let _serialized = DESCRIPTOR_TEST_LOCK.lock().await;
+        let directory = tempfile::tempdir().unwrap();
+        let leaked_path = directory.path().join("leaked-descriptor");
+        let leaked = std::fs::File::create(&leaked_path).unwrap();
+        // Model a library that opened a descriptor without O_CLOEXEC.
+        assert_eq!(
+            unsafe { libc::fcntl(leaked.as_raw_fd(), libc::F_SETFD, 0) },
+            0
+        );
+        let highest = raise_descriptor_limit();
+        // `dup2` never sets close-on-exec on the new descriptor.
+        assert_eq!(
+            unsafe { libc::dup2(leaked.as_raw_fd(), highest) },
+            highest,
+            "{}",
+            std::io::Error::last_os_error()
+        );
+        let high = unsafe { OwnedFd::from_raw_fd(highest) };
+
+        let listing = descriptor_listing_of_a_child(preferences).await;
+        assert!(
+            !listing.contains(leaked_path.to_str().unwrap()),
+            "child inherited a descriptor the parent left inheritable (highest {highest}):\n{listing}"
+        );
+        assert!(
+            sentinel_listed(&listing),
+            "descriptor hygiene removed the descendant sentinel:\n{listing}"
+        );
+        drop(high);
+        drop(leaked);
+    }
+
+    /// `ls -l /proc/self/fd` as seen by a child spawned under the given
+    /// hygiene preferences.
+    #[cfg(target_os = "linux")]
+    async fn descriptor_listing_of_a_child(preferences: (bool, bool)) -> String {
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .args(["-c", "ls -l /proc/self/fd"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        DESCRIPTOR_HYGIENE_PREFERENCES.with(|hygiene| hygiene.set(preferences));
+        let spawned = spawn_process_tree(&mut command);
+        DESCRIPTOR_HYGIENE_PREFERENCES.with(|hygiene| hygiene.set((true, true)));
+        let mut child = spawned.unwrap();
+        let mut stdout = child.take_stdout().unwrap();
+        let listing = async {
+            use tokio::io::AsyncReadExt as _;
+            let mut listing = String::new();
+            stdout.read_to_string(&mut listing).await.unwrap();
+            listing
+        };
+        let (status, listing) = tokio::join!(child.wait_and_cleanup(), listing);
+        assert!(status.unwrap().success());
+        listing
+    }
+
+    /// Whether the listing shows the sentinel: a pipe above stdio (stdout
+    /// itself is also a pipe).
+    #[cfg(target_os = "linux")]
+    fn sentinel_listed(listing: &str) -> bool {
+        listing.lines().any(|line| {
+            line.split_once(" -> ").is_some_and(|(prefix, target)| {
+                target.starts_with("pipe:")
+                    && prefix
+                        .rsplit(' ')
+                        .next()
+                        .and_then(|descriptor| descriptor.parse::<i32>().ok())
+                        .is_some_and(|descriptor| descriptor >= 3)
+            })
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn spawned_children_do_not_inherit_non_cloexec_descriptors() {
+        assert_children_do_not_inherit_descriptors((true, true)).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn descriptor_table_listing_covers_every_descriptor_number() {
+        assert_children_do_not_inherit_descriptors((false, true)).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn descriptor_walk_reaches_the_soft_limit() {
+        assert_children_do_not_inherit_descriptors((false, false)).await;
+    }
+
+    /// The walk covers the soft limit or nothing: container runtimes hand
+    /// out soft limits in the billions, and a walk that stopped short of the
+    /// limit would leave every descriptor above its stopping point
+    /// inheritable.
+    #[cfg(unix)]
+    #[test]
+    fn descriptor_walk_bound_is_the_soft_limit_or_nothing() {
+        let ceiling = DESCRIPTOR_WALK_CEILING;
+        assert_eq!(walk_bound_for_soft_limit(1024, ceiling), Some(1024));
+        assert_eq!(walk_bound_for_soft_limit(1 << 17, ceiling), Some(1 << 17));
+        assert_eq!(walk_bound_for_soft_limit(1 << 20, ceiling), Some(1 << 20));
+        assert_eq!(walk_bound_for_soft_limit((1 << 20) + 1, ceiling), None);
+        assert_eq!(walk_bound_for_soft_limit(1_073_741_816, ceiling), None);
+        assert_eq!(
+            walk_bound_for_soft_limit(libc::RLIM_INFINITY, ceiling),
+            None
+        );
+    }
+
+    /// With neither `close_range` nor a descriptor listing, a soft limit past
+    /// the walk bound must fail the spawn rather than leave the descriptors
+    /// above the bound inheritable.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn spawn_fails_rather_than_walk_short_of_the_soft_limit() {
+        let _serialized = DESCRIPTOR_TEST_LOCK.lock().await;
+        let leaked = tempfile::tempfile().unwrap();
+        assert_eq!(
+            unsafe { libc::fcntl(leaked.as_raw_fd(), libc::F_SETFD, 0) },
+            0
+        );
+        let highest = raise_descriptor_limit();
+        assert_eq!(
+            unsafe { libc::dup2(leaked.as_raw_fd(), highest) },
+            highest,
+            "{}",
+            std::io::Error::last_os_error()
+        );
+        let high = unsafe { OwnedFd::from_raw_fd(highest) };
+
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .args(["-c", "true"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        // A bound one below the soft limit models a container-sized limit
+        // without walking a billion descriptors.
+        DESCRIPTOR_HYGIENE_PREFERENCES.with(|hygiene| hygiene.set((false, false)));
+        DESCRIPTOR_WALK_CEILING_OVERRIDE.with(|ceiling| ceiling.set(Some(highest)));
+        let spawned = spawn_process_tree(&mut command);
+        DESCRIPTOR_WALK_CEILING_OVERRIDE.with(|ceiling| ceiling.set(None));
+        DESCRIPTOR_HYGIENE_PREFERENCES.with(|hygiene| hygiene.set((true, true)));
+
+        let error = match spawned {
+            Ok(_) => panic!("spawn succeeded although the walk could not reach the soft limit"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported, "{error}");
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!("({})", highest + 1)) && message.contains("close-on-exec"),
+            "{message}"
+        );
+        assert_eq!(
+            unsafe { libc::fcntl(high.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0,
+            "a refused spawn must leave the parent's descriptors alone"
+        );
+        drop(high);
+        drop(leaked);
+    }
+
+    /// A descriptor that refuses the close-on-exec mark fails the spawn,
+    /// under the listing and under the walk alike: the alternative is to
+    /// exec with the descriptor inheritable.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn spawn_fails_rather_than_exec_with_a_descriptor_that_refused_the_mark() {
+        let _serialized = DESCRIPTOR_TEST_LOCK.lock().await;
+        let leaked = tempfile::tempfile().unwrap();
+        assert_eq!(
+            unsafe { libc::fcntl(leaked.as_raw_fd(), libc::F_SETFD, 0) },
+            0
+        );
+        for preferences in [(false, true), (false, false)] {
+            let mut command = tokio::process::Command::new("/bin/sh");
+            command
+                .args(["-c", "true"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            DESCRIPTOR_HYGIENE_PREFERENCES.with(|hygiene| hygiene.set(preferences));
+            DESCRIPTOR_FLAG_REFUSAL
+                .with(|refusal| refusal.set(Some((leaked.as_raw_fd(), libc::EPERM))));
+            let spawned = spawn_process_tree(&mut command);
+            DESCRIPTOR_FLAG_REFUSAL.with(|refusal| refusal.set(None));
+            DESCRIPTOR_HYGIENE_PREFERENCES.with(|hygiene| hygiene.set((true, true)));
+
+            let error = match spawned {
+                Ok(_) => panic!(
+                    "spawn {preferences:?} succeeded although a descriptor could not be marked close-on-exec"
+                ),
+                Err(error) => error,
+            };
+            assert_eq!(error.raw_os_error(), Some(libc::EPERM), "{error}");
+            assert_eq!(
+                unsafe { libc::fcntl(leaked.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+                0,
+                "a refused spawn must leave the parent's descriptors alone"
+            );
+        }
+        drop(leaked);
+    }
+
+    /// The child-side mark, run in this process: a number that is not open
+    /// needs nothing, a descriptor that takes the mark gets it, and one that
+    /// refuses it is an error carrying the refusal.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn descriptor_mark_reports_refusals_and_skips_closed_numbers() {
+        let _serialized = DESCRIPTOR_TEST_LOCK.blocking_lock();
+        mark_descriptor_close_on_exec(libc::c_int::MAX).unwrap();
+
+        let marked = tempfile::tempfile().unwrap();
+        assert_eq!(
+            unsafe { libc::fcntl(marked.as_raw_fd(), libc::F_SETFD, 0) },
+            0
+        );
+        mark_descriptor_close_on_exec(marked.as_raw_fd()).unwrap();
+        assert_ne!(
+            unsafe { libc::fcntl(marked.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0
+        );
+
+        let refused = tempfile::tempfile().unwrap();
+        assert_eq!(
+            unsafe { libc::fcntl(refused.as_raw_fd(), libc::F_SETFD, 0) },
+            0
+        );
+        DESCRIPTOR_FLAG_REFUSAL
+            .with(|refusal| refusal.set(Some((refused.as_raw_fd(), libc::EACCES))));
+        let error = mark_descriptor_close_on_exec(refused.as_raw_fd())
+            .expect_err("a refused mark passed for applied");
+        assert_eq!(error.raw_os_error(), Some(libc::EACCES));
+        let walk = walk_descriptors_close_on_exec(refused.as_raw_fd() + 1)
+            .expect_err("the walk passed over a refused mark");
+        assert_eq!(walk.raw_os_error(), Some(libc::EACCES));
+        // Already marked: nothing to set, so nothing to refuse.
+        mark_descriptor_close_on_exec(marked.as_raw_fd()).unwrap();
+        DESCRIPTOR_FLAG_REFUSAL.with(|refusal| refusal.set(None));
+        assert_eq!(
+            unsafe { libc::fcntl(refused.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0
+        );
+        mark_descriptor_close_on_exec(refused.as_raw_fd()).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn close_range_probe_leaves_the_parent_table_untouched() {
+        let _serialized = DESCRIPTOR_TEST_LOCK.blocking_lock();
+        let file = tempfile::tempfile().unwrap();
+        assert_eq!(
+            unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, 0) },
+            0
+        );
+        let _supported = close_range_close_on_exec(libc::c_uint::MAX);
+        assert_eq!(
+            unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0,
+            "the close_range probe marked a parent descriptor close-on-exec"
+        );
+    }
+
+    /// The child-side listing, run in this process: it marks the table it
+    /// finds, and a listing that does not show the sentinel writer fails
+    /// rather than pass for complete.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn descriptor_listing_marks_the_table_and_requires_the_sentinel() {
+        let _serialized = DESCRIPTOR_TEST_LOCK.blocking_lock();
+        let mut descriptors = [-1; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(descriptors.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        let _reader = unsafe { OwnedFd::from_raw_fd(descriptors[0]) };
+        let writer = unsafe { OwnedFd::from_raw_fd(descriptors[1]) };
+        assert!(descriptor_table_lists(descriptors));
+        assert!(
+            !descriptor_table_lists([libc::c_int::MAX - 1, libc::c_int::MAX]),
+            "a parent listing that misses the sentinel must not be trusted"
+        );
+        let leaked = tempfile::tempfile().unwrap();
+        assert_eq!(
+            unsafe { libc::fcntl(leaked.as_raw_fd(), libc::F_SETFD, 0) },
+            0
+        );
+
+        let error = list_descriptors_close_on_exec(libc::c_int::MAX)
+            .expect_err("a listing without the sentinel writer passed for complete");
+        assert_eq!(error.raw_os_error(), Some(libc::EBADF));
+        list_descriptors_close_on_exec(writer.as_raw_fd()).unwrap();
+        assert_ne!(
+            unsafe { libc::fcntl(leaked.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0,
+            "the listing left an inheritable descriptor alone"
+        );
+        for stdio in 0..3 {
+            let flags = unsafe { libc::fcntl(stdio, libc::F_GETFD) };
+            assert!(
+                flags == -1 || flags & libc::FD_CLOEXEC == 0,
+                "the listing marked stdio {stdio} close-on-exec"
+            );
+        }
+    }
+
+    /// `getdents64` records: numeric names become descriptors, `.` and `..`
+    /// are skipped, and a truncated or oversized record ends the buffer.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dirent64_records_are_parsed_by_name() {
+        fn record(name: &[u8]) -> Vec<u8> {
+            let name_offset = std::mem::offset_of!(libc::dirent64, d_name);
+            let length = (name_offset + name.len() + 1).next_multiple_of(8);
+            let mut bytes = vec![0; length];
+            let length_offset = std::mem::offset_of!(libc::dirent64, d_reclen);
+            bytes[length_offset..length_offset + 2]
+                .copy_from_slice(&u16::try_from(length).unwrap().to_ne_bytes());
+            bytes[name_offset..name_offset + name.len()].copy_from_slice(name);
+            bytes
+        }
+        for (name, expected) in [
+            (&b"17"[..], Some(17)),
+            (b".", None),
+            (b"..", None),
+            (b"0", Some(0)),
+            (b"2147483647", Some(libc::c_int::MAX)),
+            (b"2147483648", None),
+            (b"1a", None),
+            (b"", None),
+        ] {
+            let bytes = record(name);
+            let parsed = unsafe { parse_dirent64(bytes.as_ptr(), bytes.len()) };
+            assert_eq!(parsed, Some((expected, bytes.len())), "{name:?}");
+            assert_eq!(
+                unsafe { parse_dirent64(bytes.as_ptr(), bytes.len() - 1) },
+                None,
+                "{name:?} parsed from a truncated buffer"
+            );
+        }
+        let mut records = record(b"3");
+        records.extend(record(b"4"));
+        let second = unsafe { parse_dirent64(records.as_ptr(), records.len()) }.unwrap();
+        assert_eq!(second, (Some(3), records.len() / 2));
+        assert_eq!(
+            unsafe { parse_dirent64(records.as_ptr().add(second.1), records.len() - second.1) },
+            Some((Some(4), records.len() / 2))
+        );
+        assert_eq!(unsafe { parse_dirent64(records.as_ptr(), 8) }, None);
+    }
+
+    /// A descriptor another thread opens after the hygiene strategy is chosen
+    /// and before the spawn must not reach the child either: the child lists
+    /// its own table, not a snapshot the parent took earlier.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn descriptor_listing_covers_descriptors_opened_after_detection() {
+        let _serialized = DESCRIPTOR_TEST_LOCK.lock().await;
+        let directory = tempfile::tempdir().unwrap();
+        let leaked_path = directory.path().join("opened-after-detection");
+        let leaked: std::sync::Arc<std::sync::Mutex<Option<std::fs::File>>> =
+            std::sync::Arc::default();
+        let (hook_path, hook_slot) = (leaked_path.clone(), std::sync::Arc::clone(&leaked));
+        AFTER_DESCRIPTOR_HYGIENE_DETECT.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                // Another thread opens a descriptor without O_CLOEXEC while
+                // the spawn is being prepared.
+                let file = std::thread::spawn(move || {
+                    let file = std::fs::File::create(&hook_path).unwrap();
+                    assert_eq!(
+                        unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFD, 0) },
+                        0
+                    );
+                    file
+                })
+                .join()
+                .unwrap();
+                *hook_slot.lock().unwrap() = Some(file);
+            }));
+        });
+
+        let listing = descriptor_listing_of_a_child((false, true)).await;
+        let opened = leaked
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the hook ran before the spawn");
+        assert!(
+            !listing.contains(leaked_path.to_str().unwrap()),
+            "child inherited a descriptor opened after the hygiene strategy was chosen (descriptor {}):\n{listing}",
+            opened.as_raw_fd()
+        );
+        assert!(
+            sentinel_listed(&listing),
+            "descriptor hygiene removed the descendant sentinel:\n{listing}"
+        );
+        drop(opened);
     }
 }

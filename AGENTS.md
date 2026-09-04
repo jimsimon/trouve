@@ -95,7 +95,12 @@ These are load-bearing. Do not violate them without a new ADR.
     PTYs, daemons, probes, and system-opener libraries — goes through
     `trouve-process`. Process-tree creation holds that shared macOS boundary
     from sentinel setup through spawn; ordinary callers release it immediately
-    after creating the child and wait outside it (ADR 0038).
+    after creating the child and wait outside it (ADR 0038). A process tree
+    owns everything in the leader's session: where holders can be named
+    (Linux), shell calls release descendants that `setsid()` into their own
+    session, report them, and stop them when the session worktree is
+    evicted; elsewhere, and for every other spawner, terminate-all semantics
+    apply (ADR 0046).
 
 ## Conventions
 
