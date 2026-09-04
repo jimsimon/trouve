@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "8.0"
+    "version": "8.1"
   },
   "paths": {
     "/v1/approvals": {
@@ -5554,6 +5554,15 @@
             "format": "int64",
             "minimum": 0
           },
+          "line_claimed": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The line the coordinator originally claimed when the server\nre-anchored `line` to where `quote` actually appears in the head\nrevision. Absent when the claim was correct or no re-anchoring was\npossible.",
+            "minimum": 0
+          },
           "path": {
             "type": "string"
           },
@@ -5820,7 +5829,7 @@
           },
           "status": {
             "type": "string",
-            "description": "`open`, `fixed`, or `dismissed`."
+            "description": "`open`, `advisory`, `fixed`, or `dismissed`. Advisory findings fell\nbelow the blocking bar when they were recorded: they never gate the\nreview, are not published to GitHub, and are only surfaced to later\nreview rounds so the coordinator can recognise duplicates or promote\nthem once verified evidence lifts them over the bar."
           },
           "theme_ids": {
             "type": "array",
@@ -5838,6 +5847,15 @@
         "type": "object",
         "description": "Concrete evidence that makes a confirmed finding independently verifiable.",
         "properties": {
+          "anchor_line_claimed": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The line the coordinator originally claimed for the finding when the\nserver re-anchored it to where `anchor_quote` actually appears in the\nhead revision. Absent when the claim was correct or no re-anchoring\nwas possible.",
+            "minimum": 0
+          },
           "anchor_match": {
             "type": "string",
             "description": "Server-derived verdict for `anchor_quote`: `matched`, `mismatched`,\nor `unchecked`. Model-provided values are overwritten."
