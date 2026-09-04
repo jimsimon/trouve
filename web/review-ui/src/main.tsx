@@ -77,6 +77,7 @@ import type {
   Dashboard,
   DurationStats,
   EventEnvelope,
+  Finding,
   GithubAppStatus,
   JobDetail,
   KnownProvider,
@@ -1284,6 +1285,67 @@ function JobDetailPane({
   );
   const candidateRejections = detail.candidate_rejections ?? [];
   const unadjudicatedCandidates = detail.unadjudicated_candidates ?? [];
+  // Advisory findings are trouve-internal debt: kept out of the main ledger
+  // and shown only inside a collapsed section.
+  const ledgerFindings = detail.findings.filter((finding) => finding.status !== "advisory");
+  const advisoryFindings = detail.findings.filter((finding) => finding.status === "advisory");
+  const renderFinding = (finding: Finding) => (
+    <article class={`finding ${finding.severity}`} key={finding.id}>
+      <header>
+        <strong>
+          {finding.title}
+          {finding.outside_diff && " · outside diff"}
+        </strong>
+        <StatusPill status={finding.status} />
+      </header>
+      <small>
+        {finding.path}:{finding.line} · Severity: {finding.severity.toUpperCase()} · Confidence: {(finding.confidence ?? "medium").toUpperCase()}
+        {finding.origin && finding.origin !== "new_change" ? ` · ${finding.origin.replaceAll("_", " ").toUpperCase()}` : ""}
+      </small>
+      <p>{finding.body}</p>
+      {finding.resolved_head && finding.status !== "advisory" && (
+        <small>
+          Fixed at {finding.resolved_head.slice(0, 12)} by review {finding.resolved_by_job_id?.slice(0, 12) || "unknown"}
+        </small>
+      )}
+      {finding.resolved_head && finding.status === "advisory" && (
+        <small>
+          Promoted to a blocking finding at {finding.resolved_head.slice(0, 12)} by review {finding.resolved_by_job_id?.slice(0, 12) || "unknown"}
+        </small>
+      )}
+      {finding.github_publication_status === "suppressed_by_policy" && (
+        <small>Retained in Trouve · Not posted to GitHub by confidence policy</small>
+      )}
+      {finding.github_publication_status === "grouped_by_theme" && (
+        <small>Retained in Trouve · Represented by the shared root-cause comment on GitHub</small>
+      )}
+      {finding.evidence?.execution_path && (
+        <details>
+          <summary>Verification evidence</summary>
+          <dl>
+            <dt>Preconditions</dt><dd>{finding.evidence.preconditions}</dd>
+            <dt>Execution path</dt><dd>{finding.evidence.execution_path}</dd>
+            <dt>Consequence</dt><dd>{finding.evidence.consequence}</dd>
+            <dt>Introduced by</dt><dd>{finding.evidence.introduction}</dd>
+            <dt>Regression test</dt><dd>{finding.evidence.regression_test}</dd>
+          </dl>
+        </details>
+      )}
+      <small>
+        Found by {finding.sources.map((source) => source.reviewer_name).join(", ") || "legacy review"}
+      </small>
+      <div class="action-row">
+        <CopyButton text={finding.prompt_for_agents} />
+        {finding.status !== "advisory" && (
+          <ExternalLink href={finding.github_comment_url}>
+            {finding.github_comment_id != null
+              ? "Open inline comment ↗"
+              : "Open review comment ↗"}
+          </ExternalLink>
+        )}
+      </div>
+    </article>
+  );
   const routingDecisions = detail.routing_decisions ?? [];
   const unrecordedCandidateDecisions = Math.max(
     0,
@@ -1684,8 +1746,6 @@ function JobDetailPane({
             <p>
               {job.issue_count} new confirmed findings
               {openIssueCount != null && ` · ${openIssueCount} blocking open across pull request`}
-              {(job.advisory_open_issue_count ?? 0) > 0 &&
-                ` · ${job.advisory_open_issue_count} advisory`}
               {` · ${acceptedCandidateIds.size} selected candidates`}
               {" · "}
               {candidateRejections.length} rejected · {unadjudicatedCandidates.length} unresolved · {job.fixed_issue_count} fixed
@@ -1733,56 +1793,16 @@ function JobDetailPane({
             ))}
           </div>
         )}
-        {detail.findings.map((finding) => (
-          <article class={`finding ${finding.severity}`} key={finding.id}>
-            <header>
-              <strong>
-                {finding.title}
-                {finding.outside_diff && " · outside diff"}
-              </strong>
-              <StatusPill status={finding.status} />
-            </header>
-            <small>
-              {finding.path}:{finding.line} · Severity: {finding.severity.toUpperCase()} · Confidence: {(finding.confidence ?? "medium").toUpperCase()}
-              {finding.origin && finding.origin !== "new_change" ? ` · ${finding.origin.replaceAll("_", " ").toUpperCase()}` : ""}
-            </small>
-            <p>{finding.body}</p>
-            {finding.resolved_head && (
-              <small>
-                Fixed at {finding.resolved_head.slice(0, 12)} by review {finding.resolved_by_job_id?.slice(0, 12) || "unknown"}
-              </small>
-            )}
-            {finding.github_publication_status === "suppressed_by_policy" && (
-              <small>Retained in Trouve · Not posted to GitHub by confidence policy</small>
-            )}
-            {finding.github_publication_status === "grouped_by_theme" && (
-              <small>Retained in Trouve · Represented by the shared root-cause comment on GitHub</small>
-            )}
-            {finding.evidence?.execution_path && (
-              <details>
-                <summary>Verification evidence</summary>
-                <dl>
-                  <dt>Preconditions</dt><dd>{finding.evidence.preconditions}</dd>
-                  <dt>Execution path</dt><dd>{finding.evidence.execution_path}</dd>
-                  <dt>Consequence</dt><dd>{finding.evidence.consequence}</dd>
-                  <dt>Introduced by</dt><dd>{finding.evidence.introduction}</dd>
-                  <dt>Regression test</dt><dd>{finding.evidence.regression_test}</dd>
-                </dl>
-              </details>
-            )}
-            <small>
-              Found by {finding.sources.map((source) => source.reviewer_name).join(", ") || "legacy review"}
-            </small>
-            <div class="action-row">
-              <CopyButton text={finding.prompt_for_agents} />
-              <ExternalLink href={finding.github_comment_url}>
-                {finding.github_comment_id != null
-                  ? "Open inline comment ↗"
-                  : "Open review comment ↗"}
-              </ExternalLink>
-            </div>
-          </article>
-        ))}
+        {ledgerFindings.map(renderFinding)}
+        {advisoryFindings.length > 0 && (
+          <details class="candidate-decisions">
+            <summary>
+              <strong>Advisory ledger ({advisoryFindings.length})</strong>
+              <span>Below the blocking bar · not posted to GitHub · does not gate</span>
+            </summary>
+            <div class="finding-list">{advisoryFindings.map(renderFinding)}</div>
+          </details>
+        )}
         {candidateRejections.length > 0 && (
           <details class="candidate-decisions">
             <summary>

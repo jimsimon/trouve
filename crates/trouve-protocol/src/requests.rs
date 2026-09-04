@@ -2341,7 +2341,11 @@ pub struct CodeReviewFinding {
     pub body: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub prompt_for_agents: String,
-    /// `open`, `fixed`, or `dismissed`.
+    /// `open`, `advisory`, `fixed`, or `dismissed`. Advisory findings fell
+    /// below the blocking bar when they were recorded: they never gate the
+    /// review, are not published to GitHub, and are only surfaced to later
+    /// review rounds so the coordinator can recognise duplicates or promote
+    /// them once verified evidence lifts them over the bar.
     pub status: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sources: Vec<CodeReviewFindingSource>,

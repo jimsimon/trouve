@@ -679,7 +679,7 @@ export class TrouveCodeReviewDashboard extends LitElement {
         </header>
 
         <dl class="job-meta">
-          <div><dt>Findings</dt><dd>${job.issue_count ?? 0} new${job.open_issue_count == null ? " · open status unknown" : ` · ${job.open_issue_count} blocking`}${(job.advisory_open_issue_count ?? 0) > 0 ? ` · ${job.advisory_open_issue_count} advisory` : ""}${legacyCoverageExhausted ? " · automatic coverage attempts exhausted" : legacyCoveragePending ? " · compatibility review pending" : ""}</dd></div>
+          <div><dt>Findings</dt><dd>${job.issue_count ?? 0} new${job.open_issue_count == null ? " · open status unknown" : ` · ${job.open_issue_count} blocking`}${legacyCoverageExhausted ? " · automatic coverage attempts exhausted" : legacyCoveragePending ? " · compatibility review pending" : ""}</dd></div>
           <div><dt>${job.status === "queued" ? "Waiting" : "Elapsed"}</dt><dd>${formatDuration(job.status === "queued" ? job.pending_elapsed_ms : job.running_elapsed_ms)}</dd></div>
           <div><dt>Started</dt><dd title=${formatDate(job.started_at ?? job.created_at)}>${formatDate(job.started_at ?? job.created_at)}</dd></div>
         </dl>
