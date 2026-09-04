@@ -12460,6 +12460,17 @@ impl Store {
             .collect())
     }
 
+    /// Findings of published rounds that were verified fixed, with the
+    /// GitHub comment and thread they were posted under. A fix regression
+    /// replies on the original finding's thread instead of opening a new one.
+    pub fn fixed_code_review_findings(
+        &self,
+        repository: &str,
+        pull_number: u64,
+    ) -> Result<Vec<trouve_protocol::CodeReviewFinding>> {
+        self.code_review_findings_for_pull_with_status(repository, pull_number, Some("fixed"))
+    }
+
     fn code_review_findings_for_pull_with_status(
         &self,
         repository: &str,

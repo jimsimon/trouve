@@ -8200,6 +8200,16 @@ impl Engine {
         has_unresolved_findings: bool,
     ) -> Result<PublishedReviewOutcome> {
         let themes = self.store.code_review_themes_for_job(&job.id)?;
+        // Fix regressions reply on the thread of the finding they regressed
+        // instead of posting inline; the replies follow the accepted review.
+        let fixed_findings = self
+            .store
+            .fixed_code_review_findings(&job.repository, job.pull_number)?;
+        let thread_replies = origin_thread_replies(findings, &themes, &fixed_findings);
+        let thread_reply_ids = thread_replies
+            .iter()
+            .map(|reply| reply.finding_id.as_str())
+            .collect::<Vec<_>>();
         let publication_groups = review_theme_publication_groups(findings, &themes);
         let grouped_ids = publication_groups
             .iter()
@@ -8312,7 +8322,9 @@ impl Engine {
                         .get(finding_id)
                         .copied()
                         .unwrap_or(finding_id);
-                    let representation = if !finding.has_inline_location() {
+                    let representation = if thread_reply_ids.contains(&finding_id) {
+                        ReviewPublicationRepresentation::ThreadReply
+                    } else if !finding.has_inline_location() {
                         ReviewPublicationRepresentation::NotEligible
                     } else if !finding.is_publishable() {
                         ReviewPublicationRepresentation::SuppressedByPolicy
@@ -8369,6 +8381,8 @@ impl Engine {
                     );
                 }
                 self.persist_publication_manifest_outcomes_best_effort(&job.id, &manifest, true)?;
+                self.post_origin_thread_replies(api, job, &thread_replies)
+                    .await;
                 let review_level_finding_ids = manifest.review_level_finding_ids();
                 let inline_finding_ids = manifest.inline_finding_ids();
                 let publication_findings = findings
@@ -8519,6 +8533,11 @@ impl Engine {
                             &grouped_finding_ids,
                             trouve_protocol::CodeReviewFindingPublicationStatus::Failed,
                         );
+                        self.persist_publication_status_best_effort(
+                            &job.id,
+                            &thread_reply_ids,
+                            trouve_protocol::CodeReviewFindingPublicationStatus::Failed,
+                        );
                     }
                     return Err(error)
                         .with_context(|| format!("reading GitHub API {status} response"));
@@ -8559,6 +8578,11 @@ impl Engine {
                 self.persist_publication_status_best_effort(
                     &job.id,
                     &grouped_finding_ids,
+                    trouve_protocol::CodeReviewFindingPublicationStatus::Failed,
+                );
+                self.persist_publication_status_best_effort(
+                    &job.id,
+                    &thread_reply_ids,
                     trouve_protocol::CodeReviewFindingPublicationStatus::Failed,
                 );
             }
@@ -9044,6 +9068,18 @@ impl Engine {
                 let Ok(expected_status) = entry.representation.publication_status() else {
                     return false;
                 };
+                if entry.representation.replies_on_origin_thread() {
+                    // The reply step records either the reply comment or a
+                    // definitive failure; anything else is still pending.
+                    return match finding.github_publication_status {
+                        trouve_protocol::CodeReviewFindingPublicationStatus::Published => {
+                            finding.github_comment_id.is_some()
+                                && !finding.github_comment_url.is_empty()
+                        }
+                        trouve_protocol::CodeReviewFindingPublicationStatus::Failed => true,
+                        _ => false,
+                    };
+                }
                 finding.github_publication_status == expected_status
                     && if entry.representation.requires_inline_comment() {
                         finding.github_comment_id.is_some()
@@ -9111,6 +9147,39 @@ impl Engine {
                 job_id = %job.id,
                 "accepted GitHub review comments remain pending reconciliation"
             );
+        }
+        // Fix-regression replies that never got a definitive outcome (the
+        // process died or GitHub was unreachable after the review was
+        // accepted) are posted here; their finding rows are still pending.
+        let pending_thread_reply_ids = manifest.thread_reply_finding_ids();
+        if !pending_thread_reply_ids.is_empty() {
+            let themes = self.store.code_review_themes_for_job(&job.id)?;
+            let fixed_findings = self
+                .store
+                .fixed_code_review_findings(&job.repository, job.pull_number)?;
+            let pending_findings = findings
+                .iter()
+                .filter(|finding| {
+                    pending_thread_reply_ids.contains(finding.id.as_str())
+                        && finding.github_publication_status
+                            == trouve_protocol::CodeReviewFindingPublicationStatus::Pending
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            let replies = origin_thread_replies(&pending_findings, &themes, &fixed_findings);
+            // A regression whose original thread can no longer be resolved
+            // has nowhere to reply; settle it so reconciliation completes.
+            let orphaned = pending_findings
+                .iter()
+                .filter(|finding| !replies.iter().any(|reply| reply.finding_id == finding.id))
+                .map(|finding| finding.id.as_str())
+                .collect::<Vec<_>>();
+            self.persist_publication_status_best_effort(
+                &job.id,
+                &orphaned,
+                trouve_protocol::CodeReviewFindingPublicationStatus::Failed,
+            );
+            self.post_origin_thread_replies(api, job, &replies).await;
         }
         self.emit_code_review_job_updated(&job.id)?;
         self.emit_code_review_updated(Some(job.id.clone()))?;
@@ -11455,6 +11524,142 @@ impl Engine {
         Ok(())
     }
 
+    async fn reopen_review_thread(&self, api: &GithubApi, thread_id: &str) -> Result<()> {
+        let mutation = r#"
+          mutation UnresolveReviewThread($threadId: ID!) {
+            unresolveReviewThread(input: {threadId: $threadId}) {
+              thread { id isResolved }
+            }
+          }
+        "#;
+        let (response, rate): (serde_json::Value, _) = api
+            .post(
+                "/graphql",
+                &serde_json::json!({
+                    "query": mutation,
+                    "variables": { "threadId": thread_id }
+                }),
+            )
+            .await?;
+        self.record_review_rate(rate);
+        if let Some(error) = github_graphql_error_message(&response, "reopening review thread") {
+            bail!(error);
+        }
+        Ok(())
+    }
+
+    /// Posts fix regressions as replies on the threads of the findings they
+    /// regressed, after the round's review is accepted. Each reply's outcome
+    /// is recorded on its own finding: the reply comment on success, a
+    /// failed publication on a definitive rejection (the original comment
+    /// may have been deleted), and nothing on a transient error so
+    /// reconciliation retries the reply for a still-pending finding.
+    async fn post_origin_thread_replies(
+        &self,
+        api: &GithubApi,
+        job: &trouve_protocol::CodeReviewJob,
+        replies: &[OriginThreadReply],
+    ) {
+        for reply in replies {
+            if let Some(thread_id) = &reply.original_thread_id
+                && let Err(error) = tokio::time::timeout(
+                    REVIEW_THREAD_REQUEST_TIMEOUT,
+                    self.reopen_review_thread(api, thread_id),
+                )
+                .await
+                .unwrap_or_else(|_| Err(anyhow!("reopening review thread timed out")))
+            {
+                // The reply still lands in the thread; a resolved thread
+                // merely hides it until someone expands it.
+                tracing::debug!(
+                    job_id = %job.id,
+                    finding_id = %reply.finding_id,
+                    thread_id,
+                    error = format!("{error:#}"),
+                    "reopening the original finding's thread failed"
+                );
+            }
+            let response = tokio::time::timeout(
+                REVIEW_THREAD_REQUEST_TIMEOUT,
+                api.request(
+                    reqwest::Method::POST,
+                    &format!(
+                        "/repos/{}/pulls/{}/comments/{}/replies",
+                        job.repository, job.pull_number, reply.original_comment_id
+                    ),
+                )
+                .json(&serde_json::json!({ "body": reply.body }))
+                .send(),
+            )
+            .await;
+            let response = match response {
+                Ok(Ok(response)) => response,
+                Ok(Err(error)) => {
+                    tracing::warn!(
+                        job_id = %job.id,
+                        finding_id = %reply.finding_id,
+                        original_finding_id = %reply.original_finding_id,
+                        %error,
+                        "posting a fix-regression reply failed; it remains pending"
+                    );
+                    continue;
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        job_id = %job.id,
+                        finding_id = %reply.finding_id,
+                        "posting a fix-regression reply timed out; it remains pending"
+                    );
+                    continue;
+                }
+            };
+            let status = response.status();
+            self.record_review_rate(rate_info(response.headers()));
+            let body = response.text().await.unwrap_or_default();
+            if status.is_success() {
+                match serde_json::from_str::<PublishedReviewComment>(&body) {
+                    Ok(comment) => {
+                        if let Err(error) = self.store.update_code_review_finding_publication(
+                            &reply.finding_id,
+                            Some(comment.id),
+                            &comment.html_url,
+                            reply.original_thread_id.as_deref(),
+                        ) {
+                            tracing::warn!(
+                                job_id = %job.id,
+                                finding_id = %reply.finding_id,
+                                %error,
+                                "recording a fix-regression reply failed"
+                            );
+                        }
+                    }
+                    Err(error) => tracing::warn!(
+                        job_id = %job.id,
+                        finding_id = %reply.finding_id,
+                        %error,
+                        "GitHub accepted a fix-regression reply but returned an invalid body"
+                    ),
+                }
+                continue;
+            }
+            tracing::warn!(
+                job_id = %job.id,
+                finding_id = %reply.finding_id,
+                original_finding_id = %reply.original_finding_id,
+                status = status.as_u16(),
+                error = %compact_api_error(&body),
+                "GitHub rejected a fix-regression reply"
+            );
+            if status.is_client_error() {
+                self.persist_publication_status_best_effort(
+                    &job.id,
+                    &[reply.finding_id.as_str()],
+                    trouve_protocol::CodeReviewFindingPublicationStatus::Failed,
+                );
+            }
+        }
+    }
+
     async fn capture_published_review_comments(
         &self,
         api: &GithubApi,
@@ -12498,7 +12703,17 @@ fn render_lifecycle_comment(
                 == trouve_protocol::CodeReviewFindingPublicationStatus::Pending
         })
         .count();
-    if !confirmed_findings.is_empty() || carried_threaded_count > 0 {
+    // Fix regressions are exempt from gating (never publishable inline) but
+    // reply on the thread of the finding they regressed once that reply has
+    // actually posted.
+    let regression_reply_count = result_findings
+        .iter()
+        .filter(|finding| {
+            finding.origin == trouve_protocol::CodeReviewFindingOrigin::FixRegression
+                && finding.github_comment_id.is_some()
+        })
+        .count();
+    if !confirmed_findings.is_empty() || carried_threaded_count > 0 || regression_reply_count > 0 {
         // Counts are per finding, not per comment: findings grouped under a
         // shared root-cause comment would otherwise inflate a comment count.
         body.push_str(&format!(
@@ -12507,6 +12722,11 @@ fn render_lifecycle_comment(
         if pending_count > 0 {
             body.push_str(&format!(
                 "  \n**Inline publication pending:** {pending_count} finding(s)"
+            ));
+        }
+        if regression_reply_count > 0 {
+            body.push_str(&format!(
+                "  \n**Fix regressions raised on their original threads:** {regression_reply_count} finding(s)"
             ));
         }
         if carried_threaded_count > 0 {
@@ -12562,12 +12782,15 @@ fn render_lifecycle_comment(
     // They are surfaced for awareness — real signal, visible on the pull
     // request — without gating it, so an autonomous agent working the
     // blocking ledger is never forced into code its change did not break.
+    // Fix regressions posted as replies on their original threads already
+    // have a visible surface and are counted above instead.
     let noticed_findings = result_findings
         .iter()
         .filter(|finding| {
             finding.status == "open"
                 && finding_is_blocking(&finding.severity, &finding.confidence)
                 && !finding_gates(&finding.evidence, finding.origin)
+                && finding.github_comment_id.is_none()
         })
         .collect::<Vec<_>>();
     const NOTICED_HEADING: &str = "### Noticed beyond this change\n\nReal issues in code this \
@@ -15977,6 +16200,12 @@ enum ReviewPublicationRepresentation {
     ReviewBody,
     GroupedInline,
     GroupedReviewBody,
+    /// A fix regression posted as a reply on the thread of the fixed
+    /// finding it regressed, after the review itself is accepted. Unlike
+    /// the review-borne representations its outcome is decided by that
+    /// separate request, so the reply step — not the manifest — owns the
+    /// finding's publication status.
+    ThreadReply,
     Omitted,
     NotEligible,
     SuppressedByPolicy,
@@ -15991,6 +16220,7 @@ impl ReviewPublicationRepresentation {
             Self::ReviewBody => "review_body",
             Self::GroupedInline => "grouped_inline",
             Self::GroupedReviewBody => "grouped_review_body",
+            Self::ThreadReply => "thread_reply",
             Self::Omitted => "omitted",
             Self::NotEligible => "not_eligible",
             Self::SuppressedByPolicy => "suppressed_by_policy",
@@ -16005,6 +16235,7 @@ impl ReviewPublicationRepresentation {
             "review_body" => Ok(Self::ReviewBody),
             "grouped_inline" => Ok(Self::GroupedInline),
             "grouped_review_body" => Ok(Self::GroupedReviewBody),
+            "thread_reply" => Ok(Self::ThreadReply),
             "omitted" => Ok(Self::Omitted),
             "not_eligible" => Ok(Self::NotEligible),
             "suppressed_by_policy" => Ok(Self::SuppressedByPolicy),
@@ -16021,6 +16252,7 @@ impl ReviewPublicationRepresentation {
                 | Self::ReviewBody
                 | Self::GroupedInline
                 | Self::GroupedReviewBody
+                | Self::ThreadReply
                 | Self::Omitted
         )
     }
@@ -16033,7 +16265,7 @@ impl ReviewPublicationRepresentation {
         use trouve_protocol::CodeReviewFindingPublicationStatus as Status;
 
         match self {
-            Self::Inline | Self::ReviewBody => Ok(Status::Published),
+            Self::Inline | Self::ReviewBody | Self::ThreadReply => Ok(Status::Published),
             Self::GroupedInline | Self::GroupedReviewBody => Ok(Status::GroupedByTheme),
             Self::Omitted => Ok(Status::Failed),
             Self::NotEligible => Ok(Status::NotEligible),
@@ -16050,6 +16282,18 @@ impl ReviewPublicationRepresentation {
 
     fn requires_inline_comment(self) -> bool {
         self == Self::Inline
+    }
+
+    fn replies_on_origin_thread(self) -> bool {
+        self == Self::ThreadReply
+    }
+
+    /// Whether the manifest decides the finding's publication status. A
+    /// thread reply is a separate request after the review; its status is
+    /// written by that request's outcome (published with the reply's comment
+    /// or failed), never repaired from the manifest.
+    fn status_owned_by_manifest(self) -> bool {
+        !self.replies_on_origin_thread()
     }
 }
 
@@ -16180,6 +16424,7 @@ impl ReviewPublicationManifest {
                     ReviewPublicationManifestFormat::Current,
                     ReviewPublicationRepresentation::Inline
                     | ReviewPublicationRepresentation::ReviewBody
+                    | ReviewPublicationRepresentation::ThreadReply
                     | ReviewPublicationRepresentation::NotEligible
                     | ReviewPublicationRepresentation::SuppressedByPolicy,
                 ) => {
@@ -16360,6 +16605,7 @@ impl ReviewPublicationManifest {
         let resolved = self
             .entries
             .iter()
+            .filter(|entry| entry.representation.status_owned_by_manifest())
             .map(|entry| Ok((entry, entry.representation.publication_status()?)))
             .collect::<Result<Vec<_>>>()?;
         let mut groups = Vec::new();
@@ -16402,11 +16648,20 @@ impl ReviewPublicationManifest {
             .collect()
     }
 
+    fn thread_reply_finding_ids(&self) -> HashSet<&str> {
+        self.entries
+            .iter()
+            .filter(|entry| entry.representation.replies_on_origin_thread())
+            .map(|entry| entry.finding_id.as_str())
+            .collect()
+    }
+
     fn published_finding_ids(&self) -> Result<Vec<&str>> {
         let mut finding_ids = Vec::new();
         for entry in &self.entries {
-            if entry.representation.publication_status()?
-                == trouve_protocol::CodeReviewFindingPublicationStatus::Published
+            if entry.representation.status_owned_by_manifest()
+                && entry.representation.publication_status()?
+                    == trouve_protocol::CodeReviewFindingPublicationStatus::Published
             {
                 finding_ids.push(entry.finding_id.as_str());
             }
@@ -16435,6 +16690,10 @@ fn review_publication_phase(
 trait CodeReviewFindingPublicationExt {
     fn has_inline_location(&self) -> bool;
     fn is_publishable(&self) -> bool;
+    /// A fix regression that would post inline were it not exempt from
+    /// gating by origin: it belongs on the thread of the finding it
+    /// regressed rather than in a fresh comment of its own.
+    fn qualifies_for_origin_thread_reply(&self) -> bool;
 }
 
 struct ReviewThemePublicationGroup<'a> {
@@ -16554,6 +16813,102 @@ impl CodeReviewFindingPublicationExt for trouve_protocol::CodeReviewFinding {
             && finding_levels_meet_publication_threshold(&self.severity, &self.confidence)
             && finding_gates(&self.evidence, self.origin)
     }
+
+    fn qualifies_for_origin_thread_reply(&self) -> bool {
+        self.origin == trouve_protocol::CodeReviewFindingOrigin::FixRegression
+            && self.has_inline_location()
+            && finding_levels_meet_publication_threshold(&self.severity, &self.confidence)
+            && finding_scope_blocks(&self.evidence)
+    }
+}
+
+/// A fix regression's publication as a reply on the fixed finding's thread.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OriginThreadReply {
+    finding_id: String,
+    original_finding_id: String,
+    original_comment_id: u64,
+    /// The original thread when trouve collapsed it after the fix; reopened
+    /// before replying so the regression is visible on the pull request.
+    original_thread_id: Option<String>,
+    body: String,
+}
+
+/// Pairs each qualifying fix regression with the fixed finding it regressed:
+/// a `fixed` finding of an earlier published round that shares one of the
+/// regression's themes and was posted as a review comment. Several
+/// candidates resolve to the most recently fixed one. Regressions whose
+/// original never reached GitHub have no thread to reply on and publish
+/// like any other non-gating finding.
+fn origin_thread_replies(
+    findings: &[trouve_protocol::CodeReviewFinding],
+    themes: &[trouve_protocol::CodeReviewTheme],
+    fixed_findings: &[trouve_protocol::CodeReviewFinding],
+) -> Vec<OriginThreadReply> {
+    let fixed_by_id = fixed_findings
+        .iter()
+        .filter(|finding| finding.status == "fixed" && finding.github_comment_id.is_some())
+        .map(|finding| (finding.id.as_str(), finding))
+        .collect::<HashMap<_, _>>();
+    let theme_by_id = themes
+        .iter()
+        .map(|theme| (theme.id.as_str(), theme))
+        .collect::<HashMap<_, _>>();
+    findings
+        .iter()
+        .filter(|finding| finding.qualifies_for_origin_thread_reply())
+        .filter_map(|finding| {
+            let original = finding
+                .theme_ids
+                .iter()
+                .filter_map(|theme_id| theme_by_id.get(theme_id.as_str()))
+                .flat_map(|theme| theme.finding_ids.iter())
+                .filter(|original_id| original_id.as_str() != finding.id)
+                .filter_map(|original_id| fixed_by_id.get(original_id.as_str()).copied())
+                .filter(|original| original.job_id != finding.job_id)
+                .max_by(|left, right| {
+                    left.resolved_at
+                        .cmp(&right.resolved_at)
+                        .then_with(|| left.id.cmp(&right.id))
+                })?;
+            Some(OriginThreadReply {
+                finding_id: finding.id.clone(),
+                original_finding_id: original.id.clone(),
+                original_comment_id: original.github_comment_id?,
+                original_thread_id: original.github_thread_id.clone(),
+                body: render_fix_regression_reply(finding, original),
+            })
+        })
+        .collect()
+}
+
+/// The reply body for a fix regression. It leads with the design question
+/// the regression raises — the fix traded one failure for another — so the
+/// thread reads as a conversation about the trade-off rather than a second,
+/// unrelated finding, and carries the finding marker like an inline comment.
+fn render_fix_regression_reply(
+    finding: &trouve_protocol::CodeReviewFinding,
+    original: &trouve_protocol::CodeReviewFinding,
+) -> String {
+    let fixed_at = original
+        .resolved_head
+        .get(..8)
+        .unwrap_or(original.resolved_head.as_str());
+    let fixed_at = if fixed_at.is_empty() {
+        String::new()
+    } else {
+        format!(" at `{fixed_at}`")
+    };
+    let preface = format!(
+        "**Design question — the fix for this finding{fixed_at} appears to trade it for a \
+         different problem.** Before addressing the regression below, it is worth deciding \
+         which trade-off this code should make; the original concern and this one may need a \
+         single design rather than another local patch. This reply does not block the pull \
+         request.\n\n---\n\n"
+    );
+    let mut body = render_inline_finding(finding);
+    body.insert_str(0, &preface);
+    body
 }
 
 /// (path, line, left-side). Context lines are commentable on either side;
@@ -22210,6 +22565,400 @@ rename to src/new.rs
         );
     }
 
+    /// Serves scripted responses like [`scripted_github_server`] but reads
+    /// each request in full (headers and body) and records it, so callers
+    /// can assert on paths and payloads once the handle completes.
+    fn recording_github_server(
+        listener: tokio::net::TcpListener,
+        bodies: Vec<String>,
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = requests.clone();
+        let handle = tokio::spawn(async move {
+            for body in bodies {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                let header_end = loop {
+                    if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                        break end + 4;
+                    }
+                    let count = stream.read(&mut buffer).await.unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&buffer[..count]);
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]).to_ascii_lowercase();
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .map_or(0, |value| value.trim().parse::<usize>().unwrap());
+                while request.len() < header_end + content_length {
+                    let count = stream.read(&mut buffer).await.unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&buffer[..count]);
+                }
+                recorded
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&request).into_owned());
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        (handle, requests)
+    }
+
+    #[tokio::test]
+    async fn fix_regressions_reply_on_the_original_findings_thread() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let finding = |title: &str, line: u64| NewCodeReviewFinding {
+            path: "src/lib.rs".into(),
+            line,
+            side: "RIGHT".into(),
+            severity: "high".into(),
+            confidence: "high".into(),
+            title: title.into(),
+            body: "Handle the error.".into(),
+            prompt_for_agents: "Handle the error and test it.".into(),
+            sources: Vec::new(),
+        };
+        let verified = || trouve_protocol::CodeReviewFindingEvidence {
+            change_scope: "verified".into(),
+            ..Default::default()
+        };
+
+        // Round one posts a finding inline; its thread is later collapsed
+        // when the finding is verified fixed.
+        let previous_job = enqueue_test_review_job(&store, "acme/widgets#42:regression-origin");
+        store.claim_code_review_job().unwrap().unwrap();
+        let original = store
+            .save_code_review_result_with_themes(
+                &previous_job.id,
+                "One issue.",
+                "Fix it.",
+                1,
+                &[finding("Registry can overflow", 10)],
+                &[NewCodeReviewFindingDetails {
+                    evidence: verified(),
+                    ..Default::default()
+                }],
+                &[],
+                &[],
+            )
+            .unwrap()
+            .remove(0);
+        assert!(
+            store
+                .claim_code_review_publication(&previous_job.id)
+                .unwrap()
+        );
+        assert!(
+            store
+                .reconcile_code_review_publication(
+                    &previous_job.id,
+                    "https://github.com/acme/widgets/pull/42#pullrequestreview-1",
+                    &[original.id.as_str()],
+                )
+                .unwrap()
+        );
+        assert!(
+            store
+                .update_code_review_finding_publication(
+                    &original.id,
+                    Some(9001),
+                    "https://github.com/acme/widgets/pull/42#discussion_r9001",
+                    Some("T1"),
+                )
+                .unwrap()
+        );
+
+        // Round two fixes it, but the fix regressed into the mirror-image
+        // problem; a third finding in the round is an ordinary new change.
+        let mut request = test_review_job_request("acme/widgets#42:regression-round");
+        request.head_sha = "3333333333333333333333333333333333333333".into();
+        let job = store.enqueue_code_review_job(&request).unwrap().unwrap();
+        store.claim_code_review_job().unwrap().unwrap();
+        assert!(
+            store
+                .resolve_code_review_finding(&original.id, "fixed", &job.head_sha, &job.id)
+                .unwrap()
+        );
+        let findings = store
+            .save_code_review_result_with_themes(
+                &job.id,
+                "The fix regressed.",
+                "Decide the trade-off.",
+                2,
+                &[
+                    finding("Ownership is now unbounded", 12),
+                    finding("Unrelated new issue", 40),
+                ],
+                &[
+                    NewCodeReviewFindingDetails {
+                        evidence: verified(),
+                        origin: trouve_protocol::CodeReviewFindingOrigin::FixRegression,
+                        theme_ids: vec!["rvth-registry".into()],
+                        ..Default::default()
+                    },
+                    NewCodeReviewFindingDetails {
+                        evidence: verified(),
+                        ..Default::default()
+                    },
+                ],
+                &[NewCodeReviewTheme {
+                    id: "rvth-registry".into(),
+                    root_cause: "registry bounds are enforced in one place only".into(),
+                    recommendation: "bound both registration and ownership".into(),
+                    observation_kind: trouve_protocol::CodeReviewThemeObservationKind::New,
+                    previous_finding_ids: vec![original.id.clone()],
+                }],
+                &[],
+            )
+            .unwrap();
+        assert!(store.claim_code_review_publication(&job.id).unwrap());
+        let regression = findings
+            .iter()
+            .find(|finding| finding.line == 12)
+            .unwrap()
+            .clone();
+        let new_change = findings
+            .iter()
+            .find(|finding| finding.line == 40)
+            .unwrap()
+            .clone();
+        assert!(regression.qualifies_for_origin_thread_reply());
+        assert!(!regression.is_publishable());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (server, requests) = recording_github_server(
+            listener,
+            vec![
+                r#"{"id":77,"html_url":"https://github.com/acme/widgets/pull/42#pullrequestreview-77"}"#.into(),
+                r#"{"data":{"unresolveReviewThread":{"thread":{"id":"T1","isResolved":false}}}}"#.into(),
+                r#"{"id":9555,"html_url":"https://github.com/acme/widgets/pull/42#discussion_r9555","body":"reply"}"#.into(),
+                serde_json::json!([{
+                    "id": 101,
+                    "html_url": "https://github.com/acme/widgets/pull/42#discussion_r101",
+                    "body": format!("<!-- trouve-code-review finding:{} -->", new_change.id),
+                }])
+                .to_string(),
+            ],
+        );
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(
+            store,
+            data.path().to_path_buf(),
+            &crate::config::Config::default(),
+        );
+        let api = GithubApi::with_base_url(
+            "Bearer installation-token".into(),
+            format!("http://{address}"),
+            "installation:7".into(),
+        )
+        .unwrap();
+
+        engine
+            .publish_review(&api, &job, &findings, true)
+            .await
+            .unwrap();
+        server.await.unwrap();
+        let requests = requests.lock().unwrap().clone();
+        assert_eq!(requests.len(), 4);
+        let review_request = &requests[0];
+        assert!(review_request.starts_with("POST /repos/acme/widgets/pulls/42/reviews "));
+        let review_body = review_request.split("\r\n\r\n").nth(1).unwrap();
+        let review: serde_json::Value = serde_json::from_str(review_body).unwrap();
+        let inline_bodies = review["comments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|comment| comment["body"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(inline_bodies.len(), 1);
+        assert!(inline_bodies[0].contains(&format!("finding:{}", new_change.id)));
+        assert!(!review_body.contains(&regression.id));
+        assert!(requests[1].starts_with("POST /graphql "));
+        assert!(requests[1].contains("unresolveReviewThread"));
+        assert!(requests[1].contains(r#""threadId":"T1""#));
+        let reply_request = &requests[2];
+        assert!(
+            reply_request.starts_with("POST /repos/acme/widgets/pulls/42/comments/9001/replies ")
+        );
+        let reply: serde_json::Value =
+            serde_json::from_str(reply_request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        let reply_body = reply["body"].as_str().unwrap();
+        assert!(reply_body.starts_with("**Design question"));
+        assert!(reply_body.contains("Ownership is now unbounded"));
+        assert!(reply_body.contains(&format!(
+            "<!-- trouve-code-review finding:{} -->",
+            regression.id
+        )));
+        assert!(requests[3].starts_with("GET /repos/acme/widgets/pulls/42/reviews/77/comments"));
+
+        let stored = engine.store.code_review_findings(&job.id).unwrap();
+        let stored_regression = stored
+            .iter()
+            .find(|finding| finding.id == regression.id)
+            .unwrap();
+        assert_eq!(
+            stored_regression.github_publication_status,
+            trouve_protocol::CodeReviewFindingPublicationStatus::Published
+        );
+        assert_eq!(stored_regression.github_comment_id, Some(9555));
+        assert_eq!(
+            stored_regression.github_comment_url,
+            "https://github.com/acme/widgets/pull/42#discussion_r9555"
+        );
+        assert_eq!(stored_regression.github_thread_id.as_deref(), Some("T1"));
+        let stored_new_change = stored
+            .iter()
+            .find(|finding| finding.id == new_change.id)
+            .unwrap();
+        assert_eq!(stored_new_change.github_comment_id, Some(101));
+        let manifest = engine
+            .store
+            .code_review_publication_manifest(&job.id)
+            .unwrap();
+        assert!(manifest.iter().any(|(finding_id, _, representation)| {
+            finding_id == &regression.id && representation == "thread_reply"
+        }));
+    }
+
+    #[test]
+    fn fix_regressions_without_a_posted_original_have_no_thread_to_reply_on() {
+        let finding = |id: &str, origin: &str, theme_ids: Vec<&str>| {
+            serde_json::from_value::<trouve_protocol::CodeReviewFinding>(serde_json::json!({
+                "id": id,
+                "job_id": "rvj-round-two",
+                "path": "src/lib.rs",
+                "line": 12,
+                "side": "RIGHT",
+                "severity": "high",
+                "confidence": "high",
+                "title": "Ownership is now unbounded",
+                "body": "The fix removed the bound.",
+                "status": "open",
+                "origin": origin,
+                "evidence": { "change_scope": "verified" },
+                "theme_ids": theme_ids,
+            }))
+            .unwrap()
+        };
+        let fixed = |id: &str, comment_id: Option<u64>, resolved_at: &str| {
+            serde_json::from_value::<trouve_protocol::CodeReviewFinding>(serde_json::json!({
+                "id": id,
+                "job_id": "rvj-round-one",
+                "path": "src/lib.rs",
+                "line": 10,
+                "side": "RIGHT",
+                "severity": "high",
+                "confidence": "high",
+                "title": "Registry can overflow",
+                "body": "Unbounded registry.",
+                "status": "fixed",
+                "resolved_head": "3".repeat(40),
+                "resolved_at": resolved_at,
+                "github_comment_id": comment_id,
+                "github_thread_id": comment_id.map(|id| format!("T{id}")),
+            }))
+            .unwrap()
+        };
+        let theme = |finding_ids: Vec<&str>| {
+            serde_json::from_value::<trouve_protocol::CodeReviewTheme>(serde_json::json!({
+                "id": "rvth-registry",
+                "repository": "acme/widgets",
+                "pull_number": 42,
+                "root_cause": "bounds enforced in one place",
+                "recommendation": "bound both sides",
+                "status": "open",
+                "first_seen_head": "1".repeat(40),
+                "last_seen_head": "3".repeat(40),
+                "finding_ids": finding_ids,
+            }))
+            .unwrap()
+        };
+
+        // The most recently fixed posted original wins; an original that
+        // never reached GitHub cannot be replied to.
+        let replies = origin_thread_replies(
+            &[finding(
+                "rvf-regression",
+                "fix_regression",
+                vec!["rvth-registry"],
+            )],
+            &[theme(vec![
+                "rvf-older",
+                "rvf-newer",
+                "rvf-unposted",
+                "rvf-regression",
+            ])],
+            &[
+                fixed("rvf-older", Some(9001), "2026-09-01T00:00:00Z"),
+                fixed("rvf-newer", Some(9002), "2026-09-02T00:00:00Z"),
+                fixed("rvf-unposted", None, "2026-09-03T00:00:00Z"),
+            ],
+        );
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].finding_id, "rvf-regression");
+        assert_eq!(replies[0].original_finding_id, "rvf-newer");
+        assert_eq!(replies[0].original_comment_id, 9002);
+        assert_eq!(replies[0].original_thread_id.as_deref(), Some("T9002"));
+        assert!(replies[0].body.starts_with("**Design question"));
+        assert!(replies[0].body.contains("at `33333333`"));
+        assert!(
+            replies[0]
+                .body
+                .contains("<!-- trouve-code-review finding:rvf-regression -->")
+        );
+
+        // No posted original, no shared theme, or a non-regression origin:
+        // nothing to reply on.
+        assert!(
+            origin_thread_replies(
+                &[finding(
+                    "rvf-regression",
+                    "fix_regression",
+                    vec!["rvth-registry"]
+                )],
+                &[theme(vec!["rvf-unposted", "rvf-regression"])],
+                &[fixed("rvf-unposted", None, "2026-09-03T00:00:00Z")],
+            )
+            .is_empty()
+        );
+        assert!(
+            origin_thread_replies(
+                &[finding(
+                    "rvf-regression",
+                    "fix_regression",
+                    vec!["rvth-other"]
+                )],
+                &[theme(vec!["rvf-older", "rvf-regression"])],
+                &[fixed("rvf-older", Some(9001), "2026-09-01T00:00:00Z")],
+            )
+            .is_empty()
+        );
+        assert!(
+            origin_thread_replies(
+                &[finding(
+                    "rvf-recurrence",
+                    "recurrence",
+                    vec!["rvth-registry"]
+                )],
+                &[theme(vec!["rvf-older", "rvf-recurrence"])],
+                &[fixed("rvf-older", Some(9001), "2026-09-01T00:00:00Z")],
+            )
+            .is_empty()
+        );
+    }
+
     #[tokio::test]
     async fn published_review_comment_capture_paginates() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -25748,6 +26497,12 @@ rename to src/new.rs
                 false,
             ),
             (
+                ReviewPublicationRepresentation::ThreadReply,
+                Status::Published,
+                false,
+                false,
+            ),
+            (
                 ReviewPublicationRepresentation::Omitted,
                 Status::Failed,
                 false,
@@ -25772,7 +26527,45 @@ rename to src/new.rs
                 representation.requires_inline_comment(),
                 requires_inline_comment
             );
+            assert_eq!(
+                representation.persisted(),
+                ReviewPublicationRepresentation::from_persisted(representation.persisted())
+                    .unwrap()
+                    .persisted()
+            );
         }
+
+        // A thread reply's status is written by the reply request itself:
+        // the manifest neither repairs it nor reports it as review-borne.
+        let manifest = ReviewPublicationManifest::current(
+            vec![
+                ReviewPublicationManifestEntry::new(
+                    "rvf-inline",
+                    "rvf-inline",
+                    ReviewPublicationRepresentation::Inline,
+                ),
+                ReviewPublicationManifestEntry::new(
+                    "rvf-reply",
+                    "rvf-reply",
+                    ReviewPublicationRepresentation::ThreadReply,
+                ),
+            ],
+            ["rvf-inline", "rvf-reply"],
+        )
+        .unwrap();
+        assert_eq!(
+            manifest.outcome_groups(true).unwrap(),
+            vec![(Status::Published, vec!["rvf-inline"])]
+        );
+        assert_eq!(
+            manifest.published_finding_ids().unwrap(),
+            vec!["rvf-inline"]
+        );
+        assert_eq!(manifest.inline_finding_ids(), HashSet::from(["rvf-inline"]));
+        assert_eq!(
+            manifest.thread_reply_finding_ids(),
+            HashSet::from(["rvf-reply"])
+        );
     }
 
     #[test]
