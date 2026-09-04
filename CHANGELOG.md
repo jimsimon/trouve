@@ -30,9 +30,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Documentation-only pushes do not re-review the branch**: an automatic
   run whose changes since the last reviewed head touch only documentation
   paths finishes with no reviewer tasks while still publishing a check run
-  for the new head. Findings anchored on code unchanged since the last
-  reviewed head are recorded as `previously_missed`, which never gates
-  the review.
+  for the new head. New-change findings anchored on code unchanged since
+  the last reviewed head are recorded as `previously_missed`, which never
+  gates the review; a recurrence or fix regression with resolved history
+  keeps its origin.
 - **Fix regressions reply on the original thread**: a `fix_regression`
   finding whose regressed original was posted inline is published as a
   reply on that thread (reopening it if it was resolved), framed as a

@@ -15574,9 +15574,13 @@ fn coordinator_validated_findings(
 /// history that supports it, and — when `touches_inter_round_change` is
 /// `Some` — whether the push since the last reviewed head actually changed
 /// the code the finding is rooted in. Code no push touched since the last
-/// review cannot have been introduced by this round: such a finding is
-/// `previously_missed` regardless of the request, so a documentation push
-/// never turns an earlier round's oversight into a blocking "new change".
+/// review cannot have been introduced by this round: a finding that would
+/// otherwise resolve to `new_change` is `previously_missed` instead, so a
+/// documentation push never turns an earlier round's oversight into a
+/// blocking "new change". A recurrence or fix regression with resolved
+/// history keeps its origin: both are justified by what the fix did rather
+/// than by which lines it touched, and a regression routinely surfaces on a
+/// line the fix left alone.
 fn finding_origin_with_history(
     requested: trouve_protocol::CodeReviewFindingOrigin,
     has_historical_support: bool,
@@ -15587,18 +15591,21 @@ fn finding_origin_with_history(
         FixRegression, NewChange, PreviouslyMissed, Recurrence,
     };
 
-    if touches_inter_round_change == Some(false) {
-        return PreviouslyMissed;
-    }
-    if !has_historical_support {
-        return NewChange;
-    }
-    match requested {
-        NewChange => NewChange,
-        PreviouslyMissed => PreviouslyMissed,
-        Recurrence | FixRegression if !has_resolved_support => PreviouslyMissed,
-        Recurrence => Recurrence,
-        FixRegression => FixRegression,
+    let origin = if !has_historical_support {
+        NewChange
+    } else {
+        match requested {
+            NewChange => NewChange,
+            PreviouslyMissed => PreviouslyMissed,
+            Recurrence | FixRegression if !has_resolved_support => PreviouslyMissed,
+            Recurrence => Recurrence,
+            FixRegression => FixRegression,
+        }
+    };
+    if origin == NewChange && touches_inter_round_change == Some(false) {
+        PreviouslyMissed
+    } else {
+        origin
     }
 }
 
@@ -26771,18 +26778,31 @@ rename to src/new.rs
         };
 
         // The push since the last reviewed head did not touch the finding's
-        // code: no request, with or without history, survives.
+        // code: a new-change claim, with or without history, does not
+        // survive.
         assert_eq!(
             finding_origin_with_history(NewChange, false, false, Some(false)),
             PreviouslyMissed
         );
         assert_eq!(
-            finding_origin_with_history(FixRegression, true, true, Some(false)),
+            finding_origin_with_history(NewChange, true, false, Some(false)),
             PreviouslyMissed
         );
         assert_eq!(
-            finding_origin_with_history(Recurrence, true, true, Some(false)),
+            finding_origin_with_history(FixRegression, true, false, Some(false)),
             PreviouslyMissed
+        );
+        // A regression or recurrence with resolved history is rooted in
+        // what the fix did, not in which lines it touched (PR #365's three
+        // real regressions all sat on lines the fix left alone), so it
+        // keeps its origin and, for a regression, its thread reply.
+        assert_eq!(
+            finding_origin_with_history(FixRegression, true, true, Some(false)),
+            FixRegression
+        );
+        assert_eq!(
+            finding_origin_with_history(Recurrence, true, true, Some(false)),
+            Recurrence
         );
         // The push touched the anchor or a waypoint: ordinary resolution.
         assert_eq!(
