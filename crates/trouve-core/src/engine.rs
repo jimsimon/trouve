@@ -121,6 +121,10 @@ const BACKEND_RETIREMENT_RETRY_MAX: Duration = Duration::from_secs(30);
 const API_PROVIDER_REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(test)]
 const API_PROVIDER_REFRESH_TIMEOUT: Duration = Duration::from_millis(250);
+#[cfg(not(test))]
+const PROVIDER_TRANSITION_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const PROVIDER_TRANSITION_WAIT_TIMEOUT: Duration = Duration::from_millis(250);
 const RUNTIME_UNINSTALL_LEASE_RETRIES: usize = 4;
 const RUNTIME_UNINSTALL_LEASE_RETRY_DELAY: Duration = Duration::from_millis(25);
 
@@ -4818,7 +4822,7 @@ impl Engine {
         // retirement and, on rollback failure, its detached reconciliation.
         let (reload, target_transitions) = self
             .lock_provider_transitions_with_shared_reload(&target_ids)
-            .await;
+            .await?;
         let mut secret_writes = Vec::new();
         if let Some(key) = req.api_key.as_deref().filter(|key| !key.is_empty()) {
             secret_writes.push((
@@ -5087,29 +5091,43 @@ impl Engine {
         Ok(guards)
     }
 
-    /// Acquire provider-scoped transition locks without ever waiting for one
-    /// while retaining the shared global reload barrier. A failed credential
-    /// rollback may own a provider lock indefinitely; unrelated exclusive
-    /// refreshes must remain admissible throughout that recovery.
+    /// Acquire provider-scoped transition locks before retaining the shared
+    /// global reload barrier. Briefly wait for transient credential recovery,
+    /// but surface a conflict instead of leaving an ordinary provider request
+    /// queued forever behind a permanently failing secret store.
     async fn lock_provider_transitions_with_shared_reload(
         &self,
         target_ids: &HashSet<String>,
-    ) -> (
-        tokio::sync::OwnedRwLockReadGuard<()>,
-        Vec<tokio::sync::OwnedMutexGuard<()>>,
-    ) {
+    ) -> Result<
+        (
+            tokio::sync::OwnedRwLockReadGuard<()>,
+            Vec<tokio::sync::OwnedMutexGuard<()>>,
+        ),
+        EngineError,
+    > {
         let mut ids = target_ids.iter().cloned().collect::<Vec<_>>();
         ids.sort_unstable();
         let mut guards = Vec::with_capacity(ids.len());
         for id in ids {
-            guards.push(self.provider_transition_lock(&id).lock_owned().await);
+            let lock = self.provider_transition_lock(&id);
+            let guard = tokio::time::timeout(
+                PROVIDER_TRANSITION_WAIT_TIMEOUT,
+                lock.lock_owned(),
+            )
+            .await
+            .map_err(|_| {
+                EngineError::Conflict(format!(
+                    "provider {id} is still reconciling credentials; repair the secret store and retry"
+                ))
+            })?;
+            guards.push(guard);
         }
         // Exclusive paths only probe provider locks while holding the global
         // barrier; they never await them. Acquiring provider locks first is
         // therefore deadlock-free and, critically, never pins the global
         // barrier behind a stalled credential reconciliation.
         let reload = self.provider_reload.clone().read_owned().await;
-        (reload, guards)
+        Ok((reload, guards))
     }
 
     // --- OAuth login (subscription providers) ---------------------------------
@@ -7358,7 +7376,7 @@ impl Engine {
     ) -> Result<BackendRetirement, EngineError> {
         let (reload, target_transitions) = self
             .lock_provider_transitions_with_shared_reload(target_ids)
-            .await;
+            .await?;
         self.retire_config_backends_matching_ids_locked(
             target_ids,
             timeout,
@@ -31629,6 +31647,24 @@ default_permission_mode = "ask"
             &engine.providers.read().unwrap()["cursor"],
             &published
         ));
+
+        let blocked_update = tokio::time::timeout(
+            Duration::from_secs(1),
+            engine.upsert_provider(
+                "cursor",
+                &UpsertProviderRequest {
+                    kind: "openai-compat".into(),
+                    base_url: Some("https://later.example.test/v1".into()),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .expect("a provider update waited indefinitely for credential recovery")
+        .unwrap_err();
+        assert!(
+            matches!(blocked_update, EngineError::Conflict(message) if message.contains("reconciling credentials"))
+        );
 
         secret_store
             .allow_rollback
