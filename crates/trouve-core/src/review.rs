@@ -6885,28 +6885,22 @@ impl Engine {
             }
             bail!("stale: review was cancelled or replaced before publication");
         }
-        // Only findings that can produce a visible inline comment may make
-        // the GitHub verdict blocking. Suppressed or unplaceable findings
-        // remain available in the durable report without creating an
-        // unexplained REQUEST_CHANGES review.
         let resolved_finding_ids = parsed
             .resolved_finding_ids
             .iter()
             .map(String::as_str)
             .collect::<Vec<_>>();
-        let has_unresolved_findings = review_has_unresolved_publishable_findings(
-            &persisted,
-            &previous_findings,
-            &resolved_finding_ids,
-        );
-        if !self
+        // Derive the GitHub verdict from the same durable SQL predicate that
+        // records the post-publication open count. Keeping a second in-memory
+        // projection here allowed a successful check to accompany a stale
+        // REQUEST_CHANGES review.
+        let Some(projected_open_issue_count) = self
             .store
-            .prepare_code_review_blocking_review_cleanup(&job.id, !has_unresolved_findings)?
-        {
-            bail!("review job changed before cleanup intent was recorded");
-        }
-        self.store
-            .prepare_code_review_finding_resolutions(&job.id, &resolved_finding_ids)?;
+            .prepare_code_review_publication_verdict(&job.id, &resolved_finding_ids)?
+        else {
+            bail!("review job changed before its publication verdict was prepared");
+        };
+        let has_unresolved_findings = projected_open_issue_count > 0;
         let published_review = self
             .publish_review(&api, &job, &persisted, has_unresolved_findings)
             .await
@@ -11964,42 +11958,6 @@ fn review_check_retry_action(
         ("requested_action", "retry_final_editor") => Some(ReviewCheckRetryAction::FinalEditor),
         _ => None,
     }
-}
-
-fn review_has_unresolved_findings(
-    current_finding_count: usize,
-    previous_finding_ids: &[&str],
-    resolved_finding_ids: &[&str],
-) -> bool {
-    current_finding_count > 0
-        || previous_finding_ids
-            .iter()
-            .any(|id| !resolved_finding_ids.contains(id))
-}
-
-fn review_has_unresolved_publishable_findings(
-    current_findings: &[trouve_protocol::CodeReviewFinding],
-    previous_findings: &[trouve_protocol::CodeReviewFinding],
-    resolved_finding_ids: &[&str],
-) -> bool {
-    let previous_finding_ids = previous_findings
-        .iter()
-        .filter(|finding| {
-            finding.is_publishable()
-                && !finding.outside_diff
-                && finding.github_publication_status
-                    == trouve_protocol::CodeReviewFindingPublicationStatus::Published
-        })
-        .map(|finding| finding.id.as_str())
-        .collect::<Vec<_>>();
-    review_has_unresolved_findings(
-        current_findings
-            .iter()
-            .filter(|finding| finding.is_publishable() && !finding.outside_diff)
-            .count(),
-        &previous_finding_ids,
-        resolved_finding_ids,
-    )
 }
 
 fn github_review_event_without_inline_comments(event: &str) -> &str {
@@ -18438,57 +18396,6 @@ mod tests {
     }
 
     #[test]
-    fn github_review_verdict_keeps_unresolved_previous_findings_open() {
-        assert!(review_has_unresolved_findings(1, &[], &[]));
-        assert!(review_has_unresolved_findings(0, &["old"], &[]));
-        assert!(!review_has_unresolved_findings(0, &["old"], &["old"]));
-    }
-
-    #[test]
-    fn outside_diff_only_findings_publish_a_comment_verdict() {
-        let store = crate::store::Store::open_in_memory().unwrap();
-        let job = enqueue_test_review_job(&store, "acme/widgets#42:outside-verdict");
-        store.claim_code_review_job().unwrap().unwrap();
-        let mut finding = store
-            .save_code_review_result_with_themes(
-                &job.id,
-                "One outside-diff issue.",
-                "Fix the outside-diff issue.",
-                1,
-                &[NewCodeReviewFinding {
-                    path: "src/lib.rs".into(),
-                    line: 42,
-                    side: "RIGHT".into(),
-                    severity: "high".into(),
-                    confidence: "high".into(),
-                    title: "Test issue".into(),
-                    body: "Issue outside the pull request diff.".into(),
-                    prompt_for_agents: "Fix it.".into(),
-                    sources: Vec::new(),
-                }],
-                &[NewCodeReviewFindingDetails {
-                    outside_diff: true,
-                    ..Default::default()
-                }],
-                &[],
-                &[],
-            )
-            .unwrap()
-            .pop()
-            .unwrap();
-
-        let current_is_blocking =
-            review_has_unresolved_publishable_findings(std::slice::from_ref(&finding), &[], &[]);
-        assert_eq!(github_review_event(current_is_blocking), "COMMENT");
-
-        finding.github_publication_status =
-            trouve_protocol::CodeReviewFindingPublicationStatus::Published;
-        let previous_is_blocking =
-            review_has_unresolved_publishable_findings(&[], std::slice::from_ref(&finding), &[]);
-        assert_eq!(github_review_event(previous_is_blocking), "COMMENT");
-    }
-
-    #[test]
     fn own_pull_verdict_rejections_are_detected_without_hiding_other_errors() {
         assert!(github_review_should_fallback_to_comment(
             "APPROVE",
@@ -23579,40 +23486,6 @@ rename to src/new.rs
                 &[],
             )
             .unwrap();
-        let hidden_findings = findings
-            .iter()
-            .filter(|finding| !finding.is_publishable())
-            .cloned()
-            .collect::<Vec<_>>();
-        assert!(!review_has_unresolved_publishable_findings(
-            &hidden_findings,
-            &[],
-            &[]
-        ));
-        assert!(!review_has_unresolved_publishable_findings(
-            &[],
-            &hidden_findings,
-            &[]
-        ));
-        let mut failed_finding = findings
-            .iter()
-            .find(|finding| finding.is_publishable())
-            .unwrap()
-            .clone();
-        failed_finding.github_publication_status =
-            trouve_protocol::CodeReviewFindingPublicationStatus::Failed;
-        assert!(!review_has_unresolved_publishable_findings(
-            &[],
-            std::slice::from_ref(&failed_finding),
-            &[]
-        ));
-        failed_finding.github_publication_status =
-            trouve_protocol::CodeReviewFindingPublicationStatus::Published;
-        assert!(review_has_unresolved_publishable_findings(
-            &[],
-            &[failed_finding],
-            &[]
-        ));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
