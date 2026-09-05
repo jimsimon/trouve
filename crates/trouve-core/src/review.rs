@@ -164,7 +164,10 @@ const INVALID_OUTSIDE_ANCHOR_REJECTION: &str = "insufficient_evidence: final fin
 /// Paths whose changes never warrant an automatic re-review on their own:
 /// prose and licensing. Lockfiles are deliberately absent — dependency
 /// changes are reviewable. Globs use `*` within one path segment and `**`
-/// for any prefix; a bare `*.ext` pattern matches the file name at any depth.
+/// for any prefix; a bare `*.ext` pattern matches the file name at any
+/// depth. A trailing `*` after a name stem matches a variant suffix
+/// (`LICENSE-MIT`, `NOTICE.txt`), never a source file that merely starts
+/// with the stem (`license.rs`, `notice_handler.ts`).
 const NON_REVIEWABLE_REVIEW_PATHS: &[&str] = &[
     "*.md",
     "*.mdx",
@@ -175,6 +178,9 @@ const NON_REVIEWABLE_REVIEW_PATHS: &[&str] = &[
     "LICENSE*",
     "NOTICE*",
 ];
+/// File extensions a name-stem pattern may carry (`LICENSE.txt`); anything
+/// else after the stem is a source file, not documentation.
+const NON_REVIEWABLE_REVIEW_EXTENSIONS: &[&str] = &["md", "mdx", "rst", "txt"];
 const MANUAL_REVIEW_MENTION: &str = "@trouve-ai";
 const REVIEW_COMMENT_PAGE_SIZE: usize = 100;
 const REVIEW_COMMENT_MAX_PAGES: u64 = 10;
@@ -16256,7 +16262,7 @@ fn normalize_finding(
 /// a high-impact guess that the evidence cannot support caused most of the
 /// fix/regression churn this gate exists to prevent. The SQL twin lives in
 /// `store::blocking_finding_predicate`; keep the two in lockstep.
-fn finding_is_blocking(severity: &str, confidence: &str) -> bool {
+pub(crate) fn finding_is_blocking(severity: &str, confidence: &str) -> bool {
     let severity = canonical_finding_level(severity);
     let confidence = canonical_finding_level(confidence);
     matches!(
@@ -17449,11 +17455,30 @@ fn non_reviewable_review_path(path: &str) -> bool {
         } else if let Some(suffix) = pattern.strip_prefix('*') {
             name.ends_with(suffix)
         } else if let Some(prefix) = pattern.strip_suffix('*') {
-            name.starts_with(prefix)
+            name.strip_prefix(prefix)
+                .is_some_and(non_reviewable_name_variant_suffix)
         } else {
             name == pattern
         }
     })
+}
+
+/// Whether what follows a name stem still names documentation: nothing, a
+/// dash-separated variant (`-MIT`), or a documentation extension, possibly
+/// combined (`-APACHE.txt`). A stem followed by a source extension or a
+/// word continuation (`.rs`, `_handler.ts`) is code.
+fn non_reviewable_name_variant_suffix(suffix: &str) -> bool {
+    let (variant, extension) = match suffix.rsplit_once('.') {
+        Some((variant, extension)) => (variant, Some(extension)),
+        None => (suffix, None),
+    };
+    let variant_ok = variant.is_empty()
+        || variant
+            .strip_prefix('-')
+            .is_some_and(|rest| rest.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
+    let extension_ok =
+        extension.is_none_or(|extension| NON_REVIEWABLE_REVIEW_EXTENSIONS.contains(&extension));
+    variant_ok && extension_ok
 }
 
 /// Whether a push touching exactly `changed_paths` contains anything a
@@ -17476,9 +17501,11 @@ fn non_reviewable_push_summary(
     if inter_round_files.is_empty() {
         return None;
     }
+    // A rename contributes both sides: moving `src/auth.rs` to
+    // `docs/auth.md` removes source and must be reviewed.
     let paths = inter_round_files
         .iter()
-        .map(|file| file.path.clone())
+        .flat_map(|file| std::iter::once(file.path.clone()).chain(review_diff_renamed_from(file)))
         .collect::<Vec<_>>();
     if push_is_reviewable(&paths) {
         return None;
@@ -27180,6 +27207,25 @@ rename to src/new.rs
         assert!(push_is_reviewable(&paths(&["package-lock.json"])));
         assert!(push_is_reviewable(&paths(&["docs-site/build.rs"])));
         assert!(push_is_reviewable(&paths(&["mkdocs.yml"])));
+        // Name-stem patterns accept documentation variants only; a source
+        // file that starts with the stem is code.
+        assert!(!push_is_reviewable(&paths(&[
+            "LICENSE-MIT",
+            "LICENSE-APACHE.txt",
+            "NOTICE.md",
+            "CHANGELOG",
+            "changelog-2026.rst",
+        ])));
+        for source in [
+            "src/CHANGELOG.rs",
+            "src/LICENSE.py",
+            "lib/notice_handler.ts",
+            "src/license.rs",
+            "LICENSE.go",
+            "CHANGELOG_parser.rb",
+        ] {
+            assert!(push_is_reviewable(&paths(&[source])), "{source}");
+        }
         assert!(
             push_is_reviewable(&[]),
             "missing path data must not skip a review"
@@ -27206,6 +27252,23 @@ rename to src/new.rs
             None,
             "an empty inter-round diff is a re-review of the same code, not a documentation push"
         );
+        // A rename is judged on both of its paths.
+        let renamed = ReviewDiffFile {
+            path: "docs/lib.md".into(),
+            diff: "diff --git a/src/lib.rs b/docs/lib.md\nsimilarity index 100%\nrename from src/lib.rs\nrename to docs/lib.md\n".into(),
+            generated_header: None,
+        };
+        assert_eq!(
+            non_reviewable_push_summary("0123456789abcdef", &[renamed]),
+            None,
+            "renaming source into documentation removes source"
+        );
+        let renamed_docs = ReviewDiffFile {
+            path: "docs/guide.md".into(),
+            diff: "diff --git a/README.md b/docs/guide.md\nsimilarity index 100%\nrename from README.md\nrename to docs/guide.md\n".into(),
+            generated_header: None,
+        };
+        assert!(non_reviewable_push_summary("0123456789abcdef", &[renamed_docs]).is_some());
     }
 
     #[test]

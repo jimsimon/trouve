@@ -702,14 +702,21 @@ const ADVISORY_FINDING_STATUS_BACKFILL_MIGRATION: &str =
 /// fix-regression thread lookup considers.
 const FIXED_FINDING_THREAD_LOOKUP_LIMIT: usize = 500;
 
+/// How many of a pull request's newest unresolved advisory findings the
+/// coordinator's deduplication ledger is built from. The ledger prompt is
+/// bounded at 16 KiB and a compact entry is at least ~100 bytes, so the
+/// newest entries that fit are always within this many rows.
+const ADVISORY_LEDGER_LOOKUP_LIMIT: usize = 256;
+
 /// Which of a pull request's published findings a lookup returns.
 struct PullFindingSelection<'a> {
     status: Option<&'a str>,
     /// Extra SQL appended to the finding predicate; `f` is the findings table.
     extra_predicate: &'a str,
-    /// Return only this many rows, newest resolution first, instead of the
-    /// whole history in round order.
-    newest_resolved_limit: Option<usize>,
+    /// Return only the newest rows under this `ORDER BY ... DESC` clause
+    /// (`f` and `j` are the findings and jobs tables) and row limit instead
+    /// of the whole history. Results are still returned oldest first.
+    newest: Option<(&'a str, usize)>,
 }
 
 // This repair runs once inside the same transaction as its completion marker.
@@ -1020,14 +1027,15 @@ const MIGRATIONS: &[&str] = &[
 /// Severity/confidence half of the blocking tier for one findings row: high
 /// severity with at least medium confidence, or medium severity with high
 /// confidence, canonicalized like `review::finding_is_blocking` (unknown
-/// levels read as `medium`, so `NOT IN ('high', 'low')` is how "medium" is
-/// spelled here). Findings failing this test are stored with status
-/// `advisory`; the scope verdict is applied separately so a blocking-level
-/// finding this change did not cause stays `open` without gating.
+/// levels read as `medium`, so `NOT IN ('high', 'low')` is how "medium" and
+/// `!= 'low'` how "at least medium" are spelled here). Findings failing this
+/// test are stored with status `advisory`; the scope verdict is applied
+/// separately so a blocking-level finding this change did not cause stays
+/// `open` without gating.
 fn blocking_finding_levels_predicate(alias: &str) -> String {
     format!(
         "((lower(trim({alias}.severity)) = 'high' \
-           AND lower(trim({alias}.confidence)) IN ('high', 'medium')) \
+           AND lower(trim({alias}.confidence)) != 'low') \
           OR (lower(trim({alias}.severity)) NOT IN ('high', 'low') \
            AND lower(trim({alias}.confidence)) = 'high'))"
     )
@@ -12469,11 +12477,18 @@ impl Store {
         repository: &str,
         pull_number: u64,
     ) -> Result<Vec<trouve_protocol::CodeReviewFinding>> {
-        Ok(self
-            .code_review_findings_for_pull_with_status(repository, pull_number, Some("advisory"))?
-            .into_iter()
-            .filter(|finding| finding.resolved_by_job_id.is_empty())
-            .collect())
+        self.select_code_review_findings_for_pull(
+            repository,
+            pull_number,
+            PullFindingSelection {
+                status: Some("advisory"),
+                extra_predicate: " AND f.resolved_by_job_id = ''",
+                newest: Some((
+                    "j.completed_at DESC, f.job_id DESC, f.path DESC, f.line DESC, f.id DESC",
+                    ADVISORY_LEDGER_LOOKUP_LIMIT,
+                )),
+            },
+        )
     }
 
     /// Findings of published rounds that were verified fixed, with the
@@ -12493,7 +12508,10 @@ impl Store {
             PullFindingSelection {
                 status: Some("fixed"),
                 extra_predicate: " AND f.github_comment_id IS NOT NULL",
-                newest_resolved_limit: Some(FIXED_FINDING_THREAD_LOOKUP_LIMIT),
+                newest: Some((
+                    "f.resolved_at DESC, f.id DESC",
+                    FIXED_FINDING_THREAD_LOOKUP_LIMIT,
+                )),
             },
         )
     }
@@ -12510,7 +12528,7 @@ impl Store {
             PullFindingSelection {
                 status,
                 extra_predicate: "",
-                newest_resolved_limit: None,
+                newest: None,
             },
         )
     }
@@ -12524,7 +12542,7 @@ impl Store {
         let PullFindingSelection {
             status,
             extra_predicate,
-            newest_resolved_limit,
+            newest,
         } = selection;
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
@@ -12536,15 +12554,27 @@ impl Store {
                 ""
             }
         );
-        let (order, limit) = match newest_resolved_limit {
-            Some(limit) => (
-                "f.resolved_at DESC, f.id".to_string(),
-                format!(" LIMIT {limit}"),
-            ),
+        let (order, limit) = match newest {
+            Some((order, limit)) => (order.to_string(), format!(" LIMIT {limit}")),
             None => (
                 "j.completed_at, f.job_id, f.path, f.line, f.id".to_string(),
                 String::new(),
             ),
+        };
+        // The companion source/theme queries are scoped to the same bounded
+        // id set so their cost is bounded too; the inner aliases shadow the
+        // outer ones.
+        let companion_filter = if newest.is_some() {
+            format!(
+                "{status_filter} AND f.id IN (
+                   SELECT f.id FROM code_review_findings f
+                   JOIN code_review_jobs j ON j.id = f.job_id
+                   WHERE j.repository = ?1 AND j.pull_number = ?2
+                     AND j.review_published = 1{status_filter}
+                   ORDER BY {order}{limit})"
+            )
+        } else {
+            status_filter.clone()
         };
         let query_params = || {
             let mut values = vec![
@@ -12612,7 +12642,7 @@ impl Store {
                  JOIN code_review_findings f ON f.id = source.finding_id
                  JOIN code_review_jobs j ON j.id = f.job_id
                  WHERE j.repository = ?1 AND j.pull_number = ?2
-                   AND j.review_published = 1{status_filter}
+                   AND j.review_published = 1{companion_filter}
                  ORDER BY source.finding_id, source.reviewer_name, source.candidate_id"
             ))?;
             let rows = stmt.query_map(rusqlite::params_from_iter(query_params()), |row| {
@@ -12643,7 +12673,7 @@ impl Store {
                  JOIN code_review_jobs j ON j.id = f.job_id
                  LEFT JOIN code_review_jobs link_job ON link_job.id = link.linked_by_job_id
                  WHERE j.repository = ?1 AND j.pull_number = ?2
-                   AND j.review_published = 1{status_filter}
+                   AND j.review_published = 1{companion_filter}
                    AND (link.linked_by_job_id = '' OR link_job.review_published != 0)
                  ORDER BY link.finding_id, link.theme_id"
             ))?;
@@ -12661,6 +12691,9 @@ impl Store {
         for finding in &mut findings {
             finding.sources = sources_by_finding.remove(&finding.id).unwrap_or_default();
             finding.theme_ids = themes_by_finding.remove(&finding.id).unwrap_or_default();
+        }
+        if newest.is_some() {
+            findings.reverse();
         }
         tx.commit()?;
         Ok(findings)
@@ -25767,6 +25800,125 @@ mod tests {
     }
 
     #[test]
+    fn advisory_ledger_selects_the_newest_unresolved_rows_in_sql() {
+        let store = Store::open_in_memory().unwrap();
+        let finding = |line: u64| NewCodeReviewFinding {
+            path: "src/advisory.rs".into(),
+            line,
+            side: "RIGHT".into(),
+            severity: "low".into(),
+            confidence: "low".into(),
+            title: format!("Advisory note {line}"),
+            body: "Minor.".into(),
+            prompt_for_agents: "Consider it.".into(),
+            sources: vec![trouve_protocol::CodeReviewFindingSource {
+                reviewer_id: "perf".into(),
+                reviewer_name: "Performance".into(),
+                candidate_id: "c-1".into(),
+                task_id: "t-1".into(),
+            }],
+        };
+        let advisory = || NewCodeReviewFindingDetails {
+            advisory: true,
+            ..Default::default()
+        };
+        let publish = |job: &trouve_protocol::CodeReviewJob| {
+            assert!(store.claim_code_review_publication(&job.id).unwrap());
+            store
+                .record_code_review_publication(
+                    &job.id,
+                    &job.repository,
+                    job.pull_number,
+                    &job.base_ref,
+                    &job.head_sha,
+                    "https://example/review",
+                    false,
+                    &[],
+                )
+                .unwrap();
+            store
+                .finish_code_review_job(&job.id, "succeeded", "https://example/review", "")
+                .unwrap();
+        };
+
+        // Round one: an old ledger larger than the lookup bound.
+        let first = enqueue_backoff_test_job(&store);
+        store.claim_code_review_job().unwrap().unwrap();
+        let old_count = ADVISORY_LEDGER_LOOKUP_LIMIT as u64;
+        let old_findings = (1..=old_count).map(finding).collect::<Vec<_>>();
+        let old_details = vec![advisory(); old_findings.len()];
+        store
+            .save_code_review_result_with_themes(
+                &first.id,
+                "summary",
+                "",
+                0,
+                &old_findings,
+                &old_details,
+                &[],
+                &[],
+            )
+            .unwrap();
+        publish(&first);
+
+        // Round two: a few newer notes, one of them already superseded.
+        let mut second_request = backoff_test_job_request();
+        second_request.dedupe_key = "acme/widgets#42:advisory-ledger-bound".into();
+        second_request.head_sha = "3333333333333333333333333333333333333333".into();
+        let second = store
+            .enqueue_code_review_job(&second_request)
+            .unwrap()
+            .unwrap();
+        store.claim_code_review_job().unwrap().unwrap();
+        let new_findings = store
+            .save_code_review_result_with_themes(
+                &second.id,
+                "summary",
+                "",
+                0,
+                &[finding(1001), finding(1002), finding(1003)],
+                &[advisory(), advisory(), advisory()],
+                &[],
+                &[],
+            )
+            .unwrap();
+        publish(&second);
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE code_review_findings SET resolved_by_job_id = ?2 WHERE id = ?1",
+                params![new_findings[2].id, second.id],
+            )
+            .unwrap();
+
+        let ledger = store
+            .advisory_code_review_findings(&second.repository, second.pull_number)
+            .unwrap();
+        assert_eq!(ledger.len(), ADVISORY_LEDGER_LOOKUP_LIMIT);
+        assert!(
+            ledger
+                .iter()
+                .all(|finding| finding.resolved_by_job_id.is_empty())
+        );
+        // Oldest first, like every pull-level history, so the prompt
+        // compaction keeps the newest entries; the two unresolved newer
+        // notes are at the end and the excess oldest rows are dropped.
+        let tail = &ledger[ledger.len() - 2..];
+        assert_eq!(
+            tail.iter().map(|finding| finding.line).collect::<Vec<_>>(),
+            [1001, 1002]
+        );
+        assert_eq!(ledger[0].job_id, first.id);
+        assert_eq!(
+            ledger[0].line, 3,
+            "the two oldest rows fall outside the bound"
+        );
+        assert!(ledger.iter().all(|finding| finding.sources.len() == 1));
+    }
+
+    #[test]
     fn previously_missed_and_fix_regression_findings_stay_open_without_gating() {
         use trouve_protocol::CodeReviewFindingOrigin::{
             FixRegression, NewChange, PreviouslyMissed,
@@ -29614,6 +29766,62 @@ mod tests {
             fixed,
             vec![(first[0].id.clone(), "fixed".to_string(), Some(9001))]
         );
+    }
+
+    /// The SQL levels predicate and `review::finding_is_blocking` must agree
+    /// on every stored value, including the unrecognized ones Rust reads as
+    /// `medium`, or pull-level counts drift from the in-memory policy.
+    #[test]
+    fn sql_blocking_levels_match_the_rust_policy_for_every_level() {
+        let store = Store::open_in_memory().unwrap();
+        let levels = ["high", "medium", "low", "unknown", "", " HIGH ", "Medium"];
+        let mut expected_blocking = 0;
+        let mut rows = Vec::new();
+        for severity in levels {
+            for confidence in levels {
+                rows.push(("crates/core/src/engine.rs", severity, confidence));
+                if crate::review::finding_is_blocking(severity, confidence) {
+                    expected_blocking += 1;
+                }
+            }
+        }
+        let (round, stored) = publish_leveled_test_round(
+            &store,
+            "acme/widgets#42:level-parity",
+            "2222222222222222222222222222222222222222",
+            trouve_protocol::CodeReviewJobScope::Incremental,
+            &rows,
+            &[],
+        );
+        assert_eq!(stored.len(), rows.len());
+        let job = store.code_review_job(&round.id).unwrap().unwrap().job;
+        assert_eq!(job.open_issue_count, Some(expected_blocking));
+        assert_eq!(
+            job.advisory_open_issue_count,
+            Some(rows.len() as u64 - expected_blocking)
+        );
+        let sql_blocking = store
+            .conn
+            .lock()
+            .unwrap()
+            .prepare(&format!(
+                "SELECT severity, confidence FROM code_review_findings f WHERE job_id = ?1 AND {}",
+                blocking_finding_levels_predicate("f")
+            ))
+            .unwrap()
+            .query_map(params![round.id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        for (severity, confidence) in &sql_blocking {
+            assert!(
+                crate::review::finding_is_blocking(severity, confidence),
+                "SQL blocks ({severity:?}, {confidence:?}) but Rust does not"
+            );
+        }
+        assert_eq!(sql_blocking.len() as u64, expected_blocking);
     }
 
     #[test]
