@@ -356,7 +356,11 @@ pub use requests::*;
 // status instead of `open`, and finding evidence exposes `anchor_line_claimed`
 // (and `line_claimed` on causal waypoints) when the server re-anchored the
 // coordinator's line to its quoted source (additive).
-pub const PROTOCOL_VERSION: &str = "8.1";
+// 8.2: the legacy /v1/clis lifecycle also manages non-CLI agent runtimes;
+// Cursor's managed artifact is its standalone Agent SDK Bridge.
+// 8.3: CLI install status can expose a non-fatal durability warning after an
+// atomically committed runtime activation (additive).
+pub const PROTOCOL_VERSION: &str = "8.3";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";
 pub const ERROR_CODE_GITHUB_REAUTHENTICATION_REQUIRED: &str = "github_reauthentication_required";

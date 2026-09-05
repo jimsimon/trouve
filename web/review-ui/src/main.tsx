@@ -55,6 +55,13 @@ import {
   thinkingSelectionIsValid,
 } from "./model-settings";
 import {
+  consumeCursorMigrationFocusRequest,
+  cursorSdkPreset,
+  providerNeedsCursorSdkMigration,
+  providerSetupGroups,
+  savedProviderMessage,
+} from "./provider-settings";
+import {
   LIVE_OUTPUT_BATCH_MS,
   appendBoundedReviewOutput,
   boundReviewOutput,
@@ -3659,6 +3666,9 @@ function ProviderSettings({
   const [cliStatuses, setCliStatuses] = useState<Record<string, CliInstallStatus>>({});
   const [cliBusy, setCliBusy] = useState("");
   const [subscriptionId, setSubscriptionId] = useState("");
+  const [subscriptionApiKey, setSubscriptionApiKey] = useState("");
+  const subscriptionApiKeyInput = useRef<HTMLInputElement>(null);
+  const [cursorMigrationFocusRequest, setCursorMigrationFocusRequest] = useState(0);
   const [apiPresetId, setApiPresetId] = useState("");
   const [providerId, setProviderId] = useState("");
   const [providerKind, setProviderKind] = useState("openai-compat");
@@ -3783,6 +3793,7 @@ function ProviderSettings({
     id: string,
     action: "install" | "cancel" | "uninstall",
   ): Promise<void> => {
+    const label = clis.find((runtime) => runtime.id === id)?.display_name ?? id;
     setCliBusy(id);
     try {
       if (action === "install") {
@@ -3791,14 +3802,14 @@ function ProviderSettings({
           ...current,
           [id]: { status: "pending", received_bytes: 0, total_bytes: 0 },
         }));
-        flash(`Installing ${id}…`);
+        flash(`Installing ${label}…`);
       } else if (action === "cancel") {
         await cancelCliInstall(id);
-        flash(`Cancelling ${id} install…`);
+        flash(`Cancelling ${label} install…`);
       } else {
-        if (!window.confirm(`Remove trouve's managed ${id}?`)) return;
+        if (!window.confirm(`Remove trouve's managed ${label}?`)) return;
         await uninstallCli(id);
-        flash(`Removed managed ${id}`);
+        flash(`Removed managed ${label}`);
         await loadCliData();
       }
     } catch (cause) {
@@ -3807,16 +3818,26 @@ function ProviderSettings({
       setCliBusy("");
     }
   };
-  const subscriptionProviders = knownProviders.filter(
-    (provider) => provider.auth === "cli" || provider.auth === "oauth",
-  );
-  const apiProviders = knownProviders.filter(
-    (provider) => provider.auth !== "cli" && provider.auth !== "oauth",
-  );
+  const { subscriptionProviders, apiProviders } = providerSetupGroups(knownProviders);
   const selectedSubscription = subscriptionProviders.find(
     (provider) => provider.id === subscriptionId,
   );
-  const requiredCli = selectedSubscription
+  useEffect(() => {
+    const remainingRequest = consumeCursorMigrationFocusRequest(
+      cursorMigrationFocusRequest,
+      selectedSubscription,
+      subscriptionApiKeyInput.current,
+    );
+    if (remainingRequest !== cursorMigrationFocusRequest) {
+      setCursorMigrationFocusRequest(remainingRequest);
+    }
+  }, [
+    cursorMigrationFocusRequest,
+    selectedSubscription?.auth,
+    selectedSubscription?.kind,
+  ]);
+  const cursorMigration = cursorSdkPreset(subscriptionProviders);
+  const requiredRuntime = selectedSubscription
     ? clis.find((cli) => cli.kinds.includes(selectedSubscription.kind))
     : undefined;
   const selectedModel = models.find((model) => model.id === defaultModel);
@@ -3891,7 +3912,25 @@ function ProviderSettings({
               <small>{provider.kind} · {provider.category}</small>
             </span>
             <StatusPill status={provider.has_credentials ? "ready" : "credentials required"} />
-            {(provider.auth === "oauth" || provider.auth === "cli") && (
+            {providerNeedsCursorSdkMigration(provider) ? (
+              cursorMigration ? (
+                <button
+                  class="ghost compact"
+                  type="button"
+                  onClick={() => {
+                    setCursorMigrationFocusRequest((request) => request + 1);
+                    setSubscriptionId(cursorMigration.id);
+                    setSubscriptionApiKey("");
+                    setLogin(null);
+                    flash("Cursor Agent SDK selected; save an API key below to finish migration");
+                  }}
+                >
+                  Migrate to Agent SDK
+                </button>
+              ) : (
+                <small>Cursor Agent SDK setup is unavailable</small>
+              )
+            ) : (provider.auth === "oauth" || provider.auth === "cli") && (
               <button class="ghost compact" type="button" onClick={() => void begin(provider)}>
                 {provider.has_credentials ? "Sign in again" : "Sign in"}
               </button>
@@ -3945,8 +3984,8 @@ function ProviderSettings({
           onSubmit={async (event) => {
             event.preventDefault();
             if (!selectedSubscription) return;
-            if (requiredCli && !cliIsInstalled(requiredCli)) {
-              await runCliAction(requiredCli.id, "install");
+            if (requiredRuntime && !cliIsInstalled(requiredRuntime)) {
+              await runCliAction(requiredRuntime.id, "install");
               return;
             }
             try {
@@ -3954,21 +3993,32 @@ function ProviderSettings({
                 selectedSubscription.id,
                 selectedSubscription.kind,
                 selectedSubscription.base_url,
+                selectedSubscription.auth === "api-key"
+                  ? subscriptionApiKey || undefined
+                  : undefined,
               );
               onChanged();
-              await begin(configured);
+              if (selectedSubscription.auth === "api-key") {
+                setSubscriptionApiKey("");
+                flash(savedProviderMessage(selectedSubscription.display_name, configured));
+              } else {
+                await begin(configured);
+              }
             } catch (cause) {
               flash(cause instanceof Error ? cause.message : String(cause));
             }
           }}
         >
           <h3>Subscription provider</h3>
-          <p class="muted">Configure a vendor subscription and open its sign-in flow.</p>
+          <p class="muted">Configure a membership-backed provider with its supported sign-in or API-key flow.</p>
           <label>
             Provider
             <select
               value={subscriptionId}
-              onChange={(event) => setSubscriptionId(event.currentTarget.value)}
+              onChange={(event) => {
+                setSubscriptionId(event.currentTarget.value);
+                setSubscriptionApiKey("");
+              }}
               required
             >
               <option value="">Choose a provider…</option>
@@ -3979,10 +4029,31 @@ function ProviderSettings({
               ))}
             </select>
           </label>
+          {selectedSubscription?.auth === "api-key" && (
+            <label>
+              API key
+              <input
+                ref={subscriptionApiKeyInput}
+                type="password"
+                autoComplete="new-password"
+                aria-describedby="subscription-api-key-guidance"
+                value={subscriptionApiKey}
+                onInput={(event) => setSubscriptionApiKey(event.currentTarget.value)}
+                placeholder="Stored in trouve's secret store; leave empty to keep"
+              />
+              <small id="subscription-api-key-guidance">
+                {selectedSubscription.api_key_env
+                  ? `Or set ${selectedSubscription.api_key_env} on the server.`
+                  : "A supported vendor API key is required for this subscription."}
+              </small>
+            </label>
+          )}
           <button type="submit" disabled={!selectedSubscription || cliBusy !== ""}>
-            {requiredCli && !cliIsInstalled(requiredCli)
-              ? `Install ${requiredCli.display_name}`
-              : "Configure and sign in"}
+            {requiredRuntime && !cliIsInstalled(requiredRuntime)
+              ? `Install ${requiredRuntime.display_name}`
+              : selectedSubscription?.auth === "api-key"
+                ? "Save provider"
+                : "Configure and sign in"}
           </button>
         </form>
         <form
@@ -4057,11 +4128,12 @@ function ProviderSettings({
             <input
               type="password"
               autoComplete="new-password"
+              aria-describedby="provider-api-key-guidance"
               value={providerApiKey}
               onInput={(event) => setProviderApiKey(event.currentTarget.value)}
               disabled={apiProviders.find((provider) => provider.id === apiPresetId)?.auth === "none"}
             />
-            <small>
+            <small id="provider-api-key-guidance">
               {apiProviders.find((provider) => provider.id === apiPresetId)?.api_key_env
                 ? `Or set ${apiProviders.find((provider) => provider.id === apiPresetId)?.api_key_env} on the server.`
                 : "Stored in trouve's secret store."}
@@ -4073,8 +4145,8 @@ function ProviderSettings({
       <section class="cli-manager">
         <header>
           <div>
-            <h3>Subscription CLI binaries</h3>
-            <p class="muted">Managed versions take precedence over system copies on PATH. Status updates automatically.</p>
+            <h3>Subscription agent runtimes</h3>
+            <p class="muted">Cursor's Agent SDK Bridge and managed vendor CLIs take precedence over system copies on PATH. Status updates automatically.</p>
           </div>
         </header>
         <div class="cli-list">
@@ -4086,6 +4158,7 @@ function ProviderSettings({
                   <strong>{cli.display_name}</strong>
                   <small>{cliVersionLabel(cli)}</small>
                   {status.status === "pending" && <small>{cliProgressLabel(status)}</small>}
+                  {status.warning && <small role="status">{status.warning}</small>}
                   {status.status === "failed" && <small class="error-text">{status.error}</small>}
                 </span>
                 <div class="action-row">

@@ -10,10 +10,11 @@ use trouve_protocol::KnownProvider;
 /// render these as one-click setup options; ids are suggestions, not
 /// constraints.
 ///
-/// Subscription access goes through the vendors' own binaries (`auth:
-/// "cli"` presets below) — never by hijacking their OAuth client
-/// registrations. The generic OAuth machinery remains available for
-/// providers that sanction third-party clients.
+/// Subscription access goes through vendor-supported credentials: their own
+/// binaries where required, or product/SDK API keys for Kimi Code and Cursor.
+/// It never hijacks vendor OAuth client registrations. The generic OAuth
+/// machinery remains available for providers that sanction third-party
+/// clients.
 pub fn known_providers(models_dev: &crate::models_dev::ModelsDevCatalog) -> Vec<KnownProvider> {
     fn p(
         id: &str,
@@ -33,7 +34,7 @@ pub fn known_providers(models_dev: &crate::models_dev::ModelsDevCatalog) -> Vec<
             headers: Default::default(),
             query_params: Default::default(),
             auth: auth.into(),
-            category: provider_category(id, auth, base_url),
+            category: provider_category(kind, auth, base_url),
             experimental: false,
         }
     }
@@ -50,7 +51,7 @@ pub fn known_providers(models_dev: &crate::models_dev::ModelsDevCatalog) -> Vec<
             Some("KIMI_CODE_API_KEY"),
             "api-key",
         ),
-        // Local runtimes and vendor CLI agent backends are Trouve
+        // Local runtimes and vendor agent backends are Trouve
         // integrations, not model API providers, so models.dev does not list
         // them.
         p(
@@ -71,16 +72,8 @@ pub fn known_providers(models_dev: &crate::models_dev::ModelsDevCatalog) -> Vec<
         ),
         p(
             "cursor",
-            "Cursor (Subscription)",
-            "cursor-cli",
-            None,
-            None,
-            "cli",
-        ),
-        p(
-            "cursor-api",
-            "Cursor (API Key)",
-            "cursor-cli",
+            "Cursor (Agent SDK)",
+            "cursor-sdk",
             None,
             Some("CURSOR_API_KEY"),
             "api-key",
@@ -111,10 +104,15 @@ fn merge_provider_presets(
     providers
 }
 
-/// Classify a configured provider for settings presentation. Authentication
-/// and transport are deliberately independent from billing/presentation.
-pub fn provider_category(id: &str, auth: &str, base_url: Option<&str>) -> String {
-    if id == "kimi-code" || auth == "cli" || auth == "oauth" {
+/// Classify a configured provider for settings presentation. Trusted
+/// integration kinds and canonical service endpoints may identify a
+/// subscription; user-chosen provider ids never do.
+pub fn provider_category(kind: &str, auth: &str, base_url: Option<&str>) -> String {
+    if matches!(kind, "cursor-sdk" | "cursor-cli")
+        || auth == "cli"
+        || auth == "oauth"
+        || crate::kimi_usage::is_kimi_code_base_url(base_url)
+    {
         "subscription".into()
     } else if base_url.is_some_and(is_loopback_url) {
         "local".into()
@@ -228,22 +226,31 @@ mod tests {
     }
 
     #[test]
-    fn provider_categories_are_independent_from_auth_and_wire_kind() {
+    fn provider_categories_use_transport_and_endpoint_not_configurable_ids() {
+        assert_eq!(provider_category("claude-cli", "cli", None), "subscription");
         assert_eq!(
-            provider_category("claude-code", "cli", None),
+            provider_category(
+                "openai-compat",
+                "api-key",
+                Some(crate::kimi_usage::KIMI_CODE_BASE_URL)
+            ),
             "subscription"
         );
         assert_eq!(
-            provider_category("kimi-code", "api-key", None),
+            provider_category("cursor-sdk", "api-key", None),
             "subscription"
         );
-        assert_eq!(provider_category("cursor-api", "api-key", None), "api");
         assert_eq!(
-            provider_category("ollama", "none", Some("http://localhost:11434/v1")),
+            provider_category("openai-compat", "api-key", None),
+            "api",
+            "a generic API transport must not inherit a subscription category"
+        );
+        assert_eq!(
+            provider_category("openai-compat", "none", Some("http://localhost:11434/v1")),
             "local"
         );
         assert_eq!(
-            provider_category("custom", "api-key", Some("http://127.0.0.1:8000/v1")),
+            provider_category("openai-compat", "api-key", Some("http://127.0.0.1:8000/v1")),
             "local"
         );
         for url in [
@@ -252,7 +259,7 @@ mod tests {
             "http://localhost:11434/v1#models",
         ] {
             assert_eq!(
-                provider_category("custom", "api-key", Some(url)),
+                provider_category("openai-compat", "api-key", Some(url)),
                 "api",
                 "non-canonical loopback URL should not be local: {url}"
             );
