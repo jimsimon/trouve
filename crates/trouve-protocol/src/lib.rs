@@ -352,7 +352,11 @@ pub use requests::*;
 // incremental watermarks and raw coverage markers. Historical rows may still
 // expose their legacy scope and review base for compatibility; derived pending
 // and exhausted states describe their bounded full-branch migration (breaking).
-pub const PROTOCOL_VERSION: &str = "8.0";
+// 8.1: findings below the blocking bar are recorded with the `advisory`
+// status instead of `open`, and finding evidence exposes `anchor_line_claimed`
+// (and `line_claimed` on causal waypoints) when the server re-anchored the
+// coordinator's line to its quoted source (additive).
+pub const PROTOCOL_VERSION: &str = "8.1";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";
 pub const ERROR_CODE_GITHUB_REAUTHENTICATION_REQUIRED: &str = "github_reauthentication_required";

@@ -8,6 +8,39 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Only well-supported findings block a review**: a finding gates the
+  pull request only at `high` severity with `high` or `medium` confidence,
+  or `medium` severity with `high` confidence. The SQL projection that
+  counts blocking issues uses the same rule, and existing pull projections
+  are backfilled on upgrade.
+- **Findings are re-anchored to their quoted source**: when the
+  coordinator's anchor quote is found in the reviewed file, the finding
+  (and each causal waypoint) snaps to the line that actually holds the
+  quote before side, diff-membership, deduplication, change-scope, and
+  confidence are derived, so an off-by-N line number no longer caps
+  confidence at `low` or lands the inline comment on the wrong line. The
+  evidence records the original `anchor_line_claimed` when a line moved.
+  Resolution claims (`current_anchor_quote`) are not re-anchored yet.
+- **Below-bar findings are recorded as `advisory`**: they no longer appear
+  in the check-run text, the lifecycle comment, the prompt for agents, or
+  the default review UI (which lists them in a collapsed ledger), and the
+  coordinator receives them only as a compact deduplication list. A later
+  candidate that meets the bar with verified evidence may promote one via
+  `promoted_from_finding_id`; the advisory row leaves the ledger once the
+  promoting review is published.
+- **Documentation-only pushes do not re-review the branch**: an automatic
+  run whose changes since the last reviewed head touch only documentation
+  paths (Markdown, reStructuredText, `docs/`, README/CHANGELOG/LICENSE/
+  NOTICE files; not arbitrary `.txt` files) finishes with no reviewer tasks
+  while still publishing a check run for the new head. New-change findings anchored on code unchanged since
+  the last reviewed head are recorded as `previously_missed`, which never
+  gates the review; a recurrence or fix regression with resolved history
+  keeps its origin.
+- **Fix regressions reply on the original thread**: a `fix_regression`
+  finding whose regressed original was posted inline is published as a
+  reply on that thread (reopening it if it was resolved), framed as a
+  design question about the trade-off, instead of a new inline comment.
+  Fix regressions never gate the review.
 - **Daemons survive the shell call that started them** (Linux): a descendant
   of a shell command that detaches into its own session (an `sccache` server,
   a package-manager or build-tool daemon) is no longer killed when the call

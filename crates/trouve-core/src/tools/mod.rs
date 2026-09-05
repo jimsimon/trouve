@@ -903,6 +903,16 @@ pub trait ToolExecutor: Send + Sync {
     ) -> Result<Option<String>, String> {
         Err("review object reads are unavailable in this executor".into())
     }
+    /// Read the full text of an immutable git object at the reviewed
+    /// revision, so the orchestrator can re-anchor quoted findings whose
+    /// claimed line number is off. Same chokepoint and guarantees as
+    /// [`review_repository_object_line`](Self::review_repository_object_line).
+    async fn review_repository_object_text(
+        &self,
+        _request: &ReviewRepositoryObjectText,
+    ) -> Result<Option<String>, String> {
+        Err("review object reads are unavailable in this executor".into())
+    }
     /// Read review diffs with optional trusted snapshot metadata. Existing
     /// executors remain compatible by supplying ordinary diff files.
     async fn review_repository_diff_with_metadata(
@@ -1031,6 +1041,15 @@ pub struct ReviewRepositoryObjectLine {
     pub head_sha: String,
     pub path: String,
     pub line: u64,
+    pub max_bytes: usize,
+    pub cancel: tokio_util::sync::CancellationToken,
+}
+
+pub struct ReviewRepositoryObjectText {
+    pub managed_root: PathBuf,
+    pub worktree: PathBuf,
+    pub head_sha: String,
+    pub path: String,
     pub max_bytes: usize,
     pub cancel: tokio_util::sync::CancellationToken,
 }
@@ -3239,6 +3258,27 @@ impl ToolExecutor for LocalToolExecutor {
                 return Err("review object read cancelled".to_owned());
             }
             crate::git::review_object_line(&worktree, &head_sha, &path, line, max_bytes, &cancel)
+                .map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(|error| format!("review object read task failed: {error}"))?
+    }
+
+    async fn review_repository_object_text(
+        &self,
+        request: &ReviewRepositoryObjectText,
+    ) -> Result<Option<String>, String> {
+        validate_review_commit(&request.head_sha)?;
+        let (_, worktree) = canonical_managed_path(&request.managed_root, &request.worktree)?;
+        let head_sha = request.head_sha.clone();
+        let path = request.path.clone();
+        let max_bytes = request.max_bytes;
+        let cancel = request.cancel.clone();
+        tokio::task::spawn_blocking(move || {
+            if cancel.is_cancelled() {
+                return Err("review object read cancelled".to_owned());
+            }
+            crate::git::review_object_text(&worktree, &head_sha, &path, max_bytes, &cancel)
                 .map_err(|error| error.to_string())
         })
         .await

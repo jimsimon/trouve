@@ -231,6 +231,9 @@ export interface Finding {
   title: string;
   body: string;
   prompt_for_agents: string;
+  /** `open`, `advisory`, `fixed`, or `dismissed`. Advisory findings fell below
+   * the blocking bar when recorded: they never gate, are not posted to GitHub,
+   * and only feed later rounds as a dedupe/promotion ledger. */
   status: string;
   sources: FindingSource[];
   github_comment_id?: number;

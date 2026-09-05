@@ -1980,6 +1980,14 @@ export interface components {
         CodeReviewCausalWaypoint: {
             /** Format: int64 */
             line: number;
+            /**
+             * Format: int64
+             * @description The line the coordinator originally claimed when the server
+             *     re-anchored `line` to where `quote` actually appears in the head
+             *     revision. Absent when the claim was correct or no re-anchoring was
+             *     possible.
+             */
+            line_claimed?: number | null;
             path: string;
             /** @description Verbatim source line at `path:line`, from the head revision. */
             quote?: string;
@@ -2085,7 +2093,13 @@ export interface components {
             severity: string;
             side: string;
             sources?: components["schemas"]["CodeReviewFindingSource"][];
-            /** @description `open`, `fixed`, or `dismissed`. */
+            /**
+             * @description `open`, `advisory`, `fixed`, or `dismissed`. Advisory findings fell
+             *     below the blocking bar when they were recorded: they never gate the
+             *     review, are not published to GitHub, and are only surfaced to later
+             *     review rounds so the coordinator can recognise duplicates or promote
+             *     them once verified evidence lifts them over the bar.
+             */
             status: string;
             theme_ids?: string[];
             /** @description Concise, generated one-line summary of the issue. */
@@ -2093,6 +2107,14 @@ export interface components {
         };
         /** @description Concrete evidence that makes a confirmed finding independently verifiable. */
         CodeReviewFindingEvidence: {
+            /**
+             * Format: int64
+             * @description The line the coordinator originally claimed for the finding when the
+             *     server re-anchored it to where `anchor_quote` actually appears in the
+             *     head revision. Absent when the claim was correct or no re-anchoring
+             *     was possible.
+             */
+            anchor_line_claimed?: number | null;
             /**
              * @description Server-derived verdict for `anchor_quote`: `matched`, `mismatched`,
              *     or `unchecked`. Model-provided values are overwritten.
