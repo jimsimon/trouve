@@ -1268,7 +1268,7 @@ pub async fn prepare_install(
     data_dir: &Path,
     id: CliId,
     version: &str,
-    progress: &Progress,
+    progress: &Arc<Progress>,
 ) -> Result<PreparedInstall, InstallError> {
     // `version` is scraped from vendor endpoints and also joined into
     // filesystem paths (version dir, staging dir, download URLs). A crafted
@@ -1422,7 +1422,7 @@ async fn install_into(
     dir: &Path,
     id: CliId,
     version: &str,
-    progress: &Progress,
+    progress: &Arc<Progress>,
 ) -> Result<PathBuf, InstallError> {
     match id {
         CliId::CursorSdkBridge => {
@@ -1449,7 +1449,7 @@ async fn install_into(
                 },
             );
             verify_cursor_sdk_bridge_digests(&asset, reviewed, &manifest, &actual)?;
-            untar_gz(bytes, dir).await?;
+            untar_gz(bytes, dir, progress).await?;
             let executable = if cfg!(windows) {
                 "cursor-sdk-bridge.exe"
             } else {
@@ -1504,7 +1504,7 @@ async fn install_into(
                 "https://github.com/openai/codex/releases/download/rust-v{version}/codex-{triple}.tar.gz"
             );
             let bytes = get_bytes(&url, progress, MAX_RUNTIME_DOWNLOAD_BYTES).await?;
-            untar_gz(bytes, dir).await?;
+            untar_gz(bytes, dir, progress).await?;
             let rel = PathBuf::from("codex");
             std::fs::rename(dir.join(format!("codex-{triple}")), dir.join(&rel))?;
             make_executable(&dir.join(&rel))?;
@@ -1516,7 +1516,7 @@ async fn install_into(
                 "https://github.com/ggml-org/llama.cpp/releases/download/{version}/llama-{version}-bin-{platform}.tar.gz"
             );
             let bytes = get_bytes(&url, progress, MAX_RUNTIME_DOWNLOAD_BYTES).await?;
-            untar_gz(bytes, dir).await?;
+            untar_gz(bytes, dir, progress).await?;
             // The tarball unpacks to `llama-<version>/` with llama-server and
             // its shared libraries side by side (rpath $ORIGIN).
             let rel = PathBuf::from(format!("llama-{version}")).join("llama-server");
@@ -1584,14 +1584,36 @@ fn path_is_contained(path: &Path) -> bool {
 /// `dir` (absolute or `..`) are rejected, and symlink/hardlink entries whose
 /// target escapes are refused — otherwise a crafted archive could plant a
 /// symlink and then write through it to an arbitrary location (tar-slip).
-async fn untar_gz(bytes: Vec<u8>, dir: &Path) -> Result<(), InstallError> {
+async fn untar_gz(
+    bytes: Vec<u8>,
+    dir: &Path,
+    progress: &Arc<Progress>,
+) -> Result<(), InstallError> {
     untar_gz_with_limits(
         bytes,
         dir,
         MAX_RUNTIME_EXTRACTED_BYTES,
         MAX_RUNTIME_ARCHIVE_ENTRIES,
+        progress,
     )
     .await
+}
+
+struct CancellableReader<R> {
+    inner: R,
+    progress: Arc<Progress>,
+}
+
+impl<R: std::io::Read> std::io::Read for CancellableReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if self.progress.cancelled() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "managed runtime extraction cancelled",
+            ));
+        }
+        self.inner.read(buffer)
+    }
 }
 
 async fn untar_gz_with_limits(
@@ -1599,11 +1621,19 @@ async fn untar_gz_with_limits(
     dir: &Path,
     max_extracted_bytes: u64,
     max_entries: usize,
+    progress: &Arc<Progress>,
 ) -> Result<(), InstallError> {
     let dir = dir.to_path_buf();
     let extraction_dir = dir.clone();
+    let extraction_progress = Arc::clone(progress);
     let extraction = tokio::task::spawn_blocking(move || -> Result<(), InstallError> {
-        let decoder = flate2::read::GzDecoder::new(std::io::Cursor::new(bytes));
+        if extraction_progress.cancelled() {
+            return Err(InstallError::Cancelled);
+        }
+        let decoder = CancellableReader {
+            inner: flate2::read::GzDecoder::new(std::io::Cursor::new(bytes)),
+            progress: Arc::clone(&extraction_progress),
+        };
         let mut archive = tar::Archive::new(decoder);
         let mut extracted_bytes = 0_u64;
         let mut entry_count = 0_usize;
@@ -1611,6 +1641,9 @@ async fn untar_gz_with_limits(
             .entries()
             .map_err(|e| InstallError::Download(format!("reading archive: {e}")))?
         {
+            if extraction_progress.cancelled() {
+                return Err(InstallError::Cancelled);
+            }
             let mut entry =
                 entry.map_err(|e| InstallError::Download(format!("archive entry: {e}")))?;
             entry_count = entry_count
@@ -1664,7 +1697,8 @@ async fn untar_gz_with_limits(
                 }
             }
             // unpack_in re-checks containment as a second layer and returns
-            // false if it still refuses the path.
+            // false if it still refuses the path. CancellableReader also
+            // checks between incremental reads of a single large entry.
             if !entry
                 .unpack_in(&dir)
                 .map_err(|e| InstallError::Download(format!("unpacking entry: {e}")))?
@@ -1680,6 +1714,11 @@ async fn untar_gz_with_limits(
     .await
     .map_err(|e| InstallError::Download(format!("unpack task: {e}")))
     .and_then(|result| result);
+    let extraction = if progress.cancelled() {
+        Err(InstallError::Cancelled)
+    } else {
+        extraction
+    };
     if let Err(error) = extraction {
         if let Err(cleanup) = std::fs::remove_dir_all(&extraction_dir)
             && extraction_dir.exists()
@@ -2070,6 +2109,7 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
 
     #[tokio::test]
     async fn untar_enforces_expanded_byte_and_entry_budgets() {
+        let progress = Arc::new(Progress::default());
         let byte_stage = tempfile::tempdir().unwrap();
         let byte_stage_path = byte_stage.path().to_path_buf();
         let byte_error = untar_gz_with_limits(
@@ -2077,6 +2117,7 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
             &byte_stage_path,
             8,
             10,
+            &progress,
         )
         .await
         .unwrap_err();
@@ -2095,6 +2136,7 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
             &entry_stage_path,
             1,
             1,
+            &progress,
         )
         .await
         .unwrap_err();
@@ -2129,10 +2171,40 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
             enc.finish().unwrap();
         }
         let dir = tempfile::tempdir().unwrap();
-        let err = untar_gz(gz, dir.path()).await.unwrap_err();
+        let progress = Arc::new(Progress::default());
+        let err = untar_gz(gz, dir.path(), &progress).await.unwrap_err();
         assert!(
             matches!(err, InstallError::Download(m) if m.contains("outside")),
             "expected a containment error"
+        );
+    }
+
+    #[tokio::test]
+    async fn untar_observes_cancellation_and_removes_the_stage() {
+        let stage = tempfile::tempdir().unwrap();
+        let stage_path = stage.path().to_path_buf();
+        let progress = Arc::new(Progress::default());
+        progress
+            .cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let contents = vec![42; 1024 * 1024];
+
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            untar_gz(
+                gzipped_tar(&[("large", contents.as_slice())]),
+                &stage_path,
+                &progress,
+            ),
+        )
+        .await
+        .expect("cancelled archive extraction did not stop promptly")
+        .unwrap_err();
+
+        assert!(matches!(error, InstallError::Cancelled));
+        assert!(
+            !stage_path.exists(),
+            "cancelled extraction retained its stage"
         );
     }
 

@@ -51,11 +51,13 @@ import {
   RED_PIXEL_PNG,
   agentMessagesContainEvidence,
   createCallbackAdmission,
+  durableReplayCheckpoints,
   inspectToolCalls,
   isNonEmptyTimestamp,
   messageRunId,
   parseConversationEvidence,
   qualificationExitCode,
+  solidPixelPng,
   startCallbackServer,
   withTimeout,
 } from "./qualify_cursor_sdk_bridge_full.mjs";
@@ -242,6 +244,45 @@ test("red-pixel fixture is a one-pixel RGBA PNG with an opaque red scanline", ()
     offset += 12 + length;
   }
   assert.deepEqual([...inflateSync(Buffer.concat(idat))], [0, 255, 0, 0, 255]);
+});
+
+test("solid-pixel image fixtures preserve their requested RGBA payload", () => {
+  const png = Buffer.from(solidPixelPng(0, 0, 255), "base64");
+  const idat = [];
+  for (let offset = 8; offset < png.length;) {
+    const length = png.readUInt32BE(offset);
+    const type = png.toString("ascii", offset + 4, offset + 8);
+    if (type === "IDAT") idat.push(png.subarray(offset + 8, offset + 8 + length));
+    offset += 12 + length;
+  }
+  assert.deepEqual([...inflateSync(Buffer.concat(idat))], [0, 0, 0, 255, 255]);
+});
+
+test("durable replay qualification rejects ambiguous offsets and probes the tail", () => {
+  assert.throws(
+    () => durableReplayCheckpoints([
+      { offset: "cursor-a" },
+      { offset: "cursor-a" },
+    ]),
+    /reused a durable offset/u,
+  );
+  assert.throws(
+    () => durableReplayCheckpoints([{ offset: "cursor-a" }]),
+    /fewer than two durable offsets/u,
+  );
+  assert.deepEqual(
+    durableReplayCheckpoints([
+      { offset: "cursor-a" },
+      { offset: "cursor-b" },
+      { step: {} },
+      { offset: "cursor-c", done: {} },
+    ]),
+    [
+      { offset: "cursor-a", index: 0 },
+      { offset: "cursor-b", index: 1 },
+      { offset: "cursor-c", index: 3 },
+    ],
+  );
 });
 
 test("subscription-health billing cycles require a real timestamp", () => {

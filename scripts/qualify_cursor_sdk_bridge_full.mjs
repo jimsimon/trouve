@@ -25,6 +25,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
 import { fileURLToPath } from "node:url";
+import { deflateSync } from "node:zlib";
 
 import {
   BRIDGE_VERSION,
@@ -61,8 +62,53 @@ const MAX_CALLBACK_BODY_BYTES = 4 * 1024 * 1024;
 const MAX_QUALIFICATION_CALLBACKS = 256;
 const MAX_QUALIFICATION_CALLBACK_CONCURRENCY = 16;
 const SCHEMA_PROBE_COUNT = 128;
-export const RED_PIXEL_PNG =
-  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
+function crc32(data) {
+  let crc = 0xffffffff;
+  for (const byte of data) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit += 1) {
+      crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1));
+    }
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function pngChunk(type, data) {
+  const typeBytes = Buffer.from(type, "ascii");
+  const length = Buffer.alloc(4);
+  length.writeUInt32BE(data.length);
+  const checksum = Buffer.alloc(4);
+  checksum.writeUInt32BE(crc32(Buffer.concat([typeBytes, data])));
+  return Buffer.concat([length, typeBytes, data, checksum]);
+}
+
+export function solidPixelPng(red, green, blue) {
+  const header = Buffer.alloc(13);
+  header.writeUInt32BE(1, 0);
+  header.writeUInt32BE(1, 4);
+  header[8] = 8;
+  header[9] = 6;
+  const scanline = deflateSync(Buffer.from([0, red, green, blue, 255]));
+  return Buffer.concat([
+    Buffer.from("89504e470d0a1a0a", "hex"),
+    pngChunk("IHDR", header),
+    pngChunk("IDAT", scanline),
+    pngChunk("IEND", Buffer.alloc(0)),
+  ]).toString("base64");
+}
+
+export const RED_PIXEL_PNG = solidPixelPng(255, 0, 0);
+
+const IMAGE_COLORS = [
+  { name: "red", rgb: [255, 0, 0] },
+  { name: "green", rgb: [0, 128, 0] },
+  { name: "blue", rgb: [0, 0, 255] },
+  { name: "yellow", rgb: [255, 255, 0] },
+  { name: "cyan", rgb: [0, 255, 255] },
+  { name: "magenta", rgb: [255, 0, 255] },
+  { name: "black", rgb: [0, 0, 0] },
+  { name: "white", rgb: [255, 255, 255] },
+];
 
 const TOOLS = {
   read: "trouve_qualification_read",
@@ -78,7 +124,7 @@ const RESULTS = {
   preRestartRead: "TROUVE_CURSOR_PRE_RESTART_OK",
   coldResumeRead: "TROUVE_CURSOR_COLD_RESUME_OK",
   denied: "TROUVE_CURSOR_PERMISSION_DENIED",
-  image: "TROUVE_CURSOR_IMAGE_OK",
+  imageDecoy: "TROUVE_CURSOR_IMAGE_TEXT_DECOY",
   parallelA: "TROUVE_CURSOR_PARALLEL_",
   parallelB: "OK",
   parallelFinal: "TROUVE_CURSOR_PARALLEL_OK",
@@ -292,6 +338,8 @@ export async function startCallbackServer(handlers, timeoutMilliseconds) {
         toolName: body.toolName,
         toolCallId: body.toolCallId,
         agentId: body.agentId,
+        args: body.args,
+        result: null,
         startedAtMs: performance.now(),
         completedAtMs: null,
         cancelledAtMs,
@@ -301,6 +349,7 @@ export async function startCallbackServer(handlers, timeoutMilliseconds) {
       };
       calls.push(record);
       const result = await handler(body.args, record);
+      record.result = result;
       record.completedAtMs = performance.now();
       record.ok = true;
       if (!response.destroyed) {
@@ -637,6 +686,8 @@ async function runTurn({
   const messageTypes = sorted(new Set(messages.map((message) => message.type)));
   return {
     frames,
+    callbacks,
+    finalText,
     summary: {
       label,
       run_id: terminal.runId ?? terminal.result?.runId,
@@ -655,6 +706,24 @@ async function runTurn({
   };
 }
 
+export function durableReplayCheckpoints(replay, label = "ObserveRun replay") {
+  const checkpoints = replay.flatMap((frame, index) =>
+    typeof frame.offset === "string" && frame.offset.length > 0
+      ? [{ offset: frame.offset, index }]
+      : []);
+  if (checkpoints.length < 2) {
+    throw new QualificationError(`${label} exposed fewer than two durable offsets`);
+  }
+  const unique = new Set(checkpoints.map(({ offset }) => offset));
+  if (unique.size !== checkpoints.length) {
+    throw new QualificationError(`${label} reused a durable offset`);
+  }
+  return [checkpoints[0], checkpoints[1], checkpoints.at(-1)].filter(
+    (checkpoint, index, selected) =>
+      selected.findIndex((candidate) => candidate.index === checkpoint.index) === index,
+  );
+}
+
 async function observeCompletedRun(bridge, runId, timeoutMilliseconds) {
   const replay = await serverStream(
     bridge,
@@ -667,39 +736,42 @@ async function observeCompletedRun(bridge, runId, timeoutMilliseconds) {
   if (!terminalStatusIsFinished(terminal.status)) {
     throw new QualificationError("ObserveRun did not replay a finished result");
   }
-  const offsets = replay
-    .map((frame) => frame.offset)
-    .filter((offset) => typeof offset === "string" && offset.length > 0);
-  if (offsets.length === 0) {
-    throw new QualificationError("ObserveRun replay omitted durable offsets");
-  }
-  const afterOffset = offsets[0];
-  const offsetIndex = replay.findIndex((frame) => frame.offset === afterOffset);
-  const expectedSuffix = replay.slice(offsetIndex + 1);
-  const resumed = await serverStream(
-    bridge,
-    "SdkAgentService",
-    "ObserveRun",
-    { runId, afterOffset },
-    timeoutMilliseconds,
-  );
-  const resumedOffsets = resumed
-    .map((frame) => frame.offset)
-    .filter((offset) => typeof offset === "string" && offset.length > 0);
-  if (resumedOffsets.includes(afterOffset)) {
-    throw new QualificationError("ObserveRun afterOffset was not exclusive");
-  }
-  if (JSON.stringify(resumed) !== JSON.stringify(expectedSuffix)) {
-    throw new QualificationError(
-      "ObserveRun afterOffset did not return the exact replay suffix",
+  const checkpoints = durableReplayCheckpoints(replay);
+  for (const { offset: afterOffset, index } of checkpoints) {
+    const expectedSuffix = replay.slice(index + 1);
+    const resumed = await serverStream(
+      bridge,
+      "SdkAgentService",
+      "ObserveRun",
+      { runId, afterOffset },
+      timeoutMilliseconds,
     );
-  }
-  if (resumed.filter((frame) => frame.done !== undefined).length !== 1) {
-    throw new QualificationError("resumed ObserveRun replay did not contain exactly one done");
+    const resumedOffsets = resumed
+      .map((frame) => frame.offset)
+      .filter((offset) => typeof offset === "string" && offset.length > 0);
+    if (resumedOffsets.includes(afterOffset)) {
+      throw new QualificationError("ObserveRun afterOffset was not exclusive");
+    }
+    if (JSON.stringify(resumed) !== JSON.stringify(expectedSuffix)) {
+      throw new QualificationError(
+        "ObserveRun afterOffset did not return the exact replay suffix",
+      );
+    }
+    const expectedDone = expectedSuffix.filter((frame) => frame.done !== undefined).length;
+    const resumedDone = resumed.filter((frame) => frame.done !== undefined).length;
+    if (resumedDone !== expectedDone) {
+      throw new QualificationError(
+        "resumed ObserveRun replay changed the terminal-frame count",
+      );
+    }
   }
   return {
     full_replay: true,
-    durable_offsets: offsets.length,
+    durable_offsets: replay.filter(
+      (frame) => typeof frame.offset === "string" && frame.offset.length > 0,
+    ).length,
+    unique_offsets: true,
+    resume_offsets_tested: checkpoints.length,
     exclusive_offset_resume: true,
   };
 }
@@ -1067,6 +1139,23 @@ async function fullQualification(args) {
   let activeReads = 0;
   let maxActiveReads = 0;
   let blockControl = null;
+  const inputColorIndex = randomBytes(1)[0] % IMAGE_COLORS.length;
+  const resultColorIndex =
+    (inputColorIndex + 1 + (randomBytes(1)[0] % (IMAGE_COLORS.length - 1))) %
+    IMAGE_COLORS.length;
+  const inputColor = IMAGE_COLORS[inputColorIndex];
+  const resultColor = IMAGE_COLORS[resultColorIndex];
+  const imageNonce = `cursor-${randomBytes(12).toString("hex")}`;
+  const inputImage = solidPixelPng(...inputColor.rgb);
+  const resultImage = solidPixelPng(...resultColor.rgb);
+  const expectedImageEvidence = `${imageNonce}:${resultColor.name}`;
+  const expectedImageResult = {
+    content: [
+      { type: "text", text: RESULTS.imageDecoy },
+      { type: "image", data: resultImage, mimeType: "image/png" },
+    ],
+    structuredContent: { nonce: imageNonce },
+  };
   const handlers = new Map();
   handlers.set(TOOLS.read, async (input) => {
     const result = new Map([
@@ -1085,16 +1174,10 @@ async function fullQualification(args) {
     structuredContent: { permission: "denied", owner: "trouve" },
   }));
   handlers.set(TOOLS.image, async (input) => {
-    if (input.token !== "red") {
+    if (input.token !== inputColor.name) {
       throw new QualificationError("image callback did not identify the attached image");
     }
-    return {
-      content: [
-        { type: "text", text: RESULTS.image },
-        { type: "image", data: RED_PIXEL_PNG, mimeType: "image/png" },
-      ],
-      structuredContent: { result: RESULTS.image, width: 1, height: 1 },
-    };
+    return expectedImageResult;
   });
   const delayedRead = (value) => async () => {
     activeReads += 1;
@@ -1342,20 +1425,33 @@ async function fullQualification(args) {
       label: "image-input-observation-and-tool-result-images",
       prompt:
         `Inspect the attached image, then call ${TOOLS.image} exactly once with ` +
-        `{"token":"<color>"}, replacing <color> with the single lowercase English ` +
-        `name of its dominant pixel color. Do not call the tool if the image is unavailable. ` +
-        `Accept its text, structured, and image content, then reply only with ` +
-        `the structured result field.`,
+        `{"token":"<color>"}, replacing <color> with exactly one of ` +
+        `${IMAGE_COLORS.map(({ name }) => name).join(", ")} according to its pixel color. ` +
+        `Do not call the tool if the image is unavailable. The tool result contains a text ` +
+        `decoy, a structured nonce, and another image. Ignore the text decoy and reply only ` +
+        `with <nonce>:<tool-result-image-color>, copying the structured nonce exactly and ` +
+        `choosing the second image's color from the same list.`,
       images: [
         {
-          data: { data: RED_PIXEL_PNG, mimeType: "image/png" },
+          data: { data: inputImage, mimeType: "image/png" },
           dimension: { width: 1, height: 1 },
         },
       ],
       expectedTools: [TOOLS.image],
-      expectedText: RESULTS.image,
+      expectedText: expectedImageEvidence,
       timeoutMilliseconds,
     });
+    if (
+      imageTurn.callbacks.length !== 1 ||
+      JSON.stringify(imageTurn.callbacks[0].args) !==
+        JSON.stringify({ token: inputColor.name }) ||
+      JSON.stringify(imageTurn.callbacks[0].result) !== JSON.stringify(expectedImageResult) ||
+      imageTurn.finalText.trim() !== expectedImageEvidence
+    ) {
+      throw new QualificationError(
+        "image qualification did not preserve exact request, structured, and image evidence",
+      );
+    }
     turns.push(imageTurn.summary);
 
     const parallelTurn = await runTurn({
@@ -1613,9 +1709,11 @@ async function fullQualification(args) {
         host_denied_is_error_result: "passed",
         host_denied_terminal_stream_event:
           deniedTurn.summary.terminal_stream_events_complete,
-        input_image_request_completed: true,
-        tool_result_text_structured_image_callback_completed: true,
-        image_payload_consumption_claimed: false,
+        input_image_payload_consumed: true,
+        tool_result_structured_content_consumed: true,
+        tool_result_image_payload_consumed: true,
+        tool_result_text_decoy_ignored: true,
+        image_challenge_palette_size: IMAGE_COLORS.length,
         parallel_read_callbacks: maxActiveReads >= 2,
         max_parallel_read_callbacks: maxActiveReads,
       },

@@ -117,6 +117,10 @@ const TOOL_CANCEL_CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::fr
 const BACKEND_RETIREMENT_TIMEOUT: Duration = Duration::from_secs(30);
 const BACKEND_RETIREMENT_RETRY_INITIAL: Duration = Duration::from_secs(1);
 const BACKEND_RETIREMENT_RETRY_MAX: Duration = Duration::from_secs(30);
+#[cfg(not(test))]
+const API_PROVIDER_REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const API_PROVIDER_REFRESH_TIMEOUT: Duration = Duration::from_millis(250);
 const RUNTIME_UNINSTALL_LEASE_RETRIES: usize = 4;
 const RUNTIME_UNINSTALL_LEASE_RETRY_DELAY: Duration = Duration::from_millis(25);
 
@@ -4995,9 +4999,19 @@ impl Engine {
             self.persist_config(&config);
         };
         // API-backed providers have no backend instance for retirement to
-        // detach. Remove the live request path as soon as the durable config
-        // commit succeeds instead of leaving it callable during keychain I/O.
-        self.providers.write().unwrap().remove(id);
+        // detach. Remove the config-owned request path as soon as the durable
+        // config commit succeeds instead of leaving it callable during
+        // keychain I/O. A programmatically injected provider with the same id
+        // is an independent overlay and must remain continuously available.
+        let injected = self.injected_providers.lock().unwrap().get(id).cloned();
+        {
+            let mut providers = self.providers.write().unwrap();
+            if let Some(injected) = injected {
+                providers.insert(id.to_string(), injected);
+            } else {
+                providers.remove(id);
+            }
+        }
         // The durable definition is now gone. Keep only the provider-scoped
         // fences while slow keychain cleanup finishes so unrelated exclusive
         // runtime transitions and registry refreshes can proceed.
@@ -7627,17 +7641,7 @@ impl Engine {
     /// backends. Local/title-model lifecycle changes historically refreshed
     /// provider metadata, but they do not change any agent runtime.
     async fn refresh_api_provider_registry(self: &Arc<Self>) {
-        let transition = self.provider_reload.clone().write_owned().await;
-        let engine = Arc::clone(self);
-        tokio::task::spawn_blocking(move || {
-            let _transition = transition;
-            engine.refresh_api_provider_registry_locked();
-        })
-        .await
-        .expect("API provider registry refresh task failed");
-    }
-
-    fn refresh_api_provider_registry_locked(&self) {
+        let _transition = self.provider_reload.clone().write_owned().await;
         let config = self.config.lock().unwrap().clone();
         let injected = self.injected_providers.lock().unwrap().clone();
         let mut target_ids = config.providers.keys().cloned().collect::<HashSet<_>>();
@@ -7670,12 +7674,32 @@ impl Engine {
             }
         }
 
-        let mut replacements = build_providers_for_ids(
-            &config,
-            &self.secrets,
-            &self.model_catalog,
-            Some(&refresh_ids),
-        );
+        // Secret-store access can block in OS keychain implementations. Build
+        // from owned snapshots off-runtime, but keep publication in this
+        // supervised async scope. If the blocking task exceeds its deadline,
+        // dropping this scope releases both the global barrier and provider
+        // guards; a late result has no path back into the live registry.
+        let secrets = self.secrets.clone();
+        let model_catalog = self.model_catalog.clone();
+        let build_ids = refresh_ids.clone();
+        let build = tokio::task::spawn_blocking(move || {
+            build_providers_for_ids(&config, &secrets, &model_catalog, Some(&build_ids))
+        });
+        let mut replacements = match tokio::time::timeout(API_PROVIDER_REFRESH_TIMEOUT, build).await
+        {
+            Ok(Ok(replacements)) => replacements,
+            Ok(Err(error)) => {
+                tracing::error!(%error, "API provider registry refresh task failed");
+                return;
+            }
+            Err(_) => {
+                tracing::warn!(
+                    timeout_seconds = API_PROVIDER_REFRESH_TIMEOUT.as_secs_f32(),
+                    "API provider registry refresh exceeded its deadline"
+                );
+                return;
+            }
+        };
         let mut providers = self.providers.write().unwrap();
         for id in &refresh_ids {
             match injected
@@ -31352,6 +31376,68 @@ default_permission_mode = "ask"
             .expect("API provider refresh task failed");
     }
 
+    #[tokio::test]
+    async fn api_provider_refresh_releases_its_barrier_after_blocking_io_times_out() {
+        const ID: &str = "timed-out-refresh";
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            ID.into(),
+            ProviderConfig {
+                kind: "openai-compat".into(),
+                base_url: Some("https://example.test/v1".into()),
+                ..Default::default()
+            },
+        );
+        let (secret_store, mut read_started_rx) = BlockingReadProviderSecretStore::new();
+        let secret_store = Arc::new(secret_store);
+        let mut engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        );
+        engine.secrets = secret_store.clone();
+        let engine = Arc::new(engine);
+        let published: Arc<dyn Provider> = Arc::new(CatalogTestProvider::new(Arc::new(
+            std::sync::atomic::AtomicUsize::new(0),
+        )));
+        engine
+            .providers
+            .write()
+            .unwrap()
+            .insert(ID.into(), published.clone());
+        let mut refresh = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.refresh_api_provider_registry().await }
+        });
+
+        observe_blocked_secret_read(
+            &secret_store,
+            &mut read_started_rx,
+            &mut refresh,
+            "timed API provider refresh",
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(1), &mut refresh)
+            .await
+            .expect("API provider refresh did not honor its blocking-I/O deadline")
+            .expect("API provider refresh task failed");
+        let transition = tokio::time::timeout(
+            Duration::from_millis(100),
+            engine.provider_reload.clone().write_owned(),
+        )
+        .await
+        .expect("timed-out API refresh retained the global provider barrier");
+        drop(transition);
+
+        secret_store.release_read();
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(Arc::ptr_eq(
+            &engine.providers.read().unwrap()[ID],
+            &published
+        ));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancelled_provider_secret_write_retains_transition_until_rollback() {
         let data = tempfile::tempdir().unwrap();
@@ -32522,6 +32608,63 @@ default_permission_mode = "ask"
     }
 
     #[tokio::test]
+    async fn retained_cleanup_retires_the_active_generation_before_publication() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            "cursor".into(),
+            ProviderConfig {
+                kind: "cursor-sdk".into(),
+                ..Default::default()
+            },
+        );
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        ));
+        let retained = Arc::new(TransientShutdownBackend {
+            shutdowns: std::sync::atomic::AtomicUsize::new(1),
+        });
+        let active = Arc::new(TransientShutdownBackend {
+            shutdowns: std::sync::atomic::AtomicUsize::new(1),
+        });
+        let retained_backend: Arc<dyn AgentBackend> = retained.clone();
+        let active_backend: Arc<dyn AgentBackend> = active.clone();
+        engine
+            .retiring_backends
+            .lock()
+            .unwrap()
+            .insert("cursor".into(), vec![retained_backend]);
+        engine
+            .backends
+            .write()
+            .unwrap()
+            .insert("cursor".into(), active_backend);
+
+        let retirement = engine
+            .retire_config_backends_matching_ids_with_timeout(
+                &HashSet::from(["cursor".to_string()]),
+                Duration::from_secs(1),
+            )
+            .await
+            .expect("retained and active generations did not retire");
+
+        assert_eq!(
+            retained.shutdowns.load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+        assert_eq!(
+            active.shutdowns.load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+        assert!(engine.retiring_backends.lock().unwrap().is_empty());
+        assert!(!engine.backends.read().unwrap().contains_key("cursor"));
+        retirement.publish().await.unwrap();
+        assert!(engine.backends.read().unwrap().contains_key("cursor"));
+    }
+
+    #[tokio::test]
     async fn runtime_teardown_only_stops_matching_config_backends() {
         let data = tempfile::tempdir().unwrap();
         let mut config = Config::default();
@@ -33018,6 +33161,61 @@ default_permission_mode = "ask"
             "secret deletion retained the global provider reload barrier"
         );
         assert!(!engine.config.lock().unwrap().providers.contains_key(ID));
+    }
+
+    #[tokio::test]
+    async fn provider_delete_preserves_a_same_id_injected_provider_during_secret_cleanup() {
+        const ID: &str = "injected-delete";
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            ID.into(),
+            ProviderConfig {
+                kind: "openai-compat".into(),
+                ..Default::default()
+            },
+        );
+        let secret_store = Arc::new(BlockingProviderSecretStore::new(ID));
+        let injected: Arc<dyn Provider> = Arc::new(CatalogTestProvider::new(Arc::new(
+            std::sync::atomic::AtomicUsize::new(0),
+        )));
+        let mut engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        );
+        engine.secrets = secret_store.clone();
+        let engine = Arc::new(engine.with_provider(ID, injected.clone()));
+        let (delete_started_tx, delete_started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let releaser = {
+            let secret_store = secret_store.clone();
+            std::thread::spawn(move || {
+                secret_store.delete_started.wait();
+                let _ = delete_started_tx.send(());
+                release_rx.recv().unwrap();
+                secret_store.allow_delete.wait();
+            })
+        };
+        let deleting = {
+            let engine = engine.clone();
+            tokio::spawn(async move { engine.delete_provider(ID).await })
+        };
+
+        delete_started_rx.await.unwrap();
+        assert!(!engine.config.lock().unwrap().providers.contains_key(ID));
+        assert!(Arc::ptr_eq(
+            &engine.providers.read().unwrap()[ID],
+            &injected
+        ));
+
+        release_tx.send(()).unwrap();
+        deleting.await.unwrap().unwrap();
+        releaser.join().unwrap();
+        assert!(Arc::ptr_eq(
+            &engine.providers.read().unwrap()[ID],
+            &injected
+        ));
     }
 
     #[test]

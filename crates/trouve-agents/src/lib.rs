@@ -18,7 +18,7 @@ mod login;
 pub mod process_env;
 mod route;
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -29,6 +29,11 @@ use futures::stream::BoxStream;
 use trouve_protocol::{ModelInfo, Usage};
 
 pub use login::{spawn_claude_login, spawn_codex_login, spawn_login};
+
+#[cfg(not(test))]
+const BACKEND_TURN_DRAIN_TIMEOUT: Duration = Duration::from_secs(20);
+#[cfg(test)]
+const BACKEND_TURN_DRAIN_TIMEOUT: Duration = Duration::from_millis(25);
 
 /// Permission posture for a backend turn, folded down from trouve's
 /// permission mode + agent mode (read-only) for the thread.
@@ -535,7 +540,8 @@ pub trait AgentBackend: Send + Sync {
 #[derive(Default)]
 struct BackendTurnActivityState {
     retiring: bool,
-    active: usize,
+    next_id: u64,
+    active: HashMap<u64, tokio_util::sync::CancellationToken>,
 }
 
 #[derive(Default)]
@@ -545,21 +551,32 @@ struct BackendTurnActivity {
 }
 
 impl BackendTurnActivity {
-    fn enter(self: &Arc<Self>, backend_id: &str) -> Result<BackendTurnActivityGuard, BackendError> {
+    fn enter(
+        self: &Arc<Self>,
+        backend_id: &str,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<BackendTurnActivityGuard, BackendError> {
         let mut state = self.state.lock().unwrap();
         if state.retiring {
             return Err(BackendError::Protocol(format!(
                 "{backend_id} is being replaced; retry the turn"
             )));
         }
-        state.active += 1;
+        let mut id = state.next_id;
+        while state.active.contains_key(&id) {
+            id = id.wrapping_add(1);
+        }
+        state.next_id = id.wrapping_add(1);
+        state.active.insert(id, cancel);
         drop(state);
         Ok(BackendTurnActivityGuard {
             activity: Arc::clone(self),
+            id,
         })
     }
 
-    async fn begin_retirement(&self) {
+    async fn begin_retirement(&self, backend_id: &str) {
+        let deadline = tokio::time::Instant::now() + BACKEND_TURN_DRAIN_TIMEOUT;
         loop {
             let idle = self.idle.notified();
             tokio::pin!(idle);
@@ -570,26 +587,46 @@ impl BackendTurnActivity {
             let active = {
                 let mut state = self.state.lock().unwrap();
                 state.retiring = true;
-                state.active
+                state.active.len()
             };
             if active == 0 {
                 return;
             }
-            idle.await;
+            if tokio::time::timeout_at(deadline, idle).await.is_err() {
+                let cancellations = self
+                    .state
+                    .lock()
+                    .unwrap()
+                    .active
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                tracing::warn!(
+                    backend_id,
+                    active_turns = cancellations.len(),
+                    drain_timeout_seconds = BACKEND_TURN_DRAIN_TIMEOUT.as_secs_f32(),
+                    "backend retirement cancelled turns that did not drain before the deadline"
+                );
+                for cancel in cancellations {
+                    cancel.cancel();
+                }
+                return;
+            }
         }
     }
 }
 
 struct BackendTurnActivityGuard {
     activity: Arc<BackendTurnActivity>,
+    id: u64,
 }
 
 impl Drop for BackendTurnActivityGuard {
     fn drop(&mut self) {
         let mut state = self.activity.state.lock().unwrap();
-        debug_assert!(state.active > 0);
-        state.active = state.active.saturating_sub(1);
-        let idle = state.active == 0;
+        let removed = state.active.remove(&self.id);
+        debug_assert!(removed.is_some());
+        let idle = state.active.is_empty();
         drop(state);
         if idle {
             self.activity.idle.notify_waiters();
@@ -646,7 +683,7 @@ impl AgentBackend for RetirementAwareBackend {
     }
 
     async fn shutdown(&self) -> Result<(), BackendError> {
-        self.activity.begin_retirement().await;
+        self.activity.begin_retirement(self.id()).await;
         self.inner.shutdown().await
     }
 
@@ -667,7 +704,7 @@ impl AgentBackend for RetirementAwareBackend {
     }
 
     async fn run_turn(&self, turn: BackendTurn) -> Result<BackendEventStream, BackendError> {
-        let activity = self.activity.enter(self.id())?;
+        let activity = self.activity.enter(self.id(), turn.cancel.clone())?;
         let stream = self.inner.run_turn(turn).await?;
         Ok(Box::pin(
             futures::stream::unfold(
@@ -1484,6 +1521,28 @@ mod tests {
         // Keep the exhausted handle alive through the assertion: EOF, not
         // destruction of the wrapper, must release the activity guard.
         assert!(exhausted.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn retirement_cancels_a_stream_retained_past_the_drain_deadline() {
+        let inner = Arc::new(DrainingTestBackend {
+            shutdowns: std::sync::atomic::AtomicUsize::new(0),
+            completes_immediately: false,
+        });
+        let backend = Arc::new(RetirementAwareBackend::new(inner.clone()));
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut turn = draining_test_turn();
+        turn.cancel = cancel.clone();
+        let stream = backend.run_turn(turn).await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), backend.shutdown())
+            .await
+            .expect("backend shutdown remained blocked behind a retained stream")
+            .expect("backend shutdown failed");
+
+        assert!(cancel.is_cancelled());
+        assert_eq!(inner.shutdowns.load(std::sync::atomic::Ordering::SeqCst), 1);
+        drop(stream);
     }
 
     #[tokio::test]
