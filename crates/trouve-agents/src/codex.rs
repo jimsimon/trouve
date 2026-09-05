@@ -395,7 +395,7 @@ impl AgentBackend for CodexBackend {
             (Some(sid), false) => sid.clone(),
             (Some(sid), true) => {
                 let resumed = server
-                    .request_effect_cancellable(
+                    .request_orphanable_effect_cancellable(
                         "thread/resume",
                         with_thread_settings(json!({ "threadId": sid })),
                         &cancel,
@@ -415,7 +415,7 @@ impl AgentBackend for CodexBackend {
                         }
                         fresh_session = true;
                         let v = server
-                            .request_effect_cancellable(
+                            .request_orphanable_effect_cancellable(
                                 "thread/start",
                                 start_params.clone(),
                                 &cancel,
@@ -428,7 +428,11 @@ impl AgentBackend for CodexBackend {
             (None, _) => {
                 fresh_session = true;
                 let v = server
-                    .request_effect_cancellable("thread/start", start_params.clone(), &cancel)
+                    .request_orphanable_effect_cancellable(
+                        "thread/start",
+                        start_params.clone(),
+                        &cancel,
+                    )
                     .await?;
                 server.validated_thread_id("thread/start", &v, None).await?
             }
@@ -2136,6 +2140,24 @@ const THREAD_UNSUBSCRIBE_TIMEOUT: std::time::Duration = std::time::Duration::fro
 const TRANSPORT_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const CHILD_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// What a request's transmitted bytes commit the app-server to, which decides
+/// how losing its response is handled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RequestFence {
+    /// Read-only or idempotent: cancellation and timeouts simply abandon the
+    /// response.
+    None,
+    /// The effect can act on a live turn (steer, unsubscribe). Once written
+    /// the exact response is awaited, and losing it retires the shared
+    /// transport so the effect cannot land on a replacement.
+    Effect,
+    /// The effect creates or loads a thread whose id only the response
+    /// carries (thread/start, thread/resume). Losing the response strands
+    /// that thread where nothing can address it, so only this request fails
+    /// and the transport keeps serving its other turns.
+    OrphanableEffect,
+}
+
 #[derive(Default)]
 struct CompletedTurnState {
     turns: HashSet<(String, String)>,
@@ -3773,7 +3795,7 @@ impl AppServer {
             "thread/unsubscribe",
             json!({ "threadId": thread_id }),
             None,
-            true,
+            RequestFence::Effect,
             THREAD_UNSUBSCRIBE_TIMEOUT,
         )
         .await
@@ -3960,7 +3982,8 @@ impl AppServer {
     }
 
     async fn request(&self, method: &str, params: Value) -> Result<Value, BackendError> {
-        self.request_with_cancel(method, params, None, false).await
+        self.request_with_cancel(method, params, None, RequestFence::None)
+            .await
     }
 
     async fn request_cancellable(
@@ -3969,7 +3992,7 @@ impl AppServer {
         params: Value,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<Value, BackendError> {
-        self.request_with_cancel(method, params, Some(cancel), false)
+        self.request_with_cancel(method, params, Some(cancel), RequestFence::None)
             .await
     }
 
@@ -3986,7 +4009,28 @@ impl AppServer {
             method,
             params,
             Some(cancel),
-            true,
+            RequestFence::Effect,
+            REQUEST_RESPONSE_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Like [`Self::request_effect_cancellable`] for effects whose only
+    /// lasting result is a thread this side never learns the id of when the
+    /// response is lost. Such a thread is unreachable rather than dangerous,
+    /// so a slow or missing response fails this request without retiring
+    /// the app-server under every other turn it is streaming.
+    async fn request_orphanable_effect_cancellable(
+        &self,
+        method: &str,
+        params: Value,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<Value, BackendError> {
+        self.request_with_cancel_timeout(
+            method,
+            params,
+            Some(cancel),
+            RequestFence::OrphanableEffect,
             REQUEST_RESPONSE_TIMEOUT,
         )
         .await
@@ -4085,16 +4129,10 @@ impl AppServer {
         method: &str,
         params: Value,
         cancel: Option<&tokio_util::sync::CancellationToken>,
-        fence_after_write: bool,
+        fence: RequestFence,
     ) -> Result<Value, BackendError> {
-        self.request_with_cancel_timeout(
-            method,
-            params,
-            cancel,
-            fence_after_write,
-            REQUEST_RESPONSE_TIMEOUT,
-        )
-        .await
+        self.request_with_cancel_timeout(method, params, cancel, fence, REQUEST_RESPONSE_TIMEOUT)
+            .await
     }
 
     async fn request_with_cancel_timeout(
@@ -4102,7 +4140,7 @@ impl AppServer {
         method: &str,
         params: Value,
         cancel: Option<&tokio_util::sync::CancellationToken>,
-        fence_after_write: bool,
+        fence: RequestFence,
         response_timeout: std::time::Duration,
     ) -> Result<Value, BackendError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
@@ -4129,9 +4167,13 @@ impl AppServer {
             }
             return Err(error);
         }
+        // `closed` distinguishes a reader that exited (the response can never
+        // arrive) from a response that is merely late.
+        let closed = std::sync::atomic::AtomicBool::new(false);
         let response = async {
             match tokio::time::timeout(response_timeout, rx).await {
                 Ok(response) => response.map_err(|_| {
+                    closed.store(true, Ordering::Relaxed);
                     BackendError::Protocol(format!("{method}: app-server closed before responding"))
                 }),
                 Err(_) => Err(BackendError::Protocol(format!(
@@ -4140,7 +4182,7 @@ impl AppServer {
                 ))),
             }
         };
-        let response = if fence_after_write {
+        let response = if fence == RequestFence::Effect {
             // Once the complete request has been flushed, its vendor-side
             // effect may already be committed. Fence the exact response
             // instead of reporting that a transmitted effect never happened.
@@ -4155,14 +4197,32 @@ impl AppServer {
                 None => response.await,
             }
         };
-        if response.is_err() && fence_after_write {
+        if response.is_err()
+            && (fence == RequestFence::Effect
+                || (fence == RequestFence::OrphanableEffect && closed.load(Ordering::Relaxed)))
+        {
             // A transmitted effect with no exact response has an ambiguous
             // vendor-side outcome. Invalidate and reap the shared app-server
-            // before returning so a late start/resume/steer cannot surface on
+            // before returning so a late steer/unsubscribe cannot surface on
             // a replacement turn or share its transport with later requests.
+            // An orphanable effect only gets here once the reader is gone,
+            // where reaping the dead process tree lets a replacement spawn.
             self.terminate_transport().await?;
         } else if response.is_err() {
+            // Dropping the pending slot makes the reader discard a late
+            // response. For an orphanable effect that is the whole story:
+            // the thread it may still create is never named to this side,
+            // so it can never be resumed or steered, and the turns sharing
+            // the transport keep streaming. Only this request fails.
             self.pending.lock().await.remove(&id);
+            if fence == RequestFence::OrphanableEffect
+                && !matches!(response, Err(BackendError::Cancelled))
+            {
+                tracing::warn!(
+                    "codex: {method} went unanswered on a shared app-server; any thread it \
+                     created is orphaned"
+                );
+            }
         }
         match response? {
             Ok(v) => Ok(v),
@@ -6480,7 +6540,7 @@ for line in sys.stdin:
                 "thread/start",
                 json!({}),
                 Some(&cancel),
-                true,
+                RequestFence::Effect,
                 std::time::Duration::from_millis(250),
             )
             .await
@@ -6525,7 +6585,7 @@ for line in sys.stdin:
                     "thread/start",
                     json!({}),
                     Some(&tokio_util::sync::CancellationToken::new()),
-                    true,
+                    RequestFence::Effect,
                     std::time::Duration::from_secs(1),
                 )
                 .await
@@ -6576,7 +6636,7 @@ for line in sys.stdin:
                     "thread/turns/list",
                     Value::Null,
                     Some(&cancel),
-                    false,
+                    RequestFence::None,
                     std::time::Duration::from_millis(25),
                 )
                 .await,
@@ -6593,7 +6653,7 @@ for line in sys.stdin:
                     "account/rateLimits/read",
                     Value::Null,
                     None,
-                    false,
+                    RequestFence::None,
                     std::time::Duration::from_secs(1),
                 )
                 .await
@@ -6601,6 +6661,89 @@ for line in sys.stdin:
             2
         );
         assert!(!server.is_closed());
+        server.terminate_transport().await.unwrap();
+    }
+
+    /// A `thread/start` that the app-server has not answered strands at most
+    /// one thread nobody can reach. It must fail alone: on a shared
+    /// app-server the same timeout used to retire the transport under every
+    /// streaming turn, so one slow start took a whole review fan-out down.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn unanswered_thread_start_fails_alone_and_keeps_the_app_server() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let stub = temp.path().join("codex-orphan-start");
+        std::fs::write(
+            &stub,
+            r#"#!/usr/bin/env python3
+import json, sys
+starts = 0
+for line in sys.stdin:
+    msg = json.loads(line)
+    method = msg.get("method")
+    mid = msg.get("id")
+    if method == "initialize":
+        result = {}
+    elif method == "notifications/initialized":
+        continue
+    elif method == "thread/start":
+        starts += 1
+        if starts == 1:
+            # Swallow the first start: its thread is created but never answered.
+            continue
+        result = {"thread": {"id": "answered-thread-%d" % starts}}
+    else:
+        result = {"starts": starts}
+    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": mid, "result": result}) + "\n")
+    sys.stdout.flush()
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let backend = CodexBackend::new("codex", Some(stub.to_string_lossy().into_owned()));
+        let server = backend.server().await.unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let error = server
+            .request_with_cancel_timeout(
+                "thread/start",
+                json!({}),
+                Some(&cancel),
+                RequestFence::OrphanableEffect,
+                std::time::Duration::from_millis(250),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, BackendError::Protocol(message) if message.contains("no response")),
+            "unexpected error: {error}"
+        );
+        assert!(
+            !server.is_closed(),
+            "an unanswered thread/start retired the shared transport"
+        );
+        assert!(
+            server.pending.lock().await.is_empty(),
+            "the unanswered start kept its pending slot"
+        );
+        // The same process keeps serving both new starts and other requests.
+        assert_eq!(
+            server
+                .request_orphanable_effect_cancellable("thread/start", json!({}), &cancel)
+                .await
+                .unwrap()["thread"]["id"],
+            "answered-thread-2"
+        );
+        assert_eq!(
+            server
+                .request("account/rateLimits/read", Value::Null)
+                .await
+                .unwrap()["starts"],
+            2
+        );
+        assert!(Arc::ptr_eq(&server, &backend.server().await.unwrap()));
         server.terminate_transport().await.unwrap();
     }
 

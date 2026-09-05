@@ -601,6 +601,14 @@ const MAX_ACTIVE_DESCENDANTS: usize = 16;
 /// Permits are released before model dispatch, so this does not cap active
 /// reviewer turns.
 const PLANNED_TURN_SETUP_CONCURRENCY: usize = 24;
+/// Bounds concurrent vendor-side turn startups per agent backend. A shared
+/// app-server (Codex) admits `thread/start` roughly serially, so an
+/// unbounded burst queues every start behind the others until the tail
+/// exceeds the backend's fixed response timeout and fails. Keeping the
+/// queue shallow keeps every start well inside that timeout. The permit is
+/// released once the vendor has accepted the turn, so this paces startups
+/// without capping active turns.
+const BACKEND_TURN_STARTUP_CONCURRENCY: usize = 4;
 const REMOVED_TURN_CONCURRENCY_ENVS: [&str; 4] = [
     "TROUVE_TURN_CONCURRENCY",
     "TROUVE_BACKGROUND_TURN_CONCURRENCY",
@@ -1228,9 +1236,12 @@ struct ProviderBackoff {
 /// Provider throttle state shared by interactive desktop turns, spawned
 /// agents, and background review personas. Turns are otherwise admitted
 /// immediately: desktop engines rely on provider capacity, while the review
-/// service bounds work through its configurable job scheduler.
+/// service bounds work through its configurable job scheduler. Vendor-side
+/// turn startup is paced per agent backend so a burst cannot outrun a
+/// shared vendor process's request timeout.
 struct TurnScheduler {
     planned_setups: Arc<tokio::sync::Semaphore>,
+    backend_startups: Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
     providers: Mutex<HashMap<String, ProviderTurnCapacity>>,
 }
 
@@ -1250,6 +1261,7 @@ impl TurnScheduler {
         }
         Self {
             planned_setups: Arc::new(tokio::sync::Semaphore::new(PLANNED_TURN_SETUP_CONCURRENCY)),
+            backend_startups: Mutex::new(HashMap::new()),
             providers: Mutex::new(HashMap::new()),
         }
     }
@@ -1263,6 +1275,34 @@ impl TurnScheduler {
             _ = cancel.cancelled() => bail!("turn setup cancelled"),
             permit = self.planned_setups.clone().acquire_owned() => {
                 permit.map_err(|_| anyhow!("turn setup scheduler closed"))
+            }
+        }
+    }
+
+    /// Wait for a vendor turn-startup slot on `backend_id`. Hold the permit
+    /// across the backend's `run_turn` and drop it as soon as the vendor has
+    /// accepted the turn.
+    async fn acquire_backend_startup(
+        &self,
+        backend_id: &str,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit> {
+        let lane = self
+            .backend_startups
+            .lock()
+            .unwrap()
+            .entry(backend_id.to_owned())
+            .or_insert_with(|| {
+                Arc::new(tokio::sync::Semaphore::new(
+                    BACKEND_TURN_STARTUP_CONCURRENCY,
+                ))
+            })
+            .clone();
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => bail!("turn cancelled"),
+            permit = lane.acquire_owned() => {
+                permit.map_err(|_| anyhow!("backend startup scheduler closed"))
             }
         }
     }
@@ -12613,26 +12653,13 @@ impl Engine {
             guard = session_lifecycle.read() => guard,
         };
         let admission = self.turn_scheduler.admit(&thread.model, &cancel).await?;
-        if background
-            && let Some(progress) = self
-                .store
-                .set_code_review_task_provider_wait(&thread.id, admission.provider_wait_ms)?
-        {
-            self.emit_code_review_task_progress(progress).await?;
-        }
-        self.store
-            .append_event_async(
-                scope.clone(),
-                Event::TurnAdmitted {
-                    turn,
-                    provider_wait_ms: admission.provider_wait_ms,
-                },
-            )
-            .await?;
 
         // External agent backend? The vendor harness owns the loop; we
         // stream its events and bridge approvals. The shared lifecycle lease
         // stays held; mutation tools take the exclusive execution lane.
+        // Admission is published there, once the backend's startup lane has
+        // also been passed, so the reported wait covers every queue the turn
+        // stood in before the vendor saw it.
         if let Some((backend_id, backend, model_name)) = self.backend_for(&thread.model) {
             return self
                 .run_backend_turn(
@@ -12649,11 +12676,14 @@ impl Engine {
                     &prompt.id,
                     tools_enabled,
                     prompt.background,
+                    admission.provider_wait_ms,
                     turn_steer_rx,
                     turn_steer_mutation_lane_state,
                 )
                 .await;
         }
+        self.publish_turn_admission(thread, turn, background, admission.provider_wait_ms)
+            .await?;
 
         let (provider, model_name) = self
             .resolve_provider(&thread.model)
@@ -14730,6 +14760,36 @@ impl Engine {
         Ok(())
     }
 
+    /// Publish that every queue between dispatch and the vendor has been
+    /// passed. `provider_wait_ms` is the total time the turn spent in them;
+    /// a code-review task records it before the thread event is visible so
+    /// observers never see admission without the wait that preceded it.
+    async fn publish_turn_admission(
+        &self,
+        thread: &Thread,
+        turn: u64,
+        automated_review: bool,
+        provider_wait_ms: u64,
+    ) -> Result<()> {
+        if automated_review
+            && let Some(progress) = self
+                .store
+                .set_code_review_task_provider_wait(&thread.id, provider_wait_ms)?
+        {
+            self.emit_code_review_task_progress(progress).await?;
+        }
+        self.store
+            .append_event_async(
+                Scope::Thread(thread.id.clone()),
+                Event::TurnAdmitted {
+                    turn,
+                    provider_wait_ms,
+                },
+            )
+            .await?;
+        Ok(())
+    }
+
     /// Run one turn through an external agent backend. The vendor harness
     /// plans, calls tools, and edits the worktree; we persist its events,
     /// gate its approval requests through our permission layer, and keep the
@@ -14753,6 +14813,7 @@ impl Engine {
         queued_prompt_id: &str,
         tools_enabled: bool,
         attach_background: bool,
+        provider_wait_ms: u64,
         mut steer_rx: Option<tokio::sync::mpsc::Receiver<SteerTurnCommand>>,
         steer_mutation_lane_state: tokio::sync::watch::Sender<SteerMutationLaneState>,
     ) -> Result<()> {
@@ -14916,6 +14977,40 @@ impl Engine {
             mcp_servers,
         };
 
+        // Queue behind the backend's startup lane before publishing admission
+        // so the turn stays visibly waiting, and its reported wait includes
+        // the lane, until the vendor is actually about to see it.
+        let startup_wait_started = Instant::now();
+        let startup_permit = match self
+            .turn_scheduler
+            .acquire_backend_startup(backend_id, &cancel)
+            .await
+        {
+            Ok(permit) => permit,
+            Err(_) if cancel.is_cancelled() => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let startup_wait_ms: u64 = startup_wait_started
+            .elapsed()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX);
+        if startup_wait_ms > 0 {
+            tracing::info!(
+                thread_id = %thread.id,
+                turn,
+                backend = %backend_id,
+                elapsed_ms = startup_wait_ms,
+                "agent startup timing: waited for backend startup lane"
+            );
+        }
+        self.publish_turn_admission(
+            thread,
+            turn,
+            automated_review,
+            provider_wait_ms.saturating_add(startup_wait_ms),
+        )
+        .await?;
         let startup_activity = backend.startup_activity(&backend_turn).await;
         if matches!(
             startup_activity,
@@ -14937,6 +15032,9 @@ impl Engine {
             Err(BackendError::Cancelled) if cancel.is_cancelled() => return Ok(()),
             Err(error) => return Err(anyhow!("backend error: {error}")),
         };
+        // The vendor has accepted the turn; the startup slot is free for the
+        // next waiter while this turn streams.
+        drop(startup_permit);
         if startup_activity.is_some() {
             self.store
                 .append_event_async(
@@ -19955,6 +20053,45 @@ mod tests {
 
         drop(permits.pop());
         let _replacement = scheduler.acquire_planned_setup(&cancel).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn backend_startup_lane_paces_each_backend_independently() {
+        let scheduler = TurnScheduler::new();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut permits = Vec::with_capacity(BACKEND_TURN_STARTUP_CONCURRENCY);
+        for _ in 0..BACKEND_TURN_STARTUP_CONCURRENCY {
+            permits.push(
+                scheduler
+                    .acquire_backend_startup("codex", &cancel)
+                    .await
+                    .unwrap(),
+            );
+        }
+
+        // Another backend owns its own lane and is not blocked by Codex.
+        let _other = scheduler
+            .acquire_backend_startup("claude-cli", &cancel)
+            .await
+            .unwrap();
+
+        let blocked_cancel = tokio_util::sync::CancellationToken::new();
+        let blocked = scheduler.acquire_backend_startup("codex", &blocked_cancel);
+        tokio::pin!(blocked);
+        tokio::select! {
+            biased;
+            result = &mut blocked => panic!("startup lane admitted excess work: {result:?}"),
+            _ = tokio::task::yield_now() => {}
+        }
+        blocked_cancel.cancel();
+        assert_eq!(blocked.await.unwrap_err().to_string(), "turn cancelled");
+
+        // A vendor-accepted turn frees its slot for the next waiter.
+        drop(permits.pop());
+        let _replacement = scheduler
+            .acquire_backend_startup("codex", &cancel)
+            .await
+            .unwrap();
     }
 
     #[test]

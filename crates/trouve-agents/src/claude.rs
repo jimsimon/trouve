@@ -1057,16 +1057,16 @@ impl AgentBackend for ClaudeBackend {
         // router distinguishes a genuinely live vendor turn from a completed
         // turn whose output is merely buffered; writing to Claude's stdin in
         // the latter case would start unrelated background work.
-        let (attached_lines, attach_registration, active_turn) = if attach {
+        let (mut lines, registration_guard, active_turn) = if attach {
             let (turn_tx, lines) = mpsc::channel::<String>(1024);
             let (registration, registration_guard) = proc_.router.register_owned(turn_tx, true)?;
             match registration {
                 RouterRegistration::StreamingLive => (
-                    Some(lines),
+                    lines,
                     registration_guard,
                     Some(proc_.begin_turn(true).await?),
                 ),
-                RouterRegistration::Streaming => (Some(lines), registration_guard, None),
+                RouterRegistration::Streaming => (lines, registration_guard, None),
                 RouterRegistration::NothingPending => {
                     return Ok(Box::pin(futures::stream::once(async {
                         Ok(BackendEvent::Completed {
@@ -1076,46 +1076,40 @@ impl AgentBackend for ClaudeBackend {
                 }
             }
         } else {
-            (None, None, Some(proc_.begin_turn(false).await?))
+            let active_turn = proc_.begin_turn(false).await?;
+            let (turn_tx, lines) = mpsc::channel::<String>(1024);
+            let (registration, registration_guard) = proc_.router.register_owned(turn_tx, false)?;
+            match registration {
+                RouterRegistration::Streaming => {}
+                RouterRegistration::StreamingLive => unreachable!(
+                    "non-attach Claude registration cannot claim a live background turn"
+                ),
+                RouterRegistration::NothingPending => {
+                    unreachable!("non-attach Claude registration always creates a consumer")
+                }
+            }
+            (lines, registration_guard, Some(active_turn))
         };
-        let prompt = turn.prompt.clone();
-        // Anthropic-style base64 image blocks, alongside the text block.
-        let mut content = vec![json!({ "type": "text", "text": prompt })];
-        for att in &turn.attachments {
-            content.push(json!({
-                "type": "image",
-                "source": {
-                    "type": "base64",
-                    "media_type": att.mime,
-                    "data": att.base64(),
-                }
-            }));
-        }
+        proc_.touch();
 
-        let stream = async_stream(move |tx| async move {
-            let _active_turn = active_turn;
-            let _attach_registration = attach_registration;
-            let mut lines = if let Some(lines) = attached_lines {
-                lines
-            } else {
-                let (turn_tx, lines) = mpsc::channel::<String>(1024);
-                match proc_.router.register(turn_tx, false) {
-                    Ok(RouterRegistration::Streaming) => {}
-                    Ok(RouterRegistration::StreamingLive) => unreachable!(
-                        "non-attach Claude registration cannot claim a live background turn"
-                    ),
-                    Ok(RouterRegistration::NothingPending) => {
-                        unreachable!("non-attach Claude registration always creates a consumer")
+        // Deliver the prompt before handing back the stream: the caller's
+        // startup pacing treats a returned stream as "the vendor has the
+        // turn", and a fresh CLI reads stdin only once it has initialized,
+        // so a deferred write would let the turn slip past that pacing.
+        if !attach {
+            let prompt = turn.prompt.clone();
+            // Anthropic-style base64 image blocks, alongside the text block.
+            let mut content = vec![json!({ "type": "text", "text": prompt })];
+            for att in &turn.attachments {
+                content.push(json!({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": att.mime,
+                        "data": att.base64(),
                     }
-                    Err(error) => {
-                        let _ = tx.send(Err(error)).await;
-                        return;
-                    }
-                }
-                lines
-            };
-            proc_.touch();
-
+                }));
+            }
             let msg = json!({
                 "type": "user",
                 "message": {
@@ -1123,50 +1117,43 @@ impl AgentBackend for ClaudeBackend {
                     "content": content,
                 }
             });
-            if !attach {
-                let sent = tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => {
-                        if let Err(error) = pool.terminate_and_remove(&thread_id, &proc_).await {
-                            let _ = tx.send(Err(error)).await;
-                        }
-                        return;
-                    }
-                    _ = tx.closed() => {
-                        if let Err(error) = pool.terminate_and_remove(&thread_id, &proc_).await {
-                            tracing::warn!(
-                                "claude: stream-drop cleanup was not acknowledged: {error}"
-                            );
-                        }
-                        return;
-                    }
-                    sent = async {
-                        let mut input = proc_.input.lock().await;
-                        input.stdin.write_all(msg.to_string().as_bytes()).await?;
-                        input.stdin.write_all(b"\n").await?;
-                        for steer in std::mem::take(&mut input.pending_steers) {
-                            input.stdin.write_all(steer.to_string().as_bytes()).await?;
-                            input.stdin.write_all(b"\n").await?;
-                        }
-                        input.stdin.flush().await?;
-                        input.prompt_sent = true;
-                        Ok::<(), std::io::Error>(())
-                    } => sent,
-                };
-                if let Err(e) = sent {
-                    // Likely the process died between turns; keep reading —
-                    // the no-result exit path below reports it (with stderr)
-                    // and drops it from the pool so the next turn respawns.
-                    // Delivery is still marked: a write error cannot
-                    // distinguish "the vendor never saw the prompt" from
-                    // "the vendor consumed the prompt and closed stdin
-                    // before our flush" (EPIPE after full consumption), and
-                    // withholding delivery in the second case strands the
-                    // legitimate response as background output.
-                    tracing::debug!("claude stdin write failed: {e}");
+            let sent = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    pool.terminate_and_remove(&thread_id, &proc_).await?;
+                    return Err(BackendError::Cancelled);
                 }
-                proc_.router.prompt_delivered();
+                sent = async {
+                    let mut input = proc_.input.lock().await;
+                    input.stdin.write_all(msg.to_string().as_bytes()).await?;
+                    input.stdin.write_all(b"\n").await?;
+                    for steer in std::mem::take(&mut input.pending_steers) {
+                        input.stdin.write_all(steer.to_string().as_bytes()).await?;
+                        input.stdin.write_all(b"\n").await?;
+                    }
+                    input.stdin.flush().await?;
+                    input.prompt_sent = true;
+                    Ok::<(), std::io::Error>(())
+                } => sent,
+            };
+            if let Err(e) = sent {
+                // Likely the process died between turns; keep reading —
+                // the stream's no-result exit path reports it (with stderr)
+                // and drops it from the pool so the next turn respawns.
+                // Delivery is still marked: a write error cannot
+                // distinguish "the vendor never saw the prompt" from
+                // "the vendor consumed the prompt and closed stdin
+                // before our flush" (EPIPE after full consumption), and
+                // withholding delivery in the second case strands the
+                // legitimate response as background output.
+                tracing::debug!("claude stdin write failed: {e}");
             }
+            proc_.router.prompt_delivered();
+        }
+
+        let stream = async_stream(move |tx| async move {
+            let _active_turn = active_turn;
+            let _registration_guard = registration_guard;
 
             let mut completed = false;
             loop {
