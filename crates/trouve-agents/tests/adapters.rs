@@ -2556,8 +2556,9 @@ cat >/dev/null
     })
     .await;
     // Steering is advertised with TurnStarted, before the returned backend
-    // stream is first polled. The adapter must queue this behind the initial
-    // prompt instead of rejecting it or writing it first.
+    // stream is first polled. The prompt has already reached the vendor by
+    // then, so the steer must be written straight through behind it rather
+    // than rejected or written first.
     backend
         .steer_turn(BackendSteer {
             cancel: Default::default(),
@@ -2567,32 +2568,6 @@ cat >/dev/null
         })
         .await
         .unwrap();
-    for index in 1..8 {
-        backend
-            .steer_turn(BackendSteer {
-                cancel: Default::default(),
-                session: "sess-steer".into(),
-                prompt: format!("queued direction {index}"),
-                attachments: Vec::new(),
-            })
-            .await
-            .unwrap();
-    }
-    let overflow = backend
-        .steer_turn(BackendSteer {
-            cancel: Default::default(),
-            session: "sess-steer".into(),
-            prompt: "one direction too many".into(),
-            attachments: Vec::new(),
-        })
-        .await
-        .unwrap_err();
-    assert!(
-        overflow
-            .to_string()
-            .contains("pending steering queue is full"),
-        "{overflow}"
-    );
 
     let mut redirected = false;
     while let Some(event) = stream.next().await {
@@ -2604,8 +2579,22 @@ cat >/dev/null
     }
     assert!(redirected);
     let stdin = std::fs::read_to_string(format!("{stub}.stdin")).unwrap();
-    assert_eq!(stdin.lines().count(), 2, "{stdin}");
-    assert!(stdin.contains("change direction"), "{stdin}");
+    let mut lines = stdin.lines();
+    assert!(
+        !lines
+            .next()
+            .unwrap_or_default()
+            .contains("change direction"),
+        "{stdin}"
+    );
+    assert!(
+        lines
+            .next()
+            .unwrap_or_default()
+            .contains("change direction"),
+        "{stdin}"
+    );
+    assert_eq!(lines.next(), None, "{stdin}");
 }
 
 #[tokio::test]
