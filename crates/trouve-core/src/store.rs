@@ -11168,8 +11168,8 @@ impl Store {
         &self,
         id: &str,
     ) -> Result<Option<CodeReviewJobTransition>> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
+        let conn = self.conn.lock().unwrap();
+        let tx = write_transaction(&conn)?;
         let old = tx
             .query_row(
                 &format!("SELECT {CODE_REVIEW_JOB_COLUMNS} FROM code_review_jobs WHERE id = ?1"),
@@ -15624,6 +15624,76 @@ impl Store {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Prepare explicit resolutions and the prior-review cleanup intent while
+    /// projecting the authoritative blocking ledger after this staged review
+    /// is published. The GitHub verdict uses the returned count so it cannot
+    /// drift from `record_code_review_open_issue_count`.
+    pub fn prepare_code_review_publication_verdict(
+        &self,
+        job_id: &str,
+        finding_ids: &[&str],
+    ) -> Result<Option<u64>> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        for finding_id in finding_ids {
+            tx.execute(
+                "UPDATE code_review_findings
+                 SET publication_resolution_job_id = ?2
+                 WHERE id = ?1 AND status = 'open'",
+                params![finding_id, job_id],
+            )?;
+        }
+        let count = tx.query_row(
+            &format!(
+                "SELECT COUNT(*)
+                 FROM code_review_findings finding
+                 JOIN code_review_jobs finding_job ON finding_job.id = finding.job_id
+                 JOIN code_review_jobs current_job ON current_job.id = ?1
+                 WHERE finding_job.repository = current_job.repository
+                   AND finding_job.pull_number = current_job.pull_number
+                   AND (finding_job.review_published != 0 OR finding.job_id = current_job.id)
+                   AND finding.status = 'open'
+                   AND COALESCE(finding.publication_resolution_job_id, '') != current_job.id
+                   AND {blocking}",
+                blocking = blocking_finding_predicate("finding")
+            ),
+            params![job_id],
+            |row| row.get::<_, i64>(0),
+        )? as u64;
+        let updated = tx.execute(
+            "UPDATE code_review_jobs
+             SET blocking_review_cleanup_pending = ?2,
+                 blocking_review_cleanup_page = 1,
+                 blocking_review_cleanup_attempts = 0,
+                 blocking_review_cleanup_next_attempt_at = NULL,
+                 blocking_review_cleanup_claim_token = NULL,
+                 blocking_review_cleanup_claim_until = NULL
+             WHERE id = ?1 AND publication_claimed != 0
+               AND status = 'running' AND cancel_requested = 0
+               AND review_published = 0
+               AND NOT EXISTS (
+                 SELECT 1 FROM code_review_jobs AS newer
+                 WHERE newer.repository = code_review_jobs.repository
+                   AND newer.pull_number = code_review_jobs.pull_number
+                   AND newer.head_sha = code_review_jobs.head_sha
+                   AND (
+                     newer.publication_generation > code_review_jobs.publication_generation
+                     OR (
+                       newer.publication_generation = code_review_jobs.publication_generation
+                       AND newer.rowid > code_review_jobs.rowid
+                     )
+                   )
+                   AND newer.status IN ('queued', 'running', 'succeeded')
+               )",
+            params![job_id, count == 0],
+        )?;
+        if updated == 0 {
+            return Ok(None);
+        }
+        tx.commit()?;
+        Ok(Some(count))
     }
 
     // The PR identity fields intentionally stay explicit: they are written
@@ -24731,6 +24801,118 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn projected_publication_count_matches_resolved_blocking_ledger() {
+        let store = Store::open_in_memory().unwrap();
+        let first = enqueue_backoff_test_job(&store);
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            first.id
+        );
+        let prior = store
+            .save_code_review_result(
+                &first.id,
+                "summary",
+                "prompt",
+                1,
+                &[NewCodeReviewFinding {
+                    path: "src/old.rs".into(),
+                    line: 3,
+                    side: "RIGHT".into(),
+                    severity: "high".into(),
+                    confidence: "high".into(),
+                    title: "Prior blocker".into(),
+                    body: "blocking".into(),
+                    prompt_for_agents: "fix".into(),
+                    sources: Vec::new(),
+                }],
+                &[],
+            )
+            .unwrap()
+            .remove(0);
+        assert!(store.claim_code_review_publication(&first.id).unwrap());
+        store
+            .record_code_review_publication(
+                &first.id,
+                &first.repository,
+                first.pull_number,
+                &first.base_ref,
+                &first.head_sha,
+                "https://example/reviews/first",
+                false,
+                &[],
+            )
+            .unwrap();
+        store
+            .finish_code_review_job(&first.id, "succeeded", "", "")
+            .unwrap();
+
+        let mut request = backoff_test_job_request();
+        request.dedupe_key = "acme/widgets#42:projected-verdict".into();
+        request.head_sha = "3333333333333333333333333333333333333333".into();
+        let current = store.enqueue_code_review_job(&request).unwrap().unwrap();
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            current.id
+        );
+        store
+            .save_code_review_result_with_themes(
+                &current.id,
+                "Only non-gating findings remain.",
+                "Keep them advisory.",
+                1,
+                &[NewCodeReviewFinding {
+                    path: "src/untouched.rs".into(),
+                    line: 7,
+                    side: "RIGHT".into(),
+                    severity: "high".into(),
+                    confidence: "high".into(),
+                    title: "Previously missed".into(),
+                    body: "not caused by this revision".into(),
+                    prompt_for_agents: "consider separately".into(),
+                    sources: Vec::new(),
+                }],
+                &[NewCodeReviewFindingDetails {
+                    origin: trouve_protocol::CodeReviewFindingOrigin::PreviouslyMissed,
+                    ..Default::default()
+                }],
+                &[],
+                &[],
+            )
+            .unwrap();
+        assert!(store.claim_code_review_publication(&current.id).unwrap());
+        assert_eq!(
+            store
+                .prepare_code_review_publication_verdict(&current.id, &[])
+                .unwrap(),
+            Some(1),
+            "the prior blocker gates until this publication resolves it"
+        );
+
+        assert_eq!(
+            store
+                .prepare_code_review_publication_verdict(&current.id, &[&prior.id])
+                .unwrap(),
+            Some(0),
+            "the projected verdict must match the final durable blocking ledger"
+        );
+        store
+            .record_code_review_publication(
+                &current.id,
+                &current.repository,
+                current.pull_number,
+                &current.base_ref,
+                &current.head_sha,
+                "https://example/reviews/current",
+                true,
+                &[&prior.id],
+            )
+            .unwrap();
+        let published = store.code_review_job(&current.id).unwrap().unwrap();
+        assert_eq!(published.job.open_issue_count, Some(0));
+        assert!(published.blocking_review_cleanup_pending);
     }
 
     #[test]
