@@ -6,6 +6,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [4.9.0] - 2026-09-05
+
+This release makes automated reviews quieter and more reliable, improves large
+review fan-outs, and lets Linux shell-launched daemons remain available for the
+life of their session worktree.
+
 ### Changed
 
 - **Only well-supported findings block a review**: a finding gates the
@@ -84,6 +90,21 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   name is the file name of the process's executable, reduced to printable
   ASCII of at most 15 characters — never the name the process set for
   itself, which a daemon could fill with inherited secrets.
+- **Client/server compatibility**: protocol compatibility advances to 8.1
+  for advisory review findings and claimed-line evidence. Upgrade the desktop
+  or PWA client, review dashboard, and `trouve-server` together.
+
+### Fixed
+
+- **Large review fan-outs survive provider startup bursts**: Codex turn
+  startup is paced per backend, an unanswered start no longer retires the
+  shared transport, and admission waits no longer consume reviewer deadlines.
+  Claude prompts are delivered before startup admission is released, keeping
+  the same capacity boundary across supported agent backends.
+- **Review verdicts follow the blocking ledger**: final review outcomes are
+  derived from the stored set of blocking findings, including superseded
+  verdict preparation, instead of a separate state path that could disagree
+  with the ledger.
 
 ## [4.8.1] - 2026-09-03
 
@@ -1219,6 +1240,7 @@ semble ([BENCHMARKS.md](BENCHMARKS.md)):
 - Incremental reindex (1 file touched): 0.86 s vs ~3 min (212x)
 - Warm query: 0.55 s vs 7.2 s (13x)
 
+[4.9.0]: https://github.com/jimsimon/trouve/compare/v4.8.1...v4.9.0
 [4.8.1]: https://github.com/jimsimon/trouve/compare/v4.8.0...v4.8.1
 [4.8.0]: https://github.com/jimsimon/trouve/compare/v4.7.0...v4.8.0
 [4.7.0]: https://github.com/jimsimon/trouve/compare/v4.6.0...v4.7.0
