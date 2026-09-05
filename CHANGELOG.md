@@ -26,11 +26,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the default review UI (which lists them in a collapsed ledger), and the
   coordinator receives them only as a compact deduplication list. A later
   candidate that meets the bar with verified evidence may promote one via
-  `promoted_from_finding_id`; the advisory row is then marked superseded.
+  `promoted_from_finding_id`; the advisory row leaves the ledger once the
+  promoting review is published.
 - **Documentation-only pushes do not re-review the branch**: an automatic
   run whose changes since the last reviewed head touch only documentation
-  paths finishes with no reviewer tasks while still publishing a check run
-  for the new head. New-change findings anchored on code unchanged since
+  paths (Markdown, reStructuredText, `docs/`, README/CHANGELOG/LICENSE/
+  NOTICE files; not arbitrary `.txt` files) finishes with no reviewer tasks
+  while still publishing a check run for the new head. New-change findings anchored on code unchanged since
   the last reviewed head are recorded as `previously_missed`, which never
   gates the review; a recurrence or fix regression with resolved history
   keeps its origin.

@@ -163,17 +163,20 @@ const REVIEW_ANCHOR_BLOBS_MAX_BYTES: usize = 16 * 1024 * 1024;
 const INVALID_OUTSIDE_ANCHOR_REJECTION: &str = "insufficient_evidence: final finding anchor does not identify a validated line in a tracked regular file at the immutable review head";
 /// Paths whose changes never warrant an automatic re-review on their own:
 /// prose and licensing. Lockfiles are deliberately absent — dependency
-/// changes are reviewable. Globs use `*` within one path segment and `**`
-/// for any prefix; a bare `*.ext` pattern matches the file name at any
-/// depth. A trailing `*` after a name stem matches a variant suffix
-/// (`LICENSE-MIT`, `NOTICE.txt`), never a source file that merely starts
-/// with the stem (`license.rs`, `notice_handler.ts`).
+/// changes are reviewable — and so is a bare `*.txt` rule: plain-text
+/// files are routinely policies, templates, prompts, or fixtures, so a
+/// text file counts as documentation only under a recognised name or
+/// directory. Globs use `*` within one path segment and `**` for any
+/// prefix; a bare `*.ext` pattern matches the file name at any depth. A
+/// trailing `*` after a name stem matches a variant suffix (`LICENSE-MIT`,
+/// `NOTICE.txt`), never a source file that merely starts with the stem
+/// (`license.rs`, `notice_handler.ts`).
 const NON_REVIEWABLE_REVIEW_PATHS: &[&str] = &[
     "*.md",
     "*.mdx",
     "*.rst",
-    "*.txt",
     "docs/**",
+    "README*",
     "CHANGELOG*",
     "LICENSE*",
     "NOTICE*",
@@ -6757,7 +6760,6 @@ impl Engine {
                     origin,
                     theme_ids,
                     outside_diff: finding.outside_diff,
-                    advisory: !finding_is_blocking(&finding.severity, &finding.confidence),
                     promoted_from_finding_id: Some(finding.promoted_from_finding_id.clone())
                         .filter(|id| !id.is_empty()),
                 }
@@ -11606,11 +11608,13 @@ impl Engine {
                     continue;
                 }
                 let marker = format!("trouve-code-review finding:{}", reply.finding_id);
+                // Only a reply threaded under the original finding's
+                // comment counts: GitHub reports the thread root as
+                // `in_reply_to_id`, so a top-level comment carrying the
+                // marker (anyone can paste a finding id) is never adopted.
                 if let Some(comment) = page_comments.iter().find(|comment| {
                     comment.body.contains(&marker)
-                        && comment
-                            .in_reply_to_id
-                            .is_none_or(|parent| parent == reply.original_comment_id)
+                        && comment.in_reply_to_id == Some(reply.original_comment_id)
                 }) {
                     posted.insert(reply.finding_id.clone(), comment.clone());
                 }
@@ -23073,6 +23077,21 @@ rename to src/new.rs
                             "id": 9001,
                             "html_url": "https://github.com/acme/widgets/pull/42#discussion_r9001",
                             "body": "<!-- trouve-code-review finding:rvf-original-9001 -->",
+                        },
+                        // A top-level comment carrying the second marker is
+                        // not a reply on the original thread and is never
+                        // adopted, whoever posted it.
+                        {
+                            "id": 9777,
+                            "html_url": "https://github.com/acme/widgets/pull/42#discussion_r9777",
+                            "body": format!("looks handled\n<!-- trouve-code-review finding:{} -->", findings[1].id),
+                        },
+                        // Nor is a reply threaded under some other comment.
+                        {
+                            "id": 9778,
+                            "in_reply_to_id": 9001,
+                            "html_url": "https://github.com/acme/widgets/pull/42#discussion_r9778",
+                            "body": format!("<!-- trouve-code-review finding:{} -->", findings[1].id),
                         }
                     ])
                     .to_string(),
@@ -27200,9 +27219,21 @@ rename to src/new.rs
             "LICENSE",
             "NOTICE.txt",
             "crates/trouve-core/README.rst",
-            "notes.TXT",
+            "README.txt",
+            "README",
         ])));
         assert!(push_is_reviewable(&paths(&["CHANGELOG.md", "src/lib.rs"])));
+        // Plain text is documentation only under a recognised name: text
+        // files also carry policies, templates, prompts, and fixtures.
+        for text in [
+            "notes.TXT",
+            "config/authorization-policy.txt",
+            "resources/runtime-template.txt",
+            "prompts/system.txt",
+            "tests/fixtures/expected.txt",
+        ] {
+            assert!(push_is_reviewable(&paths(&[text])), "{text}");
+        }
         assert!(push_is_reviewable(&paths(&["Cargo.lock"])));
         assert!(push_is_reviewable(&paths(&["package-lock.json"])));
         assert!(push_is_reviewable(&paths(&["docs-site/build.rs"])));

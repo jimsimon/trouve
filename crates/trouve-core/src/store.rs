@@ -1041,6 +1041,22 @@ fn blocking_finding_levels_predicate(alias: &str) -> String {
     )
 }
 
+/// Predicate for an advisory findings row under the given SQL alias that is
+/// still in the ledger: no *published* review has promoted it. A promoting
+/// job that fails or is abandoned before publication leaves the advisory
+/// active, so later rounds keep deduplicating against it instead of losing
+/// the debt along with the unpublished replacement.
+fn active_advisory_predicate(alias: &str) -> String {
+    format!(
+        "({alias}.resolved_by_job_id = ''
+          OR NOT EXISTS (
+            SELECT 1 FROM code_review_jobs promoting_job
+            WHERE promoting_job.id = {alias}.resolved_by_job_id
+              AND promoting_job.review_published != 0
+          ))"
+    )
+}
+
 /// Blocking-tier predicate for one findings row under the given SQL alias:
 /// the severity/confidence cutoff, the scope verdict (legacy rows carry no
 /// verdict and block as before), and an origin this pull request answers
@@ -1092,7 +1108,7 @@ fn recount_code_review_two_tier_issue_counts(conn: &Connection, guard: &str) -> 
                AND finding_job.pull_number = code_review_jobs.pull_number
                AND finding_job.review_published != 0
                AND finding.status IN ('open', 'advisory')
-               AND finding.resolved_by_job_id = ''
+               AND {active}
                AND NOT ({blocking})
            )
          WHERE publication_open_issue_count IS NOT NULL
@@ -1105,7 +1121,8 @@ fn recount_code_review_two_tier_issue_counts(conn: &Connection, guard: &str) -> 
              ORDER BY latest.publication_order DESC, latest.created_at DESC, latest.id DESC
              LIMIT 1
            )",
-            blocking = blocking_finding_predicate("finding")
+            blocking = blocking_finding_predicate("finding"),
+            active = active_advisory_predicate("finding"),
         ),
         [],
     )?;
@@ -3467,7 +3484,8 @@ fn resolve_code_review_themes_in_transaction(
     resolved_at: &str,
 ) -> Result<u64> {
     Ok(tx.execute(
-        "UPDATE code_review_themes
+        &format!(
+            "UPDATE code_review_themes
          SET status = 'resolved', resolved_head = ?3, updated_at = ?4
          WHERE repository = ?1 AND pull_number = ?2 AND status = 'open'
            AND EXISTS (
@@ -3483,10 +3501,12 @@ fn resolve_code_review_themes_in_transaction(
              LEFT JOIN code_review_jobs link_job ON link_job.id = ft.linked_by_job_id
              WHERE ft.theme_id = code_review_themes.id
                AND (f.status = 'open'
-                    OR (f.status = 'advisory' AND f.resolved_by_job_id = ''))
+                    OR (f.status = 'advisory' AND {active}))
                AND j.review_published != 0
                AND (ft.linked_by_job_id = '' OR link_job.review_published != 0)
            )",
+            active = active_advisory_predicate("f"),
+        ),
         params![repository, pull_number as i64, resolved_head, resolved_at],
     )? as u64)
 }
@@ -3532,11 +3552,12 @@ fn record_code_review_open_issue_count(tx: &rusqlite::Transaction<'_>, job_id: &
              AND finding_job.pull_number = code_review_jobs.pull_number
              AND finding_job.review_published != 0
              AND finding.status IN ('open', 'advisory')
-             AND finding.resolved_by_job_id = ''
+             AND {active}
              AND NOT ({blocking})
          )
          WHERE id = ?1",
-            blocking = blocking_finding_predicate("finding")
+            blocking = blocking_finding_predicate("finding"),
+            active = active_advisory_predicate("finding"),
         ),
         params![job_id],
     )?;
@@ -4516,10 +4537,6 @@ pub struct NewCodeReviewFindingDetails {
     pub origin: trouve_protocol::CodeReviewFindingOrigin,
     pub theme_ids: Vec<String>,
     pub outside_diff: bool,
-    /// Below the blocking bar: stored with status `advisory`, never posted
-    /// to the pull request, and fed back to later rounds only as a
-    /// deduplication ledger.
-    pub advisory: bool,
     /// An earlier advisory finding for the same pull request that this
     /// finding now supersedes with evidence meeting the blocking bar. The
     /// advisory row is marked superseded by this job and drops out of the
@@ -11523,25 +11540,33 @@ impl Store {
         for (index, finding) in findings.iter().enumerate() {
             let details = finding_details.get(index).cloned().unwrap_or_default();
             let finding_id = crate::new_id("rvf");
+            // Status is derived here rather than trusted from the caller so
+            // stored status, counts, and the ledger always agree with the
+            // blocking policy.
+            let advisory =
+                !crate::review::finding_is_blocking(&finding.severity, &finding.confidence);
             let promoted_from = details
                 .promoted_from_finding_id
                 .as_deref()
                 .map(str::trim)
                 .filter(|id| !id.is_empty());
             if let Some(promoted_from) = promoted_from {
-                if details.advisory {
+                if advisory {
                     anyhow::bail!(
                         "review finding {finding_id} cannot promote {promoted_from} while advisory"
                     );
                 }
                 let superseded = tx.execute(
-                    "UPDATE code_review_findings
+                    &format!(
+                        "UPDATE code_review_findings
                      SET resolved_by_job_id = ?1, resolved_head = ?2
-                     WHERE id = ?3 AND status = 'advisory' AND resolved_by_job_id = ''
+                     WHERE id = ?3 AND status = 'advisory' AND {active}
                        AND job_id IN (
                          SELECT id FROM code_review_jobs
                          WHERE repository = ?4 AND pull_number = ?5 AND review_published != 0
                        )",
+                        active = active_advisory_predicate("code_review_findings"),
+                    ),
                     params![job_id, head_sha, promoted_from, repository, pull_number],
                 )?;
                 if superseded == 0 {
@@ -11571,7 +11596,7 @@ impl Store {
                     code_review_finding_origin_str(details.origin),
                     finding.prompt_for_agents,
                     details.outside_diff,
-                    if details.advisory { "advisory" } else { "open" },
+                    if advisory { "advisory" } else { "open" },
                     now,
                     promoted_from.unwrap_or(""),
                 ],
@@ -11676,11 +11701,8 @@ impl Store {
         // confirmed issue count reports what the round surfaced to users.
         let confirmed_issue_count = findings
             .iter()
-            .enumerate()
-            .filter(|(index, _)| {
-                finding_details
-                    .get(*index)
-                    .is_none_or(|details| !details.advisory)
+            .filter(|finding| {
+                crate::review::finding_is_blocking(&finding.severity, &finding.confidence)
             })
             .count();
         tx.execute(
@@ -12482,7 +12504,7 @@ impl Store {
             pull_number,
             PullFindingSelection {
                 status: Some("advisory"),
-                extra_predicate: " AND f.resolved_by_job_id = ''",
+                extra_predicate: &format!(" AND {}", active_advisory_predicate("f")),
                 newest: Some((
                     "j.completed_at DESC, f.job_id DESC, f.path DESC, f.line DESC, f.id DESC",
                     ADVISORY_LEDGER_LOOKUP_LIMIT,
@@ -23338,8 +23360,10 @@ mod tests {
             store.claim_code_review_job().unwrap().unwrap().job.id,
             job.id
         );
+        // Blocking levels, but an origin this pull request does not answer
+        // for: the finding is posted yet counts in the advisory tier.
         let finding = store
-            .save_code_review_result(
+            .save_code_review_result_with_themes(
                 &job.id,
                 "summary",
                 "prompt",
@@ -23348,13 +23372,18 @@ mod tests {
                     path: "scripts/qualify.mjs".into(),
                     line: 3,
                     side: "RIGHT".into(),
-                    severity: "low".into(),
+                    severity: "high".into(),
                     confidence: "high".into(),
                     title: "Advisory".into(),
                     body: "advisory".into(),
                     prompt_for_agents: "".into(),
                     sources: Vec::new(),
                 }],
+                &[NewCodeReviewFindingDetails {
+                    origin: trouve_protocol::CodeReviewFindingOrigin::PreviouslyMissed,
+                    ..Default::default()
+                }],
+                &[],
                 &[],
             )
             .unwrap()
@@ -24313,7 +24342,7 @@ mod tests {
                     line: 3,
                     side: "RIGHT".into(),
                     severity: "medium".into(),
-                    confidence: "medium".into(),
+                    confidence: "high".into(),
                     title: "Finding".into(),
                     body: "finding".into(),
                     prompt_for_agents: "fix".into(),
@@ -25594,7 +25623,6 @@ mod tests {
                     },
                     NewCodeReviewFindingDetails {
                         theme_ids: vec!["shared-state".into()],
-                        advisory: true,
                         ..Default::default()
                     },
                 ],
@@ -25660,9 +25688,63 @@ mod tests {
         assert_eq!(themes.len(), 1);
         assert_eq!(themes[0].status, "open");
 
+        // A promotion whose job fails before publishing leaves the advisory
+        // active: the replacement never reached the pull request, so the
+        // debt must keep deduplicating later rounds.
+        let mut abandoned_request = backoff_test_job_request();
+        abandoned_request.dedupe_key = "acme/widgets#42:advisory-promotion-abandoned".into();
+        abandoned_request.head_sha = "2222222222222222222222222222222222222222".into();
+        let abandoned = store
+            .enqueue_code_review_job(&abandoned_request)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            abandoned.id
+        );
+        store
+            .save_code_review_result_with_themes(
+                &abandoned.id,
+                "summary",
+                "fix the root cause",
+                1,
+                &[finding("src/advisory.rs", "high", "high")],
+                &[NewCodeReviewFindingDetails {
+                    promoted_from_finding_id: Some(advisory.id.clone()),
+                    ..Default::default()
+                }],
+                &[],
+                &[],
+            )
+            .unwrap();
+        let ledger_ids = |repository: &str, pull_number: u64| {
+            store
+                .advisory_code_review_findings(repository, pull_number)
+                .unwrap()
+                .into_iter()
+                .map(|finding| finding.id)
+                .collect::<Vec<String>>()
+        };
+        assert_eq!(
+            ledger_ids(&abandoned.repository, abandoned.pull_number),
+            [advisory.id.as_str()],
+            "an unpublished promotion keeps the advisory in the ledger"
+        );
+        store
+            .finish_code_review_job(&abandoned.id, "failed", "", "publication failed")
+            .unwrap();
+        assert_eq!(
+            ledger_ids(&abandoned.repository, abandoned.pull_number),
+            [advisory.id.as_str()]
+        );
+        let themes = store
+            .code_review_themes_for_pull(&first.repository, first.pull_number)
+            .unwrap();
+        assert_eq!(themes[0].status, "open");
+
         // Round two promotes the advisory note: the new blocking finding
         // inherits its theme and the advisory row leaves the ledger without
-        // changing status.
+        // changing status once the promotion is published.
         let mut second_request = backoff_test_job_request();
         second_request.dedupe_key = "acme/widgets#42:advisory-promotion".into();
         second_request.head_sha = "3333333333333333333333333333333333333333".into();
@@ -25708,13 +25790,13 @@ mod tests {
             .unwrap();
         assert_eq!(promoted[0].status, "open");
         assert_eq!(promoted[0].theme_ids, advisory.theme_ids);
-        publish(&second);
-        assert!(
-            store
-                .advisory_code_review_findings(&second.repository, second.pull_number)
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            ledger_ids(&second.repository, second.pull_number),
+            [advisory.id.as_str()],
+            "the advisory stays active until the promotion is published"
         );
+        publish(&second);
+        assert!(ledger_ids(&second.repository, second.pull_number).is_empty());
         let superseded = store
             .code_review_findings_for_pull(&second.repository, second.pull_number)
             .unwrap()
@@ -25818,10 +25900,7 @@ mod tests {
                 task_id: "t-1".into(),
             }],
         };
-        let advisory = || NewCodeReviewFindingDetails {
-            advisory: true,
-            ..Default::default()
-        };
+        let advisory = NewCodeReviewFindingDetails::default;
         let publish = |job: &trouve_protocol::CodeReviewJob| {
             assert!(store.claim_code_review_publication(&job.id).unwrap());
             store
