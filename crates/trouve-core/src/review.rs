@@ -6898,7 +6898,7 @@ impl Engine {
             .store
             .prepare_code_review_publication_verdict(&job.id, &resolved_finding_ids)?
         else {
-            bail!("review job changed before its publication verdict was prepared");
+            bail!("stale: review job changed before its publication verdict was prepared");
         };
         let has_unresolved_findings = projected_open_issue_count > 0;
         let published_review = self

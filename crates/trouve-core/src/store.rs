@@ -11168,8 +11168,8 @@ impl Store {
         &self,
         id: &str,
     ) -> Result<Option<CodeReviewJobTransition>> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
+        let conn = self.conn.lock().unwrap();
+        let tx = write_transaction(&conn)?;
         let old = tx
             .query_row(
                 &format!("SELECT {CODE_REVIEW_JOB_COLUMNS} FROM code_review_jobs WHERE id = ?1"),
