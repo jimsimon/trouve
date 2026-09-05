@@ -604,10 +604,10 @@ const PLANNED_TURN_SETUP_CONCURRENCY: usize = 24;
 /// Bounds concurrent vendor-side turn startups per agent backend. A shared
 /// app-server (Codex) admits `thread/start` roughly serially, so an
 /// unbounded burst queues every start behind the others until the tail
-/// exceeds the backend's fixed response timeout — and that ambiguous
-/// startup outcome retires the transport under every in-flight turn. The
-/// permit is released once the vendor has accepted the turn, so this paces
-/// startups without capping active turns.
+/// exceeds the backend's fixed response timeout and fails. Keeping the
+/// queue shallow keeps every start well inside that timeout. The permit is
+/// released once the vendor has accepted the turn, so this paces startups
+/// without capping active turns.
 const BACKEND_TURN_STARTUP_CONCURRENCY: usize = 4;
 const REMOVED_TURN_CONCURRENCY_ENVS: [&str; 4] = [
     "TROUVE_TURN_CONCURRENCY",
@@ -12653,26 +12653,13 @@ impl Engine {
             guard = session_lifecycle.read() => guard,
         };
         let admission = self.turn_scheduler.admit(&thread.model, &cancel).await?;
-        if background
-            && let Some(progress) = self
-                .store
-                .set_code_review_task_provider_wait(&thread.id, admission.provider_wait_ms)?
-        {
-            self.emit_code_review_task_progress(progress).await?;
-        }
-        self.store
-            .append_event_async(
-                scope.clone(),
-                Event::TurnAdmitted {
-                    turn,
-                    provider_wait_ms: admission.provider_wait_ms,
-                },
-            )
-            .await?;
 
         // External agent backend? The vendor harness owns the loop; we
         // stream its events and bridge approvals. The shared lifecycle lease
         // stays held; mutation tools take the exclusive execution lane.
+        // Admission is published there, once the backend's startup lane has
+        // also been passed, so the reported wait covers every queue the turn
+        // stood in before the vendor saw it.
         if let Some((backend_id, backend, model_name)) = self.backend_for(&thread.model) {
             return self
                 .run_backend_turn(
@@ -12689,11 +12676,14 @@ impl Engine {
                     &prompt.id,
                     tools_enabled,
                     prompt.background,
+                    admission.provider_wait_ms,
                     turn_steer_rx,
                     turn_steer_mutation_lane_state,
                 )
                 .await;
         }
+        self.publish_turn_admission(thread, turn, background, admission.provider_wait_ms)
+            .await?;
 
         let (provider, model_name) = self
             .resolve_provider(&thread.model)
@@ -14770,6 +14760,36 @@ impl Engine {
         Ok(())
     }
 
+    /// Publish that every queue between dispatch and the vendor has been
+    /// passed. `provider_wait_ms` is the total time the turn spent in them;
+    /// a code-review task records it before the thread event is visible so
+    /// observers never see admission without the wait that preceded it.
+    async fn publish_turn_admission(
+        &self,
+        thread: &Thread,
+        turn: u64,
+        automated_review: bool,
+        provider_wait_ms: u64,
+    ) -> Result<()> {
+        if automated_review
+            && let Some(progress) = self
+                .store
+                .set_code_review_task_provider_wait(&thread.id, provider_wait_ms)?
+        {
+            self.emit_code_review_task_progress(progress).await?;
+        }
+        self.store
+            .append_event_async(
+                Scope::Thread(thread.id.clone()),
+                Event::TurnAdmitted {
+                    turn,
+                    provider_wait_ms,
+                },
+            )
+            .await?;
+        Ok(())
+    }
+
     /// Run one turn through an external agent backend. The vendor harness
     /// plans, calls tools, and edits the worktree; we persist its events,
     /// gate its approval requests through our permission layer, and keep the
@@ -14793,6 +14813,7 @@ impl Engine {
         queued_prompt_id: &str,
         tools_enabled: bool,
         attach_background: bool,
+        provider_wait_ms: u64,
         mut steer_rx: Option<tokio::sync::mpsc::Receiver<SteerTurnCommand>>,
         steer_mutation_lane_state: tokio::sync::watch::Sender<SteerMutationLaneState>,
     ) -> Result<()> {
@@ -14956,8 +14977,9 @@ impl Engine {
             mcp_servers,
         };
 
-        // Queue behind the backend's startup lane before announcing vendor
-        // startup so the reported phase covers only the actual start.
+        // Queue behind the backend's startup lane before publishing admission
+        // so the turn stays visibly waiting, and its reported wait includes
+        // the lane, until the vendor is actually about to see it.
         let startup_wait_started = Instant::now();
         let startup_permit = match self
             .turn_scheduler
@@ -14981,14 +15003,14 @@ impl Engine {
                 elapsed_ms = startup_wait_ms,
                 "agent startup timing: waited for backend startup lane"
             );
-            if automated_review
-                && let Some(progress) = self
-                    .store
-                    .set_code_review_task_provider_wait(&thread.id, startup_wait_ms)?
-            {
-                self.emit_code_review_task_progress(progress).await?;
-            }
         }
+        self.publish_turn_admission(
+            thread,
+            turn,
+            automated_review,
+            provider_wait_ms.saturating_add(startup_wait_ms),
+        )
+        .await?;
         let startup_activity = backend.startup_activity(&backend_turn).await;
         if matches!(
             startup_activity,

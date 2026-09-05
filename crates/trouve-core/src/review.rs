@@ -1935,6 +1935,7 @@ struct ReviewTurnRequest {
     initial_stage: trouve_protocol::CodeReviewTaskLifecycleStage,
     output_stage: trouve_protocol::CodeReviewTaskLifecycleStage,
     metrics_base: CodeReviewTaskMetrics,
+    admission_clock: Option<Arc<ReviewAdmissionClock>>,
 }
 
 impl ReviewTurnRequest {
@@ -1946,6 +1947,7 @@ impl ReviewTurnRequest {
             initial_stage: trouve_protocol::CodeReviewTaskLifecycleStage::StartingModel,
             output_stage: trouve_protocol::CodeReviewTaskLifecycleStage::RunningModel,
             metrics_base: CodeReviewTaskMetrics::default(),
+            admission_clock: None,
         }
     }
 
@@ -1957,6 +1959,7 @@ impl ReviewTurnRequest {
             initial_stage: trouve_protocol::CodeReviewTaskLifecycleStage::RepairingOutput,
             output_stage: trouve_protocol::CodeReviewTaskLifecycleStage::RepairingOutput,
             metrics_base: CodeReviewTaskMetrics::default(),
+            admission_clock: None,
         }
     }
 
@@ -1964,6 +1967,130 @@ impl ReviewTurnRequest {
         self.metrics_base = metrics_base;
         self
     }
+
+    fn with_admission_clock(mut self, clock: &Arc<ReviewAdmissionClock>) -> Self {
+        self.admission_clock = Some(Arc::clone(clock));
+        self
+    }
+}
+
+/// Time a task's turns have spent queued for provider admission. Measured on
+/// tokio's clock so the deadline it extends and the sleeps it is compared
+/// against agree, including under paused test time.
+#[derive(Clone, Copy, Debug, Default)]
+struct AdmissionWait {
+    /// Completed waits.
+    settled: Duration,
+    /// Start of a wait that has not been admitted yet.
+    waiting_since: Option<tokio::time::Instant>,
+}
+
+impl AdmissionWait {
+    fn total(&self, now: tokio::time::Instant) -> Duration {
+        self.settled
+            + self
+                .waiting_since
+                .map(|since| now.saturating_duration_since(since))
+                .unwrap_or_default()
+    }
+}
+
+/// Records the stretches of a review task during which its turn was queued
+/// behind provider admission (a throttling cooldown, a backend's startup
+/// lane) rather than running. A task timeout charges only the remainder,
+/// so a large fan-out cannot exhaust its tail reviewers' budgets merely by
+/// making them wait for their siblings to start.
+struct ReviewAdmissionClock {
+    state: tokio::sync::watch::Sender<AdmissionWait>,
+}
+
+impl ReviewAdmissionClock {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: tokio::sync::watch::Sender::new(AdmissionWait::default()),
+        })
+    }
+
+    /// The turn has been dispatched and is not yet admitted. Idempotent.
+    fn begin_wait(&self) {
+        self.state.send_modify(|wait| {
+            wait.waiting_since
+                .get_or_insert_with(tokio::time::Instant::now);
+        });
+    }
+
+    /// The turn has been admitted, or its wait ended for any other reason.
+    /// Idempotent.
+    fn end_wait(&self) {
+        self.state.send_modify(|wait| {
+            if let Some(since) = wait.waiting_since.take() {
+                wait.settled += since.elapsed();
+            }
+        });
+    }
+
+    /// Total queued time so far, including a wait still in progress.
+    fn waited(&self) -> Duration {
+        self.state.borrow().total(tokio::time::Instant::now())
+    }
+}
+
+/// Ends a wait when the turn that started it returns by any path, so a
+/// turn that fails or is cancelled before admission leaves no open wait to
+/// stall the timeout of the turn that follows it.
+struct AdmissionWaitGuard<'a>(&'a ReviewAdmissionClock);
+
+impl Drop for AdmissionWaitGuard<'_> {
+    fn drop(&mut self) {
+        self.0.end_wait();
+    }
+}
+
+/// `budget` of *active* time elapsed while `future` was pending.
+#[derive(Debug)]
+struct ActiveTimeElapsed;
+
+/// Runs `future` under `budget`, extending the deadline by every wait the
+/// clock reports so queued time is not charged. While a wait is open the
+/// deadline is unknown and the future simply runs; it is re-armed as soon
+/// as the wait settles.
+async fn timeout_active<F: std::future::Future>(
+    budget: Duration,
+    clock: &ReviewAdmissionClock,
+    future: F,
+) -> Result<F::Output, ActiveTimeElapsed> {
+    let started = tokio::time::Instant::now();
+    // `clock` outlives this call, so the sender is never dropped and
+    // `changed()` only ever resolves with a new wait state.
+    let mut waits = clock.state.subscribe();
+    let mut future = std::pin::pin!(future);
+    loop {
+        let wait = *waits.borrow_and_update();
+        let deadline = async {
+            match wait.waiting_since {
+                Some(_) => std::future::pending::<()>().await,
+                None => tokio::time::sleep_until(started + budget + wait.settled).await,
+            }
+        };
+        tokio::select! {
+            biased;
+            output = &mut future => return Ok(output),
+            _ = waits.changed() => {}
+            () = deadline => return Err(ActiveTimeElapsed),
+        }
+    }
+}
+
+/// Names the queued time a timed-out turn was *not* charged for, so the
+/// error explains why it ran past its nominal budget on the wall clock.
+fn admission_wait_suffix(waited: Duration) -> String {
+    if waited.is_zero() {
+        return String::new();
+    }
+    format!(
+        " of model time (plus {} queued for provider admission)",
+        compact_elapsed(waited.as_millis().try_into().unwrap_or(u64::MAX))
+    )
 }
 
 fn record_review_tool_call(count: &mut u64) {
@@ -6889,13 +7016,15 @@ impl Engine {
         superseded: &CancellationToken,
         active_threads: &Arc<Mutex<HashSet<String>>>,
         max_tool_calls: u64,
+        admission_clock: &Arc<ReviewAdmissionClock>,
     ) -> Result<(ReviewTurnResult, ReviewOutput)> {
         let mut turn = self
             .run_tracked_code_review_turn(
                 job,
                 task_id,
                 thread_id,
-                ReviewTurnRequest::review(prompt, max_tool_calls),
+                ReviewTurnRequest::review(prompt, max_tool_calls)
+                    .with_admission_clock(admission_clock),
                 superseded,
                 active_threads,
             )
@@ -6914,7 +7043,8 @@ impl Engine {
                     &initial_error,
                     &turn.output,
                 ))
-                .with_metrics_base(turn.metrics.clone()),
+                .with_metrics_base(turn.metrics.clone())
+                .with_admission_clock(admission_clock),
                 superseded,
                 active_threads,
             )
@@ -6946,8 +7076,13 @@ impl Engine {
         timeout: Duration,
         timeout_label: &str,
     ) -> Result<(ReviewTurnResult, ReviewOutput)> {
-        match tokio::time::timeout(
+        // The reviewer budget covers active model time only: queueing behind the
+        // provider's backoff or the backend's startup lane is excluded, so a large
+        // job's tail reviewers aren't charged for waiting on their siblings.
+        let clock = ReviewAdmissionClock::new();
+        match timeout_active(
             timeout,
+            &clock,
             self.run_parsed_code_review_turn(
                 job,
                 task_id,
@@ -6956,12 +7091,13 @@ impl Engine {
                 superseded,
                 active_threads,
                 max_tool_calls,
+                &clock,
             ),
         )
         .await
         {
             Ok(result) => result,
-            Err(_) => {
+            Err(ActiveTimeElapsed) => {
                 active_threads.lock().unwrap().remove(thread_id);
                 if let Err(error) = self.cancel_turn(thread_id) {
                     tracing::warn!(
@@ -6972,8 +7108,9 @@ impl Engine {
                     );
                 }
                 bail!(
-                    "{timeout_label} timed out after {}",
-                    compact_elapsed(timeout.as_millis().try_into().unwrap_or(u64::MAX))
+                    "{timeout_label} timed out after {}{}",
+                    compact_elapsed(timeout.as_millis().try_into().unwrap_or(u64::MAX)),
+                    admission_wait_suffix(clock.waited())
                 )
             }
         }
@@ -6991,13 +7128,15 @@ impl Engine {
         timeout: Duration,
         timeout_label: &str,
     ) -> Result<ReviewTurnResult> {
-        match tokio::time::timeout(
+        let clock = ReviewAdmissionClock::new();
+        match timeout_active(
             timeout,
+            &clock,
             self.run_tracked_code_review_turn(
                 job,
                 task_id,
                 thread_id,
-                request,
+                request.with_admission_clock(&clock),
                 superseded,
                 active_threads,
             ),
@@ -7005,7 +7144,7 @@ impl Engine {
         .await
         {
             Ok(result) => result,
-            Err(_) => {
+            Err(ActiveTimeElapsed) => {
                 active_threads.lock().unwrap().remove(thread_id);
                 if let Err(error) = self.cancel_turn(thread_id) {
                     tracing::warn!(
@@ -7016,8 +7155,9 @@ impl Engine {
                     );
                 }
                 bail!(
-                    "{timeout_label} timed out after {}",
-                    compact_elapsed(timeout.as_millis().try_into().unwrap_or(u64::MAX))
+                    "{timeout_label} timed out after {}{}",
+                    compact_elapsed(timeout.as_millis().try_into().unwrap_or(u64::MAX)),
+                    admission_wait_suffix(clock.waited())
                 )
             }
         }
@@ -7195,7 +7335,8 @@ impl Engine {
                 return None;
             }
         };
-        let outcome = tokio::time::timeout(timeout, async {
+        let clock = ReviewAdmissionClock::new();
+        let outcome = timeout_active(timeout, &clock, async {
             let started = self
                 .store
                 .start_code_review_task(&task.id, &thread.session_id, &thread.id, &thread.model)?
@@ -7206,7 +7347,7 @@ impl Engine {
                     job,
                     &task.id,
                     &thread.id,
-                    ReviewTurnRequest::json_repair(prompt.clone()),
+                    ReviewTurnRequest::json_repair(prompt.clone()).with_admission_clock(&clock),
                     superseded,
                     active_threads,
                 )
@@ -7223,7 +7364,8 @@ impl Engine {
                                 &initial_error,
                                 &turn.output,
                             ))
-                            .with_metrics_base(turn.metrics.clone()),
+                            .with_metrics_base(turn.metrics.clone())
+                            .with_admission_clock(&clock),
                             superseded,
                             active_threads,
                         )
@@ -7274,7 +7416,7 @@ impl Engine {
                 fail_task(&error);
                 None
             }
-            Err(_) => {
+            Err(ActiveTimeElapsed) => {
                 active_threads.lock().unwrap().remove(&thread.id);
                 if let Err(error) = self.cancel_turn(&thread.id) {
                     tracing::warn!(
@@ -7285,8 +7427,9 @@ impl Engine {
                     );
                 }
                 let error = anyhow!(
-                    "implementation analysis timed out after {}",
-                    compact_elapsed(timeout.as_millis().try_into().unwrap_or(u64::MAX))
+                    "implementation analysis timed out after {}{}",
+                    compact_elapsed(timeout.as_millis().try_into().unwrap_or(u64::MAX)),
+                    admission_wait_suffix(clock.waited())
                 );
                 tracing::warn!(job_id = %job.id, %error, "implementation analysis failed");
                 fail_task(&error);
@@ -7485,6 +7628,7 @@ impl Engine {
             initial_stage,
             output_stage,
             metrics_base,
+            admission_clock,
         } = request;
         ensure_review_current(superseded)?;
         let scope = Scope::Thread(thread_id.to_string());
@@ -7523,6 +7667,12 @@ impl Engine {
             self.send_message_without_tools(thread_id, prompt)?
         };
         let turn = accepted.turn;
+        // From here until the engine publishes admission the turn is queued,
+        // not running; the guard closes the wait on every exit path.
+        let mut admission_wait = admission_clock.as_deref().map(|clock| {
+            clock.begin_wait();
+            AdmissionWaitGuard(clock)
+        });
         let mut output = String::new();
         let usage;
         let mut model_started = None;
@@ -7614,6 +7764,7 @@ impl Engine {
                 } if event_turn == turn => {
                     // The engine has already persisted provider wait and the
                     // post-admission stage before publishing this thread event.
+                    drop(admission_wait.take());
                     lifecycle_stage = initial_stage;
                     observed_stage = initial_stage;
                     coalesce_observed_stage = false;
@@ -17304,6 +17455,57 @@ fn merge_review_task_metrics(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn active_timeout_excludes_admission_waits() {
+        let clock = ReviewAdmissionClock::new();
+        let budget = Duration::from_secs(10);
+
+        // A turn that never waits is bounded by the plain budget.
+        let outcome = timeout_active(budget, &clock, tokio::time::sleep(budget * 2)).await;
+        assert!(matches!(outcome, Err(ActiveTimeElapsed)));
+        assert_eq!(clock.waited(), Duration::ZERO);
+
+        // Time spent inside an open wait is not charged, whether the wait
+        // settles explicitly or by dropping its guard.
+        let clock = ReviewAdmissionClock::new();
+        let outcome = timeout_active(budget, &clock, async {
+            clock.begin_wait();
+            tokio::time::sleep(budget * 3).await;
+            clock.end_wait();
+            tokio::time::sleep(budget / 2).await;
+            {
+                clock.begin_wait();
+                let _guard = AdmissionWaitGuard(&clock);
+                tokio::time::sleep(budget * 3).await;
+            }
+            tokio::time::sleep(budget / 4).await;
+            "done"
+        })
+        .await;
+        assert!(matches!(outcome, Ok("done")));
+        assert_eq!(clock.waited(), budget * 6);
+
+        // Active time still accumulates across a wait: half the budget
+        // before it plus more than half after it trips the deadline, and
+        // the wait is reported so the failure can explain itself.
+        let clock = ReviewAdmissionClock::new();
+        let outcome = timeout_active(budget, &clock, async {
+            tokio::time::sleep(budget / 2).await;
+            clock.begin_wait();
+            tokio::time::sleep(budget).await;
+            clock.end_wait();
+            tokio::time::sleep(budget).await;
+        })
+        .await;
+        assert!(matches!(outcome, Err(ActiveTimeElapsed)));
+        assert_eq!(clock.waited(), budget);
+        assert_eq!(
+            admission_wait_suffix(clock.waited()),
+            " of model time (plus 10s queued for provider admission)"
+        );
+        assert_eq!(admission_wait_suffix(Duration::ZERO), "");
+    }
 
     async fn read_mock_http_request(stream: &mut tokio::net::TcpStream) -> String {
         use tokio::io::AsyncReadExt as _;
