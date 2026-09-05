@@ -6338,8 +6338,7 @@ impl Engine {
         }
         let inter_round_changed = inter_round_files
             .as_deref()
-            .map(|files| inter_round_changed_lines(files))
-            .unwrap_or_default();
+            .map(|files| inter_round_changed_lines(files));
         let carried_diff_contents = diff_line_contents(&carried_mapping_files);
         let carried_mapping = CarriedAnchorMappingContext {
             files: &carried_mapping_files,
@@ -6752,7 +6751,7 @@ impl Engine {
                         finding.line,
                         &finding.side,
                         &finding.evidence,
-                        &inter_round_changed,
+                        inter_round_changed.as_ref(),
                     ),
                 );
                 NewCodeReviewFindingDetails {
@@ -17571,18 +17570,17 @@ fn inter_round_changed_lines(files: &[ReviewDiffFile]) -> HashSet<(String, u64, 
 }
 
 /// Whether a finding's anchor or any causal waypoint lies on a line the
-/// inter-round diff changed. An empty set (first round, same head, or an
-/// unavailable diff) is "unknown" and never forces an origin.
+/// inter-round diff changed. `None` (first round or an unavailable diff)
+/// is "unknown" and never forces an origin; a loaded diff that changed no
+/// lines (a pure rename or mode change) means nothing was touched.
 fn finding_touches_inter_round_change(
     path: &str,
     line: u64,
     side: &str,
     evidence: &trouve_protocol::CodeReviewFindingEvidence,
-    inter_round_changed: &HashSet<(String, u64, bool)>,
+    inter_round_changed: Option<&HashSet<(String, u64, bool)>>,
 ) -> Option<bool> {
-    if inter_round_changed.is_empty() {
-        return None;
-    }
+    let inter_round_changed = inter_round_changed?;
     let left = side.eq_ignore_ascii_case("LEFT");
     Some(
         inter_round_changed.contains(&(path.to_owned(), line, left))
@@ -27176,7 +27174,7 @@ rename to src/new.rs
                     .unwrap_or_default(),
                 ..Default::default()
             };
-            finding_touches_inter_round_change(path, line, side, &evidence, &changed)
+            finding_touches_inter_round_change(path, line, side, &evidence, Some(&changed))
         };
         assert_eq!(touches("src/lib.rs", 4, "RIGHT", None), Some(true));
         assert_eq!(touches("src/lib.rs", 4, "LEFT", None), Some(true));
@@ -27191,15 +27189,20 @@ rename to src/new.rs
             Some(false)
         );
         assert_eq!(
+            finding_touches_inter_round_change("src/lib.rs", 4, "RIGHT", &Default::default(), None),
+            None,
+            "an unavailable inter-round diff never forces an origin"
+        );
+        assert_eq!(
             finding_touches_inter_round_change(
                 "src/lib.rs",
                 4,
                 "RIGHT",
                 &Default::default(),
-                &HashSet::new()
+                Some(&HashSet::new())
             ),
-            None,
-            "an unavailable inter-round diff never forces an origin"
+            Some(false),
+            "a loaded diff that changed no lines touched nothing"
         );
     }
 
