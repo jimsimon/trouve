@@ -60,7 +60,7 @@ png = "0.18.1"
 
 # Maintained system-webview product host. These stay optional so non-desktop
 # targets can build without WebKitGTK/WebView2.
-tao = { version = "0.36.0", optional = true }
+tao = { version = "0.37.0", optional = true }
 wry = { version = "0.56.0", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
