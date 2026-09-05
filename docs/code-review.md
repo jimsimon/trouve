@@ -284,6 +284,16 @@ applies its own capacity or rate limit. Provider throttle responses still
 activate shared exponential cooldown so concurrent turns do not become an
 immediate retry storm.
 
+Agent backends that multiplex every thread through one vendor process (Codex's
+app-server) admit thread starts roughly serially, so a large review's burst of
+starts would otherwise queue inside the vendor until the last one exceeded the
+backend's fixed response timeout and retired the shared transport under every
+running reviewer. The engine therefore paces vendor turn startup per backend:
+at most four turns are starting on the same backend at once, and each permit is
+released as soon as the vendor accepts the turn. Any number of reviewer turns
+may then run concurrently. Time spent waiting for a startup slot is recorded as
+the task's provider-capacity wait.
+
 The retired `TROUVE_TURN_CONCURRENCY`, `TROUVE_BACKGROUND_TURN_CONCURRENCY`,
 `TROUVE_PROVIDER_TURN_CONCURRENCY`, and
 `TROUVE_PROVIDER_BACKGROUND_TURN_CONCURRENCY` settings are ignored with a
