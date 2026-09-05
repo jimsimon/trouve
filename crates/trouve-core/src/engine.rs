@@ -5595,10 +5595,13 @@ impl Engine {
         let state_id = canonical_cli_runtime_id(id);
         match self.cli_installs.lock().unwrap().get(state_id) {
             Some(CliInstallState::Pending { progress, .. }) => {
-                progress
-                    .cancel
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
-                Ok(())
+                if progress.cancel_before_activation_commit() {
+                    Ok(())
+                } else {
+                    Err(EngineError::Conflict(format!(
+                        "the {id} install has already committed and can no longer be cancelled"
+                    )))
+                }
             }
             _ => Err(EngineError::NotFound(format!(
                 "no install for {id} is in progress"

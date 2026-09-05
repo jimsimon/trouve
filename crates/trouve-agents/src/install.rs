@@ -168,11 +168,38 @@ pub struct Progress {
     pub received: std::sync::atomic::AtomicU64,
     pub total: std::sync::atomic::AtomicU64,
     pub cancel: std::sync::atomic::AtomicBool,
+    activation_committed: std::sync::Mutex<bool>,
 }
 
 impl Progress {
     pub fn cancelled(&self) -> bool {
         self.cancel.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Linearize an external cancellation request against managed-runtime
+    /// publication. A request that wins before the pointer commit is accepted;
+    /// one that arrives after publication is told that activation already won.
+    pub fn cancel_before_activation_commit(&self) -> bool {
+        let committed = self.activation_committed.lock().unwrap();
+        if *committed {
+            return false;
+        }
+        self.cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        true
+    }
+
+    fn commit_activation(
+        &self,
+        commit: impl FnOnce() -> Result<(), InstallError>,
+    ) -> Result<(), InstallError> {
+        let mut committed = self.activation_committed.lock().unwrap();
+        if self.cancelled() {
+            return Err(InstallError::Cancelled);
+        }
+        commit()?;
+        *committed = true;
+        Ok(())
     }
 }
 
@@ -721,13 +748,12 @@ impl PreparedInstall {
         self,
         progress: &Progress,
     ) -> Result<ActivationOutcome, InstallError> {
-        self.activate_with_checkpoint(|_| {
-            if progress.cancelled() {
-                Err(InstallError::Cancelled)
-            } else {
-                Ok(())
-            }
-        })
+        let mut checkpoint = |_| Ok(());
+        self.activate_with_checkpoint_and_sync_control(
+            &mut checkpoint,
+            sync_runtime_path,
+            Some(progress),
+        )
     }
 
     fn activate_with_checkpoint(
@@ -740,7 +766,16 @@ impl PreparedInstall {
     fn activate_with_checkpoint_and_sync(
         self,
         checkpoint: &mut impl FnMut(ActivationCheckpoint) -> Result<(), InstallError>,
+        sync_path: impl FnMut(&Path) -> std::io::Result<()>,
+    ) -> Result<ActivationOutcome, InstallError> {
+        self.activate_with_checkpoint_and_sync_control(checkpoint, sync_path, None)
+    }
+
+    fn activate_with_checkpoint_and_sync_control(
+        self,
+        checkpoint: &mut impl FnMut(ActivationCheckpoint) -> Result<(), InstallError>,
         mut sync_path: impl FnMut(&Path) -> std::io::Result<()>,
+        activation_progress: Option<&Progress>,
     ) -> Result<ActivationOutcome, InstallError> {
         // Persisted executable paths and Unix compatibility symlink targets
         // must not depend on the process working directory. Public callers may
@@ -836,7 +871,14 @@ impl PreparedInstall {
         });
         let replacing_pointer = path_exists(&pointer)?;
         checkpoint(ActivationCheckpoint::BeforePointer)?;
-        replace_runtime_file(&pointer_candidate, &pointer, replacing_pointer)?;
+        if let Some(progress) = activation_progress {
+            progress.commit_activation(|| {
+                replace_runtime_file(&pointer_candidate, &pointer, replacing_pointer)?;
+                Ok(())
+            })?;
+        } else {
+            replace_runtime_file(&pointer_candidate, &pointer, replacing_pointer)?;
+        }
 
         // installed.json is the one atomically replaced commit marker. Disarm
         // generation cleanup immediately: a later directory-sync error cannot
@@ -2860,13 +2902,33 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
             bin_rel: PathBuf::from("codex"),
             operation_epoch: String::new(),
         };
-        let progress = Progress::default();
-        progress
-            .cancel
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let progress = Arc::new(Progress::default());
+        let (checkpoint_reached_tx, checkpoint_reached_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_checkpoint_tx, release_checkpoint_rx) = std::sync::mpsc::sync_channel(0);
+        let activation = std::thread::spawn({
+            let progress = Arc::clone(&progress);
+            move || {
+                let mut checkpoint = |point| {
+                    assert_eq!(point, ActivationCheckpoint::BeforePointer);
+                    checkpoint_reached_tx.send(()).unwrap();
+                    release_checkpoint_rx.recv().unwrap();
+                    Ok(())
+                };
+                prepared.activate_with_checkpoint_and_sync_control(
+                    &mut checkpoint,
+                    sync_runtime_path,
+                    Some(&progress),
+                )
+            }
+        });
 
+        checkpoint_reached_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("activation did not reach its pointer commit checkpoint");
+        assert!(progress.cancel_before_activation_commit());
+        release_checkpoint_tx.send(()).unwrap();
         assert!(matches!(
-            prepared.activate_cancellable(&progress),
+            activation.join().unwrap(),
             Err(InstallError::Cancelled)
         ));
         let active = installed(tmp.path(), CliId::Codex).unwrap();
@@ -2881,6 +2943,15 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
                 .count(),
             0
         );
+    }
+
+    #[test]
+    fn cancellation_after_activation_commit_is_rejected() {
+        let progress = Progress::default();
+        progress.commit_activation(|| Ok(())).unwrap();
+
+        assert!(!progress.cancel_before_activation_commit());
+        assert!(!progress.cancelled());
     }
 
     #[test]

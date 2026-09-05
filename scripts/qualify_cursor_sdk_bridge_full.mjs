@@ -62,6 +62,7 @@ const MAX_CALLBACK_BODY_BYTES = 4 * 1024 * 1024;
 const MAX_QUALIFICATION_CALLBACKS = 256;
 const MAX_QUALIFICATION_CALLBACK_CONCURRENCY = 16;
 const SCHEMA_PROBE_COUNT = 128;
+const SCHEMA_BOUNDARY_VALUE = "schema-capacity-boundary";
 function crc32(data) {
   let crc = 0xffffffff;
   for (const byte of data) {
@@ -117,6 +118,7 @@ const TOOLS = {
   parallelA: "trouve_qualification_parallel_read_a",
   parallelB: "trouve_qualification_parallel_read_b",
   block: "trouve_qualification_block",
+  schemaBoundary: `trouve_schema_probe_${String(SCHEMA_PROBE_COUNT - 1).padStart(3, "0")}`,
 };
 
 const RESULTS = {
@@ -129,6 +131,7 @@ const RESULTS = {
   parallelB: "OK",
   parallelFinal: "TROUVE_CURSOR_PARALLEL_OK",
   blockReleased: "TROUVE_CURSOR_BLOCK_RELEASED",
+  schemaBoundary: "TROUVE_CURSOR_SCHEMA_BOUNDARY_OK",
 };
 
 const help = `Usage: node scripts/qualify_cursor_sdk_bridge_full.mjs [options]
@@ -434,9 +437,9 @@ function buildCustomTools() {
       inputSchema: objectSchema({
         value: {
           type: "string",
-          description: "A value that is never requested during qualification.",
+          description: "Exact schema-capacity probe value requested by qualification.",
         },
-      }),
+      }, ["value"]),
     };
   }
   return definitions;
@@ -1205,6 +1208,12 @@ async function fullQualification(args) {
     const name = `trouve_schema_probe_${String(index).padStart(3, "0")}`;
     handlers.set(name, async () => ({ value: "UNEXPECTED_SCHEMA_PROBE_CALL" }));
   }
+  handlers.set(TOOLS.schemaBoundary, async (input) => {
+    if (input.value !== SCHEMA_BOUNDARY_VALUE) {
+      throw new QualificationError("schema boundary callback arguments differed");
+    }
+    return { value: RESULTS.schemaBoundary };
+  });
 
   let callback;
   let bridge;
@@ -1397,6 +1406,29 @@ async function fullQualification(args) {
       timeoutMilliseconds,
     });
     turns.push(readTurn.summary);
+
+    const schemaBoundaryTurn = await runTurn({
+      bridge,
+      callback,
+      agentId,
+      label: "custom-tool-schema-capacity-boundary",
+      prompt:
+        `Call ${TOOLS.schemaBoundary} exactly once with ` +
+        `{"value":"${SCHEMA_BOUNDARY_VALUE}"}. Reply only with the callback result's value field.`,
+      expectedTools: [TOOLS.schemaBoundary],
+      expectedText: RESULTS.schemaBoundary,
+      timeoutMilliseconds,
+    });
+    if (
+      schemaBoundaryTurn.callbacks.length !== 1 ||
+      JSON.stringify(schemaBoundaryTurn.callbacks[0].args) !==
+        JSON.stringify({ value: SCHEMA_BOUNDARY_VALUE })
+    ) {
+      throw new QualificationError(
+        "schema boundary qualification did not preserve the declared callback arguments",
+      );
+    }
+    turns.push(schemaBoundaryTurn.summary);
 
     const replay = await observeCompletedRun(
       bridge,
@@ -1702,6 +1734,8 @@ async function fullQualification(args) {
       tools_and_permissions: {
         registered_custom_tools: Object.keys(customTools).length,
         synthetic_schema_probes: SCHEMA_PROBE_COUNT,
+        schema_boundary_probe: TOOLS.schemaBoundary,
+        schema_boundary_callback_completed: true,
         confinement: "sdk-tool-allowlist-contract",
         tool_policy_validation: toolPolicy,
         cursor_native_sandbox: false,
