@@ -113,6 +113,10 @@ import {
   type ProtocolProvidersResponse,
   type ProtocolSubscriptionHealth,
 } from "../services/protocol-client.js";
+import {
+  beginTitleGeneration,
+  titleGenerationTimeoutMs,
+} from "../services/title-generation.js";
 import { createBrowserThreadIngress } from "../services/thread-ingress.js";
 import { SubscriptionHealthController } from "../services/subscription-health-controller.js";
 import { ModelCatalogController } from "../services/model-catalog-controller.js";
@@ -206,7 +210,6 @@ import "../components/thread-screen.js";
 import "../components/model-picker.js";
 import "../components/model-options-editor.js";
 
-const SESSION_TITLE_TIMEOUT_MS = 48_000;
 const VIDEO_ATTACHMENT_DOWNLOAD_TIMEOUT_MS = 30_000;
 const VIDEO_ATTACHMENT_OPEN_CONCURRENCY = 1;
 const VIDEO_ATTACHMENT_OPEN_CAPACITY = 8;
@@ -2093,7 +2096,8 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     attachments: readonly ProtocolAttachmentUpload[],
   ): Promise<ProtocolGeneratedTitle> {
     const abort = new AbortController();
-    const timeout = globalThis.setTimeout(() => abort.abort(), SESSION_TITLE_TIMEOUT_MS);
+    const timeoutMs = titleGenerationTimeoutMs();
+    const timeout = globalThis.setTimeout(() => abort.abort(), timeoutMs);
     try {
       return await this.#protocolClient.generateTitle(sessionId, prompt, attachments, {
         signal: abort.signal,
@@ -2105,59 +2109,47 @@ export class TrouveApp extends withSignalTracking(LitElement) {
 
   /** Upgrade a prompt-derived title without delaying session creation or the
    * first turn. A manual rename made while generation is in flight wins. */
-  #upgradeSessionTitleInBackground(
-    sessionId: string,
+  #upgradeTitleInBackground(
+    target: "session" | "thread",
+    id: string,
     provisionalTitle: string,
     prompt: string,
     attachments: readonly ProtocolAttachmentUpload[],
     sharedGeneration?: Promise<ProtocolGeneratedTitle>,
   ): void {
-    this.#store.beginSessionTitleGeneration(sessionId, provisionalTitle);
+    const waitingTimer = beginTitleGeneration(
+      this.#store,
+      id,
+      provisionalTitle,
+      readSignal(this.#store.sessionNamingSettings)?.settings.model,
+    );
     void (async () => {
       try {
-        const generated = await (sharedGeneration
-          ?? this.#generateTitle(sessionId, prompt, attachments));
-        const title = generated.title.trim();
-        if (title === "" || title === provisionalTitle) return;
-        if (this.#store.sessionMetadata(sessionId)?.title !== provisionalTitle) return;
-        const session = await this.#protocolClient.updateSession(sessionId, {
-          title,
-          expected_title: provisionalTitle,
-        });
-        this.#store.upsertSessionMetadata(session);
-      } catch {
-        // Naming is cosmetic; the placeholder remains.
-      } finally {
-        this.#store.endSessionTitleGeneration(sessionId);
-      }
-    })();
-  }
-
-  #upgradeThreadTitleInBackground(
-    threadId: string,
-    provisionalTitle: string,
-    prompt: string,
-    attachments: readonly ProtocolAttachmentUpload[],
-    sharedGeneration?: Promise<ProtocolGeneratedTitle>,
-  ): void {
-    this.#store.beginThreadTitleGeneration(threadId, provisionalTitle);
-    void (async () => {
-      try {
-        const sessionId = this.#store.thread(threadId)?.session_id;
+        const sessionId = target === "session"
+          ? id
+          : this.#store.thread(id)?.session_id;
         if (sessionId === undefined) return;
         const generated = await (sharedGeneration
           ?? this.#generateTitle(sessionId, prompt, attachments));
         const title = generated.title.trim();
         if (title === "" || title === provisionalTitle) return;
-        const thread = await this.#protocolClient.updateThread(threadId, {
-          title,
-          expected_title: provisionalTitle,
-        });
-        this.#store.upsertThread(thread);
+        if (target === "session") {
+          if (this.#store.sessionMetadata(id)?.title !== provisionalTitle) return;
+          this.#store.upsertSessionMetadata(await this.#protocolClient.updateSession(id, {
+            title,
+            expected_title: provisionalTitle,
+          }));
+        } else {
+          this.#store.upsertThread(await this.#protocolClient.updateThread(id, {
+            title,
+            expected_title: provisionalTitle,
+          }));
+        }
       } catch {
         // Naming is cosmetic; the placeholder or a user rename remains.
       } finally {
-        this.#store.endThreadTitleGeneration(threadId);
+        globalThis.clearTimeout(waitingTimer);
+        this.#store.endTitleGeneration(id);
       }
     })();
   }
@@ -2524,7 +2516,8 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       ? this.#generateTitle(session.id, prompt, submissionAttachments)
       : undefined;
     if (sharedGeneratedTitle !== undefined) {
-      this.#upgradeSessionTitleInBackground(
+      this.#upgradeTitleInBackground(
+        "session",
         session.id,
         submittedCreateRequest.title,
         prompt,
@@ -2543,7 +2536,8 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       );
       this.#store.upsertThread(thread);
       threadId = thread.id;
-      this.#upgradeThreadTitleInBackground(
+      this.#upgradeTitleInBackground(
+        "thread",
         thread.id,
         thread.title ?? NEW_THREAD_TITLE_FALLBACK,
         prompt,
@@ -2663,7 +2657,13 @@ export class TrouveApp extends withSignalTracking(LitElement) {
           fetch_latest: true,
         });
         this.#store.upsertSessionMetadata(createdSession);
-        this.#upgradeSessionTitleInBackground(createdSession.id, title, detail.prompt, []);
+        this.#upgradeTitleInBackground(
+          "session",
+          createdSession.id,
+          title,
+          detail.prompt,
+          [],
+        );
         sessionId = createdSession.id;
       }
 
@@ -2673,7 +2673,8 @@ export class TrouveApp extends withSignalTracking(LitElement) {
         mode: "code",
       });
       this.#store.upsertThread(thread);
-      this.#upgradeThreadTitleInBackground(
+      this.#upgradeTitleInBackground(
+        "thread",
         thread.id,
         thread.title ?? NEW_THREAD_TITLE_FALLBACK,
         detail.prompt,

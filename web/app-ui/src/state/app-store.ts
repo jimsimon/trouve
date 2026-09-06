@@ -58,6 +58,8 @@ export interface ThreadIndicatorState {
   readonly unread: boolean;
 }
 
+type TitleGenerationState = [provisionalTitle: string, waiting: boolean];
+
 export interface SessionPullRequestIdentity {
   readonly workspaceId: string;
   readonly branch: string;
@@ -209,8 +211,7 @@ export class AppStore {
   #sessionSummaryInitialized = false;
   readonly #workspaces = new Map<string, ProtocolWorkspace>();
   readonly #threads = new Map<string, ProtocolThread>();
-  readonly #generatingSessionTitles = new Map<string, string>();
-  readonly #generatingThreadTitles = new Map<string, string>();
+  readonly #generatingTitles = new Map<string, TitleGenerationState>();
   readonly #threadStatuses = new Map<string, ProtocolThreadStatus>();
   readonly #seenThreadCursors = new Map<string, number>();
   readonly #initializedThreadSessions = new Set<string>();
@@ -282,9 +283,9 @@ export class AppStore {
     for (const session of sessions) {
       if (this.#deletedSessions.has(session.id)) continue;
       this.#sessionMetadata.set(session.id, session);
-      const provisionalTitle = this.#generatingSessionTitles.get(session.id);
-      if (provisionalTitle !== undefined && session.title !== provisionalTitle) {
-        this.#generatingSessionTitles.delete(session.id);
+      const generation = this.#generatingTitles.get(session.id);
+      if (generation !== undefined && session.title !== generation[0]) {
+        this.#generatingTitles.delete(session.id);
       }
     }
     this.#touch();
@@ -293,9 +294,9 @@ export class AppStore {
   upsertSessionMetadata(session: ProtocolSession): void {
     if (this.#deletedSessions.has(session.id)) return;
     this.#sessionMetadata.set(session.id, session);
-    const provisionalTitle = this.#generatingSessionTitles.get(session.id);
-    if (provisionalTitle !== undefined && session.title !== provisionalTitle) {
-      this.#generatingSessionTitles.delete(session.id);
+    const generation = this.#generatingTitles.get(session.id);
+    if (generation !== undefined && session.title !== generation[0]) {
+      this.#generatingTitles.delete(session.id);
     }
     const summary = this.#sessionSummaries.get(session.id);
     if (summary !== undefined && session.archived !== undefined) {
@@ -323,7 +324,7 @@ export class AppStore {
     this.#seenSessionCursors.delete(sessionId);
     this.#sessionPullRequests.delete(sessionId);
     this.#sessionUsageRevisions.delete(sessionId);
-    this.#generatingSessionTitles.delete(sessionId);
+    this.#generatingTitles.delete(sessionId);
     for (const [threadId, thread] of this.#threads) {
       if (thread.session_id === sessionId) {
         this.#threads.delete(threadId);
@@ -331,7 +332,7 @@ export class AppStore {
         this.#threadTodoEvents.delete(threadId);
         this.#threadStatuses.delete(threadId);
         this.#seenThreadCursors.delete(threadId);
-        this.#generatingThreadTitles.delete(threadId);
+        this.#generatingTitles.delete(threadId);
       }
     }
     // Status snapshots can arrive before (or without) thread metadata. Purge
@@ -343,41 +344,33 @@ export class AppStore {
       this.#seenThreadCursors.delete(threadId);
       this.#threadViews.delete(threadId);
       this.#threadTodoEvents.delete(threadId);
-      this.#generatingThreadTitles.delete(threadId);
+      this.#generatingTitles.delete(threadId);
     }
     this.#initializedThreadSessions.delete(sessionId);
     this.#initializedThreadStatusSessions.delete(sessionId);
     this.#touch();
   }
 
-  beginSessionTitleGeneration(sessionId: string, provisionalTitle: string): void {
-    this.#generatingSessionTitles.set(sessionId, provisionalTitle);
+  beginTitleGeneration(id: string, provisionalTitle: string): void {
+    this.#generatingTitles.set(id, [provisionalTitle, false]);
     this.#touch();
   }
 
-  endSessionTitleGeneration(sessionId: string): void {
-    if (!this.#generatingSessionTitles.delete(sessionId)) return;
+  markTitleGenerationWaiting(id: string, provisionalTitle: string): void {
+    const current = this.#generatingTitles.get(id);
+    if (current?.[0] !== provisionalTitle || current[1]) return;
+    current[1] = true;
     this.#touch();
   }
 
-  isSessionTitleGenerating(sessionId: string): boolean {
+  endTitleGeneration(id: string): void {
+    if (!this.#generatingTitles.delete(id)) return;
+    this.#touch();
+  }
+
+  titleGenerationWaiting(id: string): boolean | undefined {
     this.#revision.get();
-    return this.#generatingSessionTitles.has(sessionId);
-  }
-
-  beginThreadTitleGeneration(threadId: string, provisionalTitle: string): void {
-    this.#generatingThreadTitles.set(threadId, provisionalTitle);
-    this.#touch();
-  }
-
-  endThreadTitleGeneration(threadId: string): void {
-    if (!this.#generatingThreadTitles.delete(threadId)) return;
-    this.#touch();
-  }
-
-  isThreadTitleGenerating(threadId: string): boolean {
-    this.#revision.get();
-    return this.#generatingThreadTitles.has(threadId);
+    return this.#generatingTitles.get(id)?.[1];
   }
 
   replaceWorkspaces(workspaces: readonly ProtocolWorkspace[]): void {
@@ -983,13 +976,13 @@ export class AppStore {
       ? thread
       : { ...thread, todos: todos.map((todo) => ({ ...todo })) };
     this.#threads.set(thread.id, stored);
-    const provisionalTitle = this.#generatingThreadTitles.get(thread.id);
+    const generation = this.#generatingTitles.get(thread.id);
     if (
-      provisionalTitle !== undefined
+      generation !== undefined
       && thread.title !== undefined
-      && thread.title !== provisionalTitle
+      && thread.title !== generation[0]
     ) {
-      this.#generatingThreadTitles.delete(thread.id);
+      this.#generatingTitles.delete(thread.id);
     }
     if (todoEvent === undefined && thread.todos !== undefined) {
       this.#threadViews.get(thread.id)?.replaceTodos(thread.todos);

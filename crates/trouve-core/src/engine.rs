@@ -5,6 +5,7 @@
 //! serialized per session (threads share the session worktree, ADR 0003).
 
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 
 /// Internal marker prompt for turns that attach to vendor-autonomous agent
 /// activity instead of prompting the model. The durable display boundary is
@@ -28,7 +29,7 @@ use trouve_protocol::{
     TurnPhase, UpdateSessionRequest, UpdateThreadRequest, UpsertProviderRequest, Usage, Workspace,
     WorkspaceListItem,
 };
-use trouve_providers::{Message, Provider, ProviderEvent, ToolSpec};
+use trouve_providers::{InferencePriority, Message, Provider, ProviderEvent, ToolSpec};
 
 use crate::config::{Config, ProviderConfig};
 use crate::permissions::{
@@ -591,6 +592,16 @@ const GITHUB_DASHBOARD_REFRESH_FRESHNESS: std::time::Duration = std::time::Durat
 // Leave a little handoff margin beyond those combined budgets so this outer
 // timeout does not silently replace a valid model request with heuristics.
 const SESSION_TITLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+// A managed local naming request may spend five minutes waiting behind user
+// turns and another five minutes loading its configured model. Keep the
+// end-to-end guard just beyond those independent bounded phases.
+const LOCAL_SESSION_TITLE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(10 * 60 + 45);
+// Naming is cosmetic and authenticated clients may retry while local
+// inference is busy. Bound both distinct work and coalesced followers so a
+// stalled sidecar cannot retain an arbitrary number of request tasks.
+const MAX_PENDING_TITLE_JOBS: usize = 32;
+const MAX_TITLE_JOB_FOLLOWERS: usize = 32;
 #[cfg(not(test))]
 const MODEL_CATALOG_VALIDATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 #[cfg(test)]
@@ -3281,6 +3292,81 @@ async fn shutdown_retiring_backend_batch(
     failures
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct TitleJobKey {
+    session_id: String,
+    model: String,
+    input_hash: u64,
+}
+
+type SharedTitleJobResult = Result<trouve_protocol::GeneratedTitle, String>;
+
+#[derive(Default)]
+struct TitleJobState {
+    waiters: Vec<tokio::sync::oneshot::Sender<SharedTitleJobResult>>,
+}
+
+struct TitleJobLeader<'a> {
+    jobs: &'a Mutex<HashMap<TitleJobKey, TitleJobState>>,
+    key: Option<TitleJobKey>,
+}
+
+fn title_job_key(
+    session_id: &str,
+    model: &str,
+    prompt: &str,
+    attachments: &[trouve_protocol::AttachmentUpload],
+) -> TitleJobKey {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    prompt.hash(&mut hasher);
+    for attachment in attachments {
+        attachment.name.hash(&mut hasher);
+        attachment.mime.hash(&mut hasher);
+        attachment.data.hash(&mut hasher);
+    }
+    TitleJobKey {
+        session_id: session_id.into(),
+        model: model.into(),
+        input_hash: hasher.finish(),
+    }
+}
+
+impl TitleJobLeader<'_> {
+    fn complete(mut self, result: SharedTitleJobResult) {
+        let Some(key) = self.key.take() else {
+            return;
+        };
+        let waiters = self
+            .jobs
+            .lock()
+            .unwrap()
+            .remove(&key)
+            .map(|job| job.waiters)
+            .unwrap_or_default();
+        for waiter in waiters {
+            let _ = waiter.send(result.clone());
+        }
+    }
+}
+
+impl Drop for TitleJobLeader<'_> {
+    fn drop(&mut self) {
+        let Some(key) = self.key.take() else {
+            return;
+        };
+        let waiters = self
+            .jobs
+            .lock()
+            .unwrap()
+            .remove(&key)
+            .map(|job| job.waiters)
+            .unwrap_or_default();
+        for waiter in waiters {
+            let _ = waiter.send(Err("title generation was cancelled".into()));
+        }
+    }
+}
+
 pub struct Engine {
     pub(crate) store: Store,
     pub(crate) data_dir: PathBuf,
@@ -3301,6 +3387,10 @@ pub struct Engine {
     /// still contribute newly released or account-specific live models.
     model_catalog: Arc<trouve_providers::models_dev::ModelsDevCatalog>,
     providers: RwLock<HashMap<String, Arc<dyn Provider>>>,
+    /// Identical cosmetic title requests share one provider inference. The
+    /// entry exists only while the leader request is alive and is removed on
+    /// success, failure, or cancellation.
+    title_jobs: Mutex<HashMap<TitleJobKey, TitleJobState>>,
     /// Providers registered programmatically (`with_provider`); preserved
     /// across config-driven registry reloads.
     injected_providers: Mutex<HashMap<String, Arc<dyn Provider>>>,
@@ -3895,6 +3985,7 @@ impl Engine {
             workspace_registration_lifecycles: Mutex::new(HashMap::new()),
             model_catalog,
             providers: RwLock::new(providers),
+            title_jobs: Mutex::new(HashMap::new()),
             injected_providers: Mutex::new(injected_providers),
             backends: Arc::new(RwLock::new(backends)),
             retiring_backends: Mutex::new(HashMap::new()),
@@ -7215,6 +7306,58 @@ impl Engine {
         prompt: &str,
         attachments: &[trouve_protocol::AttachmentUpload],
     ) -> Result<trouve_protocol::GeneratedTitle, EngineError> {
+        let model = self.session_naming_settings().model;
+        let key = title_job_key(session_id, &model, prompt, attachments);
+        let follower = {
+            let mut jobs = self.title_jobs.lock().unwrap();
+            if let Some(job) = jobs.get_mut(&key) {
+                job.waiters.retain(|waiter| !waiter.is_closed());
+                if job.waiters.len() >= MAX_TITLE_JOB_FOLLOWERS {
+                    return Err(EngineError::BadRequest(
+                        "too many callers are waiting for this title".into(),
+                    ));
+                }
+                let (sender, receiver) = tokio::sync::oneshot::channel();
+                job.waiters.push(sender);
+                Some(receiver)
+            } else {
+                if jobs.len() >= MAX_PENDING_TITLE_JOBS {
+                    return Err(EngineError::BadRequest(
+                        "too many title generation requests are waiting".into(),
+                    ));
+                }
+                jobs.insert(key.clone(), TitleJobState::default());
+                None
+            }
+        };
+        if let Some(follower) = follower {
+            return follower
+                .await
+                .map_err(|_| EngineError::BadRequest("title generation was cancelled".into()))?
+                .map_err(EngineError::BadRequest);
+        }
+
+        let leader = TitleJobLeader {
+            jobs: &self.title_jobs,
+            key: Some(key),
+        };
+        let result = self
+            .generate_title_uncoalesced(session_id, prompt, attachments)
+            .await;
+        let shared = result
+            .as_ref()
+            .cloned()
+            .map_err(std::string::ToString::to_string);
+        leader.complete(shared);
+        result
+    }
+
+    async fn generate_title_uncoalesced(
+        &self,
+        session_id: &str,
+        prompt: &str,
+        attachments: &[trouve_protocol::AttachmentUpload],
+    ) -> Result<trouve_protocol::GeneratedTitle, EngineError> {
         validate_attachment_uploads(attachments)?;
         let session = self.get_session(session_id)?;
         let settings = self.session_naming_settings();
@@ -7309,9 +7452,20 @@ impl Engine {
             })
             .collect();
         let messages = crate::title_model::messages(prompt, images);
-        let title = tokio::time::timeout(SESSION_TITLE_TIMEOUT, async {
+        let timeout = if settings.model.starts_with("local/") {
+            LOCAL_SESSION_TITLE_TIMEOUT
+        } else {
+            SESSION_TITLE_TIMEOUT
+        };
+        let title = tokio::time::timeout(timeout, async {
             let mut stream = provider
-                .stream_chat(&model_name, &messages, &[], &model_options)
+                .stream_chat_with_priority(
+                    &model_name,
+                    &messages,
+                    &[],
+                    &model_options,
+                    InferencePriority::Background,
+                )
                 .await
                 .map_err(|error| EngineError::BadRequest(error.to_string()))?;
             let mut output = String::new();
@@ -23251,6 +23405,12 @@ mod tests {
         release: Arc<tokio::sync::Semaphore>,
     }
 
+    struct BlockingTitleProvider {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        started: Arc<tokio::sync::Semaphore>,
+        release: Arc<tokio::sync::Semaphore>,
+    }
+
     fn catalog_test_model(id: &str, display_name: &str) -> trouve_protocol::ModelInfo {
         trouve_protocol::ModelInfo {
             id: id.into(),
@@ -23352,6 +23512,35 @@ mod tests {
             _options: &serde_json::Map<String, serde_json::Value>,
         ) -> Result<trouve_providers::EventStream, trouve_providers::ProviderError> {
             unreachable!("automation update tests never start a provider turn")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for BlockingTitleProvider {
+        fn id(&self) -> &str {
+            "title-test"
+        }
+
+        fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
+            vec![catalog_test_model("title-test/model", "Title test model")]
+        }
+
+        async fn stream_chat(
+            &self,
+            _model: &str,
+            _messages: &[trouve_providers::Message],
+            _tools: &[trouve_providers::ToolSpec],
+            _options: &serde_json::Map<String, serde_json::Value>,
+        ) -> Result<trouve_providers::EventStream, trouve_providers::ProviderError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.started.add_permits(1);
+            self.release.acquire().await.unwrap().forget();
+            Ok(Box::pin(futures::stream::iter(vec![
+                Ok(ProviderEvent::TextDelta("Prioritize Local Naming".into())),
+                Ok(ProviderEvent::Completed {
+                    usage: Usage::default(),
+                }),
+            ])))
         }
     }
 
@@ -24545,6 +24734,195 @@ mod tests {
                 .any(|model| model.id == "catalog-test/live")
         );
         assert_eq!(live_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn identical_title_requests_share_one_provider_inference() {
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let workspace = Workspace {
+            id: "ws_title".into(),
+            name: "title".into(),
+            path: data.path().to_string_lossy().into_owned(),
+        };
+        store.insert_workspace(&workspace).unwrap();
+        let session = Session {
+            id: "se_title".into(),
+            workspace_id: workspace.id,
+            title: "New Session".into(),
+            branch: "trouve/title".into(),
+            worktree_path: data.path().to_string_lossy().into_owned(),
+            base_ref: "main".into(),
+            archived: false,
+            active: false,
+            created_at: chrono::Utc::now(),
+        };
+        store.insert_session(&session).unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Semaphore::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let engine = Arc::new(
+            Engine::new(
+                store,
+                data.path().into(),
+                &Config {
+                    local_enabled: Some(false),
+                    session_naming_model: Some("title-test/model".into()),
+                    ..Default::default()
+                },
+            )
+            .with_provider(
+                "title-test",
+                Arc::new(BlockingTitleProvider {
+                    calls: calls.clone(),
+                    started: started.clone(),
+                    release: release.clone(),
+                }),
+            ),
+        );
+
+        let first = tokio::spawn({
+            let engine = engine.clone();
+            let session_id = session.id.clone();
+            async move {
+                engine
+                    .generate_title(&session_id, "Schedule local naming", &[])
+                    .await
+            }
+        });
+        started.acquire().await.unwrap().forget();
+        let second = tokio::spawn({
+            let engine = engine.clone();
+            let session_id = session.id.clone();
+            async move {
+                engine
+                    .generate_title(&session_id, "Schedule local naming", &[])
+                    .await
+            }
+        });
+        let coalesced_key = title_job_key(
+            &session.id,
+            "title-test/model",
+            "Schedule local naming",
+            &[],
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let waiter_count = engine
+                    .title_jobs
+                    .lock()
+                    .unwrap()
+                    .get(&coalesced_key)
+                    .map(|job| job.waiters.len());
+                if waiter_count == Some(1) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the second request should coalesce as a follower");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        release.add_permits(1);
+        let first = first.await.unwrap().unwrap();
+        let second = second.await.unwrap().unwrap();
+        assert_eq!(first.title, "Prioritize Local Naming");
+        assert_eq!(second.title, first.title);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        {
+            let mut jobs = engine.title_jobs.lock().unwrap();
+            for input_hash in 0..MAX_PENDING_TITLE_JOBS as u64 {
+                jobs.insert(
+                    TitleJobKey {
+                        session_id: format!("se_pending_{input_hash}"),
+                        model: "title-test/model".into(),
+                        input_hash,
+                    },
+                    TitleJobState::default(),
+                );
+            }
+        }
+        let error = engine
+            .generate_title(&session.id, "One title too many", &[])
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("too many title generation requests")
+        );
+
+        engine.title_jobs.lock().unwrap().clear();
+        let follower_key =
+            title_job_key(&session.id, "title-test/model", "Too many followers", &[]);
+        let mut follower_receivers = Vec::with_capacity(MAX_TITLE_JOB_FOLLOWERS);
+        let follower_senders = (0..MAX_TITLE_JOB_FOLLOWERS)
+            .map(|_| {
+                let (sender, receiver) = tokio::sync::oneshot::channel();
+                follower_receivers.push(receiver);
+                sender
+            })
+            .collect();
+        engine.title_jobs.lock().unwrap().insert(
+            follower_key.clone(),
+            TitleJobState {
+                waiters: follower_senders,
+            },
+        );
+        let error = engine
+            .generate_title(&session.id, "Too many followers", &[])
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("too many callers"));
+
+        drop(follower_receivers);
+        let follower = tokio::spawn({
+            let engine = engine.clone();
+            let session_id = session.id.clone();
+            async move {
+                engine
+                    .generate_title(&session_id, "Too many followers", &[])
+                    .await
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let waiter_count = engine
+                    .title_jobs
+                    .lock()
+                    .unwrap()
+                    .get(&follower_key)
+                    .map(|job| job.waiters.len());
+                if waiter_count == Some(1) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let live_waiter = engine
+            .title_jobs
+            .lock()
+            .unwrap()
+            .remove(&follower_key)
+            .unwrap()
+            .waiters;
+        assert_eq!(live_waiter.len(), 1);
+        live_waiter
+            .into_iter()
+            .next()
+            .unwrap()
+            .send(Ok(trouve_protocol::GeneratedTitle {
+                title: "Follower Capacity Recovered".into(),
+            }))
+            .unwrap();
+        assert_eq!(
+            follower.await.unwrap().unwrap().title,
+            "Follower Capacity Recovered"
+        );
     }
 
     #[tokio::test]

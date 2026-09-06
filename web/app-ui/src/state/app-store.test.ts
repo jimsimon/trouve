@@ -1014,28 +1014,35 @@ describe("AppStore", () => {
     store.upsertSessionMetadata({ ...metadata, title: "New Session" });
     store.upsertThread({ ...thread("th_1"), title: "New Thread" });
 
-    store.beginSessionTitleGeneration("se_1", "New Session");
-    store.beginThreadTitleGeneration("th_1", "New Thread");
-    expect(store.isSessionTitleGenerating("se_1")).toBe(true);
-    expect(store.isThreadTitleGenerating("th_1")).toBe(true);
+    store.beginTitleGeneration("se_1", "New Session");
+    store.beginTitleGeneration("th_1", "New Thread");
+    expect(store.titleGenerationWaiting("se_1")).toBe(false);
+    expect(store.titleGenerationWaiting("th_1")).toBe(false);
+
+    store.markTitleGenerationWaiting("se_1", "New Session");
+    store.markTitleGenerationWaiting("th_1", "New Thread");
+    expect(store.titleGenerationWaiting("se_1")).toBe(true);
+    expect(store.titleGenerationWaiting("th_1")).toBe(true);
 
     store.upsertSessionMetadata({ ...metadata, title: "Improve Session Naming" });
     store.upsertThread({ ...thread("th_1"), title: "Refine Shimmer State" });
-    expect(store.isSessionTitleGenerating("se_1")).toBe(false);
-    expect(store.isThreadTitleGenerating("th_1")).toBe(false);
+    store.markTitleGenerationWaiting("se_1", "New Session");
+    store.markTitleGenerationWaiting("th_1", "New Thread");
+    expect(store.titleGenerationWaiting("se_1")).toBeUndefined();
+    expect(store.titleGenerationWaiting("th_1")).toBeUndefined();
   });
 
   it("ends title generation without changing durable fallback titles", () => {
     const store = new AppStore();
     store.upsertSessionMetadata({ ...metadata, title: "New Session" });
     store.upsertThread({ ...thread("th_1"), title: "New Thread" });
-    store.beginSessionTitleGeneration("se_1", "New Session");
-    store.beginThreadTitleGeneration("th_1", "New Thread");
+    store.beginTitleGeneration("se_1", "New Session");
+    store.beginTitleGeneration("th_1", "New Thread");
 
-    store.endSessionTitleGeneration("se_1");
-    store.endThreadTitleGeneration("th_1");
-    expect(store.isSessionTitleGenerating("se_1")).toBe(false);
-    expect(store.isThreadTitleGenerating("th_1")).toBe(false);
+    store.endTitleGeneration("se_1");
+    store.endTitleGeneration("th_1");
+    expect(store.titleGenerationWaiting("se_1")).toBeUndefined();
+    expect(store.titleGenerationWaiting("th_1")).toBeUndefined();
     expect(store.sessionMetadata("se_1")?.title).toBe("New Session");
     expect(store.thread("th_1")?.title).toBe("New Thread");
   });

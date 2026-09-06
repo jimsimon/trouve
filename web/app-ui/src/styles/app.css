@@ -308,6 +308,8 @@ trouve-session-list[hidden] { display: none; }
 .session-title-shimmer { width: min(9rem, 70%); }
 .thread-title-shimmer { width: 6.5rem; max-width: 100%; }
 @keyframes naming-title-shimmer { to { background-position: -250% 0; } }
+.title-waiting::after { display: inline-block; width: 6px; height: 6px; margin-inline-start: 5px; border-radius: 999px; background: var(--trouve-accent); box-shadow: 0 0 0 2px var(--trouve-accent-dim); animation: naming-title-pending 1.4s ease-in-out infinite; content: ""; }
+@keyframes naming-title-pending { 50% { opacity: .35; } }
 .session-indicator.thread-tab-indicator { width: 14px; height: 18px; flex: 0 0 14px; margin: 0; border-radius: 3px; }
 .session-indicator.thread-tab-indicator.approval, .session-indicator.thread-tab-indicator.question, .session-indicator.thread-tab-indicator.both { font-size: 10px; }
 .session-indicator.thread-tab-indicator.error { font-size: 12px; }
@@ -711,14 +713,14 @@ trouve-agent-activity { display: contents; }
   30% { opacity: 1; translate: 0 -2px; }
 }
 [data-reduce-motion] .activity-dots i { animation: none; opacity: .7; translate: none; }
-[data-reduce-motion] .naming-title-shimmer { animation: none; }
+[data-reduce-motion] .naming-title-shimmer, [data-reduce-motion] .title-waiting::after { animation: none; }
 [data-reduce-motion] .session-indicator.busy::before { animation: none; opacity: 1; }
 [data-reduce-motion] .tool-inline-status.running { color: var(--trouve-text-dim); }
 [data-reduce-motion] .trouve-icon-spin { animation: none; }
 [data-reduce-motion] .context-compaction-spinner, [data-reduce-motion] .composer-context-usage.compacting .context-dial-value { animation: none; }
 [data-reduce-motion] .context-compaction-marker.running::after { animation: none; opacity: .5; }
 @media (prefers-reduced-motion: reduce) {
-  .context-compaction-marker.running::after, .context-compaction-spinner, .composer-context-usage.compacting .context-dial-value, .trouve-icon-spin { animation: none; }
+  .context-compaction-marker.running::after, .context-compaction-spinner, .composer-context-usage.compacting .context-dial-value, .naming-title-shimmer, .title-waiting::after, .trouve-icon-spin { animation: none; }
 }
 .attachment-list { min-width: 0; max-width: 100%; display: flex; flex-wrap: wrap; gap: 5px; margin: 8px 0 0; padding: 0; list-style: none; }
 .attachment-list li { min-width: 170px; max-width: min(100%, 310px); display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 7px; overflow: hidden; padding: 5px 7px; border: 1px solid var(--trouve-border); border-radius: var(--trouve-radius-sm); color: var(--trouve-text-dim); background: var(--trouve-surface); font-size: 10px; }

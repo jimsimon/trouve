@@ -4,6 +4,11 @@ import { repeat } from "lit/directives/repeat.js";
 
 import { appServicesContext, appStoreContext } from "../contexts/app-contexts.js";
 import { preferredSessionThreadId } from "../services/resume-preferences.js";
+import {
+  LOCAL_MODEL_WAITING_LABEL,
+  SESSION_TITLE_WAITING_STATUS,
+  titleGenerationTimeoutMs,
+} from "../services/title-generation.js";
 import type { AppStore, SessionListItem } from "../state/app-store.js";
 import { readSignal, withSignalTracking } from "../state/reactivity.js";
 import {
@@ -28,7 +33,6 @@ import {
 } from "./workspace-session-list-model.js";
 
 let nextArchivedListId = 0;
-const TITLE_SUGGESTION_TIMEOUT_MS = 48_000;
 
 type OrganizedSessionListItem = SessionListItem & WorkspaceSessionListFields & {
   readonly pullRequestBadge: SessionPullRequestBadge | undefined;
@@ -280,7 +284,8 @@ export class TrouveSessionList extends withSignalTracking(LitElement) {
     const pullRequestBadge = session.pullRequestBadge;
     const indicator = sessionIndicatorPresentation(session);
     const age = sessionAgePresentation(session.updatedAt, now);
-    const titleGenerating = this.#store.value?.isSessionTitleGenerating(session.id) ?? false;
+    const titleWaiting = this.#store.value?.titleGenerationWaiting(session.id);
+    const titleShimmer = titleWaiting === false;
     return html`
       <li class="session-entry">
         <div
@@ -312,9 +317,12 @@ export class TrouveSessionList extends withSignalTracking(LitElement) {
                         ? nothing
                         : fontAwesomeIcon(indicator.icon)}</span>`}
                   <span class="session-copy">
-                    <strong>${titleGenerating
+                    <strong class=${titleWaiting ? "title-waiting" : nothing} title=${titleWaiting ? LOCAL_MODEL_WAITING_LABEL : nothing}>${titleShimmer
                       ? html`<span class="naming-title-shimmer session-title-shimmer" aria-hidden="true"></span><span class="visually-hidden">Naming session…</span>`
                       : session.title}</strong>
+                    ${titleWaiting
+                      ? html`<span class="visually-hidden" role="status">${SESSION_TITLE_WAITING_STATUS}</span>`
+                      : nothing}
                     ${this.showBranches
                       ? html`<small class="session-branch" title=${session.branch}>${session.branch}</small>`
                       : nothing}
@@ -492,7 +500,10 @@ export class TrouveSessionList extends withSignalTracking(LitElement) {
     const startingTitle = this.#modalTitle;
     const abort = new AbortController();
     this.#generationAbort = abort;
-    const timeout = globalThis.setTimeout(() => abort.abort(), TITLE_SUGGESTION_TIMEOUT_MS);
+    const timeout = globalThis.setTimeout(
+      () => abort.abort(),
+      titleGenerationTimeoutMs(),
+    );
     this.#generatingSessionId = sessionId;
     this.#requestError = "";
     this.requestUpdate();
