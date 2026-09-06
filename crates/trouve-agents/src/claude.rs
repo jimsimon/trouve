@@ -1894,7 +1894,15 @@ fn parse_usage_health(provider_id: &str, payload: &Value) -> trouve_protocol::Su
         .unwrap_or_default();
 
     if windows.is_empty() {
-        let note = if payload["rate_limits_available"].as_bool() == Some(true) {
+        let available = payload["rate_limits_available"].as_bool() == Some(true);
+        let note = if available && rate_limits.is_null() {
+            // The CLI's own `GET /api/oauth/usage` failed (in practice the
+            // endpoint answering 429 under load); a print-mode process has
+            // no header-derived fallback, so it reports `null` here.
+            "Anthropic's usage endpoint is temporarily rate-limiting requests; \
+             usage will refresh once it recovers"
+                .to_string()
+        } else if available {
             "the Claude CLI reported no usage windows".to_string()
         } else {
             "the Claude CLI reported no usage data — subscription usage needs a \
@@ -2817,6 +2825,36 @@ cat >/dev/null
         assert_eq!(health.status, "unavailable");
         assert!(health.note.contains("claude.ai login"));
         assert!(health.windows.is_empty());
+    }
+
+    #[test]
+    fn null_rate_limits_with_subscription_means_endpoint_throttled() {
+        // Logged in on a plan, but the CLI's usage fetch failed (the
+        // endpoint answers 429 under load): `rate_limits_available` stays
+        // true while `rate_limits` comes back null.
+        let payload = json!({
+            "subscription_type": "max",
+            "rate_limits_available": true,
+            "rate_limits": null,
+            "behaviors": { "day": { "request_count": 5 } },
+        });
+        let health = parse_usage_health("claude-code", &payload);
+        assert_eq!(health.status, "unavailable");
+        assert_eq!(health.plan, "max");
+        assert!(health.note.contains("rate-limiting"), "{}", health.note);
+        assert!(health.windows.is_empty());
+    }
+
+    #[test]
+    fn empty_rate_limits_object_reports_no_windows() {
+        let payload = json!({
+            "subscription_type": "pro",
+            "rate_limits_available": true,
+            "rate_limits": {},
+        });
+        let health = parse_usage_health("claude-code", &payload);
+        assert_eq!(health.status, "unavailable");
+        assert!(health.note.contains("no usage windows"), "{}", health.note);
     }
 
     #[test]
