@@ -845,14 +845,21 @@ mod tests {
         assert_eq!(models.len(), 1, "unknown models are dropped");
         let m = &models[0];
         assert_eq!(m.id, "kilocode/anthropic/claude-sonnet-4.5");
-        assert_eq!(m.display_name, "Anthropic: Claude Sonnet 4.5");
+        assert_eq!(m.display_name, "Claude Sonnet 4.5 (latest)");
         assert_eq!(m.context_window, 1_000_000);
         assert_eq!(m.input_price_per_mtok, Some(3.0));
         assert_eq!(m.output_price_per_mtok, Some(15.0));
+        // Kilo's record has no "medium" level, so the default falls back to
+        // the catalog's first supported value.
+        assert_eq!(
+            m.options_schema
+                .pointer("/properties/reasoning_effort/enum"),
+            Some(&json!(["none", "high"]))
+        );
         assert_eq!(
             m.options_schema
                 .pointer("/properties/reasoning_effort/default"),
-            Some(&json!("medium"))
+            Some(&json!("none"))
         );
     }
 
@@ -953,7 +960,7 @@ mod tests {
         assert_eq!(models.len(), 2);
         assert_eq!(models[0].id, "openai/gpt-5.6");
         assert_eq!(models[0].context_window, 1_050_000);
-        assert_eq!(models[1].input_price_per_mtok, Some(2.5));
+        assert_eq!(models[1].input_price_per_mtok, Some(2.0));
     }
 
     #[test]

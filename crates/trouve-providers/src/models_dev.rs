@@ -1168,7 +1168,7 @@ mod tests {
             .model("openai", "openai", "gpt-5.6", OptionsDialect::OpenAi)
             .unwrap();
         assert_eq!(gpt.context_window, 1_050_000);
-        assert_eq!(gpt.input_price_per_mtok, Some(5.0));
+        assert_eq!(gpt.input_price_per_mtok, Some(4.0));
         assert!(gpt.supports_images);
         assert_eq!(
             gpt.options_schema
@@ -1203,7 +1203,7 @@ mod tests {
     fn trouve_owned_codex_provider_inherits_and_overrides_openai_models() {
         let catalog = ModelsDevCatalog::embedded();
         let models = catalog.provider_models("openai-codex", "codex", OptionsDialect::CodexCli);
-        assert_eq!(models.len(), 7);
+        assert_eq!(models.len(), 8);
 
         let sol = models
             .iter()
@@ -1211,7 +1211,7 @@ mod tests {
             .unwrap();
         assert_eq!(sol.display_name, "GPT-5.6 Sol");
         assert_eq!(sol.context_window, 500_000);
-        assert_eq!(sol.input_price_per_mtok, Some(5.0));
+        assert_eq!(sol.input_price_per_mtok, Some(4.0));
         assert_eq!(
             sol.options_schema
                 .pointer("/properties/reasoning_effort/enum"),
@@ -1236,6 +1236,35 @@ mod tests {
             luna.options_schema
                 .pointer("/properties/reasoning_effort/enum"),
             Some(&json!(["low", "medium", "high", "xhigh", "max"]))
+        );
+
+        // Codex serves Astra at its full API window and adds the `ultra`
+        // effort level models.dev does not list for the direct API.
+        let astra = models
+            .iter()
+            .find(|model| model.id == "codex/gpt-6-astra")
+            .unwrap();
+        assert_eq!(astra.display_name, "GPT-6 Astra");
+        assert_eq!(astra.context_window, 1_050_000);
+        assert_eq!(
+            astra
+                .options_schema
+                .pointer("/properties/reasoning_effort/enum"),
+            Some(&json!(["low", "medium", "high", "xhigh", "max", "ultra"]))
+        );
+        assert_eq!(
+            astra
+                .options_schema
+                .pointer("/properties/reasoning_effort/default"),
+            Some(&json!("medium"))
+        );
+        assert_eq!(
+            catalog
+                .model_record("openai-codex", "gpt-6-astra")
+                .unwrap()
+                .limit
+                .output,
+            Some(128_000)
         );
 
         let gpt_55 = catalog
@@ -1271,7 +1300,7 @@ mod tests {
     fn trouve_owned_cursor_provider_is_available_offline() {
         let catalog = ModelsDevCatalog::embedded();
         let models = catalog.provider_models("cursor", "cursor", OptionsDialect::ClaudeCli);
-        assert_eq!(models.len(), 12);
+        assert_eq!(models.len(), 14);
 
         let fable = models
             .iter()
@@ -1282,6 +1311,57 @@ mod tests {
         assert_eq!(
             fable.options_schema.pointer("/properties/effort/default"),
             Some(&json!("medium"))
+        );
+
+        // Newer base models must resolve from the embedded snapshot alone;
+        // an unresolvable `base_model` silently drops the overlay entry.
+        let fable_5_1 = models
+            .iter()
+            .find(|model| model.id == "cursor/claude-fable-5-1")
+            .unwrap();
+        assert_eq!(fable_5_1.display_name, "Claude Fable 5.1");
+        assert!(fable_5_1.supports_tools);
+
+        let flash = models
+            .iter()
+            .find(|model| model.id == "cursor/gemini-3.8-flash")
+            .unwrap();
+        assert_eq!(flash.display_name, "Gemini 3.8 Flash");
+        assert_eq!(flash.context_window, 1_000_000);
+        assert_eq!(
+            flash.options_schema.pointer("/properties/effort/default"),
+            Some(&json!("high"))
+        );
+
+        // Cursor documents its own effort ladders and defaults for the Grok
+        // models; they must win over the xai base records.
+        let grok_4_5 = models
+            .iter()
+            .find(|model| model.id == "cursor/grok-4.5")
+            .unwrap();
+        assert_eq!(grok_4_5.context_window, 256_000);
+        assert_eq!(
+            grok_4_5
+                .options_schema
+                .pointer("/properties/effort/default"),
+            Some(&json!("high"))
+        );
+
+        let grok_4_6 = models
+            .iter()
+            .find(|model| model.id == "cursor/grok-4.6")
+            .unwrap();
+        assert_eq!(grok_4_6.display_name, "Grok 4.6");
+        assert_eq!(grok_4_6.context_window, 256_000);
+        assert_eq!(
+            grok_4_6.options_schema.pointer("/properties/effort/enum"),
+            Some(&json!(["low", "medium", "high", "xhigh"]))
+        );
+        assert_eq!(
+            grok_4_6
+                .options_schema
+                .pointer("/properties/effort/default"),
+            Some(&json!("high"))
         );
 
         let composer = models
@@ -1359,8 +1439,8 @@ mod tests {
             .model("openai", "openai", "gpt-5.6", OptionsDialect::OpenAi)
             .unwrap();
         let cost = catalog.cost_usd(&model, 200_000, 100_000, 10_000).unwrap();
-        // Long-context tier: $10/M ordinary input, $1/M cached, $45/M output.
-        assert!((cost - 2.55).abs() < 1e-10, "cost was {cost}");
+        // Long-context tier: $8/M ordinary input, $0.80/M cached, $30/M output.
+        assert!((cost - 1.98).abs() < 1e-10, "cost was {cost}");
     }
 
     #[test]
@@ -1495,7 +1575,12 @@ mod tests {
             .filter(|(id, provider)| provider.to_known_provider(id).is_none())
             .map(|(id, _)| id.as_str())
             .collect();
-        assert_eq!(unsupported, ["gitlab", "sap-ai-core"]);
+        // Native AI SDK packages with no documented OpenAI-compatible or
+        // Anthropic-compatible HTTP surface; nothing to adapt yet.
+        assert_eq!(
+            unsupported,
+            ["gitlab", "qvac", "salad-cloud", "sap-ai-core", "watsonx"]
+        );
     }
 
     #[test]
