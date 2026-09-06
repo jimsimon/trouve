@@ -4,7 +4,9 @@
 //! an installed GitHub App, reconciles webhooks with inexpensive polling,
 //! and turns each immutable PR head into a normal trouve review session.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::fmt::Write as _;
 use std::path::{Component, Path};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -112,10 +114,19 @@ const REVIEW_BATCH_TARGET_TOKENS_MAX: usize = 96 * 1024;
 const REVIEW_PROMPT_ENVELOPE_RESERVE_TOKENS: usize = 8 * 1024;
 /// Floor for the derived batch token target on very small windows.
 const REVIEW_BATCH_TARGET_TOKENS_MIN: usize = 1_024;
+/// Diff lines longer than this are structurally unreviewable — minified
+/// bundles, single-line serialized data, embedded blobs — so their content is
+/// elided to a bounded prefix before batching. Without this one such line
+/// fans a small pull request out into many reviewer batches.
+const REVIEW_MAX_DIFF_LINE_BYTES: usize = 4 * 1024;
+/// Prefix retained from an elided oversized diff line.
+const REVIEW_ELIDED_LINE_PREFIX_BYTES: usize = 512;
 // Bump when batch identity or composition changes so interrupted jobs never
 // reuse routing or reviewer output against a differently assembled batch.
 // 3: batch budgets derive from the smallest configured model context window.
-const REVIEW_BATCH_FORMAT_VERSION: &str = "3";
+// 4: oversized diff lines are elided; generated artifacts follow
+//    `linguist-generated` and header markers instead of path conventions.
+const REVIEW_BATCH_FORMAT_VERSION: &str = "4";
 // The changed-path list is rendered outside `ReviewBatch::diff`, so bound it
 // separately. A byte budget admits many short paths without letting unusual
 // path names make the model request unbounded.
@@ -6026,6 +6037,7 @@ impl Engine {
                                 path: file.path,
                                 diff: file.diff,
                                 generated_header: None,
+                                linguist_generated: None,
                             })
                             .collect(),
                     )),
@@ -11294,6 +11306,7 @@ impl Engine {
                             path: file.path,
                             diff: file.diff,
                             generated_header: None,
+                            linguist_generated: None,
                         })
                         .collect(),
                     Err(error) => {
@@ -14806,6 +14819,7 @@ fn build_review_batches(
             pack_review_section(&mut batches, &file.path, section, 0, budgets);
             continue;
         }
+        let diff = elide_oversized_diff_lines(&file.diff);
         // Reserve enough room for the repeated path/fragment header so even
         // one very large file cannot produce an oversized model request.
         let largest_header = format!("\n=== {} (diff fragment {}) ===\n", file.path, usize::MAX);
@@ -14815,7 +14829,7 @@ fn build_review_batches(
             .min(token_byte_budget)
             .saturating_sub(largest_header.len() + 1)
             .max(1);
-        let chunks = split_diff_chunks(&file.diff, chunk_limit);
+        let chunks = split_diff_chunks(&diff, chunk_limit);
         let chunk_count = chunks.len();
         let mut minimum_batch_index = 0;
         for (index, chunk) in chunks.into_iter().enumerate() {
@@ -14869,8 +14883,55 @@ fn pack_review_section(
     }
 }
 
+/// Replace the body of every diff line longer than
+/// [`REVIEW_MAX_DIFF_LINE_BYTES`] with a bounded prefix and an elision note.
+/// Ordinary source never approaches the limit, so hand-written changes in the
+/// same file stay fully visible while the unreviewable line is reduced to
+/// something a reviewer can still locate in the checkout.
+fn elide_oversized_diff_lines(diff: &str) -> Cow<'_, str> {
+    if !diff
+        .split_inclusive('\n')
+        .any(|line| line.strip_suffix('\n').unwrap_or(line).len() > REVIEW_MAX_DIFF_LINE_BYTES)
+    {
+        return Cow::Borrowed(diff);
+    }
+    let mut elided = String::new();
+    for line in diff.split_inclusive('\n') {
+        let (content, newline) = match line.strip_suffix('\n') {
+            Some(content) => (content, "\n"),
+            None => (line, ""),
+        };
+        if content.len() <= REVIEW_MAX_DIFF_LINE_BYTES {
+            elided.push_str(line);
+            continue;
+        }
+        let mut cut = REVIEW_ELIDED_LINE_PREFIX_BYTES;
+        while !content.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        elided.push_str(&content[..cut]);
+        let _ = write!(
+            elided,
+            " …[{} more bytes of this oversized line elided from focused review; the full \
+             file is available in the checkout]{newline}",
+            content.len() - cut
+        );
+    }
+    Cow::Owned(elided)
+}
+
+/// Whether a changed file is summarized instead of reviewed line by line. An
+/// explicit `linguist-generated` attribute is authoritative in either
+/// direction. Otherwise a generated marker in the snapshot-side header
+/// decides, except for dependency lockfiles, whose generated banners sit
+/// above exactly the resolved content review must see. Path conventions are
+/// deliberately not consulted: repositories, languages, and generators
+/// disagree about where generated output lives.
 fn is_generated_review_artifact(file: &ReviewDiffFile) -> bool {
-    crate::tools::is_conventional_generated_artifact_path(&file.path)
+    if let Some(explicit) = file.linguist_generated {
+        return explicit;
+    }
+    !crate::tools::is_review_lockfile_path(&file.path)
         && file
             .generated_header
             .as_deref()
@@ -20936,6 +20997,7 @@ mod tests {
             diff: "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -0,0 +1,3 @@\n+let token = compare(a, b);\n+two\n+three\n"
                 .into(),
             generated_header: None,
+            linguist_generated: None,
         }];
         let candidate = |id: &str| CandidateFinding {
             candidate_id: id.into(),
@@ -21117,6 +21179,7 @@ mod tests {
             diff: "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -4,2 +4,3 @@\n context\n+let token = compare(a, b);\n context\n"
                 .into(),
             generated_header: None,
+            linguist_generated: None,
         }];
         let head =
             "one\ntwo\nthree\ncontext\nlet token = compare(a, b);\ncontext\nlet secret = load();\n";
@@ -21352,6 +21415,7 @@ mod tests {
                 diff: "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -9,3 +20,3 @@\n before();\n-stale_probe();\n+fixed_probe();\n after();\n"
                     .into(),
                 generated_header: None,
+                linguist_generated: None,
             }]),
         )]);
         let locations = carried_anchor_locations(std::slice::from_ref(&finding), &primary, &legacy);
@@ -21445,6 +21509,7 @@ mod tests {
 "
             .into(),
             generated_header: None,
+            linguist_generated: None,
         }];
         let diff_contents = diff_line_contents(&files);
         let base_anchors = CarriedFindingAnchorMap::new();
@@ -21513,6 +21578,7 @@ mod tests {
             diff: "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -10 +10 @@\n-old_registration();\n+register_before_start();\n"
                 .into(),
             generated_header: None,
+            linguist_generated: None,
         }];
         let diff_contents = diff_line_contents(&files);
         let base_anchors = CarriedFindingAnchorMap::new();
@@ -21565,6 +21631,7 @@ mod tests {
 "
             .into(),
             generated_header: None,
+            linguist_generated: None,
         }];
         let mut findings = (1..=32)
             .map(|line| {
@@ -21623,6 +21690,7 @@ mod tests {
 "
             .into(),
             generated_header: None,
+            linguist_generated: None,
         }];
         let diff_contents = diff_line_contents(&files);
         let base_anchors = CarriedFindingAnchorMap::new();
@@ -21658,6 +21726,7 @@ rename to src/new.rs
 "
             .into(),
             generated_header: None,
+            linguist_generated: None,
         }];
         let diff_contents = diff_line_contents(&files);
         let base_anchors = CarriedFindingAnchorMap::new();
@@ -21732,6 +21801,7 @@ rename to src/new.rs
 "
             .into(),
             generated_header: None,
+            linguist_generated: None,
         }];
         let diff_contents = diff_line_contents(&files);
         let base_anchors = CarriedFindingAnchorMap::new();
@@ -21779,6 +21849,7 @@ rename to src/new.rs
 "
             .into(),
             generated_header: None,
+            linguist_generated: None,
         }];
         let next_diff_contents = diff_line_contents(&next_files);
         let next_mapping = CarriedAnchorMappingContext {
@@ -21853,6 +21924,7 @@ rename to src/new.rs
 "
             .into(),
             generated_header: None,
+            linguist_generated: None,
         }];
         let diff_contents = diff_line_contents(&files);
         let base_anchors = CarriedFindingAnchorMap::new();
@@ -21943,6 +22015,7 @@ rename to src/new.rs
 "
             .into(),
             generated_header: None,
+            linguist_generated: None,
         }];
         let diff_contents = diff_line_contents(&files);
         let base_anchors = CarriedFindingAnchorMap::new();
@@ -22006,6 +22079,7 @@ rename to src/new.rs
 "
             .into(),
             generated_header: None,
+            linguist_generated: None,
         }];
         let next_diff_contents = diff_line_contents(&next_files);
         let next_mapping = CarriedAnchorMappingContext {
@@ -26818,6 +26892,7 @@ rename to src/new.rs
                 path: path.into(),
                 diff: chunk.clone(),
                 generated_header: None,
+                linguist_generated: None,
             }])
         };
 
@@ -28069,6 +28144,7 @@ rename to src/new.rs
                    context\n"
                 .into(),
             generated_header: None,
+            linguist_generated: None,
         }];
         let changed = inter_round_changed_lines(&files);
         assert_eq!(
@@ -28187,6 +28263,7 @@ rename to src/new.rs
             path: path.into(),
             diff: String::new(),
             generated_header: None,
+            linguist_generated: None,
         };
         assert_eq!(
             non_reviewable_push_summary("0123456789abcdef", &[file("CHANGELOG.md")]).as_deref(),
@@ -28209,6 +28286,7 @@ rename to src/new.rs
             path: "docs/lib.md".into(),
             diff: "diff --git a/src/lib.rs b/docs/lib.md\nsimilarity index 100%\nrename from src/lib.rs\nrename to docs/lib.md\n".into(),
             generated_header: None,
+            linguist_generated: None,
         };
         assert_eq!(
             non_reviewable_push_summary("0123456789abcdef", &[renamed]),
@@ -28219,6 +28297,7 @@ rename to src/new.rs
             path: "docs/guide.md".into(),
             diff: "diff --git a/README.md b/docs/guide.md\nsimilarity index 100%\nrename from README.md\nrename to docs/guide.md\n".into(),
             generated_header: None,
+            linguist_generated: None,
         };
         assert!(non_reviewable_push_summary("0123456789abcdef", &[renamed_docs]).is_some());
     }
@@ -29944,16 +30023,25 @@ rename to src/new.rs
                 .all(|chunk| chunk.len() <= REVIEW_BATCH_MAX_BYTES)
         );
 
+        // Many ordinary lines, not one oversized line: the latter is elided
+        // before batching and would no longer need more than one batch.
+        let large = format!(
+            "{}+{}\n",
+            "+aaaaaaaa\n".repeat(REVIEW_BATCH_MAX_BYTES / 10),
+            "β".repeat(20)
+        );
         let files = vec![
             ReviewDiffFile {
                 path: "src/large.rs".into(),
                 diff: large,
                 generated_header: None,
+                linguist_generated: None,
             },
             ReviewDiffFile {
                 path: "src/small.rs".into(),
                 diff: "+small\n".into(),
                 generated_header: None,
+                linguist_generated: None,
             },
         ];
         let batches = build_review_batches(&files, ReviewPromptBudgets::default());
@@ -29976,6 +30064,7 @@ rename to src/new.rs
             path: "src/lib.rs".into(),
             diff: "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -20,2 +2,3 @@\n context\n+added\n tail\n".into(),
             generated_header: None,
+            linguist_generated: None,
         }];
         let candidate = |path: &str, side: &str, body: &str| CandidateFinding {
             candidate_id: format!("candidate-{body}"),
@@ -30169,6 +30258,7 @@ rename to src/new.rs
             path: "src/lib.rs".into(),
             diff: "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -2 +2 @@\n-old\n+new\n".into(),
             generated_header: None,
+            linguist_generated: None,
         }];
         let candidate = CandidateFinding {
             candidate_id: "candidate-low-confidence".into(),
@@ -30393,6 +30483,7 @@ rename to src/new.rs
             diff: "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -0,0 +1,3 @@\n+one\n+two\n+three\n"
                 .into(),
             generated_header: None,
+            linguist_generated: None,
         }];
         let mut structurally_rejected = ReviewOutput {
             summary: String::new(),
@@ -30749,6 +30840,7 @@ rename to src/new.rs
                 path: format!("src/{attack}.rs"),
                 diff: format!("+// {attack}\n"),
                 generated_header: None,
+                linguist_generated: None,
             }],
             ReviewPromptBudgets::default(),
         )
@@ -33368,6 +33460,7 @@ rename to src/new.rs
             path: "src/large.rs".into(),
             diff: "+let value = 1234;\n".repeat(20_000),
             generated_header: None,
+            linguist_generated: None,
         }];
         let batches = build_review_batches(&files, ReviewPromptBudgets::default());
         assert!(batches.len() > 1);
@@ -33594,11 +33687,13 @@ rename to src/new.rs
                 path: "src/implementation.rs".into(),
                 diff: "+let reviewed = true;\n".into(),
                 generated_header: None,
+                linguist_generated: None,
             },
             ReviewDiffFile {
                 path: "web/src/generated/protocol-validators.ts".into(),
                 diff: generated_diff,
                 generated_header: Some("generated by\ndo not edit".into()),
+                linguist_generated: None,
             },
         ];
 
@@ -33623,6 +33718,7 @@ rename to src/new.rs
                    +++added_content\n"
                 .into(),
             generated_header: Some("// This file was auto-generated. Do not edit.".into()),
+            linguist_generated: None,
         };
 
         let summary = generated_review_artifact_summary(&file);
@@ -33638,6 +33734,7 @@ rename to src/new.rs
                 "--- a/src/generated/client.rs\n+++ b/src/generated/client.rs\n@@ -1 +1 @@\n-{removed}\n+{added}\n"
             ),
             generated_header: Some("// This file was auto-generated. Do not edit.".into()),
+            linguist_generated: None,
         };
         let first_file = file("old_a", "new_a");
         let second_file = file("old_b", "new_b");
@@ -33661,19 +33758,109 @@ rename to src/new.rs
     }
 
     #[test]
-    fn generated_markers_outside_conventional_paths_remain_reviewable() {
+    fn generated_markers_apply_regardless_of_path_convention() {
         let file = ReviewDiffFile {
             path: "sdk/client.ts".into(),
             diff: "@@ -1 +1,2 @@\n+// This file was auto-generated. Do not edit.\n\
                    +export const generated = true;\n"
                 .into(),
             generated_header: Some("// This file was auto-generated. Do not edit.".into()),
+            linguist_generated: None,
         };
 
-        assert!(!is_generated_review_artifact(&file));
+        assert!(is_generated_review_artifact(&file));
         let batches = build_review_batches(&[file], ReviewPromptBudgets::default());
-        assert!(!batches[0].diff.contains("generated artifact summary"));
-        assert!(batches[0].diff.contains("export const"));
+        assert!(batches[0].diff.contains("generated artifact summary"));
+        assert!(!batches[0].diff.contains("export const"));
+    }
+
+    #[test]
+    fn linguist_generated_attribute_overrides_every_heuristic() {
+        // Set: summarized even without a header marker (JSON cannot carry one).
+        let snapshot = ReviewDiffFile {
+            path: "crates/providers/data/models-dev-snapshot.json".into(),
+            diff: "@@ -1 +1 @@\n-{\"old\":true}\n+{\"new\":true}\n".into(),
+            generated_header: None,
+            linguist_generated: Some(true),
+        };
+        assert!(is_generated_review_artifact(&snapshot));
+
+        // Set on a lockfile: explicit configuration beats the lockfile exemption.
+        let lockfile = ReviewDiffFile {
+            path: "Cargo.lock".into(),
+            diff: "@@ -1 +1 @@\n+checksum = \"x\"\n".into(),
+            generated_header: Some("# This file is automatically @generated by Cargo.".into()),
+            linguist_generated: Some(true),
+        };
+        assert!(is_generated_review_artifact(&lockfile));
+
+        // Unset: reviewed in full despite a generated marker.
+        let opted_out = ReviewDiffFile {
+            path: "generated/client.rs".into(),
+            diff: "@@ -1 +1 @@\n+pub fn client() {}\n".into(),
+            generated_header: Some("// @generated by protoc. DO NOT EDIT.".into()),
+            linguist_generated: Some(false),
+        };
+        assert!(!is_generated_review_artifact(&opted_out));
+        let batches = build_review_batches(&[opted_out], ReviewPromptBudgets::default());
+        assert!(batches[0].diff.contains("pub fn client()"));
+    }
+
+    #[test]
+    fn oversized_diff_lines_are_elided_instead_of_multiplying_batches() {
+        let blob = format!("{{\"models\":{}}}", "\"m\",".repeat(400_000));
+        assert!(blob.len() > 4 * REVIEW_BATCH_MAX_BYTES);
+        let file = ReviewDiffFile {
+            path: "data/snapshot.json".into(),
+            diff: format!(
+                "diff --git a/data/snapshot.json b/data/snapshot.json\n\
+                 --- a/data/snapshot.json\n+++ b/data/snapshot.json\n@@ -1 +1 @@\n\
+                 -{blob}\n+{blob}\n"
+            ),
+            generated_header: None,
+            linguist_generated: None,
+        };
+        let source = ReviewDiffFile {
+            path: "src/lib.rs".into(),
+            diff: "@@ -1 +1 @@\n+let reviewed = true;\n".into(),
+            generated_header: None,
+            linguist_generated: None,
+        };
+
+        let batches = build_review_batches(&[file, source], ReviewPromptBudgets::default());
+
+        assert_eq!(batches.len(), 1);
+        let diff = &batches[0].diff;
+        assert!(diff.contains("let reviewed = true;"));
+        assert!(diff.contains("--- a/data/snapshot.json"));
+        assert!(diff.contains("-{\"models\":\"m\",\"m\","));
+        assert_eq!(
+            diff.matches("more bytes of this oversized line elided")
+                .count(),
+            2
+        );
+        assert!(diff.len() < 8 * 1024, "{}", diff.len());
+    }
+
+    #[test]
+    fn line_elision_keeps_ordinary_lines_and_char_boundaries() {
+        let ordinary = format!("+{}\n", "x".repeat(REVIEW_MAX_DIFF_LINE_BYTES - 1));
+        assert!(matches!(
+            elide_oversized_diff_lines(&ordinary),
+            Cow::Borrowed(_)
+        ));
+
+        // Multi-byte characters straddling the prefix cut are never split, and
+        // a final line without a trailing newline stays newline-free.
+        let oversized = format!("+{}", "β".repeat(REVIEW_MAX_DIFF_LINE_BYTES));
+        let elided = elide_oversized_diff_lines(&oversized);
+        assert!(elided.starts_with("+ββ"));
+        assert!(!elided.ends_with('\n'));
+        assert!(elided.contains(&format!(
+            "{} more bytes",
+            oversized.len() - (REVIEW_ELIDED_LINE_PREFIX_BYTES - 1)
+        )));
+        assert!(elided.len() < REVIEW_ELIDED_LINE_PREFIX_BYTES + 256);
     }
 
     #[test]
@@ -33684,6 +33871,7 @@ rename to src/new.rs
                    -generated_old_code!();\n+pub fn reviewed_source() {}\n"
                 .into(),
             generated_header: Some("pub fn reviewed_source() {}".into()),
+            linguist_generated: None,
         };
 
         assert!(!is_generated_review_artifact(&file));
@@ -33702,6 +33890,7 @@ rename to src/new.rs
                    +version = 4\n+checksum = \"untrusted-change\"\n"
                 .into(),
             generated_header: Some("# This file is automatically @generated by Cargo.".into()),
+            linguist_generated: None,
         };
 
         assert!(!is_generated_review_artifact(&file));
@@ -33712,6 +33901,7 @@ rename to src/new.rs
             path: "web/generated/package-lock.json".into(),
             diff: "@@ -1 +1 @@\n+// This file was auto-generated. Do not edit.\n".into(),
             generated_header: Some("// This file was auto-generated. Do not edit.".into()),
+            linguist_generated: None,
         };
         assert!(!is_generated_review_artifact(&nested));
     }
@@ -33721,18 +33911,21 @@ rename to src/new.rs
         let files = vec![
             ReviewDiffFile {
                 path: "src/first.rs".into(),
-                diff: "a".repeat(60_000),
+                diff: "+aaaaaaaa\n".repeat(6_000),
                 generated_header: None,
+                linguist_generated: None,
             },
             ReviewDiffFile {
                 path: "src/second.rs".into(),
-                diff: "b".repeat(75_000),
+                diff: "+bbbbbbbb\n".repeat(7_500),
                 generated_header: None,
+                linguist_generated: None,
             },
             ReviewDiffFile {
                 path: "src/third.rs".into(),
-                diff: "c".repeat(30_000),
+                diff: "+cccccccc\n".repeat(3_000),
                 generated_header: None,
+                linguist_generated: None,
             },
         ];
 
@@ -33751,13 +33944,15 @@ rename to src/new.rs
         let files = vec![
             ReviewDiffFile {
                 path: "src/filler.rs".into(),
-                diff: "a".repeat(60_000),
+                diff: "+aaaaaaaa\n".repeat(6_000),
                 generated_header: None,
+                linguist_generated: None,
             },
             ReviewDiffFile {
                 path: "src/chunked.rs".into(),
-                diff: "b".repeat(130_000),
+                diff: "+bbbbbbbb\n".repeat(13_000),
                 generated_header: None,
+                linguist_generated: None,
             },
         ];
 
@@ -33964,6 +34159,7 @@ rename to src/new.rs
                 path: format!("src/module_{index}.rs"),
                 diff: "+changed();\n".into(),
                 generated_header: None,
+                linguist_generated: None,
             })
             .collect::<Vec<_>>();
 
@@ -33980,11 +34176,13 @@ rename to src/new.rs
                 path: "src/relevant.rs".into(),
                 diff: "+broken();\n".into(),
                 generated_header: None,
+                linguist_generated: None,
             },
             ReviewDiffFile {
                 path: "src/unrelated.rs".into(),
                 diff: "+fine();\n".into(),
                 generated_header: None,
+                linguist_generated: None,
             },
         ];
         let paths = HashSet::from(["src/relevant.rs"]);
@@ -34001,11 +34199,13 @@ rename to src/new.rs
                 path: "src/historical.rs".into(),
                 diff: "+historical();\n".repeat(REVIEW_COORDINATOR_CONTEXT_MAX_BYTES),
                 generated_header: None,
+                linguist_generated: None,
             },
             ReviewDiffFile {
                 path: "src/candidate.rs".into(),
                 diff: "+candidate_defect();\n".into(),
                 generated_header: None,
+                linguist_generated: None,
             },
         ];
         let paths = HashSet::from(["src/historical.rs", "src/candidate.rs"]);
@@ -34027,6 +34227,7 @@ rename to src/new.rs
             path: "src/relevant.rs".into(),
             diff: "+changed();\n".repeat(REVIEW_COORDINATOR_CONTEXT_MAX_BYTES),
             generated_header: None,
+            linguist_generated: None,
         }];
         let paths = HashSet::from(["src/relevant.rs"]);
 
