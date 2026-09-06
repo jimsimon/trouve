@@ -2111,8 +2111,9 @@ export class TrouveApp extends withSignalTracking(LitElement) {
 
   /** Upgrade a prompt-derived title without delaying session creation or the
    * first turn. A manual rename made while generation is in flight wins. */
-  #upgradeSessionTitleInBackground(
-    sessionId: string,
+  #upgradeTitleInBackground(
+    target: "session" | "thread",
+    id: string,
     provisionalTitle: string,
     prompt: string,
     attachments: readonly ProtocolAttachmentUpload[],
@@ -2120,62 +2121,37 @@ export class TrouveApp extends withSignalTracking(LitElement) {
   ): void {
     const waitingTimer = beginTitleGeneration(
       this.#store,
-      sessionId,
+      id,
       provisionalTitle,
       readSignal(this.#store.sessionNamingSettings)?.settings.model,
     );
     void (async () => {
       try {
-        const generated = await (sharedGeneration
-          ?? this.#generateTitle(sessionId, prompt, attachments));
-        const title = generated.title.trim();
-        if (title === "" || title === provisionalTitle) return;
-        if (this.#store.sessionMetadata(sessionId)?.title !== provisionalTitle) return;
-        const session = await this.#protocolClient.updateSession(sessionId, {
-          title,
-          expected_title: provisionalTitle,
-        });
-        this.#store.upsertSessionMetadata(session);
-      } catch {
-        // Naming is cosmetic; the placeholder remains.
-      } finally {
-        if (waitingTimer !== undefined) globalThis.clearTimeout(waitingTimer);
-        this.#store.endTitleGeneration(sessionId);
-      }
-    })();
-  }
-
-  #upgradeThreadTitleInBackground(
-    threadId: string,
-    provisionalTitle: string,
-    prompt: string,
-    attachments: readonly ProtocolAttachmentUpload[],
-    sharedGeneration?: Promise<ProtocolGeneratedTitle>,
-  ): void {
-    const waitingTimer = beginTitleGeneration(
-      this.#store,
-      threadId,
-      provisionalTitle,
-      readSignal(this.#store.sessionNamingSettings)?.settings.model,
-    );
-    void (async () => {
-      try {
-        const sessionId = this.#store.thread(threadId)?.session_id;
+        const sessionId = target === "session"
+          ? id
+          : this.#store.thread(id)?.session_id;
         if (sessionId === undefined) return;
         const generated = await (sharedGeneration
           ?? this.#generateTitle(sessionId, prompt, attachments));
         const title = generated.title.trim();
         if (title === "" || title === provisionalTitle) return;
-        const thread = await this.#protocolClient.updateThread(threadId, {
-          title,
-          expected_title: provisionalTitle,
-        });
-        this.#store.upsertThread(thread);
+        if (target === "session") {
+          if (this.#store.sessionMetadata(id)?.title !== provisionalTitle) return;
+          this.#store.upsertSessionMetadata(await this.#protocolClient.updateSession(id, {
+            title,
+            expected_title: provisionalTitle,
+          }));
+        } else {
+          this.#store.upsertThread(await this.#protocolClient.updateThread(id, {
+            title,
+            expected_title: provisionalTitle,
+          }));
+        }
       } catch {
         // Naming is cosmetic; the placeholder or a user rename remains.
       } finally {
-        if (waitingTimer !== undefined) globalThis.clearTimeout(waitingTimer);
-        this.#store.endTitleGeneration(threadId);
+        globalThis.clearTimeout(waitingTimer);
+        this.#store.endTitleGeneration(id);
       }
     })();
   }
@@ -2542,7 +2518,8 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       ? this.#generateTitle(session.id, prompt, submissionAttachments)
       : undefined;
     if (sharedGeneratedTitle !== undefined) {
-      this.#upgradeSessionTitleInBackground(
+      this.#upgradeTitleInBackground(
+        "session",
         session.id,
         submittedCreateRequest.title,
         prompt,
@@ -2561,7 +2538,8 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       );
       this.#store.upsertThread(thread);
       threadId = thread.id;
-      this.#upgradeThreadTitleInBackground(
+      this.#upgradeTitleInBackground(
+        "thread",
         thread.id,
         thread.title ?? NEW_THREAD_TITLE_FALLBACK,
         prompt,
@@ -2681,7 +2659,13 @@ export class TrouveApp extends withSignalTracking(LitElement) {
           fetch_latest: true,
         });
         this.#store.upsertSessionMetadata(createdSession);
-        this.#upgradeSessionTitleInBackground(createdSession.id, title, detail.prompt, []);
+        this.#upgradeTitleInBackground(
+          "session",
+          createdSession.id,
+          title,
+          detail.prompt,
+          [],
+        );
         sessionId = createdSession.id;
       }
 
@@ -2691,7 +2675,8 @@ export class TrouveApp extends withSignalTracking(LitElement) {
         mode: "code",
       });
       this.#store.upsertThread(thread);
-      this.#upgradeThreadTitleInBackground(
+      this.#upgradeTitleInBackground(
+        "thread",
         thread.id,
         thread.title ?? NEW_THREAD_TITLE_FALLBACK,
         detail.prompt,

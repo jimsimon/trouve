@@ -16,17 +16,15 @@ export const beginTitleGeneration = (
   id: string,
   provisionalTitle: string,
   model: string | undefined,
-): ReturnType<typeof globalThis.setTimeout> | undefined => {
+): ReturnType<typeof globalThis.setTimeout> | 0 => {
   store.beginTitleGeneration(id, provisionalTitle);
-  return model?.startsWith("local/") === true
+  return model?.startsWith("local/")
     ? globalThis.setTimeout(
         () => store.markTitleGenerationWaiting(id, provisionalTitle),
         2_000,
       )
-    : undefined;
+    : 0;
 };
 
 export const titleGenerationTimeoutMs = (model: string | undefined): number =>
-  model?.startsWith("local/") === true
-    ? LOCAL_TITLE_GENERATION_TIMEOUT_MS
-    : TITLE_GENERATION_TIMEOUT_MS;
+  model?.startsWith("local/") ? 11 * 60_000 : 48_000;

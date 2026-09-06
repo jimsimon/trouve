@@ -1016,20 +1016,20 @@ describe("AppStore", () => {
 
     store.beginTitleGeneration("se_1", "New Session");
     store.beginTitleGeneration("th_1", "New Thread");
-    expect(store.titleGenerationPresentation("se_1")).toBe("shimmer");
-    expect(store.titleGenerationPresentation("th_1")).toBe("shimmer");
+    expect(store.titleGenerationWaiting("se_1")).toBe(false);
+    expect(store.titleGenerationWaiting("th_1")).toBe(false);
 
     store.markTitleGenerationWaiting("se_1", "New Session");
     store.markTitleGenerationWaiting("th_1", "New Thread");
-    expect(store.titleGenerationPresentation("se_1")).toBe("waiting");
-    expect(store.titleGenerationPresentation("th_1")).toBe("waiting");
+    expect(store.titleGenerationWaiting("se_1")).toBe(true);
+    expect(store.titleGenerationWaiting("th_1")).toBe(true);
 
     store.upsertSessionMetadata({ ...metadata, title: "Improve Session Naming" });
     store.upsertThread({ ...thread("th_1"), title: "Refine Shimmer State" });
     store.markTitleGenerationWaiting("se_1", "New Session");
     store.markTitleGenerationWaiting("th_1", "New Thread");
-    expect(store.titleGenerationPresentation("se_1")).toBeUndefined();
-    expect(store.titleGenerationPresentation("th_1")).toBeUndefined();
+    expect(store.titleGenerationWaiting("se_1")).toBeUndefined();
+    expect(store.titleGenerationWaiting("th_1")).toBeUndefined();
   });
 
   it("ends title generation without changing durable fallback titles", () => {
@@ -1041,8 +1041,8 @@ describe("AppStore", () => {
 
     store.endTitleGeneration("se_1");
     store.endTitleGeneration("th_1");
-    expect(store.titleGenerationPresentation("se_1")).toBeUndefined();
-    expect(store.titleGenerationPresentation("th_1")).toBeUndefined();
+    expect(store.titleGenerationWaiting("se_1")).toBeUndefined();
+    expect(store.titleGenerationWaiting("th_1")).toBeUndefined();
     expect(store.sessionMetadata("se_1")?.title).toBe("New Session");
     expect(store.thread("th_1")?.title).toBe("New Thread");
   });

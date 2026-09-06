@@ -1765,12 +1765,11 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       index: number,
     ) => {
       const label = labelForThread(candidate);
-      const titleGeneration = store.titleGenerationPresentation(candidate.id)
+      const titleWaiting = store.titleGenerationWaiting(candidate.id)
         ?? (candidate.id === initialThreadId
-          ? store.titleGenerationPresentation(this.sessionId)
+          ? store.titleGenerationWaiting(this.sessionId)
           : undefined);
-      const titleShimmer = titleGeneration === "shimmer";
-      const titleWaiting = titleGeneration === "waiting";
+      const titleShimmer = titleWaiting === false;
       const indicator = sessionIndicatorPresentation(
         store.threadIndicatorState(candidate.id),
       );
@@ -1778,6 +1777,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         || (indicator.kind === "busy" ? "Processing" : "");
       const accessibleLabel = titleShimmer
         ? "Naming thread…"
+        : titleWaiting ? `${label}, ${LOCAL_MODEL_WAITING_LABEL}`
         : statusLabel === "" ? label : `${label}, ${statusLabel}`;
       return html`
         <span class="thread-tab-item" role="presentation" @contextmenu=${(event: MouseEvent) => this.#openThreadTabContextMenu(event, candidate.id)}>
@@ -1787,9 +1787,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
             role="tab"
             aria-keyshortcuts="Delete"
             aria-label=${accessibleLabel}
-            title=${titleShimmer
-              ? "Naming thread…"
-              : titleWaiting ? LOCAL_MODEL_WAITING_LABEL : label}
+            title=${accessibleLabel}
             data-thread-tab-id=${candidate.id}
             aria-selected=${!newThreadSetupOpen && candidate.id === this.threadId ? "true" : "false"}
             tabindex=${rovingTabIndex(index, selectedTabIndex, threadTabCount)}
@@ -1812,11 +1810,9 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
               ? fontAwesomeIcon("code-branch")
               : nothing}${pinnedThreadTabs.has(candidate.id)
               ? fontAwesomeIcon("thumbtack", { className: "thread-tab-pin" })
-              : nothing}<span class="thread-tab-title">${titleShimmer
+              : nothing}<span class="thread-tab-title ${titleWaiting ? "title-waiting" : ""}">${titleShimmer
                 ? html`<span class="naming-title-shimmer thread-title-shimmer" aria-hidden="true"></span><span class="visually-hidden">Naming thread…</span>`
-                : label}</span>${titleWaiting
-                  ? html`<span class="naming-title-pending" aria-hidden="true"></span>`
-                  : nothing}</span>
+                : label}</span></span>
             ${threadTodoProgress(candidate.todos) === ""
               ? nothing
               : html`<span class="thread-todo-progress">${threadTodoProgress(candidate.todos)}</span>`}
@@ -6363,7 +6359,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
             // Naming is cosmetic; preserve the placeholder or a user rename.
           } finally {
             globalThis.clearTimeout(timeout);
-            if (waitingTimer !== undefined) globalThis.clearTimeout(waitingTimer);
+            globalThis.clearTimeout(waitingTimer);
             store.endTitleGeneration(thread.id);
           }
         })();

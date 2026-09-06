@@ -283,9 +283,8 @@ export class TrouveSessionList extends withSignalTracking(LitElement) {
     const pullRequestBadge = session.pullRequestBadge;
     const indicator = sessionIndicatorPresentation(session);
     const age = sessionAgePresentation(session.updatedAt, now);
-    const titleGeneration = this.#store.value?.titleGenerationPresentation(session.id);
-    const titleShimmer = titleGeneration === "shimmer";
-    const titleWaiting = titleGeneration === "waiting";
+    const titleWaiting = this.#store.value?.titleGenerationWaiting(session.id);
+    const titleShimmer = titleWaiting === false;
     return html`
       <li class="session-entry">
         <div
@@ -317,15 +316,11 @@ export class TrouveSessionList extends withSignalTracking(LitElement) {
                         ? nothing
                         : fontAwesomeIcon(indicator.icon)}</span>`}
                   <span class="session-copy">
-                    <strong>${titleShimmer
+                    <strong class=${titleWaiting ? "title-waiting" : nothing} title=${titleWaiting ? LOCAL_MODEL_WAITING_LABEL : nothing}>${titleShimmer
                       ? html`<span class="naming-title-shimmer session-title-shimmer" aria-hidden="true"></span><span class="visually-hidden">Naming session…</span>`
                       : session.title}</strong>
                     ${titleWaiting
-                      ? html`<span
-                          class="naming-title-pending"
-                          title=${LOCAL_MODEL_WAITING_LABEL}
-                          role="status"
-                        ><span class="visually-hidden">${LOCAL_MODEL_WAITING_LABEL}</span></span>`
+                      ? html`<span class="visually-hidden" role="status">${LOCAL_MODEL_WAITING_LABEL}</span>`
                       : nothing}
                     ${this.showBranches
                       ? html`<small class="session-branch" title=${session.branch}>${session.branch}</small>`

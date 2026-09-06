@@ -58,9 +58,7 @@ export interface ThreadIndicatorState {
   readonly unread: boolean;
 }
 
-export type TitleGenerationPresentation = "shimmer" | "waiting";
-
-type TitleGenerationState = [provisionalTitle: string, presentation: TitleGenerationPresentation];
+type TitleGenerationState = [provisionalTitle: string, waiting: boolean];
 
 export interface SessionPullRequestIdentity {
   readonly workspaceId: string;
@@ -354,14 +352,14 @@ export class AppStore {
   }
 
   beginTitleGeneration(id: string, provisionalTitle: string): void {
-    this.#generatingTitles.set(id, [provisionalTitle, "shimmer"]);
+    this.#generatingTitles.set(id, [provisionalTitle, false]);
     this.#touch();
   }
 
   markTitleGenerationWaiting(id: string, provisionalTitle: string): void {
     const current = this.#generatingTitles.get(id);
-    if (current?.[0] !== provisionalTitle || current[1] === "waiting") return;
-    current[1] = "waiting";
+    if (current?.[0] !== provisionalTitle || current[1]) return;
+    current[1] = true;
     this.#touch();
   }
 
@@ -370,7 +368,7 @@ export class AppStore {
     this.#touch();
   }
 
-  titleGenerationPresentation(id: string): TitleGenerationPresentation | undefined {
+  titleGenerationWaiting(id: string): boolean | undefined {
     this.#revision.get();
     return this.#generatingTitles.get(id)?.[1];
   }
