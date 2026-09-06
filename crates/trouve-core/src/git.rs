@@ -2665,14 +2665,14 @@ fn parse_review_attribute_output(
     // The remainder after the final NUL is either empty or an unterminated
     // record; either way it is not a complete field.
     fields.pop();
-    for record in fields.chunks_exact(3) {
-        let Ok(path) = std::str::from_utf8(record[0]) else {
+    for [path, _attribute, value] in fields.as_chunks::<3>().0 {
+        let Ok(path) = std::str::from_utf8(path) else {
             continue;
         };
         if !known.contains(path) {
             continue;
         }
-        let generated = match record[2] {
+        let generated = match *value {
             b"set" | b"true" => true,
             b"unset" | b"false" => false,
             _ => continue,
