@@ -20,6 +20,10 @@ use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 const PATH_MARKER: &str = "__TROUVE_LOGIN_SHELL_PATH__";
 const PATH_CAPTURE_TIMEOUT: Duration = Duration::from_secs(3);
 const PROCESS_TREE_REAP_TIMEOUT: Duration = Duration::from_secs(5);
+/// Holder enumeration walks every process descriptor table. Rescans start
+/// promptly to close fork races, then back off while a stubborn tree exits.
+const PROCESS_TREE_SWEEP_INITIAL_INTERVAL: Duration = Duration::from_millis(50);
+const PROCESS_TREE_SWEEP_MAX_INTERVAL: Duration = Duration::from_millis(400);
 /// Enumerating sentinel holders walks every `/proc/*/fd` directory. Under
 /// [`DetachedPolicy::Release`] a tree whose group is already empty re-scans at
 /// most this often while it waits for a same-session holder to exit.
@@ -1324,6 +1328,17 @@ thread_local! {
     /// Test hook: pretend the kernel offers no pidfds, standing in for a
     /// pre-5.3 kernel or a full descriptor table.
     static PIDFD_UNAVAILABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Test hook: runs after a sentinel-holder snapshot but before its
+    /// processes are signalled, making a fork during that race deterministic.
+    static AFTER_SENTINEL_HOLDER_SCAN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(any(target_os = "linux", target_os = "android"), test))]
+fn run_after_sentinel_holder_scan_hook() {
+    if let Some(hook) = AFTER_SENTINEL_HOLDER_SCAN.with(|hook| hook.borrow_mut().take()) {
+        hook();
+    }
 }
 
 #[cfg(all(unix, test))]
@@ -1360,9 +1375,11 @@ fn descriptor_walk_ceiling() -> libc::c_int {
 }
 
 fn wait_for_blocking_process_tree_exit_until(
-    child: &BlockingProcessTreeChild,
+    child: &mut BlockingProcessTreeChild,
     deadline: Instant,
 ) -> std::io::Result<()> {
+    let mut next_sweep = Instant::now();
+    let mut sweep_interval = PROCESS_TREE_SWEEP_INITIAL_INTERVAL;
     while blocking_process_tree_active(child)? {
         let now = Instant::now();
         if now >= deadline {
@@ -1371,8 +1388,37 @@ fn wait_for_blocking_process_tree_exit_until(
                 "timed out waiting for terminated blocking process tree",
             ));
         }
+        if now >= next_sweep {
+            sweep_remaining_blocking_process_tree(child, deadline)?;
+            next_sweep = Instant::now() + sweep_interval;
+            sweep_interval = (sweep_interval * 2).min(PROCESS_TREE_SWEEP_MAX_INTERVAL);
+        }
         std::thread::sleep(Duration::from_millis(10).min(deadline - now));
     }
+    Ok(())
+}
+
+/// Re-scan holders that escaped the original process group while cleanup was
+/// signalling an earlier snapshot. A descendant can fork between enumeration
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn sweep_remaining_blocking_process_tree(
+    child: &mut BlockingProcessTreeChild,
+    deadline: Instant,
+) -> std::io::Result<()> {
+    terminate_unix_sentinel_holders_until(
+        &child.descendant_sentinel,
+        child.process_group,
+        DetachedPolicy::Terminate,
+        &mut Vec::new(),
+        &mut Vec::new(),
+        Some(deadline),
+    )
+}
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn sweep_remaining_blocking_process_tree(
+    _child: &mut BlockingProcessTreeChild,
+    _deadline: Instant,
+) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -1468,6 +1514,8 @@ async fn wait_for_platform_process_tree_exit_until(
     child: &mut ProcessTreeChild,
     deadline: tokio::time::Instant,
 ) -> std::io::Result<()> {
+    let mut next_sweep = tokio::time::Instant::now();
+    let mut sweep_interval = PROCESS_TREE_SWEEP_INITIAL_INTERVAL;
     while platform_process_tree_active(child)? {
         let now = tokio::time::Instant::now();
         if now >= deadline {
@@ -1476,8 +1524,69 @@ async fn wait_for_platform_process_tree_exit_until(
                 "timed out waiting for terminated process tree",
             ));
         }
+        if now >= next_sweep {
+            sweep_remaining_platform_process_tree(child, deadline).await?;
+            next_sweep = tokio::time::Instant::now() + sweep_interval;
+            sweep_interval = (sweep_interval * 2).min(PROCESS_TREE_SWEEP_MAX_INTERVAL);
+        }
         tokio::time::sleep(Duration::from_millis(10).min(deadline - now)).await;
     }
+    Ok(())
+}
+#[cfg(any(target_os = "linux", target_os = "android"))]
+async fn sweep_remaining_platform_process_tree(
+    child: &mut ProcessTreeChild,
+    deadline: tokio::time::Instant,
+) -> std::io::Result<()> {
+    child.holder_scan = None;
+    let sentinel = child.descendant_sentinel.try_clone()?;
+    let process_group = child.process_group;
+    let detached_policy = child.detached_policy;
+    let blocking_deadline =
+        Instant::now() + deadline.saturating_duration_since(tokio::time::Instant::now());
+    let mut sweep = tokio::task::spawn_blocking(move || {
+        let mut detached = Vec::new();
+        let mut terminated = Vec::new();
+        let result = terminate_unix_sentinel_holders_until(
+            &sentinel,
+            process_group,
+            detached_policy,
+            &mut detached,
+            &mut terminated,
+            Some(blocking_deadline),
+        );
+        (result, detached, terminated)
+    });
+    let outcome = match tokio::time::timeout_at(deadline, &mut sweep).await {
+        Ok(outcome) => outcome,
+        Err(_) => {
+            sweep.abort();
+            let _ = sweep.await;
+            return Err(process_tree_reap_timeout());
+        }
+    }
+    .map_err(|error| std::io::Error::other(format!("process-tree sweep task failed: {error}")))?;
+    let (result, detached, terminated) = outcome;
+    for process in detached {
+        record_detached(&mut child.detached, process);
+    }
+    for process in terminated {
+        if !child
+            .terminated_escapees
+            .iter()
+            .any(|known| known.pid == process.pid)
+        {
+            child.terminated_escapees.push(process);
+        }
+    }
+    result
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+async fn sweep_remaining_platform_process_tree(
+    _child: &mut ProcessTreeChild,
+    _deadline: tokio::time::Instant,
+) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -1934,10 +2043,22 @@ fn linux_sentinel_holders(
     sentinel: &OwnedFd,
     tree_leader: i32,
 ) -> std::io::Result<Vec<SentinelHolder>> {
+    linux_sentinel_holders_until(sentinel, tree_leader, None)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn linux_sentinel_holders_until(
+    sentinel: &OwnedFd,
+    tree_leader: i32,
+    deadline: Option<Instant>,
+) -> std::io::Result<Vec<SentinelHolder>> {
     let sentinel_target = std::fs::read_link(format!("/proc/self/fd/{}", sentinel.as_raw_fd()))?;
     let own_pid = i32::try_from(std::process::id()).unwrap_or(-1);
     let mut holders = Vec::new();
     for process in std::fs::read_dir("/proc")? {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(process_tree_reap_timeout());
+        }
         let Ok(process) = process else { continue };
         let Some(pid) = process
             .file_name()
@@ -1952,9 +2073,16 @@ fn linux_sentinel_holders(
         let Ok(descriptors) = std::fs::read_dir(process.path().join("fd")) else {
             continue;
         };
-        let holds_sentinel = descriptors.filter_map(Result::ok).any(|descriptor| {
-            std::fs::read_link(descriptor.path()).is_ok_and(|target| target == sentinel_target)
-        });
+        let mut holds_sentinel = false;
+        for descriptor in descriptors.filter_map(Result::ok) {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Err(process_tree_reap_timeout());
+            }
+            if std::fs::read_link(descriptor.path()).is_ok_and(|target| target == sentinel_target) {
+                holds_sentinel = true;
+                break;
+            }
+        }
         if !holds_sentinel {
             continue;
         }
@@ -2053,9 +2181,27 @@ fn terminate_unix_sentinel_holders(
     detached: &mut Vec<DetachedProcess>,
     terminated: &mut Vec<TerminatedEscapee>,
 ) -> std::io::Result<()> {
+    terminate_unix_sentinel_holders_until(sentinel, tree_leader, policy, detached, terminated, None)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn terminate_unix_sentinel_holders_until(
+    sentinel: &OwnedFd,
+    tree_leader: i32,
+    policy: DetachedPolicy,
+    detached: &mut Vec<DetachedProcess>,
+    terminated: &mut Vec<TerminatedEscapee>,
+    deadline: Option<Instant>,
+) -> std::io::Result<()> {
     let own_session = unsafe { libc::getsid(0) };
     let mut first_error = None;
-    for holder in linux_sentinel_holders(sentinel, tree_leader)? {
+    let holders = linux_sentinel_holders_until(sentinel, tree_leader, deadline)?;
+    #[cfg(test)]
+    run_after_sentinel_holder_scan_hook();
+    for holder in holders {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(process_tree_reap_timeout());
+        }
         if policy == DetachedPolicy::Release
             && holder.stat.session != own_session
             && let Some(process) = holder.released()
@@ -2088,6 +2234,14 @@ fn terminate_unix_sentinel_holders(
         }
     }
     first_error.map_or(Ok(()), Err)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn process_tree_reap_timeout() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "timed out waiting for terminated process tree",
+    )
 }
 
 #[cfg(all(
@@ -2732,6 +2886,45 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn blocking_cleanup_sweeps_a_holder_forked_during_termination() {
+        let directory = tempfile::tempdir().unwrap();
+        let daemon_path = directory.path().join("daemon.pid");
+        let release_path = directory.path().join("release");
+        let worker_path = directory.path().join("worker.pid");
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                r#"setsid /bin/sh -c 'echo $$ > "$1"; while [ ! -e "$2" ]; do sleep 0.01; done; sleep 60 & echo $! > "$3"; wait' detached "$1" "$2" "$3" </dev/null >/dev/null 2>&1 &"#,
+                "trouve-process-tree-test",
+            ])
+            .arg(&daemon_path)
+            .arg(&release_path)
+            .arg(&worker_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = spawn_blocking_process_tree(&mut command).unwrap();
+        let daemon = spawned_descendant_pid_blocking(&daemon_path);
+
+        install_fork_during_holder_scan_hook(release_path, worker_path.clone());
+        let started = Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            assert!(started.elapsed() < Duration::from_secs(2));
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let worker = spawned_descendant_pid_blocking(&worker_path);
+
+        assert!(status.success());
+        assert_process_stopped_blocking(daemon);
+        assert_process_stopped_blocking(worker);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn sentinel_cleanup_preserves_an_unrelated_direct_child_during_exec() {
         use std::os::unix::process::CommandExt as _;
 
@@ -2800,6 +2993,53 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    fn spawned_descendant_pid_blocking(pid_path: &Path) -> u32 {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Ok(pid) = std::fs::read_to_string(pid_path)
+                && let Ok(pid) = pid.trim().parse::<u32>()
+            {
+                return pid;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "child did not publish its descendant pid"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn install_fork_during_holder_scan_hook(release_path: PathBuf, worker_path: PathBuf) {
+        AFTER_SENTINEL_HOLDER_SCAN.with(|hook| {
+            assert!(
+                hook.borrow().is_none(),
+                "sentinel scan hook was already installed"
+            );
+            *hook.borrow_mut() = Some(Box::new(move || {
+                std::fs::write(&release_path, []).unwrap();
+                let _ = spawned_descendant_pid_blocking(&worker_path);
+            }));
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_process_stopped_blocking(pid: u32) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let state = process_state(pid).unwrap();
+            if state.is_none() || state == Some('Z') {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "process {pid} survived cleanup in state {state:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
     fn process_state(pid: u32) -> std::io::Result<Option<char>> {
         let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
             Ok(stat) => stat,
@@ -2847,6 +3087,27 @@ mod tests {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         spawn_process_tree(&mut command).unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn sentinel_holder_scan_honors_an_expired_reap_deadline() {
+        let directory = tempfile::tempdir().unwrap();
+        let pid_path = directory.path().join("descendant.pid");
+        let mut child = process_tree_fixture(&pid_path);
+        let descendant = spawned_descendant_pid(&pid_path).await;
+
+        let error = linux_sentinel_holders_until(
+            &child.descendant_sentinel,
+            child.process_group,
+            Some(Instant::now()),
+        )
+        .err()
+        .expect("expired holder scan should time out");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+
+        child.terminate_and_reap().await.unwrap();
+        assert_process_tree_member_stopped(descendant).await;
     }
 
     #[cfg(target_os = "linux")]
@@ -2974,6 +3235,45 @@ mod tests {
 
         // `Drop` must not signal the already-reaped leader's numeric PGID.
         drop(child);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn async_cleanup_sweeps_a_holder_forked_during_termination() {
+        let directory = tempfile::tempdir().unwrap();
+        let daemon_path = directory.path().join("daemon.pid");
+        let release_path = directory.path().join("release");
+        let worker_path = directory.path().join("worker.pid");
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                r#"setsid /bin/sh -c 'echo $$ > "$1"; while [ ! -e "$2" ]; do sleep 0.01; done; sleep 60 & echo $! > "$3"; wait' detached "$1" "$2" "$3" </dev/null >/dev/null 2>&1 &"#,
+                "trouve-process-tree-test",
+            ])
+            .arg(&daemon_path)
+            .arg(&release_path)
+            .arg(&worker_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = spawn_process_tree(&mut command).unwrap();
+        let daemon = spawned_descendant_pid(&daemon_path).await;
+
+        install_fork_during_holder_scan_hook(release_path, worker_path.clone());
+        let status = child.wait_and_cleanup().await.unwrap();
+        let worker = spawned_descendant_pid(&worker_path).await;
+
+        assert!(status.success());
+        let terminated = child.take_terminated_escapees();
+        assert!(
+            terminated
+                .iter()
+                .any(|process| process.pid == worker as i32),
+            "the post-snapshot worker was not found by a later sweep: {terminated:?}"
+        );
+        assert_process_tree_member_stopped(daemon).await;
+        assert_process_tree_member_stopped(worker).await;
     }
 
     #[cfg(target_os = "linux")]
