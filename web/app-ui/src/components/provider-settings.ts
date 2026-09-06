@@ -519,7 +519,7 @@ export class TrouveProviderSettings extends LitElement {
 
         <section class="subscription-health" aria-labelledby="subscription-health-title">
           <h3 id="subscription-health-title">Subscription health</h3>
-          <p>How much of each subscription's metered allowance is used. Codex and Claude Code report through their CLIs; Kimi Code uses the subscription key saved above. Cursor's usage comes from an undocumented dashboard endpoint, so it may break or be restricted at any time.</p>
+          <p>How much of each subscription's metered allowance is used. Codex and Claude Code report through their CLIs; Kimi Code uses the subscription key saved above. Cursor uses the saved SDK API key to query an undocumented dashboard endpoint directly, so that health check may break or be restricted at any time.</p>
           <div class="card-list">
             ${this.#health.length === 0
               ? html`<div class="empty">No subscription providers configured.</div>`

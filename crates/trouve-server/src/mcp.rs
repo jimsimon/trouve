@@ -242,10 +242,7 @@ async fn tools_call(
         engine.bridged_tool_call(thread_id, name, &arguments).await
     };
     match result {
-        Ok(content) => Ok(json!({
-            "content": [ { "type": "text", "text": content } ],
-            "isError": false,
-        })),
+        Ok(result) => Ok(mcp_tool_success(result)),
         // Errors surface as tool results (isError) so the agent can react
         // instead of the whole turn failing.
         Err(e) => Ok(json!({
@@ -253,6 +250,28 @@ async fn tools_call(
             "isError": true,
         })),
     }
+}
+
+fn mcp_tool_success(result: trouve_core::BridgedToolResult) -> Value {
+    let mut content = vec![json!({ "type": "text", "text": result.content })];
+    content.extend(result.images.into_iter().map(|image| {
+        json!({
+            "type": "image",
+            "data": image.data,
+            "mimeType": image.mime,
+        })
+    }));
+    let structured = serde_json::from_str::<Value>(&result.content)
+        .ok()
+        .filter(Value::is_object);
+    let mut response = json!({
+        "content": content,
+        "isError": false,
+    });
+    if let Some(structured) = structured {
+        response["structuredContent"] = structured;
+    }
+    response
 }
 
 fn codex_tool_call_metadata(params: &Value) -> Result<(&str, Option<&str>), String> {
@@ -281,7 +300,7 @@ fn codex_tool_call_metadata(params: &Value) -> Result<(&str, Option<&str>), Stri
 
 #[cfg(test)]
 mod tests {
-    use super::{codex_tool_call_metadata, tool_call_is_available};
+    use super::{codex_tool_call_metadata, mcp_tool_success, tool_call_is_available};
 
     #[test]
     fn query_flags_gate_tool_execution_as_well_as_discovery() {
@@ -324,5 +343,21 @@ mod tests {
         ] {
             assert!(codex_tool_call_metadata(&malformed).is_err());
         }
+    }
+
+    #[test]
+    fn bridged_tool_results_preserve_structured_and_image_content() {
+        let result = mcp_tool_success(trouve_core::BridgedToolResult {
+            content: r#"{"value":"ok"}"#.into(),
+            images: vec![trouve_core::BridgedToolImage {
+                mime: "image/png".into(),
+                data: "aW1hZ2U=".into(),
+            }],
+        });
+        assert_eq!(result["structuredContent"]["value"], "ok");
+        assert_eq!(result["content"][0]["type"], "text");
+        assert_eq!(result["content"][1]["type"], "image");
+        assert_eq!(result["content"][1]["mimeType"], "image/png");
+        assert_eq!(result["content"][1]["data"], "aW1hZ2U=");
     }
 }

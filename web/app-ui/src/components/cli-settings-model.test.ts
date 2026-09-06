@@ -76,7 +76,7 @@ describe("CLI settings model", () => {
     const statuses = new Map<string, ProtocolCliInstallStatus>([
       ["codex", status("pending")],
       ["claude", status("success")],
-      ["cursor-agent", status("failed")],
+      ["cursor-sdk-bridge", status("failed")],
     ]);
     expect(pendingCliIds(statuses)).toEqual(["codex"]);
     expect(shouldPollCliInstalls(statuses)).toBe(true);

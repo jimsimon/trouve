@@ -56,3 +56,4 @@ sequentially.
 | [0044](0044-durable-assistant-produced-artifacts.md) | Durable assistant-produced artifacts | Accepted |
 | [0045](0045-full-branch-review-on-every-head.md) | Full-branch review on every head | Accepted |
 | [0046](0046-detached-descendants-are-session-scoped.md) | Detached descendants of shell calls are session-scoped | Accepted |
+| [0047](0047-cursor-sdk-bridge-transport.md) | Cursor SDK Bridge transport | Accepted |

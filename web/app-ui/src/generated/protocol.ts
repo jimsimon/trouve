@@ -181,7 +181,7 @@ export interface paths {
         put?: never;
         post?: never;
         /**
-         * Remove the managed install of a CLI (a system install found on PATH is
+         * Remove a trouve-managed agent runtime (a system install found on PATH is
          *     untouched and will be used again if present).
          */
         delete: operations["uninstall_cli"];
@@ -200,7 +200,7 @@ export interface paths {
         get: operations["cli_install_status"];
         put?: never;
         post: operations["start_cli_install"];
-        /** Cancel an in-flight install; the CLI returns to its previous state. */
+        /** Cancel an in-flight install; the agent runtime returns to its previous state. */
         delete: operations["cancel_cli_install"];
         options?: never;
         head?: never;
@@ -1907,16 +1907,19 @@ export interface components {
             status: string;
         };
         /**
-         * @description A vendor CLI trouve can download and manage (cursor-agent, claude,
-         *     codex), with its current install state.
+         * @description A vendor agent runtime trouve can download and manage (Cursor Agent SDK
+         *     Bridge, Claude Code CLI, Codex CLI), with its current install state.
          */
         CliInfo: {
             display_name: string;
-            /** @description Stable id, also the binary name: "cursor-agent", "claude", "codex". */
+            /**
+             * @description Stable artifact id, also the managed binary name:
+             *     "cursor-sdk-bridge", "claude", or "codex".
+             */
             id: string;
-            /** @description Version of the binary trouve would run, when one was resolved. */
+            /** @description Version of the runtime binary trouve would run, when one was resolved. */
             installed_version?: string | null;
-            /** @description Provider kinds served by this CLI (e.g. ["cursor-cli"]). */
+            /** @description Provider kinds served by this runtime (e.g. ["cursor-sdk"]). */
             kinds: string[];
             /** @description Newest version the vendor serves (None when the check failed). */
             latest_version?: string | null;
@@ -1931,6 +1934,7 @@ export interface components {
         };
         /** @description State of a CLI install started with `POST /v1/clis/{id}/install`. */
         CliInstallStatus: {
+            /** @description The terminal error when `status = "failed"`. */
             error?: string | null;
             /**
              * Format: int64
@@ -1946,6 +1950,11 @@ export interface components {
             total_bytes?: number;
             /** @description Version being (or just) installed, when known. */
             version?: string | null;
+            /**
+             * @description A non-fatal activation warning. When present with `status = "success"`,
+             *     the runtime is active but its crash durability could not be confirmed.
+             */
+            warning?: string | null;
         };
         CliList: {
             clis: components["schemas"]["CliInfo"][];

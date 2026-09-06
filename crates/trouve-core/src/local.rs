@@ -1578,10 +1578,7 @@ mod tests {
     #[test]
     fn runtime_bin_requires_an_active_managed_install() {
         let tmp = tempfile::tempdir().unwrap();
-        let stable = trouve_agents::install::managed_bin(
-            tmp.path(),
-            trouve_agents::install::CliId::LlamaServer,
-        );
+        let stable = tmp.path().join("cli/bin/llama-server");
         std::fs::create_dir_all(stable.parent().unwrap()).unwrap();
         std::fs::write(&stable, b"unregistered llama-server").unwrap();
 
@@ -1604,7 +1601,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(runtime_bin(tmp.path()), Some(binary));
+        assert_eq!(
+            runtime_bin(tmp.path()),
+            Some(std::fs::canonicalize(binary).unwrap())
+        );
     }
 
     #[test]
