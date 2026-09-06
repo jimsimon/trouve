@@ -73,6 +73,20 @@ impl ManagedBackgroundTasks {
         true
     }
 
+    /// Cancel and release the registered owner for the key, if one exists.
+    ///
+    /// Removing the registration before cancellation permits higher-priority
+    /// foreground work to enqueue a fresh managed pass after it completes.
+    pub(crate) fn preempt(&self, key: &str) -> bool {
+        let task = self.inner.tasks.lock().unwrap().remove(key);
+        if let Some(task) = task {
+            task.cancel.cancel();
+            true
+        } else {
+            false
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn is_running(&self, key: &str) -> bool {
         self.inner.tasks.lock().unwrap().contains_key(key)
@@ -171,6 +185,26 @@ mod tests {
         permits.add_permits(1);
         wait_until(|| !tasks.is_running("repository")).await;
         assert_eq!(starts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn preempted_work_can_be_scheduled_again_immediately() {
+        let tasks = ManagedBackgroundTasks::default();
+        let cancelled = Arc::new(AtomicUsize::new(0));
+        let observed = cancelled.clone();
+        assert!(tasks.schedule("repository".into(), move |cancel| {
+            let observed = observed.clone();
+            async move {
+                cancel.cancelled().await;
+                observed.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+
+        assert!(tasks.preempt("repository"));
+        assert!(!tasks.is_running("repository"));
+        assert!(tasks.schedule("repository".into(), |_| async {}));
+        wait_for_count(&cancelled, 1).await;
+        wait_until(|| !tasks.is_running("repository")).await;
     }
 
     #[tokio::test]

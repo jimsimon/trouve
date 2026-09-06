@@ -1793,6 +1793,13 @@ impl LocalToolExecutor {
         lock
     }
 
+    fn review_repository_foreground_lock(&self, path: &Path) -> Arc<tokio::sync::Mutex<()>> {
+        let repository_lock = self.review_repository_lock(path);
+        self.managed_background
+            .preempt(&review_repository_maintenance_key(path));
+        repository_lock
+    }
+
     fn schedule_review_repository_maintenance(&self, repository_path: &Path) {
         let repository_path = repository_path.to_path_buf();
         let repository_lock = self.review_repository_lock(&repository_path);
@@ -3006,7 +3013,7 @@ impl ToolExecutor for LocalToolExecutor {
             .map_err(|error| format!("resolving review root: {error}"))?;
         let requested_repository_path = managed_root.join(owner).join(repository);
         let repository_path = review_repository_identity(&requested_repository_path)?;
-        let repository_lock = self.review_repository_lock(&repository_path);
+        let repository_lock = self.review_repository_foreground_lock(&repository_path);
         let mut repository_guard = tokio::select! {
             biased;
             _ = request.cancel.cancelled() => {
@@ -4034,6 +4041,41 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn foreground_review_work_preempts_repository_maintenance() {
+        let repository = tempfile::tempdir().unwrap();
+        let executor = LocalToolExecutor::default();
+        let repository_lock = executor.review_repository_lock(repository.path());
+        let key = review_repository_maintenance_key(repository.path());
+        let acquired = Arc::new(tokio::sync::Semaphore::new(0));
+        let task_lock = repository_lock.clone();
+        let task_acquired = acquired.clone();
+        assert!(
+            executor
+                .managed_background
+                .schedule(key.clone(), move |cancel| {
+                    let task_lock = task_lock.clone();
+                    let task_acquired = task_acquired.clone();
+                    async move {
+                        let _guard = task_lock.lock_owned().await;
+                        task_acquired.add_permits(1);
+                        cancel.cancelled().await;
+                    }
+                })
+        );
+        acquired.acquire().await.unwrap().forget();
+
+        let foreground_lock = executor.review_repository_foreground_lock(repository.path());
+        let foreground_guard = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            foreground_lock.lock_owned(),
+        )
+        .await
+        .expect("foreground work should cancel maintenance and acquire its repository lock");
+        assert!(!executor.managed_background.is_running(&key));
+        drop(foreground_guard);
     }
 
     #[cfg(unix)]
