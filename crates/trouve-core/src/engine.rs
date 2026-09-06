@@ -24800,7 +24800,28 @@ mod tests {
                     .await
             }
         });
-        tokio::task::yield_now().await;
+        let coalesced_key = title_job_key(
+            &session.id,
+            "title-test/model",
+            "Schedule local naming",
+            &[],
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let waiter_count = engine
+                    .title_jobs
+                    .lock()
+                    .unwrap()
+                    .get(&coalesced_key)
+                    .map(|job| job.waiters.len());
+                if waiter_count == Some(1) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the second request should coalesce as a follower");
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 
         release.add_permits(1);
