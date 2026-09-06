@@ -7047,13 +7047,14 @@ impl Engine {
                 &resolved_finding_ids,
                 continuation_request.as_ref(),
             )?;
-        // Collapsing the remote threads is cleanup detached from the round
-        // entirely: it starts only after every piece of publication
-        // bookkeeping, runs outside the job future with individually bounded
-        // requests, and no failure in it can fail a job whose review is
-        // already published and recorded. Anything it leaves pending is
-        // retried durably, with backoff, by the dedicated collapse-retry
-        // task (REVIEW_COLLAPSE_RETRY_INTERVAL cadence).
+        // Remote cleanup is detached from the round entirely: it starts only
+        // after every piece of publication bookkeeping, runs outside the job
+        // future with bounded requests, and no failure in it can fail a job
+        // whose review is already published and recorded. Attempt obsolete
+        // blocking-review cleanup here so a clean replacement does not wait
+        // for the next repository poll; durable retry state remains the
+        // fallback. Fixed-finding threads likewise remain covered by the
+        // dedicated collapse-retry task (REVIEW_COLLAPSE_RETRY_INTERVAL cadence).
         let cleanup_engine = self.clone();
         let cleanup_job = job.clone();
         let closed_findings = previous_findings
@@ -7069,6 +7070,19 @@ impl Engine {
             self.code_review.job_wake.notify_one();
         }
         tokio::spawn(async move {
+            if let Err(error) = cleanup_engine
+                .sync_code_review_blocking_review_cleanup_with_api(&api, &cleanup_job)
+                .await
+            {
+                tracing::warn!(
+                    job_id = cleanup_job.id,
+                    repository = cleanup_job.repository,
+                    pull_number = cleanup_job.pull_number,
+                    error = format!("{error:#}"),
+                    "immediate obsolete blocking-review cleanup failed; \
+                     the repository poll will retry"
+                );
+            }
             if let Err(error) = cleanup_engine
                 .resolve_review_threads(
                     &api,
@@ -8890,7 +8904,6 @@ impl Engine {
             .await
     }
 
-    #[cfg(test)]
     async fn sync_code_review_blocking_review_cleanup_with_api(
         &self,
         api: &GithubApi,
