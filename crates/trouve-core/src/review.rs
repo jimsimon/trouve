@@ -31,10 +31,10 @@ use trouve_protocol::{
 use crate::config::GithubReviewAppConfig;
 use crate::engine::{Engine, EngineError, ReviewWorkspaceRegistrationFence};
 use crate::store::{
-    CodeReviewJobPhase, CodeReviewJobRecord, CodeReviewJobRetryOutcome, CodeReviewManualRequest,
-    CodeReviewModelTiming, CodeReviewTaskMetrics, LEGACY_FULL_COVERAGE_MAX_ATTEMPTS,
-    NewCodeReviewFinding, NewCodeReviewFindingDetails, NewCodeReviewJob, NewCodeReviewTask,
-    NewCodeReviewTheme,
+    CODE_REVIEW_CARRIED_ANCHOR_CURSOR_MARKER, CodeReviewJobPhase, CodeReviewJobRecord,
+    CodeReviewJobRetryOutcome, CodeReviewManualRequest, CodeReviewModelTiming,
+    CodeReviewTaskMetrics, LEGACY_FULL_COVERAGE_MAX_ATTEMPTS, NewCodeReviewFinding,
+    NewCodeReviewFindingDetails, NewCodeReviewJob, NewCodeReviewTask, NewCodeReviewTheme,
 };
 use crate::tools::{
     ReviewAnchor, ReviewDiffFileWithMetadata as ReviewDiffFile, ReviewRepositoryAnchors,
@@ -5286,7 +5286,17 @@ impl Engine {
                 ),
             ),
         };
-        let continuation_request = carried_anchor_continuation_request(&record, &record.job);
+        let legacy_carried_cursor = self
+            .store
+            .code_review_job_dedupe_key(&job_id)
+            .ok()
+            .flatten()
+            .and_then(|dedupe_key| carried_anchor_continuation_cursor(&dedupe_key));
+        let continuation_request = carried_anchor_continuation_request(
+            &record,
+            &record.job,
+            legacy_carried_cursor.as_deref(),
+        );
         let (finish_recorded, finish_transition, updated_tasks, continuation_job) =
             match self.store.finish_code_review_job_with_continuation(
                 &job_id,
@@ -5737,12 +5747,23 @@ impl Engine {
             } else {
                 CarriedFindingAnchorMap::new()
             };
+        // Continuations carry the last legacy head selected by their parent
+        // in their durable dedupe key. Advancing strictly past it lets one
+        // bounded chain reach later heads even when every mapping on an
+        // earlier page fails. A later independent review starts from the
+        // beginning again, providing the controlled retry for failed heads.
+        let legacy_carried_cursor = self
+            .store
+            .code_review_job_dedupe_key(&job.id)?
+            .and_then(|dedupe_key| carried_anchor_continuation_cursor(&dedupe_key));
         let (legacy_carried_base_shas, legacy_carried_has_more) = legacy_carried_anchor_base_shas(
             &carried_snapshot,
             &previous_pull_state.last_reviewed_head_sha,
             &carried_snapshot_base_anchors,
+            legacy_carried_cursor.as_deref(),
             CARRIED_ANCHOR_LEGACY_BASES_PER_ROUND,
         );
+        let mut next_legacy_carried_cursor = legacy_carried_cursor.clone();
         // The prior reviewed head is the coordinate space for carried
         // findings. Keep that immutable object available even though reviewer
         // coverage always starts at the pull request merge base.
@@ -6548,6 +6569,13 @@ impl Engine {
                     superseded,
                 )
                 .await?;
+            // Loading attempted every selected immutable head, including
+            // heads whose diff failed or could not map an anchor. Advance the
+            // durable continuation cursor only after that attempt; a skipped
+            // automatic round must not silently step over unexamined heads.
+            if let Some(selected) = legacy_carried_base_shas.last() {
+                next_legacy_carried_cursor = Some(selected.clone());
+            }
             let carried_locations = carried_anchor_locations(
                 &previous_findings,
                 &carried_mapping,
@@ -7084,8 +7112,9 @@ impl Engine {
             .publish_review(&api, &job, &persisted, has_unresolved_findings)
             .await
             .context("publishing GitHub pull request review")?;
-        let continuation_request =
-            carried_anchor_has_more.then(|| carried_anchor_continuation_request(record, &job));
+        let continuation_request = carried_anchor_has_more.then(|| {
+            carried_anchor_continuation_request(record, &job, next_legacy_carried_cursor.as_deref())
+        });
         let (_, continuation_job) = self
             .store
             .record_code_review_publication_with_continuation(
@@ -18117,12 +18146,14 @@ fn finding_requires_head_verification(
 
 /// Select original review heads for findings that cannot use the durable
 /// coordinate at the primary mapping base. Selection is deterministic and
-/// bounded; once a selected head maps successfully, the ordinary carried
-/// anchor record at the current head removes it from later selections.
+/// bounded. A continuation cursor advances past every attempted page so a
+/// failure cannot starve later heads; successfully mapped heads also leave
+/// the candidate set through their ordinary durable carried coordinates.
 fn legacy_carried_anchor_base_shas(
     findings: &[trouve_protocol::CodeReviewFinding],
     mapping_base_sha: &str,
     base_anchors: &CarriedFindingAnchorMap,
+    after_sha: Option<&str>,
     limit: usize,
 ) -> (Vec<String>, bool) {
     let candidates = findings
@@ -18138,7 +18169,10 @@ fn legacy_carried_anchor_base_shas(
                 && validate_sha(&finding.observed_head).is_ok()
         })
         .map(|finding| finding.observed_head.clone())
-        .collect::<BTreeSet<_>>();
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter(|sha| after_sha.is_none_or(|cursor| sha.as_str() > cursor))
+        .collect::<Vec<_>>();
     let has_more = candidates.len() > limit;
     (candidates.into_iter().take(limit).collect(), has_more)
 }
@@ -18297,12 +18331,23 @@ fn carried_anchor_history_lines(
 const CARRIED_ANCHOR_PREFETCH_PAGE_SIZE: usize = 32;
 const CARRIED_ANCHOR_MAX_READ_ATTEMPTS: u32 = 3;
 
+fn carried_anchor_continuation_cursor(dedupe_key: &str) -> Option<String> {
+    let (_, cursor) = dedupe_key.rsplit_once(CODE_REVIEW_CARRIED_ANCHOR_CURSOR_MARKER)?;
+    validate_sha(cursor).ok()?;
+    Some(cursor.to_owned())
+}
+
 fn carried_anchor_continuation_request(
     record: &CodeReviewJobRecord,
     job: &trouve_protocol::CodeReviewJob,
+    legacy_cursor: Option<&str>,
 ) -> NewCodeReviewJob {
+    let dedupe_key = legacy_cursor.map_or_else(
+        || format!("{}:carried-anchor-continuation", job.id),
+        |cursor| format!("{}:carried-anchor-continuation:{cursor}", job.id),
+    );
     NewCodeReviewJob {
-        dedupe_key: format!("{}:carried-anchor-continuation", job.id),
+        dedupe_key,
         installation_id: job.installation_id,
         repository: job.repository.clone(),
         pull_number: job.pull_number,
@@ -21038,10 +21083,39 @@ mod tests {
         )]);
 
         let (selected, has_more) =
-            legacy_carried_anchor_base_shas(&findings, &current_base, &base_anchors, 2);
+            legacy_carried_anchor_base_shas(&findings, &current_base, &base_anchors, None, 2);
 
         assert_eq!(selected, vec!["1".repeat(40), "2".repeat(40)]);
         assert!(has_more);
+    }
+
+    #[test]
+    fn legacy_carried_anchor_cursor_advances_past_a_failed_page() {
+        let current_base = "f".repeat(40);
+        let findings = (1..=3)
+            .map(|index| trouve_protocol::CodeReviewFinding {
+                observed_head: index.to_string().repeat(40),
+                ..open_history_finding(&format!("rvf_legacy_{index}"), "src/lib.rs", index, "high")
+            })
+            .collect::<Vec<_>>();
+        let base_anchors = CarriedFindingAnchorMap::new();
+        let (failed_page, has_more) =
+            legacy_carried_anchor_base_shas(&findings, &current_base, &base_anchors, None, 2);
+        assert!(has_more);
+
+        // Neither first-page head gained a durable anchor. The continuation
+        // cursor must still advance to the untouched third head instead of
+        // recomputing the same failed prefix forever.
+        let cursor = failed_page.last().unwrap();
+        let (next_page, has_more) = legacy_carried_anchor_base_shas(
+            &findings,
+            &current_base,
+            &base_anchors,
+            Some(cursor),
+            2,
+        );
+        assert_eq!(next_page, vec!["3".repeat(40)]);
+        assert!(!has_more);
     }
 
     #[test]
@@ -21802,7 +21876,8 @@ rename to src/new.rs
         );
         let record = store.code_review_job(&legacy.id).unwrap().unwrap();
 
-        let continuation = carried_anchor_continuation_request(&record, &legacy);
+        let cursor = "a".repeat(40);
+        let continuation = carried_anchor_continuation_request(&record, &legacy, Some(&cursor));
 
         assert_eq!(
             continuation.scope,
@@ -21810,6 +21885,10 @@ rename to src/new.rs
         );
         assert!(continuation.review_base_sha.is_empty());
         assert_eq!(continuation.retry_of.as_deref(), Some(legacy.id.as_str()));
+        assert_eq!(
+            carried_anchor_continuation_cursor(&continuation.dedupe_key),
+            Some(cursor)
+        );
     }
 
     #[test]
