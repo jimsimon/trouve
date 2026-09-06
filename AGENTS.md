@@ -100,7 +100,10 @@ These are load-bearing. Do not violate them without a new ADR.
     (Linux), shell calls release descendants that `setsid()` into their own
     session, report them, and stop them when the session worktree is
     evicted; elsewhere, and for every other spawner, terminate-all semantics
-    apply (ADR 0046).
+    apply (ADR 0046). Trouve-owned work that intentionally outlives its caller
+    is declared before launch and transferred to a scoped managed-background
+    owner together with its cancellation and resource leases; self-daemonizing
+    is never an implicit ownership transfer (ADR 0048).
 
 ## Conventions
 

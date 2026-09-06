@@ -11,6 +11,7 @@ mod fs;
 mod glob;
 mod grep;
 mod hashline;
+mod managed_background;
 mod patch;
 mod search;
 mod shell;
@@ -39,6 +40,7 @@ pub use edit_strategy::for_model as edit_strategy_for_model;
 
 const REVIEW_OPTIONAL_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 const REVIEW_PRIMARY_FETCH_TIMEOUT: Duration = Duration::from_secs(60);
+const REVIEW_MAINTENANCE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const REVIEW_FETCH_TERMINATION_GRACE: Duration = Duration::from_secs(2);
 const REVIEW_HISTORY_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 const REVIEW_FETCH_STDERR_MAX_BYTES: usize = 8 * 1024;
@@ -356,6 +358,13 @@ fn primary_review_fetch_args(
         format!("+{base_sha}:refs/remotes/origin/trouve-base"),
         format!("+refs/pull/{pull_number}/head:{pull_ref}"),
     ]
+}
+
+fn review_repository_maintenance_key(repository_path: &Path) -> String {
+    format!(
+        "review-repository-maintenance:{}",
+        repository_path.display()
+    )
 }
 
 fn authenticated_review_git_command(
@@ -1494,7 +1503,7 @@ async fn run_review_command_with_timeout(
             "GIT_CONFIG_GLOBAL",
             if cfg!(windows) { "NUL" } else { "/dev/null" },
         )
-        .env("GIT_CONFIG_COUNT", "7")
+        .env("GIT_CONFIG_COUNT", "8")
         // Reset any repository-local extra-header list before appending the
         // one URL-scoped credential owned by this invocation.
         .env("GIT_CONFIG_KEY_0", "http.extraheader")
@@ -1514,6 +1523,10 @@ async fn run_review_command_with_timeout(
             "GIT_CONFIG_VALUE_6",
             if cfg!(windows) { "NUL" } else { "/dev/null" },
         )
+        // Any Git subcommand that triggers maintenance must keep it inside
+        // the process tree owned by this invocation.
+        .env("GIT_CONFIG_KEY_7", "maintenance.autoDetach")
+        .env("GIT_CONFIG_VALUE_7", "false")
         .env("GIT_ALLOW_PROTOCOL", "https")
         .env("GIT_PROTOCOL_FROM_USER", "0")
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -1706,6 +1719,7 @@ pub struct LocalToolExecutor {
     built_in_specs: Vec<ToolSpec>,
     mcp: crate::mcp::McpManager,
     jobs: Arc<shell::JobRegistry>,
+    managed_background: managed_background::ManagedBackgroundTasks,
     hashline_failures: Mutex<HashMap<String, u8>>,
     review_repository_locks: Mutex<HashMap<PathBuf, std::sync::Weak<tokio::sync::Mutex<()>>>>,
 }
@@ -1762,6 +1776,7 @@ impl LocalToolExecutor {
             built_in_specs,
             mcp: crate::mcp::McpManager::with_logs(logs),
             jobs,
+            managed_background: managed_background::ManagedBackgroundTasks::default(),
             hashline_failures: Mutex::new(HashMap::new()),
             review_repository_locks: Mutex::new(HashMap::new()),
         }
@@ -1776,6 +1791,41 @@ impl LocalToolExecutor {
         let lock = Arc::new(tokio::sync::Mutex::new(()));
         locks.insert(path.to_path_buf(), Arc::downgrade(&lock));
         lock
+    }
+
+    fn schedule_review_repository_maintenance(&self, repository_path: &Path) {
+        let repository_path = repository_path.to_path_buf();
+        let repository_lock = self.review_repository_lock(&repository_path);
+        let key = review_repository_maintenance_key(&repository_path);
+        self.managed_background.schedule(key, move |cancel| {
+            let repository_path = repository_path.clone();
+            let repository_lock = repository_lock.clone();
+            async move {
+                let repository_guard = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return,
+                    guard = repository_lock.lock_owned() => guard,
+                };
+                let result = run_review_git_with_timeout(
+                    &repository_path,
+                    "",
+                    vec!["maintenance".into(), "run".into(), "--auto".into()],
+                    &cancel,
+                    REVIEW_MAINTENANCE_TIMEOUT,
+                )
+                .await;
+                drop(repository_guard);
+                if let Err(error) = result
+                    && !cancel.is_cancelled()
+                {
+                    tracing::warn!(
+                        repository = %repository_path.display(),
+                        %error,
+                        "managed review repository maintenance failed"
+                    );
+                }
+            }
+        });
     }
 
     fn find(&self, name: &str) -> Option<&Arc<dyn Tool>> {
@@ -3160,6 +3210,7 @@ impl ToolExecutor for LocalToolExecutor {
                 );
             }
         }
+        self.schedule_review_repository_maintenance(&repository_path);
         Ok(repository_path)
     }
 
@@ -3949,6 +4000,40 @@ mod tests {
         assert!(locks.get(Path::new("repo-c")).is_some());
         drop(locks);
         drop(replacement);
+    }
+
+    #[tokio::test]
+    async fn managed_review_maintenance_waits_for_the_repository_owner() {
+        let repository = tempfile::tempdir().unwrap();
+        run_review_git(
+            repository.path(),
+            "",
+            vec!["init".into(), "--template=".into()],
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let executor = LocalToolExecutor::default();
+        let repository_lock = executor.review_repository_lock(repository.path());
+        let repository_guard = repository_lock.lock_owned().await;
+        let key = review_repository_maintenance_key(repository.path());
+
+        executor.schedule_review_repository_maintenance(repository.path());
+        assert!(executor.managed_background.is_running(&key));
+        tokio::task::yield_now().await;
+        assert!(
+            executor.managed_background.is_running(&key),
+            "maintenance bypassed the repository mutex"
+        );
+
+        drop(repository_guard);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while executor.managed_background.is_running(&key) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
     }
 
     #[cfg(unix)]
