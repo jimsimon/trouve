@@ -1484,7 +1484,7 @@ cat > /dev/null
     let turn_start = std::fs::read_to_string(format!("{stub}.turn-start")).unwrap();
     let turn_start: serde_json::Value = serde_json::from_str(&turn_start).unwrap();
     assert_eq!(turn_start["params"]["approvalPolicy"], "untrusted");
-    assert_eq!(turn_start["params"]["summary"], "none");
+    assert_eq!(turn_start["params"]["summary"], "auto");
     assert_eq!(
         turn_start["params"]["input"][0]["text"], "do the thing",
         "mode instructions belong in developerInstructions, not user input"
