@@ -33,6 +33,7 @@ const MAX_CREDENTIAL_SCAN_FILES: usize = 100_000;
 const REVIEW_TOOL_CALL_LIMIT: u64 = 24;
 const REVIEW_MEDIAN_TOOL_CALL_TARGET: f64 = 4.0;
 const REVIEW_P90_TOOL_CALL_TARGET: usize = 8;
+const MAX_REVIEW_REPLAY_TASKS: usize = 128;
 
 struct LiveServerGuard {
     handle: Option<tokio::task::JoinHandle<()>>,
@@ -492,25 +493,101 @@ struct ReviewJobEndpoints {
     tasks: String,
 }
 
-fn review_output_value(output: &str) -> Option<serde_json::Value> {
-    serde_json::from_str::<serde_json::Value>(output.trim())
-        .ok()
-        .filter(|value| {
-            value
-                .get("findings")
-                .is_some_and(serde_json::Value::is_array)
-        })
+#[derive(Debug, serde::Deserialize)]
+struct QualificationReviewOutput {
+    summary: String,
+    findings: Vec<QualificationReviewFinding>,
 }
 
-fn review_output_mentions(output: &str, terms: &[&str]) -> bool {
-    let Some(value) = review_output_value(output) else {
+#[derive(Debug, serde::Deserialize)]
+struct QualificationReviewFinding {
+    path: String,
+    line: u64,
+    side: String,
+    severity: String,
+    confidence: String,
+    title: String,
+    body: String,
+    evidence: QualificationReviewEvidence,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct QualificationReviewEvidence {
+    preconditions: String,
+    execution_path: String,
+    consequence: String,
+    introduction: String,
+    regression_test: String,
+}
+
+fn review_output_value(output: &str) -> Option<QualificationReviewOutput> {
+    let review = serde_json::from_str::<QualificationReviewOutput>(output.trim()).ok()?;
+    let valid = !review.summary.trim().is_empty()
+        && review.findings.iter().all(|finding| {
+            !finding.path.trim().is_empty()
+                && finding.line > 0
+                && matches!(finding.side.as_str(), "RIGHT" | "LEFT")
+                && matches!(finding.severity.as_str(), "high" | "medium" | "low")
+                && matches!(finding.confidence.as_str(), "high" | "medium" | "low")
+                && !finding.title.trim().is_empty()
+                && !finding.body.trim().is_empty()
+                && !finding.evidence.preconditions.trim().is_empty()
+                && !finding.evidence.execution_path.trim().is_empty()
+                && !finding.evidence.consequence.trim().is_empty()
+                && !finding.evidence.introduction.trim().is_empty()
+                && !finding.evidence.regression_test.trim().is_empty()
+        });
+    valid.then_some(review)
+}
+
+fn review_output_has_finding(
+    output: &str,
+    expected_path: &str,
+    expected_line: u64,
+    terms: &[&str],
+) -> bool {
+    let Some(review) = review_output_value(output) else {
         return false;
     };
-    let findings = value["findings"].as_array().unwrap();
-    !findings.is_empty()
-        && terms
-            .iter()
-            .any(|term| value.to_string().to_ascii_lowercase().contains(term))
+    review.findings.iter().any(|finding| {
+        if finding.path != expected_path || finding.line != expected_line || finding.side != "RIGHT"
+        {
+            return false;
+        }
+        let evidence = &finding.evidence;
+        let searchable = format!(
+            "{} {} {} {} {} {} {}",
+            finding.title,
+            finding.body,
+            evidence.preconditions,
+            evidence.execution_path,
+            evidence.consequence,
+            evidence.introduction,
+            evidence.regression_test,
+        )
+        .to_ascii_lowercase();
+        terms.iter().any(|term| searchable.contains(term))
+    })
+}
+
+fn review_replay_task_limit(configured: Option<&str>, available: usize) -> Result<usize, String> {
+    let Some(configured) = configured else {
+        if available > MAX_REVIEW_REPLAY_TASKS {
+            return Err(format!(
+                "review job has {available} selected tasks; set CURSOR_E2E_REVIEW_TASK_LIMIT to at most {MAX_REVIEW_REPLAY_TASKS}"
+            ));
+        }
+        return Ok(available);
+    };
+    let limit = configured
+        .parse::<usize>()
+        .map_err(|error| format!("CURSOR_E2E_REVIEW_TASK_LIMIT: {error}"))?;
+    if !(1..=MAX_REVIEW_REPLAY_TASKS).contains(&limit) {
+        return Err(format!(
+            "CURSOR_E2E_REVIEW_TASK_LIMIT must be between 1 and {MAX_REVIEW_REPLAY_TASKS}"
+        ));
+    }
+    Ok(limit.min(available))
 }
 
 fn review_tool_counts(events: &[serde_json::Value], turn: u64) -> BTreeMap<String, usize> {
@@ -673,62 +750,85 @@ async fn run_qualified_review_turn(
         .start_code_review_task(&local_task.id, session_id, thread_id, model)
         .map_err(|error| format!("starting local review task {task_id}: {error}"))?
         .ok_or_else(|| format!("local review task {task_id} was superseded"))?;
-    let budget = engine
-        .begin_automated_review_tool_budget_for_qualification(thread_id, REVIEW_TOOL_CALL_LIMIT)
-        .map_err(|error| format!("arming review budget for {task_id}: {error}"))?;
-    let send = client
-        .post(format!("{base}/threads/{thread_id}/messages"))
-        .json(&serde_json::json!({ "content": prompt }))
-        .send()
-        .await
-        .map_err(|error| format!("sending review task {task_id}: {error}"))?;
-    if !send.status().is_success() {
-        drop(budget);
-        let error = format!("sending review task {task_id} returned {}", send.status());
-        let _ = engine
-            .store()
-            .finish_code_review_task(&local_task.id, "failed", "", 0, &error);
-        return Err(error);
-    }
-    let events = wait_for_event(
-        client,
-        &format!("{base}/threads/{thread_id}/events"),
-        |event| terminal_event(event, 1),
-    )
-    .await;
-    drop(budget);
-    let terminal = events
-        .iter()
-        .find(|event| terminal_event(event, 1))
-        .ok_or_else(|| format!("review task {task_id} omitted terminal event"))?;
-    let completed = terminal["type"] == "turn.completed";
-    let output = assistant_text(&events, 1);
-    let valid_json = review_output_value(&output).is_some();
-    let tool_calls_by_name = review_tool_counts(&events, 1);
-    let tool_call_count = tool_calls_by_name.values().sum();
-    let error = terminal["error"].as_str().unwrap_or_default().to_string();
-    let candidate_count = review_output_value(&output)
-        .and_then(|value| value["findings"].as_array().map(Vec::len))
-        .unwrap_or(0);
-    engine
-        .store()
-        .finish_code_review_task(
-            &local_task.id,
-            if completed { "succeeded" } else { "failed" },
-            &output,
-            candidate_count as u64,
-            &error,
+    let result = async {
+        let _budget = engine
+            .begin_automated_review_tool_budget_for_qualification(thread_id, REVIEW_TOOL_CALL_LIMIT)
+            .map_err(|error| format!("arming review budget for {task_id}: {error}"))?;
+        let send = client
+            .post(format!("{base}/threads/{thread_id}/messages"))
+            .json(&serde_json::json!({ "content": prompt }))
+            .send()
+            .await
+            .map_err(|error| format!("sending review task {task_id}: {error}"))?;
+        if !send.status().is_success() {
+            return Err(format!(
+                "sending review task {task_id} returned {}",
+                send.status()
+            ));
+        }
+        let events = wait_for_event(
+            client,
+            &format!("{base}/threads/{thread_id}/events"),
+            |event| terminal_event(event, 1),
         )
-        .map_err(|finish_error| format!("finishing local review task {task_id}: {finish_error}"))?;
-    Ok(ReviewTurnEvidence {
-        task_id: task_id.to_string(),
-        completed,
-        valid_json,
-        tool_call_count,
-        tool_calls_by_name,
-        error,
-        output,
-    })
+        .await;
+        let terminal = events
+            .iter()
+            .find(|event| terminal_event(event, 1))
+            .ok_or_else(|| format!("review task {task_id} omitted terminal event"))?;
+        let completed = terminal["type"] == "turn.completed";
+        let output = assistant_text(&events, 1);
+        let valid_json = review_output_value(&output).is_some();
+        let tool_calls_by_name = review_tool_counts(&events, 1);
+        let tool_call_count = tool_calls_by_name.values().sum();
+        let error = terminal["error"].as_str().unwrap_or_default().to_string();
+        Ok(ReviewTurnEvidence {
+            task_id: task_id.to_string(),
+            completed,
+            valid_json,
+            tool_call_count,
+            tool_calls_by_name,
+            error,
+            output,
+        })
+    }
+    .await;
+
+    match result {
+        Ok(evidence) => {
+            let candidate_count = review_output_value(&evidence.output)
+                .map(|review| review.findings.len())
+                .unwrap_or(0);
+            engine
+                .store()
+                .finish_code_review_task(
+                    &local_task.id,
+                    if evidence.completed {
+                        "succeeded"
+                    } else {
+                        "failed"
+                    },
+                    &evidence.output,
+                    candidate_count as u64,
+                    &evidence.error,
+                )
+                .map_err(|finish_error| {
+                    format!("finishing local review task {task_id}: {finish_error}")
+                })?;
+            Ok(evidence)
+        }
+        Err(error) => {
+            engine
+                .store()
+                .finish_code_review_task(&local_task.id, "failed", "", 0, &error)
+                .map_err(|finish_error| {
+                    format!(
+                        "{error}; additionally failed to finalize local review task {task_id}: {finish_error}"
+                    )
+                })?;
+            Err(error)
+        }
+    }
 }
 
 async fn replay_review_job(
@@ -776,12 +876,9 @@ async fn replay_review_job(
         })
         .cloned()
         .collect::<Vec<_>>();
-    if let Ok(limit) = std::env::var("CURSOR_E2E_REVIEW_TASK_LIMIT") {
-        let limit = limit
-            .parse::<usize>()
-            .map_err(|error| format!("CURSOR_E2E_REVIEW_TASK_LIMIT: {error}"))?;
-        tasks.truncate(limit);
-    }
+    let configured_limit = std::env::var("CURSOR_E2E_REVIEW_TASK_LIMIT").ok();
+    let limit = review_replay_task_limit(configured_limit.as_deref(), tasks.len())?;
+    tasks.truncate(limit);
     if tasks.is_empty() {
         return Err("review job had no selected reviewer tasks".into());
     }
@@ -1051,7 +1148,7 @@ fn assert_synthetic_review_acceptance(summary: &SyntheticReviewSummary) {
     );
     assert!(diff.valid_json, "diff-contained review did not return JSON");
     assert!(
-        review_output_mentions(&diff.output, &["retry", "attempt"]),
+        review_output_has_finding(&diff.output, "src/retry.rs", 18, &["retry", "attempt"],),
         "diff-contained review missed the retry defect: {}",
         diff.output
     );
@@ -1072,7 +1169,7 @@ fn assert_synthetic_review_acceptance(summary: &SyntheticReviewSummary) {
         "context-dependent review did not return JSON"
     );
     assert!(
-        review_output_mentions(&context.output, &["revok"]),
+        review_output_has_finding(&context.output, "src/handler.rs", 4, &["revok"]),
         "context-dependent review missed the revocation defect: {}",
         context.output
     );
@@ -1515,4 +1612,79 @@ fn review_qualification_uses_documented_distribution_statistics() {
     assert_eq!(median(&[1, 3, 5, 9]), 4.0);
     assert_eq!(p90(&[]), 0);
     assert_eq!(p90(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]), 8);
+}
+
+#[test]
+fn review_qualification_requires_complete_anchored_findings() {
+    let valid = serde_json::json!({
+        "summary": "Retry boundary is off by one",
+        "findings": [{
+            "path": "src/retry.rs",
+            "line": 18,
+            "side": "RIGHT",
+            "severity": "medium",
+            "confidence": "high",
+            "title": "Retry limit permits one extra attempt",
+            "body": "The strict comparison retries after the configured attempt limit.",
+            "evidence": {
+                "preconditions": "attempts equals max_attempts",
+                "execution_path": "should_retry evaluates the changed comparison",
+                "consequence": "one extra retry is issued",
+                "introduction": "the boundary changed from >= to >",
+                "regression_test": "assert equality at the retry limit returns false"
+            }
+        }]
+    })
+    .to_string();
+    assert!(review_output_value(&valid).is_some());
+    assert!(review_output_has_finding(
+        &valid,
+        "src/retry.rs",
+        18,
+        &["retry", "attempt"]
+    ));
+
+    assert!(review_output_value(r#"{"summary":"bad","findings":[{}]}"#).is_none());
+    assert!(review_output_value(r#"{"summary":"bad","findings":[null]}"#).is_none());
+
+    let unrelated = serde_json::json!({
+        "summary": "Retry behavior and revocation were considered",
+        "findings": [{
+            "path": "src/unrelated.rs",
+            "line": 9,
+            "side": "RIGHT",
+            "severity": "low",
+            "confidence": "high",
+            "title": "Unrelated defect",
+            "body": "This finding concerns a different path.",
+            "evidence": {
+                "preconditions": "an unrelated state",
+                "execution_path": "an unrelated path",
+                "consequence": "an unrelated result",
+                "introduction": "an unrelated change",
+                "regression_test": "exercise the unrelated behavior"
+            }
+        }]
+    })
+    .to_string();
+    assert!(!review_output_has_finding(
+        &unrelated,
+        "src/retry.rs",
+        18,
+        &["retry", "attempt"]
+    ));
+}
+
+#[test]
+fn review_qualification_bounds_paid_replay_tasks() {
+    assert_eq!(review_replay_task_limit(None, 61).unwrap(), 61);
+    assert_eq!(review_replay_task_limit(Some("12"), 61).unwrap(), 12);
+    assert_eq!(
+        review_replay_task_limit(Some("128"), 200).unwrap(),
+        MAX_REVIEW_REPLAY_TASKS
+    );
+    assert!(review_replay_task_limit(None, MAX_REVIEW_REPLAY_TASKS + 1).is_err());
+    assert!(review_replay_task_limit(Some("0"), 61).is_err());
+    assert!(review_replay_task_limit(Some("129"), MAX_REVIEW_REPLAY_TASKS + 1).is_err());
+    assert!(review_replay_task_limit(Some("many"), 61).is_err());
 }
