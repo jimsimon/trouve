@@ -954,6 +954,7 @@ pub trait ToolExecutor: Send + Sync {
                     path: file.path,
                     diff: file.diff,
                     generated_header: None,
+                    linguist_generated: None,
                 })
                 .collect()
         })
@@ -1632,12 +1633,22 @@ pub struct ReviewDiffFileWithMetadata {
     /// snapshot. Raw patch text never populates this field, and deletions keep
     /// their full diff by leaving it absent.
     pub generated_header: Option<String>,
+    /// The `linguist-generated` gitattribute resolved from the current
+    /// snapshot: `Some(true)` when set, `Some(false)` when explicitly unset
+    /// or `false`, and `None` when unspecified, unavailable, or the path was
+    /// deleted. An explicit value overrides every generated-artifact
+    /// heuristic.
+    pub linguist_generated: Option<bool>,
 }
 
-pub(crate) fn is_conventional_generated_artifact_path(path: &str) -> bool {
+/// Dependency lockfiles are never summarized as generated artifacts by
+/// heuristic: they routinely carry generated markers, yet their content
+/// (resolved versions, checksums, registry URLs) is exactly what review must
+/// see. Only an explicit `linguist-generated` attribute overrides this.
+pub(crate) fn is_review_lockfile_path(path: &str) -> bool {
     let path = path.replace('\\', "/");
     let file_name = path.rsplit('/').next().unwrap_or(path.as_str());
-    if matches!(
+    matches!(
         file_name,
         "Cargo.lock"
             | "Gemfile.lock"
@@ -1651,28 +1662,7 @@ pub(crate) fn is_conventional_generated_artifact_path(path: &str) -> bool {
             | "poetry.lock"
             | "uv.lock"
             | "yarn.lock"
-    ) {
-        return false;
-    }
-    path.split('/').any(|component| {
-        matches!(
-            component,
-            "generated" | "snapshots" | "__snapshots__" | "__screenshots__"
-        )
-    }) || file_name.ends_with(".snap")
-        || file_name.ends_with(".min.js")
-        || file_name.ends_with(".min.css")
-        || [
-            ".js.map",
-            ".mjs.map",
-            ".cjs.map",
-            ".css.map",
-            ".d.ts.map",
-            ".d.mts.map",
-            ".d.cts.map",
-        ]
-        .iter()
-        .any(|suffix| file_name.ends_with(suffix))
+    )
 }
 
 fn split_review_diff_files(
@@ -3424,7 +3414,7 @@ impl ToolExecutor for LocalToolExecutor {
                 &base_sha,
                 max_bytes,
                 &cancel,
-                is_conventional_generated_artifact_path,
+                |path| !is_review_lockfile_path(path),
             )
             .map(|files| {
                 files
@@ -3433,6 +3423,7 @@ impl ToolExecutor for LocalToolExecutor {
                         path: file.path,
                         diff: file.diff,
                         generated_header: file.generated_header,
+                        linguist_generated: file.linguist_generated,
                     })
                     .collect()
             })
@@ -3750,7 +3741,7 @@ mod tests {
     }
 
     #[test]
-    fn generated_artifact_paths_exclude_lockfiles_and_unrelated_map_files() {
+    fn review_lockfile_paths_match_by_file_name_only() {
         for lockfile in [
             "Cargo.lock",
             "Gemfile.lock",
@@ -3765,27 +3756,13 @@ mod tests {
             "uv.lock",
             "yarn.lock",
         ] {
-            assert!(!is_conventional_generated_artifact_path(&format!(
-                "generated/{lockfile}"
-            )));
+            assert!(is_review_lockfile_path(lockfile));
+            assert!(is_review_lockfile_path(&format!("generated/{lockfile}")));
+            assert!(is_review_lockfile_path(&format!("web\\app\\{lockfile}")));
         }
-        for source_map in [
-            "assets/app.js.map",
-            "assets/app.mjs.map",
-            "assets/app.cjs.map",
-            "assets/app.css.map",
-            "assets/app.d.ts.map",
-            "assets/app.d.mts.map",
-            "assets/app.d.cts.map",
-        ] {
-            assert!(is_conventional_generated_artifact_path(source_map));
-        }
-        assert!(!is_conventional_generated_artifact_path(
-            "assets/regions.map"
-        ));
-        assert!(is_conventional_generated_artifact_path(
-            "generated/client.rs"
-        ));
+        assert!(!is_review_lockfile_path("generated/client.rs"));
+        assert!(!is_review_lockfile_path("Cargo.lock.bak"));
+        assert!(!is_review_lockfile_path("docs/package-lock.json.md"));
     }
 
     #[test]

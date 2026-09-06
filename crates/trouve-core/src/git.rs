@@ -2584,6 +2584,99 @@ pub struct SessionReviewDiffFile {
     /// file. Deleted files intentionally leave this absent so their diffs stay
     /// visible.
     pub generated_header: Option<String>,
+    /// The `linguist-generated` gitattribute for the snapshot-side file:
+    /// `Some(true)` when set or `true`, `Some(false)` when unset or `false`,
+    /// `None` when unspecified. Deleted files and lookup failures leave this
+    /// absent so their diffs stay visible.
+    pub linguist_generated: Option<bool>,
+}
+
+/// Resolve the `linguist-generated` attribute for `paths` against the snapshot
+/// index (`.gitattributes` as checked in, plus repository-local and global
+/// attribute files). Returns only paths with an explicit value; a failed
+/// lookup yields an empty map so every diff stays reviewable.
+fn review_linguist_generated_attributes(
+    worktree: &Path,
+    paths: &[&str],
+    index: &TemporaryCheckpointIndex,
+    operation: &GitOperation<'_>,
+) -> Result<HashMap<String, bool>> {
+    // `git check-attr -z` emits path<NUL>attribute<NUL>value<NUL> per path.
+    const RECORD_OVERHEAD: usize = "linguist-generated".len() + "unspecified".len() + 3;
+    let mut attributes = HashMap::new();
+    if paths.is_empty() {
+        return Ok(attributes);
+    }
+    let mut input = Vec::new();
+    for path in paths {
+        input.extend_from_slice(path.as_bytes());
+        input.push(0);
+    }
+    let max_stdout = paths
+        .iter()
+        .fold(0_usize, |total, path| {
+            total.saturating_add(path.len().saturating_add(RECORD_OVERHEAD))
+        })
+        .saturating_add(1);
+    let output = match run_git_bounded_with_status(
+        worktree,
+        Some(index),
+        &[
+            "check-attr",
+            "--cached",
+            "-z",
+            "--stdin",
+            "linguist-generated",
+        ],
+        Some(GitCommandInput::Bytes(input)),
+        max_stdout,
+        operation,
+    ) {
+        Ok(output) if output.status.success() && !output.stdout.truncated => output.stdout,
+        Ok(_) => {
+            operation.check_cancelled()?;
+            return Ok(attributes);
+        }
+        Err(error) => {
+            // Attribute lookup is optional after patches are loaded; only
+            // explicit caller cancellation aborts the completed operation.
+            operation.check_cancelled()?;
+            tracing::debug!(%error, "review linguist-generated attribute lookup failed");
+            return Ok(attributes);
+        }
+    };
+    let mut fields = output.bytes.split(|byte| *byte == 0);
+    while let (Some(path), Some(_attribute), Some(value)) =
+        (fields.next(), fields.next(), fields.next())
+    {
+        let Ok(path) = std::str::from_utf8(path) else {
+            continue;
+        };
+        if !paths.contains(&path) {
+            continue;
+        }
+        let generated = match value {
+            b"set" | b"true" => true,
+            b"unset" | b"false" => false,
+            _ => continue,
+        };
+        attributes.insert(path.to_owned(), generated);
+    }
+    Ok(attributes)
+}
+
+/// Whether one rename-aware review patch removes its path from the snapshot.
+/// A type change renders as a deletion segment followed by an addition, so
+/// only a patch whose every segment is a deletion counts.
+fn review_patch_deletes_path(diff: &str) -> bool {
+    !diff.is_empty()
+        && diff.split("\ndiff --git ").all(|segment| {
+            segment
+                .lines()
+                .skip(1)
+                .take(3)
+                .any(|line| line.starts_with("deleted file mode "))
+        })
 }
 
 fn parse_review_marker_output(
@@ -3085,6 +3178,7 @@ where
                     path,
                     diff: diff[range[0]..range[1]].to_owned(),
                     generated_header: None,
+                    linguist_generated: None,
                 });
             }
         }
@@ -3094,8 +3188,19 @@ where
             .map(|file| file.path.as_str())
             .collect::<Vec<_>>();
         let mut headers = review_blob_headers(worktree, &current, index, &operation)?;
+        // Attributes cover every surviving path, not only the header-eligible
+        // ones: an explicit `linguist-generated` value must be able to override
+        // the heuristics either way.
+        let surviving = patches
+            .iter()
+            .filter(|file| !review_patch_deletes_path(&file.diff))
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>();
+        let mut attributes =
+            review_linguist_generated_attributes(worktree, &surviving, index, &operation)?;
         for file in &mut patches {
             file.generated_header = headers.remove(&file.path);
+            file.linguist_generated = attributes.remove(&file.path);
         }
         Ok(patches)
     })
@@ -4648,6 +4753,78 @@ line three
         );
         assert!(deleted.generated_header.is_none());
         assert!(deleted.diff.contains("Generated by"));
+    }
+
+    #[test]
+    fn review_diff_resolves_linguist_generated_attributes_from_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo(tmp.path());
+        let data = tmp.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        for name in [
+            "snapshot.json",
+            "opted-out.json",
+            "plain.json",
+            "deleted.json",
+        ] {
+            std::fs::write(data.join(name), "{\"old\":true}\n").unwrap();
+        }
+        run(tmp.path(), &["add", "data"]);
+        run(tmp.path(), &["commit", "-m", "add data"]);
+        let base = run(tmp.path(), &["rev-parse", "HEAD"]);
+
+        // The attributes file is part of the reviewed snapshot itself, so a
+        // pull request may introduce it alongside the artifact it describes.
+        std::fs::write(
+            tmp.path().join(".gitattributes"),
+            "data/snapshot.json linguist-generated=true\n\
+             data/deleted.json linguist-generated\n\
+             data/opted-out.json -linguist-generated\n",
+        )
+        .unwrap();
+        for name in ["snapshot.json", "opted-out.json", "plain.json"] {
+            std::fs::write(data.join(name), "{\"new\":true}\n").unwrap();
+        }
+        std::fs::remove_file(data.join("deleted.json")).unwrap();
+
+        let files = session_diff_patches_cancellable(
+            tmp.path(),
+            &base,
+            1024 * 1024,
+            &tokio_util::sync::CancellationToken::new(),
+            |_| true,
+        )
+        .unwrap();
+        let attribute = |path: &str| {
+            files
+                .iter()
+                .find(|file| file.path == path)
+                .unwrap_or_else(|| panic!("{path} missing from review diff"))
+                .linguist_generated
+        };
+
+        assert_eq!(attribute("data/snapshot.json"), Some(true));
+        assert_eq!(attribute("data/opted-out.json"), Some(false));
+        assert_eq!(attribute("data/plain.json"), None);
+        assert_eq!(attribute(".gitattributes"), None);
+        // Deletions keep their diff visible regardless of attributes.
+        assert_eq!(attribute("data/deleted.json"), None);
+    }
+
+    #[test]
+    fn review_patch_deletion_detection_requires_every_segment_to_delete() {
+        assert!(review_patch_deletes_path(
+            "diff --git a/x b/x\ndeleted file mode 100644\nindex 1..0\n--- a/x\n+++ /dev/null\n"
+        ));
+        assert!(!review_patch_deletes_path(
+            "diff --git a/x b/x\nindex 1..2 100644\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-deleted file mode 100644\n+kept\n"
+        ));
+        // A type change renders as deletion + addition of the same path.
+        assert!(!review_patch_deletes_path(
+            "diff --git a/x b/x\ndeleted file mode 120000\n--- a/x\n+++ /dev/null\n\
+             diff --git a/x b/x\nnew file mode 100644\n--- /dev/null\n+++ b/x\n"
+        ));
+        assert!(!review_patch_deletes_path(""));
     }
 
     #[test]
