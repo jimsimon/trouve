@@ -360,7 +360,14 @@ pub use requests::*;
 // Cursor's managed artifact is its standalone Agent SDK Bridge.
 // 8.3: CLI install status can expose a non-fatal durability warning after an
 // atomically committed runtime activation (additive).
-pub const PROTOCOL_VERSION: &str = "8.3";
+// 9.0: asynchronous provider-backed session/thread naming replaces the
+// dedicated local title model, heuristic titles, pre-creation title-derived
+// branches, and the session-title endpoint; model catalogs advertise image
+// input support so naming-model selection can identify text-only models
+// (breaking).
+// 9.1: sessions and threads can request transcript-derived title suggestions
+// for manual rename recovery (additive).
+pub const PROTOCOL_VERSION: &str = "9.1";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";
 pub const ERROR_CODE_GITHUB_REAUTHENTICATION_REQUIRED: &str = "github_reauthentication_required";

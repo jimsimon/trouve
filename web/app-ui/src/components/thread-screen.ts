@@ -3,6 +3,7 @@ import { html, LitElement, nothing, type PropertyValues } from "lit";
 import { live } from "lit/directives/live.js";
 import { repeat } from "lit/directives/repeat.js";
 
+import { NEW_THREAD_TITLE_FALLBACK } from "../app/new-session-model.js";
 import {
   appServicesContext,
   appStoreContext,
@@ -231,7 +232,7 @@ const CHAT_HISTORY_STATUS_DELAY_MS = 180;
 const CHAT_HISTORY_RETRY_DELAY_MS = 1_500;
 // Title generation is optional metadata and must not make thread creation
 // appear hung when the naming provider is slow or unavailable.
-const THREAD_TITLE_TIMEOUT_MS = 2_000;
+const THREAD_TITLE_TIMEOUT_MS = 48_000;
 
 const sameVirtualRenderWindow = (
   left: VirtualWindow<VirtualChatItem>,
@@ -264,6 +265,12 @@ interface MarkdownContextMenu {
   readonly markdown: string;
   readonly selection: string;
   readonly selectionRanges: readonly Range[];
+  readonly x: number;
+  readonly y: number;
+}
+
+interface ThreadTabContextMenu {
+  readonly threadId: string;
   readonly x: number;
   readonly y: number;
 }
@@ -520,6 +527,12 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   #threadTabResizeObserver: ResizeObserver | undefined;
   #observedThreadTabs: HTMLElement | undefined;
   #pendingThreadTabFocus = "";
+  #threadTabContextMenu: ThreadTabContextMenu | undefined;
+  #renamingThreadId = "";
+  #threadRenameTitle = "";
+  #threadRenameBusy = false;
+  #threadRenameGenerating = false;
+  #threadRenameError = "";
   #chatFindOpen = false;
   #chatFindQuery = "";
   #chatFindCaseSensitive = false;
@@ -573,6 +586,10 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     if (changed.has("sessionId")) {
       this.#newThreadRequest = undefined;
       this.#threadSwitcherOpen = false;
+      this.#threadTabContextMenu = undefined;
+      this.#renamingThreadId = "";
+      this.#threadRenameTitle = "";
+      this.#threadRenameError = "";
       this.#threadSwitcherQuery = "";
       this.#threadSwitcherFilter = "all";
       this.#recentThreadIds = [];
@@ -759,6 +776,15 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         tab.focus();
       }
     }
+    const renameDialog = this.querySelector<HTMLDialogElement>(".thread-rename-modal");
+    if (this.#renamingThreadId !== "" && renameDialog !== null && !renameDialog.open) {
+      try {
+        renameDialog.showModal();
+      } catch {
+        renameDialog.show();
+      }
+      renameDialog.querySelector<HTMLInputElement>('input[name="title"]')?.select();
+    }
     if (this.#restoreComposerSelection) {
       const textarea = this.querySelector<HTMLTextAreaElement>('textarea[name="message"]');
       if (textarea !== null) {
@@ -931,6 +957,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     document.addEventListener("keydown", this.#dismissMarkdownContextMenuFromKeyboard, true);
     document.addEventListener("keydown", this.#chatFindGlobalKeydown, true);
     document.addEventListener("pointerdown", this.#dismissThreadSwitcherFromPointer, true);
+    document.addEventListener("pointerdown", this.#dismissThreadTabContextMenuFromPointer, true);
     document.addEventListener("scroll", this.#dismissMarkdownContextMenu, true);
     globalThis.addEventListener("resize", this.#dismissMarkdownContextMenu);
     globalThis.addEventListener("pagehide", this.#persistComposerDraftFromPageHide);
@@ -948,6 +975,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     document.removeEventListener("keydown", this.#dismissMarkdownContextMenuFromKeyboard, true);
     document.removeEventListener("keydown", this.#chatFindGlobalKeydown, true);
     document.removeEventListener("pointerdown", this.#dismissThreadSwitcherFromPointer, true);
+    document.removeEventListener("pointerdown", this.#dismissThreadTabContextMenuFromPointer, true);
     document.removeEventListener("scroll", this.#dismissMarkdownContextMenu, true);
     globalThis.removeEventListener("resize", this.#dismissMarkdownContextMenu);
     globalThis.removeEventListener("pagehide", this.#persistComposerDraftFromPageHide);
@@ -992,6 +1020,8 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     this.#markdownContextMenu = undefined;
     this.#pendingMarkdownContextSelection = undefined;
     this.#markdownContextMenuReturnFocus = undefined;
+    this.#threadTabContextMenu = undefined;
+    this.#renamingThreadId = "";
     super.disconnectedCallback();
   }
 
@@ -1309,6 +1339,213 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     }
   }
 
+  #threadTabKeydown(
+    event: KeyboardEvent,
+    currentIndex: number,
+    threads: readonly { readonly id: string }[],
+    newThreadSetupOpen: boolean,
+    threadId: string,
+  ): void {
+    if (event.key === "ContextMenu" || (event.shiftKey && event.key === "F10")) {
+      this.#openThreadTabContextMenu(event, threadId);
+      return;
+    }
+    this.#selectThreadWithKeyboard(event, currentIndex, threads, newThreadSetupOpen);
+  }
+
+  #openThreadTabContextMenu(event: MouseEvent | KeyboardEvent, threadId: string): void {
+    event.preventDefault();
+    event.stopPropagation();
+    const target = event.currentTarget as HTMLElement;
+    const bounds = target.getBoundingClientRect();
+    const pointerEvent = event instanceof MouseEvent ? event : undefined;
+    const pointerX = pointerEvent !== undefined && pointerEvent.clientX > 0
+      ? pointerEvent.clientX
+      : bounds.left + 12;
+    const pointerY = pointerEvent !== undefined && pointerEvent.clientY > 0
+      ? pointerEvent.clientY
+      : bounds.bottom;
+    this.#threadTabContextMenu = {
+      threadId,
+      x: Math.max(4, Math.min(pointerX, globalThis.innerWidth - 158)),
+      y: Math.max(4, Math.min(pointerY, globalThis.innerHeight - 82)),
+    };
+    this.#threadSwitcherOpen = false;
+    this.requestUpdate();
+    void this.updateComplete.then(() => {
+      this.querySelector<HTMLButtonElement>(".thread-tab-context-menu [role='menuitem']")
+        ?.focus();
+    });
+  }
+
+  readonly #dismissThreadTabContextMenuFromPointer = (event: PointerEvent): void => {
+    if (this.#threadTabContextMenu === undefined) return;
+    const target = event.target;
+    if (
+      target instanceof Element
+      && target.closest(".thread-tab-context-menu") !== null
+    ) return;
+    this.#threadTabContextMenu = undefined;
+    this.requestUpdate();
+  };
+
+  #threadTabContextMenuKeydown(event: KeyboardEvent): void {
+    const items = [...(event.currentTarget as HTMLElement)
+      .querySelectorAll<HTMLButtonElement>("[role='menuitem']:not(:disabled)")];
+    const current = items.indexOf(document.activeElement as HTMLButtonElement);
+    let next: number | undefined;
+    if (event.key === "ArrowDown") next = (current + 1) % items.length;
+    else if (event.key === "ArrowUp") next = (current - 1 + items.length) % items.length;
+    else if (event.key === "Home") next = 0;
+    else if (event.key === "End") next = items.length - 1;
+    else if (event.key === "Escape") {
+      event.preventDefault();
+      const threadId = this.#threadTabContextMenu?.threadId;
+      this.#threadTabContextMenu = undefined;
+      this.requestUpdate();
+      if (threadId !== undefined) {
+        void this.updateComplete.then(() => {
+          this.querySelector<HTMLButtonElement>(`[data-thread-tab-id="${CSS.escape(threadId)}"]`)
+            ?.focus();
+        });
+      }
+      return;
+    }
+    if (next === undefined || items.length === 0) return;
+    event.preventDefault();
+    items[next]?.focus();
+  }
+
+  #renderThreadTabContextMenu() {
+    const menu = this.#threadTabContextMenu;
+    if (menu === undefined || this.#renamingThreadId !== "") return nothing;
+    const thread = this.#store.value?.thread(menu.threadId);
+    if (thread === undefined) return nothing;
+    return html`
+      <div
+        class="thread-tab-context-menu"
+        role="menu"
+        aria-label=${`Actions for ${thread.title}`}
+        style=${`left:${menu.x}px;top:${menu.y}px`}
+        @contextmenu=${(event: Event) => event.preventDefault()}
+        @keydown=${this.#threadTabContextMenuKeydown}
+      >
+        <button type="button" role="menuitem" @click=${() => this.#startThreadRename(thread.id)}>Rename</button>
+        <button type="button" role="menuitem" @click=${() => {
+          this.#threadTabContextMenu = undefined;
+          this.#closeThreadTabById(thread.id);
+        }}>Close</button>
+      </div>
+    `;
+  }
+
+  #startThreadRename(threadId: string): void {
+    const thread = this.#store.value?.thread(threadId);
+    if (thread === undefined) return;
+    this.#threadTabContextMenu = undefined;
+    this.#renamingThreadId = threadId;
+    this.#threadRenameTitle = thread.title?.trim() || "New Thread";
+    this.#threadRenameError = "";
+    this.requestUpdate();
+  }
+
+  #renderThreadRenameDialog() {
+    if (this.#renamingThreadId === "") return nothing;
+    return html`
+      <dialog
+        class="session-modal thread-rename-modal"
+        aria-labelledby="thread-rename-title"
+        @cancel=${(event: Event) => {
+          event.preventDefault();
+          this.#closeThreadRenameDialog();
+        }}
+      >
+        <form class="session-modal-layout" @submit=${this.#renameThread}>
+          <h2 id="thread-rename-title">Rename thread</h2>
+          <label class="visually-hidden" for="thread-rename-input">Thread title</label>
+          <input
+            id="thread-rename-input"
+            name="title"
+            .value=${this.#threadRenameTitle}
+            @input=${(event: InputEvent) => {
+              this.#threadRenameTitle = (event.currentTarget as HTMLInputElement).value;
+            }}
+            maxlength="200"
+            placeholder="Thread title"
+            required
+          />
+          ${this.#threadRenameError === ""
+            ? nothing
+            : html`<p class="dialog-error" role="alert">${this.#threadRenameError}</p>`}
+          <footer>
+            <button type="button" @click=${this.#closeThreadRenameDialog}>Cancel</button>
+            <button type="button" ?disabled=${this.#threadRenameBusy || this.#threadRenameGenerating} @click=${() => void this.#generateThreadRename()}>${this.#threadRenameGenerating ? "Generating…" : "Generate"}</button>
+            <button class="primary" type="submit" ?disabled=${this.#threadRenameBusy}>Rename</button>
+          </footer>
+        </form>
+      </dialog>
+    `;
+  }
+
+  readonly #closeThreadRenameDialog = (): void => {
+    if (this.#threadRenameBusy) return;
+    this.#renamingThreadId = "";
+    this.#threadRenameTitle = "";
+    this.#threadRenameError = "";
+    this.requestUpdate();
+  };
+
+  readonly #renameThread = async (event: SubmitEvent): Promise<void> => {
+    event.preventDefault();
+    const services = this.#services.value;
+    const store = this.#store.value;
+    const threadId = this.#renamingThreadId;
+    const title = this.#threadRenameTitle.trim();
+    if (services === undefined || store === undefined || threadId === "" || title === "") return;
+    this.#threadRenameBusy = true;
+    this.#threadRenameError = "";
+    this.requestUpdate();
+    try {
+      const updated = await services.protocol.updateThread(threadId, { title });
+      if (this.#renamingThreadId !== threadId) return;
+      store.upsertThread(updated);
+      this.#renamingThreadId = "";
+      this.#threadRenameTitle = "";
+    } catch {
+      if (this.#renamingThreadId === threadId) {
+        this.#threadRenameError = "Thread could not be renamed.";
+      }
+    } finally {
+      this.#threadRenameBusy = false;
+      this.requestUpdate();
+    }
+  };
+
+  async #generateThreadRename(): Promise<void> {
+    const services = this.#services.value;
+    const threadId = this.#renamingThreadId;
+    if (services === undefined || threadId === "" || this.#threadRenameGenerating) return;
+    const startingTitle = this.#threadRenameTitle;
+    this.#threadRenameGenerating = true;
+    this.#threadRenameError = "";
+    this.requestUpdate();
+    try {
+      const suggestion = await services.protocol.generateThreadTitleSuggestion(threadId);
+      if (
+        this.#renamingThreadId === threadId
+        && this.#threadRenameTitle === startingTitle
+      ) this.#threadRenameTitle = suggestion.title.trim();
+    } catch {
+      if (this.#renamingThreadId === threadId) {
+        this.#threadRenameError =
+          "A title could not be generated. You can still enter one manually.";
+      }
+    } finally {
+      this.#threadRenameGenerating = false;
+      this.requestUpdate();
+    }
+  }
+
   #observeThreadWorkingSet(): void {
     const tabs = this.querySelector<HTMLElement>(".thread-tabs");
     if (tabs === null || tabs === this.#observedThreadTabs) return;
@@ -1490,25 +1727,35 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       index: number,
     ) => {
       const label = labelForThread(candidate);
+      const titleGenerating = store.isThreadTitleGenerating(candidate.id)
+        || (candidate.id === initialThreadId && store.isSessionTitleGenerating(this.sessionId));
       const indicator = sessionIndicatorPresentation(
         store.threadIndicatorState(candidate.id),
       );
       const statusLabel = indicator.tooltip
         || (indicator.kind === "busy" ? "Processing" : "");
+      const accessibleLabel = titleGenerating
+        ? "Naming thread…"
+        : statusLabel === "" ? label : `${label}, ${statusLabel}`;
       return html`
-        <span class="thread-tab-item" role="presentation">
+        <span class="thread-tab-item" role="presentation" @contextmenu=${(event: MouseEvent) => this.#openThreadTabContextMenu(event, candidate.id)}>
           <button
             class="thread-tab-main"
             type="button"
             role="tab"
             aria-keyshortcuts="Delete"
-            aria-label=${statusLabel === "" ? label : `${label}, ${statusLabel}`}
-            title=${label}
+            aria-label=${accessibleLabel}
+            title=${titleGenerating ? "Naming thread…" : label}
             data-thread-tab-id=${candidate.id}
             aria-selected=${!newThreadSetupOpen && candidate.id === this.threadId ? "true" : "false"}
             tabindex=${rovingTabIndex(index, selectedTabIndex, threadTabCount)}
-            @keydown=${(event: KeyboardEvent) =>
-              this.#selectThreadWithKeyboard(event, index, workingThreads, newThreadSetupOpen)}
+            @keydown=${(event: KeyboardEvent) => this.#threadTabKeydown(
+              event,
+              index,
+              workingThreads,
+              newThreadSetupOpen,
+              candidate.id,
+            )}
             @click=${() => this.#selectThread(candidate.id)}
           >
             <span class="thread-tab-label"><span
@@ -1521,7 +1768,9 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
               ? fontAwesomeIcon("code-branch")
               : nothing}${pinnedThreadTabs.has(candidate.id)
               ? fontAwesomeIcon("thumbtack", { className: "thread-tab-pin" })
-              : nothing}<span class="thread-tab-title">${label}</span></span>
+              : nothing}<span class="thread-tab-title">${titleGenerating
+                ? html`<span class="naming-title-shimmer thread-title-shimmer" aria-hidden="true"></span><span class="visually-hidden">Naming thread…</span>`
+                : label}</span></span>
             ${threadTodoProgress(candidate.todos) === ""
               ? nothing
               : html`<span class="thread-todo-progress">${threadTodoProgress(candidate.todos)}</span>`}
@@ -2183,6 +2432,8 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       `}
       `}
       ${this.#renderMarkdownContextMenu()}
+      ${this.#renderThreadTabContextMenu()}
+      ${this.#renderThreadRenameDialog()}
       <span class="visually-hidden" role="status" aria-live="polite">
         ${this.#markdownContextMenuStatus}
       </span>
@@ -6003,27 +6254,11 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     this.requestUpdate();
     let createdThreadId: string | undefined;
     try {
-      let request = event.detail.request;
+      const request = {
+        ...event.detail.request,
+        title: NEW_THREAD_TITLE_FALLBACK,
+      };
       const prompt = event.detail.initialMessage?.content.trim() ?? "";
-      if (prompt !== "") {
-        const abort = new AbortController();
-        const timeout = globalThis.setTimeout(() => abort.abort(), THREAD_TITLE_TIMEOUT_MS);
-        try {
-          const generated = await services.protocol.generateSessionTitle(prompt, {
-            signal: abort.signal,
-          });
-          if (!this.#isCurrentNewThreadRequest(token)) return;
-          if (generated.title.trim() !== "") {
-            request = { ...request, title: generated.title.trim() };
-          }
-        } catch {
-          if (!this.#isCurrentNewThreadRequest(token)) return;
-          // The request already carries the same bounded prompt fallback used
-          // when session-title generation is unavailable.
-        } finally {
-          globalThis.clearTimeout(timeout);
-        }
-      }
       if (!this.#isCurrentNewThreadRequest(token)) return;
       const thread = await services.protocol.createThread(request);
       if (!this.#isCurrentNewThreadRequest(token)) return;
@@ -6043,6 +6278,34 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         if (!this.#isCurrentNewThreadRequest(token)) return;
         await services.protocol.sendMessage(thread.id, event.detail.initialMessage);
         if (!this.#isCurrentNewThreadRequest(token)) return;
+      }
+      if (
+        prompt !== ""
+        || (event.detail.initialMessage?.attachments?.length ?? 0) > 0
+      ) {
+        void (async () => {
+          const abort = new AbortController();
+          const timeout = globalThis.setTimeout(() => abort.abort(), THREAD_TITLE_TIMEOUT_MS);
+          try {
+            const generated = await services.protocol.generateTitle(
+              token.sessionId,
+              prompt,
+              event.detail.initialMessage?.attachments ?? [],
+              { signal: abort.signal },
+            );
+            const title = generated.title.trim();
+            if (title === "" || title === NEW_THREAD_TITLE_FALLBACK) return;
+            const renamed = await services.protocol.updateThread(thread.id, {
+              title,
+              expected_title: NEW_THREAD_TITLE_FALLBACK,
+            });
+            store.upsertThread(renamed);
+          } catch {
+            // Naming is cosmetic; preserve the placeholder or a user rename.
+          } finally {
+            globalThis.clearTimeout(timeout);
+          }
+        })();
       }
     } catch {
       if (!this.#isCurrentNewThreadRequest(token)) return;

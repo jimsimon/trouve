@@ -80,15 +80,8 @@ const installFixtureEventSource = async (page: Page): Promise<void> => {
 
 const installProtocolFixtures = async (page: Page): Promise<void> => {
   let namingSettings = {
+    model: "test/tiny",
     derive_branch_name_from_session_title: false,
-    title_model_load_behavior: "auto",
-    title_model_resource_policy: "cpu_ram_only",
-    title_model: {
-      state: "not_installed",
-      detail: "Built-in naming rules are active.",
-      runtime_installed: false,
-      model_downloaded: false,
-    },
   };
   await page.route("**/v1/**", async (route) => {
     const request = route.request();
@@ -133,7 +126,13 @@ const installProtocolFixtures = async (page: Page): Promise<void> => {
         default_thinking_level: null,
         providers: [],
       },
-      "GET /v1/models": [],
+      "GET /v1/models": [{
+        id: "test/tiny",
+        display_name: "Tiny",
+        context_window: 32_000,
+        supports_tools: true,
+        options_schema: {},
+      }],
       "GET /v1/personas": [
         {
           id: "code",
@@ -209,14 +208,14 @@ const installProtocolFixtures = async (page: Page): Promise<void> => {
       await route.fulfill({ status: 204 });
       return;
     }
-    if (key === "GET /v1/config/git-worktrees") {
+    if (key === "GET /v1/config/session-naming") {
       await route.fulfill({
         headers: { "x-trouve-event-cursor": "6" },
         json: namingSettings,
       });
       return;
     }
-    if (key === "PUT /v1/config/git-worktrees") {
+    if (key === "PUT /v1/config/session-naming") {
       const update = request.postDataJSON() as Partial<typeof namingSettings>;
       namingSettings = { ...namingSettings, ...update };
       await route.fulfill({
@@ -704,8 +703,10 @@ test("Sessions & Chat settings preserve grouping and branch-naming choices", asy
     .toBeVisible();
   const branchNames = page.getByLabel("Use session names in branch names");
   await expect(branchNames).not.toBeChecked();
-  await expect(page.getByText(/new branches use a compact name such as trouve\/abc123/u))
-    .toBeVisible();
+  await expect(page.getByText(
+    "The compact branch is renamed after background naming completes. Existing remote branches are not renamed.",
+    { exact: true },
+  )).toBeVisible();
   const sequentialToggle = page.getByLabel("Collapse sequential tool calls.");
   await expect(sequentialToggle).toBeChecked();
   const toggle = page.getByLabel("Collapse thinking output with tool calls.");
@@ -746,10 +747,13 @@ test("Sessions & Chat settings preserve grouping and branch-naming choices", asy
   await expect(todoToggle).toBeChecked();
   const branchUpdate = page.waitForRequest((request) =>
     request.method() === "PUT" &&
-    new URL(request.url()).pathname === "/v1/config/git-worktrees"
+    new URL(request.url()).pathname === "/v1/config/session-naming"
   );
   await branchNames.click();
   await expect(branchNames).toBeChecked();
+  await page.locator("trouve-session-naming-settings")
+    .getByRole("button", { name: "Save", exact: true })
+    .click();
   await expect((await branchUpdate).postDataJSON()).toMatchObject({
     derive_branch_name_from_session_title: true,
   });
@@ -768,6 +772,21 @@ test("Sessions & Chat settings preserve grouping and branch-naming choices", asy
   await expect(page.getByLabel("Collapse context compaction with tool calls.")).toBeChecked();
   await expect(page.getByLabel("Collapse TODO updates with tool calls.")).toBeChecked();
   await expect(page.getByLabel("Use session names in branch names")).toBeChecked();
+});
+test("Session naming directs an empty model catalog to provider setup", async ({ page }) => {
+  await page.route("**/v1/models", async (route) => {
+    await route.fulfill({ json: [] });
+  });
+  await page.goto("/settings/chat");
+
+  await expect(page.getByText(
+    "No models are available. Add a provider to choose a naming model.",
+    { exact: true },
+  )).toBeVisible();
+  await page.getByRole("button", { name: "Add provider", exact: true }).click();
+
+  await expect(page).toHaveURL(/\/settings\/providers$/u);
+  await expect(page.getByRole("heading", { name: "Providers", exact: true })).toBeVisible();
 });
 
 test("Settings reopens the last screen until the app restarts", async ({ page }) => {

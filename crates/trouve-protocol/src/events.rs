@@ -651,13 +651,16 @@ pub enum Event {
     /// state for initial fetches.
     #[serde(rename = "server.connectivity_changed")]
     ConnectivityChanged { online: bool },
-    /// The persisted session-naming settings or the session-title model's
-    /// install/load state changed. Carries a full replacement snapshot so
-    /// replay and reconnect reconstruct the settings UI exactly.
-    #[serde(rename = "settings.git_worktrees_updated")]
-    GitWorktreeSettingsUpdated {
-        settings: crate::GitWorktreeSettings,
+    /// The configured model used for asynchronous session and thread naming changed.
+    /// Carries a full replacement snapshot for replay and reconnect.
+    #[serde(rename = "settings.session_naming_updated")]
+    SessionNamingSettingsUpdated {
+        settings: crate::SessionNamingSettings,
     },
+    /// Legacy protocol 8.1-and-earlier naming lifecycle snapshot. Retained only
+    /// so existing durable event logs remain decodable after upgrading.
+    #[serde(rename = "settings.git_worktrees_updated")]
+    LegacyGitWorktreeSettingsUpdated { settings: serde_json::Value },
     /// The persisted automated code-review execution deadlines changed.
     /// Carries a full replacement snapshot for replay and reconnect.
     #[serde(rename = "settings.code_review_updated")]
@@ -793,34 +796,39 @@ mod tests {
     }
 
     #[test]
-    fn git_worktree_settings_event_uses_namespaced_tag() {
-        let event = Event::GitWorktreeSettingsUpdated {
-            settings: crate::GitWorktreeSettings {
+    fn session_naming_settings_event_uses_namespaced_tag() {
+        let event = Event::SessionNamingSettingsUpdated {
+            settings: crate::SessionNamingSettings {
+                model: "openai/gpt-5-mini".into(),
                 derive_branch_name_from_session_title: false,
-                title_model_load_behavior: crate::TitleModelLoadBehavior::Off,
-                title_model_resource_policy: crate::TitleModelResourcePolicy::CpuRamOnly,
-                title_model: crate::TitleModelStatus {
-                    state: "stopped".into(),
-                    detail: "Built-in naming heuristics are active.".into(),
-                    runtime_installed: false,
-                    model_downloaded: false,
-                    install_stage: String::new(),
-                    install_bytes: 0,
-                    install_total: 0,
-                },
             },
         };
         let value = serde_json::to_value(event).unwrap();
-        assert_eq!(value["type"], "settings.git_worktrees_updated");
-        assert_eq!(
-            value["settings"]["derive_branch_name_from_session_title"],
-            false
-        );
-        assert_eq!(value["settings"]["title_model_load_behavior"], "off");
-        assert_eq!(
-            value["settings"]["title_model_resource_policy"],
-            "cpu_ram_only"
-        );
+        assert_eq!(value["type"], "settings.session_naming_updated");
+        assert_eq!(value["settings"]["model"], "openai/gpt-5-mini");
+    }
+
+    #[test]
+    fn legacy_git_worktree_settings_events_remain_decodable() {
+        let event: Event = serde_json::from_value(serde_json::json!({
+            "type": "settings.git_worktrees_updated",
+            "settings": {
+                "derive_branch_name_from_session_title": false,
+                "title_model_load_behavior": "auto",
+                "title_model_resource_policy": "cpu_ram_only",
+                "title_model": {
+                    "state": "ready",
+                    "runtime_installed": true,
+                    "model_downloaded": true
+                }
+            }
+        }))
+        .unwrap();
+        assert!(matches!(
+            event,
+            Event::LegacyGitWorktreeSettingsUpdated { settings }
+                if settings["title_model"]["state"] == "ready"
+        ));
     }
 
     #[test]

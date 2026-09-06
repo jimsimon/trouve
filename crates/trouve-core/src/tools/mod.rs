@@ -972,6 +972,9 @@ pub trait ToolExecutor: Send + Sync {
     ) -> Result<String, String> {
         Err("session branch push is unavailable in this executor".into())
     }
+    async fn rename_session_branch(&self, _request: &SessionBranchRename) -> Result<(), String> {
+        Err("session branch rename is unavailable in this executor".into())
+    }
     /// Atomically reserve and create a session worktree. The returned receipt
     /// is opaque outside the executor and is required for finalize/rollback.
     async fn create_session_worktree(
@@ -1105,6 +1108,13 @@ pub struct SessionRepositoryPush {
     pub requested_base: Option<String>,
     pub branch: String,
     pub cancel: tokio_util::sync::CancellationToken,
+}
+
+pub struct SessionBranchRename {
+    pub managed_root: PathBuf,
+    pub worktree: PathBuf,
+    pub old_branch: String,
+    pub new_branch: String,
 }
 
 /// One attachment selected from durable metadata for trusted verification and
@@ -3455,6 +3465,18 @@ impl ToolExecutor for LocalToolExecutor {
         })
         .await
         .map_err(|error| format!("session branch push task failed: {error}"))?
+        .map_err(|error| error.to_string())
+    }
+
+    async fn rename_session_branch(&self, request: &SessionBranchRename) -> Result<(), String> {
+        let (_, worktree) = canonical_managed_path(&request.managed_root, &request.worktree)?;
+        let old_branch = request.old_branch.clone();
+        let new_branch = request.new_branch.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::git::rename_session_branch(&worktree, &old_branch, &new_branch)
+        })
+        .await
+        .map_err(|error| format!("session branch rename task failed: {error}"))?
         .map_err(|error| error.to_string())
     }
 

@@ -40,6 +40,7 @@ fn catalog_model(id: &str, display_name: &str) -> trouve_protocol::ModelInfo {
         display_name: display_name.into(),
         context_window: 100_000,
         supports_tools: true,
+        supports_images: false,
         input_price_per_mtok: None,
         output_price_per_mtok: None,
         options_schema: serde_json::json!({}),
@@ -83,6 +84,7 @@ impl Provider for ScriptedProvider {
             display_name: "Scripted test model".into(),
             context_window: 100_000,
             supports_tools: true,
+            supports_images: true,
             input_price_per_mtok: Some(1.0),
             output_price_per_mtok: Some(2.0),
             options_schema: serde_json::json!({}),
@@ -1413,6 +1415,7 @@ impl Provider for CompactingProvider {
             display_name: "Tiny".into(),
             context_window: 1000,
             supports_tools: true,
+            supports_images: false,
             input_price_per_mtok: None,
             output_price_per_mtok: None,
             options_schema: serde_json::json!({}),
@@ -2306,9 +2309,19 @@ impl trouve_agents::AgentBackend for ConcurrentBackend {
             display_name: "Concurrent".into(),
             context_window: 100_000,
             supports_tools: true,
+            supports_images: false,
             input_price_per_mtok: None,
             output_price_per_mtok: None,
-            options_schema: serde_json::json!({"type": "object", "properties": {}}),
+            options_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "reasoning_effort": {
+                        "type": "string",
+                        "enum": ["low", "medium", "high"],
+                        "default": "medium"
+                    }
+                }
+            }),
         }]
     }
 
@@ -2354,6 +2367,7 @@ impl trouve_agents::AgentBackend for HandoffBackend {
             display_name: self.name.into(),
             context_window: 100_000,
             supports_tools: true,
+            supports_images: false,
             input_price_per_mtok: None,
             output_price_per_mtok: None,
             options_schema: serde_json::json!({"type": "object", "properties": {}}),
@@ -2692,6 +2706,7 @@ impl trouve_agents::AgentBackend for SteerableBackend {
             display_name: "Steerable Agent".into(),
             context_window: 100_000,
             supports_tools: true,
+            supports_images: false,
             input_price_per_mtok: None,
             output_price_per_mtok: None,
             options_schema: serde_json::json!({"type": "object", "properties": {}}),
@@ -3261,6 +3276,7 @@ impl trouve_agents::AgentBackend for ScriptedBackend {
             display_name: "Fake Agent".into(),
             context_window: 100_000,
             supports_tools: true,
+            supports_images: false,
             input_price_per_mtok: None,
             output_price_per_mtok: None,
             options_schema: serde_json::json!({"type": "object", "properties": {}}),
@@ -3761,6 +3777,7 @@ impl trouve_agents::AgentBackend for CancellationAckBackend {
             display_name: "Cancellation acknowledgement".into(),
             context_window: 100_000,
             supports_tools: true,
+            supports_images: false,
             input_price_per_mtok: None,
             output_price_per_mtok: None,
             options_schema: serde_json::json!({"type": "object", "properties": {}}),
@@ -5168,6 +5185,7 @@ impl Provider for FailingAutomationProvider {
             display_name: "Automation failure test".into(),
             context_window: 100_000,
             supports_tools: true,
+            supports_images: false,
             input_price_per_mtok: None,
             output_price_per_mtok: None,
             options_schema: serde_json::json!({
@@ -5316,16 +5334,18 @@ async fn automation_records_the_turn_outcome_not_just_dispatch() {
     assert_eq!(threads[0]["model_options"]["temperature"], 0.4);
 }
 
-/// Session naming settings persist through the protocol, and missing model
-/// assets always degrade to the deterministic heuristic instead of blocking
-/// creation.
+/// Session naming settings persist the selected configured model and branch mode.
 #[tokio::test]
-async fn session_title_settings_and_fallback() {
+async fn session_naming_settings_persist_and_publish() {
     let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
     let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
     let config_file = tmp.path().join("config.toml");
     let engine = Arc::new(
         Engine::new(store, tmp.path().join("data"), &Config::default())
+            .with_provider("static", Arc::new(StaticModelProvider { id: "static" }))
             .with_config_dir(None)
             .with_config_file(Some(config_file.clone())),
     );
@@ -5338,77 +5358,27 @@ async fn session_title_settings_and_fallback() {
     let client = reqwest::Client::new();
 
     let response = client
-        .get(format!("{base}/config/git-worktrees"))
+        .put(format!("{base}/config/session-naming"))
+        .json(&serde_json::json!({
+            "model": "static/m",
+            "derive_branch_name_from_session_title": true
+        }))
         .send()
         .await
         .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
     assert!(
         response
             .headers()
             .contains_key(trouve_protocol::EVENT_CURSOR_HEADER)
     );
     let settings: serde_json::Value = response.json().await.unwrap();
-    assert_eq!(settings["derive_branch_name_from_session_title"], false);
-    assert_eq!(settings["title_model_load_behavior"], "auto");
-    assert_eq!(settings["title_model_resource_policy"], "cpu_ram_only");
-    assert_eq!(settings["title_model"]["state"], "not_installed");
-
-    let response = client
-        .put(format!("{base}/config/git-worktrees"))
-        .json(&serde_json::json!({
-            "derive_branch_name_from_session_title": true,
-            "title_model_load_behavior": "off",
-            "title_model_resource_policy": "gpu_cpu_ram"
-        }))
-        .send()
-        .await
-        .unwrap();
-    assert!(
-        response
-            .headers()
-            .contains_key(trouve_protocol::EVENT_CURSOR_HEADER)
-    );
-    let settings: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(settings["model"], "static/m");
     assert_eq!(settings["derive_branch_name_from_session_title"], true);
-    assert_eq!(settings["title_model_load_behavior"], "off");
-    assert_eq!(settings["title_model_resource_policy"], "gpu_cpu_ram");
 
-    // Requests from clients predating the additive branch-naming option must
-    // preserve an explicit opt-in rather than resetting it to the default.
-    let settings: serde_json::Value = client
-        .put(format!("{base}/config/git-worktrees"))
-        .json(&serde_json::json!({
-            "title_model_load_behavior": "off",
-            "title_model_resource_policy": "gpu_cpu_ram"
-        }))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(settings["derive_branch_name_from_session_title"], true);
-    let response = client
-        .delete(format!("{base}/config/git-worktrees/title-model/install"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
-    assert!(
-        std::fs::read_to_string(&config_file)
-            .unwrap()
-            .contains("title_model_load_behavior = \"off\"")
-    );
-    assert!(
-        std::fs::read_to_string(&config_file)
-            .unwrap()
-            .contains("title_model_resource_policy = \"gpu_cpu_ram\"")
-    );
-    assert!(
-        std::fs::read_to_string(&config_file)
-            .unwrap()
-            .contains("derive_branch_name_from_session_title = true")
-    );
+    let persisted = std::fs::read_to_string(&config_file).unwrap();
+    assert!(persisted.contains("session_naming_model = \"static/m\""));
+    assert!(persisted.contains("derive_branch_name_from_session_title = true"));
     assert!(
         engine
             .store()
@@ -5417,14 +5387,43 @@ async fn session_title_settings_and_fallback() {
             .iter()
             .any(|envelope| matches!(
                 envelope.event,
-                trouve_protocol::Event::GitWorktreeSettingsUpdated { .. }
+                trouve_protocol::Event::SessionNamingSettingsUpdated { .. }
             ))
     );
 
-    let title: serde_json::Value = client
-        .post(format!("{base}/session-title"))
+    let workspace: serde_json::Value = client
+        .post(format!("{base}/workspaces"))
+        .json(&serde_json::json!({ "path": repo }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let session: serde_json::Value = client
+        .post(format!("{base}/sessions"))
+        .json(&serde_json::json!({ "workspace_id": workspace["id"] }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(session["title"], "New Session");
+    let compact_branch = session["branch"].as_str().unwrap();
+    assert!(compact_branch.starts_with("trouve/"));
+    assert_eq!(compact_branch.matches('-').count(), 0);
+
+    let generated: serde_json::Value = client
+        .post(format!("{base}/title"))
         .json(&serde_json::json!({
-            "prompt": "When initially naming a new session, can the app create an intelligent summarized title based on the prompt instead of just using the prompt as-is?"
+            "session_id": session["id"],
+            "prompt": "What drives this review comment?",
+            "attachments": [{
+                "name": "review.png",
+                "mime": "image/png",
+                "data": "QUJD"
+            }]
         }))
         .send()
         .await
@@ -5432,11 +5431,103 @@ async fn session_title_settings_and_fallback() {
         .json()
         .await
         .unwrap();
-    assert_eq!(title["source"], "heuristic");
-    assert_eq!(
-        title["title"],
-        "Create intelligent summarized title from prompt"
+    assert_eq!(generated["title"], "Explain Retry Classification");
+
+    let renamed: serde_json::Value = client
+        .patch(format!(
+            "{base}/sessions/{}",
+            session["id"].as_str().unwrap()
+        ))
+        .json(&serde_json::json!({
+            "title": generated["title"],
+            "expected_title": "New Session"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(renamed["title"], "Explain Retry Classification");
+    assert_ne!(renamed["branch"], compact_branch);
+    assert!(
+        renamed["branch"]
+            .as_str()
+            .unwrap()
+            .contains("explain-retry-classification")
     );
+    let mut branch_command = Command::new("git");
+    branch_command
+        .arg("-C")
+        .arg(Path::new(renamed["worktree_path"].as_str().unwrap()))
+        .args(["branch", "--show-current"]);
+    let branch_output = trouve_process::output(&mut branch_command).unwrap();
+    assert!(branch_output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&branch_output.stdout).trim(),
+        renamed["branch"].as_str().unwrap()
+    );
+
+    let thread: serde_json::Value = client
+        .post(format!("{base}/threads"))
+        .json(&serde_json::json!({ "session_id": session["id"] }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(thread["title"], "New Thread");
+    let thread_id = thread["id"].as_str().unwrap();
+    engine
+        .store()
+        .append_events(
+            trouve_protocol::Scope::Thread(thread_id.into()),
+            vec![
+                trouve_protocol::Event::UserMessage {
+                    turn: 1,
+                    content: "Make rename recovery transcript-aware".into(),
+                    attachments: Vec::new(),
+                    background: false,
+                },
+                trouve_protocol::Event::AssistantMessage {
+                    turn: 1,
+                    content: "Added a Generate button".into(),
+                },
+            ],
+        )
+        .unwrap();
+    let suggested: serde_json::Value = client
+        .post(format!(
+            "{base}/sessions/{}/title-suggestion",
+            session["id"].as_str().unwrap()
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(suggested["title"], "Improve Rename Recovery");
+    let thread_suggested: serde_json::Value = client
+        .post(format!("{base}/threads/{thread_id}/title-suggestion"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(thread_suggested["title"], "Improve Rename Recovery");
+    let conflict = client
+        .patch(format!("{base}/threads/{}", thread["id"].as_str().unwrap()))
+        .json(&serde_json::json!({
+            "title": "Late Generated Name",
+            "expected_title": "Already Renamed"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(conflict.status(), reqwest::StatusCode::CONFLICT);
 }
 
 #[tokio::test]
@@ -6241,7 +6332,7 @@ async fn spawn_thread_child_agent_end_to_end() {
     let child = threads.iter().find(|t| t["id"] == child_id).unwrap();
     assert_eq!(child["spawned"], true, "{child}");
     assert_eq!(child["mode"], "code");
-    assert_eq!(child["title"], "Subagent: Child task compute answer");
+    assert_eq!(child["title"], "New Thread");
     let subagents: Vec<serde_json::Value> = client
         .get(format!("{base}/threads/{thread_id}/subagents"))
         .send()
@@ -6552,19 +6643,58 @@ impl Provider for StaticModelProvider {
             display_name: self.id.into(),
             context_window: 100_000,
             supports_tools: true,
+            supports_images: true,
             input_price_per_mtok: None,
             output_price_per_mtok: None,
-            options_schema: serde_json::json!({"type": "object", "properties": {}}),
+            options_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "reasoning_effort": {
+                        "type": "string",
+                        "enum": ["low", "medium", "high"],
+                        "default": "medium"
+                    }
+                }
+            }),
         }]
     }
 
     async fn stream_chat(
         &self,
         _model: &str,
-        _messages: &[Message],
+        messages: &[Message],
         _tools: &[ToolSpec],
-        _options: &serde_json::Map<String, serde_json::Value>,
+        options: &serde_json::Map<String, serde_json::Value>,
     ) -> Result<EventStream, ProviderError> {
+        if self.id == "static" {
+            assert_eq!(
+                options.get("reasoning_effort"),
+                Some(&serde_json::json!("low"))
+            );
+            let title = match &messages[1] {
+                Message::UserWithImages { content, images }
+                    if content == "What drives this review comment?"
+                        && images.len() == 1
+                        && images[0].mime == "image/png"
+                        && images[0].data == "QUJD" =>
+                {
+                    "Explain Retry Classification"
+                }
+                Message::User(content)
+                    if content.contains("User: Make rename recovery transcript-aware")
+                        && content.contains("Assistant outcome: Added a Generate button") =>
+                {
+                    "Improve Rename Recovery"
+                }
+                unexpected => panic!("unexpected naming prompt: {unexpected:?}"),
+            };
+            return Ok(Box::pin(futures::stream::iter(vec![
+                Ok(ProviderEvent::TextDelta(title.into())),
+                Ok(ProviderEvent::Completed {
+                    usage: trouve_protocol::Usage::default(),
+                }),
+            ])));
+        }
         Err(ProviderError::Request("catalog-only provider".into()))
     }
 }
@@ -6670,6 +6800,7 @@ async fn code_review_dashboard_and_repository_policy_round_trip() {
                 display_name: "Claude".into(),
                 context_window: 100_000,
                 supports_tools: true,
+                supports_images: false,
                 input_price_per_mtok: None,
                 output_price_per_mtok: None,
                 options_schema: serde_json::json!({

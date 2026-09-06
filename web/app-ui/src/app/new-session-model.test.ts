@@ -23,9 +23,6 @@ import {
   defaultThinkingSelection,
   interruptNewSessionOptionLoad,
   failNewSessionSetup,
-  NEW_SESSION_TITLE_FALLBACK,
-  NEW_SESSION_TITLE_MAX_LENGTH,
-  NEW_THREAD_TITLE_FALLBACK,
   newSessionOptionsAreAuthoritative,
   newSessionOptionsBlockSubmission,
   navigateNewSessionSetup,
@@ -37,13 +34,11 @@ import {
   resolveNewThreadDefaults,
   openNewSessionSetup,
   openNewSessionSetupForWorkspace,
-  sessionTitleFallback,
   settleNewSessionOptionLoad,
   shouldRestoreFailedNewSessionDraft,
   snapshotNewSessionSubmission,
   thinkingOption,
   thinkingSelectionIsValid,
-  threadTitleFallback,
 } from "./new-session-model.js";
 
 const model = (
@@ -184,31 +179,6 @@ describe("new session model", () => {
       restoringDraft: false,
     });
     expect(replaced.lifecycle.generation).toBeGreaterThan(failed.generation);
-  });
-
-  it("uses the bounded first prompt line and removes invisible controls from fallback titles", () => {
-    expect(sessionTitleFallback("  Build\n\t the   dashboard\r\n now  ")).toBe(
-      "Build",
-    );
-    expect(sessionTitleFallback("Review\u202ethe diff")).toBe("Review the diff");
-    expect(sessionTitleFallback("\n\n  Build   the dashboard\nignore this line")).toBe(
-      "Build the dashboard",
-    );
-  });
-
-  it("returns a nonempty fallback and bounds titles by Unicode code points", () => {
-    expect(sessionTitleFallback("\u0000\u202e\t")).toBe(NEW_SESSION_TITLE_FALLBACK);
-    const title = sessionTitleFallback(`🙂${"é".repeat(80)}`);
-    expect(Array.from(title)).toHaveLength(NEW_SESSION_TITLE_MAX_LENGTH);
-    expect(title.startsWith("🙂é")).toBe(true);
-  });
-
-  it("derives bounded thread titles from the first prompt line", () => {
-    expect(threadTitleFallback("  Review the parser edge cases\nIgnore this line"))
-      .toBe("Review the parser edge cases");
-    expect(threadTitleFallback("\u0000\u202e\t")).toBe(NEW_THREAD_TITLE_FALLBACK);
-    expect(Array.from(threadTitleFallback(`🙂${"é".repeat(80)}`)))
-      .toHaveLength(NEW_SESSION_TITLE_MAX_LENGTH);
   });
 
   it("prefers a valid thinking_level schema and reports its enum and default", () => {

@@ -36,7 +36,7 @@ export const threadNavigationTitle = (input: {
       : `Subagent: ${storedTitle ?? metadataFallback}`;
   }
   if (thread.id === input.initialThreadId) {
-    return cleanTitle(input.sessionTitle) ?? storedTitle ?? metadataFallback;
+    return storedTitle ?? cleanTitle(input.sessionTitle) ?? metadataFallback;
   }
   return storedTitle ?? metadataFallback;
 };

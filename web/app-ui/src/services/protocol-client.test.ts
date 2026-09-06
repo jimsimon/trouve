@@ -76,15 +76,9 @@ describe("ProtocolClient", () => {
     const projection = {
       github_pull_requests: [],
       session_pull_requests: [],
-      git_worktree_settings: {
+      session_naming_settings: {
+        model: "provider/model",
         derive_branch_name_from_session_title: false,
-        title_model_load_behavior: "auto",
-        title_model_resource_policy: "adaptive",
-        title_model: {
-          state: "ready",
-          runtime_installed: true,
-          model_downloaded: true,
-        },
       },
     };
     const client = new ProtocolClient("http://127.0.0.1:43127", {
@@ -721,12 +715,12 @@ describe("ProtocolClient", () => {
     )).toBe(true);
   });
 
-  it("generates a validated session title through a protected protocol mutation", async () => {
+  it("generates a validated title through a protected protocol mutation", async () => {
     const requests: Request[] = [];
     const fakeFetch = vi.fn<typeof fetch>(async (input, init) => {
       const request = input instanceof Request ? input : new Request(input, init);
       requests.push(request);
-      return Response.json({ title: "Preserve frontend parity", source: "heuristic" });
+      return Response.json({ title: "Preserve Frontend Parity" });
     });
     const client = new ProtocolClient("http://127.0.0.1:43127", {
       fetch: fakeFetch,
@@ -734,31 +728,40 @@ describe("ProtocolClient", () => {
     });
 
     const abort = new AbortController();
-    await expect(client.generateSessionTitle("Preserve the existing frontend", {
+    await expect(client.generateTitle("se_1", "Preserve the existing frontend", [], {
       signal: abort.signal,
     }))
-      .resolves.toEqual({ title: "Preserve frontend parity", source: "heuristic" });
+      .resolves.toEqual({ title: "Preserve Frontend Parity" });
     expect(requests[0]?.method).toBe("POST");
-    expect(requests[0]?.url).toContain("/v1/session-title");
+    expect(requests[0]?.url).toContain("/v1/title");
     expect(requests[0]?.headers.get("x-trouve-host-csrf")).toBe("ephemeral-token");
     expect(requests[0]?.signal.aborted).toBe(false);
     abort.abort();
     expect(requests[0]?.signal.aborted).toBe(true);
     await expect(requests[0]?.json()).resolves.toEqual({
+      session_id: "se_1",
       prompt: "Preserve the existing frontend",
+      attachments: [],
     });
+
+    await expect(client.generateSessionTitleSuggestion("se/slash"))
+      .resolves.toEqual({ title: "Preserve Frontend Parity" });
+    expect(requests[1]?.method).toBe("POST");
+    expect(new URL(requests[1]?.url ?? "").pathname).toBe(
+      "/v1/sessions/se%2Fslash/title-suggestion",
+    );
+    expect(requests[1]?.headers.get("x-trouve-host-csrf")).toBe("ephemeral-token");
+    await expect(client.generateThreadTitleSuggestion("th/slash"))
+      .resolves.toEqual({ title: "Preserve Frontend Parity" });
+    expect(new URL(requests[2]?.url ?? "").pathname).toBe(
+      "/v1/threads/th%2Fslash/title-suggestion",
+    );
   });
 
-  it("pairs Git and worktree settings with a validated server cursor", async () => {
+  it("pairs session naming settings with a validated server cursor", async () => {
     const settings = {
+      model: "provider/model",
       derive_branch_name_from_session_title: false,
-      title_model_load_behavior: "auto",
-      title_model_resource_policy: "adaptive",
-      title_model: {
-        state: "ready",
-        runtime_installed: true,
-        model_downloaded: true,
-      },
     };
     const withCursor = new ProtocolClient("http://127.0.0.1:43127", {
       fetch: vi.fn<typeof fetch>(async () => Response.json(settings, {
@@ -766,7 +769,7 @@ describe("ProtocolClient", () => {
       })),
     });
 
-    await expect(withCursor.gitWorktreeSettingsSnapshot()).resolves.toEqual({
+    await expect(withCursor.sessionNamingSettingsSnapshot()).resolves.toEqual({
       cursor: 42,
       value: settings,
     });
@@ -774,7 +777,7 @@ describe("ProtocolClient", () => {
     const withoutCursor = new ProtocolClient("http://127.0.0.1:43127", {
       fetch: vi.fn<typeof fetch>(async () => Response.json(settings)),
     });
-    const error = await withoutCursor.gitWorktreeSettingsSnapshot()
+    const error = await withoutCursor.sessionNamingSettingsSnapshot()
       .catch((reason: unknown) => reason);
     expect(error).toBeInstanceOf(ProtocolClientError);
     expect(error).toMatchObject({ kind: "invalid-response" });
@@ -1242,11 +1245,11 @@ describe("protocol compatibility", () => {
   });
 
   it("accepts the exact generated protocol version", () => {
-    expect(() => assertProtocolCompatibility("8.3")).not.toThrow();
+    expect(() => assertProtocolCompatibility("9.1")).not.toThrow();
   });
 
   it("rejects older, newer, other-major, and malformed servers", () => {
-    for (const version of ["4.0", "5.2", "6.1", "7.0", "7.1", "7.2", "7.3", "7.4", "7.5", "7.6", "7.7", "7.8", "7.9", "7.10", "7.11", "7.12", "7.13", "7.14", "7.15", "7.16", "7.17", "7.18", "7.19", "7.20", "7.21", "7.22", "7.23", "7.24", "7.25", "7.26", "7.27", "7.28", "7.28.1", "7.29", "7.29.1", "7.30", "7.30.1", "7.31", "7.31.1", "7.32", "8.0", "8.1", "8.2", "8.4", "9.0", "unknown", ""]) {
+    for (const version of ["4.0", "5.2", "6.1", "7.0", "7.1", "7.2", "7.3", "7.4", "7.5", "7.6", "7.7", "7.8", "7.9", "7.10", "7.11", "7.12", "7.13", "7.14", "7.15", "7.16", "7.17", "7.18", "7.19", "7.20", "7.21", "7.22", "7.23", "7.24", "7.25", "7.26", "7.27", "7.28", "7.28.1", "7.29", "7.29.1", "7.30", "7.30.1", "7.31", "7.31.1", "7.32", "8.0", "8.1", "8.2", "8.3", "8.4", "9.0", "unknown", ""]) {
       expect(() => assertProtocolCompatibility(version)).toThrowError(
         expect.objectContaining({ kind: "incompatible-protocol" }),
       );

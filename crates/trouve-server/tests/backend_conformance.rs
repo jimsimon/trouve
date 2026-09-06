@@ -29,6 +29,7 @@ fn model(id: &str, name: &str) -> ModelInfo {
         display_name: name.into(),
         context_window: 100_000,
         supports_tools: true,
+        supports_images: true,
         input_price_per_mtok: None,
         output_price_per_mtok: None,
         options_schema: serde_json::json!({"type":"object", "properties":{}}),

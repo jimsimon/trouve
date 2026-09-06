@@ -143,12 +143,11 @@ describe("thread screen asynchronous lifecycle guards", () => {
       "\n  async #updateThreadModelOption(",
     );
     expect(disconnected).toContain("this.#newThreadRequest = undefined;");
-    expectGuardBetween(
-      submit,
-      "const generated = await services.protocol.generateSessionTitle",
-      "if (!this.#isCurrentNewThreadRequest",
-      "if (generated.title.trim()",
-    );
+    expect(submit).toContain("title: NEW_THREAD_TITLE_FALLBACK");
+    expect(submit).toContain("services.protocol.generateTitle(");
+    expect(submit).toContain("expected_title: NEW_THREAD_TITLE_FALLBACK");
+    expect(submit.indexOf("services.protocol.createThread(request)"))
+      .toBeLessThan(submit.indexOf("services.protocol.generateTitle("));
     expectGuardBetween(
       submit,
       "const thread = await services.protocol.createThread(request);",
@@ -204,6 +203,17 @@ describe("thread screen asynchronous lifecycle guards", () => {
     expect(agentActivitySource).toContain('aria-live="polite"');
     expect(agentActivitySource).toContain('aria-atomic="true"');
     expect(agentActivitySource).toContain('aria-hidden="true"');
+  });
+
+  it("offers keyboard-accessible rename and close actions for thread tabs", () => {
+    expect(source).toContain("#openThreadTabContextMenu(event, candidate.id)");
+    expect(source).toContain('event.key === "ContextMenu"');
+    expect(source).toContain("event.shiftKey && event.key === \"F10\"");
+    expect(source).toContain('class="thread-tab-context-menu"');
+    expect(source).toContain(">Rename</button>");
+    expect(source).toContain(">Close</button>");
+    expect(source).toContain('>Rename thread</h2>');
+    expect(source).toContain("generateThreadTitleSuggestion(threadId)");
   });
 
 });

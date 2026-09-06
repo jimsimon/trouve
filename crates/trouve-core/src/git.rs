@@ -3606,6 +3606,13 @@ pub fn push_branch(worktree: &Path, remote: &str, branch: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn rename_session_branch(worktree: &Path, old_branch: &str, new_branch: &str) -> Result<()> {
+    ensure_safe_ref(old_branch)?;
+    ensure_safe_ref(new_branch)?;
+    git(worktree, &["branch", "-m", old_branch, new_branch])?;
+    Ok(())
+}
+
 /// Where session worktrees live: `<data_dir>/worktrees/<session_id>`.
 pub fn worktree_dir(data_dir: &Path, session_id: &str) -> PathBuf {
     data_dir.join("worktrees").join(session_id)
@@ -3635,6 +3642,25 @@ mod tests {
         std::fs::write(dir.join("a.txt"), "one\n").unwrap();
         run(dir, &["add", "-A"]);
         run(dir, &["commit", "-m", "init"]);
+    }
+
+    #[test]
+    fn rename_session_branch_renames_the_checked_out_local_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo(tmp.path());
+        run(tmp.path(), &["switch", "-c", "trouve/session-id"]);
+
+        rename_session_branch(
+            tmp.path(),
+            "trouve/session-id",
+            "trouve/describe-authentication-failure",
+        )
+        .unwrap();
+
+        assert_eq!(
+            run(tmp.path(), &["branch", "--show-current"]),
+            "trouve/describe-authentication-failure"
+        );
     }
 
     #[cfg(unix)]

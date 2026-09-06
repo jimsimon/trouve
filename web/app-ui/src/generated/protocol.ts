@@ -495,33 +495,17 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/v1/config/git-worktrees": {
+    "/v1/config/session-naming": {
         parameters: {
             query?: never;
             header?: never;
             path?: never;
             cookie?: never;
         };
-        get: operations["get_git_worktree_settings"];
-        put: operations["set_git_worktree_settings"];
+        get: operations["get_session_naming_settings"];
+        put: operations["set_session_naming_settings"];
         post?: never;
         delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/v1/config/git-worktrees/title-model/install": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post: operations["install_title_model"];
-        delete: operations["cancel_title_model_install"];
         options?: never;
         head?: never;
         patch?: never;
@@ -1059,22 +1043,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/v1/session-title": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post: operations["generate_session_title"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/v1/sessions": {
         parameters: {
             query?: never;
@@ -1363,6 +1331,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/sessions/{id}/title-suggestion": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["generate_session_title_from_transcript"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/sessions/{id}/undo": {
         parameters: {
             query?: never;
@@ -1631,6 +1615,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/threads/{id}/title-suggestion": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["generate_thread_title_from_transcript"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/threads/{id}/tools/{call_id}": {
         parameters: {
             query?: never;
@@ -1673,6 +1673,22 @@ export interface paths {
         get: operations["get_thread_view"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/title": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["generate_title"];
         delete?: never;
         options?: never;
         head?: never;
@@ -3231,7 +3247,11 @@ export interface components {
             /** @enum {string} */
             type: "server.connectivity_changed";
         } | {
-            settings: components["schemas"]["GitWorktreeSettings"];
+            settings: components["schemas"]["SessionNamingSettings"];
+            /** @enum {string} */
+            type: "settings.session_naming_updated";
+        } | {
+            settings: unknown;
             /** @enum {string} */
             type: "settings.git_worktrees_updated";
         } | {
@@ -3281,25 +3301,14 @@ export interface components {
             session: components["schemas"]["Session"];
             thread: components["schemas"]["Thread"];
         };
-        /** @description Ask the server to derive a concise title for a new session. */
-        GenerateSessionTitleRequest: {
+        /** @description Ask the configured naming model to derive a concise navigation title. */
+        GenerateTitleRequest: {
+            attachments?: components["schemas"]["AttachmentUpload"][];
             prompt: string;
+            session_id: components["schemas"]["String"];
         };
-        GeneratedSessionTitle: {
-            /** @description `model` or `heuristic`. */
-            source: string;
+        GeneratedTitle: {
             title: string;
-        };
-        /** @description Global session-naming settings shown under Settings → Sessions & Chat. */
-        GitWorktreeSettings: {
-            /**
-             * @description Whether new session branches include a slug derived from the session
-             *     title. False uses the compact `trouve/<short-id>` form.
-             */
-            derive_branch_name_from_session_title?: boolean;
-            title_model: components["schemas"]["TitleModelStatus"];
-            title_model_load_behavior: components["schemas"]["TitleModelLoadBehavior"];
-            title_model_resource_policy?: components["schemas"]["TitleModelResourcePolicy"];
         };
         /**
          * @description Public GitHub App state. Private keys and webhook secrets are never
@@ -3635,6 +3644,11 @@ export interface components {
             options_schema: unknown;
             /** Format: double */
             output_price_per_mtok?: number | null;
+            /**
+             * @description Whether the model accepts image inputs. False for unknown/custom
+             *     endpoints so clients do not imply that attachments will be inspected.
+             */
+            supports_images?: boolean;
             supports_tools: boolean;
         };
         /**
@@ -4357,8 +4371,8 @@ export interface components {
          *     server event stream at the session-summary cursor instead of cursor zero.
          */
         ServerProjection: {
-            git_worktree_settings: components["schemas"]["GitWorktreeSettings"];
             github_pull_requests: components["schemas"]["GithubPrHostProjection"][];
+            session_naming_settings: components["schemas"]["SessionNamingSettings"];
             session_pull_requests: components["schemas"]["SessionPrProjection"][];
         };
         Session: {
@@ -4374,8 +4388,9 @@ export interface components {
             archived?: boolean;
             base_ref: string;
             /**
-             * @description Branch dedicated to this session. New sessions default to
-             *     `trouve/<short-id>`; users may opt into `trouve/<slug>-<short-id>`.
+             * @description Branch dedicated to this session. New sessions start as
+             *     `trouve/<short-id>` and may be renamed to `trouve/<slug>-<short-id>`
+             *     after asynchronous naming.
              */
             branch: string;
             /** Format: date-time */
@@ -4420,6 +4435,13 @@ export interface components {
         SessionFileDiff: {
             diff: string;
             path: string;
+        };
+        /** @description Global asynchronous naming settings shown under Settings → Sessions & Chat. */
+        SessionNamingSettings: {
+            /** @description Rename the compact worktree branch after the session receives its name. */
+            derive_branch_name_from_session_title: boolean;
+            /** @description Provider-qualified configured model used for session and thread names. */
+            model: string;
         };
         /**
          * @description A fresh session-level notification edge derived from a durable thread
@@ -4526,13 +4548,6 @@ export interface components {
         SetDefaultPermissionModeRequest: {
             permission_mode: components["schemas"]["PermissionMode"];
         };
-        /** @description Update the Session Naming section under Settings → Sessions & Chat. */
-        SetGitWorktreeSettingsRequest: {
-            /** @description Omitted by older clients to preserve the current branch-naming mode. */
-            derive_branch_name_from_session_title?: boolean | null;
-            title_model_load_behavior: components["schemas"]["TitleModelLoadBehavior"];
-            title_model_resource_policy?: components["schemas"]["TitleModelResourcePolicy"];
-        };
         /**
          * @description Atomically replace the global defaults used by new threads
          *     (`PUT /v1/config/defaults`).
@@ -4561,6 +4576,11 @@ export interface components {
             scope: string;
             /** @description Required for workspace scope: whose `.agents/.mcp.json` to edit. */
             workspace_id?: string | null;
+        };
+        /** @description Update the Session Naming section under Settings → Sessions & Chat. */
+        SetSessionNamingSettingsRequest: {
+            derive_branch_name_from_session_title: boolean;
+            model: string;
         };
         /**
          * @description A steering message accepted by the active vendor turn. Durable display
@@ -4938,34 +4958,6 @@ export interface components {
                 [key: string]: string;
             };
         };
-        /**
-         * @description When the dedicated session-title model should occupy memory.
-         * @enum {string}
-         */
-        TitleModelLoadBehavior: "auto" | "always" | "on_demand" | "off";
-        /**
-         * @description Compute resources the dedicated session-title model may use.
-         * @enum {string}
-         */
-        TitleModelResourcePolicy: "adaptive" | "gpu_cpu_ram" | "gpu_only" | "cpu_ram_only";
-        /** @description Runtime status for the managed session-title model. */
-        TitleModelStatus: {
-            /** @description Human-readable context for the settings screen. */
-            detail?: string;
-            /** Format: int64 */
-            install_bytes?: number;
-            /** @description Empty, `runtime`, or `model`. */
-            install_stage?: string;
-            /** Format: int64 */
-            install_total?: number;
-            model_downloaded: boolean;
-            runtime_installed: boolean;
-            /**
-             * @description `not_installed`, `installing`, `stopped`, `loading`, `ready`, or
-             *     `error`.
-             */
-            state: string;
-        };
         /** @description One stable item in a thread's current todo list. */
         TodoItem: {
             content: string;
@@ -5049,10 +5041,12 @@ export interface components {
             title?: string | null;
         };
         /**
-         * @description Partial thread update between turns (mode/model switching). Rejected with
-         *     a conflict while a turn is running. Omitted fields are unchanged.
+         * @description Partial thread title/settings update between turns. Rejected with a
+         *     conflict while a turn is running. Omitted fields are unchanged.
          */
         UpdateThreadRequest: {
+            /** @description Apply the generated title only while the persisted title still has this value. */
+            expected_title?: string | null;
             mode?: string | null;
             model?: string | null;
             /** @description Replaces the thread's model options when present. */
@@ -5060,6 +5054,7 @@ export interface components {
                 [key: string]: components["schemas"]["ModelOptionValue"];
             } | null;
             permission_mode?: null | components["schemas"]["PermissionMode"];
+            title?: string | null;
         };
         /**
          * @description Create or update an automation (`POST /v1/automations`,
@@ -6314,7 +6309,7 @@ export interface operations {
             };
         };
     };
-    get_git_worktree_settings: {
+    get_session_naming_settings: {
         parameters: {
             query?: never;
             header?: never;
@@ -6330,12 +6325,12 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["GitWorktreeSettings"];
+                    "application/json": components["schemas"]["SessionNamingSettings"];
                 };
             };
         };
     };
-    set_git_worktree_settings: {
+    set_session_naming_settings: {
         parameters: {
             query?: never;
             header?: never;
@@ -6344,7 +6339,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["SetGitWorktreeSettingsRequest"];
+                "application/json": components["schemas"]["SetSessionNamingSettingsRequest"];
             };
         };
         responses: {
@@ -6355,65 +6350,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["GitWorktreeSettings"];
-                };
-            };
-        };
-    };
-    install_title_model: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            202: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            409: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-        };
-    };
-    cancel_title_model_install: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            204: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-            409: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
+                    "application/json": components["schemas"]["SessionNamingSettings"];
                 };
             };
         };
@@ -7485,29 +7422,6 @@ export interface operations {
             };
         };
     };
-    generate_session_title: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["GenerateSessionTitleRequest"];
-            };
-        };
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["GeneratedSessionTitle"];
-                };
-            };
-        };
-    };
     list_sessions: {
         parameters: {
             query?: {
@@ -8287,6 +8201,44 @@ export interface operations {
             };
         };
     };
+    generate_session_title_from_transcript: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Session whose conversation supplies the naming context */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GeneratedTitle"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     undo_session: {
         parameters: {
             query?: never;
@@ -8865,6 +8817,44 @@ export interface operations {
             };
         };
     };
+    generate_thread_title_from_transcript: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Thread whose conversation supplies the naming context */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GeneratedTitle"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     get_thread_tool_details: {
         parameters: {
             query?: never;
@@ -8953,6 +8943,37 @@ export interface operations {
                 };
             };
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    generate_title: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["GenerateTitleRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GeneratedTitle"];
+                };
+            };
+            400: {
                 headers: {
                     [name: string]: unknown;
                 };

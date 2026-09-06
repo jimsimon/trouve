@@ -3,7 +3,7 @@ import {
   resolveNewSessionModel,
   resolveNewThreadDefaults,
   thinkingOption,
-  threadTitleFallback,
+  NEW_THREAD_TITLE_FALLBACK,
 } from "../app/new-session-model.js";
 import {
   modelOptionControls,
@@ -352,7 +352,7 @@ export const createNewThreadSetupSubmission = (input: {
   const prompt = input.draft.prompt.trim();
   const request = createNewSessionThreadRequest({
     sessionId: input.sessionId,
-    title: threadTitleFallback(prompt),
+    title: NEW_THREAD_TITLE_FALLBACK,
     ...(mode === undefined ? {} : { mode: mode.id }),
     ...(model === undefined ? {} : { model: model.id }),
     permissionMode: input.draft.permissionMode,

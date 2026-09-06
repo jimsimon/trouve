@@ -9,13 +9,13 @@ const thread = {
 };
 
 describe("threadNavigationTitle", () => {
-  it("uses the session name for its initial thread", () => {
+  it("keeps the initial thread independently renameable", () => {
     expect(threadNavigationTitle({
       thread: { ...thread, title: "Prompt-derived title" },
       sessionTitle: "Session name",
       initialThreadId: "th_1",
       modeDisplayName: "Code",
-    })).toBe("Session name");
+    })).toBe("Prompt-derived title");
   });
 
   it("uses durable prompt-derived titles for later user threads", () => {

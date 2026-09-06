@@ -121,96 +121,36 @@ pub struct ServerInfo {
     pub online: bool,
 }
 
-// --- session naming settings --------------------------------------------
+// --- session and thread naming ------------------------------------------
 
-/// When the dedicated session-title model should occupy memory.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum TitleModelLoadBehavior {
-    /// Keep the model ready when the server detects comfortable memory
-    /// headroom; otherwise load it for each naming request.
-    #[default]
-    Auto,
-    /// Load at server startup and keep the model resident.
-    Always,
-    /// Load for naming requests and release it after an idle period.
-    OnDemand,
-    /// Never load the model; use the built-in naming heuristics.
-    Off,
-}
-
-/// Compute resources the dedicated session-title model may use.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum TitleModelResourcePolicy {
-    /// Choose GPU acceleration when it will not contend with a running local
-    /// coding model; otherwise use CPU and system RAM.
-    Adaptive,
-    /// Allow llama.cpp to place the model across GPU, CPU, and system RAM.
-    GpuCpuRam,
-    /// Require all model layers to fit on a detected GPU.
-    GpuOnly,
-    /// Keep all model computation off the GPU. This preserves the behavior
-    /// used before resource selection was exposed.
-    #[default]
-    CpuRamOnly,
-}
-
-/// Runtime status for the managed session-title model.
+/// Global asynchronous naming settings shown under Settings → Sessions & Chat.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct TitleModelStatus {
-    /// `not_installed`, `installing`, `stopped`, `loading`, `ready`, or
-    /// `error`.
-    pub state: String,
-    /// Human-readable context for the settings screen.
-    #[serde(default)]
-    pub detail: String,
-    pub runtime_installed: bool,
-    pub model_downloaded: bool,
-    /// Empty, `runtime`, or `model`.
-    #[serde(default)]
-    pub install_stage: String,
-    #[serde(default)]
-    pub install_bytes: u64,
-    #[serde(default)]
-    pub install_total: u64,
-}
-
-/// Global session-naming settings shown under Settings → Sessions & Chat.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct GitWorktreeSettings {
-    /// Whether new session branches include a slug derived from the session
-    /// title. False uses the compact `trouve/<short-id>` form.
-    #[serde(default)]
+pub struct SessionNamingSettings {
+    /// Provider-qualified configured model used for session and thread names.
+    pub model: String,
+    /// Rename the compact worktree branch after the session receives its name.
     pub derive_branch_name_from_session_title: bool,
-    pub title_model_load_behavior: TitleModelLoadBehavior,
-    #[serde(default)]
-    pub title_model_resource_policy: TitleModelResourcePolicy,
-    pub title_model: TitleModelStatus,
 }
 
 /// Update the Session Naming section under Settings → Sessions & Chat.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct SetGitWorktreeSettingsRequest {
-    /// Omitted by older clients to preserve the current branch-naming mode.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub derive_branch_name_from_session_title: Option<bool>,
-    pub title_model_load_behavior: TitleModelLoadBehavior,
-    #[serde(default)]
-    pub title_model_resource_policy: TitleModelResourcePolicy,
+pub struct SetSessionNamingSettingsRequest {
+    pub model: String,
+    pub derive_branch_name_from_session_title: bool,
 }
 
-/// Ask the server to derive a concise title for a new session.
+/// Ask the configured naming model to derive a concise navigation title.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct GenerateSessionTitleRequest {
+pub struct GenerateTitleRequest {
+    pub session_id: SessionId,
     pub prompt: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<AttachmentUpload>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct GeneratedSessionTitle {
+pub struct GeneratedTitle {
     pub title: String,
-    /// `model` or `heuristic`.
-    pub source: String,
 }
 
 // --- workspaces ----------------------------------------------------------
@@ -277,8 +217,9 @@ pub struct Session {
     pub id: SessionId,
     pub workspace_id: WorkspaceId,
     pub title: String,
-    /// Branch dedicated to this session. New sessions default to
-    /// `trouve/<short-id>`; users may opt into `trouve/<slug>-<short-id>`.
+    /// Branch dedicated to this session. New sessions start as
+    /// `trouve/<short-id>` and may be renamed to `trouve/<slug>-<short-id>`
+    /// after asynchronous naming.
     pub branch: String,
     /// Absolute path of the session worktree.
     pub worktree_path: String,
@@ -638,10 +579,15 @@ pub struct ThreadViewQuery {
     pub turn_aligned: Option<bool>,
 }
 
-/// Partial thread update between turns (mode/model switching). Rejected with
-/// a conflict while a turn is running. Omitted fields are unchanged.
+/// Partial thread title/settings update between turns. Rejected with a
+/// conflict while a turn is running. Omitted fields are unchanged.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct UpdateThreadRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Apply the generated title only while the persisted title still has this value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1024,7 +970,7 @@ pub struct SessionPrProjection {
 pub struct ServerProjection {
     pub github_pull_requests: Vec<GithubPrHostProjection>,
     pub session_pull_requests: Vec<SessionPrProjection>,
-    pub git_worktree_settings: GitWorktreeSettings,
+    pub session_naming_settings: SessionNamingSettings,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -3301,6 +3247,10 @@ pub struct ModelInfo {
     pub display_name: String,
     pub context_window: u64,
     pub supports_tools: bool,
+    /// Whether the model accepts image inputs. False for unknown/custom
+    /// endpoints so clients do not imply that attachments will be inspected.
+    #[serde(default)]
+    pub supports_images: bool,
     /// USD per million input tokens (None = unknown; cost reporting skips it).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_price_per_mtok: Option<f64>,
@@ -3357,28 +3307,14 @@ mod tests {
     }
 
     #[test]
-    fn title_resources_default_to_the_historical_cpu_mode() {
-        let request: SetGitWorktreeSettingsRequest = serde_json::from_value(serde_json::json!({
-            "title_model_load_behavior": "auto"
+    fn session_naming_settings_round_trip() {
+        let request: SetSessionNamingSettingsRequest = serde_json::from_value(serde_json::json!({
+            "model": "openai/gpt-5-mini",
+            "derive_branch_name_from_session_title": true
         }))
         .unwrap();
-
-        assert_eq!(
-            request.title_model_resource_policy,
-            TitleModelResourcePolicy::CpuRamOnly
-        );
-        assert_eq!(request.derive_branch_name_from_session_title, None);
-
-        let historical: GitWorktreeSettings = serde_json::from_value(serde_json::json!({
-            "title_model_load_behavior": "auto",
-            "title_model": {
-                "state": "not_installed",
-                "runtime_installed": false,
-                "model_downloaded": false
-            }
-        }))
-        .unwrap();
-        assert!(!historical.derive_branch_name_from_session_title);
+        assert_eq!(request.model, "openai/gpt-5-mini");
+        assert!(request.derive_branch_name_from_session_title);
     }
 
     #[test]

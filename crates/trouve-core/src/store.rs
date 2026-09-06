@@ -17,7 +17,7 @@ use tokio::sync::broadcast;
 use trouve_protocol::{
     Event, EventEnvelope, GithubPrList, PermissionMode, Scope, Session, SessionAttention,
     SessionOutcome, SessionSummariesSnapshot, SessionSummary, Thread, ThreadStatus,
-    ThreadToolDetails, ThreadViewItem, ThreadViewSnapshot, Workspace,
+    ThreadToolDetails, ThreadViewItem, ThreadViewSnapshot, UpdateThreadRequest, Workspace,
 };
 use trouve_thread_view::{MaterializedThreadItem, ThreadProjection};
 
@@ -5041,11 +5041,14 @@ enum StoreMutation {
     Update {
         id: String,
         title: Option<String>,
+        branch: Option<String>,
         archived: Option<bool>,
         expected_title: Option<String>,
     },
     UpdateThread {
         id: String,
+        title: Option<String>,
+        expected_title: Option<String>,
         mode: Option<String>,
         model: Option<String>,
         model_options: Option<serde_json::Map<String, serde_json::Value>>,
@@ -5442,14 +5445,17 @@ fn update_session_row(
     conn: &Connection,
     id: &str,
     title: Option<&str>,
+    branch: Option<&str>,
     archived: Option<bool>,
     expected_title: Option<&str>,
 ) -> Result<()> {
     let updated = conn.execute(
         "UPDATE sessions
-         SET title = COALESCE(?2, title), archived = COALESCE(?3, archived)
-         WHERE id = ?1 AND (?4 IS NULL OR title = ?4)",
-        params![id, title, archived, expected_title],
+         SET title = COALESCE(?2, title),
+             branch = COALESCE(?3, branch),
+             archived = COALESCE(?4, archived)
+         WHERE id = ?1 AND (?5 IS NULL OR title = ?5)",
+        params![id, title, branch, archived, expected_title],
     )?;
     anyhow::ensure!(
         updated == 1,
@@ -5458,24 +5464,30 @@ fn update_session_row(
     Ok(())
 }
 
-fn update_thread_row(
-    conn: &Connection,
-    id: &str,
-    mode: Option<&str>,
-    model: Option<&str>,
-    model_options: Option<&serde_json::Map<String, serde_json::Value>>,
-    permission_mode: Option<PermissionMode>,
-) -> Result<()> {
-    let model_options = model_options.map(serde_json::to_string).transpose()?;
-    let permission_mode = permission_mode.map(permission_mode_str);
+fn update_thread_row(conn: &Connection, id: &str, request: &UpdateThreadRequest) -> Result<()> {
+    let model_options = request
+        .model_options
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()?;
+    let permission_mode = request.permission_mode.map(permission_mode_str);
     let updated = conn.execute(
         "UPDATE threads
-         SET mode = COALESCE(?2, mode),
-             model = COALESCE(?3, model),
-             model_options = COALESCE(?4, model_options),
-             permission_mode = COALESCE(?5, permission_mode)
-         WHERE id = ?1",
-        params![id, mode, model, model_options, permission_mode],
+         SET title = COALESCE(?2, title),
+             mode = COALESCE(?3, mode),
+             model = COALESCE(?4, model),
+             model_options = COALESCE(?5, model_options),
+             permission_mode = COALESCE(?6, permission_mode)
+         WHERE id = ?1 AND (?7 IS NULL OR title = ?7)",
+        params![
+            id,
+            request.title,
+            request.mode,
+            request.model,
+            model_options,
+            permission_mode,
+            request.expected_title
+        ],
     )?;
     anyhow::ensure!(updated == 1, "thread {id} no longer exists");
     Ok(())
@@ -5764,17 +5776,21 @@ fn apply_store_mutation(
         StoreMutation::Update {
             id,
             title,
+            branch,
             archived,
             expected_title,
         } => update_session_row(
             conn,
             id,
             title.as_deref(),
+            branch.as_deref(),
             *archived,
             expected_title.as_deref(),
         )?,
         StoreMutation::UpdateThread {
             id,
+            title,
+            expected_title,
             mode,
             model,
             model_options,
@@ -5782,10 +5798,14 @@ fn apply_store_mutation(
         } => update_thread_row(
             conn,
             id,
-            mode.as_deref(),
-            model.as_deref(),
-            model_options.as_ref(),
-            *permission_mode,
+            &UpdateThreadRequest {
+                title: title.clone(),
+                expected_title: expected_title.clone(),
+                mode: mode.clone(),
+                model: model.clone(),
+                model_options: model_options.clone(),
+                permission_mode: *permission_mode,
+            },
         )?,
         StoreMutation::InsertThread {
             thread,
@@ -7302,6 +7322,36 @@ impl Store {
         Ok(out)
     }
 
+    /// Conversation text relevant to a navigation title, oldest first.
+    /// Filtering in SQLite avoids loading potentially large tool-output and
+    /// reasoning events merely to discard them in the naming path.
+    pub fn thread_naming_events(&self, thread_id: &str) -> Result<Vec<Event>> {
+        let payloads = {
+            let conn = self.conn.lock().unwrap();
+            let mut stmt = conn.prepare_cached(
+                "SELECT payload FROM events
+                 WHERE scope_kind = 'thread' AND scope_id = ?1
+                   AND json_extract(payload, '$.type') IN (
+                     'user.message', 'turn.steered', 'assistant.message'
+                   )
+                 ORDER BY cursor",
+            )?;
+            let rows = stmt.query_map(params![thread_id], |row| row.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut events = Vec::with_capacity(payloads.len());
+        for payload in payloads {
+            match serde_json::from_str(&payload) {
+                Ok(event) => events.push(event),
+                Err(error) => tracing::warn!(
+                    %thread_id,
+                    "skipping undeserializable naming event: {error}"
+                ),
+            }
+        }
+        Ok(events)
+    }
+
     /// Most recently persisted account PR snapshot event for `host`.
     ///
     /// The scan runs newest-first in bounded pages and stops at the first
@@ -7788,7 +7838,7 @@ impl Store {
         title: Option<&str>,
         archived: Option<bool>,
     ) -> Result<()> {
-        update_session_row(&self.conn.lock().unwrap(), id, title, archived, None)
+        update_session_row(&self.conn.lock().unwrap(), id, title, None, archived, None)
     }
 
     /// Rename/archive and append the lifecycle source event atomically.
@@ -7796,6 +7846,7 @@ impl Store {
         &self,
         id: &str,
         title: Option<&str>,
+        branch: Option<&str>,
         archived: Option<bool>,
         expected_title: Option<&str>,
         event: Event,
@@ -7805,6 +7856,7 @@ impl Store {
             StoreMutation::Update {
                 id: id.to_string(),
                 title: title.map(str::to_owned),
+                branch: branch.map(str::to_owned),
                 archived,
                 expected_title: expected_title.map(str::to_owned),
             },
@@ -8238,42 +8290,27 @@ impl Store {
         thread_statuses(&conn, session_id)
     }
 
-    /// Update thread settings between turns. `None` fields are unchanged.
-    pub fn update_thread(
-        &self,
-        id: &str,
-        mode: Option<&str>,
-        model: Option<&str>,
-        model_options: Option<&serde_json::Map<String, serde_json::Value>>,
-        permission_mode: Option<PermissionMode>,
-    ) -> Result<()> {
-        update_thread_row(
-            &self.conn.lock().unwrap(),
-            id,
-            mode,
-            model,
-            model_options,
-            permission_mode,
-        )
+    /// Update a thread title or settings between turns.
+    pub fn update_thread(&self, id: &str, request: &UpdateThreadRequest) -> Result<()> {
+        update_thread_row(&self.conn.lock().unwrap(), id, request)
     }
 
     pub(crate) fn update_thread_with_event(
         &self,
         id: &str,
-        mode: Option<&str>,
-        model: Option<&str>,
-        model_options: Option<&serde_json::Map<String, serde_json::Value>>,
-        permission_mode: Option<PermissionMode>,
+        request: &UpdateThreadRequest,
         event: Event,
     ) -> Result<EventEnvelope> {
         let pending = serialize_lifecycle_events(
             vec![(Scope::Server, event)],
             StoreMutation::UpdateThread {
                 id: id.to_string(),
-                mode: mode.map(str::to_owned),
-                model: model.map(str::to_owned),
-                model_options: model_options.cloned(),
-                permission_mode,
+                title: request.title.clone(),
+                expected_title: request.expected_title.clone(),
+                mode: request.mode.clone(),
+                model: request.model.clone(),
+                model_options: request.model_options.clone(),
+                permission_mode: request.permission_mode,
             },
         )?;
         Ok(self
@@ -18776,6 +18813,7 @@ mod tests {
         store
             .update_session_with_event(
                 "se_q",
+                None,
                 None,
                 Some(true),
                 None,

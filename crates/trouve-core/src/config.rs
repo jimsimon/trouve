@@ -48,16 +48,11 @@ pub struct Config {
     /// active. Unset means enabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_enabled: Option<bool>,
-    /// Lifecycle policy for the dedicated session-title model. Unset uses
-    /// adaptive loading.
+    /// Provider-qualified configured model used to name new sessions and threads.
+    /// Unset inherits `default_model`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub title_model_load_behavior: Option<trouve_protocol::TitleModelLoadBehavior>,
-    /// Compute resources available to the dedicated session-title model.
-    /// Unset preserves the historical CPU-only behavior.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub title_model_resource_policy: Option<trouve_protocol::TitleModelResourcePolicy>,
-    /// Whether new session branches include a slug derived from the session
-    /// title. Unset means compact `trouve/<short-id>` branches.
+    pub session_naming_model: Option<String>,
+    /// Rename a session's compact worktree branch after asynchronous naming.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub derive_branch_name_from_session_title: Option<bool>,
     /// Client id of a GitHub OAuth app (with device flow enabled) for
@@ -279,9 +274,7 @@ mod tests {
         assert_eq!(cfg.default_model.as_deref(), Some("openai/gpt"));
         assert_eq!(cfg.default_thinking_level.as_deref(), Some("high"));
         let mut cfg = cfg;
-        cfg.title_model_load_behavior = Some(trouve_protocol::TitleModelLoadBehavior::OnDemand);
-        cfg.title_model_resource_policy =
-            Some(trouve_protocol::TitleModelResourcePolicy::GpuCpuRam);
+        cfg.session_naming_model = Some("openai/gpt-5-mini".into());
         cfg.derive_branch_name_from_session_title = Some(true);
         cfg.code_review_max_parallel_reviews = Some(4);
         cfg.code_review_timeout_seconds = Some(1_200);
@@ -290,12 +283,8 @@ mod tests {
         cfg.save_to(&path).unwrap();
         let cfg = Config::load_from(&path);
         assert_eq!(
-            cfg.title_model_load_behavior,
-            Some(trouve_protocol::TitleModelLoadBehavior::OnDemand)
-        );
-        assert_eq!(
-            cfg.title_model_resource_policy,
-            Some(trouve_protocol::TitleModelResourcePolicy::GpuCpuRam)
+            cfg.session_naming_model.as_deref(),
+            Some("openai/gpt-5-mini")
         );
         assert_eq!(cfg.derive_branch_name_from_session_title, Some(true));
         assert_eq!(cfg.code_review_max_parallel_reviews, Some(4));

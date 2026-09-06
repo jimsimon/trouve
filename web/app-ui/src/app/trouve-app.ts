@@ -106,8 +106,9 @@ import {
 import {
   ProtocolClient,
   type ProtocolAgentPersona,
+  type ProtocolAttachmentUpload,
   type ProtocolEventEnvelope,
-  type ProtocolGeneratedSessionTitle,
+  type ProtocolGeneratedTitle,
   type ProtocolModelInfo,
   type ProtocolProvidersResponse,
   type ProtocolSubscriptionHealth,
@@ -151,7 +152,8 @@ import {
   resolveNewThreadDefaults,
   openNewSessionSetup,
   openNewSessionSetupForWorkspace,
-  sessionTitleFallback,
+  NEW_SESSION_TITLE_FALLBACK,
+  NEW_THREAD_TITLE_FALLBACK,
   settleNewSessionOptionLoad,
   snapshotNewSessionSubmission,
   thinkingOption,
@@ -2083,14 +2085,17 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       : {};
   }
 
-  /** Match the retained controller's bounded title-model request. Session
-   * creation must remain usable when the managed model or a remote provider
-   * accepts a connection but never completes it. */
-  async #generateSessionTitle(prompt: string): Promise<ProtocolGeneratedSessionTitle> {
+  /** Keep cosmetic naming bounded even when a configured provider accepts a
+   * connection but never completes it. */
+  async #generateTitle(
+    sessionId: string,
+    prompt: string,
+    attachments: readonly ProtocolAttachmentUpload[],
+  ): Promise<ProtocolGeneratedTitle> {
     const abort = new AbortController();
     const timeout = globalThis.setTimeout(() => abort.abort(), SESSION_TITLE_TIMEOUT_MS);
     try {
-      return await this.#protocolClient.generateSessionTitle(prompt, {
+      return await this.#protocolClient.generateTitle(sessionId, prompt, attachments, {
         signal: abort.signal,
       });
     } finally {
@@ -2104,10 +2109,12 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     sessionId: string,
     provisionalTitle: string,
     prompt: string,
+    attachments: readonly ProtocolAttachmentUpload[],
   ): void {
+    this.#store.beginSessionTitleGeneration(sessionId, provisionalTitle);
     void (async () => {
       try {
-        const generated = await this.#generateSessionTitle(prompt);
+        const generated = await this.#generateTitle(sessionId, prompt, attachments);
         const title = generated.title.trim();
         if (title === "" || title === provisionalTitle) return;
         if (this.#store.sessionMetadata(sessionId)?.title !== provisionalTitle) return;
@@ -2117,7 +2124,36 @@ export class TrouveApp extends withSignalTracking(LitElement) {
         });
         this.#store.upsertSessionMetadata(session);
       } catch {
-        // Naming is cosmetic; the deterministic provisional title remains.
+        // Naming is cosmetic; the placeholder remains.
+      } finally {
+        this.#store.endSessionTitleGeneration(sessionId);
+      }
+    })();
+  }
+
+  #upgradeThreadTitleInBackground(
+    threadId: string,
+    provisionalTitle: string,
+    prompt: string,
+    attachments: readonly ProtocolAttachmentUpload[],
+  ): void {
+    this.#store.beginThreadTitleGeneration(threadId, provisionalTitle);
+    void (async () => {
+      try {
+        const sessionId = this.#store.thread(threadId)?.session_id;
+        if (sessionId === undefined) return;
+        const generated = await this.#generateTitle(sessionId, prompt, attachments);
+        const title = generated.title.trim();
+        if (title === "" || title === provisionalTitle) return;
+        const thread = await this.#protocolClient.updateThread(threadId, {
+          title,
+          expected_title: provisionalTitle,
+        });
+        this.#store.upsertThread(thread);
+      } catch {
+        // Naming is cosmetic; the placeholder or a user rename remains.
+      } finally {
+        this.#store.endThreadTitleGeneration(threadId);
       }
     })();
   }
@@ -2432,7 +2468,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       ),
     });
     const submissionAttachments = this.#newSessionAttachments.map(({ upload }) => upload);
-    const title = retainedCreateRequest?.title ?? sessionTitleFallback(prompt);
+    const title = retainedCreateRequest?.title ?? NEW_SESSION_TITLE_FALLBACK;
     const createRequest = {
       workspaceId,
       title,
@@ -2480,20 +2516,29 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     }
 
     this.#store.upsertSessionMetadata(session);
-    if (retainedCreateRequest === undefined) {
-      this.#upgradeSessionTitleInBackground(session.id, submittedCreateRequest.title, prompt);
-    }
+    this.#upgradeSessionTitleInBackground(
+      session.id,
+      submittedCreateRequest.title,
+      prompt,
+      submissionAttachments,
+    );
     let threadId: string | undefined;
     try {
       const thread = await this.#protocolClient.createThread(
         createNewSessionThreadRequestFromSnapshot({
           sessionId: session.id,
-          title: session.title,
+          title: NEW_THREAD_TITLE_FALLBACK,
           snapshot: submissionOptions,
         }),
       );
       this.#store.upsertThread(thread);
       threadId = thread.id;
+      this.#upgradeThreadTitleInBackground(
+        thread.id,
+        thread.title ?? NEW_THREAD_TITLE_FALLBACK,
+        prompt,
+        submissionAttachments,
+      );
     } catch {
       this.#shellNotice = "Session created, but its first thread could not be created; the prompt was not sent.";
     }
@@ -2599,7 +2644,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     let createdSession: Awaited<ReturnType<ProtocolClient["createSession"]>> | undefined;
     try {
       if (sessionId === undefined) {
-        const title = sessionTitleFallback(detail.prompt);
+        const title = NEW_SESSION_TITLE_FALLBACK;
         createdSession = await this.#protocolClient.createSession({
           workspace_id: detail.workspaceId,
           title,
@@ -2607,16 +2652,22 @@ export class TrouveApp extends withSignalTracking(LitElement) {
           fetch_latest: true,
         });
         this.#store.upsertSessionMetadata(createdSession);
-        this.#upgradeSessionTitleInBackground(createdSession.id, title, detail.prompt);
+        this.#upgradeSessionTitleInBackground(createdSession.id, title, detail.prompt, []);
         sessionId = createdSession.id;
       }
 
       const thread = await this.#protocolClient.createThread({
         session_id: sessionId,
-        title: sessionTitleFallback(detail.prompt),
+        title: NEW_THREAD_TITLE_FALLBACK,
         mode: "code",
       });
       this.#store.upsertThread(thread);
+      this.#upgradeThreadTitleInBackground(
+        thread.id,
+        thread.title ?? NEW_THREAD_TITLE_FALLBACK,
+        detail.prompt,
+        [],
+      );
       let messageSent = true;
       try {
         await this.#protocolClient.sendMessage(thread.id, {

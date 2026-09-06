@@ -41,8 +41,8 @@ use crate::store::{
 use crate::tools::{
     AttachmentMaterialization, AttachmentMaterializationFile, DeletedSessionCleanup,
     LocalToolExecutor, MaterializedAttachment, McpConfigMutation, McpConfigMutationOutcome,
-    McpConfigMutationRequest, SessionRepositoryDiff, SessionRepositoryPush, ToolCtx, ToolExecutor,
-    ToolResult, edit_strategy_for_model,
+    McpConfigMutationRequest, SessionBranchRename, SessionRepositoryDiff, SessionRepositoryPush,
+    ToolCtx, ToolExecutor, ToolResult, edit_strategy_for_model,
 };
 use crate::{context, git, new_id, personas};
 
@@ -117,8 +117,6 @@ const TOOL_CANCEL_CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::fr
 const BACKEND_RETIREMENT_TIMEOUT: Duration = Duration::from_secs(30);
 const BACKEND_RETIREMENT_RETRY_INITIAL: Duration = Duration::from_secs(1);
 const BACKEND_RETIREMENT_RETRY_MAX: Duration = Duration::from_secs(30);
-#[cfg(not(test))]
-const API_PROVIDER_REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(test)]
 const API_PROVIDER_REFRESH_TIMEOUT: Duration = Duration::from_millis(250);
 #[cfg(not(test))]
@@ -3404,8 +3402,6 @@ pub struct Engine {
     /// Where provider configuration changes are persisted. `None` disables
     /// persistence (tests).
     config_file: Option<PathBuf>,
-    /// Serializes persistence and runtime application of title-model behavior.
-    title_model_behavior_transition: tokio::sync::Mutex<()>,
     /// One coherent snapshot of the defaults inherited by personas. Keeping
     /// these values under one lock prevents new threads from observing a
     /// partially applied global-defaults update.
@@ -3424,12 +3420,6 @@ pub struct Engine {
     cli_runtime_operations: Arc<Mutex<HashSet<String>>>,
     /// The llama-server sidecar behind the built-in "local" provider.
     local_manager: Arc<crate::local::LlamaManager>,
-    /// A separate sidecar for session titles with independently configured
-    /// resource placement.
-    title_model: Arc<crate::title_model::TitleModelManager>,
-    /// A timed-out generation stays tracked while its cold start finishes.
-    /// The next request cancels and joins it before starting another.
-    title_model_generation: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// The built-in "local" provider, kept around so enabling re-injects
     /// the same instance after a disable removed it from the registry.
     local_provider: Arc<dyn Provider>,
@@ -3854,17 +3844,6 @@ impl Engine {
         // Construction reaps llama-servers leaked by a crashed previous run
         // (they hold VRAM and would starve this run's model loads).
         let local_manager = Arc::new(crate::local::LlamaManager::new(&data_dir));
-        let title_model = Arc::new(crate::title_model::TitleModelManager::new(
-            data_dir.clone(),
-            config.title_model_load_behavior.unwrap_or_default(),
-            config.title_model_resource_policy.unwrap_or_default(),
-            config
-                .derive_branch_name_from_session_title
-                .unwrap_or(false),
-            &local_manager,
-            store.clone(),
-        ));
-        local_manager.set_adaptive_title(Arc::downgrade(&title_model));
         let local_provider: Arc<dyn Provider> = Arc::new(crate::local::LocalProvider::new(
             data_dir.clone(),
             config_dir.clone(),
@@ -3927,7 +3906,6 @@ impl Engine {
             // let test/embedded engines built from synthetic configs
             // clobber the user's config.toml on any provider change.
             config_file: None,
-            title_model_behavior_transition: tokio::sync::Mutex::new(()),
             global_defaults: RwLock::new(GlobalDefaults {
                 model: config
                     .default_model
@@ -3944,8 +3922,6 @@ impl Engine {
             test_cli_install_result: Mutex::new(None),
             cli_runtime_operations: Arc::new(Mutex::new(HashSet::new())),
             local_manager,
-            title_model,
-            title_model_generation: tokio::sync::Mutex::new(None),
             local_provider,
             local_downloads: Mutex::new(HashMap::new()),
             hardware: std::sync::OnceLock::new(),
@@ -5639,7 +5615,6 @@ impl Engine {
         };
         if cli == trouve_agents::install::CliId::LlamaServer {
             self.local_manager.stop().await;
-            self.title_model.stop().await;
         }
         let retirement = self.retire_config_backends_for_runtime(cli).await?;
         // Runtime-specific teardown removes the registry's leased wrapper
@@ -6691,7 +6666,6 @@ impl Engine {
             self.injected_providers.lock().unwrap().remove("local");
             self.providers.write().unwrap().remove("local");
             self.local_manager.stop().await;
-            self.title_model.local_model_stopped().await;
         }
         Ok(())
     }
@@ -6903,7 +6877,6 @@ impl Engine {
             .ok_or_else(|| EngineError::NotFound(format!("local model {id}")))?;
         if self.local_manager.running_model().as_deref() == Some(id) {
             self.local_manager.stop().await;
-            self.title_model.local_model_stopped().await;
         }
         self.local_downloads.lock().unwrap().remove(id);
         let gguf = crate::local::gguf_path(&self.data_dir, &entry);
@@ -6927,7 +6900,6 @@ impl Engine {
     /// local turn restarts it).
     pub async fn stop_local_server(&self) {
         self.local_manager.stop().await;
-        self.title_model.local_model_stopped().await;
     }
 
     /// Restart the llama-server sidecar with the model it is serving. The
@@ -7151,137 +7123,302 @@ impl Engine {
         Ok(())
     }
 
-    /// Current settings and runtime state for session naming.
-    pub fn git_worktree_settings(&self) -> trouve_protocol::GitWorktreeSettings {
-        self.title_model.settings()
+    pub fn session_naming_settings(&self) -> trouve_protocol::SessionNamingSettings {
+        let config = self.config.lock().unwrap();
+        trouve_protocol::SessionNamingSettings {
+            model: config
+                .session_naming_model
+                .clone()
+                .or_else(|| config.default_model.clone())
+                .unwrap_or_default(),
+            derive_branch_name_from_session_title: config
+                .derive_branch_name_from_session_title
+                .unwrap_or(false),
+        }
     }
 
-    /// Current settings paired with the server cursor they are at least as
-    /// fresh as. Read the cursor first so a concurrent status change can only
-    /// make the returned settings newer than the cursor, never older.
-    pub fn git_worktree_settings_snapshot(
+    pub fn session_naming_settings_snapshot(
         &self,
-    ) -> Result<(u64, trouve_protocol::GitWorktreeSettings), EngineError> {
+    ) -> Result<(u64, trouve_protocol::SessionNamingSettings), EngineError> {
         let cursor = self
             .store
             .latest_event_cursor(&trouve_protocol::Scope::Server)?;
-        Ok((cursor, self.git_worktree_settings()))
+        Ok((cursor, self.session_naming_settings()))
     }
 
-    /// Persist and immediately apply session-title lifecycle and placement.
-    pub async fn set_git_worktree_settings(
+    pub async fn set_session_naming_settings(
         &self,
-        behavior: trouve_protocol::TitleModelLoadBehavior,
-        resources: trouve_protocol::TitleModelResourcePolicy,
-        derive_branch_name_from_session_title: Option<bool>,
-    ) -> Result<trouve_protocol::GitWorktreeSettings, EngineError> {
-        if resources == trouve_protocol::TitleModelResourcePolicy::GpuOnly
-            && self.hardware().await.gpus.is_empty()
-        {
+        model: String,
+        derive_branch_name_from_session_title: bool,
+    ) -> Result<trouve_protocol::SessionNamingSettings, EngineError> {
+        let model = model.trim().to_string();
+        if model.is_empty() {
             return Err(EngineError::BadRequest(
-                "GPU-only session naming requires a detected GPU".into(),
+                "session naming model cannot be empty".into(),
             ));
         }
-        let _transition = self.title_model_behavior_transition.lock().await;
-        let derive_branch_name_from_session_title = derive_branch_name_from_session_title
-            .unwrap_or_else(|| self.title_model.derive_branch_name_from_session_title());
+        self.resolve_model_info(&model).await?;
         {
             let mut config = self.config.lock().unwrap();
-            config.title_model_load_behavior = Some(behavior);
-            config.title_model_resource_policy = Some(resources);
+            config.session_naming_model = Some(model);
             config.derive_branch_name_from_session_title =
                 Some(derive_branch_name_from_session_title);
             self.persist_config(&config);
         }
-        self.title_model
-            .set_configuration(behavior, resources, derive_branch_name_from_session_title)
-            .await;
-        Ok(self.git_worktree_settings())
+        let settings = self.session_naming_settings();
+        self.store.append_event(
+            Scope::Server,
+            Event::SessionNamingSettingsUpdated {
+                settings: settings.clone(),
+            },
+        )?;
+        Ok(settings)
     }
 
-    /// Warm the dedicated title model according to its configured lifecycle.
-    /// This is non-blocking and is safe to call once the Tokio runtime exists.
-    pub fn warm_title_model(&self) {
-        self.title_model.warm_on_start();
-    }
-
-    pub fn install_title_model(self: &Arc<Self>) -> Result<(), EngineError> {
-        let engine = Arc::downgrade(self);
-        self.title_model
-            .start_install(move || {
-                if let Some(engine) = engine.upgrade() {
-                    engine
-                        .cli_latest
-                        .lock()
-                        .unwrap()
-                        .remove(trouve_agents::install::CliId::LlamaServer.as_str());
-                    tokio::spawn(async move {
-                        engine.refresh_api_provider_registry().await;
-                    });
-                }
-            })
-            .map_err(|error| EngineError::Conflict(error.to_string()))?;
-        Ok(())
-    }
-
-    pub fn cancel_title_model_install(&self) -> Result<(), EngineError> {
-        match self.title_model.cancel_install() {
-            Ok(()) => Ok(()),
-            Err(error) if error.is::<crate::title_model::NoInstallInProgress>() => {
-                Err(EngineError::NotFound(error.to_string()))
-            }
-            Err(error) => Err(EngineError::Conflict(error.to_string())),
-        }
-    }
-
-    /// Derive a title without ever blocking session creation on optional
-    /// model assets or model-quality failures.
-    pub async fn generate_session_title(
+    pub async fn generate_title(
         &self,
+        session_id: &str,
         prompt: &str,
-    ) -> trouve_protocol::GeneratedSessionTitle {
-        let title_model = self.title_model.clone();
-        let prompt_owned = prompt.to_string();
-        let generated = match tokio::time::timeout(SESSION_TITLE_TIMEOUT, async {
-            let mut generation = self.title_model_generation.lock().await;
-            if let Some(previous) = generation.as_mut() {
-                previous.abort();
-                let _ = previous.await;
-            }
-            generation.take();
-
-            let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-            *generation = Some(tokio::spawn(async move {
-                let _ = result_tx.send(title_model.generate(&prompt_owned).await);
-            }));
-            drop(generation);
-
-            result_rx
+        attachments: &[trouve_protocol::AttachmentUpload],
+    ) -> Result<trouve_protocol::GeneratedTitle, EngineError> {
+        let session = self.get_session(session_id)?;
+        let settings = self.session_naming_settings();
+        if settings.model.is_empty() {
+            return Err(EngineError::BadRequest(
+                "configure a session naming model first".into(),
+            ));
+        }
+        let model_info = self.resolve_model_info(&settings.model).await?;
+        let model_options = crate::title_model::model_options(&model_info);
+        if let Some((_, backend, model_name)) = self.backend_for(&settings.model) {
+            use base64::Engine as _;
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let backend_attachments = attachments
+                .iter()
+                .filter(|_| model_info.supports_images)
+                .filter(|attachment| attachment.mime.starts_with("image/"))
+                .map(|attachment| {
+                    let bytes = base64::engine::general_purpose::STANDARD
+                        .decode(&attachment.data)
+                        .map_err(|error| EngineError::BadRequest(error.to_string()))?;
+                    Ok(trouve_agents::TurnAttachment {
+                        name: attachment.name.clone(),
+                        mime: attachment.mime.clone(),
+                        bytes: Arc::from(bytes),
+                        local_path: None,
+                    })
+                })
+                .collect::<Result<Vec<_>, EngineError>>()?;
+            let turn = BackendTurn {
+                cancel: cancel.clone(),
+                thread_id: format!("title_{}", uuid::Uuid::new_v4()),
+                worktree: PathBuf::from(session.worktree_path),
+                session: None,
+                model: model_name,
+                model_options: model_options.clone(),
+                prompt: crate::title_model::backend_prompt(prompt),
+                attachments: backend_attachments,
+                instructions: None,
+                permission: BackendPermission::ReadOnly,
+                tool_free: true,
+                attach_background: false,
+                mcp_bridge: None,
+                mcp_servers: Vec::new(),
+            };
+            let title = tokio::time::timeout(SESSION_TITLE_TIMEOUT, async {
+                let mut stream = backend
+                    .run_turn(turn)
+                    .await
+                    .map_err(|error| EngineError::BadRequest(error.to_string()))?;
+                let mut output = String::new();
+                while let Some(event) = stream.next().await {
+                    match event.map_err(|error| EngineError::BadRequest(error.to_string()))? {
+                        BackendEvent::TextDelta(delta) => output.push_str(&delta),
+                        BackendEvent::ToolStarted { .. }
+                        | BackendEvent::ToolOutput { .. }
+                        | BackendEvent::ToolCompleted { .. } => {
+                            cancel.cancel();
+                            return Err(EngineError::BadRequest(
+                                "naming backend attempted to use a tool".into(),
+                            ));
+                        }
+                        BackendEvent::ApprovalNeeded { responder, .. } => {
+                            let _ = responder.send(false);
+                        }
+                        BackendEvent::QuestionsNeeded { responder, .. } => {
+                            let _ = responder.send(None);
+                        }
+                        _ => {}
+                    }
+                }
+                crate::title_model::title_from_output(prompt, &output)
+                    .map_err(|error| EngineError::BadRequest(error.to_string()))
+            })
+            .await
+            .map_err(|_| {
+                cancel.cancel();
+                EngineError::BadRequest("title generation timed out".into())
+            })??;
+            return Ok(trouve_protocol::GeneratedTitle { title });
+        }
+        let (provider, model_name) = self.resolve_provider(&settings.model)?;
+        let images = attachments
+            .iter()
+            .filter(|_| model_info.supports_images)
+            .filter(|attachment| attachment.mime.starts_with("image/"))
+            .map(|attachment| trouve_providers::ToolImage {
+                mime: attachment.mime.clone(),
+                data: attachment.data.clone(),
+            })
+            .collect();
+        let messages = crate::title_model::messages(prompt, images);
+        let title = tokio::time::timeout(SESSION_TITLE_TIMEOUT, async {
+            let mut stream = provider
+                .stream_chat(&model_name, &messages, &[], &model_options)
                 .await
-                .map_err(|error| anyhow!("session title task failed: {error}"))?
+                .map_err(|error| EngineError::BadRequest(error.to_string()))?;
+            let mut output = String::new();
+            while let Some(event) = stream.next().await {
+                if let ProviderEvent::TextDelta(delta) =
+                    event.map_err(|error| EngineError::BadRequest(error.to_string()))?
+                {
+                    output.push_str(&delta);
+                }
+            }
+            crate::title_model::title_from_output(prompt, &output)
+                .map_err(|error| EngineError::BadRequest(error.to_string()))
         })
         .await
-        {
-            Ok(result) => result,
-            Err(_) => Err(anyhow!("session title generation timed out")),
-        };
-        match generated {
-            Ok(title) => trouve_protocol::GeneratedSessionTitle {
-                title,
-                source: "model".into(),
-            },
-            Err(error) => {
-                tracing::debug!("using heuristic session title: {error:#}");
-                trouve_protocol::GeneratedSessionTitle {
-                    title: crate::title::summarize_session_title(prompt),
-                    source: "heuristic".into(),
+        .map_err(|_| EngineError::BadRequest("title generation timed out".into()))??;
+        Ok(trouve_protocol::GeneratedTitle { title })
+    }
+
+    /// Derive a manual rename suggestion from the user-visible conversation,
+    /// rather than retrying only the session's original prompt. Tool output,
+    /// progress, and reasoning are deliberately excluded from this context.
+    pub async fn generate_session_title_from_transcript(
+        &self,
+        session_id: &str,
+    ) -> Result<trouve_protocol::GeneratedTitle, EngineError> {
+        self.get_session(session_id)?;
+        let mut threads = self.list_threads(session_id)?;
+        threads.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        self.generate_title_from_transcript_threads(session_id, &threads)
+            .await
+    }
+
+    /// Derive a manual rename suggestion for one thread. The thread remains
+    /// independently nameable even when it is the session's initial thread.
+    pub async fn generate_thread_title_from_transcript(
+        &self,
+        thread_id: &str,
+    ) -> Result<trouve_protocol::GeneratedTitle, EngineError> {
+        let thread = self.get_thread(thread_id)?;
+        let session_id = thread.session_id.clone();
+        self.generate_title_from_transcript_threads(&session_id, &[thread])
+            .await
+    }
+
+    async fn generate_title_from_transcript_threads(
+        &self,
+        session_id: &str,
+        threads: &[trouve_protocol::Thread],
+    ) -> Result<trouve_protocol::GeneratedTitle, EngineError> {
+        use base64::Engine as _;
+
+        let mut context = String::new();
+        let mut attachment_refs = Vec::new();
+        for (index, thread) in threads.iter().enumerate() {
+            let events = self.store.thread_naming_events(&thread.id)?;
+            let mut has_content = false;
+            for event in events {
+                let (role, content, attachments) = match event {
+                    Event::UserMessage {
+                        content,
+                        attachments,
+                        background: false,
+                        ..
+                    }
+                    | Event::TurnSteered {
+                        content,
+                        attachments,
+                        ..
+                    } => ("User", content, attachments),
+                    Event::AssistantMessage { content, .. } => {
+                        ("Assistant outcome", content, Vec::new())
+                    }
+                    _ => continue,
+                };
+                let content = content.trim();
+                if content.is_empty() && attachments.is_empty() {
+                    continue;
                 }
+                if !has_content {
+                    if !context.is_empty() {
+                        context.push_str("\n\n");
+                    }
+                    context.push_str(&format!("Thread {}:\n", index + 1));
+                    has_content = true;
+                }
+                if !content.is_empty() {
+                    context.push_str(role);
+                    context.push_str(": ");
+                    context.push_str(content);
+                    context.push('\n');
+                }
+                attachment_refs.extend(attachments);
             }
         }
+        if context.trim().is_empty() && attachment_refs.is_empty() {
+            return Err(EngineError::BadRequest(
+                "the session has no conversation to name".into(),
+            ));
+        }
+
+        let settings = self.session_naming_settings();
+        if settings.model.is_empty() {
+            return Err(EngineError::BadRequest(
+                "configure a session naming model first".into(),
+            ));
+        }
+        let supports_images = self
+            .resolve_model_info(&settings.model)
+            .await?
+            .supports_images;
+        let mut uploads = Vec::new();
+        let mut retained_bytes = 0_u64;
+        if supports_images {
+            for attachment in attachment_refs
+                .into_iter()
+                .rev()
+                .filter(|attachment| attachment.mime.starts_with("image/"))
+                .take(4)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+            {
+                if retained_bytes.saturating_add(attachment.size_bytes) > 20 * 1024 * 1024 {
+                    continue;
+                }
+                let (_, bytes) = self.attachment(&attachment.id).await?;
+                retained_bytes = retained_bytes.saturating_add(attachment.size_bytes);
+                uploads.push(trouve_protocol::AttachmentUpload {
+                    name: attachment.name,
+                    mime: attachment.mime,
+                    data: base64::engine::general_purpose::STANDARD.encode(bytes),
+                });
+            }
+        }
+        self.generate_title(session_id, &context, &uploads).await
     }
 
     async fn generate_subagent_title(
         &self,
+        session_id: &str,
         supplied_name: Option<&str>,
         prompt: Option<&str>,
     ) -> Option<String> {
@@ -7289,7 +7426,10 @@ impl Engine {
             Some(name) => name.to_string(),
             None => {
                 let prompt = prompt.map(str::trim).filter(|prompt| !prompt.is_empty())?;
-                self.generate_session_title(prompt).await.title
+                self.generate_title(session_id, prompt, &[])
+                    .await
+                    .ok()?
+                    .title
             }
         };
         let normalized = name.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -7661,6 +7801,7 @@ impl Engine {
     /// Refresh API-backed providers without touching long-lived vendor
     /// backends. Local/title-model lifecycle changes historically refreshed
     /// provider metadata, but they do not change any agent runtime.
+    #[cfg(test)]
     async fn refresh_api_provider_registry(self: &Arc<Self>) {
         let _transition = self.provider_reload.clone().write_owned().await;
         let config = self.config.lock().unwrap().clone();
@@ -9500,13 +9641,13 @@ impl Engine {
             }
         }
 
-        let git_worktree_settings = self.git_worktree_settings();
+        let session_naming_settings = self.session_naming_settings();
         Ok((
             cursor,
             trouve_protocol::ServerProjection {
                 github_pull_requests,
                 session_pull_requests,
-                git_worktree_settings,
+                session_naming_settings,
             },
         ))
     }
@@ -11436,14 +11577,10 @@ impl Engine {
         let ws =
             self.workspace_for_session_creation(&req.workspace_id, adopt_workspace_registration)?;
         let repo = PathBuf::from(&ws.path);
-        let title = req.title.unwrap_or_else(|| "New session".into());
+        let title = req.title.unwrap_or_else(|| "New Session".into());
         let session_id = new_id("se");
         let checkpoint_id = new_id("cp");
-        let branch = session_branch_name(
-            &title,
-            &session_id,
-            self.title_model.derive_branch_name_from_session_title(),
-        );
+        let branch = session_branch_name(&title, &session_id, false);
         let worktree_path = git::worktree_dir(&self.data_dir, &session_id);
         let fetch_latest = req.fetch_latest;
         if self.store.session(&session_id)?.is_some() {
@@ -11719,6 +11856,7 @@ impl Engine {
             self.store.update_session_with_event(
                 id,
                 req.title.as_deref(),
+                None,
                 req.archived,
                 req.expected_title.as_deref(),
                 Event::SessionUpdated {
@@ -11747,6 +11885,69 @@ impl Engine {
             session
         };
         Ok(updated)
+    }
+
+    pub async fn rename_session_branch_for_title(
+        &self,
+        session_id: &str,
+        title: &str,
+    ) -> Result<Session, EngineError> {
+        if !self
+            .session_naming_settings()
+            .derive_branch_name_from_session_title
+        {
+            return self.get_session(session_id);
+        }
+        let session = self.get_session(session_id)?;
+        if session.title != title {
+            return Ok(session);
+        }
+        let desired = session_branch_name(title, session_id, true);
+        if desired == session.branch {
+            return Ok(session);
+        }
+        let request = SessionBranchRename {
+            managed_root: git::worktree_dir(&self.data_dir, ""),
+            worktree: PathBuf::from(&session.worktree_path),
+            old_branch: session.branch.clone(),
+            new_branch: desired.clone(),
+        };
+        self.executor
+            .rename_session_branch(&request)
+            .await
+            .map_err(|error| EngineError::Internal(anyhow!(error)))?;
+        let current = self.get_session(session_id)?;
+        if current.title != title {
+            let rollback = SessionBranchRename {
+                managed_root: git::worktree_dir(&self.data_dir, ""),
+                worktree: PathBuf::from(&session.worktree_path),
+                old_branch: desired,
+                new_branch: session.branch,
+            };
+            let _ = self.executor.rename_session_branch(&rollback).await;
+            return Ok(current);
+        }
+        if let Err(error) = self.store.update_session_with_event(
+            session_id,
+            None,
+            Some(&desired),
+            None,
+            Some(title),
+            Event::SessionUpdated {
+                session_id: session_id.to_string(),
+                workspace_id: session.workspace_id,
+            },
+        ) {
+            let rollback = SessionBranchRename {
+                managed_root: git::worktree_dir(&self.data_dir, ""),
+                worktree: PathBuf::from(&session.worktree_path),
+                old_branch: desired,
+                new_branch: session.branch,
+            };
+            let _ = self.executor.rename_session_branch(&rollback).await;
+            return Err(error.into());
+        }
+        self.get_session(session_id)
     }
 
     pub async fn delete_session(&self, id: &str) -> Result<(), EngineError> {
@@ -11903,6 +12104,7 @@ impl Engine {
             parent_thread_id: spawn.map(|(parent, _)| parent.to_string()),
             title: req
                 .title
+                .or_else(|| Some("New Thread".into()))
                 .map(|title| title.split_whitespace().collect::<Vec<_>>().join(" "))
                 .map(|title| title.chars().take(96).collect::<String>())
                 .filter(|title| !title.is_empty()),
@@ -12137,7 +12339,19 @@ impl Engine {
         id: &str,
         req: &UpdateThreadRequest,
     ) -> Result<Thread, EngineError> {
+        if req.expected_title.is_some() && req.title.is_none() {
+            return Err(EngineError::BadRequest(
+                "expected_title requires a title update".into(),
+            ));
+        }
         let thread = self.get_thread(id)?;
+        if let Some(expected_title) = req.expected_title.as_deref()
+            && thread.title.as_deref() != Some(expected_title)
+        {
+            return Err(EngineError::Conflict(format!(
+                "thread {id} title changed before the generated title was ready"
+            )));
+        }
         if self.subagent_is_read_only(&thread)? {
             return Err(EngineError::Conflict(
                 "this subagent uses a read-only exploration, audit, or review mode".into(),
@@ -12169,6 +12383,13 @@ impl Engine {
             .store
             .session(&thread.session_id)?
             .ok_or_else(|| EngineError::NotFound(format!("session {}", thread.session_id)))?;
+        if let Some(expected_title) = req.expected_title.as_deref()
+            && thread.title.as_deref() != Some(expected_title)
+        {
+            return Err(EngineError::Conflict(format!(
+                "thread {id} title changed before the generated title was ready"
+            )));
+        }
 
         if let Some(mode_id) = req.mode.as_deref() {
             let ws = self.store.workspace(&session.workspace_id)?.unwrap();
@@ -12188,10 +12409,7 @@ impl Engine {
         }
         self.store.update_thread_with_event(
             id,
-            req.mode.as_deref(),
-            req.model.as_deref(),
-            req.model_options.as_ref(),
-            req.permission_mode,
+            req,
             Event::ThreadUpdated {
                 thread_id: id.to_string(),
                 session_id: session.id,
@@ -15725,7 +15943,7 @@ impl Engine {
             })
         });
         let title = self
-            .generate_subagent_title(name.as_deref(), prompt.as_deref())
+            .generate_subagent_title(&session.id, name.as_deref(), prompt.as_deref())
             .await;
         let child_mode = self.backend_collaborator_mode(session, &inherited_thread, access)?;
         let collaborator_mode = personas::find_persona(&all_modes, &child_mode)
@@ -18695,12 +18913,16 @@ impl Engine {
         let generated_title = if supplied_child_name.is_none()
             || (name == "spawn_session" && explicit_session_title.is_none())
         {
-            Some(self.generate_session_title(prompt).await.title)
+            self.generate_title(&session.id, prompt, &[])
+                .await
+                .ok()
+                .map(|generated| generated.title)
         } else {
             None
         };
         let child_title = self
             .generate_subagent_title(
+                &session.id,
                 supplied_child_name
                     .as_deref()
                     .or(generated_title.as_deref()),
@@ -22823,6 +23045,7 @@ mod tests {
             display_name: display_name.into(),
             context_window: 100_000,
             supports_tools: true,
+            supports_images: false,
             input_price_per_mtok: None,
             output_price_per_mtok: None,
             options_schema: if id.ends_with("/static") {
@@ -24426,10 +24649,10 @@ mod tests {
         let mut collaborators = HashMap::new();
         assert_eq!(
             engine
-                .generate_subagent_title(None, Some("Investigate the failing test"))
-                .await
-                .as_deref(),
-            Some("Subagent: Investigate failing test")
+                .generate_subagent_title("se_test", None, Some("Investigate the failing test"))
+                .await,
+            None,
+            "prompt-derived subagent names require a configured naming model"
         );
         engine
             .start_backend_collaborator(
@@ -28955,6 +29178,7 @@ default_permission_mode = "ask"
             display_name: "GPT".into(),
             context_window: 100_000,
             supports_tools: true,
+            supports_images: false,
             input_price_per_mtok: None,
             output_price_per_mtok: None,
             options_schema: serde_json::json!({
@@ -29067,6 +29291,7 @@ default_permission_mode = "ask"
             display_name: "Options".into(),
             context_window: 100_000,
             supports_tools: true,
+            supports_images: false,
             input_price_per_mtok: None,
             output_price_per_mtok: None,
             options_schema: serde_json::json!({
@@ -30562,47 +30787,6 @@ default_permission_mode = "ask"
                 .unwrap()
                 .iter()
                 .all(|(_, result)| result.is_ok())
-        );
-    }
-
-    #[tokio::test]
-    async fn gpu_only_title_settings_require_a_detected_gpu_before_transition() {
-        let data = tempfile::tempdir().unwrap();
-        let engine = Engine::new(
-            Store::open_in_memory().unwrap(),
-            data.path().to_path_buf(),
-            &Config::default(),
-        );
-        engine
-            .hardware
-            .set(crate::local::Hardware {
-                ram_bytes: 16 * 1024 * 1024 * 1024,
-                gpus: Vec::new(),
-            })
-            .unwrap();
-
-        let _transition = engine.title_model_behavior_transition.lock().await;
-        let error = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            engine.set_git_worktree_settings(
-                trouve_protocol::TitleModelLoadBehavior::Always,
-                trouve_protocol::TitleModelResourcePolicy::GpuOnly,
-                None,
-            ),
-        )
-        .await
-        .expect("hardware validation must run before waiting for the transition lock")
-        .unwrap_err();
-
-        assert!(matches!(error, EngineError::BadRequest(ref message)
-                if message == "GPU-only session naming requires a detected GPU"));
-        let config = engine.config.lock().unwrap();
-        assert_eq!(config.title_model_load_behavior, None);
-        assert_eq!(config.title_model_resource_policy, None);
-        drop(config);
-        assert_eq!(
-            engine.git_worktree_settings().title_model_resource_policy,
-            trouve_protocol::TitleModelResourcePolicy::CpuRamOnly
         );
     }
 

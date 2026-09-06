@@ -359,7 +359,7 @@ export class TrouveSettingsScreen extends withSignalTracking(LitElement) {
                             <p class="settings-note">When off, started, completed, cancelled, and skipped TODO updates stay visible on the turn rail and separate collapsible tool-call groups.</p>
                           </div>
                         </div>
-                        <trouve-git-worktree-settings></trouve-git-worktree-settings>
+                        <trouve-session-naming-settings></trouve-session-naming-settings>
                       </div>
                     `
                 : active === "personas"
