@@ -21,6 +21,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   disposition label, and an `unresolve` command to reopen them. Findings fixed
   in code continue to leave the list automatically.
 
+### Fixed
+
+- **Subscription usage survives a throttled usage endpoint**: the Usage panel
+  no longer reports "the Claude CLI reported no usage windows" when
+  Anthropic's `/api/oauth/usage` endpoint answers 429 to the Claude CLI's
+  probe. The engine now explains that the endpoint is temporarily
+  rate-limiting requests, keeps the last good reading (up to 15 minutes old,
+  labelled with its age) on screen through the outage, and serves every
+  provider's usage from a per-provider cache with a 60 s fresh window and
+  exponential failure backoff, so many open clients no longer each spawn a
+  vendor probe and trip the limit themselves.
+
 ## [4.9.0] - 2026-09-05
 
 This release makes automated reviews quieter and more reliable, improves large

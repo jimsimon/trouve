@@ -3406,6 +3406,13 @@ pub struct Engine {
     /// add sections to an entry on demand instead of repeating GitHub's rich
     /// nested detail query on every render or pane switch.
     github_pr_detail_cache: Mutex<GithubPrDetailCache>,
+    /// Per-provider subscription-usage readings with freshness and failure
+    /// backoff, so many clients polling do not each spawn a vendor probe
+    /// (and trip Anthropic's usage-endpoint rate limit).
+    subscription_health_cache: Mutex<crate::subscription_health::SubscriptionHealthCache>,
+    /// Serializes usage probes so concurrent requests that all miss the
+    /// cache at once result in one vendor query, not one per client.
+    subscription_health_probe: tokio::sync::Mutex<()>,
     /// Orders authenticated-host capture, cache registration, and snapshot
     /// publication against host removal without holding the cache map lock
     /// across event-log writes.
@@ -3919,6 +3926,8 @@ impl Engine {
             resume_after_cancel: Mutex::new(HashSet::new()),
             github_dashboard_caches: Mutex::new(HashMap::new()),
             github_pr_detail_cache: Mutex::new(GithubPrDetailCache::default()),
+            subscription_health_cache: Mutex::new(Default::default()),
+            subscription_health_probe: tokio::sync::Mutex::new(()),
             github_dashboard_publication: Mutex::new(()),
             provider_locks: Mutex::new(HashMap::new()),
             provider_transition_locks: Mutex::new(HashMap::new()),
@@ -9964,28 +9973,18 @@ impl Engine {
     /// key for an ephemeral token before calling the dashboard's undocumented
     /// usage RPC. Kimi Code uses the key stored for its provider preset
     /// against the same `/usages` endpoint as Kimi's open-source CLI.
+    ///
+    /// Results are served from a per-provider cache with failure backoff
+    /// (see [`crate::subscription_health`]); probes run one at a time so a
+    /// burst of clients missing the cache together still costs one query.
     pub async fn subscription_health(&self) -> Vec<trouve_protocol::SubscriptionHealth> {
+        let _probe_lane = self.subscription_health_probe.lock().await;
         let backends: Vec<(String, Arc<dyn AgentBackend>)> = {
             let map = self.backends.read().unwrap();
             let mut list: Vec<_> = map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
             list.sort_by(|a, b| a.0.cmp(&b.0));
             list
         };
-        let mut out = Vec::new();
-        for (id, backend) in backends {
-            match backend.subscription_health().await {
-                Some(health) => out.push(health),
-                None => out.push(trouve_protocol::SubscriptionHealth {
-                    provider_id: id,
-                    status: "unsupported".into(),
-                    plan: String::new(),
-                    windows: Vec::new(),
-                    credits: String::new(),
-                    note: "This vendor does not provide subscription usage to third-party apps."
-                        .into(),
-                }),
-            }
-        }
         let kimi_configs: Vec<(String, ProviderConfig)> = {
             let config = self.config.lock().unwrap();
             config
@@ -10000,6 +9999,37 @@ impl Engine {
                 .map(|(id, provider)| (id.clone(), provider.clone()))
                 .collect()
         };
+        {
+            let known: HashSet<&str> = backends
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .chain(kimi_configs.iter().map(|(id, _)| id.as_str()))
+                .collect();
+            self.subscription_health_cache
+                .lock()
+                .unwrap()
+                .retain(|id| known.contains(id));
+        }
+        let mut out = Vec::new();
+        for (id, backend) in backends {
+            let health = self
+                .cached_subscription_health(&id, || async {
+                    backend.subscription_health().await.unwrap_or_else(|| {
+                        trouve_protocol::SubscriptionHealth {
+                            provider_id: id.clone(),
+                            status: "unsupported".into(),
+                            plan: String::new(),
+                            windows: Vec::new(),
+                            credits: String::new(),
+                            note: "This vendor does not provide subscription usage to \
+                                   third-party apps."
+                                .into(),
+                        }
+                    })
+                })
+                .await;
+            out.push(health);
+        }
         for (id, provider) in kimi_configs {
             let Some(api_key) = resolved_api_key(&id, &provider, &self.secrets) else {
                 out.push(trouve_protocol::SubscriptionHealth {
@@ -10017,12 +10047,41 @@ impl Engine {
                 .base_url
                 .as_deref()
                 .unwrap_or(trouve_providers::kimi_usage::KIMI_CODE_BASE_URL);
-            out.push(
-                trouve_providers::kimi_usage::subscription_health(&id, base_url, &api_key).await,
-            );
+            let health = self
+                .cached_subscription_health(&id, || {
+                    trouve_providers::kimi_usage::subscription_health(&id, base_url, &api_key)
+                })
+                .await;
+            out.push(health);
         }
         out.sort_by(|a, b| a.provider_id.cmp(&b.provider_id));
         out
+    }
+
+    /// Serve `provider_id` from the usage cache, running `probe` only when
+    /// its fresh window or failure backoff has lapsed.
+    async fn cached_subscription_health<F, Fut>(
+        &self,
+        provider_id: &str,
+        probe: F,
+    ) -> trouve_protocol::SubscriptionHealth
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = trouve_protocol::SubscriptionHealth>,
+    {
+        let cached = self
+            .subscription_health_cache
+            .lock()
+            .unwrap()
+            .lookup(provider_id, Instant::now());
+        if let Some(health) = cached {
+            return health;
+        }
+        let health = probe().await;
+        self.subscription_health_cache
+            .lock()
+            .unwrap()
+            .record(provider_id, health, Instant::now())
     }
 
     /// Whether GitHub calls can authenticate, per host. The top-level

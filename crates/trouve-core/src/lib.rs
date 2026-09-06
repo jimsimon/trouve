@@ -20,6 +20,7 @@ pub mod review;
 pub mod reviewers;
 pub mod skills;
 pub mod store;
+pub mod subscription_health;
 pub mod terminal;
 pub mod title_model;
 pub mod tools;
