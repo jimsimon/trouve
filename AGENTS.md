@@ -103,7 +103,7 @@ These are load-bearing. Do not violate them without a new ADR.
     apply (ADR 0046). Trouve-owned work that intentionally outlives its caller
     is declared before launch and transferred to a scoped managed-background
     owner together with its cancellation and resource leases; self-daemonizing
-    is never an implicit ownership transfer (ADR 0048).
+    is never an implicit ownership transfer (ADR 0049).
 
 ## Conventions
 
