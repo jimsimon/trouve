@@ -31,6 +31,9 @@ const CLEANUP_ACKNOWLEDGEMENT_ATTEMPTS: u32 = 3;
 /// How long a foreground call waits without stdout/stderr activity after its
 /// leader exits. Each new chunk resets the grace period.
 const POST_EXIT_PIPE_IDLE_GRACE: Duration = Duration::from_millis(200);
+/// Absolute post-exit drain budget. A descendant that continually writes to an
+/// inherited pipe cannot retain a foreground tool call indefinitely.
+const POST_EXIT_PIPE_DRAIN_LIMIT: Duration = Duration::from_secs(1);
 /// Time a released daemon gets to exit after SIGTERM at worktree eviction
 /// before it is killed.
 const DETACHED_EXIT_GRACE: Duration = Duration::from_secs(2);
@@ -966,29 +969,28 @@ impl Capture {
     }
 
     /// Wait for end-of-file. When something outside the tree may hold the
-    /// pipe, stop only after the stream has been idle for `idle_limit`;
-    /// every new chunk starts a fresh grace period so late diagnostics are
-    /// not cut off by a deadline measured from leader exit.
-    async fn finish(mut self, idle_limit: Option<Duration>) -> CapturedOutput {
-        match idle_limit {
-            None => {
-                let _ = (&mut self.reader).await;
-            }
-            Some(limit) => loop {
-                tokio::select! {
-                    _ = &mut self.reader => break,
-                    changed = self.activity.changed() => {
-                        if changed.is_err() {
-                            let _ = (&mut self.reader).await;
-                            break;
-                        }
-                    }
-                    _ = tokio::time::sleep(limit) => {
-                        self.reader.abort();
+    /// pipe, stop after either the stream has been idle for the idle limit or
+    /// the absolute limit expires. New chunks reset only the idle grace.
+    async fn finish(mut self, idle_limit: Duration, absolute_limit: Duration) -> CapturedOutput {
+        let absolute_deadline = tokio::time::Instant::now() + absolute_limit;
+        loop {
+            tokio::select! {
+                _ = &mut self.reader => break,
+                changed = self.activity.changed() => {
+                    if changed.is_err() {
+                        let _ = (&mut self.reader).await;
                         break;
                     }
                 }
-            },
+                _ = tokio::time::sleep(idle_limit) => {
+                    self.reader.abort();
+                    break;
+                }
+                _ = tokio::time::sleep_until(absolute_deadline) => {
+                    self.reader.abort();
+                    break;
+                }
+            }
         }
         std::mem::take(&mut *self.buffer.lock().unwrap())
     }
@@ -1029,8 +1031,8 @@ async fn foreground_result(
     cleanup_warning: Option<&str>,
 ) -> ToolResult {
     let (stdout, stderr) = tokio::join!(
-        stdout.finish(Some(POST_EXIT_PIPE_IDLE_GRACE)),
-        stderr.finish(Some(POST_EXIT_PIPE_IDLE_GRACE))
+        stdout.finish(POST_EXIT_PIPE_IDLE_GRACE, POST_EXIT_PIPE_DRAIN_LIMIT),
+        stderr.finish(POST_EXIT_PIPE_IDLE_GRACE, POST_EXIT_PIPE_DRAIN_LIMIT)
     );
     let (stdout, stdout_truncated) = stdout.into_string();
     let (stderr, stderr_truncated) = stderr.into_string();
@@ -1691,9 +1693,71 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(1)).await;
         });
 
-        let output = capture.finish(Some(Duration::from_millis(60))).await;
+        let output = capture
+            .finish(Duration::from_millis(60), Duration::from_secs(1))
+            .await;
 
         assert_eq!(output.into_string().0, "first-second-third");
+    }
+
+    #[tokio::test]
+    async fn foreground_capture_has_an_absolute_post_exit_deadline() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let (mut writer, reader) = tokio::io::duplex(1024);
+        let capture = Capture::start(Some(reader));
+        tokio::spawn(async move {
+            loop {
+                if writer.write_all(b"x").await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+
+        let output = tokio::time::timeout(
+            Duration::from_millis(500),
+            capture.finish(Duration::from_millis(40), Duration::from_millis(150)),
+        )
+        .await
+        .expect("continuous output must not extend the absolute drain deadline");
+        assert!(!output.bytes.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn foreground_shell_bounds_continuously_writing_detached_pipe_holder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ready = tmp.path().join("writer-ready");
+        let ctx = ToolCtx {
+            worktree: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let (shell, _, _) = tools();
+        let command = format!(
+            "setsid /bin/sh -c 'trap \"\" PIPE; : > \"$1\"; while :; do printf x || true; sleep 0.05; done' daemon '{}' & while [ ! -e '{}' ]; do sleep 0.01; done",
+            ready.display(),
+            ready.display()
+        );
+
+        let started = tokio::time::Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            shell.run(&ctx, &json!({ "command": command })),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        shell.jobs.kill_worktree(tmp.path()).await.unwrap();
+
+        let result = result.expect("detached output must not retain the foreground call");
+        assert_eq!(result.status, trouve_protocol::ToolStatus::Ok);
+        let stdout = result.result["stdout"].as_str().unwrap();
+        assert!(!stdout.is_empty());
+        assert!(stdout.len() <= MAX_CAPTURE_BYTES);
+        assert!(
+            elapsed >= Duration::from_millis(800),
+            "fixture did not keep the inherited pipe active: {elapsed:?}"
+        );
     }
 
     #[tokio::test]

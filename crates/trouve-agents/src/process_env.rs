@@ -20,9 +20,10 @@ use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 const PATH_MARKER: &str = "__TROUVE_LOGIN_SHELL_PATH__";
 const PATH_CAPTURE_TIMEOUT: Duration = Duration::from_secs(3);
 const PROCESS_TREE_REAP_TIMEOUT: Duration = Duration::from_secs(5);
-/// Holder enumeration walks `/proc`; retry often enough to close fork races
-/// promptly without turning the acknowledgement poll into a continuous scan.
-const PROCESS_TREE_SWEEP_INTERVAL: Duration = Duration::from_millis(50);
+/// Holder enumeration walks every process descriptor table. Rescans start
+/// promptly to close fork races, then back off while a stubborn tree exits.
+const PROCESS_TREE_SWEEP_INITIAL_INTERVAL: Duration = Duration::from_millis(50);
+const PROCESS_TREE_SWEEP_MAX_INTERVAL: Duration = Duration::from_millis(400);
 /// Enumerating sentinel holders walks every `/proc/*/fd` directory. Under
 /// [`DetachedPolicy::Release`] a tree whose group is already empty re-scans at
 /// most this often while it waits for a same-session holder to exit.
@@ -1378,6 +1379,7 @@ fn wait_for_blocking_process_tree_exit_until(
     deadline: Instant,
 ) -> std::io::Result<()> {
     let mut next_sweep = Instant::now();
+    let mut sweep_interval = PROCESS_TREE_SWEEP_INITIAL_INTERVAL;
     while blocking_process_tree_active(child)? {
         let now = Instant::now();
         if now >= deadline {
@@ -1388,7 +1390,8 @@ fn wait_for_blocking_process_tree_exit_until(
         }
         if now >= next_sweep {
             sweep_remaining_blocking_process_tree(child)?;
-            next_sweep = Instant::now() + PROCESS_TREE_SWEEP_INTERVAL;
+            next_sweep = Instant::now() + sweep_interval;
+            sweep_interval = (sweep_interval * 2).min(PROCESS_TREE_SWEEP_MAX_INTERVAL);
         }
         std::thread::sleep(Duration::from_millis(10).min(deadline - now));
     }
@@ -1512,6 +1515,7 @@ async fn wait_for_platform_process_tree_exit_until(
     deadline: tokio::time::Instant,
 ) -> std::io::Result<()> {
     let mut next_sweep = tokio::time::Instant::now();
+    let mut sweep_interval = PROCESS_TREE_SWEEP_INITIAL_INTERVAL;
     while platform_process_tree_active(child)? {
         let now = tokio::time::Instant::now();
         if now >= deadline {
@@ -1521,8 +1525,9 @@ async fn wait_for_platform_process_tree_exit_until(
             ));
         }
         if now >= next_sweep {
-            sweep_remaining_platform_process_tree(child)?;
-            next_sweep = tokio::time::Instant::now() + PROCESS_TREE_SWEEP_INTERVAL;
+            sweep_remaining_platform_process_tree(child).await?;
+            next_sweep = tokio::time::Instant::now() + sweep_interval;
+            sweep_interval = (sweep_interval * 2).min(PROCESS_TREE_SWEEP_MAX_INTERVAL);
         }
         tokio::time::sleep(Duration::from_millis(10).min(deadline - now)).await;
     }
@@ -1530,19 +1535,46 @@ async fn wait_for_platform_process_tree_exit_until(
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn sweep_remaining_platform_process_tree(child: &mut ProcessTreeChild) -> std::io::Result<()> {
+async fn sweep_remaining_platform_process_tree(
+    child: &mut ProcessTreeChild,
+) -> std::io::Result<()> {
     child.holder_scan = None;
-    terminate_unix_sentinel_holders(
-        &child.descendant_sentinel,
-        child.process_group,
-        child.detached_policy,
-        &mut child.detached,
-        &mut child.terminated_escapees,
-    )
+    let sentinel = child.descendant_sentinel.try_clone()?;
+    let process_group = child.process_group;
+    let detached_policy = child.detached_policy;
+    let (result, detached, terminated) = tokio::task::spawn_blocking(move || {
+        let mut detached = Vec::new();
+        let mut terminated = Vec::new();
+        let result = terminate_unix_sentinel_holders(
+            &sentinel,
+            process_group,
+            detached_policy,
+            &mut detached,
+            &mut terminated,
+        );
+        (result, detached, terminated)
+    })
+    .await
+    .map_err(|error| std::io::Error::other(format!("process-tree sweep task failed: {error}")))?;
+    for process in detached {
+        record_detached(&mut child.detached, process);
+    }
+    for process in terminated {
+        if !child
+            .terminated_escapees
+            .iter()
+            .any(|known| known.pid == process.pid)
+        {
+            child.terminated_escapees.push(process);
+        }
+    }
+    result
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
-fn sweep_remaining_platform_process_tree(_child: &mut ProcessTreeChild) -> std::io::Result<()> {
+async fn sweep_remaining_platform_process_tree(
+    _child: &mut ProcessTreeChild,
+) -> std::io::Result<()> {
     Ok(())
 }
 

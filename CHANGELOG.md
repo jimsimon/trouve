@@ -12,10 +12,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and Android process owners now keep enumerating and killing newly inherited
   sentinel holders until the tree is empty or the existing cleanup deadline
   expires, closing fork-during-termination races across Git, providers, MCP,
-  probes, and shell calls. Foreground shell output uses an activity-resetting
-  post-exit idle grace instead of waiting indefinitely for inherited pipes,
-  and any tree whose bounded cleanup remains unacknowledged transfers to the
-  session registry for another attempt during worktree eviction.
+  probes, and shell calls. Expensive holder rescans run on the blocking pool
+  and back off adaptively. Foreground shell output keeps an activity-resetting
+  idle grace for late diagnostics plus an absolute post-exit deadline, and any
+  tree whose bounded cleanup remains unacknowledged transfers to the session
+  registry for another attempt during worktree eviction.
 - **Non-gating review findings stay off pull requests**: credible findings that
   are not mechanically tied to the reviewed change remain available in
   trouve's dashboard and durable review history, but no longer appear in the
