@@ -16,9 +16,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   back off adaptively, and honor the tree's absolute reap deadline while
   scanning and signalling. Foreground shell output keeps an activity-resetting
   idle grace plus an absolute post-exit deadline. Unacknowledged foreground
-  trees transfer through an eviction-safe handoff, are reaped opportunistically
-  during later shell admission, and apply backpressure at a fixed registry
-  capacity.
+  trees transfer through cancellation-safe, counted eviction handoffs, are
+  reaped opportunistically during later shell admission, and reserve bounded
+  registry capacity before process launch.
 - **Background work has an explicit owner**: trouve-owned subsystems can move
   intentional long-lived work into a cancelling, coalescing registry without
   trusting arbitrary detached descendants. Review fetches now schedule bounded
