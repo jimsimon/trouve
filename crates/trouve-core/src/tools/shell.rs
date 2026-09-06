@@ -2,7 +2,7 @@
 //! (the classic one-shot) or as a background job the model can poll with
 //! `shell_output` and stop with `shell_kill` — dev servers, long builds.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -28,6 +28,8 @@ const CLEANUP_RETRY_DELAY: Duration = Duration::from_millis(50);
 /// attempt is itself bounded by the process-tree reap timeout) before the
 /// call transfers ownership and releases the mutation lane.
 const CLEANUP_ACKNOWLEDGEMENT_ATTEMPTS: u32 = 3;
+const MAX_PENDING_FOREGROUND_TREES: usize = 16;
+const PENDING_REAP_PER_CALL: usize = 4;
 /// How long a foreground call waits without stdout/stderr activity after its
 /// leader exits. Each new chunk resets the grace period.
 const POST_EXIT_PIPE_IDLE_GRACE: Duration = Duration::from_millis(200);
@@ -667,6 +669,88 @@ impl PendingTree {
     }
 }
 
+#[derive(Default)]
+struct ForegroundHandoffRegistry {
+    state: Mutex<ForegroundHandoffState>,
+    changed: tokio::sync::Notify,
+}
+
+#[derive(Default)]
+struct ForegroundHandoffState {
+    active: HashMap<PathBuf, usize>,
+    evicting: HashSet<PathBuf>,
+}
+
+struct ForegroundHandoff {
+    registry: Arc<ForegroundHandoffRegistry>,
+    worktree: PathBuf,
+}
+
+struct ForegroundEviction {
+    registry: Arc<ForegroundHandoffRegistry>,
+    worktree: PathBuf,
+}
+
+impl ForegroundHandoffRegistry {
+    fn begin(self: &Arc<Self>, worktree: &Path) -> Result<ForegroundHandoff, String> {
+        let mut state = self.state.lock().unwrap();
+        if state.evicting.contains(worktree) {
+            return Err("session worktree is being evicted".to_owned());
+        }
+        *state.active.entry(worktree.to_path_buf()).or_insert(0) += 1;
+        Ok(ForegroundHandoff {
+            registry: self.clone(),
+            worktree: worktree.to_path_buf(),
+        })
+    }
+
+    async fn begin_eviction(self: &Arc<Self>, worktree: &Path) -> ForegroundEviction {
+        loop {
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let idle = {
+                let mut state = self.state.lock().unwrap();
+                state.evicting.insert(worktree.to_path_buf());
+                !state.active.contains_key(worktree)
+            };
+            if idle {
+                return ForegroundEviction {
+                    registry: self.clone(),
+                    worktree: worktree.to_path_buf(),
+                };
+            }
+            notified.await;
+        }
+    }
+}
+
+impl Drop for ForegroundHandoff {
+    fn drop(&mut self) {
+        let mut state = self.registry.state.lock().unwrap();
+        if let Some(active) = state.active.get_mut(&self.worktree) {
+            *active -= 1;
+            if *active == 0 {
+                state.active.remove(&self.worktree);
+            }
+        }
+        drop(state);
+        self.registry.changed.notify_waiters();
+    }
+}
+
+impl Drop for ForegroundEviction {
+    fn drop(&mut self) {
+        self.registry
+            .state
+            .lock()
+            .unwrap()
+            .evicting
+            .remove(&self.worktree);
+        self.registry.changed.notify_waiters();
+    }
+}
+
 /// One background job: its shared handle and the model's read cursor.
 struct Job {
     handle: JobHandle,
@@ -698,6 +782,7 @@ pub struct JobRegistry {
     pending: Mutex<Vec<PendingTree>>,
     cleanup: Arc<CleanupController>,
     detached: Arc<DetachedRegistry>,
+    foreground_handoffs: Arc<ForegroundHandoffRegistry>,
 }
 
 static JOB_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -806,6 +891,58 @@ enum ForegroundCleanup {
 }
 
 impl JobRegistry {
+    fn begin_foreground(&self, worktree: &Path) -> Result<ForegroundHandoff, String> {
+        self.reap_settled_pending();
+        if self.pending.lock().unwrap().len() >= MAX_PENDING_FOREGROUND_TREES {
+            return Err(format!(
+                "{MAX_PENDING_FOREGROUND_TREES} foreground process trees are awaiting cleanup; retry after they exit or evict their session"
+            ));
+        }
+        self.foreground_handoffs.begin(worktree)
+    }
+
+    /// Remove a bounded number of retained trees that have since exited.
+    /// This runs on ordinary shell admission so active sessions reclaim
+    /// settled process handles without waiting for worktree eviction.
+    fn reap_settled_pending(&self) {
+        let candidates: Vec<PendingTree> = {
+            let mut pending = self.pending.lock().unwrap();
+            let take = PENDING_REAP_PER_CALL.min(pending.len());
+            let candidates = pending.iter().take(take).cloned().collect();
+            // Rotate inspected entries so a long-lived tree cannot starve
+            // later settled trees from this bounded admission-time sweep.
+            pending.rotate_left(take);
+            candidates
+        };
+        for tree in candidates {
+            let Ok(mut child) = tree.child.try_lock() else {
+                continue;
+            };
+            match child.try_wait_tree() {
+                Ok(Some(_)) => {
+                    let remnants = self.detached.adopt(&tree.worktree, &mut child);
+                    if !remnants.is_empty() {
+                        tracing::info!(
+                            worktree = %tree.worktree.display(),
+                            "opportunistically reaped foreground tree produced cleanup remnants"
+                        );
+                    }
+                    drop(child);
+                    self.pending
+                        .lock()
+                        .unwrap()
+                        .retain(|known| !Arc::ptr_eq(&known.child, &tree.child));
+                }
+                Ok(None) => {}
+                Err(error) => tracing::debug!(
+                    worktree = %tree.worktree.display(),
+                    %error,
+                    "could not opportunistically inspect retained foreground tree"
+                ),
+            }
+        }
+    }
+
     /// Transfer a foreground tree to the registry before returning an
     /// unacknowledged cleanup result. The tree remains attached to its
     /// session worktree and is retried when that worktree is evicted.
@@ -863,6 +1000,8 @@ impl JobRegistry {
     /// removed. Closing a call or job without proving its tree empty spares
     /// the caller a wait; it does not release ownership.
     pub async fn kill_worktree(&self, worktree: &Path) -> Result<(), String> {
+        let _foreground_eviction = self.foreground_handoffs.begin_eviction(worktree).await;
+        self.reap_settled_pending();
         let jobs: Vec<(String, JobHandle)> = {
             let jobs = self.jobs.lock().unwrap();
             jobs.iter()
@@ -1108,6 +1247,10 @@ impl Tool for Shell {
         {
             return self.spawn_background(ctx, command).await;
         }
+        let _foreground_handoff = match self.jobs.begin_foreground(&ctx.worktree) {
+            Ok(handoff) => handoff,
+            Err(error) => return ToolResult::error(error),
+        };
         let timeout = Duration::from_secs(
             args.get("timeout_secs")
                 .and_then(Value::as_u64)
@@ -2403,6 +2546,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn worktree_eviction_waits_for_foreground_tree_handoff() {
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = Arc::new(JobRegistry::default());
+        let handoff = registry.begin_foreground(tmp.path()).unwrap();
+        let mut command = tokio::process::Command::new("sh");
+        command.arg("-c").arg("sleep 60");
+        let child = Arc::new(tokio::sync::Mutex::new(
+            spawn_process_tree(&mut command).unwrap(),
+        ));
+        registry
+            .cleanup
+            .injected_failures
+            .store(1, Ordering::SeqCst);
+
+        let eviction = {
+            let registry = registry.clone();
+            let worktree = tmp.path().to_path_buf();
+            tokio::spawn(async move { registry.kill_worktree(&worktree).await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!eviction.is_finished());
+
+        registry.retain_foreground_tree(tmp.path(), child);
+        drop(handoff);
+        eviction.await.unwrap().unwrap();
+        assert!(
+            registry.pending.lock().unwrap().is_empty(),
+            "eviction missed the foreground tree transferred while it waited"
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_admission_reaps_a_settled_foreground_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = JobRegistry::default();
+        let mut command = tokio::process::Command::new("sh");
+        command.arg("-c").arg("true");
+        let child = Arc::new(tokio::sync::Mutex::new(
+            spawn_process_tree(&mut command).unwrap(),
+        ));
+        registry.retain_foreground_tree(tmp.path(), child);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !registry.pending.lock().unwrap().is_empty() {
+                registry.reap_settled_pending();
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("settled foreground tree was not opportunistically reaped");
+    }
+
+    #[tokio::test]
+    async fn foreground_admission_applies_backpressure_at_retained_tree_capacity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = JobRegistry::default();
+        let mut command = tokio::process::Command::new("sh");
+        command.arg("-c").arg("sleep 60");
+        let child = Arc::new(tokio::sync::Mutex::new(
+            spawn_process_tree(&mut command).unwrap(),
+        ));
+        for _ in 0..MAX_PENDING_FOREGROUND_TREES {
+            registry.retain_foreground_tree(tmp.path(), child.clone());
+        }
+
+        let error = registry
+            .begin_foreground(tmp.path())
+            .err()
+            .expect("capacity must reject another foreground tree");
+        assert!(
+            error.contains("foreground process trees are awaiting cleanup"),
+            "{error}"
+        );
+
+        registry.pending.lock().unwrap().clear();
+        child.lock().await.terminate_and_reap().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn lifetime_cap_closes_the_job_after_the_acknowledgement_bound() {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = ToolCtx {
@@ -2593,45 +2815,16 @@ mod tests {
     }
 
     /// An eviction stays on record while a call started from the worktree
-    /// is in flight, however many other worktrees are evicted meanwhile:
-    /// the daemon that call hands over at its end is stopped, not kept.
-    #[cfg(target_os = "linux")]
+    /// is in flight, however many other worktrees are evicted meanwhile.
     #[tokio::test]
     async fn eviction_stays_on_record_while_a_call_is_in_flight() {
-        require_setsid();
         let tmp = tempfile::tempdir().unwrap();
         let other = tempfile::tempdir().unwrap();
-        let ctx = ToolCtx {
-            worktree: tmp.path().to_path_buf(),
-            ..Default::default()
-        };
-        let (shell, _, _) = tools();
-        let jobs = shell.jobs.clone();
-        // One remembered eviction: the next one would push ours out.
+        let jobs = JobRegistry::default();
+        // One remembered eviction: the next one would push ours out unless
+        // its in-flight ownership protects it.
         jobs.detached.state.lock().unwrap().evicted_limit = 1;
-
-        // The call starts its daemon only once told to, so the evictions
-        // are on record before the hand-over.
-        let command = format!("while [ ! -e go ]; do sleep 0.01; done; {SETSID_DAEMON}");
-        let call = tokio::spawn(async move {
-            shell
-                .run(&ctx, &json!({"command": command, "timeout_secs": 5}))
-                .await
-        });
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while !jobs
-                .detached
-                .state
-                .lock()
-                .unwrap()
-                .in_flight
-                .contains_key(tmp.path())
-            {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("the call never went in flight");
+        let in_flight = InFlightCall::begin(&jobs.detached, tmp.path());
 
         jobs.kill_worktree(tmp.path()).await.unwrap();
         jobs.kill_worktree(other.path()).await.unwrap();
@@ -2645,30 +2838,8 @@ mod tests {
             );
         }
 
-        std::fs::write(tmp.path().join("go"), b"").unwrap();
-        let res = tokio::time::timeout(Duration::from_secs(5), call)
-            .await
-            .expect("the call did not finish")
-            .unwrap();
-        assert_eq!(
-            res.status,
-            trouve_protocol::ToolStatus::Ok,
-            "{:?}",
-            res.result
-        );
-        let child_pid = wait_for_pid_file(&tmp.path().join("child.pid")).await;
-        assert_eq!(
-            reported_pids(&res.result, "stopped_after_eviction"),
-            vec![child_pid]
-        );
-        assert!(res.result.get("detached").is_none(), "{:?}", res.result);
-        wait_for_process_exit(child_pid).await;
-
         // With nothing in flight the record is trimmed to the limit again.
-        assert!(
-            jobs.detached.state.lock().unwrap().in_flight.is_empty(),
-            "the finished call is still in flight"
-        );
+        drop(in_flight);
         jobs.kill_worktree(other.path()).await.unwrap();
         let state = jobs.detached.state.lock().unwrap();
         assert_eq!(state.evicted.len(), 1);

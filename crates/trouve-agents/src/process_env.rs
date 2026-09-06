@@ -1389,7 +1389,7 @@ fn wait_for_blocking_process_tree_exit_until(
             ));
         }
         if now >= next_sweep {
-            sweep_remaining_blocking_process_tree(child)?;
+            sweep_remaining_blocking_process_tree(child, deadline)?;
             next_sweep = Instant::now() + sweep_interval;
             sweep_interval = (sweep_interval * 2).min(PROCESS_TREE_SWEEP_MAX_INTERVAL);
         }
@@ -1400,24 +1400,24 @@ fn wait_for_blocking_process_tree_exit_until(
 
 /// Re-scan holders that escaped the original process group while cleanup was
 /// signalling an earlier snapshot. A descendant can fork between enumeration
-/// and SIGKILL; waiting on the sentinel alone would then retain the new holder
-/// until the cleanup deadline without ever signalling it.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn sweep_remaining_blocking_process_tree(
     child: &mut BlockingProcessTreeChild,
+    deadline: Instant,
 ) -> std::io::Result<()> {
-    terminate_unix_sentinel_holders(
+    terminate_unix_sentinel_holders_until(
         &child.descendant_sentinel,
         child.process_group,
         DetachedPolicy::Terminate,
         &mut Vec::new(),
         &mut Vec::new(),
+        Some(deadline),
     )
 }
-
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 fn sweep_remaining_blocking_process_tree(
     _child: &mut BlockingProcessTreeChild,
+    _deadline: Instant,
 ) -> std::io::Result<()> {
     Ok(())
 }
@@ -1525,7 +1525,7 @@ async fn wait_for_platform_process_tree_exit_until(
             ));
         }
         if now >= next_sweep {
-            sweep_remaining_platform_process_tree(child).await?;
+            sweep_remaining_platform_process_tree(child, deadline).await?;
             next_sweep = tokio::time::Instant::now() + sweep_interval;
             sweep_interval = (sweep_interval * 2).min(PROCESS_TREE_SWEEP_MAX_INTERVAL);
         }
@@ -1533,29 +1533,40 @@ async fn wait_for_platform_process_tree_exit_until(
     }
     Ok(())
 }
-
 #[cfg(any(target_os = "linux", target_os = "android"))]
 async fn sweep_remaining_platform_process_tree(
     child: &mut ProcessTreeChild,
+    deadline: tokio::time::Instant,
 ) -> std::io::Result<()> {
     child.holder_scan = None;
     let sentinel = child.descendant_sentinel.try_clone()?;
     let process_group = child.process_group;
     let detached_policy = child.detached_policy;
-    let (result, detached, terminated) = tokio::task::spawn_blocking(move || {
+    let blocking_deadline =
+        Instant::now() + deadline.saturating_duration_since(tokio::time::Instant::now());
+    let mut sweep = tokio::task::spawn_blocking(move || {
         let mut detached = Vec::new();
         let mut terminated = Vec::new();
-        let result = terminate_unix_sentinel_holders(
+        let result = terminate_unix_sentinel_holders_until(
             &sentinel,
             process_group,
             detached_policy,
             &mut detached,
             &mut terminated,
+            Some(blocking_deadline),
         );
         (result, detached, terminated)
-    })
-    .await
+    });
+    let outcome = match tokio::time::timeout_at(deadline, &mut sweep).await {
+        Ok(outcome) => outcome,
+        Err(_) => {
+            sweep.abort();
+            let _ = sweep.await;
+            return Err(process_tree_reap_timeout());
+        }
+    }
     .map_err(|error| std::io::Error::other(format!("process-tree sweep task failed: {error}")))?;
+    let (result, detached, terminated) = outcome;
     for process in detached {
         record_detached(&mut child.detached, process);
     }
@@ -1574,6 +1585,7 @@ async fn sweep_remaining_platform_process_tree(
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 async fn sweep_remaining_platform_process_tree(
     _child: &mut ProcessTreeChild,
+    _deadline: tokio::time::Instant,
 ) -> std::io::Result<()> {
     Ok(())
 }
@@ -2031,10 +2043,22 @@ fn linux_sentinel_holders(
     sentinel: &OwnedFd,
     tree_leader: i32,
 ) -> std::io::Result<Vec<SentinelHolder>> {
+    linux_sentinel_holders_until(sentinel, tree_leader, None)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn linux_sentinel_holders_until(
+    sentinel: &OwnedFd,
+    tree_leader: i32,
+    deadline: Option<Instant>,
+) -> std::io::Result<Vec<SentinelHolder>> {
     let sentinel_target = std::fs::read_link(format!("/proc/self/fd/{}", sentinel.as_raw_fd()))?;
     let own_pid = i32::try_from(std::process::id()).unwrap_or(-1);
     let mut holders = Vec::new();
     for process in std::fs::read_dir("/proc")? {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(process_tree_reap_timeout());
+        }
         let Ok(process) = process else { continue };
         let Some(pid) = process
             .file_name()
@@ -2049,9 +2073,16 @@ fn linux_sentinel_holders(
         let Ok(descriptors) = std::fs::read_dir(process.path().join("fd")) else {
             continue;
         };
-        let holds_sentinel = descriptors.filter_map(Result::ok).any(|descriptor| {
-            std::fs::read_link(descriptor.path()).is_ok_and(|target| target == sentinel_target)
-        });
+        let mut holds_sentinel = false;
+        for descriptor in descriptors.filter_map(Result::ok) {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Err(process_tree_reap_timeout());
+            }
+            if std::fs::read_link(descriptor.path()).is_ok_and(|target| target == sentinel_target) {
+                holds_sentinel = true;
+                break;
+            }
+        }
         if !holds_sentinel {
             continue;
         }
@@ -2150,12 +2181,27 @@ fn terminate_unix_sentinel_holders(
     detached: &mut Vec<DetachedProcess>,
     terminated: &mut Vec<TerminatedEscapee>,
 ) -> std::io::Result<()> {
+    terminate_unix_sentinel_holders_until(sentinel, tree_leader, policy, detached, terminated, None)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn terminate_unix_sentinel_holders_until(
+    sentinel: &OwnedFd,
+    tree_leader: i32,
+    policy: DetachedPolicy,
+    detached: &mut Vec<DetachedProcess>,
+    terminated: &mut Vec<TerminatedEscapee>,
+    deadline: Option<Instant>,
+) -> std::io::Result<()> {
     let own_session = unsafe { libc::getsid(0) };
     let mut first_error = None;
-    let holders = linux_sentinel_holders(sentinel, tree_leader)?;
+    let holders = linux_sentinel_holders_until(sentinel, tree_leader, deadline)?;
     #[cfg(test)]
     run_after_sentinel_holder_scan_hook();
     for holder in holders {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(process_tree_reap_timeout());
+        }
         if policy == DetachedPolicy::Release
             && holder.stat.session != own_session
             && let Some(process) = holder.released()
@@ -2188,6 +2234,14 @@ fn terminate_unix_sentinel_holders(
         }
     }
     first_error.map_or(Ok(()), Err)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn process_tree_reap_timeout() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "timed out waiting for terminated process tree",
+    )
 }
 
 #[cfg(all(
@@ -3033,6 +3087,27 @@ mod tests {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         spawn_process_tree(&mut command).unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn sentinel_holder_scan_honors_an_expired_reap_deadline() {
+        let directory = tempfile::tempdir().unwrap();
+        let pid_path = directory.path().join("descendant.pid");
+        let mut child = process_tree_fixture(&pid_path);
+        let descendant = spawned_descendant_pid(&pid_path).await;
+
+        let error = linux_sentinel_holders_until(
+            &child.descendant_sentinel,
+            child.process_group,
+            Some(Instant::now()),
+        )
+        .err()
+        .expect("expired holder scan should time out");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+
+        child.terminate_and_reap().await.unwrap();
+        assert_process_tree_member_stopped(descendant).await;
     }
 
     #[cfg(target_os = "linux")]
