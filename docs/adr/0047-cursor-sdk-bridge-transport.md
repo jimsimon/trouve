@@ -1,6 +1,6 @@
 # ADR 0047: Cursor SDK Bridge transport
 
-Status: Accepted (2026-08)
+Status: Partially superseded by ADR 0050 (2026-09)
 
 ## Context
 
