@@ -1369,7 +1369,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     this.#threadTabContextMenu = {
       threadId,
       x: Math.max(4, Math.min(pointerX, globalThis.innerWidth - 158)),
-      y: Math.max(4, Math.min(pointerY, globalThis.innerHeight - 82)),
+      y: Math.max(4, Math.min(pointerY, globalThis.innerHeight - 112)),
     };
     this.#threadSwitcherOpen = false;
     this.requestUpdate();
@@ -1432,12 +1432,21 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         @keydown=${this.#threadTabContextMenuKeydown}
       >
         <button type="button" role="menuitem" tabindex="-1" @click=${() => this.#startThreadRename(thread.id)}>Rename</button>
+        <button type="button" role="menuitem" tabindex="-1" @click=${() => void this.#copyThreadId(thread.id)}>Copy Thread Id</button>
         <button type="button" role="menuitem" tabindex="-1" @click=${() => {
           this.#threadTabContextMenu = undefined;
           this.#closeThreadTabById(thread.id);
         }}>Close</button>
       </div>
     `;
+  }
+
+  async #copyThreadId(threadId: string): Promise<void> {
+    this.#threadTabContextMenu = undefined;
+    this.requestUpdate();
+    const result = await copyChatText(threadId, globalThis.navigator?.clipboard);
+    this.#markdownContextMenuStatus = `Thread id: ${copyActionLabel(result)}`;
+    this.requestUpdate();
   }
 
   #startThreadRename(threadId: string): void {

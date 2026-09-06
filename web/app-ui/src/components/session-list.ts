@@ -16,6 +16,7 @@ import {
   type SessionPullRequestBadge,
 } from "./session-pull-request-badge.js";
 import { fontAwesomeIcon } from "./font-awesome-icon.js";
+import { copyChatText } from "./chat-presentation.js";
 import {
   organizeWorkspaceSessions,
   pullRequestKind,
@@ -340,6 +341,7 @@ export class TrouveSessionList extends withSignalTracking(LitElement) {
           ? html`
               <div class="session-actions" role="menu" aria-label=${`Actions for ${session.title}`} style=${`left:${this.#menuPosition.x}px;top:${this.#menuPosition.y}px`} @contextmenu=${(event: Event) => event.preventDefault()} @keydown=${this.#contextMenuKeydown}>
                 <button type="button" role="menuitem" tabindex="-1" @click=${() => this.#startRename(session)}>Rename</button>
+                <button type="button" role="menuitem" tabindex="-1" @click=${() => void this.#copySessionId(session.id)}>Copy Session Id</button>
                 <button type="button" role="menuitem" tabindex="-1" ?disabled=${this.#busySessionId === session.id} @click=${() => this.#setArchived(session.id, !session.archived)}>${session.archived ? "Unarchive" : "Archive"}</button>
                 <button class="danger" type="button" role="menuitem" tabindex="-1" @click=${() => this.#confirmDelete(session)}>Delete…</button>
               </div>
@@ -405,7 +407,7 @@ export class TrouveSessionList extends withSignalTracking(LitElement) {
       : bounds.bottom;
     this.#menuPosition = {
       x: Math.max(4, Math.min(pointerX, globalThis.innerWidth - 158)),
-      y: Math.max(4, Math.min(pointerY, globalThis.innerHeight - 118)),
+      y: Math.max(4, Math.min(pointerY, globalThis.innerHeight - 148)),
     };
     this.#menuSessionId = sessionId;
     this.#editingSessionId = "";
@@ -520,6 +522,15 @@ export class TrouveSessionList extends withSignalTracking(LitElement) {
       { archived },
       archived ? "Session could not be archived." : "Session could not be restored.",
     );
+  }
+
+  async #copySessionId(sessionId: string): Promise<void> {
+    this.#closeActions();
+    const result = await copyChatText(sessionId, globalThis.navigator?.clipboard);
+    if (result !== "copied") {
+      this.#requestError = "Session id could not be copied.";
+      this.requestUpdate();
+    }
   }
 
   async #updateSession(
