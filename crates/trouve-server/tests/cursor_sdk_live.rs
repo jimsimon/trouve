@@ -953,6 +953,7 @@ async fn replay_review_job(
     base: &str,
     engine: &Arc<Engine>,
     qualification_job_id: &str,
+    replay_model: &str,
     job_url: &str,
 ) -> Result<ReviewReplaySummary, String> {
     let endpoints = review_job_endpoints(job_url)?;
@@ -1067,15 +1068,14 @@ async fn replay_review_job(
         let engine = engine.clone();
         let session_id = replay_session_id.clone();
         let qualification_job_id = qualification_job_id.to_string();
+        // Replay the recorded prompt and revisions, but deliberately qualify
+        // Cursor rather than whichever provider produced the original run.
+        let replay_model = replay_model.to_string();
         let task_base = endpoints.tasks.clone();
         async move {
             let task_id = task["id"]
                 .as_str()
                 .ok_or_else(|| "review task omitted id".to_string())?
-                .to_string();
-            let model = task["model"]
-                .as_str()
-                .ok_or_else(|| format!("review task {task_id} omitted model"))?
                 .to_string();
             let detail: serde_json::Value = client
                 .get(format!("{task_base}/tasks/{task_id}"))
@@ -1099,7 +1099,7 @@ async fn replay_review_job(
                 &qualification_job_id,
                 &task_id,
                 &format!("Replay {task_id}"),
-                &model,
+                &replay_model,
                 prompt,
             )
             .await
@@ -1643,9 +1643,15 @@ async fn cursor_sdk_shipping_path_installs_tools_resumes_and_cleans_up() {
                         &qualified_model,
                     )
                     .await?;
-                    let replay =
-                        replay_review_job(&client, &base, &engine, &qualification_job_id, &job_url)
-                            .await?;
+                    let replay = replay_review_job(
+                        &client,
+                        &base,
+                        &engine,
+                        &qualification_job_id,
+                        &qualified_model,
+                        &job_url,
+                    )
+                    .await?;
                     Ok::<_, String>((synthetic, replay))
                 }
                 .await,
