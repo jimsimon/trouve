@@ -20031,6 +20031,22 @@ mod tests {
             vec![intent.clone()]
         );
         store
+            .update_session(&session.id, Some("Manual Rename"), None)
+            .unwrap();
+        assert!(
+            store
+                .complete_session_branch_rename_with_event(intent.clone(), workspace.id.clone())
+                .is_err()
+        );
+        assert_eq!(
+            store.session(&session.id).unwrap().unwrap().branch,
+            session.branch
+        );
+        assert_eq!(
+            store.session_branch_rename_intents().unwrap(),
+            vec![intent.clone()]
+        );
+        store
             .update_session(&session.id, Some(&intent.title), None)
             .unwrap();
         store

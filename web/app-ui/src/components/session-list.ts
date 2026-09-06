@@ -27,6 +27,7 @@ import {
 } from "./workspace-session-list-model.js";
 
 let nextArchivedListId = 0;
+const TITLE_SUGGESTION_TIMEOUT_MS = 48_000;
 
 type OrganizedSessionListItem = SessionListItem & WorkspaceSessionListFields & {
   readonly pullRequestBadge: SessionPullRequestBadge | undefined;
@@ -77,6 +78,7 @@ export class TrouveSessionList extends withSignalTracking(LitElement) {
   #modalTitle = "";
   #busySessionId = "";
   #generatingSessionId = "";
+  #generationAbort: AbortController | undefined;
   #requestError = "";
   readonly #expandedArchivedWorkspaceIds = new Set<string>();
   readonly #collapsedSessionSections = new Set<string>();
@@ -464,6 +466,9 @@ export class TrouveSessionList extends withSignalTracking(LitElement) {
   }
 
   readonly #closeActions = (): void => {
+    this.#generationAbort?.abort();
+    this.#generationAbort = undefined;
+    this.#generatingSessionId = "";
     this.#menuSessionId = "";
     this.#editingSessionId = "";
     this.#deleteSessionId = "";
@@ -483,11 +488,16 @@ export class TrouveSessionList extends withSignalTracking(LitElement) {
     const services = this.#services.value;
     if (services === undefined || this.#generatingSessionId !== "") return;
     const startingTitle = this.#modalTitle;
+    const abort = new AbortController();
+    this.#generationAbort = abort;
+    const timeout = globalThis.setTimeout(() => abort.abort(), TITLE_SUGGESTION_TIMEOUT_MS);
     this.#generatingSessionId = sessionId;
     this.#requestError = "";
     this.requestUpdate();
     try {
-      const suggestion = await services.protocol.generateSessionTitleSuggestion(sessionId);
+      const suggestion = await services.protocol.generateSessionTitleSuggestion(sessionId, {
+        signal: abort.signal,
+      });
       if (this.#editingSessionId !== sessionId || this.#modalTitle !== startingTitle) return;
       this.#modalTitle = suggestion.title.trim();
     } catch {
@@ -495,7 +505,9 @@ export class TrouveSessionList extends withSignalTracking(LitElement) {
         this.#requestError = "A title could not be generated. You can still enter one manually.";
       }
     } finally {
-      if (this.#generatingSessionId === sessionId) {
+      globalThis.clearTimeout(timeout);
+      if (this.#generationAbort === abort) {
+        this.#generationAbort = undefined;
         this.#generatingSessionId = "";
         this.requestUpdate();
       }

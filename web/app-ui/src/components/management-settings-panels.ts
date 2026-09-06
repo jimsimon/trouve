@@ -226,13 +226,11 @@ export class TrouveSessionNamingSettings extends withSignalTracking(LitElement) 
     this.#error = false;
     this.requestUpdate();
     try {
-      const [snapshot, models] = await Promise.all([
-        services.protocol.sessionNamingSettingsSnapshot(),
-        services.modelCatalog.refresh("if-stale"),
-      ]);
+      const models = services.modelCatalog.refresh("if-stale").catch(() => this.#models);
+      const snapshot = await services.protocol.sessionNamingSettingsSnapshot();
       this.#store.value?.replaceSessionNamingSettings(snapshot.cursor, snapshot.value);
       this.#settings = snapshot.value;
-      this.#models = models;
+      this.#models = await models;
       this.#message = "";
     } catch {
       this.#message = genericFailure("Loading settings");

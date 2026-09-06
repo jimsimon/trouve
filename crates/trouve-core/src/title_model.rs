@@ -34,11 +34,19 @@ pub(crate) fn backend_prompt(prompt: &str) -> String {
 }
 
 pub(crate) fn title_from_output(_prompt: &str, raw: &str) -> Result<String> {
-    let line = raw
+    let first_line = raw
         .lines()
         .map(str::trim)
         .find(|line| !line.is_empty())
         .ok_or_else(|| anyhow::anyhow!("naming model returned no text"))?;
+    // Some providers expose reasoning controls imperfectly and may still emit
+    // a preamble. Prefer an explicitly labelled final answer when present;
+    // otherwise preserve the strict first-line contract.
+    let line = raw
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("Title:") || line.starts_with("title:"))
+        .unwrap_or(first_line);
     let line = line
         .strip_prefix("Title:")
         .or_else(|| line.strip_prefix("title:"))
@@ -68,7 +76,7 @@ pub(crate) fn model_options(
         "reasoning",
         "thinking_budget_tokens",
     ];
-    const LOWEST_VALUES: [&str; 5] = ["off", "none", "minimal", "low", "disabled"];
+    const LOWEST_VALUES: [&str; 5] = ["off", "none", "disabled", "minimal", "low"];
     let properties = model
         .options_schema
         .get("properties")
@@ -172,6 +180,18 @@ mod tests {
     fn rejects_invalid_title_shapes() {
         assert!(title_from_output("Fix login", "one").is_err());
         assert!(title_from_output("Fix login", "A title with far too many words").is_err());
+    }
+
+    #[test]
+    fn accepts_a_labelled_title_after_a_reasoning_preamble() {
+        assert_eq!(
+            title_from_output(
+                "Fix authentication",
+                "I should describe the requested outcome.\nTitle: Fix Authentication Flow"
+            )
+            .unwrap(),
+            "Fix Authentication Flow"
+        );
     }
 
     #[test]

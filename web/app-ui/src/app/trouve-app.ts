@@ -2110,11 +2110,13 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     provisionalTitle: string,
     prompt: string,
     attachments: readonly ProtocolAttachmentUpload[],
+    sharedGeneration?: Promise<ProtocolGeneratedTitle>,
   ): void {
     this.#store.beginSessionTitleGeneration(sessionId, provisionalTitle);
     void (async () => {
       try {
-        const generated = await this.#generateTitle(sessionId, prompt, attachments);
+        const generated = await (sharedGeneration
+          ?? this.#generateTitle(sessionId, prompt, attachments));
         const title = generated.title.trim();
         if (title === "" || title === provisionalTitle) return;
         if (this.#store.sessionMetadata(sessionId)?.title !== provisionalTitle) return;
@@ -2136,13 +2138,15 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     provisionalTitle: string,
     prompt: string,
     attachments: readonly ProtocolAttachmentUpload[],
+    sharedGeneration?: Promise<ProtocolGeneratedTitle>,
   ): void {
     this.#store.beginThreadTitleGeneration(threadId, provisionalTitle);
     void (async () => {
       try {
         const sessionId = this.#store.thread(threadId)?.session_id;
         if (sessionId === undefined) return;
-        const generated = await this.#generateTitle(sessionId, prompt, attachments);
+        const generated = await (sharedGeneration
+          ?? this.#generateTitle(sessionId, prompt, attachments));
         const title = generated.title.trim();
         if (title === "" || title === provisionalTitle) return;
         const thread = await this.#protocolClient.updateThread(threadId, {
@@ -2516,12 +2520,16 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     }
 
     this.#store.upsertSessionMetadata(session);
-    if (retainedCreateRequest === undefined) {
+    const sharedGeneratedTitle = retainedCreateRequest === undefined
+      ? this.#generateTitle(session.id, prompt, submissionAttachments)
+      : undefined;
+    if (sharedGeneratedTitle !== undefined) {
       this.#upgradeSessionTitleInBackground(
         session.id,
         submittedCreateRequest.title,
         prompt,
         submissionAttachments,
+        sharedGeneratedTitle,
       );
     }
     let threadId: string | undefined;
@@ -2540,6 +2548,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
         thread.title ?? NEW_THREAD_TITLE_FALLBACK,
         prompt,
         submissionAttachments,
+        sharedGeneratedTitle,
       );
     } catch {
       this.#shellNotice = "Session created, but its first thread could not be created; the prompt was not sent.";

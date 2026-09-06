@@ -213,7 +213,8 @@ describe("thread screen asynchronous lifecycle guards", () => {
     expect(source).toContain(">Rename</button>");
     expect(source).toContain(">Close</button>");
     expect(source).toContain('>Rename thread</h2>');
-    expect(source).toContain("generateThreadTitleSuggestion(threadId)");
+    expect(source).toContain("generateThreadTitleSuggestion(threadId, {");
+    expect(source).toContain("signal: abort.signal");
   });
 
 });

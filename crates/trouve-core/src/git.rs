@@ -3611,6 +3611,10 @@ pub fn rename_session_branch(worktree: &Path, old_branch: &str, new_branch: &str
     ensure_safe_ref(new_branch)?;
     let (current_branch, _) = checked_out_branch_head(worktree)?;
     if current_branch == new_branch {
+        anyhow::ensure!(
+            !local_branch_exists(worktree, old_branch)?,
+            "worktree is on {new_branch}, but old session branch {old_branch} still exists"
+        );
         return Ok(());
     }
     anyhow::ensure!(
@@ -3676,6 +3680,15 @@ mod tests {
         assert_eq!(
             run(tmp.path(), &["branch", "--show-current"]),
             "trouve/describe-authentication-failure"
+        );
+        run(tmp.path(), &["branch", "trouve/session-id"]);
+        assert!(
+            rename_session_branch(
+                tmp.path(),
+                "trouve/session-id",
+                "trouve/describe-authentication-failure",
+            )
+            .is_err()
         );
     }
 

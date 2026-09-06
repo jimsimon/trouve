@@ -959,7 +959,16 @@ impl LlamaManager {
         let model_size = std::fs::metadata(gguf)
             .map(|metadata| metadata.len())
             .unwrap_or(0);
-        let hardware = self.hardware.get_or_init(probe_hardware);
+        if self.hardware.get().is_none() {
+            let hardware = tokio::task::spawn_blocking(probe_hardware)
+                .await
+                .unwrap_or_default();
+            let _ = self.hardware.set(hardware);
+        }
+        let hardware = self
+            .hardware
+            .get()
+            .expect("hardware is initialized before llama-server launch");
         let requested_context = launch_context(native_context, model_size, hardware);
         let port = free_port()?;
         let log = std::fs::File::create(log_path)

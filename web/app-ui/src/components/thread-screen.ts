@@ -532,6 +532,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   #threadRenameTitle = "";
   #threadRenameBusy = false;
   #threadRenameGenerating = false;
+  #threadRenameGenerationAbort: AbortController | undefined;
   #threadRenameError = "";
   #chatFindOpen = false;
   #chatFindQuery = "";
@@ -1430,8 +1431,8 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         @contextmenu=${(event: Event) => event.preventDefault()}
         @keydown=${this.#threadTabContextMenuKeydown}
       >
-        <button type="button" role="menuitem" @click=${() => this.#startThreadRename(thread.id)}>Rename</button>
-        <button type="button" role="menuitem" @click=${() => {
+        <button type="button" role="menuitem" tabindex="-1" @click=${() => this.#startThreadRename(thread.id)}>Rename</button>
+        <button type="button" role="menuitem" tabindex="-1" @click=${() => {
           this.#threadTabContextMenu = undefined;
           this.#closeThreadTabById(thread.id);
         }}>Close</button>
@@ -1489,6 +1490,9 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
 
   readonly #closeThreadRenameDialog = (): void => {
     if (this.#threadRenameBusy) return;
+    this.#threadRenameGenerationAbort?.abort();
+    this.#threadRenameGenerationAbort = undefined;
+    this.#threadRenameGenerating = false;
     this.#pendingThreadTabFocus = this.#renamingThreadId;
     this.#renamingThreadId = "";
     this.#threadRenameTitle = "";
@@ -1528,11 +1532,16 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     const threadId = this.#renamingThreadId;
     if (services === undefined || threadId === "" || this.#threadRenameGenerating) return;
     const startingTitle = this.#threadRenameTitle;
+    const abort = new AbortController();
+    this.#threadRenameGenerationAbort = abort;
+    const timeout = globalThis.setTimeout(() => abort.abort(), THREAD_TITLE_TIMEOUT_MS);
     this.#threadRenameGenerating = true;
     this.#threadRenameError = "";
     this.requestUpdate();
     try {
-      const suggestion = await services.protocol.generateThreadTitleSuggestion(threadId);
+      const suggestion = await services.protocol.generateThreadTitleSuggestion(threadId, {
+        signal: abort.signal,
+      });
       if (
         this.#renamingThreadId === threadId
         && this.#threadRenameTitle === startingTitle
@@ -1543,8 +1552,12 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
           "A title could not be generated. You can still enter one manually.";
       }
     } finally {
-      this.#threadRenameGenerating = false;
-      this.requestUpdate();
+      globalThis.clearTimeout(timeout);
+      if (this.#threadRenameGenerationAbort === abort) {
+        this.#threadRenameGenerationAbort = undefined;
+        this.#threadRenameGenerating = false;
+        this.requestUpdate();
+      }
     }
   }
 

@@ -152,7 +152,8 @@ describe("session list component contract", () => {
     expect(component).toContain('class="session-modal"');
     expect(component).toContain('dialog.showModal()');
     expect(component).toContain('>Rename session</h2>');
-    expect(component).toContain('generateSessionTitleSuggestion(sessionId)');
+    expect(component).toContain('generateSessionTitleSuggestion(sessionId, {');
+    expect(component).toContain('signal: abort.signal');
     expect(component).toContain('? "Generating…" : "Generate"');
     expect(component).toContain("You can still enter one manually.");
     expect(component).toContain('>Delete session “${this.#modalTitle}”?</h2>');
