@@ -412,6 +412,10 @@ export class TrouveCliSettings extends LitElement {
       request === this.#loadRequest;
   }
 
+  #invalidateModelCatalog(): void {
+    void this.#services.value?.modelCatalog.refresh("force").catch(() => undefined);
+  }
+
   async #install(cli: ProtocolCliInfo): Promise<void> {
     const protocol = this.#services.value?.protocol;
     if (protocol === undefined || this.#busyId !== "") return;
@@ -500,6 +504,7 @@ export class TrouveCliSettings extends LitElement {
     this.requestUpdate();
     try {
       await protocol.uninstallCli(cli.id);
+      this.#invalidateModelCatalog();
       if (!this.#actionIsCurrent(lifecycle, cli.id)) return;
       await this.#load();
       if (!this.isConnected || lifecycle !== this.#lifecycleGeneration) return;
@@ -597,6 +602,9 @@ export class TrouveCliSettings extends LitElement {
     this.#replaceStatuses(statuses);
     this.#pollFailures = readFailure ? this.#pollFailures + 1 : 0;
     if (terminalStatusObserved) {
+      // A newly installed (or failed) vendor runtime changes which backend
+      // models can run, and the model catalog caches that roster.
+      this.#invalidateModelCatalog();
       try {
         const response = await protocol.clis();
         if (generation !== this.#pollGeneration || !this.isConnected) return;

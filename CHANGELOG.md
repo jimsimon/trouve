@@ -17,6 +17,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   idle grace for late diagnostics plus an absolute post-exit deadline, and any
   tree whose bounded cleanup remains unacknowledged transfers to the session
   registry for another attempt during worktree eviction.
+- **Background work has an explicit owner**: trouve-owned subsystems can move
+  intentional long-lived work into a cancelling, coalescing registry without
+  trusting arbitrary detached descendants. Review fetches now schedule bounded
+  repository-locked Git maintenance through that owner instead of either
+  waiting for Git's detached auto-maintenance or disabling housekeeping
+  indefinitely.
 - **Non-gating review findings stay off pull requests**: credible findings that
   are not mechanically tied to the reviewed change remain available in
   trouve's dashboard and durable review history, but no longer appear in the

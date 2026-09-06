@@ -31,10 +31,10 @@ use trouve_protocol::{
 use crate::config::GithubReviewAppConfig;
 use crate::engine::{Engine, EngineError, ReviewWorkspaceRegistrationFence};
 use crate::store::{
-    CodeReviewJobPhase, CodeReviewJobRecord, CodeReviewJobRetryOutcome, CodeReviewManualRequest,
-    CodeReviewModelTiming, CodeReviewTaskMetrics, LEGACY_FULL_COVERAGE_MAX_ATTEMPTS,
-    NewCodeReviewFinding, NewCodeReviewFindingDetails, NewCodeReviewJob, NewCodeReviewTask,
-    NewCodeReviewTheme,
+    CODE_REVIEW_CARRIED_ANCHOR_CURSOR_MARKER, CodeReviewJobPhase, CodeReviewJobRecord,
+    CodeReviewJobRetryOutcome, CodeReviewManualRequest, CodeReviewModelTiming,
+    CodeReviewTaskMetrics, LEGACY_FULL_COVERAGE_MAX_ATTEMPTS, NewCodeReviewFinding,
+    NewCodeReviewFindingDetails, NewCodeReviewJob, NewCodeReviewTask, NewCodeReviewTheme,
 };
 use crate::tools::{
     ReviewAnchor, ReviewDiffFileWithMetadata as ReviewDiffFile, ReviewRepositoryAnchors,
@@ -160,6 +160,11 @@ const REVIEW_ANCHOR_MAX_DISTINCT_BLOBS: usize = MAX_CANDIDATE_FINDINGS;
 const REVIEW_ANCHOR_BLOB_MAX_BYTES: usize = 2 * 1024 * 1024;
 const REVIEW_ANCHOR_ERROR_MAX_BYTES: usize = 2 * 1024;
 const REVIEW_ANCHOR_BLOBS_MAX_BYTES: usize = 16 * 1024 * 1024;
+/// Historical review heads reserved per round for findings that predate the
+/// durable carried-anchor index. The repository synchronizer retains three
+/// optional history refs; one remains available for the ordinary previous
+/// reviewed head while continuations advance additional legacy heads.
+const CARRIED_ANCHOR_LEGACY_BASES_PER_ROUND: usize = 2;
 const INVALID_OUTSIDE_ANCHOR_REJECTION: &str = "insufficient_evidence: final finding anchor does not identify a validated line in a tracked regular file at the immutable review head";
 /// Paths whose changes never warrant an automatic re-review on their own:
 /// prose and licensing. Lockfiles are deliberately absent — dependency
@@ -217,10 +222,14 @@ const RETRY_CHECK_ACTION_DESCRIPTION: &str = "Retry this review on the current P
 const RETRY_FINAL_EDITOR_CHECK_ACTION_DESCRIPTION: &str = "Retry only the final review editor";
 const REVIEWER_EXECUTION_GUIDANCE: &str = "\
 Time and exploration budget: finish this review in about three minutes. Use no more than 24 \
-tool calls total. Treat the supplied diff as the primary evidence; do not inventory the \
-repository, recreate the diff, make a todo list, or run builds/tests. Batch independent reads or \
-searches when the tool supports it. If the budget is nearly exhausted, stop exploring and return \
-the best supported JSON result.";
+tool calls total; this hard limit is an emergency ceiling, not a target. Treat the supplied diff \
+as the primary evidence. Before any lookup, form a concrete defect hypothesis from changed \
+behavior and identify the unresolved question whose answer could change a finding. Use the \
+narrowest lookup that answers that question, batch independent reads or searches when the tool \
+supports it, and connect the result back to the change or discard the hypothesis. Do not inventory \
+the repository, recreate the diff, make a todo list, or run builds/tests. Stop when each material \
+hypothesis is supported or refuted. If the budget is nearly exhausted, return the best supported \
+JSON result.";
 const EXTERNAL_FACT_EVIDENCE_GUIDANCE: &str = "\
 Evidence for changing external facts: claims about current releases, version availability, known \
 vulnerabilities, action versions, registries, or provider/service support require an authoritative \
@@ -5281,7 +5290,17 @@ impl Engine {
                 ),
             ),
         };
-        let continuation_request = carried_anchor_continuation_request(&record, &record.job);
+        let legacy_carried_cursor = self
+            .store
+            .code_review_job_dedupe_key(&job_id)
+            .ok()
+            .flatten()
+            .and_then(|dedupe_key| carried_anchor_continuation_cursor(&dedupe_key));
+        let continuation_request = carried_anchor_continuation_request(
+            &record,
+            &record.job,
+            legacy_carried_cursor.as_deref(),
+        );
         let (finish_recorded, finish_transition, updated_tasks, continuation_job) =
             match self.store.finish_code_review_job_with_continuation(
                 &job_id,
@@ -5708,11 +5727,54 @@ impl Engine {
         let previous_pull_state = self
             .store
             .code_review_pull_state(&job.repository, job.pull_number)?;
+        // Findings created before durable carried anchors have no coordinate
+        // at the last reviewed head. Reserve a bounded set of their original
+        // immutable heads now so the coordinator can bootstrap exact mappings
+        // after repository sync. Successful mappings are recorded at this
+        // job's head, and a continuation advances the next bounded set.
+        let carried_snapshot = self
+            .store
+            .open_code_review_findings(&job.repository, job.pull_number)?
+            .into_iter()
+            .filter(|finding| finding.job_id != job.id)
+            .collect::<Vec<_>>();
+        let carried_snapshot_ids = carried_snapshot
+            .iter()
+            .map(|finding| finding.id.clone())
+            .collect::<Vec<_>>();
+        let carried_snapshot_base_anchors =
+            if validate_sha(&previous_pull_state.last_reviewed_head_sha).is_ok() {
+                self.store.code_review_carried_finding_anchors(
+                    &carried_snapshot_ids,
+                    &previous_pull_state.last_reviewed_head_sha,
+                )?
+            } else {
+                CarriedFindingAnchorMap::new()
+            };
+        // Continuations carry the last legacy head selected by their parent
+        // in their durable dedupe key. Advancing strictly past it lets one
+        // bounded chain reach later heads even when every mapping on an
+        // earlier page fails. A later independent review starts from the
+        // beginning again, providing the controlled retry for failed heads.
+        let legacy_carried_cursor = self
+            .store
+            .code_review_job_dedupe_key(&job.id)?
+            .and_then(|dedupe_key| carried_anchor_continuation_cursor(&dedupe_key));
+        let (legacy_carried_base_shas, legacy_carried_has_more) = legacy_carried_anchor_base_shas(
+            &carried_snapshot,
+            &previous_pull_state.last_reviewed_head_sha,
+            &carried_snapshot_base_anchors,
+            legacy_carried_cursor.as_deref(),
+            CARRIED_ANCHOR_LEGACY_BASES_PER_ROUND,
+        );
+        let mut next_legacy_carried_cursor = legacy_carried_cursor.clone();
         // The prior reviewed head is the coordinate space for carried
         // findings. Keep that immutable object available even though reviewer
         // coverage always starts at the pull request merge base.
         let mut optional_shas = Vec::new();
-        for sha in [&previous_pull_state.last_reviewed_head_sha] {
+        for sha in std::iter::once(&previous_pull_state.last_reviewed_head_sha)
+            .chain(legacy_carried_base_shas.iter())
+        {
             if validate_sha(sha).is_ok()
                 && sha != &job.base_ref
                 && sha != &job.head_sha
@@ -6434,7 +6496,7 @@ impl Engine {
         } else {
             analysis_handle.await.ok().flatten()
         };
-        let mut carried_anchor_has_more = false;
+        let mut carried_anchor_has_more = legacy_carried_has_more;
         let carried_finding_ids = previous_findings
             .iter()
             .map(|finding| finding.id.clone())
@@ -6503,6 +6565,26 @@ impl Engine {
         } else {
             let mut execution_record = record.clone();
             execution_record.job = job.clone();
+            let legacy_carried_mappings = self
+                .load_legacy_carried_anchor_mappings(
+                    &job,
+                    &legacy_carried_base_shas,
+                    Path::new(&session.worktree_path),
+                    superseded,
+                )
+                .await?;
+            // Loading attempted every selected immutable head, including
+            // heads whose diff failed or could not map an anchor. Advance the
+            // durable continuation cursor only after that attempt; a skipped
+            // automatic round must not silently step over unexamined heads.
+            if let Some(selected) = legacy_carried_base_shas.last() {
+                next_legacy_carried_cursor = Some(selected.clone());
+            }
+            let carried_locations = carried_anchor_locations(
+                &previous_findings,
+                &carried_mapping,
+                &legacy_carried_mappings,
+            );
             // Carried-finding verification at head: the server reads the
             // current code at each carried open blocking finding's anchor
             // so the coordinator can judge — and provably ground — fixes
@@ -6513,15 +6595,17 @@ impl Engine {
                 .prefetch_carried_anchor_lines(
                     &job,
                     &previous_findings,
-                    &carried_mapping,
+                    &carried_locations,
+                    !legacy_carried_mappings.is_empty(),
                     repository_path.as_path(),
                     superseded,
                 )
                 .await?;
-            carried_anchor_has_more = has_more;
+            carried_anchor_has_more |= has_more;
             let carried_history_lines = carried_anchor_history_lines(
                 &previous_findings,
-                &carried_mapping,
+                &carried_locations,
+                &carried_diff_contents,
                 &carried_anchor_lines,
             );
             let prompt = validation_prompt(
@@ -6756,7 +6840,7 @@ impl Engine {
                 validated.resolved_finding_ids,
                 &validated.resolved_findings,
                 &previous_findings,
-                &carried_mapping,
+                &carried_locations,
                 &carried_anchor_lines,
             );
             let themes = coordinator_validated_themes(
@@ -7032,8 +7116,9 @@ impl Engine {
             .publish_review(&api, &job, &persisted, has_unresolved_findings)
             .await
             .context("publishing GitHub pull request review")?;
-        let continuation_request =
-            carried_anchor_has_more.then(|| carried_anchor_continuation_request(record, &job));
+        let continuation_request = carried_anchor_has_more.then(|| {
+            carried_anchor_continuation_request(record, &job, next_legacy_carried_cursor.as_deref())
+        });
         let (_, continuation_job) = self
             .store
             .record_code_review_publication_with_continuation(
@@ -10935,12 +11020,15 @@ impl Engine {
         &self,
         job: &trouve_protocol::CodeReviewJob,
         findings: &[trouve_protocol::CodeReviewFinding],
-        mapping: &CarriedAnchorMappingContext<'_>,
+        locations: &CarriedAnchorLocations,
+        register_legacy_targets: bool,
         repository_path: &std::path::Path,
         cancel: &CancellationToken,
     ) -> Result<(HashMap<(String, u64), Option<String>>, bool)> {
-        let positions = carried_anchor_positions(findings, mapping);
-        if job.trigger != "carried-anchor-continuation" {
+        let positions = carried_anchor_positions(findings, locations);
+        let register_targets =
+            job.trigger != "carried-anchor-continuation" || register_legacy_targets;
+        if register_targets {
             let advanced = positions
                 .iter()
                 .map(|position| {
@@ -10954,14 +11042,14 @@ impl Engine {
             self.store
                 .record_code_review_carried_finding_anchors(&job.head_sha, &advanced)?;
         }
-        let targets = carried_anchor_targets(findings, mapping);
+        let targets = carried_anchor_targets(findings, locations);
         let page = self.store.claim_code_review_carried_anchor_page(
             &job.id,
             &job.repository,
             job.pull_number,
             &job.head_sha,
             &targets,
-            job.trigger != "carried-anchor-continuation",
+            register_targets,
             CARRIED_ANCHOR_PREFETCH_PAGE_SIZE,
         )?;
         let mut lines = page
@@ -11051,6 +11139,61 @@ impl Engine {
             }
         }
         Ok((lines, has_more))
+    }
+
+    /// Load bounded direct diffs for findings created before durable carried
+    /// coordinates existed. These are bootstrap evidence only: failures leave
+    /// findings open, and successful coordinates are persisted at this job's
+    /// head by `prefetch_carried_anchor_lines` for ordinary future mapping.
+    async fn load_legacy_carried_anchor_mappings(
+        &self,
+        job: &trouve_protocol::CodeReviewJob,
+        base_shas: &[String],
+        worktree: &std::path::Path,
+        cancel: &CancellationToken,
+    ) -> Result<HashMap<String, LegacyCarriedAnchorMapping>> {
+        let mut mappings = HashMap::new();
+        for base_sha in base_shas {
+            let files = if base_sha == &job.head_sha {
+                Vec::new()
+            } else {
+                let loaded = self
+                    .executor
+                    .review_repository_diff(&ReviewRepositoryDiff {
+                        managed_root: self.data_dir.join("worktrees"),
+                        worktree: worktree.to_path_buf(),
+                        base_sha: base_sha.clone(),
+                        head_sha: job.head_sha.clone(),
+                        cancel: cancel.clone(),
+                        max_bytes: REVIEW_DIFF_CACHE_MAX_BYTES,
+                    })
+                    .await;
+                ensure_review_current(cancel)?;
+                match loaded {
+                    Ok(files) => files
+                        .into_iter()
+                        .map(|file| ReviewDiffFile {
+                            path: file.path,
+                            diff: file.diff,
+                            generated_header: None,
+                        })
+                        .collect(),
+                    Err(error) => {
+                        tracing::warn!(
+                            job_id = %job.id,
+                            legacy_head = %base_sha,
+                            head = %job.head_sha,
+                            %error,
+                            "could not bootstrap carried anchors from their original review head; \
+                             affected findings remain open"
+                        );
+                        continue;
+                    }
+                }
+            };
+            mappings.insert(base_sha.clone(), LegacyCarriedAnchorMapping::new(files));
+        }
+        Ok(mappings)
     }
 
     /// Read the head-revision text of every file a coordinator finding or
@@ -17770,11 +17913,27 @@ fn finding_touches_inter_round_change(
 /// no right-side line. It is never registered as an object-read target.
 const CARRIED_ANCHOR_ABSENT_LINE: u64 = 0;
 type CarriedFindingAnchorMap = HashMap<String, (String, u64)>;
+type CarriedAnchorLocations = HashMap<String, HistoricalAnchorLocation>;
 struct CarriedAnchorMappingContext<'a> {
     files: &'a [ReviewDiffFile],
     diff_contents: &'a HashMap<(String, u64, bool), String>,
     review_base_sha: &'a str,
     base_anchors: &'a CarriedFindingAnchorMap,
+}
+
+struct LegacyCarriedAnchorMapping {
+    files: Vec<ReviewDiffFile>,
+    diff_contents: HashMap<(String, u64, bool), String>,
+}
+
+impl LegacyCarriedAnchorMapping {
+    fn new(files: Vec<ReviewDiffFile>) -> Self {
+        let diff_contents = diff_line_contents(&files);
+        Self {
+            files,
+            diff_contents,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17989,9 +18148,99 @@ fn finding_requires_head_verification(
         && !matches!(location, HistoricalAnchorLocation::InDiff { .. })
 }
 
+/// Select original review heads for findings that cannot use the durable
+/// coordinate at the primary mapping base. Selection is deterministic and
+/// bounded. A continuation cursor advances past every attempted page so a
+/// failure cannot starve later heads; successfully mapped heads also leave
+/// the candidate set through their ordinary durable carried coordinates.
+fn legacy_carried_anchor_base_shas(
+    findings: &[trouve_protocol::CodeReviewFinding],
+    mapping_base_sha: &str,
+    base_anchors: &CarriedFindingAnchorMap,
+    after_sha: Option<&str>,
+    limit: usize,
+) -> (Vec<String>, bool) {
+    let candidates = findings
+        .iter()
+        .filter(|finding| {
+            finding.status == "open"
+                && finding.line > 0
+                && !finding.side.eq_ignore_ascii_case("left")
+                && finding_is_blocking(&finding.severity, &finding.confidence)
+                && finding_gates(&finding.evidence, finding.origin)
+                && !base_anchors.contains_key(&finding.id)
+                && finding.observed_head != mapping_base_sha
+                && validate_sha(&finding.observed_head).is_ok()
+        })
+        .map(|finding| finding.observed_head.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter(|sha| after_sha.is_none_or(|cursor| sha.as_str() > cursor))
+        .collect::<Vec<_>>();
+    let has_more = candidates.len() > limit;
+    (candidates.into_iter().take(limit).collect(), has_more)
+}
+
+/// Legacy mappings are direct observed-head-to-current-head diffs. Even when
+/// the historical anchor occurs in that private bootstrap diff, normalize its
+/// right-side coordinate to a head line so resolution still requires the
+/// coordinator to echo server-read current source rather than resolving by id.
+fn legacy_carried_anchor_location(
+    finding: &trouve_protocol::CodeReviewFinding,
+    mapping: &LegacyCarriedAnchorMapping,
+) -> HistoricalAnchorLocation {
+    let base_anchors = CarriedFindingAnchorMap::new();
+    let context = CarriedAnchorMappingContext {
+        files: &mapping.files,
+        diff_contents: &mapping.diff_contents,
+        review_base_sha: &finding.observed_head,
+        base_anchors: &base_anchors,
+    };
+    match historical_anchor_location(finding, &context) {
+        HistoricalAnchorLocation::InDiff {
+            head: Some((path, CARRIED_ANCHOR_ABSENT_LINE)),
+        }
+        | HistoricalAnchorLocation::Absent { path } => HistoricalAnchorLocation::Absent { path },
+        HistoricalAnchorLocation::InDiff {
+            head: Some((path, line)),
+        }
+        | HistoricalAnchorLocation::HeadLine { path, line } => {
+            HistoricalAnchorLocation::HeadLine { path, line }
+        }
+        HistoricalAnchorLocation::InDiff { head: None }
+        | HistoricalAnchorLocation::Unverifiable => HistoricalAnchorLocation::Unverifiable,
+    }
+}
+
+/// Resolve every finding's location once for this round. Prompt evidence,
+/// durable advancement, and the acceptance verifier all consume this same
+/// map, preventing either side from applying a different fallback policy.
+fn carried_anchor_locations(
+    findings: &[trouve_protocol::CodeReviewFinding],
+    primary: &CarriedAnchorMappingContext<'_>,
+    legacy: &HashMap<String, LegacyCarriedAnchorMapping>,
+) -> CarriedAnchorLocations {
+    findings
+        .iter()
+        .map(|finding| {
+            let primary_location = historical_anchor_location(finding, primary);
+            let location = if primary_location == HistoricalAnchorLocation::Unverifiable {
+                legacy
+                    .get(&finding.observed_head)
+                    .map_or(primary_location, |mapping| {
+                        legacy_carried_anchor_location(finding, mapping)
+                    })
+            } else {
+                primary_location
+            };
+            (finding.id.clone(), location)
+        })
+        .collect()
+}
+
 fn carried_anchor_positions(
     findings: &[trouve_protocol::CodeReviewFinding],
-    mapping: &CarriedAnchorMappingContext<'_>,
+    locations: &CarriedAnchorLocations,
 ) -> Vec<CarriedAnchorPosition> {
     findings
         .iter()
@@ -18002,7 +18251,7 @@ fn carried_anchor_positions(
                 && finding_gates(&finding.evidence, finding.origin)
         })
         .filter_map(|finding| {
-            let location = historical_anchor_location(finding, mapping);
+            let location = locations.get(&finding.id)?.clone();
             let (path, line, requires_read) = match location {
                 HistoricalAnchorLocation::HeadLine { path, line } => (path, line, true),
                 HistoricalAnchorLocation::InDiff {
@@ -18034,10 +18283,10 @@ fn carried_anchor_positions(
 
 fn carried_anchor_targets(
     findings: &[trouve_protocol::CodeReviewFinding],
-    mapping: &CarriedAnchorMappingContext<'_>,
+    locations: &CarriedAnchorLocations,
 ) -> Vec<(String, u64)> {
     let mut seen = HashSet::new();
-    carried_anchor_positions(findings, mapping)
+    carried_anchor_positions(findings, locations)
         .into_iter()
         .filter(|position| position.requires_read)
         .filter_map(|position| {
@@ -18052,28 +18301,29 @@ fn carried_anchor_targets(
 /// mapped coordinate directly; this view is solely for the coordinator.
 fn carried_anchor_history_lines(
     findings: &[trouve_protocol::CodeReviewFinding],
-    mapping: &CarriedAnchorMappingContext<'_>,
+    locations: &CarriedAnchorLocations,
+    diff_contents: &HashMap<(String, u64, bool), String>,
     carried_anchor_lines: &HashMap<(String, u64), Option<String>>,
 ) -> HashMap<(String, u64), Option<String>> {
     let mut history_lines = HashMap::new();
     for finding in findings {
-        let current = match historical_anchor_location(finding, mapping) {
-            HistoricalAnchorLocation::HeadLine { path, line } => {
-                carried_anchor_lines.get(&(path, line)).cloned()
+        let current = match locations.get(&finding.id) {
+            Some(HistoricalAnchorLocation::HeadLine { path, line }) => {
+                carried_anchor_lines.get(&(path.clone(), *line)).cloned()
             }
-            HistoricalAnchorLocation::InDiff {
+            Some(HistoricalAnchorLocation::InDiff {
                 head: Some((_, CARRIED_ANCHOR_ABSENT_LINE)),
-            }
-            | HistoricalAnchorLocation::Absent { .. } => Some(None),
-            HistoricalAnchorLocation::InDiff {
+            })
+            | Some(HistoricalAnchorLocation::Absent { .. }) => Some(None),
+            Some(HistoricalAnchorLocation::InDiff {
                 head: Some((path, line)),
-            } => mapping
-                .diff_contents
-                .get(&(path, line, false))
+            }) => diff_contents
+                .get(&(path.clone(), *line, false))
                 .cloned()
                 .map(Some),
-            HistoricalAnchorLocation::InDiff { head: None }
-            | HistoricalAnchorLocation::Unverifiable => None,
+            Some(HistoricalAnchorLocation::InDiff { head: None })
+            | Some(HistoricalAnchorLocation::Unverifiable)
+            | None => None,
         };
         if let Some(current) = current {
             history_lines.insert((finding.path.clone(), finding.line), current);
@@ -18085,12 +18335,23 @@ fn carried_anchor_history_lines(
 const CARRIED_ANCHOR_PREFETCH_PAGE_SIZE: usize = 32;
 const CARRIED_ANCHOR_MAX_READ_ATTEMPTS: u32 = 3;
 
+fn carried_anchor_continuation_cursor(dedupe_key: &str) -> Option<String> {
+    let (_, cursor) = dedupe_key.rsplit_once(CODE_REVIEW_CARRIED_ANCHOR_CURSOR_MARKER)?;
+    validate_sha(cursor).ok()?;
+    Some(cursor.to_owned())
+}
+
 fn carried_anchor_continuation_request(
     record: &CodeReviewJobRecord,
     job: &trouve_protocol::CodeReviewJob,
+    legacy_cursor: Option<&str>,
 ) -> NewCodeReviewJob {
+    let dedupe_key = legacy_cursor.map_or_else(
+        || format!("{}:carried-anchor-continuation", job.id),
+        |cursor| format!("{}:carried-anchor-continuation:{cursor}", job.id),
+    );
     NewCodeReviewJob {
-        dedupe_key: format!("{}:carried-anchor-continuation", job.id),
+        dedupe_key,
         installation_id: job.installation_id,
         repository: job.repository.clone(),
         pull_number: job.pull_number,
@@ -18157,7 +18418,7 @@ fn verified_resolution_ids(
     listed: Vec<String>,
     claims: &[ResolvedFindingClaim],
     previous_findings: &[trouve_protocol::CodeReviewFinding],
-    mapping: &CarriedAnchorMappingContext<'_>,
+    locations: &CarriedAnchorLocations,
     carried_anchor_lines: &HashMap<(String, u64), Option<String>>,
 ) -> Vec<String> {
     let claim_by_id = claims
@@ -18176,7 +18437,10 @@ fn verified_resolution_ids(
                 // pass-through; downstream resolution guards them.
                 return true;
             };
-            let location = historical_anchor_location(finding, mapping);
+            let location = locations
+                .get(&finding.id)
+                .cloned()
+                .unwrap_or(HistoricalAnchorLocation::Unverifiable);
             if !finding_requires_head_verification(finding, &location) {
                 return true;
             }
@@ -18800,6 +19064,7 @@ mod tests {
                 display_name: "Progress test".into(),
                 context_window: 100_000,
                 supports_tools: true,
+                supports_images: false,
                 input_price_per_mtok: None,
                 output_price_per_mtok: None,
                 options_schema: serde_json::json!({}),
@@ -19156,6 +19421,7 @@ mod tests {
                     display_name: "Router".into(),
                     context_window: 100_000,
                     supports_tools: true,
+                    supports_images: false,
                     input_price_per_mtok: None,
                     output_price_per_mtok: None,
                     options_schema: serde_json::json!({
@@ -19174,6 +19440,7 @@ mod tests {
                     display_name: "Plain".into(),
                     context_window: 100_000,
                     supports_tools: true,
+                    supports_images: false,
                     input_price_per_mtok: None,
                     output_price_per_mtok: None,
                     options_schema: serde_json::json!({}),
@@ -19183,6 +19450,7 @@ mod tests {
                     display_name: "Fixed thinking".into(),
                     context_window: 100_000,
                     supports_tools: true,
+                    supports_images: false,
                     input_price_per_mtok: None,
                     output_price_per_mtok: None,
                     options_schema: serde_json::json!({
@@ -20793,6 +21061,156 @@ mod tests {
         }
     }
 
+    fn mapped_locations(
+        findings: &[trouve_protocol::CodeReviewFinding],
+        mapping: &CarriedAnchorMappingContext<'_>,
+    ) -> CarriedAnchorLocations {
+        carried_anchor_locations(findings, mapping, &HashMap::new())
+    }
+
+    #[test]
+    fn legacy_carried_anchor_heads_are_bounded_and_skip_durable_coordinates() {
+        let current_base = "f".repeat(40);
+        let mut findings = (1..=3)
+            .map(|index| trouve_protocol::CodeReviewFinding {
+                observed_head: index.to_string().repeat(40),
+                ..open_history_finding(&format!("rvf_legacy_{index}"), "src/lib.rs", index, "high")
+            })
+            .collect::<Vec<_>>();
+        findings.push(trouve_protocol::CodeReviewFinding {
+            observed_head: "4".repeat(40),
+            ..open_history_finding("rvf_indexed", "src/lib.rs", 4, "high")
+        });
+        findings.push(trouve_protocol::CodeReviewFinding {
+            observed_head: current_base.clone(),
+            ..open_history_finding("rvf_current", "src/lib.rs", 5, "high")
+        });
+        let base_anchors = CarriedFindingAnchorMap::from([(
+            "rvf_indexed".to_owned(),
+            ("src/lib.rs".to_owned(), 4),
+        )]);
+
+        let (selected, has_more) =
+            legacy_carried_anchor_base_shas(&findings, &current_base, &base_anchors, None, 2);
+
+        assert_eq!(selected, vec!["1".repeat(40), "2".repeat(40)]);
+        assert!(has_more);
+    }
+
+    #[test]
+    fn legacy_carried_anchor_cursor_advances_past_a_failed_page() {
+        let current_base = "f".repeat(40);
+        let findings = (1..=3)
+            .map(|index| trouve_protocol::CodeReviewFinding {
+                observed_head: index.to_string().repeat(40),
+                ..open_history_finding(&format!("rvf_legacy_{index}"), "src/lib.rs", index, "high")
+            })
+            .collect::<Vec<_>>();
+        let base_anchors = CarriedFindingAnchorMap::new();
+        let (failed_page, has_more) =
+            legacy_carried_anchor_base_shas(&findings, &current_base, &base_anchors, None, 2);
+        assert!(has_more);
+
+        // Neither first-page head gained a durable anchor. The continuation
+        // cursor must still advance to the untouched third head instead of
+        // recomputing the same failed prefix forever.
+        let cursor = failed_page.last().unwrap();
+        let (next_page, has_more) = legacy_carried_anchor_base_shas(
+            &findings,
+            &current_base,
+            &base_anchors,
+            Some(cursor),
+            2,
+        );
+        assert_eq!(next_page, vec!["3".repeat(40)]);
+        assert!(!has_more);
+    }
+
+    #[test]
+    fn legacy_carried_anchor_bootstrap_supplies_verifiable_resolution_evidence() {
+        let legacy_head = "1".repeat(40);
+        let finding = trouve_protocol::CodeReviewFinding {
+            observed_head: legacy_head.clone(),
+            ..open_history_finding("rvf_legacy", "src/lib.rs", 10, "high")
+        };
+        let primary_files = Vec::new();
+        let primary_diff_contents = HashMap::new();
+        let primary_base_anchors = CarriedFindingAnchorMap::new();
+        let primary = CarriedAnchorMappingContext {
+            files: &primary_files,
+            diff_contents: &primary_diff_contents,
+            review_base_sha: &"2".repeat(40),
+            base_anchors: &primary_base_anchors,
+        };
+        let before = mapped_locations(std::slice::from_ref(&finding), &primary);
+        assert_eq!(
+            before.get(&finding.id),
+            Some(&HistoricalAnchorLocation::Unverifiable)
+        );
+        assert!(
+            carried_anchor_history_lines(
+                std::slice::from_ref(&finding),
+                &before,
+                &primary_diff_contents,
+                &HashMap::new(),
+            )
+            .is_empty()
+        );
+
+        let legacy = HashMap::from([(
+            legacy_head,
+            LegacyCarriedAnchorMapping::new(vec![ReviewDiffFile {
+                path: "src/lib.rs".into(),
+                diff: "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -9,3 +20,3 @@\n before();\n-stale_probe();\n+fixed_probe();\n after();\n"
+                    .into(),
+                generated_header: None,
+            }]),
+        )]);
+        let locations = carried_anchor_locations(std::slice::from_ref(&finding), &primary, &legacy);
+        assert_eq!(
+            locations.get(&finding.id),
+            Some(&HistoricalAnchorLocation::HeadLine {
+                path: "src/lib.rs".to_owned(),
+                line: 21,
+            })
+        );
+        assert_eq!(
+            carried_anchor_positions(std::slice::from_ref(&finding), &locations),
+            vec![CarriedAnchorPosition {
+                finding_id: finding.id.clone(),
+                path: "src/lib.rs".to_owned(),
+                line: 21,
+                requires_read: true,
+            }]
+        );
+        let current_lines = HashMap::from([(
+            ("src/lib.rs".to_owned(), 21),
+            Some("fixed_probe();".to_owned()),
+        )]);
+        let history_lines = carried_anchor_history_lines(
+            std::slice::from_ref(&finding),
+            &locations,
+            &primary_diff_contents,
+            &current_lines,
+        );
+        let history = compact_finding_history(
+            std::slice::from_ref(&finding),
+            REVIEW_HISTORY_FINDINGS_MAX_BYTES,
+            &history_lines,
+        )
+        .unwrap();
+        assert_eq!(history[0]["current_anchor_line"], "fixed_probe();");
+
+        let claim = ResolvedFindingClaim {
+            finding_id: finding.id.clone(),
+            current_anchor_quote: "fixed_probe();".into(),
+        };
+        assert_eq!(
+            verified_resolution_ids(Vec::new(), &[claim], &[finding], &locations, &current_lines,),
+            vec!["rvf_legacy".to_owned()]
+        );
+    }
+
     #[test]
     fn carried_resolution_claims_verify_against_the_head_revision() {
         // Exact trimmed equality against the server's read; absence is
@@ -20848,6 +21266,7 @@ mod tests {
             review_base_sha: "base",
             base_anchors: &base_anchors,
         };
+        let locations = mapped_locations(&previous, &mapping);
         let anchors = HashMap::from([
             (
                 ("src/untouched.rs".to_owned(), 7),
@@ -20872,7 +21291,7 @@ mod tests {
             ],
             &repaired.resolved_findings,
             &previous,
-            &mapping,
+            &locations,
             &anchors,
         );
         // Only the exact in-window anchor resolves by id; another anchor in
@@ -20915,20 +21334,32 @@ mod tests {
             review_base_sha: selected_base,
             base_anchors: &base_anchors,
         };
+        let locations = mapped_locations(std::slice::from_ref(&finding), &mapping);
         let claim = ResolvedFindingClaim {
             finding_id: finding.id.clone(),
             current_anchor_quote: "register_before_start();".into(),
         };
 
         assert_eq!(
-            carried_anchor_history_lines(std::slice::from_ref(&finding), &mapping, &HashMap::new(),),
+            carried_anchor_history_lines(
+                std::slice::from_ref(&finding),
+                &locations,
+                &diff_contents,
+                &HashMap::new(),
+            ),
             HashMap::from([(
                 ("src/lib.rs".to_owned(), 10),
                 Some("register_before_start();".to_owned()),
             )])
         );
         assert_eq!(
-            verified_resolution_ids(Vec::new(), &[claim], &[finding], &mapping, &HashMap::new(),),
+            verified_resolution_ids(
+                Vec::new(),
+                &[claim],
+                &[finding],
+                &locations,
+                &HashMap::new(),
+            ),
             vec!["rvf_full".to_owned()]
         );
     }
@@ -20948,7 +21379,14 @@ mod tests {
             generated_header: None,
         }];
         let mut findings = (1..=32)
-            .map(|line| open_history_finding("rvf_touched", "src/touched.rs", line, "high"))
+            .map(|line| {
+                open_history_finding(
+                    &format!("rvf_touched_{line}"),
+                    "src/touched.rs",
+                    line,
+                    "high",
+                )
+            })
             .collect::<Vec<_>>();
         findings.extend([
             open_history_finding("rvf_duplicate_1", "src/duplicate.rs", 7, "high"),
@@ -20971,7 +21409,8 @@ mod tests {
             review_base_sha: "base",
             base_anchors: &base_anchors,
         };
-        let targets = carried_anchor_targets(&findings, &mapping);
+        let locations = mapped_locations(&findings, &mapping);
+        let targets = carried_anchor_targets(&findings, &locations);
 
         assert_eq!(targets.len(), 66);
         assert!(targets.contains(&("src/touched.rs".to_owned(), 1)));
@@ -21005,9 +21444,10 @@ mod tests {
             review_base_sha: "base",
             base_anchors: &base_anchors,
         };
+        let locations = mapped_locations(std::slice::from_ref(&finding), &mapping);
 
         assert_eq!(
-            carried_anchor_positions(std::slice::from_ref(&finding), &mapping),
+            carried_anchor_positions(std::slice::from_ref(&finding), &locations),
             vec![CarriedAnchorPosition {
                 finding_id: finding.id.clone(),
                 path: "src/context.rs".to_owned(),
@@ -21015,7 +21455,7 @@ mod tests {
                 requires_read: false,
             }]
         );
-        assert!(carried_anchor_targets(&[finding], &mapping).is_empty());
+        assert!(carried_anchor_targets(&[finding], &locations).is_empty());
     }
 
     #[test]
@@ -21039,9 +21479,10 @@ rename to src/new.rs
             review_base_sha: "base",
             base_anchors: &base_anchors,
         };
+        let locations = mapped_locations(std::slice::from_ref(&finding), &mapping);
 
         assert_eq!(
-            carried_anchor_positions(std::slice::from_ref(&finding), &mapping),
+            carried_anchor_positions(std::slice::from_ref(&finding), &locations),
             vec![CarriedAnchorPosition {
                 finding_id: finding.id.clone(),
                 path: "src/new.rs".to_owned(),
@@ -21050,7 +21491,7 @@ rename to src/new.rs
             }]
         );
         assert_eq!(
-            carried_anchor_targets(std::slice::from_ref(&finding), &mapping),
+            carried_anchor_targets(std::slice::from_ref(&finding), &locations),
             vec![("src/new.rs".to_owned(), 10)]
         );
         let current_lines = HashMap::from([(
@@ -21066,7 +21507,7 @@ rename to src/new.rs
                 Vec::new(),
                 &[absent],
                 std::slice::from_ref(&finding),
-                &mapping,
+                &locations,
                 &current_lines,
             )
             .is_empty()
@@ -21076,7 +21517,13 @@ rename to src/new.rs
             current_anchor_quote: "still_broken();".into(),
         };
         assert_eq!(
-            verified_resolution_ids(Vec::new(), &[matched], &[finding], &mapping, &current_lines,),
+            verified_resolution_ids(
+                Vec::new(),
+                &[matched],
+                &[finding],
+                &locations,
+                &current_lines,
+            ),
             vec!["rvf_renamed".to_owned()]
         );
     }
@@ -21106,7 +21553,8 @@ rename to src/new.rs
             review_base_sha: "base",
             base_anchors: &base_anchors,
         };
-        let positions = carried_anchor_positions(std::slice::from_ref(&finding), &mapping);
+        let locations = mapped_locations(std::slice::from_ref(&finding), &mapping);
+        let positions = carried_anchor_positions(std::slice::from_ref(&finding), &locations);
         assert_eq!(
             positions,
             vec![CarriedAnchorPosition {
@@ -21117,7 +21565,12 @@ rename to src/new.rs
             }]
         );
         assert_eq!(
-            carried_anchor_history_lines(std::slice::from_ref(&finding), &mapping, &HashMap::new(),),
+            carried_anchor_history_lines(
+                std::slice::from_ref(&finding),
+                &locations,
+                &diff_contents,
+                &HashMap::new(),
+            ),
             HashMap::from([(
                 ("src/replaced.rs".to_owned(), 10),
                 Some("replacement();".to_owned()),
@@ -21146,8 +21599,9 @@ rename to src/new.rs
             review_base_sha: "head-2",
             base_anchors: &advanced,
         };
+        let next_locations = mapped_locations(std::slice::from_ref(&finding), &next_mapping);
         assert_eq!(
-            carried_anchor_targets(std::slice::from_ref(&finding), &next_mapping),
+            carried_anchor_targets(std::slice::from_ref(&finding), &next_locations),
             vec![("src/replaced.rs".to_owned(), 11)]
         );
         let current_lines = HashMap::from([(
@@ -21157,7 +21611,8 @@ rename to src/new.rs
         assert_eq!(
             carried_anchor_history_lines(
                 std::slice::from_ref(&finding),
-                &next_mapping,
+                &next_locations,
+                &next_diff_contents,
                 &current_lines,
             ),
             HashMap::from([(
@@ -21174,7 +21629,7 @@ rename to src/new.rs
                 Vec::new(),
                 &[mismatched],
                 std::slice::from_ref(&finding),
-                &next_mapping,
+                &next_locations,
                 &current_lines,
             )
             .is_empty()
@@ -21188,7 +21643,7 @@ rename to src/new.rs
                 Vec::new(),
                 &[matched],
                 &[finding],
-                &next_mapping,
+                &next_locations,
                 &current_lines,
             ),
             vec!["rvf_replaced".to_owned()]
@@ -21219,7 +21674,8 @@ rename to src/new.rs
             review_base_sha: "base",
             base_anchors: &base_anchors,
         };
-        let positions = carried_anchor_positions(std::slice::from_ref(&finding), &mapping);
+        let locations = mapped_locations(std::slice::from_ref(&finding), &mapping);
+        let positions = carried_anchor_positions(std::slice::from_ref(&finding), &locations);
         assert_eq!(
             positions,
             vec![CarriedAnchorPosition {
@@ -21230,7 +21686,12 @@ rename to src/new.rs
             }]
         );
         assert_eq!(
-            carried_anchor_history_lines(std::slice::from_ref(&finding), &mapping, &HashMap::new(),),
+            carried_anchor_history_lines(
+                std::slice::from_ref(&finding),
+                &locations,
+                &diff_contents,
+                &HashMap::new(),
+            ),
             HashMap::from([(("src/deleted.rs".to_owned(), 10), None)])
         );
 
@@ -21246,11 +21707,12 @@ rename to src/new.rs
             review_base_sha: "head-2",
             base_anchors: &advanced,
         };
+        let next_locations = mapped_locations(std::slice::from_ref(&finding), &next_mapping);
         assert_eq!(
-            carried_anchor_positions(std::slice::from_ref(&finding), &next_mapping),
+            carried_anchor_positions(std::slice::from_ref(&finding), &next_locations),
             positions
         );
-        assert!(carried_anchor_targets(std::slice::from_ref(&finding), &next_mapping,).is_empty());
+        assert!(carried_anchor_targets(std::slice::from_ref(&finding), &next_locations).is_empty());
         let mismatched = ResolvedFindingClaim {
             finding_id: finding.id.clone(),
             current_anchor_quote: "still present".into(),
@@ -21260,7 +21722,7 @@ rename to src/new.rs
                 Vec::new(),
                 &[mismatched],
                 std::slice::from_ref(&finding),
-                &next_mapping,
+                &next_locations,
                 &HashMap::new(),
             )
             .is_empty()
@@ -21274,7 +21736,7 @@ rename to src/new.rs
                 Vec::new(),
                 &[matched],
                 &[finding],
-                &next_mapping,
+                &next_locations,
                 &HashMap::new(),
             ),
             vec!["rvf_deleted".to_owned()]
@@ -21302,8 +21764,9 @@ rename to src/new.rs
             review_base_sha: "base",
             base_anchors: &base_anchors,
         };
+        let locations = mapped_locations(std::slice::from_ref(&finding), &mapping);
         assert_eq!(
-            carried_anchor_targets(std::slice::from_ref(&finding), &mapping),
+            carried_anchor_targets(std::slice::from_ref(&finding), &locations),
             vec![("src/shifted.rs".to_owned(), 101)]
         );
 
@@ -21320,7 +21783,7 @@ rename to src/new.rs
                 Vec::new(),
                 std::slice::from_ref(&claim),
                 std::slice::from_ref(&finding),
-                &mapping,
+                &locations,
                 &stale_line,
             )
             .is_empty()
@@ -21335,7 +21798,7 @@ rename to src/new.rs
                 Vec::new(),
                 std::slice::from_ref(&claim),
                 std::slice::from_ref(&finding),
-                &mapping,
+                &locations,
                 &remapped_line,
             ),
             vec!["rvf_shifted".to_owned()]
@@ -21363,8 +21826,9 @@ rename to src/new.rs
             review_base_sha: "head-2",
             base_anchors: &advanced,
         };
+        let next_locations = mapped_locations(std::slice::from_ref(&finding), &next_mapping);
         assert_eq!(
-            carried_anchor_targets(std::slice::from_ref(&finding), &next_mapping),
+            carried_anchor_targets(std::slice::from_ref(&finding), &next_locations),
             vec![("src/shifted.rs".to_owned(), 102)]
         );
         let head_three_line = HashMap::from([(
@@ -21376,7 +21840,7 @@ rename to src/new.rs
                 Vec::new(),
                 &[claim],
                 &[finding],
-                &next_mapping,
+                &next_locations,
                 &head_three_line,
             ),
             vec!["rvf_shifted".to_owned()]
@@ -21420,7 +21884,8 @@ rename to src/new.rs
         );
         let record = store.code_review_job(&legacy.id).unwrap().unwrap();
 
-        let continuation = carried_anchor_continuation_request(&record, &legacy);
+        let cursor = "a".repeat(40);
+        let continuation = carried_anchor_continuation_request(&record, &legacy, Some(&cursor));
 
         assert_eq!(
             continuation.scope,
@@ -21428,6 +21893,10 @@ rename to src/new.rs
         );
         assert!(continuation.review_base_sha.is_empty());
         assert_eq!(continuation.retry_of.as_deref(), Some(legacy.id.as_str()));
+        assert_eq!(
+            carried_anchor_continuation_cursor(&continuation.dedupe_key),
+            Some(cursor)
+        );
     }
 
     #[test]
@@ -29644,6 +30113,9 @@ rename to src/new.rs
     fn review_prompts_bound_exploration_to_fit_the_latency_target() {
         assert!(REVIEWER_EXECUTION_GUIDANCE.contains("about three minutes"));
         assert!(REVIEWER_EXECUTION_GUIDANCE.contains("no more than 24 tool calls"));
+        assert!(REVIEWER_EXECUTION_GUIDANCE.contains("emergency ceiling, not a target"));
+        assert!(REVIEWER_EXECUTION_GUIDANCE.contains("concrete defect hypothesis"));
+        assert!(REVIEWER_EXECUTION_GUIDANCE.contains("narrowest lookup"));
         assert_eq!(REVIEWER_MAX_TOOL_CALLS, 24);
         assert!(COORDINATOR_EXECUTION_GUIDANCE.contains("about one minute"));
         assert!(COORDINATOR_EXECUTION_GUIDANCE.contains("no more than 4 tool calls"));
@@ -32320,6 +32792,7 @@ rename to src/new.rs
                 display_name: id.into(),
                 context_window,
                 supports_tools: true,
+                supports_images: false,
                 input_price_per_mtok: None,
                 output_price_per_mtok: None,
                 options_schema: serde_json::json!({}),

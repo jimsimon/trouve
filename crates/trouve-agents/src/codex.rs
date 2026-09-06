@@ -27,7 +27,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufRead
 use tokio::process::ChildStdin;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use trouve_protocol::{ModelInfo, TodoItem, TodoStatus, Usage};
-use trouve_providers::codex::completed_raw_reasoning_text;
+use trouve_providers::codex::completed_reasoning_text;
 use trouve_providers::models_dev::{ModelsDevCatalog, OptionsDialect};
 
 use crate::process_env::{ProcessTreeChild, spawn_process_tree};
@@ -622,11 +622,12 @@ fn split_effort(model: &str) -> (&str, Option<&str>) {
     }
 }
 
-/// Commentary messages drive trouve's progress blocks. Disable reasoning
-/// summaries so their heading-like text is not generated alongside the
-/// richer commentary stream.
+/// Reasoning summaries are the only reasoning most hosted OpenAI models expose
+/// (raw reasoning stays encrypted), so request them and surface them as
+/// thinking. Commentary messages still drive the separate progress stream;
+/// the two can paraphrase each other, as they do under the Cursor adapter.
 fn apply_reasoning_options(params: &mut Value, effort: Option<&str>) {
-    params["summary"] = json!("none");
+    params["summary"] = json!("auto");
     if let Some(effort) = effort {
         params["effort"] = json!(effort);
     }
@@ -660,7 +661,57 @@ struct CollaboratorStreamState {
     usage: Usage,
     user_messages: HashSet<String>,
     commentary_messages: HashSet<String>,
-    streamed_raw_reasoning: HashSet<String>,
+    reasoning: ReasoningStreamState,
+}
+
+/// Tracks which reasoning items have already streamed as thinking so the
+/// completion fallback does not repeat them, and so summaries are dropped for
+/// items whose raw reasoning is being streamed (raw wins when both arrive).
+#[derive(Default)]
+struct ReasoningStreamState {
+    raw: HashSet<String>,
+    summary: HashSet<String>,
+}
+
+impl ReasoningStreamState {
+    /// Raw reasoning delta: always shown.
+    fn raw_delta<'a>(&mut self, params: &'a Value) -> Option<&'a str> {
+        let delta = params["delta"].as_str()?;
+        if let Some(id) = params["itemId"].as_str() {
+            self.raw.insert(id.to_string());
+        }
+        Some(delta)
+    }
+
+    /// Summary delta: shown unless raw reasoning already streams for the item.
+    fn summary_delta<'a>(&mut self, params: &'a Value) -> Option<&'a str> {
+        let delta = params["delta"].as_str()?;
+        let id = params["itemId"].as_str().unwrap_or("");
+        if self.raw.contains(id) {
+            return None;
+        }
+        self.summary.insert(id.to_string());
+        Some(delta)
+    }
+
+    /// Summary parts are separate sections; separate every part after the
+    /// first from the text already streamed for the same item.
+    fn summary_part_separator(&self, params: &Value) -> Option<&'static str> {
+        let id = params["itemId"].as_str().unwrap_or("");
+        (params["summaryIndex"].as_i64().unwrap_or(0) > 0
+            && !self.raw.contains(id)
+            && self.summary.contains(id))
+        .then_some("\n\n")
+    }
+
+    /// Whether the completed reasoning item already streamed as thinking.
+    fn complete(&mut self, item: &Value) -> bool {
+        item["id"].as_str().is_some_and(|id| {
+            let raw = self.raw.remove(id);
+            let summary = self.summary.remove(id);
+            raw || summary
+        })
+    }
 }
 
 /// Tracks every provider-native collaborator announced anywhere below the
@@ -822,11 +873,18 @@ fn collaborator_notification(
             }
         }
         "item/reasoning/textDelta" => {
-            if let Some(delta) = params["delta"].as_str() {
-                if let Some(id) = params["itemId"].as_str() {
-                    state.streamed_raw_reasoning.insert(id.to_string());
-                }
+            if let Some(delta) = state.reasoning.raw_delta(params) {
                 events.push(BackendCollaboratorEvent::ThinkingDelta(delta.into()));
+            }
+        }
+        "item/reasoning/summaryTextDelta" => {
+            if let Some(delta) = state.reasoning.summary_delta(params) {
+                events.push(BackendCollaboratorEvent::ThinkingDelta(delta.into()));
+            }
+        }
+        "item/reasoning/summaryPartAdded" => {
+            if let Some(separator) = state.reasoning.summary_part_separator(params) {
+                events.push(BackendCollaboratorEvent::ThinkingDelta(separator.into()));
             }
         }
         "item/started" => {
@@ -878,14 +936,11 @@ fn collaborator_notification(
             {
                 events.push(BackendCollaboratorEvent::UserMessage(content));
             }
-            let raw_reasoning_streamed = kind == "reasoning"
-                && item["id"]
-                    .as_str()
-                    .is_some_and(|id| state.streamed_raw_reasoning.remove(id));
-            let mut thinking_emitted = raw_reasoning_streamed;
+            let reasoning_streamed = kind == "reasoning" && state.reasoning.complete(item);
+            let mut thinking_emitted = reasoning_streamed;
             if kind == "reasoning"
-                && !raw_reasoning_streamed
-                && let Some(text) = completed_raw_reasoning_text(item)
+                && !reasoning_streamed
+                && let Some(text) = completed_reasoning_text(item)
             {
                 thinking_emitted = true;
                 events.push(BackendCollaboratorEvent::ThinkingDelta(text));
@@ -1058,10 +1113,10 @@ fn turn_stream(
         // displayed as thinking or appended to the final answer. Missing
         // phases retain the legacy final-answer behavior.
         let mut commentary_messages = HashSet::new();
-        // Some providers only populate raw reasoning on the completed item.
-        // Track streamed raw items so the completion fallback does not repeat
+        // Some providers only populate reasoning on the completed item.
+        // Track streamed items so the completion fallback does not repeat
         // content already shown.
-        let mut streamed_raw_reasoning = HashSet::new();
+        let mut reasoning = ReasoningStreamState::default();
         let mut client_gone = false;
         let mut cancelled = false;
         let mut route_overloaded = false;
@@ -1297,14 +1352,23 @@ fn turn_stream(
                                 }
                             }
                             // Raw reasoning is only exposed by some models (notably
-                            // open-source models). Summary deltas are deliberately not
-                            // used as thinking; they are section headings, while
-                            // agent-message commentary is the readable progress stream.
+                            // open-source models); hosted OpenAI models expose
+                            // reasoning summaries instead. Either is shown as thinking,
+                            // raw taking precedence when both arrive for an item.
                             "item/reasoning/textDelta" => {
-                                if let Some(d) = params["delta"].as_str() {
-                                    if let Some(id) = params["itemId"].as_str() {
-                                        streamed_raw_reasoning.insert(id.to_string());
-                                    }
+                                if let Some(d) = reasoning.raw_delta(&params) {
+                                    let _ =
+                                        tx.send(Ok(BackendEvent::ThinkingDelta(d.into()))).await;
+                                }
+                            }
+                            "item/reasoning/summaryTextDelta" => {
+                                if let Some(d) = reasoning.summary_delta(&params) {
+                                    let _ =
+                                        tx.send(Ok(BackendEvent::ThinkingDelta(d.into()))).await;
+                                }
+                            }
+                            "item/reasoning/summaryPartAdded" => {
+                                if let Some(d) = reasoning.summary_part_separator(&params) {
                                     let _ =
                                         tx.send(Ok(BackendEvent::ThinkingDelta(d.into()))).await;
                                 }
@@ -1348,14 +1412,12 @@ fn turn_stream(
                             "item/completed" => {
                                 let item = &params["item"];
                                 let ty = item["type"].as_str().unwrap_or("");
-                                let raw_reasoning_streamed = ty == "reasoning"
-                                    && item["id"]
-                                        .as_str()
-                                        .is_some_and(|id| streamed_raw_reasoning.remove(id));
-                                let mut thinking_emitted = raw_reasoning_streamed;
+                                let reasoning_streamed =
+                                    ty == "reasoning" && reasoning.complete(item);
+                                let mut thinking_emitted = reasoning_streamed;
                                 if ty == "reasoning"
-                                    && !raw_reasoning_streamed
-                                    && let Some(text) = completed_raw_reasoning_text(item)
+                                    && !reasoning_streamed
+                                    && let Some(text) = completed_reasoning_text(item)
                                 {
                                     thinking_emitted = true;
                                     let _ = tx.send(Ok(BackendEvent::ThinkingDelta(text))).await;
@@ -5571,7 +5633,7 @@ mod tests {
     }
 
     #[test]
-    fn extracts_completed_raw_codex_reasoning_as_a_stream_fallback() {
+    fn extracts_completed_codex_reasoning_as_a_stream_fallback() {
         let summarized = json!({
             "id": "reason-1",
             "type": "reasoning",
@@ -5579,15 +5641,12 @@ mod tests {
             "content": ["raw text is secondary"],
         });
         assert_eq!(
-            completed_raw_reasoning_text(&summarized).as_deref(),
+            completed_reasoning_text(&summarized).as_deref(),
             Some("raw text is secondary")
         );
 
         let raw = json!({ "type": "reasoning", "summary": [], "content": ["thinking"] });
-        assert_eq!(
-            completed_raw_reasoning_text(&raw).as_deref(),
-            Some("thinking")
-        );
+        assert_eq!(completed_reasoning_text(&raw).as_deref(), Some("thinking"));
         let response_item = json!({
             "type": "reasoning",
             "summary": [
@@ -5597,12 +5656,129 @@ mod tests {
             "content": [{ "type": "reasoning_text", "text": "raw thought" }],
         });
         assert_eq!(
-            completed_raw_reasoning_text(&response_item).as_deref(),
+            completed_reasoning_text(&response_item).as_deref(),
             Some("raw thought")
         );
+        // Hosted models keep raw reasoning encrypted and only return a summary.
+        let summary_only = json!({
+            "type": "reasoning",
+            "summary": ["**Checking the adapter**", "Looking at the config override."],
+            "content": [],
+        });
         assert_eq!(
-            completed_raw_reasoning_text(&json!({ "type": "reasoning" })),
+            completed_reasoning_text(&summary_only).as_deref(),
+            Some("**Checking the adapter**\n\nLooking at the config override.")
+        );
+        assert_eq!(
+            completed_reasoning_text(&json!({ "type": "reasoning" })),
             None
+        );
+    }
+
+    #[test]
+    fn streams_reasoning_summaries_as_thinking_unless_raw_reasoning_streams() {
+        let mut state = CollaboratorStreamState::default();
+        let delta = |state: &mut CollaboratorStreamState, method: &str, params: Value| {
+            collaborator_notification(method, &params, state)
+                .into_iter()
+                .map(|event| match event {
+                    BackendCollaboratorEvent::ThinkingDelta(text) => text,
+                    BackendCollaboratorEvent::ThinkingCompleted => "<done>".into(),
+                    other => panic!("unexpected event {other:?}"),
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // Summary-only model: parts stream, later parts are paragraph-separated,
+        // and completion closes the item without repeating it.
+        assert!(
+            delta(
+                &mut state,
+                "item/reasoning/summaryPartAdded",
+                json!({ "itemId": "r1", "summaryIndex": 0 }),
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            delta(
+                &mut state,
+                "item/reasoning/summaryTextDelta",
+                json!({ "itemId": "r1", "delta": "**Checking**", "summaryIndex": 0 }),
+            ),
+            ["**Checking**"]
+        );
+        assert_eq!(
+            delta(
+                &mut state,
+                "item/reasoning/summaryPartAdded",
+                json!({ "itemId": "r1", "summaryIndex": 1 }),
+            ),
+            ["\n\n"]
+        );
+        assert_eq!(
+            delta(
+                &mut state,
+                "item/reasoning/summaryTextDelta",
+                json!({ "itemId": "r1", "delta": "Next.", "summaryIndex": 1 }),
+            ),
+            ["Next."]
+        );
+        assert_eq!(
+            delta(
+                &mut state,
+                "item/completed",
+                json!({ "item": {
+                    "id": "r1",
+                    "type": "reasoning",
+                    "summary": ["**Checking**", "Next."],
+                    "content": []
+                } }),
+            ),
+            ["<done>"]
+        );
+
+        // Raw reasoning wins: summary deltas for the same item are dropped.
+        assert_eq!(
+            delta(
+                &mut state,
+                "item/reasoning/textDelta",
+                json!({ "itemId": "r2", "delta": "raw" }),
+            ),
+            ["raw"]
+        );
+        assert!(
+            delta(
+                &mut state,
+                "item/reasoning/summaryTextDelta",
+                json!({ "itemId": "r2", "delta": "summary", "summaryIndex": 0 }),
+            )
+            .is_empty()
+        );
+        assert!(
+            delta(
+                &mut state,
+                "item/reasoning/summaryPartAdded",
+                json!({ "itemId": "r2", "summaryIndex": 1 }),
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            delta(
+                &mut state,
+                "item/completed",
+                json!({ "item": { "id": "r2", "type": "reasoning", "summary": ["summary"], "content": ["raw"] } }),
+            ),
+            ["<done>"]
+        );
+
+        // Nothing streamed: the completed summary is the fallback.
+        assert_eq!(
+            delta(
+                &mut state,
+                "item/completed",
+                json!({ "item": { "id": "r3", "type": "reasoning", "summary": ["only at the end"], "content": [] } }),
+            ),
+            ["only at the end", "<done>"]
         );
     }
 
@@ -5633,15 +5809,15 @@ mod tests {
     }
 
     #[test]
-    fn turn_disables_reasoning_summaries() {
+    fn turn_requests_reasoning_summaries() {
         let mut params = json!({ "threadId": "thread-1", "input": [] });
         apply_reasoning_options(&mut params, Some("high"));
-        assert_eq!(params["summary"], "none");
+        assert_eq!(params["summary"], "auto");
         assert_eq!(params["effort"], "high");
 
         let mut without_effort = json!({});
         apply_reasoning_options(&mut without_effort, None);
-        assert_eq!(without_effort["summary"], "none");
+        assert_eq!(without_effort["summary"], "auto");
         assert!(without_effort["effort"].is_null());
     }
 

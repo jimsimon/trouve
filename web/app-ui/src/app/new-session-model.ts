@@ -14,9 +14,8 @@ import {
 } from "../components/model-option-controls.js";
 import { parseExactModelOptionNumber } from "../services/protocol-json.js";
 
-export const NEW_SESSION_TITLE_MAX_LENGTH = 48;
-export const NEW_SESSION_TITLE_FALLBACK = "New session";
-export const NEW_THREAD_TITLE_FALLBACK = "New thread";
+export const NEW_SESSION_TITLE_FALLBACK = "New Session";
+export const NEW_THREAD_TITLE_FALLBACK = "New Thread";
 export const NEW_SESSION_OPTIONS_TIMEOUT_MS = 10_000;
 
 type ThinkingOptionKey =
@@ -273,33 +272,6 @@ const nonEmpty = (value: string | null | undefined): string | undefined => {
   const trimmed = value?.trim();
   return trimmed === undefined || trimmed === "" ? undefined : trimmed;
 };
-
-/**
- * Derives the same bounded first-line fallback as the retained desktop UI,
- * while additionally removing invisible controls and avoiding a split UTF-16
- * surrogate pair at the title boundary.
- */
-const promptTitleFallback = (prompt: string, fallback: string): string => {
-  const sanitized = prompt
-    .replace(/[\u0000-\u0009\u000b\u000c\u000e-\u001f\u007f-\u009f\u200b\u200e\u200f\u202a-\u202e\u2066-\u2069]+/gu, " ")
-    .trim();
-  const normalized = (sanitized.split(/\r\n?|\n/u)[0] ?? "")
-    .replace(/\s+/gu, " ")
-    .trim();
-  if (normalized === "") return fallback;
-
-  const title = Array.from(normalized)
-    .slice(0, NEW_SESSION_TITLE_MAX_LENGTH)
-    .join("")
-    .trimEnd();
-  return title === "" ? fallback : title;
-};
-
-export const sessionTitleFallback = (prompt: string): string =>
-  promptTitleFallback(prompt, NEW_SESSION_TITLE_FALLBACK);
-
-export const threadTitleFallback = (prompt: string): string =>
-  promptTitleFallback(prompt, NEW_THREAD_TITLE_FALLBACK);
 
 /** Returns the first valid thinking option in the established precedence. */
 export const thinkingOption = (

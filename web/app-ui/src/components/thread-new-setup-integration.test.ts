@@ -25,14 +25,18 @@ describe("thread screen provisional setup integration", () => {
     );
   });
 
-  it("uses the shared title generator before creating and seeding the thread", () => {
-    expect(screen).toContain("services.protocol.generateSessionTitle(prompt");
-    expect(screen).toContain("request = { ...request, title: generated.title.trim() }");
+  it("creates and seeds the placeholder thread before naming it in the background", () => {
+    expect(screen).toContain("title: NEW_THREAD_TITLE_FALLBACK");
     expect(screen).toContain("services.protocol.createThread(request)");
     expect(screen).toContain("store.upsertThread(thread)");
     expect(screen).toContain(
       "services.protocol.sendMessage(thread.id, event.detail.initialMessage)",
     );
+    expect(screen).toContain("services.protocol.generateTitle(");
+    expect(screen).toContain("event.detail.initialMessage?.attachments ?? []");
+    expect(screen).toContain("expected_title: NEW_THREAD_TITLE_FALLBACK");
+    expect(screen.indexOf("services.protocol.createThread(request)"))
+      .toBeLessThan(screen.indexOf("services.protocol.generateTitle("));
     expect(screen).toContain(
       "Thread was created, but its first message could not be sent.",
     );

@@ -3080,6 +3080,10 @@ struct RunProjection {
     final_text: Option<String>,
     usage: Usage,
     emitted_assistant_text: bool,
+    /// A streamed reasoning block is open. Bridge `thinking` messages arrive
+    /// as token fragments, so the block is closed only on an explicit
+    /// `completed` subtype, when other content starts, or at run end.
+    thinking_open: bool,
     last_status_message: Option<String>,
     terminal_status: Option<Value>,
     terminal_error_code: Option<String>,
@@ -3103,28 +3107,40 @@ impl RunProjection {
                 .unwrap_or("");
             match kind {
                 "assistant" => {
-                    for text in message_text_blocks(payload) {
-                        if !text.is_empty() {
-                            self.emitted_assistant_text = true;
-                            send_projected_event(events, cancel, BackendEvent::TextDelta(text))
-                                .await?;
-                        }
+                    let blocks: Vec<String> = message_text_blocks(payload)
+                        .into_iter()
+                        .filter(|text| !text.is_empty())
+                        .collect();
+                    if !blocks.is_empty() {
+                        self.close_thinking(events, cancel).await?;
+                    }
+                    for text in blocks {
+                        self.emitted_assistant_text = true;
+                        send_projected_event(events, cancel, BackendEvent::TextDelta(text)).await?;
                     }
                 }
                 "thinking" => {
+                    let subtype = payload
+                        .get("subtype")
+                        .or_else(|| sdk.get("subtype"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
                     if let Some(text) = message_text(payload)
                         && !text.is_empty()
                     {
+                        self.thinking_open = true;
                         send_projected_event(events, cancel, BackendEvent::ThinkingDelta(text))
                             .await?;
-                        send_projected_event(events, cancel, BackendEvent::ThinkingCompleted)
-                            .await?;
+                    }
+                    if subtype == "completed" {
+                        self.close_thinking(events, cancel).await?;
                     }
                 }
                 "task" => {
                     if let Some(text) = message_text(payload)
                         && !text.is_empty()
                     {
+                        self.close_thinking(events, cancel).await?;
                         send_projected_event(events, cancel, BackendEvent::ProgressDelta(text))
                             .await?;
                     }
@@ -3201,8 +3217,19 @@ impl RunProjection {
         }
     }
 
+    async fn close_thinking(
+        &mut self,
+        events: &BackendEventSender,
+        cancel: &CancellationToken,
+    ) -> Result<(), StreamStop> {
+        if std::mem::take(&mut self.thinking_open) {
+            send_projected_event(events, cancel, BackendEvent::ThinkingCompleted).await?;
+        }
+        Ok(())
+    }
+
     async fn finish(
-        self,
+        mut self,
         events: &BackendEventSender,
         cancel: &CancellationToken,
     ) -> Result<TurnTerminal, BackendError> {
@@ -3211,6 +3238,12 @@ impl RunProjection {
         }
         if events.is_closed() {
             return Ok(TurnTerminal::ConsumerClosed);
+        }
+        if let Err(stop) = self.close_thinking(events, cancel).await {
+            return Ok(match stop {
+                StreamStop::Cancelled => TurnTerminal::Cancelled,
+                StreamStop::ConsumerClosed => TurnTerminal::ConsumerClosed,
+            });
         }
         match self.done {
             DoneState::Seen => {}
@@ -4226,6 +4259,71 @@ mod tests {
             error
                 .to_string()
                 .contains("invalid or duplicate done envelope")
+        );
+    }
+
+    #[tokio::test]
+    async fn projection_keeps_streamed_thinking_in_one_block() {
+        let (sender_tx, sender_rx) = tokio::sync::oneshot::channel();
+        let mut stream = Box::pin(async_stream(move |events| async move {
+            let _ = sender_tx.send(events);
+            std::future::pending::<()>().await;
+        }));
+        let events = sender_rx.await.unwrap();
+        let cancel = CancellationToken::new();
+        let mut projection = RunProjection::default();
+        let frames = [
+            json!({ "sdkMessage": { "message": { "type": "thinking", "subtype": "delta", "text": "The" } } }),
+            json!({ "sdkMessage": { "message": { "type": "thinking", "subtype": "delta", "text": " user" } } }),
+            json!({ "sdkMessage": { "message": { "type": "thinking", "subtype": "completed" } } }),
+            json!({ "sdkMessage": { "message": { "type": "thinking", "text": "Next" } } }),
+            json!({ "sdkMessage": { "message": { "type": "thinking", "text": " block" } } }),
+            json!({ "sdkMessage": { "message": { "type": "assistant", "text": "Done." } } }),
+            json!({ "sdkMessage": { "message": { "type": "thinking", "text": "Trailing" } } }),
+            json!({
+                "result": {
+                    "status": "RUN_LIFECYCLE_STATUS_FINISHED",
+                    "result": { "result": "Done." }
+                }
+            }),
+            json!({ "done": {} }),
+        ];
+        for frame in frames {
+            projection.process(frame, &events, &cancel).await.unwrap();
+        }
+        assert!(matches!(
+            projection.finish(&events, &cancel).await.unwrap(),
+            TurnTerminal::Finished(_)
+        ));
+
+        // Adjacent thinking deltas are merged here because the intermediate
+        // buffer coalesces them opportunistically; the shape under test is
+        // where the ThinkingCompleted boundaries land.
+        let mut observed: Vec<String> = Vec::new();
+        while let Ok(Some(event)) =
+            tokio::time::timeout(Duration::from_millis(200), stream.next()).await
+        {
+            match event.unwrap() {
+                BackendEvent::ThinkingDelta(text) => match observed.last_mut() {
+                    Some(last) if last.starts_with("thinking:") => last.push_str(&text),
+                    _ => observed.push(format!("thinking:{text}")),
+                },
+                BackendEvent::ThinkingCompleted => observed.push("thinking-completed".into()),
+                BackendEvent::TextDelta(text) => observed.push(format!("text:{text}")),
+                other => panic!("unexpected event {other:?}"),
+            }
+        }
+        assert_eq!(
+            observed,
+            [
+                "thinking:The user",
+                "thinking-completed",
+                "thinking:Next block",
+                "thinking-completed",
+                "text:Done.",
+                "thinking:Trailing",
+                "thinking-completed",
+            ]
         );
     }
 

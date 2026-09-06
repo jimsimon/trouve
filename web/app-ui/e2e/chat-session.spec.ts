@@ -197,6 +197,7 @@ const installEventStream = async (page: Page): Promise<void> => {
 interface ProtocolFixtureOptions {
   readonly sentMessages?: Array<Record<string, unknown>>;
   readonly createdThreadRequests?: Array<Record<string, unknown>>;
+  readonly renamedThreadRequests?: Array<Record<string, unknown>>;
   readonly generatedThreadTitle?: string;
   readonly steeredMessages?: Array<Record<string, unknown>>;
   readonly cancelledThreadIds?: string[];
@@ -226,6 +227,7 @@ const installProtocolFixtures = async (
   {
     sentMessages = [],
     createdThreadRequests = [],
+    renamedThreadRequests = [],
     generatedThreadTitle = "Generated thread title",
     steeredMessages = [],
     cancelledThreadIds = [],
@@ -281,9 +283,9 @@ const installProtocolFixtures = async (
       });
       return;
     }
-    if (key === "POST /v1/session-title") {
+    if (key === "POST /v1/title") {
       await route.fulfill({
-        json: { title: generatedThreadTitle, source: "model" },
+        json: { title: generatedThreadTitle },
       });
       return;
     }
@@ -299,6 +301,23 @@ const installProtocolFixtures = async (
           model: body["model"] ?? "test/model",
           model_options: body["model_options"] ?? {},
           permission_mode: body["permission_mode"] ?? "ask",
+          created_at: "2026-08-05T08:00:00Z",
+        },
+      });
+      return;
+    }
+    if (key === "PATCH /v1/threads/th_created") {
+      const body = request.postDataJSON() as Record<string, unknown>;
+      renamedThreadRequests.push(body);
+      await route.fulfill({
+        json: {
+          id: "th_created",
+          session_id: "se_1",
+          title: body["title"],
+          mode: "code",
+          model: "test/model",
+          model_options: {},
+          permission_mode: "ask",
           created_at: "2026-08-05T08:00:00Z",
         },
       });
@@ -466,15 +485,9 @@ const installProtocolFixtures = async (
           session_pull_requests: sessionPullRequests.length === 0
             ? []
             : [{ session_id: "se_1", prs: sessionPullRequests }],
-          git_worktree_settings: {
+          session_naming_settings: {
+            model: "test/tiny",
             derive_branch_name_from_session_title: false,
-            title_model: {
-              model_downloaded: false,
-              runtime_installed: false,
-              state: "not_installed",
-            },
-            title_model_load_behavior: "auto",
-            title_model_resource_policy: "adaptive",
           },
         },
       });
@@ -1497,10 +1510,12 @@ test("new-thread model choices do not wait for subscription health", async ({ pa
   }
 });
 
-test("new user threads use the shared server title generator", async ({ page }) => {
+test("new user threads are renamed asynchronously by the shared server title generator", async ({ page }) => {
   const createdThreadRequests: Array<Record<string, unknown>> = [];
+  const renamedThreadRequests: Array<Record<string, unknown>> = [];
   await installProtocolFixtures(page, {
     createdThreadRequests,
+    renamedThreadRequests,
     generatedThreadTitle: "Review streaming cancellation behavior",
   });
   await page.goto("/");
@@ -1513,8 +1528,12 @@ test("new user threads use the shared server title generator", async ({ page }) 
   await setup.getByRole("button", { name: "Start thread" }).click();
 
   await expect.poll(() => createdThreadRequests.length).toBe(1);
-  expect(createdThreadRequests[0]?.["title"])
-    .toBe("Review streaming cancellation behavior");
+  expect(createdThreadRequests[0]?.["title"]).toBe("New Thread");
+  await expect.poll(() => renamedThreadRequests.length).toBe(1);
+  expect(renamedThreadRequests[0]).toMatchObject({
+    title: "Review streaming cancellation behavior",
+    expected_title: "New Thread",
+  });
 });
 
 test("the YOLO warning remains centered and exposes its hover text", async ({ page }) => {

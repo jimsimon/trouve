@@ -57,3 +57,5 @@ sequentially.
 | [0045](0045-full-branch-review-on-every-head.md) | Full-branch review on every head | Accepted |
 | [0046](0046-detached-descendants-are-session-scoped.md) | Detached descendants of shell calls are session-scoped | Accepted |
 | [0047](0047-cursor-sdk-bridge-transport.md) | Cursor SDK Bridge transport | Accepted |
+| [0048](0048-configured-asynchronous-session-naming.md) | Configured asynchronous session naming | Accepted |
+| [0049](0049-explicit-ownership-for-managed-background-work.md) | Explicit ownership for managed background work | Accepted |

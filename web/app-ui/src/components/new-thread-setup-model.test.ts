@@ -171,7 +171,7 @@ describe("new thread setup model", () => {
     });
     expect(detail.request).toEqual({
       session_id: "se-main",
-      title: "New thread",
+      title: "New Thread",
       mode: "code",
       model: "provider/global",
     });
@@ -342,7 +342,7 @@ describe("new thread setup model", () => {
       sessionId: "se-main",
       request: {
         session_id: "se-main",
-        title: "Review this change.",
+        title: "New Thread",
         mode: "review",
         model: "provider/review",
         permission_mode: "allow_list",
@@ -365,7 +365,7 @@ describe("new thread setup model", () => {
       catalog,
     });
     expect(empty.initialMessage).toBeUndefined();
-    expect(empty.request.title).toBe("New thread");
+    expect(empty.request.title).toBe("New Thread");
 
     const attachmentOnly = createNewThreadSetupSubmission({
       workspaceId: "ws-main",
@@ -377,7 +377,7 @@ describe("new thread setup model", () => {
       content: "",
       attachments: [upload.upload],
     });
-    expect(attachmentOnly.request.title).toBe("New thread");
+    expect(attachmentOnly.request.title).toBe("New Thread");
   });
 
   it("drops tampered mode, model, and option selections instead of inventing request fields", () => {
@@ -393,7 +393,7 @@ describe("new thread setup model", () => {
       },
       catalog,
     });
-    expect(detail.request).toEqual({ session_id: "se-main", title: "New thread" });
+    expect(detail.request).toEqual({ session_id: "se-main", title: "New Thread" });
   });
 
   it("enforces per-item, count, and aggregate attachment budgets", () => {

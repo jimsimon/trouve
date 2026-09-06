@@ -11,6 +11,7 @@ mod fs;
 mod glob;
 mod grep;
 mod hashline;
+mod managed_background;
 mod patch;
 mod search;
 mod shell;
@@ -39,6 +40,7 @@ pub use edit_strategy::for_model as edit_strategy_for_model;
 
 const REVIEW_OPTIONAL_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 const REVIEW_PRIMARY_FETCH_TIMEOUT: Duration = Duration::from_secs(60);
+const REVIEW_MAINTENANCE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const REVIEW_FETCH_TERMINATION_GRACE: Duration = Duration::from_secs(2);
 const REVIEW_HISTORY_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 const REVIEW_FETCH_STDERR_MAX_BYTES: usize = 8 * 1024;
@@ -356,6 +358,13 @@ fn primary_review_fetch_args(
         format!("+{base_sha}:refs/remotes/origin/trouve-base"),
         format!("+refs/pull/{pull_number}/head:{pull_ref}"),
     ]
+}
+
+fn review_repository_maintenance_key(repository_path: &Path) -> String {
+    format!(
+        "review-repository-maintenance:{}",
+        repository_path.display()
+    )
 }
 
 fn authenticated_review_git_command(
@@ -991,6 +1000,9 @@ pub trait ToolExecutor: Send + Sync {
     ) -> Result<String, String> {
         Err("session branch push is unavailable in this executor".into())
     }
+    async fn rename_session_branch(&self, _request: &SessionBranchRename) -> Result<(), String> {
+        Err("session branch rename is unavailable in this executor".into())
+    }
     /// Atomically reserve and create a session worktree. The returned receipt
     /// is opaque outside the executor and is required for finalize/rollback.
     async fn create_session_worktree(
@@ -1124,6 +1136,13 @@ pub struct SessionRepositoryPush {
     pub requested_base: Option<String>,
     pub branch: String,
     pub cancel: tokio_util::sync::CancellationToken,
+}
+
+pub struct SessionBranchRename {
+    pub managed_root: PathBuf,
+    pub worktree: PathBuf,
+    pub old_branch: String,
+    pub new_branch: String,
 }
 
 /// One attachment selected from durable metadata for trusted verification and
@@ -1484,7 +1503,7 @@ async fn run_review_command_with_timeout(
             "GIT_CONFIG_GLOBAL",
             if cfg!(windows) { "NUL" } else { "/dev/null" },
         )
-        .env("GIT_CONFIG_COUNT", "7")
+        .env("GIT_CONFIG_COUNT", "8")
         // Reset any repository-local extra-header list before appending the
         // one URL-scoped credential owned by this invocation.
         .env("GIT_CONFIG_KEY_0", "http.extraheader")
@@ -1504,6 +1523,10 @@ async fn run_review_command_with_timeout(
             "GIT_CONFIG_VALUE_6",
             if cfg!(windows) { "NUL" } else { "/dev/null" },
         )
+        // Any Git subcommand that triggers maintenance must keep it inside
+        // the process tree owned by this invocation.
+        .env("GIT_CONFIG_KEY_7", "maintenance.autoDetach")
+        .env("GIT_CONFIG_VALUE_7", "false")
         .env("GIT_ALLOW_PROTOCOL", "https")
         .env("GIT_PROTOCOL_FROM_USER", "0")
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -1696,6 +1719,7 @@ pub struct LocalToolExecutor {
     built_in_specs: Vec<ToolSpec>,
     mcp: crate::mcp::McpManager,
     jobs: Arc<shell::JobRegistry>,
+    managed_background: managed_background::ManagedBackgroundTasks,
     hashline_failures: Mutex<HashMap<String, u8>>,
     review_repository_locks: Mutex<HashMap<PathBuf, std::sync::Weak<tokio::sync::Mutex<()>>>>,
 }
@@ -1752,6 +1776,7 @@ impl LocalToolExecutor {
             built_in_specs,
             mcp: crate::mcp::McpManager::with_logs(logs),
             jobs,
+            managed_background: managed_background::ManagedBackgroundTasks::default(),
             hashline_failures: Mutex::new(HashMap::new()),
             review_repository_locks: Mutex::new(HashMap::new()),
         }
@@ -1766,6 +1791,48 @@ impl LocalToolExecutor {
         let lock = Arc::new(tokio::sync::Mutex::new(()));
         locks.insert(path.to_path_buf(), Arc::downgrade(&lock));
         lock
+    }
+
+    fn review_repository_foreground_lock(&self, path: &Path) -> Arc<tokio::sync::Mutex<()>> {
+        let repository_lock = self.review_repository_lock(path);
+        self.managed_background
+            .preempt(&review_repository_maintenance_key(path));
+        repository_lock
+    }
+
+    fn schedule_review_repository_maintenance(&self, repository_path: &Path) {
+        let repository_path = repository_path.to_path_buf();
+        let repository_lock = self.review_repository_lock(&repository_path);
+        let key = review_repository_maintenance_key(&repository_path);
+        self.managed_background.schedule(key, move |cancel| {
+            let repository_path = repository_path.clone();
+            let repository_lock = repository_lock.clone();
+            async move {
+                let repository_guard = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return,
+                    guard = repository_lock.lock_owned() => guard,
+                };
+                let result = run_review_git_with_timeout(
+                    &repository_path,
+                    "",
+                    vec!["maintenance".into(), "run".into(), "--auto".into()],
+                    &cancel,
+                    REVIEW_MAINTENANCE_TIMEOUT,
+                )
+                .await;
+                drop(repository_guard);
+                if let Err(error) = result
+                    && !cancel.is_cancelled()
+                {
+                    tracing::warn!(
+                        repository = %repository_path.display(),
+                        %error,
+                        "managed review repository maintenance failed"
+                    );
+                }
+            }
+        });
     }
 
     fn find(&self, name: &str) -> Option<&Arc<dyn Tool>> {
@@ -2946,7 +3013,7 @@ impl ToolExecutor for LocalToolExecutor {
             .map_err(|error| format!("resolving review root: {error}"))?;
         let requested_repository_path = managed_root.join(owner).join(repository);
         let repository_path = review_repository_identity(&requested_repository_path)?;
-        let repository_lock = self.review_repository_lock(&repository_path);
+        let repository_lock = self.review_repository_foreground_lock(&repository_path);
         let mut repository_guard = tokio::select! {
             biased;
             _ = request.cancel.cancelled() => {
@@ -3150,6 +3217,7 @@ impl ToolExecutor for LocalToolExecutor {
                 );
             }
         }
+        self.schedule_review_repository_maintenance(&repository_path);
         Ok(repository_path)
     }
 
@@ -3472,6 +3540,18 @@ impl ToolExecutor for LocalToolExecutor {
         })
         .await
         .map_err(|error| format!("session branch push task failed: {error}"))?
+        .map_err(|error| error.to_string())
+    }
+
+    async fn rename_session_branch(&self, request: &SessionBranchRename) -> Result<(), String> {
+        let (_, worktree) = canonical_managed_path(&request.managed_root, &request.worktree)?;
+        let old_branch = request.old_branch.clone();
+        let new_branch = request.new_branch.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::git::rename_session_branch(&worktree, &old_branch, &new_branch)
+        })
+        .await
+        .map_err(|error| format!("session branch rename task failed: {error}"))?
         .map_err(|error| error.to_string())
     }
 
@@ -3927,6 +4007,75 @@ mod tests {
         assert!(locks.get(Path::new("repo-c")).is_some());
         drop(locks);
         drop(replacement);
+    }
+
+    #[tokio::test]
+    async fn managed_review_maintenance_waits_for_the_repository_owner() {
+        let repository = tempfile::tempdir().unwrap();
+        run_review_git(
+            repository.path(),
+            "",
+            vec!["init".into(), "--template=".into()],
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let executor = LocalToolExecutor::default();
+        let repository_lock = executor.review_repository_lock(repository.path());
+        let repository_guard = repository_lock.lock_owned().await;
+        let key = review_repository_maintenance_key(repository.path());
+
+        executor.schedule_review_repository_maintenance(repository.path());
+        assert!(executor.managed_background.is_running(&key));
+        tokio::task::yield_now().await;
+        assert!(
+            executor.managed_background.is_running(&key),
+            "maintenance bypassed the repository mutex"
+        );
+
+        drop(repository_guard);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while executor.managed_background.is_running(&key) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn foreground_review_work_preempts_repository_maintenance() {
+        let repository = tempfile::tempdir().unwrap();
+        let executor = LocalToolExecutor::default();
+        let repository_lock = executor.review_repository_lock(repository.path());
+        let key = review_repository_maintenance_key(repository.path());
+        let acquired = Arc::new(tokio::sync::Semaphore::new(0));
+        let task_lock = repository_lock.clone();
+        let task_acquired = acquired.clone();
+        assert!(
+            executor
+                .managed_background
+                .schedule(key.clone(), move |cancel| {
+                    let task_lock = task_lock.clone();
+                    let task_acquired = task_acquired.clone();
+                    async move {
+                        let _guard = task_lock.lock_owned().await;
+                        task_acquired.add_permits(1);
+                        cancel.cancelled().await;
+                    }
+                })
+        );
+        acquired.acquire().await.unwrap().forget();
+
+        let foreground_lock = executor.review_repository_foreground_lock(repository.path());
+        let foreground_guard = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            foreground_lock.lock_owned(),
+        )
+        .await
+        .expect("foreground work should cancel maintenance and acquire its repository lock");
+        assert!(!executor.managed_background.is_running(&key));
+        drop(foreground_guard);
     }
 
     #[cfg(unix)]

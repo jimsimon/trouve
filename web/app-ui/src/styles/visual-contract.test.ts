@@ -216,6 +216,8 @@ describe("Trouve visual contract", () => {
     expect(app).toMatch(/\.navigation-panel \{[^}]*display:\s*flex/s);
     expect(app).toMatch(/\.navigation-panel \{[^}]*overflow:\s*hidden/s);
     expect(app).toMatch(/\.workspace-scroll \{[^}]*overflow:\s*auto/s);
+    // The scroller spans the panel's inline padding so the scrollbar lands in the gutter, not over the rows.
+    expect(app).toMatch(/\.workspace-scroll \{[^}]*margin-inline:\s*-10px[^}]*padding-inline:\s*10px/s);
     expect(app).toMatch(/\.navigation-panel \.workspace-row \{[^}]*position:\s*sticky/s);
     expect(app).toMatch(/\.navigation-panel \.workspace-row \{[^}]*inset-block-start:\s*0/s);
     expect(app).toMatch(/\.navigation-panel > trouve-session-usage-panel \{[^}]*flex:\s*none/s);
@@ -851,35 +853,21 @@ describe("Trouve visual contract", () => {
     expect(providerSettings).not.toContain("${health.status}</span>");
   });
 
-  it("keeps the session-naming choices and reactive explanations", () => {
-    for (const label of [
-      "Adaptive (Recommended)",
-      "Keep Ready",
-      "Load When Needed",
-      "Rules Only",
-      "GPU, CPU, & RAM",
-      "GPU Only",
-      "CPU & RAM Only",
-    ]) {
-      expect(managementSettings).toContain(`label: "${label}"`);
-    }
-    for (const description of [
-      "Keeps the naming model ready when this computer has comfortable memory headroom; otherwise loads it only when needed.",
-      "Loads the naming model at startup and keeps it in memory for the fastest new-session creation.",
-      "Loads the naming model when a session is created, then releases it after a short idle period.",
-      "Uses fast built-in heuristics and never loads the optional naming model.",
-      "Uses GPU, CPU, and RAM when no local coding model is active; otherwise uses CPU and RAM only.",
-      "Lets llama.cpp use available GPU memory and spill remaining work to CPU and system RAM.",
-      "Requires every model layer to fit on a detected GPU; naming falls back to rules when it cannot.",
-      "Keeps session naming entirely off the GPU and uses CPU plus system RAM.",
-    ]) {
-      expect(managementSettings).toContain(`"${description}"`);
-    }
-    expect(managementSettings).toContain("this.#draftLoadBehavior = behaviorSelect.value");
-    expect(managementSettings).toContain("this.#draftResourcePolicy = resourceSelect.value");
-    expect(managementSettings).toContain("const behavior = this.#draftLoadBehavior ??");
-    expect(managementSettings).toContain("const resources = this.#draftResourcePolicy ??");
-    expect(managementSettings).toContain("form.requestSubmit()");
-    expect(managementSettings).toContain("current?.title_model_resource_policy ?? \"adaptive\"");
+  it("keeps configured asynchronous session naming explicit", () => {
+    expect(managementSettings).toContain("<h2>Session naming</h2>");
+    expect(managementSettings).toContain("the selected model names them in the background");
+    expect(managementSettings).toContain("lowest available reasoning level");
+    expect(managementSettings).toContain('name="model"');
+    expect(managementSettings).toContain("modelSelectorLabel(model)");
+    expect(managementSettings).toContain('" · Text only"');
+    expect(managementSettings).toContain("cannot inspect attached screenshots");
+    expect(managementSettings).toContain("Use session names in branch names");
+    expect(managementSettings).toContain("The compact branch is renamed after background naming completes.");
+    expect(managementSettings).toContain("Add a provider to choose a naming model.");
+    expect(managementSettings).toContain(">Add provider</button>");
+    expect(managementSettings).toContain('section: "providers"');
+    expect(managementSettings).toContain("setSessionNamingSettingsSnapshot");
+    expect(managementSettings).not.toContain("title_model_resource_policy");
+    expect(managementSettings).not.toContain("Built-in naming rules");
   });
 });

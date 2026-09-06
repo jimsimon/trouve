@@ -75,7 +75,9 @@ describe("session list component contract", () => {
 
   it("keeps compact rows while optionally rendering branch names", () => {
     expect(component).toContain('<span class="session-copy">');
-    expect(component).toContain("<strong>${session.title}</strong>");
+    expect(component).toContain("isSessionTitleGenerating(session.id)");
+    expect(component).toContain('class="naming-title-shimmer session-title-shimmer"');
+    expect(component).toContain("Naming session…");
     expect(component).toContain("sessionAgePresentation(session.updatedAt, now)");
     expect(component).toContain('class="session-age"');
     expect(component).toContain("this.showBranches");
@@ -89,14 +91,12 @@ describe("session list component contract", () => {
     );
   });
 
-  it("keeps ages visible while revealing row actions only on interaction", () => {
+  it("keeps ages visible and opens row actions as a context menu", () => {
     expect(component).toContain("data-actions-open=${this.#menuSessionId === session.id}");
-    expect(styles).toMatch(
-      /@media \(hover: hover\) and \(pointer: fine\) \{[^}]*\.session-menu-button \{[^}]*opacity:\s*0[^}]*pointer-events:\s*none/s,
-    );
-    expect(styles).toContain(".session-row-wrap:hover .session-menu-button");
-    expect(styles).toContain(".session-row-wrap:focus-within .session-menu-button");
-    expect(styles).toContain(".session-row-wrap:hover .session-age");
+    expect(component).toContain("@contextmenu=${(event: MouseEvent) => this.#openContextMenu(event, session.id)}");
+    expect(component).toContain('event.key !== "ContextMenu"');
+    expect(component).toContain("event.shiftKey && event.key === \"F10\"");
+    expect(component).not.toContain("session-menu-button");
     expect(styles).toMatch(
       /\.session-copy strong \{[^}]*color:\s*var\(--trouve-text-mid\)/s,
     );
@@ -147,15 +147,19 @@ describe("session list component contract", () => {
     expect(shell).toContain('route.kind === "inbox" && recoverySession !== undefined');
   });
 
-  it("keeps actions in the compact popup and rename/delete in a modal", () => {
+  it("keeps actions in the contextual popup and rename/delete in a modal", () => {
     expect(component).toContain('class="session-actions"');
     expect(component).toContain('class="session-modal"');
     expect(component).toContain('dialog.showModal()');
     expect(component).toContain('>Rename session</h2>');
+    expect(component).toContain('generateSessionTitleSuggestion(sessionId, {');
+    expect(component).toContain('signal: abort.signal');
+    expect(component).toContain('? "Generating…" : "Generate"');
+    expect(component).toContain("You can still enter one manually.");
     expect(component).toContain('>Delete session “${this.#modalTitle}”?</h2>');
     expect(component).toContain("This removes the session's worktree, branch history in trouve, and its event log. The git branch itself is kept.");
     expect(styles).toMatch(
-      /\.session-actions \{[^}]*position: absolute;[^}]*width: 150px;/u,
+      /\.session-actions \{[^}]*position: fixed;[^}]*width: 150px;/u,
     );
     expect(styles).toContain('.session-modal { width: min(380px, calc(100vw - 32px));');
   });

@@ -77,9 +77,9 @@ type GithubSnapshotEnvelope = Extract<
   ProtocolEventEnvelope,
   { readonly type: "github.pull_requests_updated" }
 >;
-type GitWorktreeSettingsEnvelope = Extract<
+type SessionNamingSettingsEnvelope = Extract<
   ProtocolEventEnvelope,
-  { readonly type: "settings.git_worktrees_updated" }
+  { readonly type: "settings.session_naming_updated" }
 >;
 
 /** Keep only the newest durable state replacement from startup history.
@@ -87,7 +87,7 @@ type GitWorktreeSettingsEnvelope = Extract<
  * as session notifications must never be replayed as fresh UI activity. */
 export class ServerReplayBuffer {
   readonly #github = new Map<string, GithubSnapshotEnvelope>();
-  #gitWorktreeSettings: GitWorktreeSettingsEnvelope | undefined;
+  #sessionNamingSettings: SessionNamingSettingsEnvelope | undefined;
 
   push(envelope: ProtocolEventEnvelope): boolean {
     if (envelope.type === "github.pull_requests_updated") {
@@ -98,11 +98,11 @@ export class ServerReplayBuffer {
       }
       return true;
     }
-    if (envelope.type === "settings.git_worktrees_updated") {
+    if (envelope.type === "settings.session_naming_updated") {
       if (
-        this.#gitWorktreeSettings === undefined
-        || envelope.cursor > this.#gitWorktreeSettings.cursor
-      ) this.#gitWorktreeSettings = envelope;
+        this.#sessionNamingSettings === undefined
+        || envelope.cursor > this.#sessionNamingSettings.cursor
+      ) this.#sessionNamingSettings = envelope;
       return true;
     }
     return false;
@@ -110,8 +110,8 @@ export class ServerReplayBuffer {
 
   take(): readonly ProtocolEventEnvelope[] {
     const envelopes: ProtocolEventEnvelope[] = [...this.#github.values()];
-    if (this.#gitWorktreeSettings !== undefined) {
-      envelopes.push(this.#gitWorktreeSettings);
+    if (this.#sessionNamingSettings !== undefined) {
+      envelopes.push(this.#sessionNamingSettings);
     }
     this.clear();
     return Object.freeze(envelopes.sort((left, right) => left.cursor - right.cursor));
@@ -119,7 +119,7 @@ export class ServerReplayBuffer {
 
   clear(): void {
     this.#github.clear();
-    this.#gitWorktreeSettings = undefined;
+    this.#sessionNamingSettings = undefined;
   }
 }
 
@@ -443,7 +443,7 @@ export class ProtocolIngress {
       if (!(cause instanceof ProtocolClientError) || cause.status !== 404) {
         throw cause;
       }
-      const fence = await this.#client.gitWorktreeSettingsSnapshot();
+      const fence = await this.#client.sessionNamingSettingsSnapshot();
       return { kind: "metadata-fallback", cursor: fence.cursor };
     }
   }
