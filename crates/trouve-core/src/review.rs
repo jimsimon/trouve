@@ -9384,12 +9384,9 @@ impl Engine {
         let new_issue_count = detail
             .findings
             .iter()
-            .filter(|finding| {
-                finding.status != "advisory"
-                    && finding_is_blocking(&finding.severity, &finding.confidence)
-                    && finding_gates(&finding.evidence, finding.origin)
-            })
+            .filter(|finding| finding_is_publicly_actionable(finding))
             .count();
+        let public_result_summary = public_review_summary(&detail);
         let status = match job.status.as_str() {
             "queued" => "queued",
             "running" => "in_progress",
@@ -9436,7 +9433,11 @@ impl Engine {
         };
         let check_summary = bounded_check_details(&check_summary);
         let latest_tasks = self.store.latest_code_review_reviewer_tasks(&job.id)?;
-        let check_details = bounded_check_details(&render_check_details(&detail, &latest_tasks));
+        let check_details = bounded_check_details(&render_check_details(
+            &detail,
+            public_result_summary,
+            &latest_tasks,
+        ));
         let mut check_body = serde_json::json!({
             "name": "trouve-code-review",
             "head_sha": job.head_sha,
@@ -12262,15 +12263,39 @@ fn lifecycle_comment_marker(job_id: &str) -> String {
     format!("<!-- trouve-code-review lifecycle job:{job_id} -->")
 }
 
+fn finding_is_publicly_actionable(finding: &trouve_protocol::CodeReviewFinding) -> bool {
+    finding.status != "advisory"
+        && finding_is_blocking(&finding.severity, &finding.confidence)
+        && finding_gates(&finding.evidence, finding.origin)
+}
+
+/// Coordinator summaries may describe every internally retained finding. A
+/// summary is safe for GitHub only when every non-advisory finding from the
+/// round is actionable on this pull request; otherwise the public renderers
+/// use their server-derived counts and status-specific fallback prose.
+fn public_review_summary(detail: &trouve_protocol::CodeReviewJobDetail) -> &str {
+    if detail
+        .findings
+        .iter()
+        .filter(|finding| finding.status != "advisory")
+        .all(finding_is_publicly_actionable)
+    {
+        detail.summary.as_str()
+    } else {
+        ""
+    }
+}
+
 fn render_check_details(
     detail: &trouve_protocol::CodeReviewJobDetail,
+    public_result_summary: &str,
     latest_reviewer_tasks: &[trouve_protocol::CodeReviewTask],
 ) -> String {
     let job = &detail.job;
     let mut body = String::new();
-    if !detail.summary.trim().is_empty() {
+    if !public_result_summary.trim().is_empty() {
         body.push_str(&safe_public_model_markdown(
-            detail.summary.trim(),
+            public_result_summary.trim(),
             CHECK_DETAILS_MAX_CHARS,
             CHECK_DETAILS_TRUNCATION_MARKER,
         ));
@@ -12783,11 +12808,6 @@ fn render_lifecycle_comment(
     // is revalidated; cancelled and stale jobs never accepted that result.
     let expose_results = job.status == "succeeded"
         || (job.status == "failed" && !detail.unadjudicated_candidates.is_empty());
-    let result_summary = if expose_results {
-        detail.summary.as_str()
-    } else {
-        ""
-    };
     // Advisory findings live only in trouve's ledger; the lifecycle comment
     // reports the round's blocking-level findings.
     let result_findings = if expose_results {
@@ -12806,17 +12826,14 @@ fn render_lifecycle_comment(
     // or rendering them on the pull request.
     let actionable_result_findings = result_findings
         .iter()
-        .filter(|finding| {
-            finding_is_blocking(&finding.severity, &finding.confidence)
-                && finding_gates(&finding.evidence, finding.origin)
-        })
+        .filter(|finding| finding_is_publicly_actionable(finding))
         .collect::<Vec<_>>();
     // The coordinator summary is free text and may discuss every internally
     // retained finding. If this round contains any non-gating observations,
     // use the server-derived actionable count on GitHub instead so those
     // observations cannot leak through prose after their rows are filtered.
-    let public_result_summary = if actionable_result_findings.len() == result_findings.len() {
-        result_summary
+    let public_result_summary = if expose_results {
+        public_review_summary(detail)
     } else {
         ""
     };
@@ -21683,7 +21700,7 @@ rename to src/new.rs
         store
             .save_code_review_result_with_themes(
                 &queued.id,
-                "summary",
+                "In scope issue and Beyond scope issue",
                 "prompt",
                 2,
                 &[finding("In scope issue"), finding("Beyond scope issue")],
@@ -21708,6 +21725,9 @@ rename to src/new.rs
         assert!(!body.contains("blocking issue(s) remain open"));
         assert!(!body.contains("Noticed beyond this change"));
         assert!(!body.contains("Beyond scope issue"));
+        let check_details = render_check_details(&detail, public_review_summary(&detail), &[]);
+        assert!(!check_details.contains("Beyond scope issue"));
+        assert!(check_details.contains("review completed without an additional summary"));
     }
 
     #[test]
@@ -25687,7 +25707,7 @@ rename to src/new.rs
 
         let detail = store.code_review_job_detail(&queued.id).unwrap().unwrap();
         let latest_tasks = store.latest_code_review_reviewer_tasks(&queued.id).unwrap();
-        let running = render_check_details(&detail, &latest_tasks);
+        let running = render_check_details(&detail, &detail.summary, &latest_tasks);
         assert!(running.contains("Reviewers are examining the current revision."));
         assert!(running.contains("### Reviewer status"));
         assert!(running.contains("Application Reliability Engineer"));
@@ -25712,7 +25732,7 @@ rename to src/new.rs
 
         let detail = store.code_review_job_detail(&queued.id).unwrap().unwrap();
         let latest_tasks = store.latest_code_review_reviewer_tasks(&queued.id).unwrap();
-        let failed = render_check_details(&detail, &latest_tasks);
+        let failed = render_check_details(&detail, &detail.summary, &latest_tasks);
         assert!(failed.contains("### Error"));
         assert!(failed.contains("reviewer output was invalid"));
         assert!(failed.contains("### Failed review tasks"));
@@ -25725,7 +25745,7 @@ rename to src/new.rs
             .unwrap();
         let detail = store.code_review_job_detail(&queued.id).unwrap().unwrap();
         let latest_tasks = store.latest_code_review_reviewer_tasks(&queued.id).unwrap();
-        let retried = render_check_details(&detail, &latest_tasks);
+        let retried = render_check_details(&detail, &detail.summary, &latest_tasks);
         assert!(!retried.contains("### Failed review tasks"));
         assert!(!retried.contains("review did not contain JSON"));
     }
