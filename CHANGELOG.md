@@ -6,6 +6,21 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **Non-gating review findings stay off pull requests**: credible findings that
+  are not mechanically tied to the reviewed change remain available in
+  trouve's dashboard and durable review history, but no longer appear in the
+  GitHub lifecycle comment, its actionable counts or summary, or remediation
+  prompts. GitHub result messages now count only new findings that gate the
+  pull request and describe the remaining actionable total without a redundant
+  `blocking` qualifier.
+- **Resolved threadless findings have a distinct visual state**: findings
+  resolved as won't-fix by a maintainer move into a collapsed disclosure in
+  the GitHub lifecycle comment, with struck-through issue text, an explicit
+  disposition label, and an `unresolve` command to reopen them. Findings fixed
+  in code continue to leave the list automatically.
+
 ## [4.9.0] - 2026-09-05
 
 This release makes automated reviews quieter and more reliable, improves large
