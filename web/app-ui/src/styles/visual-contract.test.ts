@@ -216,6 +216,8 @@ describe("Trouve visual contract", () => {
     expect(app).toMatch(/\.navigation-panel \{[^}]*display:\s*flex/s);
     expect(app).toMatch(/\.navigation-panel \{[^}]*overflow:\s*hidden/s);
     expect(app).toMatch(/\.workspace-scroll \{[^}]*overflow:\s*auto/s);
+    // The scroller spans the panel's inline padding so the scrollbar lands in the gutter, not over the rows.
+    expect(app).toMatch(/\.workspace-scroll \{[^}]*margin-inline:\s*-10px[^}]*padding-inline:\s*10px/s);
     expect(app).toMatch(/\.navigation-panel \.workspace-row \{[^}]*position:\s*sticky/s);
     expect(app).toMatch(/\.navigation-panel \.workspace-row \{[^}]*inset-block-start:\s*0/s);
     expect(app).toMatch(/\.navigation-panel > trouve-session-usage-panel \{[^}]*flex:\s*none/s);
