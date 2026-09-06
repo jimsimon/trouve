@@ -32,6 +32,10 @@ import type {
   ProtocolUpdateThreadRequest,
   ProtocolUsageSummary,
 } from "../services/protocol-client.js";
+import {
+  TITLE_GENERATION_SHIMMER_MS,
+  titleGenerationTimeoutMs,
+} from "../services/title-generation.js";
 import type { ComposerDraft } from "../services/composer-drafts.js";
 import {
   DEFAULT_CHAT_PREFERENCES,
@@ -232,7 +236,6 @@ const CHAT_HISTORY_STATUS_DELAY_MS = 180;
 const CHAT_HISTORY_RETRY_DELAY_MS = 1_500;
 // Title generation is optional metadata and must not make thread creation
 // appear hung when the naming provider is slow or unavailable.
-const THREAD_TITLE_TIMEOUT_MS = 48_000;
 
 const sameVirtualRenderWindow = (
   left: VirtualWindow<VirtualChatItem>,
@@ -1538,12 +1541,22 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
 
   async #generateThreadRename(): Promise<void> {
     const services = this.#services.value;
+    const store = this.#store.value;
     const threadId = this.#renamingThreadId;
-    if (services === undefined || threadId === "" || this.#threadRenameGenerating) return;
+    if (
+      services === undefined
+      || store === undefined
+      || threadId === ""
+      || this.#threadRenameGenerating
+    ) return;
     const startingTitle = this.#threadRenameTitle;
     const abort = new AbortController();
     this.#threadRenameGenerationAbort = abort;
-    const timeout = globalThis.setTimeout(() => abort.abort(), THREAD_TITLE_TIMEOUT_MS);
+    const namingModel = readSignal(store.sessionNamingSettings)?.settings.model;
+    const timeout = globalThis.setTimeout(
+      () => abort.abort(),
+      titleGenerationTimeoutMs(namingModel),
+    );
     this.#threadRenameGenerating = true;
     this.#threadRenameError = "";
     this.requestUpdate();
@@ -1751,15 +1764,21 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       index: number,
     ) => {
       const label = labelForThread(candidate);
-      const titleGenerating = store.isThreadTitleGenerating(candidate.id)
-        || (candidate.id === initialThreadId && store.isSessionTitleGenerating(this.sessionId));
+      const titleGeneration = store.threadTitleGenerationPresentation(candidate.id)
+        ?? (candidate.id === initialThreadId
+          ? store.sessionTitleGenerationPresentation(this.sessionId)
+          : undefined);
+      const titleShimmer = titleGeneration === "shimmer";
+      const titleWaiting = titleGeneration === "waiting";
       const indicator = sessionIndicatorPresentation(
         store.threadIndicatorState(candidate.id),
       );
       const statusLabel = indicator.tooltip
         || (indicator.kind === "busy" ? "Processing" : "");
-      const accessibleLabel = titleGenerating
+      const accessibleLabel = titleShimmer
         ? "Naming thread…"
+        : titleWaiting
+          ? `${label}, Waiting for the local model`
         : statusLabel === "" ? label : `${label}, ${statusLabel}`;
       return html`
         <span class="thread-tab-item" role="presentation" @contextmenu=${(event: MouseEvent) => this.#openThreadTabContextMenu(event, candidate.id)}>
@@ -1769,7 +1788,9 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
             role="tab"
             aria-keyshortcuts="Delete"
             aria-label=${accessibleLabel}
-            title=${titleGenerating ? "Naming thread…" : label}
+            title=${titleShimmer
+              ? "Naming thread…"
+              : titleWaiting ? "Waiting for the local model." : label}
             data-thread-tab-id=${candidate.id}
             aria-selected=${!newThreadSetupOpen && candidate.id === this.threadId ? "true" : "false"}
             tabindex=${rovingTabIndex(index, selectedTabIndex, threadTabCount)}
@@ -1792,9 +1813,11 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
               ? fontAwesomeIcon("code-branch")
               : nothing}${pinnedThreadTabs.has(candidate.id)
               ? fontAwesomeIcon("thumbtack", { className: "thread-tab-pin" })
-              : nothing}<span class="thread-tab-title">${titleGenerating
+              : nothing}<span class="thread-tab-title">${titleShimmer
                 ? html`<span class="naming-title-shimmer thread-title-shimmer" aria-hidden="true"></span><span class="visually-hidden">Naming thread…</span>`
-                : label}</span></span>
+                : label}</span>${titleWaiting
+                  ? html`<span class="naming-title-pending" aria-hidden="true"></span>`
+                  : nothing}</span>
             ${threadTodoProgress(candidate.todos) === ""
               ? nothing
               : html`<span class="thread-todo-progress">${threadTodoProgress(candidate.todos)}</span>`}
@@ -6307,9 +6330,24 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         prompt !== ""
         || (event.detail.initialMessage?.attachments?.length ?? 0) > 0
       ) {
+        store.beginThreadTitleGeneration(thread.id, NEW_THREAD_TITLE_FALLBACK);
+        const namingModel = readSignal(store.sessionNamingSettings)?.settings.model;
+        const localNaming = namingModel?.startsWith("local/") ?? false;
+        const waitingTimer = localNaming
+          ? globalThis.setTimeout(
+              () => store.markThreadTitleGenerationWaiting(
+                thread.id,
+                NEW_THREAD_TITLE_FALLBACK,
+              ),
+              TITLE_GENERATION_SHIMMER_MS,
+            )
+          : undefined;
         void (async () => {
           const abort = new AbortController();
-          const timeout = globalThis.setTimeout(() => abort.abort(), THREAD_TITLE_TIMEOUT_MS);
+          const timeout = globalThis.setTimeout(
+            () => abort.abort(),
+            titleGenerationTimeoutMs(namingModel),
+          );
           try {
             const generated = await services.protocol.generateTitle(
               token.sessionId,
@@ -6328,6 +6366,8 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
             // Naming is cosmetic; preserve the placeholder or a user rename.
           } finally {
             globalThis.clearTimeout(timeout);
+            if (waitingTimer !== undefined) globalThis.clearTimeout(waitingTimer);
+            store.endThreadTitleGeneration(thread.id);
           }
         })();
       }

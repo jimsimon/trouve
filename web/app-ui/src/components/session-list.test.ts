@@ -75,9 +75,12 @@ describe("session list component contract", () => {
 
   it("keeps compact rows while optionally rendering branch names", () => {
     expect(component).toContain('<span class="session-copy">');
-    expect(component).toContain("isSessionTitleGenerating(session.id)");
+    expect(component).toContain("sessionTitleGenerationPresentation(session.id)");
     expect(component).toContain('class="naming-title-shimmer session-title-shimmer"');
     expect(component).toContain("Naming session…");
+    expect(component).toContain('class="naming-title-pending"');
+    expect(component).toContain("Waiting for the local model.");
+    expect(styles).toContain(".naming-title-pending");
     expect(component).toContain("sessionAgePresentation(session.updatedAt, now)");
     expect(component).toContain('class="session-age"');
     expect(component).toContain("this.showBranches");

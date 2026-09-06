@@ -120,6 +120,16 @@ pub enum ProviderError {
 
 pub type EventStream = BoxStream<'static, Result<ProviderEvent, ProviderError>>;
 
+/// Admission priority for providers that serialize inference internally.
+/// Most remote providers ignore this distinction; the managed local provider
+/// uses it to keep cosmetic work from delaying user turns.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum InferencePriority {
+    #[default]
+    Foreground,
+    Background,
+}
+
 const PROVIDER_DELTA_WINDOW: std::time::Duration = std::time::Duration::from_millis(16);
 const PROVIDER_DELTA_MAX_BYTES: usize = 64 * 1024;
 
@@ -242,6 +252,19 @@ pub trait Provider: Send + Sync {
         tools: &[ToolSpec],
         options: &serde_json::Map<String, serde_json::Value>,
     ) -> Result<EventStream, ProviderError>;
+
+    /// Run one model turn with an admission hint. Providers without a shared
+    /// single-model runtime retain their normal behavior.
+    async fn stream_chat_with_priority(
+        &self,
+        model: &str,
+        messages: &[Message],
+        tools: &[ToolSpec],
+        options: &serde_json::Map<String, serde_json::Value>,
+        _priority: InferencePriority,
+    ) -> Result<EventStream, ProviderError> {
+        self.stream_chat(model, messages, tools, options).await
+    }
 }
 
 #[cfg(test)]

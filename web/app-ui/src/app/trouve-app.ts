@@ -113,6 +113,10 @@ import {
   type ProtocolProvidersResponse,
   type ProtocolSubscriptionHealth,
 } from "../services/protocol-client.js";
+import {
+  TITLE_GENERATION_SHIMMER_MS,
+  titleGenerationTimeoutMs,
+} from "../services/title-generation.js";
 import { createBrowserThreadIngress } from "../services/thread-ingress.js";
 import { SubscriptionHealthController } from "../services/subscription-health-controller.js";
 import { ModelCatalogController } from "../services/model-catalog-controller.js";
@@ -206,7 +210,6 @@ import "../components/thread-screen.js";
 import "../components/model-picker.js";
 import "../components/model-options-editor.js";
 
-const SESSION_TITLE_TIMEOUT_MS = 48_000;
 const VIDEO_ATTACHMENT_DOWNLOAD_TIMEOUT_MS = 30_000;
 const VIDEO_ATTACHMENT_OPEN_CONCURRENCY = 1;
 const VIDEO_ATTACHMENT_OPEN_CAPACITY = 8;
@@ -2093,7 +2096,10 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     attachments: readonly ProtocolAttachmentUpload[],
   ): Promise<ProtocolGeneratedTitle> {
     const abort = new AbortController();
-    const timeout = globalThis.setTimeout(() => abort.abort(), SESSION_TITLE_TIMEOUT_MS);
+    const timeoutMs = titleGenerationTimeoutMs(
+      readSignal(this.#store.sessionNamingSettings)?.settings.model,
+    );
+    const timeout = globalThis.setTimeout(() => abort.abort(), timeoutMs);
     try {
       return await this.#protocolClient.generateTitle(sessionId, prompt, attachments, {
         signal: abort.signal,
@@ -2101,6 +2107,11 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     } finally {
       globalThis.clearTimeout(timeout);
     }
+  }
+
+  #usesManagedLocalNaming(): boolean {
+    return readSignal(this.#store.sessionNamingSettings)?.settings.model.startsWith("local/")
+      ?? false;
   }
 
   /** Upgrade a prompt-derived title without delaying session creation or the
@@ -2113,6 +2124,12 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     sharedGeneration?: Promise<ProtocolGeneratedTitle>,
   ): void {
     this.#store.beginSessionTitleGeneration(sessionId, provisionalTitle);
+    const waitingTimer = this.#usesManagedLocalNaming()
+      ? globalThis.setTimeout(
+          () => this.#store.markSessionTitleGenerationWaiting(sessionId, provisionalTitle),
+          TITLE_GENERATION_SHIMMER_MS,
+        )
+      : undefined;
     void (async () => {
       try {
         const generated = await (sharedGeneration
@@ -2128,6 +2145,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       } catch {
         // Naming is cosmetic; the placeholder remains.
       } finally {
+        if (waitingTimer !== undefined) globalThis.clearTimeout(waitingTimer);
         this.#store.endSessionTitleGeneration(sessionId);
       }
     })();
@@ -2141,6 +2159,12 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     sharedGeneration?: Promise<ProtocolGeneratedTitle>,
   ): void {
     this.#store.beginThreadTitleGeneration(threadId, provisionalTitle);
+    const waitingTimer = this.#usesManagedLocalNaming()
+      ? globalThis.setTimeout(
+          () => this.#store.markThreadTitleGenerationWaiting(threadId, provisionalTitle),
+          TITLE_GENERATION_SHIMMER_MS,
+        )
+      : undefined;
     void (async () => {
       try {
         const sessionId = this.#store.thread(threadId)?.session_id;
@@ -2157,6 +2181,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       } catch {
         // Naming is cosmetic; the placeholder or a user rename remains.
       } finally {
+        if (waitingTimer !== undefined) globalThis.clearTimeout(waitingTimer);
         this.#store.endThreadTitleGeneration(threadId);
       }
     })();

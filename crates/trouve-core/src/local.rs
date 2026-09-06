@@ -25,9 +25,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use trouve_protocol::LocalGpu;
-use trouve_providers::Provider;
+use trouve_providers::{InferencePriority, Provider};
+
+const BACKGROUND_ADMISSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 // --- curated catalog ---------------------------------------------------------
 
@@ -768,6 +771,112 @@ fn kill_pid(pid: u32) {
     }
 }
 
+#[derive(Default)]
+struct LocalInferenceScheduler {
+    state: std::sync::Mutex<LocalInferenceSchedulerState>,
+    changed: tokio::sync::Notify,
+}
+
+#[derive(Default)]
+struct LocalInferenceSchedulerState {
+    active: bool,
+    foreground_waiters: usize,
+}
+
+struct LocalInferenceLease {
+    scheduler: Arc<LocalInferenceScheduler>,
+}
+
+impl Drop for LocalInferenceLease {
+    fn drop(&mut self) {
+        self.scheduler.state.lock().unwrap().active = false;
+        self.scheduler.changed.notify_waiters();
+    }
+}
+
+struct ForegroundWaiter {
+    scheduler: Arc<LocalInferenceScheduler>,
+    registered: bool,
+}
+
+impl ForegroundWaiter {
+    fn register(scheduler: Arc<LocalInferenceScheduler>) -> Self {
+        scheduler.state.lock().unwrap().foreground_waiters += 1;
+        Self {
+            scheduler,
+            registered: true,
+        }
+    }
+
+    fn admitted(&mut self) {
+        if !self.registered {
+            return;
+        }
+        self.scheduler.state.lock().unwrap().foreground_waiters -= 1;
+        self.registered = false;
+    }
+}
+
+impl Drop for ForegroundWaiter {
+    fn drop(&mut self) {
+        if !self.registered {
+            return;
+        }
+        self.scheduler.state.lock().unwrap().foreground_waiters -= 1;
+        self.scheduler.changed.notify_waiters();
+    }
+}
+
+impl LocalInferenceScheduler {
+    async fn acquire(self: &Arc<Self>, priority: InferencePriority) -> Result<LocalInferenceLease> {
+        match priority {
+            InferencePriority::Foreground => self.acquire_foreground().await,
+            InferencePriority::Background => {
+                tokio::time::timeout(BACKGROUND_ADMISSION_TIMEOUT, self.acquire_background())
+                    .await
+                    .map_err(|_| {
+                        anyhow::anyhow!("local naming waited five minutes for inference capacity")
+                    })
+            }
+        }
+    }
+
+    async fn acquire_foreground(self: &Arc<Self>) -> Result<LocalInferenceLease> {
+        let mut waiter = ForegroundWaiter::register(self.clone());
+        loop {
+            let changed = self.changed.notified();
+            {
+                let mut state = self.state.lock().unwrap();
+                if !state.active {
+                    state.active = true;
+                    drop(state);
+                    waiter.admitted();
+                    return Ok(LocalInferenceLease {
+                        scheduler: self.clone(),
+                    });
+                }
+            }
+            changed.await;
+        }
+    }
+
+    async fn acquire_background(self: &Arc<Self>) -> LocalInferenceLease {
+        loop {
+            let changed = self.changed.notified();
+            {
+                let mut state = self.state.lock().unwrap();
+                if !state.active && state.foreground_waiters == 0 {
+                    state.active = true;
+                    return LocalInferenceLease {
+                        scheduler: self.clone(),
+                    };
+                }
+            }
+            changed.await;
+        }
+    }
+}
+
 struct Running {
     model_id: String,
     port: u16,
@@ -788,6 +897,7 @@ pub enum ServerState {
 /// asking for a different model stops the old server and starts a new one.
 pub struct LlamaManager {
     inner: tokio::sync::Mutex<Option<Running>>,
+    scheduler: Arc<LocalInferenceScheduler>,
     state: std::sync::Mutex<ServerState>,
     /// Pidfile tracking spawned servers across app runs (crash recovery).
     pids: PathBuf,
@@ -821,6 +931,7 @@ impl LlamaManager {
         Self::reap_stale(&pids, data_dir);
         Self {
             inner: tokio::sync::Mutex::new(None),
+            scheduler: Arc::new(LocalInferenceScheduler::default()),
             state: std::sync::Mutex::new(ServerState::Stopped),
             pids,
             effective_contexts: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -1250,7 +1361,31 @@ impl Provider for LocalProvider {
         tools: &[trouve_providers::ToolSpec],
         options: &serde_json::Map<String, serde_json::Value>,
     ) -> Result<trouve_providers::EventStream, trouve_providers::ProviderError> {
+        self.stream_chat_with_priority(
+            model,
+            messages,
+            tools,
+            options,
+            InferencePriority::Foreground,
+        )
+        .await
+    }
+
+    async fn stream_chat_with_priority(
+        &self,
+        model: &str,
+        messages: &[trouve_providers::Message],
+        tools: &[trouve_providers::ToolSpec],
+        options: &serde_json::Map<String, serde_json::Value>,
+        priority: InferencePriority,
+    ) -> Result<trouve_providers::EventStream, trouve_providers::ProviderError> {
         use trouve_providers::ProviderError;
+        let lease = self
+            .manager
+            .scheduler
+            .acquire(priority)
+            .await
+            .map_err(|error| ProviderError::Request(error.to_string()))?;
         let entry = all_entries(self.config_dir.as_deref())
             .into_iter()
             .find(|e| e.id == model)
@@ -1284,13 +1419,106 @@ impl Provider for LocalProvider {
         // Thinking knobs travel as template kwargs, not top-level fields.
         let mut options = options.clone();
         apply_thinking_options(metadata.thinking, &mut options);
-        inner.stream_chat(model, messages, tools, &options).await
+        let stream = inner.stream_chat(model, messages, tools, &options).await?;
+        Ok(stream
+            .map(move |event| {
+                let _keep_lease_alive = &lease;
+                event
+            })
+            .boxed())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn foreground_inference_jumps_a_waiting_naming_request() {
+        let scheduler = Arc::new(LocalInferenceScheduler::default());
+        let active = scheduler
+            .acquire(InferencePriority::Foreground)
+            .await
+            .unwrap();
+
+        let (background_acquired_tx, mut background_acquired_rx) = tokio::sync::mpsc::channel(1);
+        let (release_background_tx, release_background_rx) = tokio::sync::oneshot::channel();
+        let background_scheduler = scheduler.clone();
+        let background = tokio::spawn(async move {
+            let lease = background_scheduler
+                .acquire(InferencePriority::Background)
+                .await
+                .unwrap();
+            background_acquired_tx.send(()).await.unwrap();
+            let _ = release_background_rx.await;
+            drop(lease);
+        });
+        tokio::task::yield_now().await;
+
+        let (foreground_acquired_tx, mut foreground_acquired_rx) = tokio::sync::mpsc::channel(1);
+        let (release_foreground_tx, release_foreground_rx) = tokio::sync::oneshot::channel();
+        let foreground_scheduler = scheduler.clone();
+        let foreground = tokio::spawn(async move {
+            let lease = foreground_scheduler
+                .acquire(InferencePriority::Foreground)
+                .await
+                .unwrap();
+            foreground_acquired_tx.send(()).await.unwrap();
+            let _ = release_foreground_rx.await;
+            drop(lease);
+        });
+        tokio::task::yield_now().await;
+
+        drop(active);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            foreground_acquired_rx.recv(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(background_acquired_rx.try_recv().is_err());
+
+        release_foreground_tx.send(()).unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            background_acquired_rx.recv(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        release_background_tx.send(()).unwrap();
+        foreground.await.unwrap();
+        background.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_foreground_waiter_does_not_starve_naming() {
+        let scheduler = Arc::new(LocalInferenceScheduler::default());
+        let active = scheduler
+            .acquire(InferencePriority::Foreground)
+            .await
+            .unwrap();
+        let waiting_scheduler = scheduler.clone();
+        let waiter = tokio::spawn(async move {
+            waiting_scheduler
+                .acquire(InferencePriority::Foreground)
+                .await
+        });
+        tokio::task::yield_now().await;
+        waiter.abort();
+        let _ = waiter.await;
+        assert_eq!(scheduler.state.lock().unwrap().foreground_waiters, 0);
+
+        drop(active);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            scheduler.acquire(InferencePriority::Background),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    }
 
     #[test]
     fn catalog_ids_are_unique_and_sane() {
