@@ -1445,6 +1445,31 @@ test("subscription status renders complete quota lines in the workspace usage pa
   expect(idState.duplicateCount).toBe(0);
   await expect(page.locator(".composer .subscription-option")).toHaveCount(0);
   await expect(page.locator(".composer .model-health-pill")).toHaveCount(0);
+
+  // The panel keeps a fixed footprint at the bottom of the navigation rail
+  // and collapses to a one-line summary of the most constrained window.
+  const navigation = page.locator(".navigation-panel");
+  const box = panel.locator(".session-usage-box");
+  await expect(box).toHaveCSS("height", "196px");
+  const collapse = panel.getByRole("button", { name: "Collapse usage details" });
+  await collapse.click();
+  await expect(panel.locator(".session-usage-box.collapsed")).toBeVisible();
+  await expect(panel.locator(".session-usage-summary")).toHaveText(/Usage\s+Pro · 57% used/u);
+  await expect(panel.getByRole("tab")).toHaveCount(0);
+  const navigationBounds = await navigation.boundingBox();
+  const panelBounds = await panel.boundingBox();
+  expect(navigationBounds).not.toBeNull();
+  expect(panelBounds).not.toBeNull();
+  expect(Math.round(navigationBounds!.y + navigationBounds!.height - (panelBounds!.y + panelBounds!.height)))
+    .toBeLessThanOrEqual(12);
+  await page.reload();
+  await replayHistory(page);
+  if (testInfo.project.name.startsWith("mobile")) {
+    await page.getByRole("button", { name: "Sessions", exact: true }).click();
+  }
+  await expect(panel.locator(".session-usage-box.collapsed")).toBeVisible();
+  await panel.getByRole("button", { name: "Expand usage details" }).click();
+  await expect(usageTab).toHaveAttribute("aria-selected", "true");
 });
 
 test("new-thread model choices do not wait for subscription health", async ({ page }) => {

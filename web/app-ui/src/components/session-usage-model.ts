@@ -1,3 +1,6 @@
+import type { ProtocolSubscriptionHealth } from "../services/protocol-client.js";
+import { type ModelHealthTone, modelHealthPresentation } from "./model-health.js";
+
 export type SessionUsagePanelKind =
   | "placeholder"
   | "local"
@@ -19,6 +22,44 @@ export const sessionUsagePanelKind = (input: {
   ) return "placeholder";
   if (input.model.startsWith("local/")) return "local";
   return input.hasSubscriptionHealth ? "subscription" : "api";
+};
+
+export interface CollapsedUsageSummary {
+  readonly text: string;
+  readonly tone: ModelHealthTone;
+}
+
+/**
+ * One-line summary for the collapsed sidebar footer: the same "most
+ * constrained window" line the model picker shows for subscriptions, the
+ * running cost for API-billed models, and the server state for local ones.
+ */
+export const collapsedUsageSummary = (input: {
+  readonly kind: SessionUsagePanelKind;
+  readonly loading: boolean;
+  readonly error: string;
+  readonly health: ProtocolSubscriptionHealth | undefined;
+  readonly sessionCostUsd: number | undefined;
+  readonly localServerStatus: string | undefined;
+}): CollapsedUsageSummary => {
+  if (input.kind === "placeholder") return { text: "No active session", tone: "neutral" };
+  if (input.kind === "subscription" && input.health !== undefined) {
+    const presentation = modelHealthPresentation(input.health);
+    return { text: presentation.summary, tone: presentation.tone };
+  }
+  if (input.kind === "local") {
+    return {
+      text: input.localServerStatus === undefined
+        ? "Local model"
+        : `Local · ${input.localServerStatus || "stopped"}`,
+      tone: "neutral",
+    };
+  }
+  if (input.sessionCostUsd !== undefined) {
+    return { text: `Session · $${input.sessionCostUsd.toFixed(2)}`, tone: "neutral" };
+  }
+  if (input.loading) return { text: "Loading usage…", tone: "neutral" };
+  return { text: input.error || "Usage unavailable", tone: input.error === "" ? "neutral" : "warning" };
 };
 
 export const usageThroughput = (
