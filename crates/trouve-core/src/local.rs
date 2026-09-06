@@ -1403,12 +1403,6 @@ impl Provider for LocalProvider {
         priority: InferencePriority,
     ) -> Result<trouve_providers::EventStream, trouve_providers::ProviderError> {
         use trouve_providers::ProviderError;
-        let lease = self
-            .manager
-            .scheduler
-            .acquire(priority)
-            .await
-            .map_err(|error| ProviderError::Request(error.to_string()))?;
         let entry = all_entries(self.config_dir.as_deref())
             .into_iter()
             .find(|e| e.id == model)
@@ -1427,6 +1421,12 @@ impl Provider for LocalProvider {
                     .into(),
             )
         })?;
+        let lease = self
+            .manager
+            .scheduler
+            .acquire(priority)
+            .await
+            .map_err(|error| ProviderError::Request(error.to_string()))?;
         let log_path = self.data_dir.join("llama-server.log");
         let base_url = self
             .manager
