@@ -1661,6 +1661,12 @@ pub struct GithubAppStatus {
     /// deployments still create and update Check Runs when this is true.
     #[serde(default)]
     pub checks_write_configured: bool,
+    /// Whether the installation token reports `contents: write`. GitHub
+    /// rejects the `resolveReviewThread`/`unresolveReviewThread` mutations
+    /// for installation tokens without it, so fixed findings' threads stay
+    /// open on GitHub until this is granted.
+    #[serde(default)]
+    pub contents_write_configured: bool,
     /// Whether `check_run` delivery is selected in the GitHub App. This is
     /// optional unless interactive Re-run actions are desired.
     #[serde(default)]
@@ -2321,10 +2327,32 @@ pub struct CodeReviewFinding {
     /// Review job that demonstrated the fix, for exact fix-diff reconstruction.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub resolved_by_job_id: String,
+    /// State of the auto-resolve worker for this finding's GitHub review
+    /// thread. Present while a collapse is still owed or after one failed,
+    /// so a thread that stays open on GitHub can be explained.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_collapse: Option<CodeReviewThreadCollapse>,
 }
 
 fn default_code_review_confidence() -> String {
     "medium".into()
+}
+
+/// Auto-resolve progress for one finding's GitHub review thread.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct CodeReviewThreadCollapse {
+    /// The worker still owes a collapse attempt. False with a `last_error`
+    /// means the collapse was abandoned after repeated terminal failures.
+    pub pending: bool,
+    /// Failed attempts so far.
+    #[serde(default)]
+    pub attempts: u64,
+    /// Earliest time of the next attempt while one is pending.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_attempt_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Error from the most recent failed attempt.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub last_error: String,
 }
 
 /// A durable execution of one model review against one immutable PR head.
@@ -2630,6 +2658,16 @@ pub struct CodeReviewCollapseBacklog {
     /// Age of the oldest pending entry, from when its finding was resolved.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oldest_pending_minutes: Option<u64>,
+    /// Pending entries whose most recent attempt failed.
+    #[serde(default)]
+    pub failing: u64,
+    /// Entries the worker gave up on after repeated terminal failures; their
+    /// threads stay open on GitHub until resolved by hand.
+    #[serde(default)]
+    pub abandoned: u64,
+    /// Error from the most recently failed attempt across the backlog.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub last_error: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

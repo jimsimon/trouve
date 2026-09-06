@@ -506,6 +506,7 @@ export class TrouveCodeReviewDashboard extends LitElement {
             <dt>Last poll</dt><dd>${formatDate(app.last_poll_at)}</dd>
             <dt>Rate limit</dt><dd>${app.rate_limit_remaining ?? "Unknown"}</dd>
             <dt>Checks write</dt><dd>${app.checks_write_configured === true ? "Ready" : "Unavailable"}</dd>
+            <dt>Contents write</dt><dd>${app.contents_write_configured === true ? "Ready" : "Unavailable"}</dd>
           </dl>
           ${app.last_error ? html`<p class="health-error">${app.last_error}</p>` : nothing}
         </article>

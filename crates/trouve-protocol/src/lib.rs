@@ -367,7 +367,11 @@ pub use requests::*;
 // (breaking).
 // 9.1: sessions and threads can request transcript-derived title suggestions
 // for manual rename recovery (additive).
-pub const PROTOCOL_VERSION: &str = "9.1";
+// 9.2: code-review findings expose their GitHub thread auto-resolve state
+// (`thread_collapse`), the collapse backlog reports failing/abandoned entries
+// with the latest error, and GitHub App status reports
+// `contents_write_configured` (additive).
+pub const PROTOCOL_VERSION: &str = "9.2";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";
 pub const ERROR_CODE_GITHUB_REAUTHENTICATION_REQUIRED: &str = "github_reauthentication_required";

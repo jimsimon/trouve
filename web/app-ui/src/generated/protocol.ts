@@ -2044,6 +2044,19 @@ export interface components {
         CodeReviewCollapseBacklog: {
             /**
              * Format: int64
+             * @description Entries the worker gave up on after repeated terminal failures; their
+             *     threads stay open on GitHub until resolved by hand.
+             */
+            abandoned?: number;
+            /**
+             * Format: int64
+             * @description Pending entries whose most recent attempt failed.
+             */
+            failing?: number;
+            /** @description Error from the most recently failed attempt across the backlog. */
+            last_error?: string;
+            /**
+             * Format: int64
              * @description Age of the oldest pending entry, from when its finding was resolved.
              */
             oldest_pending_minutes?: number | null;
@@ -2127,6 +2140,7 @@ export interface components {
              */
             status: string;
             theme_ids?: string[];
+            thread_collapse?: null | components["schemas"]["CodeReviewThreadCollapse"];
             /** @description Concise, generated one-line summary of the issue. */
             title: string;
         };
@@ -2748,6 +2762,26 @@ export interface components {
          * @enum {string}
          */
         CodeReviewThemeObservationKind: "new" | "continuation" | "recurrence";
+        /** @description Auto-resolve progress for one finding's GitHub review thread. */
+        CodeReviewThreadCollapse: {
+            /**
+             * Format: int64
+             * @description Failed attempts so far.
+             */
+            attempts?: number;
+            /** @description Error from the most recent failed attempt. */
+            last_error?: string;
+            /**
+             * Format: date-time
+             * @description Earliest time of the next attempt while one is pending.
+             */
+            next_attempt_at?: string | null;
+            /**
+             * @description The worker still owes a collapse attempt. False with a `last_error`
+             *     means the collapse was abandoned after repeated terminal failures.
+             */
+            pending: boolean;
+        };
         /**
          * @description A reviewer candidate the final editor neither retained nor substantively
          *     rejected. This represents incomplete coordinator work, not a negative
@@ -3329,6 +3363,13 @@ export interface components {
              */
             checks_write_configured?: boolean;
             configured: boolean;
+            /**
+             * @description Whether the installation token reports `contents: write`. GitHub
+             *     rejects the `resolveReviewThread`/`unresolveReviewThread` mutations
+             *     for installation tokens without it, so fixed findings' threads stay
+             *     open on GitHub until this is granted.
+             */
+            contents_write_configured?: boolean;
             /** Format: int64 */
             installation_count?: number;
             last_error?: string;

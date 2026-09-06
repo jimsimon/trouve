@@ -952,12 +952,14 @@ struct RuntimeState {
     rate_limit_remaining: Option<u64>,
     rate_limit_reset_at: Option<DateTime<Utc>>,
     checks_write_configured: bool,
+    contents_write_configured: bool,
     check_run_webhook_configured: bool,
 }
 
 impl RuntimeState {
     fn set_app_health(&mut self, health: GithubAppHealth) {
         self.checks_write_configured = health.checks_write_configured;
+        self.contents_write_configured = health.contents_write_configured;
         self.check_run_webhook_configured = health.check_run_webhook_configured;
     }
 }
@@ -1054,19 +1056,24 @@ struct AppInfo {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct GithubAppHealth {
     checks_write_configured: bool,
+    contents_write_configured: bool,
     check_run_webhook_configured: bool,
 }
 
 impl From<&AppInfo> for GithubAppHealth {
     fn from(app: &AppInfo) -> Self {
         Self {
-            checks_write_configured: app
-                .permissions
-                .get("checks")
-                .is_some_and(|permission| permission == "write"),
+            checks_write_configured: permission_is_write(&app.permissions, "checks"),
+            contents_write_configured: permission_is_write(&app.permissions, "contents"),
             check_run_webhook_configured: app.events.iter().any(|event| event == "check_run"),
         }
     }
+}
+
+fn permission_is_write(permissions: &HashMap<String, String>, name: &str) -> bool {
+    permissions
+        .get(name)
+        .is_some_and(|permission| permission == "write")
 }
 
 #[derive(Deserialize)]
@@ -2803,6 +2810,7 @@ impl Engine {
                 .unwrap_or_default(),
             webhook_configured,
             checks_write_configured: state.checks_write_configured,
+            contents_write_configured: state.contents_write_configured,
             check_run_webhook_configured: state.check_run_webhook_configured,
             installation_count: state.installation_count,
             last_poll_at: state.last_poll_at,
@@ -3913,16 +3921,14 @@ impl Engine {
             )
             .await?;
         self.record_review_rate(rate);
-        if created
-            .permissions
-            .get("checks")
-            .is_some_and(|permission| permission == "write")
         {
-            self.code_review
-                .state
-                .lock()
-                .unwrap()
-                .checks_write_configured = true;
+            let mut state = self.code_review.state.lock().unwrap();
+            if permission_is_write(&created.permissions, "checks") {
+                state.checks_write_configured = true;
+            }
+            if permission_is_write(&created.permissions, "contents") {
+                state.contents_write_configured = true;
+            }
         }
         self.code_review.installation_tokens.lock().await.insert(
             installation_id,
@@ -9808,6 +9814,24 @@ impl Engine {
         findings: &[trouve_protocol::CodeReviewFinding],
         deadline: Instant,
     ) -> Result<()> {
+        // A known-missing Contents permission makes every mutation below a
+        // guaranteed FORBIDDEN: record the actionable error on the whole
+        // group without spending requests on listings or resetting cached
+        // thread ids that are still perfectly valid.
+        if let Err(error) = self.ensure_review_thread_mutations_permitted() {
+            let message = format!("{error:#}");
+            tracing::warn!(
+                repository,
+                pull_number,
+                findings = findings.len(),
+                error = message,
+                "review threads cannot be collapsed until the GitHub App permission is granted"
+            );
+            for finding in findings {
+                self.defer_thread_collapse_logged(finding, true, &message);
+            }
+            return Err(error);
+        }
         // Findings with a comment-guarded cached thread id skip the listing
         // entirely and go first: a retry after a failed mutation costs one
         // request, not a re-walk of the PR's thread pages. The listing is
@@ -9882,8 +9906,13 @@ impl Engine {
                         }
                         Err(error) => {
                             let terminal_failure = !projection_error_is_retryable(&error);
+                            let message = format!("{error:#}");
                             for remaining in &ordered[index..] {
-                                self.defer_thread_collapse_logged(remaining, terminal_failure);
+                                self.defer_thread_collapse_logged(
+                                    remaining,
+                                    terminal_failure,
+                                    &message,
+                                );
                             }
                             first_error.get_or_insert(error);
                             break;
@@ -9909,13 +9938,14 @@ impl Engine {
                 }
                 Err(error) => {
                     let terminal_failure = !projection_error_is_retryable(&error);
+                    let message = format!("{error:#}");
                     tracing::warn!(
                         finding_id = finding.id,
                         path = finding.path,
-                        error = format!("{error:#}"),
+                        error = message,
                         "collapsing a finding's review thread failed; deferred with backoff"
                     );
-                    self.defer_thread_collapse_logged(finding, terminal_failure);
+                    self.defer_thread_collapse_logged(finding, terminal_failure, &message);
                     first_error.get_or_insert(error);
                 }
             }
@@ -9986,10 +10016,11 @@ impl Engine {
         &self,
         finding: &trouve_protocol::CodeReviewFinding,
         terminal_failure: bool,
+        error: &str,
     ) {
         match self
             .store
-            .defer_code_review_thread_collapse(&finding.id, terminal_failure)
+            .defer_code_review_thread_collapse(&finding.id, terminal_failure, error)
         {
             Ok(true) => tracing::warn!(
                 finding_id = finding.id,
@@ -10157,15 +10188,16 @@ impl Engine {
             Ok(Ok(api)) => api,
             Ok(Err(error)) => {
                 let terminal_failure = !projection_error_is_retryable(&error);
+                let message = format!("{error:#}");
                 tracing::warn!(
                     repository,
                     pull_number,
-                    error = format!("{error:#}"),
+                    error = message,
                     "failed to build a GitHub client for pending thread collapses; \
                      the group was deferred"
                 );
                 for finding in findings {
-                    self.defer_thread_collapse_logged(finding, terminal_failure);
+                    self.defer_thread_collapse_logged(finding, terminal_failure, &message);
                 }
                 return;
             }
@@ -10178,7 +10210,11 @@ impl Engine {
                      the group was deferred"
                 );
                 for finding in findings {
-                    self.defer_thread_collapse_logged(finding, false);
+                    self.defer_thread_collapse_logged(
+                        finding,
+                        false,
+                        "building a GitHub client for the thread collapse timed out",
+                    );
                 }
                 return;
             }
@@ -11688,7 +11724,22 @@ impl Engine {
         }
     }
 
+    /// GitHub rejects the review-thread resolve/unresolve mutations for
+    /// installation tokens without `contents: write` ("Resource not
+    /// accessible by integration"), even though they only touch pull-request
+    /// data. Once an installation token has shown the permission is missing,
+    /// fail fast with the same terminal, actionable message the Checks gate
+    /// uses instead of spending every retry on a guaranteed FORBIDDEN.
+    fn ensure_review_thread_mutations_permitted(&self) -> Result<()> {
+        let state = self.code_review.state.lock().unwrap();
+        if !state.contents_write_configured && state.installation_count > 0 {
+            bail!("GitHub App needs repository permission: Contents (read and write)");
+        }
+        Ok(())
+    }
+
     async fn collapse_review_thread(&self, api: &GithubApi, thread_id: &str) -> Result<()> {
+        self.ensure_review_thread_mutations_permitted()?;
         let mutation = r#"
           mutation ResolveReviewThread($threadId: ID!) {
             resolveReviewThread(input: {threadId: $threadId}) {
@@ -11713,6 +11764,7 @@ impl Engine {
     }
 
     async fn reopen_review_thread(&self, api: &GithubApi, thread_id: &str) -> Result<()> {
+        self.ensure_review_thread_mutations_permitted()?;
         let mutation = r#"
           mutation UnresolveReviewThread($threadId: ID!) {
             unresolveReviewThread(input: {threadId: $threadId}) {
@@ -20798,6 +20850,7 @@ mod tests {
             observed_head: "base".into(),
             resolved_head: String::new(),
             resolved_by_job_id: String::new(),
+            thread_collapse: None,
         }
     }
 
@@ -21644,6 +21697,7 @@ rename to src/new.rs
             observed_head: String::new(),
             resolved_head: String::new(),
             resolved_by_job_id: String::new(),
+            thread_collapse: None,
         };
         assert!(!finding.is_publishable());
         let mut verified = finding.clone();
@@ -28645,7 +28699,7 @@ rename to src/new.rs
         // Seed one real failure. Another failure defer would now schedule a
         // two-minute retry; a budget requeue must remain due after one minute.
         store
-            .defer_code_review_thread_collapse(&finding.id, false)
+            .defer_code_review_thread_collapse(&finding.id, false, "transient")
             .unwrap();
         let data = tempfile::tempdir().unwrap();
         let engine = Engine::new(
@@ -28692,6 +28746,150 @@ rename to src/new.rs
                 .unwrap()
                 .len(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_contents_write_permission_fails_collapse_fast_with_an_actionable_error() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let previous_job = enqueue_test_review_job(&store, "acme/widgets#42:contents-permission");
+        store
+            .save_code_review_result(
+                &previous_job.id,
+                "summary",
+                "prompt",
+                1,
+                &[NewCodeReviewFinding {
+                    path: "src/lib.rs".into(),
+                    line: 3,
+                    side: "RIGHT".into(),
+                    severity: "medium".into(),
+                    confidence: "high".into(),
+                    title: "Test issue".into(),
+                    body: "finding".into(),
+                    prompt_for_agents: "fix it".into(),
+                    sources: Vec::new(),
+                }],
+                &[],
+            )
+            .unwrap();
+        let finding = store
+            .code_review_findings(&previous_job.id)
+            .unwrap()
+            .remove(0);
+        store
+            .update_code_review_finding_publication(
+                &finding.id,
+                Some(9001),
+                "https://github.com/acme/widgets/pull/42",
+                Some("T1"),
+            )
+            .unwrap();
+        store
+            .resolve_code_review_finding(
+                &finding.id,
+                "fixed",
+                &previous_job.head_sha,
+                &previous_job.id,
+            )
+            .unwrap();
+        let finding = store
+            .code_review_findings(&previous_job.id)
+            .unwrap()
+            .remove(0);
+        assert_eq!(finding.github_thread_id.as_deref(), Some("T1"));
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(
+            store,
+            data.path().to_path_buf(),
+            &crate::config::Config::default(),
+        );
+        // An installation token has been minted (installations are known)
+        // and it did not carry `contents: write`.
+        {
+            let mut state = engine.code_review.state.lock().unwrap();
+            state.installation_count = 1;
+            state.contents_write_configured = false;
+        }
+        // No GitHub request may be made: the scripted server has no
+        // responses and would panic on a connection.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = scripted_github_server(listener, Vec::new());
+        let api = GithubApi::with_base_url(
+            "Bearer token".into(),
+            format!("http://{address}"),
+            "installation:7".into(),
+        )
+        .unwrap();
+
+        let error = engine
+            .resolve_review_threads(&api, "acme/widgets", 42, std::slice::from_ref(&finding))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("Contents (read and write)"),
+            "{error:#}"
+        );
+        assert!(!projection_error_is_retryable(&error));
+        await_mock_server(server).await;
+
+        let failed = engine
+            .store
+            .code_review_findings(&previous_job.id)
+            .unwrap()
+            .remove(0);
+        // The gate ran before any mutation, so the still-valid cached thread
+        // id survives for the retry.
+        assert_eq!(failed.github_thread_id.as_deref(), Some("T1"));
+        let recorded = failed
+            .thread_collapse
+            .expect("the failed collapse must be recorded on the finding");
+        assert!(recorded.pending);
+        assert_eq!(recorded.attempts, 1);
+        assert!(
+            recorded
+                .last_error
+                .contains("GitHub App needs repository permission: Contents (read and write)"),
+            "{}",
+            recorded.last_error
+        );
+        // Once the permission is granted the same finding collapses.
+        engine
+            .code_review
+            .state
+            .lock()
+            .unwrap()
+            .contents_write_configured = true;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = scripted_github_server(
+            listener,
+            vec![
+                r#"{"data":{"resolveReviewThread":{"thread":{"id":"T1","isResolved":true}}}}"#
+                    .into(),
+                r#"{"id": 1}"#.into(),
+            ],
+        );
+        let api = GithubApi::with_base_url(
+            "Bearer token".into(),
+            format!("http://{address}"),
+            "installation:7".into(),
+        )
+        .unwrap();
+        engine
+            .resolve_review_threads(&api, "acme/widgets", 42, std::slice::from_ref(&finding))
+            .await
+            .unwrap();
+        await_mock_server(server).await;
+        assert!(
+            engine
+                .store
+                .code_review_findings(&previous_job.id)
+                .unwrap()
+                .remove(0)
+                .thread_collapse
+                .is_none()
         );
     }
 
@@ -29002,6 +29200,7 @@ rename to src/new.rs
                 observed_head: String::new(),
                 resolved_head: String::new(),
                 resolved_by_job_id: String::new(),
+                thread_collapse: None,
             };
         let outside = finding("rvf_outside", true, "Outside issue");
         let inline = finding("rvf_inline", false, "Inline issue");
@@ -30110,13 +30309,13 @@ rename to src/new.rs
     fn github_app_health_tracks_current_permissions_and_events() {
         let configured: AppInfo = serde_json::from_value(serde_json::json!({
             "slug": "trouve-ai",
-            "permissions": {"checks": "write"},
+            "permissions": {"checks": "write", "contents": "write"},
             "events": ["check_run", "pull_request"]
         }))
         .unwrap();
         let missing: AppInfo = serde_json::from_value(serde_json::json!({
             "slug": "trouve-ai",
-            "permissions": {"checks": "read"},
+            "permissions": {"checks": "read", "contents": "read"},
             "events": ["pull_request"]
         }))
         .unwrap();
@@ -30124,10 +30323,12 @@ rename to src/new.rs
 
         state.set_app_health(GithubAppHealth::from(&configured));
         assert!(state.checks_write_configured);
+        assert!(state.contents_write_configured);
         assert!(state.check_run_webhook_configured);
 
         state.set_app_health(GithubAppHealth::from(&missing));
         assert!(!state.checks_write_configured);
+        assert!(!state.contents_write_configured);
         assert!(!state.check_run_webhook_configured);
     }
 
@@ -31798,6 +31999,7 @@ rename to src/new.rs
             observed_head: String::new(),
             resolved_head: String::new(),
             resolved_by_job_id: String::new(),
+            thread_collapse: None,
             outside_diff: true,
         };
         let store = crate::store::Store::open_in_memory().unwrap();
@@ -31892,6 +32094,7 @@ rename to src/new.rs
             observed_head: String::new(),
             resolved_head: String::new(),
             resolved_by_job_id: String::new(),
+            thread_collapse: None,
             outside_diff: true,
         };
         let findings = (0..40).map(finding).collect::<Vec<_>>();

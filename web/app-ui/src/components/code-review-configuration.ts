@@ -320,6 +320,7 @@ export class TrouveCodeReviewConfiguration extends withSignalTracking(LitElement
           <div><dt>Bot</dt><dd>${app.bot_login || app.slug || "Not reported"}</dd></div>
           <div><dt>Installations</dt><dd>${app.installation_count ?? 0}</dd></div>
           <div><dt>Checks permission</dt><dd>${app.checks_write_configured ? "Ready" : "Not confirmed"}</dd></div>
+          <div><dt>Contents permission</dt><dd>${app.contents_write_configured ? "Ready" : "Not confirmed"}</dd></div>
           <div><dt>Webhook</dt><dd>${app.webhook_configured ? "Configured" : "Polling only"}</dd></div>
           <div><dt>Re-run actions</dt><dd>${app.check_run_webhook_configured ? "Ready" : "Not confirmed"}</dd></div>
           <div><dt>Last poll</dt><dd>${formatTimestamp(app.last_poll_at)}</dd></div>

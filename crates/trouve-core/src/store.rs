@@ -504,6 +504,7 @@ CREATE TABLE IF NOT EXISTS code_review_findings (
   collapse_attempts INTEGER NOT NULL DEFAULT 0,
   collapse_terminal_attempts INTEGER NOT NULL DEFAULT 0,
   collapse_next_attempt_at TEXT,
+  collapse_error TEXT NOT NULL DEFAULT '',
   publication_resolution_job_id TEXT,
   created_at TEXT NOT NULL
 );
@@ -1036,6 +1037,11 @@ const MIGRATIONS: &[&str] = &[
     // finding with supporting evidence.
     "ALTER TABLE code_review_findings
        ADD COLUMN promoted_from_finding_id TEXT NOT NULL DEFAULT ''",
+    // Last failure of the auto-resolve worker for a finding's GitHub thread,
+    // so a stuck or abandoned collapse is diagnosable from the API instead
+    // of only from server logs.
+    "ALTER TABLE code_review_findings
+       ADD COLUMN collapse_error TEXT NOT NULL DEFAULT ''",
 ];
 
 /// Severity/confidence half of the blocking tier for one findings row: high
@@ -3650,6 +3656,30 @@ fn refresh_code_review_pull_projection_counts_in_tx(
 
 fn parse_optional_datetime(value: Option<String>) -> Option<chrono::DateTime<chrono::Utc>> {
     value.and_then(|value| value.parse().ok())
+}
+
+/// Reads a finding's thread auto-resolve state from the four `collapse_*`
+/// columns (in the order `collapse_pending, collapse_attempts,
+/// collapse_next_attempt_at, collapse_error`) starting at `index`. Absent
+/// once the collapse is complete or was never owed, so untouched findings
+/// carry no noise.
+fn code_review_thread_collapse_from_row(
+    row: &rusqlite::Row<'_>,
+    index: usize,
+) -> rusqlite::Result<Option<trouve_protocol::CodeReviewThreadCollapse>> {
+    let pending: bool = row.get(index)?;
+    let attempts: i64 = row.get(index + 1)?;
+    let next_attempt_at = parse_optional_datetime(row.get(index + 2)?);
+    let last_error: String = row.get(index + 3)?;
+    if !pending && last_error.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(trouve_protocol::CodeReviewThreadCollapse {
+        pending,
+        attempts: attempts.max(0) as u64,
+        next_attempt_at: next_attempt_at.filter(|_| pending),
+        last_error,
+    }))
 }
 
 fn code_review_scope_from(value: &str) -> trouve_protocol::CodeReviewJobScope {
@@ -12157,6 +12187,10 @@ impl Store {
                      WHEN status IN ('fixed', 'dismissed') AND ?2 IS NOT NULL AND collapse_pending = 0 THEN NULL
                      ELSE collapse_next_attempt_at
                  END,
+                 collapse_error = CASE
+                     WHEN status IN ('fixed', 'dismissed') AND ?2 IS NOT NULL AND collapse_pending = 0 THEN ''
+                     ELSE collapse_error
+                 END,
                  collapse_pending = CASE
                      WHEN status IN ('fixed', 'dismissed') AND ?2 IS NOT NULL THEN 1
                      ELSE collapse_pending
@@ -12276,6 +12310,10 @@ impl Store {
                      WHEN github_comment_id IS NOT NULL THEN NULL
                      ELSE collapse_next_attempt_at
                  END,
+                 collapse_error = CASE
+                     WHEN github_comment_id IS NOT NULL THEN ''
+                     ELSE collapse_error
+                 END,
                  collapse_pending = CASE
                      WHEN github_comment_id IS NOT NULL THEN 1
                      ELSE 0
@@ -12307,6 +12345,7 @@ impl Store {
             "UPDATE code_review_findings
              SET collapse_pending = 0, collapse_attempts = 0,
                  collapse_terminal_attempts = 0, collapse_next_attempt_at = NULL,
+                 collapse_error = '',
                  github_thread_id = CASE
                      WHEN ?3 IS NOT NULL THEN ?3 ELSE github_thread_id
                  END,
@@ -12361,13 +12400,21 @@ impl Store {
     /// Only consecutive terminal failures count toward abandonment; transient
     /// API, network, and token failures keep retrying and reset that counter.
     /// Abandonment is cosmetic — the finding's ledger state is already
-    /// durable; only its GitHub thread stays un-collapsed.
+    /// durable; only its GitHub thread stays un-collapsed. The failure
+    /// message is kept on the row (bounded) so the API can explain why a
+    /// thread is still open on GitHub.
     pub fn defer_code_review_thread_collapse(
         &self,
         id: &str,
         terminal_failure: bool,
+        error: &str,
     ) -> Result<bool> {
         const THREAD_COLLAPSE_MAX_ATTEMPTS: i64 = 24;
+        const THREAD_COLLAPSE_ERROR_MAX_CHARS: usize = 512;
+        let error = error
+            .chars()
+            .take(THREAD_COLLAPSE_ERROR_MAX_CHARS)
+            .collect::<String>();
         let conn = self.conn.lock().unwrap();
         let tx = write_transaction(&conn)?;
         let (attempts, terminal_attempts): (i64, i64) = tx
@@ -12391,9 +12438,10 @@ impl Store {
                  SET collapse_pending = 0,
                      collapse_attempts = collapse_attempts + 1,
                      collapse_terminal_attempts = ?2,
-                     collapse_next_attempt_at = NULL
+                     collapse_next_attempt_at = NULL,
+                     collapse_error = ?3
                  WHERE id = ?1",
-                params![id, terminal_attempts],
+                params![id, terminal_attempts, error],
             )?;
         } else {
             let delay_seconds = (60_i64 << attempts.clamp(0, 6)).min(3600);
@@ -12402,9 +12450,10 @@ impl Store {
                 "UPDATE code_review_findings
                  SET collapse_attempts = collapse_attempts + 1,
                      collapse_terminal_attempts = ?2,
-                     collapse_next_attempt_at = ?3
+                     collapse_next_attempt_at = ?3,
+                     collapse_error = ?4
                  WHERE id = ?1",
-                params![id, terminal_attempts, next_attempt.to_rfc3339()],
+                params![id, terminal_attempts, next_attempt.to_rfc3339(), error],
             )?;
         }
         tx.commit()?;
@@ -12439,7 +12488,7 @@ impl Store {
                     f.github_comment_url, f.github_publication_status,
                     f.github_thread_id, f.resolved_at,
                     j.head_sha, f.resolved_head, f.resolved_by_job_id,
-                    f.outside_diff
+                    f.outside_diff, f.collapse_pending, f.collapse_attempts, f.collapse_next_attempt_at, f.collapse_error
              FROM code_review_findings f
              JOIN code_review_jobs j ON j.id = f.job_id
              WHERE f.collapse_pending = 1
@@ -12491,6 +12540,7 @@ impl Store {
                         resolved_head: row.get(22)?,
                         resolved_by_job_id: row.get(23)?,
                         outside_diff: row.get(24)?,
+                        thread_collapse: code_review_thread_collapse_from_row(row, 25)?,
                     },
                 ))
             })?
@@ -12523,7 +12573,7 @@ impl Store {
                         github_comment_url, github_publication_status,
                         github_thread_id, resolved_at,
                         (SELECT head_sha FROM code_review_jobs WHERE id = code_review_findings.job_id),
-                        resolved_head, resolved_by_job_id, outside_diff
+                        resolved_head, resolved_by_job_id, outside_diff, collapse_pending, collapse_attempts, collapse_next_attempt_at, collapse_error
                  FROM code_review_findings
                  WHERE job_id = ?1{status_filter} ORDER BY path, line, id"
             ))?;
@@ -12559,6 +12609,7 @@ impl Store {
                     resolved_head: row.get(19)?,
                     resolved_by_job_id: row.get(20)?,
                     outside_diff: row.get(21)?,
+                    thread_collapse: code_review_thread_collapse_from_row(row, 22)?,
                 })
             })?
             .collect::<rusqlite::Result<_>>()?
@@ -12803,7 +12854,7 @@ impl Store {
                         f.prompt_for_agents, f.status, f.github_comment_id,
                         f.github_comment_url, f.github_publication_status,
                         f.github_thread_id, f.resolved_at, j.head_sha,
-                        f.resolved_head, f.resolved_by_job_id, f.outside_diff
+                        f.resolved_head, f.resolved_by_job_id, f.outside_diff, f.collapse_pending, f.collapse_attempts, f.collapse_next_attempt_at, f.collapse_error
                  FROM code_review_findings f
                  JOIN code_review_jobs j ON j.id = f.job_id
                  WHERE j.repository = ?1 AND j.pull_number = ?2
@@ -12838,6 +12889,7 @@ impl Store {
                     resolved_head: row.get(19)?,
                     resolved_by_job_id: row.get(20)?,
                     outside_diff: row.get(21)?,
+                    thread_collapse: code_review_thread_collapse_from_row(row, 22)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?
@@ -12925,7 +12977,7 @@ impl Store {
                         f.github_thread_resolved, f.github_thread_generation,
                         f.github_thread_recheck_pending, f.evidence, f.origin,
                         j.head_sha, f.resolved_head, f.resolved_by_job_id,
-                        f.outside_diff
+                        f.outside_diff, f.collapse_pending, f.collapse_attempts, f.collapse_next_attempt_at, f.collapse_error
                  FROM code_review_findings f
                  JOIN code_review_jobs j ON j.id = f.job_id
                  WHERE j.repository = ?1 AND j.pull_number = ?2
@@ -12963,6 +13015,7 @@ impl Store {
                         resolved_head: row.get(22)?,
                         resolved_by_job_id: row.get(23)?,
                         outside_diff: row.get(24)?,
+                        thread_collapse: code_review_thread_collapse_from_row(row, 25)?,
                     },
                     is_resolved: row.get(16)?,
                     generation: row.get::<_, i64>(17)? as u64,
@@ -13098,6 +13151,10 @@ impl Store {
                      collapse_next_attempt_at = CASE
                        WHEN ?5 AND status IN ('fixed', 'dismissed') THEN NULL
                        ELSE collapse_next_attempt_at
+                     END,
+                     collapse_error = CASE
+                       WHEN ?5 AND status IN ('fixed', 'dismissed') THEN ''
+                       ELSE collapse_error
                      END,
                      status = CASE
                        WHEN ?5 AND status IN ('fixed', 'dismissed') THEN 'open'
@@ -13654,6 +13711,7 @@ impl Store {
                     resolved_head: String::new(),
                     resolved_by_job_id: String::new(),
                     outside_diff: true,
+                    thread_collapse: None,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -14610,15 +14668,41 @@ impl Store {
             // The time range intentionally does not apply: the backlog is a
             // point-in-time gauge of work still owed, not activity within
             // the window.
-            let (pending, oldest): (i64, Option<String>) = conn.query_row(
-                "SELECT COUNT(*), MIN(COALESCE(finding.resolved_at, finding.created_at))
+            let (pending, oldest, failing): (i64, Option<String>, i64) = conn.query_row(
+                "SELECT COUNT(*), MIN(COALESCE(finding.resolved_at, finding.created_at)),
+                        COALESCE(SUM(finding.collapse_error != ''), 0)
                  FROM code_review_findings finding
                  JOIN code_review_jobs job ON job.id = finding.job_id
                  WHERE finding.collapse_pending = 1
                    AND (?1 IS NULL OR job.repository = ?1)",
                 params![repository],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )?;
+            // Abandoned rows keep their last error with collapse_pending
+            // cleared; a later successful collapse or re-arm wipes it.
+            let abandoned: i64 = conn.query_row(
+                "SELECT COUNT(*)
+                 FROM code_review_findings finding
+                 JOIN code_review_jobs job ON job.id = finding.job_id
+                 WHERE finding.collapse_pending = 0 AND finding.collapse_error != ''
+                   AND (?1 IS NULL OR job.repository = ?1)",
+                params![repository],
+                |row| row.get(0),
+            )?;
+            let last_error: Option<String> = conn
+                .query_row(
+                    "SELECT finding.collapse_error
+                     FROM code_review_findings finding
+                     JOIN code_review_jobs job ON job.id = finding.job_id
+                     WHERE finding.collapse_error != ''
+                       AND (?1 IS NULL OR job.repository = ?1)
+                     ORDER BY finding.collapse_pending DESC,
+                              COALESCE(finding.resolved_at, finding.created_at) DESC
+                     LIMIT 1",
+                    params![repository],
+                    |row| row.get(0),
+                )
+                .optional()?;
             trouve_protocol::CodeReviewCollapseBacklog {
                 pending: pending.max(0) as u64,
                 oldest_pending_minutes: oldest
@@ -14630,6 +14714,9 @@ impl Store {
                             .num_minutes()
                             .max(0) as u64
                     }),
+                failing: failing.max(0) as u64,
+                abandoned: abandoned.max(0) as u64,
+                last_error: last_error.unwrap_or_default(),
             }
         };
         let mut persona_stats: BTreeMap<(String, String), PersonaAccumulator> = BTreeMap::new();
@@ -15550,6 +15637,10 @@ impl Store {
                          WHEN github_comment_id IS NOT NULL THEN NULL
                          ELSE collapse_next_attempt_at
                      END,
+                     collapse_error = CASE
+                         WHEN github_comment_id IS NOT NULL THEN ''
+                         ELSE collapse_error
+                     END,
                      collapse_pending = CASE
                          WHEN github_comment_id IS NOT NULL THEN 1
                          ELSE 0
@@ -16022,6 +16113,10 @@ impl Store {
                      collapse_next_attempt_at = CASE
                          WHEN github_comment_id IS NOT NULL THEN NULL
                          ELSE collapse_next_attempt_at
+                     END,
+                     collapse_error = CASE
+                         WHEN github_comment_id IS NOT NULL THEN ''
+                         ELSE collapse_error
                      END,
                      collapse_pending = CASE
                          WHEN github_comment_id IS NOT NULL THEN 1
@@ -22763,8 +22858,12 @@ mod tests {
         // Stale backoff accrued while the row had nothing to collapse (e.g.
         // a cleanup pass deferring on a listing failure) must not delay a
         // freshly armed collapse.
-        store.defer_code_review_thread_collapse(&id, false).unwrap();
-        store.defer_code_review_thread_collapse(&id, false).unwrap();
+        store
+            .defer_code_review_thread_collapse(&id, false, "transient")
+            .unwrap();
+        store
+            .defer_code_review_thread_collapse(&id, false, "transient")
+            .unwrap();
 
         // A comment published by a concurrent round after the close re-arms
         // the collapse with reset retry metadata: due immediately, not after
@@ -22851,7 +22950,9 @@ mod tests {
         };
 
         // First failure: due in one minute — not before, not much after.
-        store.defer_code_review_thread_collapse(&id, false).unwrap();
+        store
+            .defer_code_review_thread_collapse(&id, false, "transient")
+            .unwrap();
         let first = next_attempt(&store);
         let elapsed = first - chrono::Utc::now();
         assert!(elapsed > chrono::Duration::seconds(55), "{elapsed}");
@@ -22859,14 +22960,18 @@ mod tests {
 
         // The delay doubles per failure and stops growing at one hour.
         for _ in 0..6 {
-            store.defer_code_review_thread_collapse(&id, false).unwrap();
+            store
+                .defer_code_review_thread_collapse(&id, false, "transient")
+                .unwrap();
         }
         let capped = next_attempt(&store);
         let elapsed = capped - chrono::Utc::now();
         assert!(elapsed > chrono::Duration::minutes(59), "{elapsed}");
         assert!(elapsed <= chrono::Duration::minutes(61), "{elapsed}");
 
-        store.defer_code_review_thread_collapse(&id, false).unwrap();
+        store
+            .defer_code_review_thread_collapse(&id, false, "transient")
+            .unwrap();
         let still_capped = next_attempt(&store) - chrono::Utc::now();
         assert!(
             still_capped <= chrono::Duration::minutes(61),
@@ -22880,7 +22985,9 @@ mod tests {
         let requeued = next_attempt(&store) - chrono::Utc::now();
         assert!(requeued > chrono::Duration::seconds(55), "{requeued}");
         assert!(requeued <= chrono::Duration::seconds(61), "{requeued}");
-        store.defer_code_review_thread_collapse(&id, false).unwrap();
+        store
+            .defer_code_review_thread_collapse(&id, false, "transient")
+            .unwrap();
         let after_requeue = next_attempt(&store) - chrono::Utc::now();
         assert!(
             after_requeue > chrono::Duration::minutes(59),
@@ -22890,7 +22997,11 @@ mod tests {
         // Transient failures can continue past the bound without abandoning
         // the work; only their backoff remains capped.
         for _ in 0..30 {
-            assert!(!store.defer_code_review_thread_collapse(&id, false).unwrap());
+            assert!(
+                !store
+                    .defer_code_review_thread_collapse(&id, false, "transient")
+                    .unwrap()
+            );
         }
 
         // Past the terminal-failure bound the collapse is abandoned instead of
@@ -22898,7 +23009,10 @@ mod tests {
         // and the finding leaves the retry queue.
         let mut abandoned = false;
         for _ in 0..24 {
-            if store.defer_code_review_thread_collapse(&id, true).unwrap() {
+            if store
+                .defer_code_review_thread_collapse(&id, true, "terminal")
+                .unwrap()
+            {
                 abandoned = true;
                 break;
             }
@@ -22915,6 +23029,119 @@ mod tests {
             )
             .unwrap();
         assert!(!pending, "an abandoned collapse must leave the queue");
+    }
+
+    #[test]
+    fn collapse_failures_are_recorded_on_the_finding_and_the_backlog() {
+        let store = Store::open_in_memory().unwrap();
+        let job = enqueue_backoff_test_job(&store);
+        let findings = store
+            .save_code_review_result(
+                &job.id,
+                "summary",
+                "prompt",
+                1,
+                &[NewCodeReviewFinding {
+                    path: "src/lib.rs".into(),
+                    line: 3,
+                    side: "RIGHT".into(),
+                    severity: "medium".into(),
+                    confidence: "high".into(),
+                    title: "Test finding".into(),
+                    body: "finding".into(),
+                    prompt_for_agents: "fix".into(),
+                    sources: Vec::new(),
+                }],
+                &[],
+            )
+            .unwrap();
+        let id = findings[0].id.clone();
+        let finding = |store: &Store| {
+            store
+                .code_review_findings(&job.id)
+                .unwrap()
+                .into_iter()
+                .find(|finding| finding.id == id)
+                .unwrap()
+        };
+        // Nothing owed yet: the finding carries no collapse state.
+        assert!(finding(&store).thread_collapse.is_none());
+
+        store
+            .update_code_review_finding_publication(&id, Some(9001), "https://example", None)
+            .unwrap();
+        assert!(
+            store
+                .resolve_code_review_finding(&id, "fixed", "resolved-head", "resolver-job")
+                .unwrap()
+        );
+        let owed = finding(&store).thread_collapse.unwrap();
+        assert!(owed.pending);
+        assert_eq!(owed.attempts, 0);
+        assert!(owed.last_error.is_empty());
+
+        let forbidden = "GitHub GraphQL error while resolving review thread: FORBIDDEN: \
+                         Resource not accessible by integration";
+        assert!(
+            !store
+                .defer_code_review_thread_collapse(&id, true, forbidden)
+                .unwrap()
+        );
+        let failing = finding(&store).thread_collapse.unwrap();
+        assert!(failing.pending);
+        assert_eq!(failing.attempts, 1);
+        assert_eq!(failing.last_error, forbidden);
+        assert!(failing.next_attempt_at.is_some());
+
+        let stats = store
+            .code_review_stats(trouve_protocol::CodeReviewStatsRange::Week, None)
+            .unwrap();
+        let backlog = stats.thread_collapse_backlog.unwrap();
+        assert_eq!(backlog.pending, 1);
+        assert_eq!(backlog.failing, 1);
+        assert_eq!(backlog.abandoned, 0);
+        assert_eq!(backlog.last_error, forbidden);
+
+        // The recorded message is bounded so a pathological error body
+        // cannot bloat the row.
+        let oversized = "x".repeat(2000);
+        store
+            .defer_code_review_thread_collapse(&id, true, &oversized)
+            .unwrap();
+        assert_eq!(
+            finding(&store).thread_collapse.unwrap().last_error.len(),
+            512
+        );
+
+        // Abandonment keeps the explanation while leaving the queue.
+        while !store
+            .defer_code_review_thread_collapse(&id, true, forbidden)
+            .unwrap()
+        {}
+        let abandoned = finding(&store).thread_collapse.unwrap();
+        assert!(!abandoned.pending);
+        assert!(abandoned.next_attempt_at.is_none());
+        assert_eq!(abandoned.last_error, forbidden);
+        let stats = store
+            .code_review_stats(trouve_protocol::CodeReviewStatsRange::Week, None)
+            .unwrap();
+        let backlog = stats.thread_collapse_backlog.unwrap();
+        assert_eq!(backlog.pending, 0);
+        assert_eq!(backlog.failing, 0);
+        assert_eq!(backlog.abandoned, 1);
+        assert_eq!(backlog.last_error, forbidden);
+
+        // A successful collapse clears every trace.
+        store
+            .clear_code_review_thread_collapse(&id, Some(9001), Some("thread-9001"))
+            .unwrap();
+        assert!(finding(&store).thread_collapse.is_none());
+        let stats = store
+            .code_review_stats(trouve_protocol::CodeReviewStatsRange::Week, None)
+            .unwrap();
+        let backlog = stats.thread_collapse_backlog.unwrap();
+        assert_eq!(backlog.abandoned, 0);
+        assert!(backlog.last_error.is_empty());
     }
 
     #[test]
@@ -24735,10 +24962,10 @@ mod tests {
         assert_eq!(resolved[0].is_resolved, Some(true));
         assert!(!resolved[0].recheck_pending);
         store
-            .defer_code_review_thread_collapse(&finding.id, false)
+            .defer_code_review_thread_collapse(&finding.id, false, "transient")
             .unwrap();
         store
-            .defer_code_review_thread_collapse(&finding.id, false)
+            .defer_code_review_thread_collapse(&finding.id, false, "transient")
             .unwrap();
 
         assert!(

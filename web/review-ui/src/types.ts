@@ -24,6 +24,7 @@ export interface GithubAppStatus {
   bot_login: string;
   webhook_configured: boolean;
   checks_write_configured: boolean;
+  contents_write_configured?: boolean;
   check_run_webhook_configured: boolean;
   installation_count: number;
   last_poll_at?: string;
@@ -259,6 +260,14 @@ export interface Finding {
   observed_head?: string;
   resolved_head?: string;
   resolved_by_job_id?: string;
+  thread_collapse?: ThreadCollapseState | null;
+}
+
+export interface ThreadCollapseState {
+  pending: boolean;
+  attempts?: number;
+  next_attempt_at?: string;
+  last_error?: string;
 }
 
 export interface ReviewTheme {
@@ -422,6 +431,9 @@ export interface ReviewStats {
   thread_collapse_backlog?: {
     pending: number;
     oldest_pending_minutes?: number | null;
+    failing?: number;
+    abandoned?: number;
+    last_error?: string;
   } | null;
   churn?: {
     recurrence_issue_count: number;

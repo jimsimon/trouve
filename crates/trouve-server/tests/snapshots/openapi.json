@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "9.1"
+    "version": "9.2"
   },
   "paths": {
     "/v1/approvals": {
@@ -5700,6 +5700,22 @@
           "pending"
         ],
         "properties": {
+          "abandoned": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Entries the worker gave up on after repeated terminal failures; their\nthreads stay open on GitHub until resolved by hand.",
+            "minimum": 0
+          },
+          "failing": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Pending entries whose most recent attempt failed.",
+            "minimum": 0
+          },
+          "last_error": {
+            "type": "string",
+            "description": "Error from the most recently failed attempt across the backlog."
+          },
           "oldest_pending_minutes": {
             "type": [
               "integer",
@@ -5902,6 +5918,17 @@
             "items": {
               "type": "string"
             }
+          },
+          "thread_collapse": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/CodeReviewThreadCollapse",
+                "description": "State of the auto-resolve worker for this finding's GitHub review\nthread. Present while a collapse is still owed or after one failed,\nso a thread that stays open on GitHub can be explained."
+              }
+            ]
           },
           "title": {
             "type": "string",
@@ -7379,6 +7406,37 @@
           "continuation",
           "recurrence"
         ]
+      },
+      "CodeReviewThreadCollapse": {
+        "type": "object",
+        "description": "Auto-resolve progress for one finding's GitHub review thread.",
+        "required": [
+          "pending"
+        ],
+        "properties": {
+          "attempts": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Failed attempts so far.",
+            "minimum": 0
+          },
+          "last_error": {
+            "type": "string",
+            "description": "Error from the most recent failed attempt."
+          },
+          "next_attempt_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Earliest time of the next attempt while one is pending."
+          },
+          "pending": {
+            "type": "boolean",
+            "description": "The worker still owes a collapse attempt. False with a `last_error`\nmeans the collapse was abandoned after repeated terminal failures."
+          }
+        }
       },
       "CodeReviewUnadjudicatedCandidate": {
         "type": "object",
@@ -9454,6 +9512,10 @@
           },
           "configured": {
             "type": "boolean"
+          },
+          "contents_write_configured": {
+            "type": "boolean",
+            "description": "Whether the installation token reports `contents: write`. GitHub\nrejects the `resolveReviewThread`/`unresolveReviewThread` mutations\nfor installation tokens without it, so fixed findings' threads stay\nopen on GitHub until this is granted."
           },
           "installation_count": {
             "type": "integer",
