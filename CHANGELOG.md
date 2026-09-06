@@ -10,10 +10,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **Background work has an explicit owner**: trouve-owned subsystems can move
   intentional long-lived work into a cancelling, coalescing registry without
-  trusting arbitrary detached descendants. Review fetches now schedule bounded
-  repository-locked Git maintenance through that owner instead of either
-  waiting for Git's detached auto-maintenance or disabling housekeeping
-  indefinitely.
+  trusting arbitrary detached descendants. Review fetches suppress inline Git
+  maintenance, preempt lower-priority managed maintenance without losing the
+  pending pass, and globally limit repository-locked housekeeping instead of
+  disabling it indefinitely.
 - **Non-gating review findings stay off pull requests**: credible findings that
   are not mechanically tied to the reviewed change remain available in
   trouve's dashboard and durable review history, but no longer appear in the

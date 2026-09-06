@@ -41,6 +41,7 @@ pub use edit_strategy::for_model as edit_strategy_for_model;
 const REVIEW_OPTIONAL_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 const REVIEW_PRIMARY_FETCH_TIMEOUT: Duration = Duration::from_secs(60);
 const REVIEW_MAINTENANCE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const REVIEW_MAINTENANCE_CONCURRENCY: usize = 1;
 const REVIEW_FETCH_TERMINATION_GRACE: Duration = Duration::from_secs(2);
 const REVIEW_HISTORY_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 const REVIEW_FETCH_STDERR_MAX_BYTES: usize = 8 * 1024;
@@ -1722,6 +1723,30 @@ pub struct LocalToolExecutor {
     managed_background: managed_background::ManagedBackgroundTasks,
     hashline_failures: Mutex<HashMap<String, u8>>,
     review_repository_locks: Mutex<HashMap<PathBuf, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+    review_maintenance_slots: Arc<tokio::sync::Semaphore>,
+}
+
+struct ReviewMaintenanceRescheduler<'a> {
+    executor: &'a LocalToolExecutor,
+    repository_path: PathBuf,
+    armed: bool,
+}
+
+impl ReviewMaintenanceRescheduler<'_> {
+    fn schedule(mut self) {
+        self.executor
+            .schedule_review_repository_maintenance(&self.repository_path);
+        self.armed = false;
+    }
+}
+
+impl Drop for ReviewMaintenanceRescheduler<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.executor
+                .schedule_review_repository_maintenance(&self.repository_path);
+        }
+    }
 }
 
 impl Default for LocalToolExecutor {
@@ -1779,6 +1804,9 @@ impl LocalToolExecutor {
             managed_background: managed_background::ManagedBackgroundTasks::default(),
             hashline_failures: Mutex::new(HashMap::new()),
             review_repository_locks: Mutex::new(HashMap::new()),
+            review_maintenance_slots: Arc::new(tokio::sync::Semaphore::new(
+                REVIEW_MAINTENANCE_CONCURRENCY,
+            )),
         }
     }
 
@@ -1793,25 +1821,38 @@ impl LocalToolExecutor {
         lock
     }
 
-    fn review_repository_foreground_lock(&self, path: &Path) -> Arc<tokio::sync::Mutex<()>> {
+    fn review_repository_foreground_lock(
+        &self,
+        path: &Path,
+    ) -> (Arc<tokio::sync::Mutex<()>>, bool) {
         let repository_lock = self.review_repository_lock(path);
-        self.managed_background
+        let maintenance_preempted = self
+            .managed_background
             .preempt(&review_repository_maintenance_key(path));
-        repository_lock
+        (repository_lock, maintenance_preempted)
     }
 
     fn schedule_review_repository_maintenance(&self, repository_path: &Path) {
         let repository_path = repository_path.to_path_buf();
         let repository_lock = self.review_repository_lock(&repository_path);
         let key = review_repository_maintenance_key(&repository_path);
+        let maintenance_slots = self.review_maintenance_slots.clone();
         self.managed_background.schedule(key, move |cancel| {
             let repository_path = repository_path.clone();
             let repository_lock = repository_lock.clone();
+            let maintenance_slots = maintenance_slots.clone();
             async move {
                 let repository_guard = tokio::select! {
                     biased;
                     _ = cancel.cancelled() => return,
                     guard = repository_lock.lock_owned() => guard,
+                };
+                let _maintenance_slot = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return,
+                    permit = maintenance_slots.acquire_owned() => {
+                        permit.expect("review maintenance semaphore remains open")
+                    },
                 };
                 let result = run_review_git_with_timeout(
                     &repository_path,
@@ -3013,7 +3054,13 @@ impl ToolExecutor for LocalToolExecutor {
             .map_err(|error| format!("resolving review root: {error}"))?;
         let requested_repository_path = managed_root.join(owner).join(repository);
         let repository_path = review_repository_identity(&requested_repository_path)?;
-        let repository_lock = self.review_repository_foreground_lock(&repository_path);
+        let (repository_lock, maintenance_preempted) =
+            self.review_repository_foreground_lock(&repository_path);
+        let maintenance_rescheduler = ReviewMaintenanceRescheduler {
+            executor: self,
+            repository_path: repository_path.clone(),
+            armed: maintenance_preempted,
+        };
         let mut repository_guard = tokio::select! {
             biased;
             _ = request.cancel.cancelled() => {
@@ -3217,7 +3264,7 @@ impl ToolExecutor for LocalToolExecutor {
                 );
             }
         }
-        self.schedule_review_repository_maintenance(&repository_path);
+        maintenance_rescheduler.schedule();
         Ok(repository_path)
     }
 
@@ -4044,6 +4091,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn review_maintenance_is_globally_concurrency_limited() {
+        let first_repository = tempfile::tempdir().unwrap();
+        let second_repository = tempfile::tempdir().unwrap();
+        for repository in [&first_repository, &second_repository] {
+            run_review_git(
+                repository.path(),
+                "",
+                vec!["init".into(), "--template=".into()],
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        }
+        let executor = LocalToolExecutor::default();
+        let held_slot = executor
+            .review_maintenance_slots
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+        let first_lock = executor.review_repository_lock(first_repository.path());
+        let second_lock = executor.review_repository_lock(second_repository.path());
+        let first_key = review_repository_maintenance_key(first_repository.path());
+        let second_key = review_repository_maintenance_key(second_repository.path());
+
+        executor.schedule_review_repository_maintenance(first_repository.path());
+        executor.schedule_review_repository_maintenance(second_repository.path());
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while first_lock.try_lock().is_ok() || second_lock.try_lock().is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("maintenance tasks did not reach the shared concurrency gate");
+        assert_eq!(executor.review_maintenance_slots.available_permits(), 0);
+
+        drop(held_slot);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while executor.managed_background.is_running(&first_key)
+                || executor.managed_background.is_running(&second_key)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
     async fn foreground_review_work_preempts_repository_maintenance() {
         let repository = tempfile::tempdir().unwrap();
         let executor = LocalToolExecutor::default();
@@ -4067,7 +4163,14 @@ mod tests {
         );
         acquired.acquire().await.unwrap().forget();
 
-        let foreground_lock = executor.review_repository_foreground_lock(repository.path());
+        let (foreground_lock, maintenance_preempted) =
+            executor.review_repository_foreground_lock(repository.path());
+        assert!(maintenance_preempted);
+        let maintenance_rescheduler = ReviewMaintenanceRescheduler {
+            executor: &executor,
+            repository_path: repository.path().to_path_buf(),
+            armed: maintenance_preempted,
+        };
         let foreground_guard = tokio::time::timeout(
             std::time::Duration::from_secs(2),
             foreground_lock.lock_owned(),
@@ -4075,7 +4178,20 @@ mod tests {
         .await
         .expect("foreground work should cancel maintenance and acquire its repository lock");
         assert!(!executor.managed_background.is_running(&key));
+
+        maintenance_rescheduler.schedule();
+        assert!(
+            executor.managed_background.is_running(&key),
+            "preempted maintenance was not rescheduled"
+        );
         drop(foreground_guard);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while executor.managed_background.is_running(&key) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
     }
 
     #[cfg(unix)]
