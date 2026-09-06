@@ -641,6 +641,14 @@ fn session_branch_name(title: &str, session_id: &str, derive_from_session_title:
     }
 }
 
+fn should_replay_session_branch_rename(
+    pending: &SessionBranchRenameIntent,
+    persisted_title: &str,
+    requested_title: &str,
+) -> bool {
+    persisted_title == pending.title && requested_title == pending.title
+}
+
 async fn flush_backend_event_batch(
     store: &Store,
     scope: &Scope,
@@ -11928,7 +11936,7 @@ impl Engine {
         let _execution = self.tool_execution_lock(session_id).write_owned().await;
         let mut session = self.get_session(session_id)?;
         if let Some(pending) = self.store.session_branch_rename_intent(session_id)? {
-            if session.title == pending.title {
+            if should_replay_session_branch_rename(&pending, &session.title, title) {
                 let rename = SessionBranchRename {
                     managed_root: git::worktree_dir(&self.data_dir, ""),
                     worktree: PathBuf::from(&session.worktree_path),
@@ -11945,6 +11953,9 @@ impl Engine {
                 )?;
                 session = self.get_session(session_id)?;
             } else {
+                // A new title supersedes a failed rename. Do not make users
+                // repair an obsolete branch target before they can choose a
+                // different one; staging below atomically replaces the intent.
                 self.store.clear_session_branch_rename_intent(session_id)?;
             }
         }
@@ -21656,6 +21667,27 @@ fn expand_provider_template(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_new_title_supersedes_a_failed_branch_rename() {
+        let pending = SessionBranchRenameIntent {
+            session_id: "se_pending".into(),
+            old_branch: "trouve/old".into(),
+            new_branch: "trouve/conflicting".into(),
+            title: "Conflicting Title".into(),
+        };
+
+        assert!(should_replay_session_branch_rename(
+            &pending,
+            "Conflicting Title",
+            "Conflicting Title",
+        ));
+        assert!(!should_replay_session_branch_rename(
+            &pending,
+            "Conflicting Title",
+            "Replacement Title",
+        ));
+    }
 
     #[test]
     fn dispatched_background_activity_is_not_a_user_message() {

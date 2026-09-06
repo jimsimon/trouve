@@ -20030,6 +20030,17 @@ mod tests {
             store.session_branch_rename_intents().unwrap(),
             vec![intent.clone()]
         );
+        let replacement = SessionBranchRenameIntent {
+            new_branch: "trouve/replacement".into(),
+            title: "Replacement Title".into(),
+            ..intent.clone()
+        };
+        store.stage_session_branch_rename(&replacement).unwrap();
+        assert_eq!(
+            store.session_branch_rename_intents().unwrap(),
+            vec![replacement]
+        );
+        store.stage_session_branch_rename(&intent).unwrap();
         store
             .update_session(&session.id, Some("Manual Rename"), None)
             .unwrap();
