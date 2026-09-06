@@ -957,13 +957,56 @@ struct RuntimeState {
     rate_limit_remaining: Option<u64>,
     rate_limit_reset_at: Option<DateTime<Utc>>,
     checks_write_configured: bool,
+    /// The Contents permission the App *declares* (`/app` metadata). An
+    /// installation only gains a newly declared permission once its owner
+    /// accepts the update, so this is the fallback for installations
+    /// without an observation of their own.
+    contents_write_configured: bool,
+    /// The Contents permission each installation was *observed* to hold:
+    /// positive and negative from the permissions its token reports, and
+    /// negative when GitHub rejects a review-thread mutation as forbidden.
+    /// Observations override the declared permission for that installation.
+    contents_write_by_installation: HashMap<u64, bool>,
     check_run_webhook_configured: bool,
 }
 
 impl RuntimeState {
-    fn set_app_health(&mut self, health: GithubAppHealth) {
+    /// Returns true when the declared Contents permission went from
+    /// missing to granted, so the caller can re-arm collapses it blocked.
+    fn set_app_health(&mut self, health: GithubAppHealth) -> bool {
+        let contents_granted = !self.contents_write_configured && health.contents_write_configured;
         self.checks_write_configured = health.checks_write_configured;
+        self.contents_write_configured = health.contents_write_configured;
         self.check_run_webhook_configured = health.check_run_webhook_configured;
+        contents_granted
+    }
+
+    /// Whether review-thread mutations through `installation_id` are
+    /// expected to succeed: the installation's own observation when there
+    /// is one, otherwise the App's declared permission.
+    fn contents_write_permitted(&self, installation_id: Option<u64>) -> bool {
+        installation_id
+            .and_then(|id| self.contents_write_by_installation.get(&id).copied())
+            .unwrap_or(self.contents_write_configured)
+    }
+
+    /// Records an installation's effective Contents permission. Returns
+    /// true when the installation went from blocked to permitted.
+    fn observe_installation_contents_write(&mut self, installation_id: u64, write: bool) -> bool {
+        let was_permitted = self.contents_write_permitted(Some(installation_id));
+        self.contents_write_by_installation
+            .insert(installation_id, write);
+        !was_permitted && write
+    }
+
+    /// The health reported to operators: the declared permission, unless
+    /// an installation has been observed without it.
+    fn contents_write_healthy(&self) -> bool {
+        self.contents_write_configured
+            && self
+                .contents_write_by_installation
+                .values()
+                .all(|write| *write)
     }
 }
 
@@ -1059,19 +1102,24 @@ struct AppInfo {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct GithubAppHealth {
     checks_write_configured: bool,
+    contents_write_configured: bool,
     check_run_webhook_configured: bool,
 }
 
 impl From<&AppInfo> for GithubAppHealth {
     fn from(app: &AppInfo) -> Self {
         Self {
-            checks_write_configured: app
-                .permissions
-                .get("checks")
-                .is_some_and(|permission| permission == "write"),
+            checks_write_configured: permission_is_write(&app.permissions, "checks"),
+            contents_write_configured: permission_is_write(&app.permissions, "contents"),
             check_run_webhook_configured: app.events.iter().any(|event| event == "check_run"),
         }
     }
+}
+
+fn permission_is_write(permissions: &HashMap<String, String>, name: &str) -> bool {
+    permissions
+        .get(name)
+        .is_some_and(|permission| permission == "write")
 }
 
 #[derive(Deserialize)]
@@ -2250,6 +2298,14 @@ impl GithubApi {
         })
     }
 
+    /// The installation whose token authenticates this client, when it is
+    /// an installation client rather than the App (JWT) client.
+    fn installation_id(&self) -> Option<u64> {
+        self.cache_scope
+            .strip_prefix("installation:")
+            .and_then(|id| id.parse().ok())
+    }
+
     fn request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
         self.http
             .request(method, format!("{}{path}", self.base_url))
@@ -2776,11 +2832,16 @@ impl Engine {
         self.code_review.installation_tokens.lock().await.clear();
         self.code_review.rest_cache.lock().unwrap().clear();
         self.record_review_rate(rate);
-        {
+        let contents_granted = {
             let mut state = self.code_review.state.lock().unwrap();
             state.installation_count = 0;
             state.last_error.clear();
-            state.set_app_health(app_health);
+            // Observations belong to the previous App's installations.
+            state.contents_write_by_installation.clear();
+            state.set_app_health(app_health)
+        };
+        if contents_granted {
+            self.revive_permission_blocked_thread_collapses(None);
         }
         self.code_review.poll_wake.notify_one();
         self.emit_code_review_updated(None)?;
@@ -2808,6 +2869,7 @@ impl Engine {
                 .unwrap_or_default(),
             webhook_configured,
             checks_write_configured: state.checks_write_configured,
+            contents_write_configured: state.contents_write_healthy(),
             check_run_webhook_configured: state.check_run_webhook_configured,
             installation_count: state.installation_count,
             last_poll_at: state.last_poll_at,
@@ -3918,16 +3980,26 @@ impl Engine {
             )
             .await?;
         self.record_review_rate(rate);
-        if created
-            .permissions
-            .get("checks")
-            .is_some_and(|permission| permission == "write")
-        {
-            self.code_review
-                .state
-                .lock()
-                .unwrap()
-                .checks_write_configured = true;
+        let contents_granted = {
+            let mut state = self.code_review.state.lock().unwrap();
+            if permission_is_write(&created.permissions, "checks") {
+                state.checks_write_configured = true;
+            }
+            // The token's permissions are the installation's effective
+            // ones — authoritative in both directions, unlike the App's
+            // declared permissions, which an installation only gains once
+            // its owner accepts the update.
+            if created.permissions.is_empty() {
+                false
+            } else {
+                state.observe_installation_contents_write(
+                    installation_id,
+                    permission_is_write(&created.permissions, "contents"),
+                )
+            }
+        };
+        if contents_granted {
+            self.revive_permission_blocked_thread_collapses(Some(installation_id));
         }
         self.code_review.installation_tokens.lock().await.insert(
             installation_id,
@@ -3967,11 +4039,15 @@ impl Engine {
         {
             Ok((app, rate)) => {
                 self.record_review_rate(rate);
-                self.code_review
+                let contents_granted = self
+                    .code_review
                     .state
                     .lock()
                     .unwrap()
                     .set_app_health(GithubAppHealth::from(&app));
+                if contents_granted {
+                    self.revive_permission_blocked_thread_collapses(None);
+                }
             }
             Err(error) => {
                 had_errors = true;
@@ -9889,6 +9965,24 @@ impl Engine {
         findings: &[trouve_protocol::CodeReviewFinding],
         deadline: Instant,
     ) -> Result<()> {
+        // A known-missing Contents permission makes every mutation below a
+        // guaranteed FORBIDDEN: record the actionable error on the whole
+        // group without spending requests on listings or resetting cached
+        // thread ids that are still perfectly valid.
+        if let Err(error) = self.ensure_review_thread_mutations_permitted(api) {
+            let message = format!("{error:#}");
+            tracing::warn!(
+                repository,
+                pull_number,
+                findings = findings.len(),
+                error = message,
+                "review threads cannot be collapsed until the GitHub App permission is granted"
+            );
+            for finding in findings {
+                self.defer_thread_collapse_logged(finding, true, &message);
+            }
+            return Err(error);
+        }
         // Findings with a comment-guarded cached thread id skip the listing
         // entirely and go first: a retry after a failed mutation costs one
         // request, not a re-walk of the PR's thread pages. The listing is
@@ -9963,8 +10057,13 @@ impl Engine {
                         }
                         Err(error) => {
                             let terminal_failure = !projection_error_is_retryable(&error);
+                            let message = format!("{error:#}");
                             for remaining in &ordered[index..] {
-                                self.defer_thread_collapse_logged(remaining, terminal_failure);
+                                self.defer_thread_collapse_logged(
+                                    remaining,
+                                    terminal_failure,
+                                    &message,
+                                );
                             }
                             first_error.get_or_insert(error);
                             break;
@@ -9990,13 +10089,14 @@ impl Engine {
                 }
                 Err(error) => {
                     let terminal_failure = !projection_error_is_retryable(&error);
+                    let message = format!("{error:#}");
                     tracing::warn!(
                         finding_id = finding.id,
                         path = finding.path,
-                        error = format!("{error:#}"),
+                        error = message,
                         "collapsing a finding's review thread failed; deferred with backoff"
                     );
-                    self.defer_thread_collapse_logged(finding, terminal_failure);
+                    self.defer_thread_collapse_logged(finding, terminal_failure, &message);
                     first_error.get_or_insert(error);
                 }
             }
@@ -10067,10 +10167,11 @@ impl Engine {
         &self,
         finding: &trouve_protocol::CodeReviewFinding,
         terminal_failure: bool,
+        error: &str,
     ) {
         match self
             .store
-            .defer_code_review_thread_collapse(&finding.id, terminal_failure)
+            .defer_code_review_thread_collapse(&finding.id, terminal_failure, error)
         {
             Ok(true) => tracing::warn!(
                 finding_id = finding.id,
@@ -10238,15 +10339,16 @@ impl Engine {
             Ok(Ok(api)) => api,
             Ok(Err(error)) => {
                 let terminal_failure = !projection_error_is_retryable(&error);
+                let message = format!("{error:#}");
                 tracing::warn!(
                     repository,
                     pull_number,
-                    error = format!("{error:#}"),
+                    error = message,
                     "failed to build a GitHub client for pending thread collapses; \
                      the group was deferred"
                 );
                 for finding in findings {
-                    self.defer_thread_collapse_logged(finding, terminal_failure);
+                    self.defer_thread_collapse_logged(finding, terminal_failure, &message);
                 }
                 return;
             }
@@ -10259,7 +10361,11 @@ impl Engine {
                      the group was deferred"
                 );
                 for finding in findings {
-                    self.defer_thread_collapse_logged(finding, false);
+                    self.defer_thread_collapse_logged(
+                        finding,
+                        false,
+                        "building a GitHub client for the thread collapse timed out",
+                    );
                 }
                 return;
             }
@@ -11827,7 +11933,68 @@ impl Engine {
         }
     }
 
+    /// GitHub rejects the review-thread resolve/unresolve mutations for
+    /// installation tokens without `contents: write` ("Resource not
+    /// accessible by integration"), even though they only touch pull-request
+    /// data. Once the installation behind `api` has shown the permission is
+    /// missing — through its token's permissions or a rejected mutation —
+    /// fail fast with the same terminal, actionable message the Checks gate
+    /// uses instead of spending every retry on a guaranteed FORBIDDEN.
+    fn ensure_review_thread_mutations_permitted(&self, api: &GithubApi) -> Result<()> {
+        let state = self.code_review.state.lock().unwrap();
+        if state.installation_count > 0 && !state.contents_write_permitted(api.installation_id()) {
+            bail!("GitHub App needs repository permission: Contents (read and write)");
+        }
+        Ok(())
+    }
+
+    /// A review-thread mutation GitHub rejected as forbidden proves the
+    /// installation lacks Contents write, whatever the App declares or an
+    /// earlier token reported: record it so the gate above stops the next
+    /// attempts locally until a fresh token or the App metadata shows the
+    /// permission granted.
+    fn record_review_thread_mutation_error(&self, api: &GithubApi, error: &str) {
+        let lowered = error.to_ascii_lowercase();
+        let forbidden =
+            lowered.contains("forbidden") || lowered.contains("not accessible by integration");
+        if let Some(installation_id) = api.installation_id()
+            && forbidden
+        {
+            self.code_review
+                .state
+                .lock()
+                .unwrap()
+                .observe_installation_contents_write(installation_id, false);
+        }
+    }
+
+    /// Re-arms the thread collapses the Contents permission blocked —
+    /// backed off or abandoned — so the worker retries them now that the
+    /// permission was observed granted, for one installation or all.
+    fn revive_permission_blocked_thread_collapses(&self, installation_id: Option<u64>) {
+        match self
+            .store
+            .revive_permission_blocked_code_review_thread_collapses(installation_id)
+        {
+            Ok(0) => {}
+            Ok(revived) => {
+                tracing::info!(
+                    installation_id,
+                    revived,
+                    "Contents write was granted; blocked review thread collapses were requeued"
+                );
+                self.code_review.poll_wake.notify_one();
+            }
+            Err(error) => tracing::warn!(
+                installation_id,
+                error = format!("{error:#}"),
+                "failed to requeue review thread collapses after the Contents permission was granted"
+            ),
+        }
+    }
+
     async fn collapse_review_thread(&self, api: &GithubApi, thread_id: &str) -> Result<()> {
+        self.ensure_review_thread_mutations_permitted(api)?;
         let mutation = r#"
           mutation ResolveReviewThread($threadId: ID!) {
             resolveReviewThread(input: {threadId: $threadId}) {
@@ -11846,12 +12013,14 @@ impl Engine {
             .await?;
         self.record_review_rate(rate);
         if let Some(error) = github_graphql_error_message(&response, "resolving review thread") {
+            self.record_review_thread_mutation_error(api, &error);
             bail!(error);
         }
         Ok(())
     }
 
     async fn reopen_review_thread(&self, api: &GithubApi, thread_id: &str) -> Result<()> {
+        self.ensure_review_thread_mutations_permitted(api)?;
         let mutation = r#"
           mutation UnresolveReviewThread($threadId: ID!) {
             unresolveReviewThread(input: {threadId: $threadId}) {
@@ -11870,6 +12039,7 @@ impl Engine {
             .await?;
         self.record_review_rate(rate);
         if let Some(error) = github_graphql_error_message(&response, "reopening review thread") {
+            self.record_review_thread_mutation_error(api, &error);
             bail!(error);
         }
         Ok(())
@@ -21058,6 +21228,7 @@ mod tests {
             observed_head: "base".into(),
             resolved_head: String::new(),
             resolved_by_job_id: String::new(),
+            thread_collapse: None,
         }
     }
 
@@ -22105,6 +22276,7 @@ rename to src/new.rs
             observed_head: String::new(),
             resolved_head: String::new(),
             resolved_by_job_id: String::new(),
+            thread_collapse: None,
         };
         assert!(!finding.is_publishable());
         let mut verified = finding.clone();
@@ -29106,7 +29278,7 @@ rename to src/new.rs
         // Seed one real failure. Another failure defer would now schedule a
         // two-minute retry; a budget requeue must remain due after one minute.
         store
-            .defer_code_review_thread_collapse(&finding.id, false)
+            .defer_code_review_thread_collapse(&finding.id, false, "transient")
             .unwrap();
         let data = tempfile::tempdir().unwrap();
         let engine = Engine::new(
@@ -29154,6 +29326,305 @@ rename to src/new.rs
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn missing_contents_write_permission_fails_collapse_fast_with_an_actionable_error() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let previous_job = enqueue_test_review_job(&store, "acme/widgets#42:contents-permission");
+        store
+            .save_code_review_result(
+                &previous_job.id,
+                "summary",
+                "prompt",
+                1,
+                &[NewCodeReviewFinding {
+                    path: "src/lib.rs".into(),
+                    line: 3,
+                    side: "RIGHT".into(),
+                    severity: "medium".into(),
+                    confidence: "high".into(),
+                    title: "Test issue".into(),
+                    body: "finding".into(),
+                    prompt_for_agents: "fix it".into(),
+                    sources: Vec::new(),
+                }],
+                &[],
+            )
+            .unwrap();
+        let finding = store
+            .code_review_findings(&previous_job.id)
+            .unwrap()
+            .remove(0);
+        store
+            .update_code_review_finding_publication(
+                &finding.id,
+                Some(9001),
+                "https://github.com/acme/widgets/pull/42",
+                Some("T1"),
+            )
+            .unwrap();
+        store
+            .resolve_code_review_finding(
+                &finding.id,
+                "fixed",
+                &previous_job.head_sha,
+                &previous_job.id,
+            )
+            .unwrap();
+        let finding = store
+            .code_review_findings(&previous_job.id)
+            .unwrap()
+            .remove(0);
+        assert_eq!(finding.github_thread_id.as_deref(), Some("T1"));
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(
+            store,
+            data.path().to_path_buf(),
+            &crate::config::Config::default(),
+        );
+        // An installation token has been minted (installations are known)
+        // and it did not carry `contents: write`.
+        {
+            let mut state = engine.code_review.state.lock().unwrap();
+            state.installation_count = 1;
+            state.contents_write_configured = false;
+        }
+        // No GitHub request may be made: the scripted server has no
+        // responses and would panic on a connection.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = scripted_github_server(listener, Vec::new());
+        let api = GithubApi::with_base_url(
+            "Bearer token".into(),
+            format!("http://{address}"),
+            "installation:7".into(),
+        )
+        .unwrap();
+
+        let error = engine
+            .resolve_review_threads(&api, "acme/widgets", 42, std::slice::from_ref(&finding))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("Contents (read and write)"),
+            "{error:#}"
+        );
+        assert!(!projection_error_is_retryable(&error));
+        await_mock_server(server).await;
+
+        let failed = engine
+            .store
+            .code_review_findings(&previous_job.id)
+            .unwrap()
+            .remove(0);
+        // The gate ran before any mutation, so the still-valid cached thread
+        // id survives for the retry.
+        assert_eq!(failed.github_thread_id.as_deref(), Some("T1"));
+        let recorded = failed
+            .thread_collapse
+            .expect("the failed collapse must be recorded on the finding");
+        assert!(recorded.pending);
+        assert_eq!(recorded.attempts, 1);
+        assert!(
+            recorded
+                .last_error
+                .contains("GitHub App needs repository permission: Contents (read and write)"),
+            "{}",
+            recorded.last_error
+        );
+        // Once the permission is granted the same finding collapses.
+        engine
+            .code_review
+            .state
+            .lock()
+            .unwrap()
+            .contents_write_configured = true;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = scripted_github_server(
+            listener,
+            vec![
+                r#"{"data":{"resolveReviewThread":{"thread":{"id":"T1","isResolved":true}}}}"#
+                    .into(),
+                r#"{"id": 1}"#.into(),
+            ],
+        );
+        let api = GithubApi::with_base_url(
+            "Bearer token".into(),
+            format!("http://{address}"),
+            "installation:7".into(),
+        )
+        .unwrap();
+        engine
+            .resolve_review_threads(&api, "acme/widgets", 42, std::slice::from_ref(&finding))
+            .await
+            .unwrap();
+        await_mock_server(server).await;
+        assert!(
+            engine
+                .store
+                .code_review_findings(&previous_job.id)
+                .unwrap()
+                .remove(0)
+                .thread_collapse
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn installation_observations_override_the_declared_contents_permission() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let previous_job = enqueue_test_review_job(&store, "acme/widgets#42:contents-observed");
+        store
+            .save_code_review_result(
+                &previous_job.id,
+                "summary",
+                "prompt",
+                1,
+                &[NewCodeReviewFinding {
+                    path: "src/lib.rs".into(),
+                    line: 3,
+                    side: "RIGHT".into(),
+                    severity: "medium".into(),
+                    confidence: "high".into(),
+                    title: "Test issue".into(),
+                    body: "finding".into(),
+                    prompt_for_agents: "fix it".into(),
+                    sources: Vec::new(),
+                }],
+                &[],
+            )
+            .unwrap();
+        let finding = store
+            .code_review_findings(&previous_job.id)
+            .unwrap()
+            .remove(0);
+        store
+            .update_code_review_finding_publication(
+                &finding.id,
+                Some(9001),
+                "https://github.com/acme/widgets/pull/42",
+                Some("T1"),
+            )
+            .unwrap();
+        store
+            .resolve_code_review_finding(
+                &finding.id,
+                "fixed",
+                &previous_job.head_sha,
+                &previous_job.id,
+            )
+            .unwrap();
+        let finding = store
+            .code_review_findings(&previous_job.id)
+            .unwrap()
+            .remove(0);
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(
+            store,
+            data.path().to_path_buf(),
+            &crate::config::Config::default(),
+        );
+        // The App declares Contents write, but this installation has not
+        // accepted the permission update: GitHub rejects the mutation.
+        {
+            let mut state = engine.code_review.state.lock().unwrap();
+            state.installation_count = 1;
+            state.contents_write_configured = true;
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = scripted_github_server(
+            listener,
+            vec![
+                r#"{"errors":[{"type":"FORBIDDEN","message":"Resource not accessible by integration"}]}"#
+                    .into(),
+            ],
+        );
+        let api = GithubApi::with_base_url(
+            "Bearer token".into(),
+            format!("http://{address}"),
+            "installation:7".into(),
+        )
+        .unwrap();
+        let error = engine
+            .resolve_review_threads(&api, "acme/widgets", 42, std::slice::from_ref(&finding))
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("FORBIDDEN"), "{error:#}");
+        await_mock_server(server).await;
+        // The rejection is recorded against the installation, overriding
+        // the declared permission for the gate and for reported health.
+        {
+            let state = engine.code_review.state.lock().unwrap();
+            assert!(state.contents_write_configured);
+            assert!(!state.contents_write_permitted(Some(7)));
+            assert!(state.contents_write_permitted(Some(8)));
+            assert!(!state.contents_write_healthy());
+        }
+
+        // The next attempt fails locally: the scripted server has no
+        // responses and would panic on a connection.
+        let finding = engine
+            .store
+            .code_review_findings(&previous_job.id)
+            .unwrap()
+            .remove(0);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = scripted_github_server(listener, Vec::new());
+        let api = GithubApi::with_base_url(
+            "Bearer token".into(),
+            format!("http://{address}"),
+            "installation:7".into(),
+        )
+        .unwrap();
+        let error = engine
+            .resolve_review_threads(&api, "acme/widgets", 42, std::slice::from_ref(&finding))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("Contents (read and write)"),
+            "{error:#}"
+        );
+        await_mock_server(server).await;
+        let blocked = engine
+            .store
+            .code_review_findings(&previous_job.id)
+            .unwrap()
+            .remove(0)
+            .thread_collapse
+            .unwrap();
+        assert!(blocked.pending);
+        assert_eq!(blocked.attempts, 2);
+        assert!(blocked.next_attempt_at.is_some());
+
+        // A fresh token showing the permission accepted flips the
+        // installation back and requeues the blocked collapse immediately.
+        let granted = engine
+            .code_review
+            .state
+            .lock()
+            .unwrap()
+            .observe_installation_contents_write(7, true);
+        assert!(granted);
+        engine.revive_permission_blocked_thread_collapses(Some(7));
+        {
+            let state = engine.code_review.state.lock().unwrap();
+            assert!(state.contents_write_permitted(Some(7)));
+            assert!(state.contents_write_healthy());
+        }
+        let due = engine
+            .store
+            .pending_code_review_thread_collapses(Utc::now(), 10, &[])
+            .unwrap();
+        assert_eq!(due.len(), 1);
+        let revived = due[0].3.thread_collapse.as_ref().unwrap();
+        assert!(revived.pending);
+        assert_eq!(revived.attempts, 0);
+        assert!(revived.next_attempt_at.is_none());
+        assert!(revived.last_error.is_empty());
     }
 
     #[tokio::test]
@@ -29463,6 +29934,7 @@ rename to src/new.rs
                 observed_head: String::new(),
                 resolved_head: String::new(),
                 resolved_by_job_id: String::new(),
+                thread_collapse: None,
             };
         let outside = finding("rvf_outside", true, "Outside issue");
         let inline = finding("rvf_inline", false, "Inline issue");
@@ -30571,25 +31043,49 @@ rename to src/new.rs
     fn github_app_health_tracks_current_permissions_and_events() {
         let configured: AppInfo = serde_json::from_value(serde_json::json!({
             "slug": "trouve-ai",
-            "permissions": {"checks": "write"},
+            "permissions": {"checks": "write", "contents": "write"},
             "events": ["check_run", "pull_request"]
         }))
         .unwrap();
         let missing: AppInfo = serde_json::from_value(serde_json::json!({
             "slug": "trouve-ai",
-            "permissions": {"checks": "read"},
+            "permissions": {"checks": "read", "contents": "read"},
             "events": ["pull_request"]
         }))
         .unwrap();
         let mut state = RuntimeState::default();
 
-        state.set_app_health(GithubAppHealth::from(&configured));
+        // Only the false-to-true Contents transition reports a grant.
+        assert!(state.set_app_health(GithubAppHealth::from(&configured)));
         assert!(state.checks_write_configured);
+        assert!(state.contents_write_configured);
         assert!(state.check_run_webhook_configured);
+        assert!(!state.set_app_health(GithubAppHealth::from(&configured)));
 
-        state.set_app_health(GithubAppHealth::from(&missing));
+        assert!(!state.set_app_health(GithubAppHealth::from(&missing)));
         assert!(!state.checks_write_configured);
+        assert!(!state.contents_write_configured);
         assert!(!state.check_run_webhook_configured);
+
+        // Installation observations override the declared permission for
+        // that installation only, and any negative one degrades health.
+        assert!(state.set_app_health(GithubAppHealth::from(&configured)));
+        assert!(state.contents_write_permitted(Some(7)));
+        assert!(!state.observe_installation_contents_write(7, false));
+        assert!(!state.contents_write_permitted(Some(7)));
+        assert!(state.contents_write_permitted(Some(8)));
+        assert!(state.contents_write_permitted(None));
+        assert!(!state.contents_write_healthy());
+        assert!(state.observe_installation_contents_write(7, true));
+        assert!(!state.observe_installation_contents_write(7, true));
+        assert!(state.contents_write_healthy());
+        // A declared permission the installation is known to hold still
+        // counts once the App stops declaring it — only until a fresh
+        // token says otherwise.
+        assert!(!state.set_app_health(GithubAppHealth::from(&missing)));
+        assert!(state.contents_write_permitted(Some(7)));
+        assert!(!state.contents_write_permitted(Some(8)));
+        assert!(!state.contents_write_healthy());
     }
 
     #[test]
@@ -32259,6 +32755,7 @@ rename to src/new.rs
             observed_head: String::new(),
             resolved_head: String::new(),
             resolved_by_job_id: String::new(),
+            thread_collapse: None,
             outside_diff: true,
         };
         let store = crate::store::Store::open_in_memory().unwrap();
@@ -32353,6 +32850,7 @@ rename to src/new.rs
             observed_head: String::new(),
             resolved_head: String::new(),
             resolved_by_job_id: String::new(),
+            thread_collapse: None,
             outside_diff: true,
         };
         let findings = (0..40).map(finding).collect::<Vec<_>>();

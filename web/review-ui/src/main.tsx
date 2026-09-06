@@ -1326,6 +1326,18 @@ function JobDetailPane({
       {finding.github_publication_status === "grouped_by_theme" && (
         <small>Retained in Trouve · Represented by the shared root-cause comment on GitHub</small>
       )}
+      {finding.thread_collapse?.last_error && (
+        <small class="warning">
+          {finding.thread_collapse.pending
+            ? `GitHub thread not resolved yet (${finding.thread_collapse.attempts ?? 0} failed attempt(s)${
+                finding.thread_collapse.next_attempt_at
+                  ? `, retrying ${new Date(finding.thread_collapse.next_attempt_at).toLocaleString()}`
+                  : ""
+              })`
+            : "GitHub thread left unresolved after repeated failures"}
+          : {finding.thread_collapse.last_error}
+        </small>
+      )}
       {finding.evidence?.execution_path && (
         <details>
           <summary>Verification evidence</summary>
@@ -3062,13 +3074,29 @@ function StatsPage({ repositories }: { repositories: Repository[] }) {
                     stats?.thread_collapse_backlog?.oldest_pending_minutes != null
                       ? ` (oldest ${stats.thread_collapse_backlog.oldest_pending_minutes}m)`
                       : ""
+                  }${
+                    (stats?.thread_collapse_backlog?.failing ?? 0) > 0
+                      ? `, ${stats?.thread_collapse_backlog?.failing} failing`
+                      : ""
                   }`}
                   value={stats?.thread_collapse_backlog?.pending ?? 0}
                   color="amber"
                 />
               )}
+              {(stats?.thread_collapse_backlog?.abandoned ?? 0) > 0 && (
+                <Metric
+                  label="Thread resolves abandoned"
+                  value={stats?.thread_collapse_backlog?.abandoned ?? 0}
+                  color="red"
+                />
+              )}
               <Metric label="Max rounds to clean" value={churn.max_rounds_to_clean} color="amber" />
             </div>
+            {stats?.thread_collapse_backlog?.last_error && (
+              <p class="warning">
+                Latest thread resolve failure: {stats.thread_collapse_backlog.last_error}
+              </p>
+            )}
           </section>
           <div class="chart-grid">
             <StatsChart
@@ -3573,6 +3601,11 @@ function GithubAppSettings({
       <div class="health-list">
         <Health ok={app.configured} label="App credentials" detail={app.bot_login || "Not configured"} />
         <Health ok={app.checks_write_configured} label="Checks permission" detail="Read and write required to show a PR check" />
+        <Health
+          ok={app.contents_write_configured === true}
+          label="Contents permission"
+          detail="Read and write required for GitHub to let the bot resolve finding threads"
+        />
         <Health ok={app.webhook_configured} label="Webhook secret" detail="Optional with polling; secures webhook delivery" />
         <Health ok={app.check_run_webhook_configured} optional label="check_run webhook" detail="Optional; enables GitHub Re-run actions" />
       </div>

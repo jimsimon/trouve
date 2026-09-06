@@ -74,7 +74,16 @@ Use these common settings:
 - **Enable Device Flow**: disabled.
 - Setup URL: blank (or the dashboard URL as an optional convenience).
 - **Redirect on update**: disabled.
-- Repository permission **Contents**: Read-only.
+- Repository permission **Checks**: Read and write, so trouve can publish a
+  Check Run per review.
+- Repository permission **Contents**: Read and write. Reading is enough to
+  fetch the branch, but GitHub rejects the `resolveReviewThread` and
+  `unresolveReviewThread` GraphQL mutations for installation tokens without
+  Contents write access (`FORBIDDEN: Resource not accessible by integration`),
+  so with Read-only the bot cannot collapse the threads of fixed findings.
+  The dashboard reports **Contents permission** and each affected finding's
+  last collapse error until the permission is granted and the installation
+  has accepted the update.
 - Repository permission **Issues**: Read-only. GitHub requires this permission
   to deliver `issue_comment` events, including commands written in the pull
   request conversation.
@@ -257,7 +266,12 @@ can resolve one as won't-fix with its displayed `@trouve-ai resolve` command.
 Resolved entries move into a collapsed **Resolved as won't-fix** disclosure,
 where struck-through issue text, an explicit disposition, and an `unresolve`
 command distinguish that decision from a code fix. Findings fixed in code
-leave the list automatically on the next review round.
+leave the list automatically on the next review round, and the bot resolves
+their inline GitHub threads with an explanatory reply. Thread resolution
+retries with backoff; a thread that stays open shows its last failure on the
+finding in the dashboard and the stats page counts failing and abandoned
+entries, the usual cause being a missing **Contents: Read and write**
+permission.
 
 Later reviews receive bounded pull-request history: unresolved and dismissed
 findings, root-cause themes and recurrence evidence, prior candidate
