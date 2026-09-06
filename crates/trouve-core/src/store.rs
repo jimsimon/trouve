@@ -22,6 +22,7 @@ use trouve_protocol::{
 use trouve_thread_view::{MaterializedThreadItem, ThreadProjection};
 
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const CODE_REVIEW_CARRIED_ANCHOR_CURSOR_MARKER: &str = ":carried-anchor-continuation:";
 
 // Version 2 retains server-measured per-tool execution durations. Treat the
 // projection as a rebuildable cache so existing databases are upgraded by
@@ -10233,6 +10234,22 @@ impl Store {
             .optional()?)
     }
 
+    /// Internal idempotency metadata for one review job. Continuation jobs
+    /// encode their bounded legacy-anchor cursor here so it survives process
+    /// restarts without widening the public protocol.
+    pub(crate) fn code_review_job_dedupe_key(&self, id: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT dedupe_key FROM code_review_jobs WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
     pub fn code_review_job_exists(&self, dedupe_key: &str) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         Ok(conn
@@ -14953,8 +14970,11 @@ impl Store {
                     {
                         let mut request = request.clone();
                         request.dedupe_key = format!(
-                            "{}#{}:{}:carried-anchor:{path}:{line}:{id}",
-                            record.job.repository, record.job.pull_number, record.job.head_sha
+                            "{}#{}:{}:carried-anchor:{path}:{line}:{id}:{}",
+                            record.job.repository,
+                            record.job.pull_number,
+                            record.job.head_sha,
+                            request.dedupe_key,
                         );
                         continuation_job = Self::enqueue_code_review_job_conn(&tx, &request)?;
                     }
@@ -16105,13 +16125,17 @@ impl Store {
                 params![repository, pull_number as i64, head_sha, id],
                 |row| row.get(0),
             )?;
-            if let Some((path, line)) = next_anchor
-                && !another_continuation_active
-            {
+            let legacy_page_pending = request
+                .dedupe_key
+                .contains(CODE_REVIEW_CARRIED_ANCHOR_CURSOR_MARKER);
+            if !another_continuation_active && (next_anchor.is_some() || legacy_page_pending) {
                 let mut request = request.clone();
-                request.dedupe_key = format!(
-                    "{repository}#{pull_number}:{head_sha}:carried-anchor:{path}:{line}:{id}"
-                );
+                if let Some((path, line)) = next_anchor {
+                    request.dedupe_key = format!(
+                        "{repository}#{pull_number}:{head_sha}:carried-anchor:{path}:{line}:{id}:{}",
+                        request.dedupe_key,
+                    );
+                }
                 Self::enqueue_code_review_job_conn(&tx, &request)?
             } else {
                 None
@@ -23755,6 +23779,52 @@ mod tests {
             .refresh_code_review_pull_projection_counts("acme/widgets", 42)
             .unwrap();
         assert_eq!(refreshed.as_deref(), Some(job.id.as_str()));
+    }
+
+    #[test]
+    fn legacy_carried_cursor_continues_without_object_anchor_targets() {
+        let store = Store::open_in_memory().unwrap();
+        let first = enqueue_backoff_test_job(&store);
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            first.id
+        );
+        store
+            .save_code_review_result(&first.id, "first", "", 0, &[], &[])
+            .unwrap();
+        assert!(store.claim_code_review_publication(&first.id).unwrap());
+
+        let cursor = "a".repeat(40);
+        let mut request = retry_request_for(&store, &first.id, "legacy-cursor");
+        request.trigger = "carried-anchor-continuation".into();
+        request.dedupe_key = format!(
+            "{}{}{}",
+            first.id, CODE_REVIEW_CARRIED_ANCHOR_CURSOR_MARKER, cursor
+        );
+        let expected_dedupe_key = request.dedupe_key.clone();
+        let (_, continuation) = store
+            .record_code_review_publication_with_continuation(
+                &first.id,
+                &first.repository,
+                first.pull_number,
+                &first.base_ref,
+                &first.head_sha,
+                "https://example/review/first",
+                false,
+                &[],
+                Some(&request),
+            )
+            .unwrap();
+        let continuation =
+            continuation.expect("a pending legacy page should queue without object-read targets");
+
+        assert_eq!(
+            store
+                .code_review_job_dedupe_key(&continuation.id)
+                .unwrap()
+                .as_deref(),
+            Some(expected_dedupe_key.as_str())
+        );
     }
 
     #[test]
