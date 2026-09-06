@@ -8205,7 +8205,7 @@ for line in sys.stdin:
     async fn listing_models_is_static_and_does_not_spawn_app_server() {
         let backend = CodexBackend::new("codex", Some("definitely-not-a-command".into()));
         let models = backend.list_models().await;
-        assert_eq!(models.len(), 7);
+        assert_eq!(models.len(), 8);
         assert!(backend.server.lock().await.is_none());
     }
 
@@ -8221,7 +8221,7 @@ for line in sys.stdin:
     fn trouve_catalog_owns_codex_roster_metadata_and_settings() {
         let backend = CodexBackend::new("codex", None);
         let models = backend.models();
-        assert_eq!(models.len(), 7);
+        assert_eq!(models.len(), 8);
         let sol = models
             .iter()
             .find(|model| model.id == "codex/gpt-5.6-sol")
