@@ -1583,7 +1583,18 @@ struct PublishedReview {
 #[derive(Debug)]
 struct PublishedReviewOutcome {
     url: String,
-    blocking: bool,
+    /// The GitHub review event GitHub actually accepted, after any fallback.
+    event: &'static str,
+}
+
+impl PublishedReviewOutcome {
+    /// Whether this app's earlier REQUEST_CHANGES reviews must be dismissed
+    /// explicitly. An APPROVE supersedes them on GitHub's side (a reviewer's
+    /// verdict is their latest APPROVE or REQUEST_CHANGES), so only a clean
+    /// round that had to fall back to a COMMENT leaves them standing.
+    fn needs_blocking_review_cleanup(&self) -> bool {
+        self.event == "COMMENT"
+    }
 }
 
 #[cfg(test)]
@@ -7128,7 +7139,7 @@ impl Engine {
                 &job.base_ref,
                 &job.head_sha,
                 &published_review.url,
-                !published_review.blocking,
+                published_review.needs_blocking_review_cleanup(),
                 &resolved_finding_ids,
                 continuation_request.as_ref(),
             )?;
@@ -8684,7 +8695,7 @@ impl Engine {
                                 }
                                 Ok(PublishedReviewOutcome {
                                     url: published.html_url,
-                                    blocking: event == "REQUEST_CHANGES",
+                                    event,
                                 })
                             }
                             Err(error) => {
@@ -8695,7 +8706,7 @@ impl Engine {
                                 );
                                 Ok(PublishedReviewOutcome {
                                     url: String::new(),
-                                    blocking: event == "REQUEST_CHANGES",
+                                    event,
                                 })
                             }
                         };
@@ -8729,7 +8740,7 @@ impl Engine {
                                 );
                                 return Ok(PublishedReviewOutcome {
                                     url: String::new(),
-                                    blocking: event == "REQUEST_CHANGES",
+                                    event,
                                 });
                             }
                         }
@@ -8753,7 +8764,7 @@ impl Engine {
                 }
                 return Ok(PublishedReviewOutcome {
                     url: published.html_url,
-                    blocking: event == "REQUEST_CHANGES",
+                    event,
                 });
             }
 
@@ -8943,8 +8954,9 @@ impl Engine {
         )
     }
 
-    /// Clear this app's earlier blocking verdict after the replacement clean
-    /// COMMENT has been durably recorded. The pending flag is written in the
+    /// Clear this app's earlier blocking verdict once the ledger is clean but
+    /// no APPROVE superseded it (a clean COMMENT fallback, or a gate cleared
+    /// by trusted dismissals). The pending flag is written in the
     /// publication transaction and cleared only after every dismissal
     /// succeeds, so polling can retry this cleanup after any crash or error.
     async fn sync_code_review_blocking_review_cleanup(
@@ -12163,11 +12175,16 @@ fn should_log_code_review_job_failure(status: &str, finish_transition: Option<bo
     status == "failed" && finish_transition != Some(false)
 }
 
+/// A clean round approves rather than merely commenting: alongside the Check
+/// Run, the approval is the verdict a reviewer sees in the merge box, and it
+/// supersedes this app's earlier REQUEST_CHANGES without a dismissal. GitHub
+/// rejects APPROVE on the app's own pull request; publication falls back to
+/// COMMENT there and dismisses the stale verdict explicitly instead.
 fn github_review_event(has_findings: bool) -> &'static str {
     if has_findings {
         "REQUEST_CHANGES"
     } else {
-        "COMMENT"
+        "APPROVE"
     }
 }
 
@@ -18900,7 +18917,7 @@ mod tests {
 
     #[test]
     fn github_review_verdict_matches_confirmed_findings() {
-        assert_eq!(github_review_event(false), "COMMENT");
+        assert_eq!(github_review_event(false), "APPROVE");
         assert_eq!(github_review_event(true), "REQUEST_CHANGES");
         assert_eq!(
             github_review_event_without_inline_comments("REQUEST_CHANGES"),
@@ -25701,35 +25718,21 @@ rename to src/new.rs
         assert!(omitted > 0);
     }
 
-    #[tokio::test]
-    async fn clean_review_dismisses_the_apps_block_and_publishes_only_a_comment() {
+    /// Serves scripted responses in order, asserting each request's method,
+    /// path prefix, and (optionally) a body fragment.
+    fn scripted_review_server(
+        listener: tokio::net::TcpListener,
+        responses: Vec<(
+            &'static str,
+            Option<&'static str>,
+            &'static str,
+            &'static str,
+        )>,
+    ) -> tokio::task::JoinHandle<()> {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
-        let store = crate::store::Store::open_in_memory().unwrap();
-        let job = enqueue_test_review_job(&store, "acme/widgets#42:clean-verdict");
-        store.claim_code_review_job().unwrap().unwrap();
-        assert!(store.claim_code_review_publication(&job.id).unwrap());
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let responses = [
-                (
-                    "post /repos/acme/widgets/pulls/42/reviews ",
-                    Some(r#""event":"comment""#),
-                    r#"{"id":11,"html_url":"https://github.com/acme/widgets/pull/42#pullrequestreview-11","state":"COMMENTED"}"#,
-                ),
-                (
-                    "get /repos/acme/widgets/pulls/42/reviews?per_page=100&page=1 ",
-                    None,
-                    r#"[{"id":9,"html_url":"https://github.com/review-9","state":"CHANGES_REQUESTED","user":{"login":"trouve-ai[bot]","type":"Bot"}},{"id":10,"html_url":"https://github.com/review-10","state":"CHANGES_REQUESTED","user":{"login":"human","type":"User"}}]"#,
-                ),
-                (
-                    "put /repos/acme/widgets/pulls/42/reviews/9/dismissals ",
-                    Some(r#""event":"dismiss""#),
-                    r#"{"id":9,"state":"DISMISSED"}"#,
-                ),
-            ];
-            for (expected_path, expected_body, body) in responses {
+        tokio::spawn(async move {
+            for (expected_path, expected_body, status, body) in responses {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut request = Vec::new();
                 let mut buffer = [0_u8; 2048];
@@ -25763,13 +25766,34 @@ rename to src/new.rs
                     assert!(request.contains(expected_body), "{request}");
                 }
                 let response = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
                      content-length: {}\r\nconnection: close\r\n\r\n{body}",
                     body.len()
                 );
                 stream.write_all(response.as_bytes()).await.unwrap();
             }
-        });
+        })
+    }
+
+    #[tokio::test]
+    async fn clean_review_approves_and_needs_no_dismissal_of_the_apps_block() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let job = enqueue_test_review_job(&store, "acme/widgets#42:clean-verdict");
+        store.claim_code_review_job().unwrap().unwrap();
+        assert!(store.claim_code_review_publication(&job.id).unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        // The APPROVE supersedes the app's earlier REQUEST_CHANGES on
+        // GitHub's side, so no review listing or dismissal follows.
+        let server = scripted_review_server(
+            listener,
+            vec![(
+                "post /repos/acme/widgets/pulls/42/reviews ",
+                Some(r#""event":"approve""#),
+                "201 Created",
+                r#"{"id":11,"html_url":"https://github.com/acme/widgets/pull/42#pullrequestreview-11","state":"APPROVED"}"#,
+            )],
+        );
         let data = tempfile::tempdir().unwrap();
         let engine = Engine::new(store, data.path().to_path_buf(), &review_app_test_config());
         let api = GithubApi::with_base_url(
@@ -25779,11 +25803,13 @@ rename to src/new.rs
         )
         .unwrap();
 
-        let review_url = engine.publish_review(&api, &job, &[], false).await.unwrap();
+        let published = engine.publish_review(&api, &job, &[], false).await.unwrap();
         assert_eq!(
-            review_url,
+            published,
             "https://github.com/acme/widgets/pull/42#pullrequestreview-11"
         );
+        assert_eq!(published.event, "APPROVE");
+        assert!(!published.needs_blocking_review_cleanup());
         engine
             .store
             .record_code_review_publication(
@@ -25792,8 +25818,96 @@ rename to src/new.rs
                 job.pull_number,
                 &job.base_ref,
                 &job.head_sha,
-                &review_url.url,
-                true,
+                &published.url,
+                published.needs_blocking_review_cleanup(),
+                &[],
+            )
+            .unwrap();
+        assert!(
+            !engine
+                .store
+                .code_review_job(&job.id)
+                .unwrap()
+                .unwrap()
+                .blocking_review_cleanup_pending
+        );
+        assert!(
+            engine
+                .store
+                .code_review_jobs_pending_blocking_review_cleanup(10)
+                .unwrap()
+                .is_empty()
+        );
+        engine
+            .sync_code_review_blocking_review_cleanup_with_api(&api, &job)
+            .await
+            .unwrap();
+        await_mock_server(server).await;
+    }
+
+    #[tokio::test]
+    async fn clean_review_on_own_pull_falls_back_to_a_comment_and_dismisses_the_apps_block() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let job = enqueue_test_review_job(&store, "acme/widgets#42:clean-verdict-own-pull");
+        store.claim_code_review_job().unwrap().unwrap();
+        assert!(store.claim_code_review_publication(&job.id).unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = scripted_review_server(
+            listener,
+            vec![
+                (
+                    "post /repos/acme/widgets/pulls/42/reviews ",
+                    Some(r#""event":"approve""#),
+                    "422 Unprocessable Entity",
+                    r#"{"message":"Can not approve your own pull request"}"#,
+                ),
+                (
+                    "post /repos/acme/widgets/pulls/42/reviews ",
+                    Some(r#""event":"comment""#),
+                    "201 Created",
+                    r#"{"id":11,"html_url":"https://github.com/acme/widgets/pull/42#pullrequestreview-11","state":"COMMENTED"}"#,
+                ),
+                (
+                    "get /repos/acme/widgets/pulls/42/reviews?per_page=100&page=1 ",
+                    None,
+                    "200 OK",
+                    r#"[{"id":9,"html_url":"https://github.com/review-9","state":"CHANGES_REQUESTED","user":{"login":"trouve-ai[bot]","type":"Bot"}},{"id":10,"html_url":"https://github.com/review-10","state":"CHANGES_REQUESTED","user":{"login":"human","type":"User"}}]"#,
+                ),
+                (
+                    "put /repos/acme/widgets/pulls/42/reviews/9/dismissals ",
+                    Some(r#""event":"dismiss""#),
+                    "200 OK",
+                    r#"{"id":9,"state":"DISMISSED"}"#,
+                ),
+            ],
+        );
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(store, data.path().to_path_buf(), &review_app_test_config());
+        let api = GithubApi::with_base_url(
+            "Bearer installation-token".into(),
+            format!("http://{address}"),
+            "installation:7".into(),
+        )
+        .unwrap();
+
+        let published = engine.publish_review(&api, &job, &[], false).await.unwrap();
+        assert_eq!(
+            published,
+            "https://github.com/acme/widgets/pull/42#pullrequestreview-11"
+        );
+        assert_eq!(published.event, "COMMENT");
+        assert!(published.needs_blocking_review_cleanup());
+        engine
+            .store
+            .record_code_review_publication(
+                &job.id,
+                &job.repository,
+                job.pull_number,
+                &job.base_ref,
+                &job.head_sha,
+                &published.url,
+                published.needs_blocking_review_cleanup(),
                 &[],
             )
             .unwrap();
