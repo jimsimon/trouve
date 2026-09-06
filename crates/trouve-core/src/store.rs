@@ -12460,6 +12460,39 @@ impl Store {
         Ok(abandoned)
     }
 
+    /// Re-arms the collapses a missing Contents permission blocked — the
+    /// ones backed off or abandoned with a permission error, plus those
+    /// abandoned before failures were recorded — for one installation or
+    /// all, so a granted permission is acted on without waiting out the
+    /// backoff or an unrelated re-arm. Abandoned rows are recognised by
+    /// their surviving attempt count: a completed collapse resets it. Rows
+    /// whose thread GitHub already reports resolved owe nothing. Returns
+    /// the number of findings requeued.
+    pub fn revive_permission_blocked_code_review_thread_collapses(
+        &self,
+        installation_id: Option<u64>,
+    ) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        let revived = conn.execute(
+            "UPDATE code_review_findings
+             SET collapse_pending = 1, collapse_attempts = 0,
+                 collapse_terminal_attempts = 0, collapse_next_attempt_at = NULL,
+                 collapse_error = ''
+             WHERE status IN ('fixed', 'dismissed')
+               AND github_comment_id IS NOT NULL
+               AND github_thread_resolved IS NOT 1
+               AND (collapse_pending = 1 OR collapse_attempts > 0)
+               AND (collapse_error = ''
+                    OR lower(collapse_error) LIKE '%forbidden%'
+                    OR lower(collapse_error) LIKE '%not accessible by integration%'
+                    OR lower(collapse_error) LIKE '%contents (read and write)%')
+               AND (?1 IS NULL OR job_id IN (
+                    SELECT id FROM code_review_jobs WHERE installation_id = ?1))",
+            params![installation_id.map(|value| value as i64)],
+        )?;
+        Ok(revived as u64)
+    }
+
     /// Fixed findings whose GitHub review thread has not been confirmed
     /// collapsed and whose backoff window has elapsed, with the owning job's
     /// coordinates so a caller can build an installation client and retry
@@ -23142,6 +23175,136 @@ mod tests {
         let backlog = stats.thread_collapse_backlog.unwrap();
         assert_eq!(backlog.abandoned, 0);
         assert!(backlog.last_error.is_empty());
+    }
+
+    #[test]
+    fn granted_contents_permission_revives_the_collapses_it_blocked() {
+        let store = Store::open_in_memory().unwrap();
+        let job = enqueue_backoff_test_job(&store);
+        let finding_at = |path: &str| NewCodeReviewFinding {
+            path: path.into(),
+            line: 3,
+            side: "RIGHT".into(),
+            severity: "medium".into(),
+            confidence: "high".into(),
+            title: "Test finding".into(),
+            body: "finding".into(),
+            prompt_for_agents: "fix".into(),
+            sources: Vec::new(),
+        };
+        let findings = store
+            .save_code_review_result(
+                &job.id,
+                "summary",
+                "prompt",
+                1,
+                &[
+                    finding_at("src/abandoned.rs"),
+                    finding_at("src/backed_off.rs"),
+                    finding_at("src/legacy.rs"),
+                    finding_at("src/unrelated.rs"),
+                    finding_at("src/resolved.rs"),
+                ],
+                &[],
+            )
+            .unwrap();
+        let ids = findings
+            .iter()
+            .map(|finding| finding.id.clone())
+            .collect::<Vec<_>>();
+        for (index, id) in ids.iter().enumerate() {
+            store
+                .update_code_review_finding_publication(
+                    id,
+                    Some(9000 + index as u64),
+                    "https://example",
+                    None,
+                )
+                .unwrap();
+            assert!(
+                store
+                    .resolve_code_review_finding(id, "fixed", "resolved-head", "resolver-job")
+                    .unwrap()
+            );
+        }
+        let collapse = |id: &str| {
+            store
+                .code_review_findings(&job.id)
+                .unwrap()
+                .into_iter()
+                .find(|finding| finding.id == id)
+                .unwrap()
+                .thread_collapse
+        };
+        let forbidden = "GitHub GraphQL error while resolving review thread: FORBIDDEN: \
+                         Resource not accessible by integration";
+        // Abandoned after the terminal budget with the permission error.
+        while !store
+            .defer_code_review_thread_collapse(&ids[0], true, forbidden)
+            .unwrap()
+        {}
+        // Still queued, backed off with the local gate's message.
+        store
+            .defer_code_review_thread_collapse(
+                &ids[1],
+                true,
+                "GitHub App needs repository permission: Contents (read and write)",
+            )
+            .unwrap();
+        // Abandoned before failures were recorded on the row.
+        while !store
+            .defer_code_review_thread_collapse(&ids[2], true, "")
+            .unwrap()
+        {}
+        // Abandoned for an unrelated reason: not the permission's to revive.
+        while !store
+            .defer_code_review_thread_collapse(&ids[3], true, "NOT_FOUND: thread gone")
+            .unwrap()
+        {}
+        // Collapsed successfully: owes nothing.
+        store
+            .clear_code_review_thread_collapse(&ids[4], Some(9004), Some("thread-9004"))
+            .unwrap();
+        assert!(!collapse(&ids[0]).unwrap().pending);
+        assert!(collapse(&ids[1]).unwrap().next_attempt_at.is_some());
+        assert!(collapse(&ids[2]).is_none());
+        assert!(collapse(&ids[4]).is_none());
+
+        // Another installation's grant leaves this installation's rows alone.
+        assert_eq!(
+            store
+                .revive_permission_blocked_code_review_thread_collapses(Some(8))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .revive_permission_blocked_code_review_thread_collapses(Some(7))
+                .unwrap(),
+            3
+        );
+        for id in &ids[..3] {
+            let revived = collapse(id).unwrap();
+            assert!(revived.pending, "{id}");
+            assert_eq!(revived.attempts, 0);
+            assert!(revived.next_attempt_at.is_none());
+            assert!(revived.last_error.is_empty());
+        }
+        let unrelated = collapse(&ids[3]).unwrap();
+        assert!(!unrelated.pending);
+        assert_eq!(unrelated.last_error, "NOT_FOUND: thread gone");
+        assert!(collapse(&ids[4]).is_none());
+        let due = store
+            .pending_code_review_thread_collapses(chrono::Utc::now(), 10, &[])
+            .unwrap();
+        assert_eq!(due.len(), 3);
+        // Reviving is idempotent for rows already due.
+        assert_eq!(
+            store
+                .revive_permission_blocked_code_review_thread_collapses(None)
+                .unwrap(),
+            3
+        );
     }
 
     #[test]
