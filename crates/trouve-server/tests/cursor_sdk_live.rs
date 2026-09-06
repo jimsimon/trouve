@@ -460,9 +460,17 @@ struct ReviewTurnEvidence {
     valid_json: bool,
     tool_call_count: usize,
     tool_calls_by_name: BTreeMap<String, usize>,
+    authorization_dependency_resolved: bool,
     error: String,
     #[serde(skip)]
     output: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct ReviewToolEvidence {
+    tool: String,
+    args: serde_json::Value,
+    result: Option<serde_json::Value>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -600,6 +608,110 @@ fn review_tool_counts(events: &[serde_json::Value], turn: u64) -> BTreeMap<Strin
         *counts.entry(tool.to_string()).or_default() += 1;
     }
     counts
+}
+
+fn review_tool_evidence(events: &[serde_json::Value], turn: u64) -> Vec<ReviewToolEvidence> {
+    let completed = events
+        .iter()
+        .filter(|event| event["type"] == "tool.completed")
+        .filter_map(|event| {
+            Some((
+                event["call_id"].as_str()?,
+                event.get("result").cloned().unwrap_or_default(),
+            ))
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    events
+        .iter()
+        .filter(|event| event["type"] == "tool.requested" && event["turn"] == turn)
+        .filter_map(|event| {
+            let call_id = event["call_id"].as_str()?;
+            Some(ReviewToolEvidence {
+                tool: event["tool"].as_str()?.to_string(),
+                args: event.get("args").cloned().unwrap_or_default(),
+                result: completed.get(call_id).cloned(),
+            })
+        })
+        .collect()
+}
+
+fn review_tool_evidence_resolves_authorization_dependency(
+    tool_calls: &[ReviewToolEvidence],
+) -> bool {
+    tool_calls.iter().any(|call| {
+        let args = call.args.to_string().to_ascii_lowercase();
+        let request_targets_dependency = args.contains("authorization")
+            || args.contains("authorize_cached")
+            || args.contains("revok")
+            || (call.tool == "find_related" && args.contains("handler.rs"));
+        let result = call
+            .result
+            .as_ref()
+            .map(serde_json::Value::to_string)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        request_targets_dependency
+            && result.contains("authorize_cached")
+            && result.contains("revok")
+    })
+}
+
+#[test]
+fn context_qualification_requires_authorization_lookup_evidence() {
+    let events = vec![
+        serde_json::json!({
+            "type": "tool.requested",
+            "turn": 1,
+            "call_id": "targeted",
+            "tool": "read_file",
+            "args": {"path": "src/authorization.rs"}
+        }),
+        serde_json::json!({
+            "type": "tool.completed",
+            "call_id": "targeted",
+            "result": {"content": "fn authorize_cached(request: &Request) { !request.revoked }"}
+        }),
+    ];
+    assert!(review_tool_evidence_resolves_authorization_dependency(
+        &review_tool_evidence(&events, 1)
+    ));
+
+    let unrelated = vec![
+        serde_json::json!({
+            "type": "tool.requested",
+            "turn": 1,
+            "call_id": "unrelated",
+            "tool": "read_file",
+            "args": {"path": "README.md"}
+        }),
+        serde_json::json!({
+            "type": "tool.completed",
+            "call_id": "unrelated",
+            "result": {"content": "project documentation"}
+        }),
+    ];
+    assert!(!review_tool_evidence_resolves_authorization_dependency(
+        &review_tool_evidence(&unrelated, 1)
+    ));
+
+    let incomplete_result = vec![
+        serde_json::json!({
+            "type": "tool.requested",
+            "turn": 1,
+            "call_id": "incomplete",
+            "tool": "search",
+            "args": {"query": "authorize_cached"}
+        }),
+        serde_json::json!({
+            "type": "tool.completed",
+            "call_id": "incomplete",
+            "result": {"content": "fn authorize_cached(request: &Request)"}
+        }),
+    ];
+    assert!(!review_tool_evidence_resolves_authorization_dependency(
+        &review_tool_evidence(&incomplete_result, 1)
+    ));
 }
 
 fn median(values: &[usize]) -> f64 {
@@ -781,6 +893,10 @@ async fn run_qualified_review_turn(
         let valid_json = review_output_value(&output).is_some();
         let tool_calls_by_name = review_tool_counts(&events, 1);
         let tool_call_count = tool_calls_by_name.values().sum();
+        let authorization_dependency_resolved =
+            review_tool_evidence_resolves_authorization_dependency(&review_tool_evidence(
+                &events, 1,
+            ));
         let error = terminal["error"].as_str().unwrap_or_default().to_string();
         Ok(ReviewTurnEvidence {
             task_id: task_id.to_string(),
@@ -788,6 +904,7 @@ async fn run_qualified_review_turn(
             valid_json,
             tool_call_count,
             tool_calls_by_name,
+            authorization_dependency_resolved,
             error,
             output,
         })
@@ -1185,6 +1302,10 @@ fn assert_synthetic_review_acceptance(summary: &SyntheticReviewSummary) {
         )),
         "context-dependent review used inventory/diff tools: {:?}",
         context.tool_calls_by_name
+    );
+    assert!(
+        context.authorization_dependency_resolved,
+        "context-dependent review did not inspect the unchanged authorization dependency"
     );
 }
 
