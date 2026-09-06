@@ -12264,7 +12264,7 @@ fn lifecycle_comment_marker(job_id: &str) -> String {
 }
 
 fn finding_is_publicly_actionable(finding: &trouve_protocol::CodeReviewFinding) -> bool {
-    finding.status != "advisory"
+    finding.status == "open"
         && finding_is_blocking(&finding.severity, &finding.confidence)
         && finding_gates(&finding.evidence, finding.origin)
 }
@@ -12274,12 +12274,7 @@ fn finding_is_publicly_actionable(finding: &trouve_protocol::CodeReviewFinding) 
 /// round is actionable on this pull request; otherwise the public renderers
 /// use their server-derived counts and status-specific fallback prose.
 fn public_review_summary(detail: &trouve_protocol::CodeReviewJobDetail) -> &str {
-    if detail
-        .findings
-        .iter()
-        .filter(|finding| finding.status != "advisory")
-        .all(finding_is_publicly_actionable)
-    {
+    if detail.findings.iter().all(finding_is_publicly_actionable) {
         detail.summary.as_str()
     } else {
         ""
@@ -21728,6 +21723,31 @@ rename to src/new.rs
         let check_details = render_check_details(&detail, public_review_summary(&detail), &[]);
         assert!(!check_details.contains("Beyond scope issue"));
         assert!(check_details.contains("review completed without an additional summary"));
+
+        // Summary eligibility is closed and positive: advisory-only and
+        // mixed advisory/actionable results cannot expose coordinator prose.
+        let mut advisory_only = detail.clone();
+        advisory_only.summary = "Advisory-only summary must stay internal".into();
+        advisory_only.findings.truncate(1);
+        advisory_only.findings[0].status = "advisory".into();
+        assert_eq!(public_review_summary(&advisory_only), "");
+        let mut mixed_advisory = detail.clone();
+        mixed_advisory.summary = "Mixed advisory summary must stay internal".into();
+        mixed_advisory.findings[1].status = "advisory".into();
+        assert_eq!(public_review_summary(&mixed_advisory), "");
+
+        // A maintainer-dismissed finding remains visible in the resolved
+        // disclosure, but is neither counted nor summarized as actionable.
+        let mut dismissed = detail.clone();
+        dismissed.summary = "Dismissed issue must not remain actionable".into();
+        dismissed.findings.truncate(1);
+        dismissed.findings[0].status = "dismissed".into();
+        dismissed.findings[0].outside_diff = true;
+        let dismissed_body = render_lifecycle_comment(&dismissed, &dismissed.findings, false, &[]);
+        assert!(dismissed_body.contains("**Result:** 0 new confirmed issue(s);"));
+        assert!(!dismissed_body.contains("Dismissed issue must not remain actionable"));
+        assert!(dismissed_body.contains("<summary>Resolved as won't-fix (1)</summary>"));
+        assert_eq!(public_review_summary(&dismissed), "");
     }
 
     #[test]
@@ -22406,7 +22426,8 @@ rename to src/new.rs
         assert!(!body[..prompt_start].contains("Published inline body"));
         assert!(body[prompt_start..].contains("Published inline body"));
         assert!(body[failed_section..prompt_start].contains("Failed inline body"));
-        assert!(body.contains("Three confirmed issues, including uncertain issue details."));
+        assert!(!body.contains("Three confirmed issues, including uncertain issue details."));
+        assert!(body.contains("Found 2 actionable issue(s)."));
         // Publication-policy suppression is an internal detail; the comment
         // never advertises retained-but-unposted findings.
         assert!(!body.contains("retained in Trouve"));
