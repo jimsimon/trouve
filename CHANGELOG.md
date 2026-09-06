@@ -8,6 +8,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Process-tree cleanup closes fork-during-termination races**: Linux and
+  Android process owners now keep enumerating and killing newly inherited
+  sentinel holders until the tree is empty or the existing cleanup deadline
+  expires. A detached descendant that forks while an earlier holder snapshot
+  is being killed can no longer leave Git, provider, MCP, probe, or shell
+  cleanup waiting on a process it never signals.
 - **Non-gating review findings stay off pull requests**: credible findings that
   are not mechanically tied to the reviewed change remain available in
   trouve's dashboard and durable review history, but no longer appear in the
