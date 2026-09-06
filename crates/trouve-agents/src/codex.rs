@@ -415,11 +415,7 @@ impl AgentBackend for CodexBackend {
                         }
                         fresh_session = true;
                         let v = server
-                            .request_orphanable_effect_cancellable(
-                                "thread/start",
-                                start_params.clone(),
-                                &cancel,
-                            )
+                            .start_thread_cancellable(start_params.clone(), &cancel)
                             .await?;
                         server.validated_thread_id("thread/start", &v, None).await?
                     }
@@ -428,11 +424,7 @@ impl AgentBackend for CodexBackend {
             (None, _) => {
                 fresh_session = true;
                 let v = server
-                    .request_orphanable_effect_cancellable(
-                        "thread/start",
-                        start_params.clone(),
-                        &cancel,
-                    )
+                    .start_thread_cancellable(start_params.clone(), &cancel)
                     .await?;
                 server.validated_thread_id("thread/start", &v, None).await?
             }
@@ -2156,6 +2148,25 @@ enum RequestFence {
     /// that thread where nothing can address it, so only this request fails
     /// and the transport keeps serving its other turns.
     OrphanableEffect,
+}
+
+fn request_response_timed_out(
+    error: &BackendError,
+    method: &str,
+    response_timeout: std::time::Duration,
+) -> bool {
+    matches!(
+        error,
+        BackendError::Protocol(message)
+            if message == &request_response_timeout_message(method, response_timeout)
+    )
+}
+
+fn request_response_timeout_message(method: &str, response_timeout: std::time::Duration) -> String {
+    format!(
+        "{method}: no response within {}s",
+        response_timeout.as_secs_f64()
+    )
 }
 
 #[derive(Default)]
@@ -4036,6 +4047,53 @@ impl AppServer {
         .await
     }
 
+    /// Retry one isolated `thread/start` response timeout. Each unanswered
+    /// request can only strand an unreachable vendor thread, and the
+    /// orphanable-effect fence keeps the shared app-server available for the
+    /// retry and for turns that are already streaming.
+    async fn start_thread_cancellable(
+        &self,
+        params: Value,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<Value, BackendError> {
+        self.start_thread_cancellable_with_timeout(params, cancel, REQUEST_RESPONSE_TIMEOUT)
+            .await
+    }
+
+    async fn start_thread_cancellable_with_timeout(
+        &self,
+        params: Value,
+        cancel: &tokio_util::sync::CancellationToken,
+        response_timeout: std::time::Duration,
+    ) -> Result<Value, BackendError> {
+        let first = self
+            .request_with_cancel_timeout(
+                "thread/start",
+                params.clone(),
+                Some(cancel),
+                RequestFence::OrphanableEffect,
+                response_timeout,
+            )
+            .await;
+        match first {
+            Err(error) if request_response_timed_out(&error, "thread/start", response_timeout) => {
+                tracing::warn!(
+                    timeout_seconds = response_timeout.as_secs_f64(),
+                    "codex: retrying unanswered thread/start once"
+                );
+                self.request_with_cancel_timeout(
+                    "thread/start",
+                    params,
+                    Some(cancel),
+                    RequestFence::OrphanableEffect,
+                    response_timeout,
+                )
+                .await
+            }
+            result => result,
+        }
+    }
+
     async fn validate_effect_id(
         &self,
         method: &str,
@@ -4176,9 +4234,9 @@ impl AppServer {
                     closed.store(true, Ordering::Relaxed);
                     BackendError::Protocol(format!("{method}: app-server closed before responding"))
                 }),
-                Err(_) => Err(BackendError::Protocol(format!(
-                    "{method}: no response within {}s",
-                    response_timeout.as_secs_f64()
+                Err(_) => Err(BackendError::Protocol(request_response_timeout_message(
+                    method,
+                    response_timeout,
                 ))),
             }
         };
@@ -6665,12 +6723,12 @@ for line in sys.stdin:
     }
 
     /// A `thread/start` that the app-server has not answered strands at most
-    /// one thread nobody can reach. It must fail alone: on a shared
-    /// app-server the same timeout used to retire the transport under every
-    /// streaming turn, so one slow start took a whole review fan-out down.
+    /// one thread nobody can reach. Retry it once on the same shared server:
+    /// the old behavior retired the transport under every streaming turn, so
+    /// one slow start took a whole review fan-out down.
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn unanswered_thread_start_fails_alone_and_keeps_the_app_server() {
+    async fn unanswered_thread_start_is_retried_once_on_the_same_app_server() {
         use std::os::unix::fs::PermissionsExt;
 
         let temp = tempfile::tempdir().unwrap();
@@ -6706,20 +6764,15 @@ for line in sys.stdin:
         let backend = CodexBackend::new("codex", Some(stub.to_string_lossy().into_owned()));
         let server = backend.server().await.unwrap();
         let cancel = tokio_util::sync::CancellationToken::new();
-        let error = server
-            .request_with_cancel_timeout(
-                "thread/start",
+        let response = server
+            .start_thread_cancellable_with_timeout(
                 json!({}),
-                Some(&cancel),
-                RequestFence::OrphanableEffect,
+                &cancel,
                 std::time::Duration::from_millis(250),
             )
             .await
-            .unwrap_err();
-        assert!(
-            matches!(&error, BackendError::Protocol(message) if message.contains("no response")),
-            "unexpected error: {error}"
-        );
+            .unwrap();
+        assert_eq!(response["thread"]["id"], "answered-thread-2");
         assert!(
             !server.is_closed(),
             "an unanswered thread/start retired the shared transport"
@@ -6728,14 +6781,7 @@ for line in sys.stdin:
             server.pending.lock().await.is_empty(),
             "the unanswered start kept its pending slot"
         );
-        // The same process keeps serving both new starts and other requests.
-        assert_eq!(
-            server
-                .request_orphanable_effect_cancellable("thread/start", json!({}), &cancel)
-                .await
-                .unwrap()["thread"]["id"],
-            "answered-thread-2"
-        );
+        // The same process served both start attempts and remains available.
         assert_eq!(
             server
                 .request("account/rateLimits/read", Value::Null)
