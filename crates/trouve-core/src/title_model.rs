@@ -45,6 +45,7 @@ pub(crate) fn title_from_output(_prompt: &str, raw: &str) -> Result<String> {
     let line = raw
         .lines()
         .map(str::trim)
+        .rev()
         .find(|line| line.starts_with("Title:") || line.starts_with("title:"))
         .unwrap_or(first_line);
     let line = line
@@ -188,6 +189,18 @@ mod tests {
             title_from_output(
                 "Fix authentication",
                 "I should describe the requested outcome.\nTitle: Fix Authentication Flow"
+            )
+            .unwrap(),
+            "Fix Authentication Flow"
+        );
+    }
+
+    #[test]
+    fn selects_the_final_labelled_title() {
+        assert_eq!(
+            title_from_output(
+                "Fix authentication",
+                "Title: Draft Authentication Name\nMore reasoning.\nTitle: Fix Authentication Flow"
             )
             .unwrap(),
             "Fix Authentication Flow"

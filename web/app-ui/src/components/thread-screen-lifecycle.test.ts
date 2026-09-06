@@ -210,6 +210,7 @@ describe("thread screen asynchronous lifecycle guards", () => {
     expect(source).toContain('event.key === "ContextMenu"');
     expect(source).toContain("event.shiftKey && event.key === \"F10\"");
     expect(source).toContain('class="thread-tab-context-menu"');
+    expect(source).toContain('thread.title?.trim() || "this thread"');
     expect(source).toContain(">Rename</button>");
     expect(source).toContain(">Close</button>");
     expect(source).toContain('>Rename thread</h2>');

@@ -1426,7 +1426,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       <div
         class="thread-tab-context-menu"
         role="menu"
-        aria-label=${`Actions for ${thread.title}`}
+        aria-label=${`Actions for ${thread.title?.trim() || "this thread"}`}
         style=${`left:${menu.x}px;top:${menu.y}px`}
         @contextmenu=${(event: Event) => event.preventDefault()}
         @keydown=${this.#threadTabContextMenuKeydown}
