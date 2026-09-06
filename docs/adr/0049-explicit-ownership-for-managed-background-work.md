@@ -32,14 +32,15 @@ degrade.
 - **Equal work is coalesced.** A stable scope key permits one active execution
   and at most one requested rerun. Repeated triggers therefore preserve a final
   pass without creating an unbounded task queue.
-- **Git maintenance is repository-scoped and lower priority.** Review fetches
-  suppress their inline auto-maintenance, then schedule git maintenance
-  run --auto. The managed task acquires the same repository mutex as fetch and
-  ref cleanup, forces maintenance.autoDetach=false, and runs under the ordinary
-  bounded process-tree owner. A new foreground fetch preempts maintenance
-  before waiting for that mutex; its successful fetch schedules a fresh pass.
-  Maintenance failure is logged and may be retried by a later coalesced trigger;
-  it does not invalidate an otherwise successful immutable fetch.
+- **Git maintenance is repository-scoped, globally bounded, and lower
+  priority.** Review fetches suppress their inline auto-maintenance, then
+  schedule git maintenance run --auto. Maintenance executions share one
+  concurrency slot across repositories, acquire the repository mutex, force
+  maintenance.autoDetach=false, and run under the ordinary bounded process-tree
+  owner. A new foreground fetch preempts maintenance before waiting for that
+  mutex. The fetch scope guarantees a fresh pass is scheduled whether the
+  foreground operation succeeds, fails, or is cancelled. Maintenance failure
+  is logged and does not invalidate an otherwise successful immutable fetch.
 - **Shell daemon adoption remains specialized.** ADR 0046 continues to govern
   commands that trouve does not control. The managed registry does not broaden
   which arbitrary descendants may survive a call.
@@ -48,8 +49,8 @@ degrade.
 
 - Background work can outlive the request that scheduled it without becoming
   unowned, leaking pipes, or dropping a required repository lock.
-- Repository housekeeping is kept off the review-fetch critical path while
-  still running whenever Git's automatic thresholds say it is needed.
+- Repository housekeeping is kept off the review-fetch critical path, bounded
+  across repositories, and still runs whenever Git's thresholds say it is due.
 - New intentional background consumers have a reusable ownership and
   coalescing primitive, but still must define a scope key, resource lease,
   timeout, cancellation behavior, and failure policy.
