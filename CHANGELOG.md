@@ -6,6 +6,37 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [4.10.0] - 2026-09-06
+
+This release replaces Cursor's legacy ACP transport with its Agent SDK,
+makes session naming configurable and asynchronous, refreshes the supported
+model catalog, and improves navigation, reasoning display, review automation,
+usage reporting, and process ownership.
+
+### Added
+
+- **Cursor Agent SDK support**: Cursor turns now use a pinned, reusable SDK
+  Bridge with API-key health checks, durable per-thread agents, bounded
+  process pooling, and trouve-owned custom tools. Cursor's native tools remain
+  denied so filesystem, shell, Git, and MCP effects continue through the
+  normal permission and audit boundary. Existing `cursor-cli` configurations
+  must select Cursor (Agent SDK), install its managed runtime, and save a
+  Cursor API key; CLI login credentials are no longer used.
+- **Configured asynchronous naming**: sessions and threads are created
+  immediately, then named in the background by a user-selected provider model
+  using the initial prompt and supported image attachments. Rename menus can
+  generate a suggestion from conversation context, queued work is visible and
+  bounded, and title-derived local branches are renamed only after the title
+  update succeeds.
+- **Expanded model catalog**: the embedded models.dev snapshot now includes
+  current provider metadata, with GPT-6 Astra available for Codex and Claude
+  Fable 5.1 and Gemini 3.8 Flash available for Cursor. Cursor's Grok reasoning
+  levels and defaults now match its documented roster.
+- **Faster session navigation**: the workspace list keeps its scrollbar in
+  the sidebar gutter, session and thread context menus can copy durable IDs,
+  and the fixed usage footer can collapse to the most constrained
+  subscription window with the preference retained locally.
+
 ### Changed
 
 - **Process completion and ownership survive background descendants**: Linux
@@ -37,6 +68,21 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the GitHub lifecycle comment, with struck-through issue text, an explicit
   disposition label, and an `unresolve` command to reopen them. Findings fixed
   in code continue to leave the list automatically.
+- **Evidence-driven automated reviews**: review agents retain the full
+  unattended tool catalog and qualification now proves that tool results were
+  used for anchored findings. Generated files honor trusted
+  `linguist-generated` attributes from the base revision, and oversized diff
+  lines are elided before batching so serialized snapshots cannot multiply
+  reviewer fan-out.
+- **Clean reviews publish approvals**: a clean review round now submits an
+  approval alongside its successful Check Run when GitHub permits it, allowing
+  the new verdict to supersede an earlier request for changes without a
+  separate dismissal.
+- **Client/server compatibility**: protocol compatibility advances to 9.2 for
+  review-thread collapse diagnostics and effective GitHub Contents permission
+  reporting. Upgrade the desktop or PWA client, review dashboard, and
+  `trouve-server` together, and grant the GitHub App Contents and Checks
+  read/write permissions to enable review-thread resolution.
 
 ### Fixed
 
@@ -49,6 +95,21 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   provider's usage from a per-provider cache with a 60 s fresh window and
   exponential failure backoff, so many open clients no longer each spawn a
   vendor probe and trip the limit themselves.
+- **Reasoning stays visible and coherent**: Codex reasoning summaries are
+  rendered when hosted models do not expose raw reasoning, while streamed
+  Cursor fragments remain in one thinking block until completion or assistant
+  output begins.
+- **Provider changes refresh model choices**: successful runtime installs,
+  removals, provider updates, and sign-ins now invalidate the model catalog so
+  newly available models appear without reloading the application.
+- **Review-thread permission failures are actionable**: collapse failures are
+  persisted and surfaced in review statistics and dashboards, missing
+  installation-level Contents write permission fails fast, and affected
+  collapses resume when permission is restored.
+- **Reliable provider and naming admission**: isolated Codex starts retry
+  without contending with review storage, user turns take priority over local
+  naming, and cancellation-safe limits prevent queued naming work from growing
+  without bound.
 
 ## [4.9.0] - 2026-09-05
 
@@ -1284,6 +1345,7 @@ semble ([BENCHMARKS.md](BENCHMARKS.md)):
 - Incremental reindex (1 file touched): 0.86 s vs ~3 min (212x)
 - Warm query: 0.55 s vs 7.2 s (13x)
 
+[4.10.0]: https://github.com/jimsimon/trouve/compare/v4.9.0...v4.10.0
 [4.9.0]: https://github.com/jimsimon/trouve/compare/v4.8.1...v4.9.0
 [4.8.1]: https://github.com/jimsimon/trouve/compare/v4.8.0...v4.8.1
 [4.8.0]: https://github.com/jimsimon/trouve/compare/v4.7.0...v4.8.0
