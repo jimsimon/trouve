@@ -1341,7 +1341,9 @@ mod tests {
             .unwrap();
         assert_eq!(grok_4_5.context_window, 256_000);
         assert_eq!(
-            grok_4_5.options_schema.pointer("/properties/effort/default"),
+            grok_4_5
+                .options_schema
+                .pointer("/properties/effort/default"),
             Some(&json!("high"))
         );
 
@@ -1356,7 +1358,9 @@ mod tests {
             Some(&json!(["low", "medium", "high", "xhigh"]))
         );
         assert_eq!(
-            grok_4_6.options_schema.pointer("/properties/effort/default"),
+            grok_4_6
+                .options_schema
+                .pointer("/properties/effort/default"),
             Some(&json!("high"))
         );
 
