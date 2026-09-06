@@ -15823,8 +15823,8 @@ impl Store {
         job_id: &str,
         finding_ids: &[&str],
     ) -> Result<Option<u64>> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
+        let conn = self.conn.lock().unwrap();
+        let tx = write_transaction(&conn)?;
         for finding_id in finding_ids {
             tx.execute(
                 "UPDATE code_review_findings
@@ -25063,6 +25063,66 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn publication_verdict_waits_for_a_concurrent_writer_before_reading() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        static HIT_BUSY_HANDLER: AtomicBool = AtomicBool::new(false);
+
+        fn keep_waiting_for_writer(_: i32) -> bool {
+            HIT_BUSY_HANDLER.store(true, Ordering::SeqCst);
+            true
+        }
+
+        HIT_BUSY_HANDLER.store(false, Ordering::SeqCst);
+        let data = tempfile::tempdir().unwrap();
+        let database = data.path().join("publication-verdict-contention.sqlite3");
+        let store = Store::open(&database).unwrap();
+        let job = enqueue_backoff_test_job(&store);
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            job.id
+        );
+        store
+            .save_code_review_result(&job.id, "summary", "prompt", 0, &[], &[])
+            .unwrap();
+        assert!(store.claim_code_review_publication(&job.id).unwrap());
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .busy_handler(Some(keep_waiting_for_writer))
+            .unwrap();
+
+        let mut blocker = Connection::open(&database).unwrap();
+        let blocker_tx = blocker
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        blocker_tx
+            .execute(
+                "UPDATE code_review_jobs SET pull_title = 'Committed title' WHERE id = ?1",
+                params![job.id],
+            )
+            .unwrap();
+
+        let preparing_store = store.clone();
+        let preparing_job_id = job.id.clone();
+        let preparing = std::thread::spawn(move || {
+            preparing_store.prepare_code_review_publication_verdict(&preparing_job_id, &[])
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !HIT_BUSY_HANDLER.load(Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "publication verdict read before reserving SQLite's writer slot"
+            );
+            std::thread::yield_now();
+        }
+        blocker_tx.commit().unwrap();
+
+        assert_eq!(preparing.join().unwrap().unwrap(), Some(0));
     }
 
     #[test]

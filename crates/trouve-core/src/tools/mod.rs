@@ -339,6 +339,25 @@ fn optional_review_fetch_command(
     command
 }
 
+fn primary_review_fetch_args(
+    remote_url: &str,
+    base_sha: &str,
+    pull_number: u64,
+    pull_ref: &str,
+) -> Vec<String> {
+    vec![
+        "fetch".into(),
+        "--force".into(),
+        "--no-tags".into(),
+        // Review fetches own their process tree and repository lock. Do not
+        // let Git detach automatic maintenance that outlives either one.
+        "--no-auto-maintenance".into(),
+        remote_url.into(),
+        format!("+{base_sha}:refs/remotes/origin/trouve-base"),
+        format!("+refs/pull/{pull_number}/head:{pull_ref}"),
+    ]
+}
+
 fn authenticated_review_git_command(
     repository_path: &Path,
     auth: &str,
@@ -3054,14 +3073,12 @@ impl ToolExecutor for LocalToolExecutor {
         .is_ok();
         if !base_present || !head_present {
             let pull_ref = format!("refs/remotes/origin/trouve-pr-{}", request.pull_number);
-            let fetch_args = vec![
-                "fetch".into(),
-                "--force".into(),
-                "--no-tags".into(),
-                remote_url.clone(),
-                format!("+{}:refs/remotes/origin/trouve-base", request.base_sha),
-                format!("+refs/pull/{}/head:{pull_ref}", request.pull_number),
-            ];
+            let fetch_args = primary_review_fetch_args(
+                &remote_url,
+                &request.base_sha,
+                request.pull_number,
+                &pull_ref,
+            );
             let command =
                 authenticated_review_git_command(&repository_path, &auth, &remote_url, &fetch_args);
             repository_guard = run_managed_authenticated_review_git_command(
@@ -4291,6 +4308,18 @@ mod tests {
 
     #[test]
     fn review_fetch_command_disables_credential_tracing_and_global_fetch_locks() {
+        let primary_args = primary_review_fetch_args(
+            "https://github.com/acme/widgets.git",
+            "abc",
+            42,
+            "refs/remotes/origin/trouve-pr-42",
+        );
+        assert!(
+            primary_args
+                .iter()
+                .any(|arg| arg == "--no-auto-maintenance")
+        );
+
         let command = optional_review_fetch_command(
             Path::new("."),
             "secret-auth",
