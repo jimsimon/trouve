@@ -434,6 +434,9 @@ test("session navigation shows configured branch names", async ({ page }, testIn
     await expect(actions).toHaveCSS("opacity", "1");
 
     const workspace = page.locator(".workspace-row").filter({ hasText: "trouve" }).first();
+    await expect(workspace).toHaveCSS("position", "sticky");
+    await expect(page.locator(".workspace-scroll")).toHaveCSS("overflow-y", "auto");
+    await expect(page.locator(".navigation-panel")).toHaveCSS("overflow-y", "hidden");
     const workspaceOrder = workspace.locator(".workspace-order-controls");
     const workspaceActions = workspace.locator(".workspace-actions-wrap");
     await page.mouse.move(0, 0);

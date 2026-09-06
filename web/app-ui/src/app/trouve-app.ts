@@ -3224,6 +3224,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
               })}</button>
           </div>
           <p class="visually-hidden" role="status" aria-live="polite" aria-atomic="true">${this.#workspaceOrderStatus}</p>
+          <div class="workspace-scroll">
           ${displayedWorkspaces.map(
             (workspace, index) => {
               const collapsed = this.#collapsedWorkspaceIds.has(workspace.id);
@@ -3430,6 +3431,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                     : "Create a session with the + button above."}</span>
               </div>`
             : nothing}
+          </div>
           <trouve-session-usage-panel
             session-id=${route.kind === "session" ? route.sessionId : ""}
             thread-id=${route.kind === "session" ? route.threadId ?? "" : ""}
