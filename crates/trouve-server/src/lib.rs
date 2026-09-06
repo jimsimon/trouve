@@ -969,6 +969,7 @@ pub async fn serve_listener(
     security: ServerSecurity,
 ) -> anyhow::Result<()> {
     engine.reconcile_checkpoint_refs().await;
+    engine.reconcile_session_branch_renames().await;
     engine.retry_artifact_cleanup_jobs().await;
     engine.retry_persona_deletions().await;
     engine.start_artifact_cleanup_worker();
@@ -1399,13 +1400,9 @@ async fn update_session(
     Path(id): Path<String>,
     Json(req): Json<UpdateSessionRequest>,
 ) -> Result<Json<Session>, ApiError> {
-    let session = engine.update_session(&id, &req)?;
-    if let Some(title) = req.title.as_deref() {
-        return Ok(Json(
-            engine.rename_session_branch_for_title(&id, title).await?,
-        ));
-    }
-    Ok(Json(session))
+    Ok(Json(
+        engine.update_session_and_rename_branch(&id, &req).await?,
+    ))
 }
 
 #[utoipa::path(delete, path = "/v1/sessions/{id}", params(("id" = String, Path,)),

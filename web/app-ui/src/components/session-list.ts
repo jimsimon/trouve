@@ -337,9 +337,9 @@ export class TrouveSessionList extends withSignalTracking(LitElement) {
         ${this.#menuSessionId === session.id && this.#editingSessionId === "" && this.#deleteSessionId === ""
           ? html`
               <div class="session-actions" role="menu" aria-label=${`Actions for ${session.title}`} style=${`left:${this.#menuPosition.x}px;top:${this.#menuPosition.y}px`} @contextmenu=${(event: Event) => event.preventDefault()} @keydown=${this.#contextMenuKeydown}>
-                <button type="button" role="menuitem" @click=${() => this.#startRename(session)}>Rename</button>
-                <button type="button" role="menuitem" ?disabled=${this.#busySessionId === session.id} @click=${() => this.#setArchived(session.id, !session.archived)}>${session.archived ? "Unarchive" : "Archive"}</button>
-                <button class="danger" type="button" role="menuitem" @click=${() => this.#confirmDelete(session)}>Delete…</button>
+                <button type="button" role="menuitem" tabindex="-1" @click=${() => this.#startRename(session)}>Rename</button>
+                <button type="button" role="menuitem" tabindex="-1" ?disabled=${this.#busySessionId === session.id} @click=${() => this.#setArchived(session.id, !session.archived)}>${session.archived ? "Unarchive" : "Archive"}</button>
+                <button class="danger" type="button" role="menuitem" tabindex="-1" @click=${() => this.#confirmDelete(session)}>Delete…</button>
               </div>
             `
           : nothing}

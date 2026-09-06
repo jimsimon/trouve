@@ -6,6 +6,7 @@ use anyhow::{Result, bail};
 use trouve_providers::Message;
 
 const MAX_PROMPT_CHARS: usize = 4_096;
+const MAX_OUTPUT_BYTES: usize = 4_096;
 const MAX_TITLE_WORDS: usize = 5;
 const MAX_TITLE_CHARS: usize = 80;
 
@@ -96,7 +97,15 @@ pub(crate) fn model_options(
     options
 }
 
-fn capped_prompt(prompt: &str) -> Cow<'_, str> {
+pub(crate) fn append_output(output: &mut String, delta: &str) -> Result<()> {
+    if output.len().saturating_add(delta.len()) > MAX_OUTPUT_BYTES {
+        bail!("naming model returned too much text");
+    }
+    output.push_str(delta);
+    Ok(())
+}
+
+pub(crate) fn capped_prompt(prompt: &str) -> Cow<'_, str> {
     let count = prompt.chars().count();
     if count <= MAX_PROMPT_CHARS {
         return Cow::Borrowed(prompt);
@@ -119,7 +128,7 @@ fn capped_prompt(prompt: &str) -> Cow<'_, str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{backend_prompt, messages, model_options, title_from_output};
+    use super::{append_output, backend_prompt, messages, model_options, title_from_output};
 
     #[test]
     fn builds_short_tool_free_prompts() {
@@ -172,6 +181,13 @@ mod tests {
         assert!(rendered.contains("START"));
         assert!(rendered.ends_with("END"));
         assert!(rendered.contains("\n…\n"));
+    }
+
+    #[test]
+    fn bounds_streamed_model_output() {
+        let mut output = "x".repeat(super::MAX_OUTPUT_BYTES - 1);
+        append_output(&mut output, "y").unwrap();
+        assert!(append_output(&mut output, "z").is_err());
     }
 
     #[test]

@@ -1489,6 +1489,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
 
   readonly #closeThreadRenameDialog = (): void => {
     if (this.#threadRenameBusy) return;
+    this.#pendingThreadTabFocus = this.#renamingThreadId;
     this.#renamingThreadId = "";
     this.#threadRenameTitle = "";
     this.#threadRenameError = "";
@@ -1509,6 +1510,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       const updated = await services.protocol.updateThread(threadId, { title });
       if (this.#renamingThreadId !== threadId) return;
       store.upsertThread(updated);
+      this.#pendingThreadTabFocus = threadId;
       this.#renamingThreadId = "";
       this.#threadRenameTitle = "";
     } catch {

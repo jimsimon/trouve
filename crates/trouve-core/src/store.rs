@@ -71,6 +71,13 @@ CREATE TABLE IF NOT EXISTS session_create_requests (
   session_id TEXT NOT NULL UNIQUE REFERENCES sessions(id) ON DELETE CASCADE,
   request_fingerprint TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS session_branch_rename_intents (
+  session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+  old_branch TEXT NOT NULL,
+  new_branch TEXT NOT NULL,
+  title TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
 -- Provider-reported PR numbers are nominations, not authorization. Capture
 -- the session worktree's coherent checked-out branch and exact HEAD when the
 -- creator completes, then reconcile that immutable evidence with GitHub
@@ -766,6 +773,13 @@ WHERE usage.model = ''
 /// `CREATE TABLE IF NOT EXISTS` won't touch existing tables, so column
 /// additions are retried and "duplicate column" errors are ignored.
 const MIGRATIONS: &[&str] = &[
+    "CREATE TABLE IF NOT EXISTS session_branch_rename_intents (
+       session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+       old_branch TEXT NOT NULL,
+       new_branch TEXT NOT NULL,
+       title TEXT NOT NULL,
+       created_at TEXT NOT NULL
+     )",
     "ALTER TABLE session_create_requests ADD COLUMN request_fingerprint TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE workspaces ADD COLUMN closed INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE workspaces ADD COLUMN review_registration_generation INTEGER NOT NULL DEFAULT 0",
@@ -4992,6 +5006,14 @@ pub(crate) struct PersonaDeletionClaim {
     pub attempts: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SessionBranchRenameIntent {
+    pub session_id: String,
+    pub old_branch: String,
+    pub new_branch: String,
+    pub title: String,
+}
+
 const PERSONA_DELETION_CLAIM_MINUTES: i64 = 5;
 
 pub(crate) struct PromptAcceptance {
@@ -5044,6 +5066,9 @@ enum StoreMutation {
         branch: Option<String>,
         archived: Option<bool>,
         expected_title: Option<String>,
+    },
+    CompleteSessionBranchRename {
+        intent: SessionBranchRenameIntent,
     },
     UpdateThread {
         id: String,
@@ -5489,7 +5514,10 @@ fn update_thread_row(conn: &Connection, id: &str, request: &UpdateThreadRequest)
             request.expected_title
         ],
     )?;
-    anyhow::ensure!(updated == 1, "thread {id} no longer exists");
+    anyhow::ensure!(
+        updated == 1,
+        "thread {id} no longer exists or its title no longer matches"
+    );
     Ok(())
 }
 
@@ -5787,6 +5815,21 @@ fn apply_store_mutation(
             *archived,
             expected_title.as_deref(),
         )?,
+        StoreMutation::CompleteSessionBranchRename { intent } => {
+            update_session_row(
+                conn,
+                &intent.session_id,
+                None,
+                Some(&intent.new_branch),
+                None,
+                Some(&intent.title),
+            )?;
+            let deleted = conn.execute(
+                "DELETE FROM session_branch_rename_intents WHERE session_id = ?1",
+                params![intent.session_id],
+            )?;
+            anyhow::ensure!(deleted == 1, "session branch rename intent disappeared");
+        }
         StoreMutation::UpdateThread {
             id,
             title,
@@ -7326,17 +7369,32 @@ impl Store {
     /// Filtering in SQLite avoids loading potentially large tool-output and
     /// reasoning events merely to discard them in the naming path.
     pub fn thread_naming_events(&self, thread_id: &str) -> Result<Vec<Event>> {
+        const EDGE_ROWS: i64 = 32;
         let payloads = {
             let conn = self.conn.lock().unwrap();
             let mut stmt = conn.prepare_cached(
-                "SELECT payload FROM events
-                 WHERE scope_kind = 'thread' AND scope_id = ?1
-                   AND json_extract(payload, '$.type') IN (
-                     'user.message', 'turn.steered', 'assistant.message'
+                "SELECT payload FROM (
+                   SELECT cursor, payload FROM (
+                     SELECT cursor, payload FROM events
+                     WHERE scope_kind = 'thread' AND scope_id = ?1
+                       AND json_extract(payload, '$.type') IN (
+                         'user.message', 'turn.steered', 'assistant.message'
+                       )
+                     ORDER BY cursor ASC LIMIT ?2
                    )
-                 ORDER BY cursor",
+                   UNION
+                   SELECT cursor, payload FROM (
+                     SELECT cursor, payload FROM events
+                     WHERE scope_kind = 'thread' AND scope_id = ?1
+                       AND json_extract(payload, '$.type') IN (
+                         'user.message', 'turn.steered', 'assistant.message'
+                       )
+                     ORDER BY cursor DESC LIMIT ?2
+                   )
+                 ) ORDER BY cursor",
             )?;
-            let rows = stmt.query_map(params![thread_id], |row| row.get::<_, String>(0))?;
+            let rows =
+                stmt.query_map(params![thread_id, EDGE_ROWS], |row| row.get::<_, String>(0))?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
         };
         let mut events = Vec::with_capacity(payloads.len());
@@ -7862,7 +7920,100 @@ impl Store {
             },
         )?;
         Ok(self
-            .append_pending_events(pending)?
+            .append_pending_events_isolated(pending)?
+            .pop()
+            .expect("one lifecycle event returns one envelope"))
+    }
+
+    pub(crate) fn stage_session_branch_rename(
+        &self,
+        intent: &SessionBranchRenameIntent,
+    ) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO session_branch_rename_intents
+               (session_id, old_branch, new_branch, title, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(session_id) DO UPDATE SET
+               old_branch = excluded.old_branch,
+               new_branch = excluded.new_branch,
+               title = excluded.title,
+               created_at = excluded.created_at",
+            params![
+                intent.session_id,
+                intent.old_branch,
+                intent.new_branch,
+                intent.title,
+                chrono::Utc::now().to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn session_branch_rename_intents(&self) -> Result<Vec<SessionBranchRenameIntent>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT session_id, old_branch, new_branch, title
+             FROM session_branch_rename_intents ORDER BY created_at",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(SessionBranchRenameIntent {
+                session_id: row.get(0)?,
+                old_branch: row.get(1)?,
+                new_branch: row.get(2)?,
+                title: row.get(3)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn session_branch_rename_intent(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<SessionBranchRenameIntent>> {
+        self.conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT session_id, old_branch, new_branch, title
+                 FROM session_branch_rename_intents WHERE session_id = ?1",
+                params![session_id],
+                |row| {
+                    Ok(SessionBranchRenameIntent {
+                        session_id: row.get(0)?,
+                        old_branch: row.get(1)?,
+                        new_branch: row.get(2)?,
+                        title: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn clear_session_branch_rename_intent(&self, session_id: &str) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "DELETE FROM session_branch_rename_intents WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn complete_session_branch_rename_with_event(
+        &self,
+        intent: SessionBranchRenameIntent,
+        workspace_id: String,
+    ) -> Result<EventEnvelope> {
+        let event = Event::SessionUpdated {
+            session_id: intent.session_id.clone(),
+            workspace_id,
+        };
+        let pending = serialize_lifecycle_events(
+            vec![(Scope::Server, event)],
+            StoreMutation::CompleteSessionBranchRename { intent },
+        )?;
+        Ok(self
+            .append_pending_events_isolated(pending)?
             .pop()
             .expect("one lifecycle event returns one envelope"))
     }
@@ -7892,7 +8043,7 @@ impl Store {
             },
         )?;
         let envelope = self
-            .append_pending_events(pending)?
+            .append_pending_events_isolated(pending)?
             .pop()
             .expect("one lifecycle event returns one envelope");
         Ok(envelope)
@@ -19844,6 +19995,52 @@ mod tests {
         let got = store.session("se_1").unwrap().unwrap();
         assert_eq!(got.title, "after");
         assert!(!got.archived);
+    }
+
+    #[test]
+    fn branch_rename_intent_survives_until_branch_and_event_commit() {
+        let store = Store::open_in_memory().unwrap();
+        let workspace = Workspace {
+            id: "ws_branch_rename".into(),
+            name: "x".into(),
+            path: "/tmp/repo-branch-rename".into(),
+        };
+        store.insert_workspace(&workspace).unwrap();
+        let session = Session {
+            id: "se_branch_rename".into(),
+            workspace_id: workspace.id.clone(),
+            title: "New Session".into(),
+            branch: "trouve/session-id".into(),
+            worktree_path: "/tmp/wt-branch-rename".into(),
+            base_ref: "main".into(),
+            archived: false,
+            active: false,
+            created_at: chrono::Utc::now(),
+        };
+        store.insert_session(&session).unwrap();
+        let intent = SessionBranchRenameIntent {
+            session_id: session.id.clone(),
+            old_branch: session.branch.clone(),
+            new_branch: "trouve/fix-authentication".into(),
+            title: "Fix Authentication".into(),
+        };
+
+        store.stage_session_branch_rename(&intent).unwrap();
+        assert_eq!(
+            store.session_branch_rename_intents().unwrap(),
+            vec![intent.clone()]
+        );
+        store
+            .update_session(&session.id, Some(&intent.title), None)
+            .unwrap();
+        store
+            .complete_session_branch_rename_with_event(intent.clone(), workspace.id)
+            .unwrap();
+
+        let committed = store.session(&session.id).unwrap().unwrap();
+        assert_eq!(committed.title, intent.title);
+        assert_eq!(committed.branch, intent.new_branch);
+        assert!(store.session_branch_rename_intents().unwrap().is_empty());
     }
 
     #[tokio::test]

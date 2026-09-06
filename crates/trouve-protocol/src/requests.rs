@@ -579,8 +579,9 @@ pub struct ThreadViewQuery {
     pub turn_aligned: Option<bool>,
 }
 
-/// Partial thread title/settings update between turns. Rejected with a
-/// conflict while a turn is running. Omitted fields are unchanged.
+/// Partial thread title/settings update. Title-only updates remain available
+/// during a turn; model, mode, option, and permission changes are rejected
+/// until the turn is idle. Omitted fields are unchanged.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct UpdateThreadRequest {
     #[serde(skip_serializing_if = "Option::is_none")]

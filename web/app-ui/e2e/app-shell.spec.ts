@@ -410,9 +410,7 @@ test("session navigation shows configured branch names", async ({ page }, testIn
   await expect(row.locator(".session-branch")).toHaveText("feature");
   await expect(row).toHaveCSS("height", "46px");
   await expect(row.locator(".session-copy strong")).toHaveCSS("white-space", "nowrap");
-  const wrapper = row.locator("..");
   const age = row.locator(".session-age");
-  const actions = wrapper.getByRole("button", { name: "Actions for Protocol ingress" });
   await expect(age).toHaveText(/^(?:now|\d+[mhdy])$/u);
   await expect(row).toHaveClass(/without-status/u);
   await expect(age).toHaveCSS("grid-column-start", "3");
@@ -420,17 +418,11 @@ test("session navigation shows configured branch names", async ({ page }, testIn
     getComputedStyle(element).gridTemplateColumns.split(" ").length)).toBe(3);
   if (testInfo.project.name.startsWith("mobile")) {
     await expect(age).toHaveCSS("opacity", "0");
-    await expect(actions).toHaveCSS("opacity", "1");
   } else {
     await expect(age).toHaveCSS("opacity", "1");
-    await expect(actions).toHaveCSS("opacity", "0");
-    await wrapper.hover();
-    await expect(age).toHaveCSS("opacity", "0");
-    await expect(actions).toHaveCSS("opacity", "1");
-    await page.mouse.move(0, 0);
-    await actions.focus();
-    await expect(age).toHaveCSS("opacity", "0");
-    await expect(actions).toHaveCSS("opacity", "1");
+    await row.click({ button: "right" });
+    await expect(page.getByRole("menu", { name: "Actions for Protocol ingress" })).toBeVisible();
+    await page.keyboard.press("Escape");
 
     const workspace = page.locator(".workspace-row").filter({ hasText: "trouve" }).first();
     await expect(workspace).toHaveCSS("position", "sticky");

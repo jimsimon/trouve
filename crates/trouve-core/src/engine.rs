@@ -36,7 +36,7 @@ use crate::permissions::{
 };
 use crate::store::{
     ArtifactCleanupClaim, ArtifactCleanupJob, CheckpointRow, PromptAcceptance,
-    ReviewWorkspaceCleanupIntent, SessionPrVerificationIntent, Store,
+    ReviewWorkspaceCleanupIntent, SessionBranchRenameIntent, SessionPrVerificationIntent, Store,
 };
 use crate::tools::{
     AttachmentMaterialization, AttachmentMaterializationFile, DeletedSessionCleanup,
@@ -7181,6 +7181,7 @@ impl Engine {
         prompt: &str,
         attachments: &[trouve_protocol::AttachmentUpload],
     ) -> Result<trouve_protocol::GeneratedTitle, EngineError> {
+        validate_attachment_uploads(attachments)?;
         let session = self.get_session(session_id)?;
         let settings = self.session_naming_settings();
         if settings.model.is_empty() {
@@ -7233,7 +7234,9 @@ impl Engine {
                 let mut output = String::new();
                 while let Some(event) = stream.next().await {
                     match event.map_err(|error| EngineError::BadRequest(error.to_string()))? {
-                        BackendEvent::TextDelta(delta) => output.push_str(&delta),
+                        BackendEvent::TextDelta(delta) => {
+                            crate::title_model::append_output(&mut output, &delta)?;
+                        }
                         BackendEvent::ToolStarted { .. }
                         | BackendEvent::ToolOutput { .. }
                         | BackendEvent::ToolCompleted { .. } => {
@@ -7282,7 +7285,7 @@ impl Engine {
                 if let ProviderEvent::TextDelta(delta) =
                     event.map_err(|error| EngineError::BadRequest(error.to_string()))?
                 {
-                    output.push_str(&delta);
+                    crate::title_model::append_output(&mut output, &delta)?;
                 }
             }
             crate::title_model::title_from_output(prompt, &output)
@@ -7307,6 +7310,11 @@ impl Engine {
                 .cmp(&right.created_at)
                 .then_with(|| left.id.cmp(&right.id))
         });
+        if threads.len() > 8 {
+            let tail = threads.split_off(threads.len() - 4);
+            threads.truncate(4);
+            threads.extend(tail);
+        }
         self.generate_title_from_transcript_threads(session_id, &threads)
             .await
     }
@@ -7369,6 +7377,7 @@ impl Engine {
                     context.push_str(": ");
                     context.push_str(content);
                     context.push('\n');
+                    context = crate::title_model::capped_prompt(&context).into_owned();
                 }
                 attachment_refs.extend(attachments);
             }
@@ -7404,7 +7413,17 @@ impl Engine {
                 if retained_bytes.saturating_add(attachment.size_bytes) > 20 * 1024 * 1024 {
                     continue;
                 }
-                let (_, bytes) = self.attachment(&attachment.id).await?;
+                let bytes = match self.attachment(&attachment.id).await {
+                    Ok((_, bytes)) => bytes,
+                    Err(EngineError::NotFound(_)) => {
+                        tracing::debug!(
+                            attachment_id = %attachment.id,
+                            "skipping unreadable attachment during transcript naming"
+                        );
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
                 retained_bytes = retained_bytes.saturating_add(attachment.size_bytes);
                 uploads.push(trouve_protocol::AttachmentUpload {
                     name: attachment.name,
@@ -11887,67 +11906,123 @@ impl Engine {
         Ok(updated)
     }
 
-    pub async fn rename_session_branch_for_title(
+    pub async fn update_session_and_rename_branch(
         &self,
         session_id: &str,
-        title: &str,
+        req: &UpdateSessionRequest,
     ) -> Result<Session, EngineError> {
+        let Some(title) = req.title.as_deref() else {
+            return self.update_session(session_id, req);
+        };
         if !self
             .session_naming_settings()
             .derive_branch_name_from_session_title
         {
-            return self.get_session(session_id);
+            return self.update_session(session_id, req);
         }
-        let session = self.get_session(session_id)?;
-        if session.title != title {
-            return Ok(session);
+
+        // Branch changes mutate the session worktree. Hold both the lifecycle
+        // lease and the same exclusive execution lane used by agent tools so
+        // deletion, restore, and active turns cannot race the rename.
+        let _lifecycle = self.session_lock(session_id).read_owned().await;
+        let _execution = self.tool_execution_lock(session_id).write_owned().await;
+        let mut session = self.get_session(session_id)?;
+        if let Some(pending) = self.store.session_branch_rename_intent(session_id)? {
+            if session.title == pending.title {
+                let rename = SessionBranchRename {
+                    managed_root: git::worktree_dir(&self.data_dir, ""),
+                    worktree: PathBuf::from(&session.worktree_path),
+                    old_branch: pending.old_branch.clone(),
+                    new_branch: pending.new_branch.clone(),
+                };
+                self.executor
+                    .rename_session_branch(&rename)
+                    .await
+                    .map_err(|error| EngineError::Internal(anyhow!(error)))?;
+                self.store.complete_session_branch_rename_with_event(
+                    pending,
+                    session.workspace_id.clone(),
+                )?;
+                session = self.get_session(session_id)?;
+            } else {
+                self.store.clear_session_branch_rename_intent(session_id)?;
+            }
         }
         let desired = session_branch_name(title, session_id, true);
         if desired == session.branch {
-            return Ok(session);
+            return self.update_session(session_id, req);
         }
-        let request = SessionBranchRename {
+        let intent = SessionBranchRenameIntent {
+            session_id: session_id.to_string(),
+            old_branch: session.branch.clone(),
+            new_branch: desired,
+            title: title.to_string(),
+        };
+        self.store.stage_session_branch_rename(&intent)?;
+        let updated = match self.update_session(session_id, req) {
+            Ok(session) => session,
+            Err(error) => {
+                let _ = self.store.clear_session_branch_rename_intent(session_id);
+                return Err(error);
+            }
+        };
+        let rename = SessionBranchRename {
             managed_root: git::worktree_dir(&self.data_dir, ""),
             worktree: PathBuf::from(&session.worktree_path),
-            old_branch: session.branch.clone(),
-            new_branch: desired.clone(),
+            old_branch: intent.old_branch.clone(),
+            new_branch: intent.new_branch.clone(),
         };
-        self.executor
-            .rename_session_branch(&request)
-            .await
-            .map_err(|error| EngineError::Internal(anyhow!(error)))?;
-        let current = self.get_session(session_id)?;
-        if current.title != title {
-            let rollback = SessionBranchRename {
-                managed_root: git::worktree_dir(&self.data_dir, ""),
-                worktree: PathBuf::from(&session.worktree_path),
-                old_branch: desired,
-                new_branch: session.branch,
-            };
-            let _ = self.executor.rename_session_branch(&rollback).await;
-            return Ok(current);
+        if let Err(error) = self.executor.rename_session_branch(&rename).await {
+            // The title update is already durable. Keep the intent so startup
+            // reconciliation can retry, and return the committed session
+            // instead of reporting that the whole PATCH failed.
+            tracing::warn!(session_id, %error, "session branch rename deferred for recovery");
+            return Ok(updated);
         }
-        if let Err(error) = self.store.update_session_with_event(
-            session_id,
-            None,
-            Some(&desired),
-            None,
-            Some(title),
-            Event::SessionUpdated {
-                session_id: session_id.to_string(),
-                workspace_id: session.workspace_id,
-            },
-        ) {
-            let rollback = SessionBranchRename {
-                managed_root: git::worktree_dir(&self.data_dir, ""),
-                worktree: PathBuf::from(&session.worktree_path),
-                old_branch: desired,
-                new_branch: session.branch,
-            };
-            let _ = self.executor.rename_session_branch(&rollback).await;
-            return Err(error.into());
-        }
+        self.store
+            .complete_session_branch_rename_with_event(intent, session.workspace_id)?;
         self.get_session(session_id)
+    }
+
+    /// Finish branch renames whose durable title update survived a crash or a
+    /// transient Git failure. Git rename is idempotent when it already won.
+    pub async fn reconcile_session_branch_renames(&self) {
+        let intents = match self.store.session_branch_rename_intents() {
+            Ok(intents) => intents,
+            Err(error) => {
+                tracing::warn!(%error, "failed to load session branch rename intents");
+                return;
+            }
+        };
+        for intent in intents {
+            let session_id = intent.session_id.clone();
+            let _lifecycle = self.session_lock(&session_id).read_owned().await;
+            let _execution = self.tool_execution_lock(&session_id).write_owned().await;
+            let Some(session) = self.store.session(&session_id).ok().flatten() else {
+                let _ = self.store.clear_session_branch_rename_intent(&session_id);
+                continue;
+            };
+            if session.title != intent.title {
+                let _ = self.store.clear_session_branch_rename_intent(&session_id);
+                continue;
+            }
+            let rename = SessionBranchRename {
+                managed_root: git::worktree_dir(&self.data_dir, ""),
+                worktree: PathBuf::from(&session.worktree_path),
+                old_branch: intent.old_branch.clone(),
+                new_branch: intent.new_branch.clone(),
+            };
+            if let Err(error) = self.executor.rename_session_branch(&rename).await {
+                tracing::warn!(session_id, %error, "session branch rename reconciliation deferred");
+                continue;
+            }
+            if let Err(error) = self
+                .store
+                .complete_session_branch_rename_with_event(intent, session.workspace_id)
+            {
+                tracing::warn!(session_id, %error, "failed to commit reconciled session branch rename");
+            }
+        }
     }
 
     pub async fn delete_session(&self, id: &str) -> Result<(), EngineError> {
@@ -12332,8 +12407,9 @@ impl Engine {
         Ok(self.store.list_thread_statuses(session_id)?)
     }
 
-    /// Change thread settings (mode/model/options) between turns. Conflicts
-    /// only while a turn is running on this thread.
+    /// Change a thread title or settings. Cosmetic title-only updates may run
+    /// during a turn; changes that affect inference wait for the thread to be
+    /// idle.
     pub fn update_thread(
         &self,
         id: &str,
@@ -12344,6 +12420,11 @@ impl Engine {
                 "expected_title requires a title update".into(),
             ));
         }
+        let title_only = req.title.is_some()
+            && req.mode.is_none()
+            && req.model.is_none()
+            && req.model_options.is_none()
+            && req.permission_mode.is_none();
         let thread = self.get_thread(id)?;
         if let Some(expected_title) = req.expected_title.as_deref()
             && thread.title.as_deref() != Some(expected_title)
@@ -12363,7 +12444,7 @@ impl Engine {
         // this thread until its settings update has been persisted. Sibling
         // threads have independent settings and do not block one another.
         let active_threads = self.active_threads.lock().unwrap();
-        if active_threads.contains_key(id) {
+        if active_threads.contains_key(id) && !title_only {
             return Err(EngineError::Conflict(
                 "cannot change thread settings while this thread is running a turn".into(),
             ));

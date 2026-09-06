@@ -2516,12 +2516,14 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     }
 
     this.#store.upsertSessionMetadata(session);
-    this.#upgradeSessionTitleInBackground(
-      session.id,
-      submittedCreateRequest.title,
-      prompt,
-      submissionAttachments,
-    );
+    if (retainedCreateRequest === undefined) {
+      this.#upgradeSessionTitleInBackground(
+        session.id,
+        submittedCreateRequest.title,
+        prompt,
+        submissionAttachments,
+      );
+    }
     let threadId: string | undefined;
     try {
       const thread = await this.#protocolClient.createThread(

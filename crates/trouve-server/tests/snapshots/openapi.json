@@ -14093,7 +14093,7 @@
       },
       "UpdateThreadRequest": {
         "type": "object",
-        "description": "Partial thread title/settings update between turns. Rejected with a\nconflict while a turn is running. Omitted fields are unchanged.",
+        "description": "Partial thread title/settings update. Title-only updates remain available\nduring a turn; model, mode, option, and permission changes are rejected\nuntil the turn is idle. Omitted fields are unchanged.",
         "properties": {
           "expected_title": {
             "type": [

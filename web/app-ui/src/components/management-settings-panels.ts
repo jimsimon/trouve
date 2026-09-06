@@ -210,6 +210,14 @@ export class TrouveSessionNamingSettings extends withSignalTracking(LitElement) 
     queueMicrotask(() => void this.#load());
   }
 
+  protected override updated(): void {
+    const select = this.renderRoot.querySelector<HTMLSelectElement>('select[name="model"]');
+    const model = this.#currentSettings()?.model ?? "";
+    if (select !== null && [...select.options].some((option) => option.value === model)) {
+      select.value = model;
+    }
+  }
+
   async #load(): Promise<void> {
     const services = this.#services.value;
     if (services === undefined) return;

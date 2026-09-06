@@ -3609,6 +3609,14 @@ pub fn push_branch(worktree: &Path, remote: &str, branch: &str) -> Result<()> {
 pub fn rename_session_branch(worktree: &Path, old_branch: &str, new_branch: &str) -> Result<()> {
     ensure_safe_ref(old_branch)?;
     ensure_safe_ref(new_branch)?;
+    let (current_branch, _) = checked_out_branch_head(worktree)?;
+    if current_branch == new_branch {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        current_branch == old_branch,
+        "worktree is on branch {current_branch}, expected {old_branch}"
+    );
     git(worktree, &["branch", "-m", old_branch, new_branch])?;
     Ok(())
 }
@@ -3650,6 +3658,14 @@ mod tests {
         init_repo(tmp.path());
         run(tmp.path(), &["switch", "-c", "trouve/session-id"]);
 
+        rename_session_branch(
+            tmp.path(),
+            "trouve/session-id",
+            "trouve/describe-authentication-failure",
+        )
+        .unwrap();
+        // Recovery may replay an intent after Git succeeded but before the
+        // corresponding store transaction committed.
         rename_session_branch(
             tmp.path(),
             "trouve/session-id",

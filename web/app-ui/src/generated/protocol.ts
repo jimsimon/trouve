@@ -5041,8 +5041,9 @@ export interface components {
             title?: string | null;
         };
         /**
-         * @description Partial thread title/settings update between turns. Rejected with a
-         *     conflict while a turn is running. Omitted fields are unchanged.
+         * @description Partial thread title/settings update. Title-only updates remain available
+         *     during a turn; model, mode, option, and permission changes are rejected
+         *     until the turn is idle. Omitted fields are unchanged.
          */
         UpdateThreadRequest: {
             /** @description Apply the generated title only while the persisted title still has this value. */
