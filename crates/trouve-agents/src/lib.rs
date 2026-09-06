@@ -610,7 +610,22 @@ impl BackendTurnActivity {
                 for cancel in cancellations {
                     cancel.cancel();
                 }
-                return;
+                let cancellation_deadline =
+                    tokio::time::Instant::now() + BACKEND_TURN_DRAIN_TIMEOUT;
+                loop {
+                    let idle = self.idle.notified();
+                    tokio::pin!(idle);
+                    idle.as_mut().enable();
+                    if self.state.lock().unwrap().active.is_empty() {
+                        return;
+                    }
+                    if tokio::time::timeout_at(cancellation_deadline, idle)
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
             }
         }
     }
@@ -1521,6 +1536,36 @@ mod tests {
         // Keep the exhausted handle alive through the assertion: EOF, not
         // destruction of the wrapper, must release the activity guard.
         assert!(exhausted.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn retirement_waits_for_cancelled_stream_cleanup_before_shutdown() {
+        let inner = Arc::new(DrainingTestBackend {
+            shutdowns: std::sync::atomic::AtomicUsize::new(0),
+            completes_immediately: false,
+        });
+        let backend = Arc::new(RetirementAwareBackend::new(inner.clone()));
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut turn = draining_test_turn();
+        turn.cancel = cancel.clone();
+        let stream = backend.run_turn(turn).await.unwrap();
+        let shutdown = tokio::spawn({
+            let backend = backend.clone();
+            async move { backend.shutdown().await }
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), cancel.cancelled())
+            .await
+            .expect("backend retirement did not cancel its retained turn");
+        assert_eq!(inner.shutdowns.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(1), shutdown)
+            .await
+            .expect("backend shutdown did not resume after cancellation cleanup")
+            .expect("backend shutdown task failed")
+            .expect("backend shutdown failed");
+        assert_eq!(inner.shutdowns.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
