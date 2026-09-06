@@ -3116,8 +3116,7 @@ impl RunProjection {
                     }
                     for text in blocks {
                         self.emitted_assistant_text = true;
-                        send_projected_event(events, cancel, BackendEvent::TextDelta(text))
-                            .await?;
+                        send_projected_event(events, cancel, BackendEvent::TextDelta(text)).await?;
                     }
                 }
                 "thinking" => {
