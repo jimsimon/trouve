@@ -7311,6 +7311,7 @@ impl Engine {
         let follower = {
             let mut jobs = self.title_jobs.lock().unwrap();
             if let Some(job) = jobs.get_mut(&key) {
+                job.waiters.retain(|waiter| !waiter.is_closed());
                 if job.waiters.len() >= MAX_TITLE_JOB_FOLLOWERS {
                     return Err(EngineError::BadRequest(
                         "too many callers are waiting for this title".into(),
@@ -24835,12 +24836,18 @@ mod tests {
         engine.title_jobs.lock().unwrap().clear();
         let follower_key =
             title_job_key(&session.id, "title-test/model", "Too many followers", &[]);
+        let mut follower_receivers = Vec::with_capacity(MAX_TITLE_JOB_FOLLOWERS);
+        let follower_senders = (0..MAX_TITLE_JOB_FOLLOWERS)
+            .map(|_| {
+                let (sender, receiver) = tokio::sync::oneshot::channel();
+                follower_receivers.push(receiver);
+                sender
+            })
+            .collect();
         engine.title_jobs.lock().unwrap().insert(
-            follower_key,
+            follower_key.clone(),
             TitleJobState {
-                waiters: (0..MAX_TITLE_JOB_FOLLOWERS)
-                    .map(|_| tokio::sync::oneshot::channel().0)
-                    .collect(),
+                waiters: follower_senders,
             },
         );
         let error = engine
@@ -24848,6 +24855,53 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("too many callers"));
+
+        drop(follower_receivers);
+        let follower = tokio::spawn({
+            let engine = engine.clone();
+            let session_id = session.id.clone();
+            async move {
+                engine
+                    .generate_title(&session_id, "Too many followers", &[])
+                    .await
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let waiter_count = engine
+                    .title_jobs
+                    .lock()
+                    .unwrap()
+                    .get(&follower_key)
+                    .map(|job| job.waiters.len());
+                if waiter_count == Some(1) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let live_waiter = engine
+            .title_jobs
+            .lock()
+            .unwrap()
+            .remove(&follower_key)
+            .unwrap()
+            .waiters;
+        assert_eq!(live_waiter.len(), 1);
+        live_waiter
+            .into_iter()
+            .next()
+            .unwrap()
+            .send(Ok(trouve_protocol::GeneratedTitle {
+                title: "Follower Capacity Recovered".into(),
+            }))
+            .unwrap();
+        assert_eq!(
+            follower.await.unwrap().unwrap().title,
+            "Follower Capacity Recovered"
+        );
     }
 
     #[tokio::test]

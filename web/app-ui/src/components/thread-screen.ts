@@ -1554,10 +1554,9 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     const startingTitle = this.#threadRenameTitle;
     const abort = new AbortController();
     this.#threadRenameGenerationAbort = abort;
-    const namingModel = readSignal(store.sessionNamingSettings)?.settings.model;
     const timeout = globalThis.setTimeout(
       () => abort.abort(),
-      titleGenerationTimeoutMs(namingModel),
+      titleGenerationTimeoutMs(),
     );
     this.#threadRenameGenerating = true;
     this.#threadRenameError = "";
@@ -6340,7 +6339,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
           const abort = new AbortController();
           const timeout = globalThis.setTimeout(
             () => abort.abort(),
-            titleGenerationTimeoutMs(namingModel),
+            titleGenerationTimeoutMs(),
           );
           try {
             const generated = await services.protocol.generateTitle(

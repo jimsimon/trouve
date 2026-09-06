@@ -2096,9 +2096,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     attachments: readonly ProtocolAttachmentUpload[],
   ): Promise<ProtocolGeneratedTitle> {
     const abort = new AbortController();
-    const timeoutMs = titleGenerationTimeoutMs(
-      readSignal(this.#store.sessionNamingSettings)?.settings.model,
-    );
+    const timeoutMs = titleGenerationTimeoutMs();
     const timeout = globalThis.setTimeout(() => abort.abort(), timeoutMs);
     try {
       return await this.#protocolClient.generateTitle(sessionId, prompt, attachments, {

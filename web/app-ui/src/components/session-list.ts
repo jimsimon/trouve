@@ -500,12 +500,9 @@ export class TrouveSessionList extends withSignalTracking(LitElement) {
     const startingTitle = this.#modalTitle;
     const abort = new AbortController();
     this.#generationAbort = abort;
-    const namingModel = this.#store.value === undefined
-      ? undefined
-      : readSignal(this.#store.value.sessionNamingSettings)?.settings.model;
     const timeout = globalThis.setTimeout(
       () => abort.abort(),
-      titleGenerationTimeoutMs(namingModel),
+      titleGenerationTimeoutMs(),
     );
     this.#generatingSessionId = sessionId;
     this.#requestError = "";
