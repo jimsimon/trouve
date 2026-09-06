@@ -278,9 +278,14 @@ findings, root-cause themes and recurrence evidence, prior candidate
 rejections, current external threads, and carried finding anchors. This
 structured history helps the review converge without suppressing reconsideration
 of code whose behavior changed. Reviewer output and a clean verdict from an
-older head are not reused as coverage of a future head. A successful published
-round with no open blocking findings makes the Check Run succeed immediately;
-there is no separate full-coverage confirmation round for current jobs. A
+older head are not reused as coverage of a future head. A round with open
+blocking findings is published as a review that requests changes; a clean
+round is published as an approval, which supersedes the earlier request on
+GitHub without a dismissal. GitHub forbids approving the app's own pull
+request, so a clean round there falls back to a comment review and dismisses
+the stale request explicitly. A successful published round with no open
+blocking findings also makes the Check Run succeed immediately; there is no
+separate full-coverage confirmation round for current jobs. A
 clean pre-8.0 partial result remains visibly pending while reconciliation makes
 an initial full-branch compatibility attempt and at most one automatic retry.
 If both attempts end without publication, the dashboards mark the state as
