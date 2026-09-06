@@ -26,12 +26,11 @@ const MAX_JOBS: usize = 16;
 const CLEANUP_RETRY_DELAY: Duration = Duration::from_millis(50);
 /// A cleanup that cannot be acknowledged is retried this many times (each
 /// attempt is itself bounded by the process-tree reap timeout) before the
-/// call reports the failure instead of holding the mutation lane for as long
-/// as the unowned process lives.
+/// call transfers ownership and releases the mutation lane.
 const CLEANUP_ACKNOWLEDGEMENT_ATTEMPTS: u32 = 3;
-/// How long a foreground call keeps draining stdout/stderr once its tree is
-/// done but a released daemon may still hold the pipes open.
-const RELEASED_PIPE_DRAIN: Duration = Duration::from_millis(200);
+/// How long a foreground call waits without stdout/stderr activity after its
+/// leader exits. Each new chunk resets the grace period.
+const POST_EXIT_PIPE_IDLE_GRACE: Duration = Duration::from_millis(200);
 /// Time a released daemon gets to exit after SIGTERM at worktree eviction
 /// before it is killed.
 const DETACHED_EXIT_GRACE: Duration = Duration::from_secs(2);
@@ -117,11 +116,6 @@ impl TreeRemnants {
         self.detached.is_empty()
             && self.terminated_escapees.is_empty()
             && self.stopped_after_eviction.is_empty()
-    }
-
-    /// Whether something outside the tree may still hold its stdio pipes.
-    fn may_hold_pipes(&self) -> bool {
-        !self.detached.is_empty() || !self.stopped_after_eviction.is_empty()
     }
 
     fn absorb(&mut self, other: Self) {
@@ -648,6 +642,28 @@ impl JobHandle {
     }
 }
 
+/// A foreground call whose bounded cleanup could not prove its tree empty.
+/// Ownership moves here before the tool returns so worktree eviction can
+/// retry cleanup instead of relying on a best-effort `Drop` signal.
+#[derive(Clone)]
+struct PendingTree {
+    child: Arc<tokio::sync::Mutex<ProcessTreeChild>>,
+    worktree: PathBuf,
+    _in_flight: Arc<InFlightCall>,
+}
+
+impl PendingTree {
+    async fn collect_remnants(&self, registry: &DetachedRegistry) {
+        let remnants = registry.adopt(&self.worktree, &mut *self.child.lock().await);
+        if !remnants.is_empty() {
+            tracing::info!(
+                worktree = %self.worktree.display(),
+                "retained foreground process tree produced cleanup remnants"
+            );
+        }
+    }
+}
+
 /// One background job: its shared handle and the model's read cursor.
 struct Job {
     handle: JobHandle,
@@ -670,11 +686,13 @@ struct JobOutput {
     cleanup_pending: bool,
 }
 
-/// Shared by the three shell tools; owns every background job and every
-/// daemon released from a shell call.
+/// Shared by the three shell tools; owns every background job, every
+/// daemon released from a shell call, and every foreground tree whose
+/// bounded cleanup has not yet been acknowledged.
 #[derive(Default)]
 pub struct JobRegistry {
     jobs: Mutex<HashMap<String, Job>>,
+    pending: Mutex<Vec<PendingTree>>,
     cleanup: Arc<CleanupController>,
     detached: Arc<DetachedRegistry>,
 }
@@ -735,6 +753,36 @@ async fn terminate_background_job_bounded(
     Err(warning)
 }
 
+async fn terminate_pending_tree(
+    cleanup: &CleanupController,
+    detached: &DetachedRegistry,
+    tree: &PendingTree,
+) -> std::io::Result<()> {
+    let result = cleanup.terminate_and_reap(&tree.child).await;
+    tree.collect_remnants(detached).await;
+    result.map(|_| ())
+}
+
+async fn terminate_pending_tree_bounded(
+    cleanup: &CleanupController,
+    detached: &DetachedRegistry,
+    tree: &PendingTree,
+) -> Result<(), String> {
+    let mut attempts = 0;
+    loop {
+        match terminate_pending_tree(cleanup, detached, tree).await {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                attempts += 1;
+                if attempts >= CLEANUP_ACKNOWLEDGEMENT_ATTEMPTS {
+                    return Err(unacknowledged_cleanup_warning(&error));
+                }
+                tokio::time::sleep(CLEANUP_RETRY_DELAY).await;
+            }
+        }
+    }
+}
+
 fn unacknowledged_cleanup_warning(error: &impl std::fmt::Display) -> String {
     format!(
         "process-tree cleanup was not acknowledged after \
@@ -755,6 +803,26 @@ enum ForegroundCleanup {
 }
 
 impl JobRegistry {
+    /// Transfer a foreground tree to the registry before returning an
+    /// unacknowledged cleanup result. The tree remains attached to its
+    /// session worktree and is retried when that worktree is evicted.
+    fn retain_foreground_tree(
+        &self,
+        worktree: &Path,
+        child: Arc<tokio::sync::Mutex<ProcessTreeChild>>,
+    ) {
+        let tree = PendingTree {
+            child,
+            worktree: worktree.to_path_buf(),
+            _in_flight: Arc::new(InFlightCall::begin(&self.detached, worktree)),
+        };
+        tracing::warn!(
+            worktree = %worktree.display(),
+            "retaining an unacknowledged foreground process tree for worktree cleanup"
+        );
+        self.pending.lock().unwrap().push(tree);
+    }
+
     /// Drop finished jobs until a slot is free; running jobs are never
     /// evicted. A job closed without its tree being proven empty goes only
     /// when no other finished job can, so eviction keeps its chance to
@@ -787,10 +855,10 @@ impl JobRegistry {
         }
     }
 
-    /// Stop every running job, and every daemon released from a shell call,
-    /// belonging to a worktree being removed. A job closed without its
-    /// tree being proven empty counts as running here: closing it spared
-    /// the caller a wait, not the tree an eviction.
+    /// Stop every running job, every unacknowledged foreground tree, and
+    /// every daemon released from a shell call belonging to a worktree being
+    /// removed. Closing a call or job without proving its tree empty spares
+    /// the caller a wait; it does not release ownership.
     pub async fn kill_worktree(&self, worktree: &Path) -> Result<(), String> {
         let jobs: Vec<(String, JobHandle)> = {
             let jobs = self.jobs.lock().unwrap();
@@ -803,6 +871,14 @@ impl JobRegistry {
                 .map(|(id, job)| (id.clone(), job.handle.clone()))
                 .collect()
         };
+        let pending: Vec<PendingTree> = self
+            .pending
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|tree| tree.worktree == worktree)
+            .cloned()
+            .collect();
         let mut failures = Vec::new();
         for (id, job) in jobs {
             // Bounded: the job is closed either way, so an unstoppable tree
@@ -813,8 +889,19 @@ impl JobRegistry {
                 failures.push(format!("{id}: {warning}"));
             }
         }
-        // Jobs first: stopping one can release further daemons for this
-        // worktree.
+        for tree in pending {
+            match terminate_pending_tree_bounded(&self.cleanup, &self.detached, &tree).await {
+                Ok(()) => {
+                    self.pending
+                        .lock()
+                        .unwrap()
+                        .retain(|known| !Arc::ptr_eq(&known.child, &tree.child));
+                }
+                Err(warning) => failures.push(format!("foreground tree: {warning}")),
+            }
+        }
+        // Owned trees first: stopping one can release further daemons for
+        // this worktree.
         failures.extend(self.detached.terminate_worktree(worktree).await);
         if failures.is_empty() {
             Ok(())
@@ -859,31 +946,49 @@ fn pump(
 struct Capture {
     buffer: Arc<Mutex<CapturedOutput>>,
     reader: tokio::task::JoinHandle<()>,
+    activity: tokio::sync::watch::Receiver<u64>,
 }
 
 impl Capture {
     fn start(stream: Option<impl tokio::io::AsyncRead + Unpin + Send + 'static>) -> Self {
         let buffer = Arc::new(Mutex::new(CapturedOutput::default()));
-        let reader = tokio::spawn(read_capped(stream, buffer.clone()));
-        Self { buffer, reader }
+        let (activity_tx, activity) = tokio::sync::watch::channel(0);
+        let reader = tokio::spawn(read_capped(stream, buffer.clone(), activity_tx));
+        Self {
+            buffer,
+            reader,
+            activity,
+        }
     }
 
     fn abort(&self) {
         self.reader.abort();
     }
 
-    /// Wait for end-of-file — at most `drain_limit` when something outside
-    /// the tree may hold the pipe — then take what was captured.
-    async fn finish(mut self, drain_limit: Option<Duration>) -> CapturedOutput {
-        match drain_limit {
+    /// Wait for end-of-file. When something outside the tree may hold the
+    /// pipe, stop only after the stream has been idle for `idle_limit`;
+    /// every new chunk starts a fresh grace period so late diagnostics are
+    /// not cut off by a deadline measured from leader exit.
+    async fn finish(mut self, idle_limit: Option<Duration>) -> CapturedOutput {
+        match idle_limit {
             None => {
                 let _ = (&mut self.reader).await;
             }
-            Some(limit) => {
-                if tokio::time::timeout(limit, &mut self.reader).await.is_err() {
-                    self.reader.abort();
+            Some(limit) => loop {
+                tokio::select! {
+                    _ = &mut self.reader => break,
+                    changed = self.activity.changed() => {
+                        if changed.is_err() {
+                            let _ = (&mut self.reader).await;
+                            break;
+                        }
+                    }
+                    _ = tokio::time::sleep(limit) => {
+                        self.reader.abort();
+                        break;
+                    }
                 }
-            }
+            },
         }
         std::mem::take(&mut *self.buffer.lock().unwrap())
     }
@@ -892,21 +997,27 @@ impl Capture {
 async fn read_capped(
     stream: Option<impl tokio::io::AsyncRead + Unpin>,
     sink: Arc<Mutex<CapturedOutput>>,
+    activity: tokio::sync::watch::Sender<u64>,
 ) {
     use tokio::io::AsyncReadExt as _;
 
     let Some(mut stream) = stream else { return };
+    let mut sequence = 0_u64;
     let mut buffer = [0u8; 8 * 1024];
     loop {
         let read = match stream.read(&mut buffer).await {
             Ok(0) | Err(_) => return,
             Ok(read) => read,
         };
-        let mut captured = sink.lock().unwrap();
-        let room = MAX_CAPTURE_BYTES.saturating_sub(captured.bytes.len());
-        let retained = read.min(room);
-        captured.bytes.extend_from_slice(&buffer[..retained]);
-        captured.truncated |= retained < read;
+        {
+            let mut captured = sink.lock().unwrap();
+            let room = MAX_CAPTURE_BYTES.saturating_sub(captured.bytes.len());
+            let retained = read.min(room);
+            captured.bytes.extend_from_slice(&buffer[..retained]);
+            captured.truncated |= retained < read;
+        }
+        sequence = sequence.wrapping_add(1);
+        activity.send_replace(sequence);
     }
 }
 
@@ -917,8 +1028,10 @@ async fn foreground_result(
     remnants: &TreeRemnants,
     cleanup_warning: Option<&str>,
 ) -> ToolResult {
-    let drain_limit = remnants.may_hold_pipes().then_some(RELEASED_PIPE_DRAIN);
-    let (stdout, stderr) = tokio::join!(stdout.finish(drain_limit), stderr.finish(drain_limit));
+    let (stdout, stderr) = tokio::join!(
+        stdout.finish(Some(POST_EXIT_PIPE_IDLE_GRACE)),
+        stderr.finish(Some(POST_EXIT_PIPE_IDLE_GRACE))
+    );
     let (stdout, stdout_truncated) = stdout.into_string();
     let (stderr, stderr_truncated) = stderr.into_string();
     let mut result = json!({
@@ -1056,6 +1169,10 @@ impl Tool for Shell {
                             (Some(error.clone()), Some(unacknowledged_cleanup_warning(error)))
                         }
                     };
+                    if matches!(&cleanup, ForegroundCleanup::Unacknowledged { .. }) {
+                        self.jobs
+                            .retain_foreground_tree(&ctx.worktree, child.clone());
+                    }
                     tracing::warn!(
                         %error,
                         retry_error = retry_error.as_deref(),
@@ -1099,8 +1216,8 @@ impl Shell {
     /// The engine owns the session mutation lane while this future is live;
     /// keeping the future pending therefore quarantines the lane while
     /// cleanup cannot be acknowledged. The retries are bounded: a tree that
-    /// still cannot be proven empty after them is reported and abandoned
-    /// rather than freezing the lane for as long as its stragglers live.
+    /// still cannot be proven empty is transferred to the registry before
+    /// the lane is released.
     async fn cleanup_foreground_until_acknowledged(
         &self,
         child: &Arc<tokio::sync::Mutex<ProcessTreeChild>>,
@@ -1155,6 +1272,10 @@ impl Shell {
         cleanup: ForegroundCleanup,
     ) -> ToolResult {
         let remnants = self.collect_foreground_remnants(ctx, child).await;
+        if matches!(&cleanup, ForegroundCleanup::Unacknowledged { .. }) {
+            self.jobs
+                .retain_foreground_tree(&ctx.worktree, child.clone());
+        }
         let message = match cleanup {
             ForegroundCleanup::Acknowledged {
                 retried_after: None,
@@ -1553,6 +1674,26 @@ mod tests {
             MAX_CAPTURE_BYTES
         );
         assert_eq!(res.result["truncated"], true);
+    }
+
+    #[tokio::test]
+    async fn foreground_capture_resets_its_idle_grace_on_each_chunk() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let (mut writer, reader) = tokio::io::duplex(1024);
+        let capture = Capture::start(Some(reader));
+        writer.write_all(b"first").await.unwrap();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            writer.write_all(b"-second").await.unwrap();
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            writer.write_all(b"-third").await.unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+
+        let output = capture.finish(Some(Duration::from_millis(60))).await;
+
+        assert_eq!(output.into_string().0, "first-second-third");
     }
 
     #[tokio::test]
@@ -2183,6 +2324,17 @@ mod tests {
         assert!(
             error.contains("injected shell process-tree cleanup failure"),
             "{error}"
+        );
+        assert_eq!(
+            shell.jobs.pending.lock().unwrap().len(),
+            1,
+            "the failed foreground cleanup was not retained"
+        );
+
+        shell.jobs.kill_worktree(tmp.path()).await.unwrap();
+        assert!(
+            shell.jobs.pending.lock().unwrap().is_empty(),
+            "worktree cleanup did not release the retained tree"
         );
     }
 
