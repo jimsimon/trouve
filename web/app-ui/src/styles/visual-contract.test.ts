@@ -212,8 +212,17 @@ describe("Trouve visual contract", () => {
     expect(app).toMatch(/\.primary-links \{[^}]*display:\s*flex/s);
     expect(app).toMatch(/\.primary-links button \{[^}]*height:\s*34px/s);
     expect(app).toContain(".navigation-icon-button:focus-visible::after");
-    expect(app).toContain(".navigation-panel > trouve-session-usage-panel");
-    expect(app).toMatch(/\.navigation-panel > trouve-session-usage-panel \{[^}]*position:\s*sticky/s);
+    expect(shell).toContain('<div class="workspace-scroll">');
+    expect(app).toMatch(/\.navigation-panel \{[^}]*display:\s*flex/s);
+    expect(app).toMatch(/\.navigation-panel \{[^}]*overflow:\s*hidden/s);
+    expect(app).toMatch(/\.workspace-scroll \{[^}]*overflow:\s*auto/s);
+    expect(app).toMatch(/\.navigation-panel \.workspace-row \{[^}]*position:\s*sticky/s);
+    expect(app).toMatch(/\.navigation-panel \.workspace-row \{[^}]*inset-block-start:\s*0/s);
+    expect(app).toMatch(/\.navigation-panel > trouve-session-usage-panel \{[^}]*flex:\s*none/s);
+    expect(app).not.toMatch(/\.navigation-panel > trouve-session-usage-panel \{[^}]*position:\s*sticky/s);
+    expect(app).toMatch(/\.session-usage-box \{[^}]*height:\s*196px/s);
+    expect(app).toMatch(/\.session-usage-box\.collapsed \{[^}]*height:\s*auto/s);
+    expect(app).toMatch(/\.session-usage-body \{[^}]*overflow-y:\s*auto/s);
     expect(app).toMatch(
       /\.session-usage-heading > small \{[^}]*overflow-wrap:\s*anywhere/s,
     );

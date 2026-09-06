@@ -11,11 +11,13 @@ import type {
   ProtocolUsageSummary,
 } from "../services/protocol-client.js";
 import { withSignalTracking } from "../state/reactivity.js";
+import { fontAwesomeIcon } from "./font-awesome-icon.js";
 import {
   boundedSubscriptionUsage,
   subscriptionUsageTone,
 } from "./model-health.js";
 import {
+  collapsedUsageSummary,
   latestCompletedTurnDuration,
   localMemoryUtilization,
   sessionUsagePanelKind,
@@ -35,6 +37,27 @@ const USAGE_PANEL_TABS = [
 ] as const satisfies readonly (readonly [UsagePanelTab, string])[];
 
 let nextSessionUsagePanelId = 0;
+
+const COLLAPSED_STORAGE_KEY = "trouve.usage-panel.v1";
+
+const loadCollapsed = (): boolean => {
+  try {
+    return globalThis.localStorage?.getItem(COLLAPSED_STORAGE_KEY) === "collapsed";
+  } catch {
+    return false;
+  }
+};
+
+const saveCollapsed = (collapsed: boolean): void => {
+  try {
+    globalThis.localStorage?.setItem(
+      COLLAPSED_STORAGE_KEY,
+      collapsed ? "collapsed" : "expanded",
+    );
+  } catch {
+    // Preference remains effective for this frontend lifetime.
+  }
+};
 
 const formatCount = (value: number): string =>
   new Intl.NumberFormat(undefined, { maximumFractionDigits: 0 }).format(value);
@@ -81,6 +104,7 @@ export class TrouveSessionUsagePanel extends withSignalTracking(LitElement) {
   #threadSummary: ProtocolUsageSummary | undefined;
   #localStatus: ProtocolLocalStatus | undefined;
   #activeTab: UsagePanelTab = "usage";
+  #collapsed = loadCollapsed();
   readonly #idPrefix = `session-usage-${nextSessionUsagePanelId += 1}`;
 
   protected override createRenderRoot(): HTMLElement {
@@ -115,21 +139,63 @@ export class TrouveSessionUsagePanel extends withSignalTracking(LitElement) {
       hasSubscriptionHealth: this.#health !== undefined,
     });
     const placeholder = kind === "placeholder";
+    const bodyId = `${this.#idPrefix}-body`;
+    const collapseButton = html`
+      <button
+        class="session-usage-collapse"
+        type="button"
+        aria-expanded=${this.#collapsed ? "false" : "true"}
+        aria-controls=${bodyId}
+        aria-label=${this.#collapsed ? "Expand usage details" : "Collapse usage details"}
+        title=${this.#collapsed ? "Expand usage details" : "Collapse usage details"}
+        @click=${this.#toggleCollapsed}
+      >${fontAwesomeIcon(this.#collapsed ? "caret-up" : "caret-down")}</button>
+    `;
+    if (this.#collapsed) {
+      const summary = collapsedUsageSummary({
+        kind,
+        loading: this.#loading,
+        error: this.#error,
+        health: this.#health,
+        sessionCostUsd: this.#sessionSummary?.cost_usd,
+        localServerStatus: this.#localStatus?.server_status,
+      });
+      return html`
+        <section class="session-usage-box collapsed" aria-label="Usage details">
+          <header class="session-usage-heading">
+            <div class="session-usage-summary" id=${bodyId}>
+              <strong>Usage</strong>
+              <span class=${summary.tone === "neutral" || summary.tone === "ok" ? "" : `tone-${summary.tone}`}>${summary.text}</span>
+            </div>
+            ${collapseButton}
+          </header>
+        </section>
+      `;
+    }
     return html`
       <section class="session-usage-box" aria-label="Usage details">
         <header class="session-usage-heading">
           ${placeholder
             ? html`<strong>Usage</strong>`
             : html`${this.#renderTabs()}<small>${this.model}</small>`}
+          ${collapseButton}
         </header>
-        ${placeholder
-          ? html`<p class="session-usage-placeholder">
-              Subscription and model usage details will show here once a session is started.
-            </p>`
-          : this.#renderActive(kind)}
+        <div class="session-usage-body" id=${bodyId}>
+          ${placeholder
+            ? html`<p class="session-usage-placeholder">
+                Subscription and model usage details will show here once a session is started.
+              </p>`
+            : this.#renderActive(kind)}
+        </div>
       </section>
     `;
   }
+
+  readonly #toggleCollapsed = (): void => {
+    this.#collapsed = !this.#collapsed;
+    saveCollapsed(this.#collapsed);
+    this.requestUpdate();
+  };
 
   #renderActive(kind: Exclude<SessionUsagePanelKind, "placeholder">) {
     if (this.#loading) {

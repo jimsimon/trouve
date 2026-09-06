@@ -44,15 +44,17 @@ const entryLimit = mode === "desktop" ? 856_000 : 850_000;
 // combined graphs to 3,287,832 B for desktop and 3,272,977 B for PWA. The
 // advisory finding status, re-anchored line evidence, and the managed-agent
 // runtime status bring the combined protocol 8.3 graphs to 3,294,114 B and
-// 3,279,260 B; preserve less than 1 kB of headroom for each. Entry, worker,
-// and largest-chunk budgets below still prevent one bundle from hiding in the
-// aggregate.
-const totalJavaScriptLimit = mode === "desktop" ? 3_295_000 : 3_280_000;
+// 3,279,260 B. The collapsible usage footer with its persisted state and
+// collapsed summary brings them to 3,296,049 B and 3,281,194 B; preserve
+// less than 2 kB of headroom for each. Entry, worker, and largest-chunk
+// budgets below still prevent one bundle from hiding in the aggregate.
+const totalJavaScriptLimit = mode === "desktop" ? 3_298_000 : 3_283_000;
 // Version-check, transcript-search, compact navigation, and the sticky
 // multi-mode usage panel with thread/session model rows plus workspace
-// organization styling bring the clean artifact to 190,958 B. Preserve less
-// than 2 kB of headroom.
-const totalStyleLimit = 192_000;
+// organization styling bring the clean artifact to 190,958 B. The pinned
+// sidebar chrome, sticky workspace headers, and collapsible usage footer
+// bring it to 193,215 B. Preserve less than 2 kB of headroom.
+const totalStyleLimit = 195_000;
 const limits = {
   entry: entryLimit,
   worker: 350_000,

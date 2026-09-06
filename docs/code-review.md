@@ -244,9 +244,20 @@ repository settings.
 
 Candidate findings are first checked against actual commentable diff lines. A
 separate final editor pass then verifies them against the repository, removes
-false positives and findings not introduced by the revision, merges semantic
-duplicates, corrects line metadata, and produces the published summary. The
-result is checked against diff lines again before it is sent to GitHub.
+false positives, classifies whether the revision caused each issue, merges
+semantic duplicates, corrects line metadata, and produces the review summary.
+The result is checked against diff lines again before it is sent to GitHub.
+Credible findings that are not mechanically tied to the revision remain in
+trouve's durable history and dashboard for later triage, but are excluded from
+GitHub comments, actionable counts, summaries, and remediation prompts.
+
+Blocking findings whose best anchor is outside the pull-request diff appear in
+the lifecycle comment under **Findings without inline threads**. A maintainer
+can resolve one as won't-fix with its displayed `@trouve-ai resolve` command.
+Resolved entries move into a collapsed **Resolved as won't-fix** disclosure,
+where struck-through issue text, an explicit disposition, and an `unresolve`
+command distinguish that decision from a code fix. Findings fixed in code
+leave the list automatically on the next review round.
 
 Later reviews receive bounded pull-request history: unresolved and dismissed
 findings, root-cause themes and recurrence evidence, prior candidate
