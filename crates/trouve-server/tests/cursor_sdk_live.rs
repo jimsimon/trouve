@@ -1000,8 +1000,24 @@ async fn replay_review_job(
         return Err("review job had no selected reviewer tasks".into());
     }
     let selected_tasks = tasks.len();
-    let repository =
-        std::env::current_dir().map_err(|error| format!("resolving repository root: {error}"))?;
+    let mut git = Command::new("git");
+    git.args(["rev-parse", "--show-toplevel"]);
+    let top_level = trouve_process::output(&mut git)
+        .map_err(|error| format!("resolving repository root: {error}"))?;
+    if !top_level.status.success() {
+        return Err(format!(
+            "resolving repository root: git rev-parse failed: {}",
+            String::from_utf8_lossy(&top_level.stderr).trim()
+        ));
+    }
+    let repository = PathBuf::from(
+        std::str::from_utf8(&top_level.stdout)
+            .map_err(|error| format!("decoding repository root: {error}"))?
+            .trim(),
+    );
+    if repository.as_os_str().is_empty() {
+        return Err("resolving repository root: git returned an empty path".into());
+    }
     let workspace: serde_json::Value = client
         .post(format!("{base}/workspaces"))
         .json(&serde_json::json!({ "path": repository }))
@@ -1160,7 +1176,7 @@ async fn run_synthetic_review_qualification(
 
 Untrusted pull-request evidence:
 diff --git a/src/retry.rs b/src/retry.rs
-@@ -17,7 +17,7 @@ fn should_retry(attempts: usize, max_attempts: usize) -> bool {
+@@ -18,4 +18,4 @@ fn should_retry(attempts: usize, max_attempts: usize) -> bool {
 -    if attempts >= max_attempts {
 +    if attempts > max_attempts {
          return false;
@@ -1174,9 +1190,10 @@ Return an empty findings array only when there is no actionable issue."#;
 
 Untrusted pull-request evidence:
 diff --git a/src/handler.rs b/src/handler.rs
-@@ -1,5 +1,5 @@
+@@ -1 +1 @@
 -use crate::authorization::{authorize, Request};
 +use crate::authorization::{authorize_cached, Request};
+@@ -3,3 +3,3 @@
  pub fn handle_admin_request(request: &Request) -> bool {
 -    authorize(request)
 +    authorize_cached(request)

@@ -226,8 +226,10 @@ TROUVE_E2E=1 CURSOR_API_KEY=... \
 The UI fragment form above and a direct
 `/v1/code-review/jobs/{id}` API URL are both accepted. The recorded git objects
 must already exist in the local repository. Use
-`CURSOR_E2E_REVIEW_TASK_LIMIT` for a paid smoke subset and
+`CURSOR_E2E_REVIEW_TASK_LIMIT` (1 to 128) for a paid smoke subset and
 `CURSOR_E2E_REVIEW_CONCURRENCY` (default 8, maximum 16) to control parallelism.
+A job with more than 128 selected reviewer tasks requires an explicit
+`CURSOR_E2E_REVIEW_TASK_LIMIT`; an unset limit rejects that replay.
 The test prints aggregate and per-task `tool.requested` counts grouped by tool
 name, so future restrictions can be based on evidence rather than intuition.
 
