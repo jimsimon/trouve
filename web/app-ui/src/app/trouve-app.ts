@@ -114,7 +114,7 @@ import {
   type ProtocolSubscriptionHealth,
 } from "../services/protocol-client.js";
 import {
-  TITLE_GENERATION_SHIMMER_MS,
+  beginTitleGeneration,
   titleGenerationTimeoutMs,
 } from "../services/title-generation.js";
 import { createBrowserThreadIngress } from "../services/thread-ingress.js";
@@ -2109,11 +2109,6 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     }
   }
 
-  #usesManagedLocalNaming(): boolean {
-    return readSignal(this.#store.sessionNamingSettings)?.settings.model.startsWith("local/")
-      ?? false;
-  }
-
   /** Upgrade a prompt-derived title without delaying session creation or the
    * first turn. A manual rename made while generation is in flight wins. */
   #upgradeSessionTitleInBackground(
@@ -2123,13 +2118,12 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     attachments: readonly ProtocolAttachmentUpload[],
     sharedGeneration?: Promise<ProtocolGeneratedTitle>,
   ): void {
-    this.#store.beginSessionTitleGeneration(sessionId, provisionalTitle);
-    const waitingTimer = this.#usesManagedLocalNaming()
-      ? globalThis.setTimeout(
-          () => this.#store.markSessionTitleGenerationWaiting(sessionId, provisionalTitle),
-          TITLE_GENERATION_SHIMMER_MS,
-        )
-      : undefined;
+    const waitingTimer = beginTitleGeneration(
+      this.#store,
+      sessionId,
+      provisionalTitle,
+      readSignal(this.#store.sessionNamingSettings)?.settings.model,
+    );
     void (async () => {
       try {
         const generated = await (sharedGeneration
@@ -2146,7 +2140,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
         // Naming is cosmetic; the placeholder remains.
       } finally {
         if (waitingTimer !== undefined) globalThis.clearTimeout(waitingTimer);
-        this.#store.endSessionTitleGeneration(sessionId);
+        this.#store.endTitleGeneration(sessionId);
       }
     })();
   }
@@ -2158,13 +2152,12 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     attachments: readonly ProtocolAttachmentUpload[],
     sharedGeneration?: Promise<ProtocolGeneratedTitle>,
   ): void {
-    this.#store.beginThreadTitleGeneration(threadId, provisionalTitle);
-    const waitingTimer = this.#usesManagedLocalNaming()
-      ? globalThis.setTimeout(
-          () => this.#store.markThreadTitleGenerationWaiting(threadId, provisionalTitle),
-          TITLE_GENERATION_SHIMMER_MS,
-        )
-      : undefined;
+    const waitingTimer = beginTitleGeneration(
+      this.#store,
+      threadId,
+      provisionalTitle,
+      readSignal(this.#store.sessionNamingSettings)?.settings.model,
+    );
     void (async () => {
       try {
         const sessionId = this.#store.thread(threadId)?.session_id;
@@ -2182,7 +2175,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
         // Naming is cosmetic; the placeholder or a user rename remains.
       } finally {
         if (waitingTimer !== undefined) globalThis.clearTimeout(waitingTimer);
-        this.#store.endThreadTitleGeneration(threadId);
+        this.#store.endTitleGeneration(threadId);
       }
     })();
   }

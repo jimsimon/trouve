@@ -33,7 +33,8 @@ import type {
   ProtocolUsageSummary,
 } from "../services/protocol-client.js";
 import {
-  TITLE_GENERATION_SHIMMER_MS,
+  beginTitleGeneration,
+  LOCAL_MODEL_WAITING_LABEL,
   titleGenerationTimeoutMs,
 } from "../services/title-generation.js";
 import type { ComposerDraft } from "../services/composer-drafts.js";
@@ -1764,9 +1765,9 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       index: number,
     ) => {
       const label = labelForThread(candidate);
-      const titleGeneration = store.threadTitleGenerationPresentation(candidate.id)
+      const titleGeneration = store.titleGenerationPresentation(candidate.id)
         ?? (candidate.id === initialThreadId
-          ? store.sessionTitleGenerationPresentation(this.sessionId)
+          ? store.titleGenerationPresentation(this.sessionId)
           : undefined);
       const titleShimmer = titleGeneration === "shimmer";
       const titleWaiting = titleGeneration === "waiting";
@@ -1777,8 +1778,6 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         || (indicator.kind === "busy" ? "Processing" : "");
       const accessibleLabel = titleShimmer
         ? "Naming thread…"
-        : titleWaiting
-          ? `${label}, Waiting for the local model`
         : statusLabel === "" ? label : `${label}, ${statusLabel}`;
       return html`
         <span class="thread-tab-item" role="presentation" @contextmenu=${(event: MouseEvent) => this.#openThreadTabContextMenu(event, candidate.id)}>
@@ -1790,7 +1789,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
             aria-label=${accessibleLabel}
             title=${titleShimmer
               ? "Naming thread…"
-              : titleWaiting ? "Waiting for the local model." : label}
+              : titleWaiting ? LOCAL_MODEL_WAITING_LABEL : label}
             data-thread-tab-id=${candidate.id}
             aria-selected=${!newThreadSetupOpen && candidate.id === this.threadId ? "true" : "false"}
             tabindex=${rovingTabIndex(index, selectedTabIndex, threadTabCount)}
@@ -1822,6 +1821,9 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
               ? nothing
               : html`<span class="thread-todo-progress">${threadTodoProgress(candidate.todos)}</span>`}
           </button>
+          ${titleWaiting
+            ? html`<span class="visually-hidden" role="status">${LOCAL_MODEL_WAITING_LABEL}</span>`
+            : nothing}
           <span
             class="thread-tab-close"
             aria-hidden="true"
@@ -6330,18 +6332,13 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         prompt !== ""
         || (event.detail.initialMessage?.attachments?.length ?? 0) > 0
       ) {
-        store.beginThreadTitleGeneration(thread.id, NEW_THREAD_TITLE_FALLBACK);
         const namingModel = readSignal(store.sessionNamingSettings)?.settings.model;
-        const localNaming = namingModel?.startsWith("local/") ?? false;
-        const waitingTimer = localNaming
-          ? globalThis.setTimeout(
-              () => store.markThreadTitleGenerationWaiting(
-                thread.id,
-                NEW_THREAD_TITLE_FALLBACK,
-              ),
-              TITLE_GENERATION_SHIMMER_MS,
-            )
-          : undefined;
+        const waitingTimer = beginTitleGeneration(
+          store,
+          thread.id,
+          NEW_THREAD_TITLE_FALLBACK,
+          namingModel,
+        );
         void (async () => {
           const abort = new AbortController();
           const timeout = globalThis.setTimeout(
@@ -6367,7 +6364,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
           } finally {
             globalThis.clearTimeout(timeout);
             if (waitingTimer !== undefined) globalThis.clearTimeout(waitingTimer);
-            store.endThreadTitleGeneration(thread.id);
+            store.endTitleGeneration(thread.id);
           }
         })();
       }

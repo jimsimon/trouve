@@ -842,9 +842,21 @@ impl LocalInferenceScheduler {
     }
 
     async fn acquire_foreground(self: &Arc<Self>) -> Result<LocalInferenceLease> {
+        self.acquire_foreground_after_check(|| {}).await
+    }
+
+    async fn acquire_foreground_after_check(
+        self: &Arc<Self>,
+        mut after_check: impl FnMut(),
+    ) -> Result<LocalInferenceLease> {
         let mut waiter = ForegroundWaiter::register(self.clone());
         loop {
             let changed = self.changed.notified();
+            tokio::pin!(changed);
+            // Notify::notify_waiters does not retain a permit. Register this
+            // waiter before inspecting the predicate so a release in the
+            // check-to-await gap cannot be lost.
+            changed.as_mut().enable();
             {
                 let mut state = self.state.lock().unwrap();
                 if !state.active {
@@ -856,13 +868,23 @@ impl LocalInferenceScheduler {
                     });
                 }
             }
+            after_check();
             changed.await;
         }
     }
 
     async fn acquire_background(self: &Arc<Self>) -> LocalInferenceLease {
+        self.acquire_background_after_check(|| {}).await
+    }
+
+    async fn acquire_background_after_check(
+        self: &Arc<Self>,
+        mut after_check: impl FnMut(),
+    ) -> LocalInferenceLease {
         loop {
             let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
             {
                 let mut state = self.state.lock().unwrap();
                 if !state.active && state.foreground_waiters == 0 {
@@ -872,6 +894,7 @@ impl LocalInferenceScheduler {
                     };
                 }
             }
+            after_check();
             changed.await;
         }
     }
@@ -1518,6 +1541,43 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn release_between_state_check_and_wait_wakes_both_priorities() {
+        let scheduler = Arc::new(LocalInferenceScheduler::default());
+        let active = scheduler
+            .acquire(InferencePriority::Foreground)
+            .await
+            .unwrap();
+        let active = Arc::new(std::sync::Mutex::new(Some(active)));
+        let foreground = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            scheduler.acquire_foreground_after_check({
+                let active = active.clone();
+                move || drop(active.lock().unwrap().take())
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        drop(foreground);
+
+        let active = scheduler
+            .acquire(InferencePriority::Foreground)
+            .await
+            .unwrap();
+        let active = Arc::new(std::sync::Mutex::new(Some(active)));
+        let background = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            scheduler.acquire_background_after_check({
+                let active = active.clone();
+                move || drop(active.lock().unwrap().take())
+            }),
+        )
+        .await
+        .unwrap();
+        drop(background);
     }
 
     #[test]
