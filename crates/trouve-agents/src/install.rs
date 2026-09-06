@@ -1303,6 +1303,25 @@ fn create_install_stage(root: &Path, version: &str) -> std::io::Result<PathBuf> 
     Ok(stage)
 }
 
+fn finish_install_into(
+    stage: &Path,
+    progress: &Progress,
+    result: Result<PathBuf, InstallError>,
+) -> Result<PathBuf, InstallError> {
+    if progress.cancelled() {
+        let _ = std::fs::remove_dir_all(stage);
+        return Err(InstallError::Cancelled);
+    }
+    let bin_rel = match result {
+        Ok(rel) => rel,
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(stage);
+            return Err(error);
+        }
+    };
+    Ok(bin_rel)
+}
+
 /// Download and verify `version` of `id` into a staging directory without
 /// changing the active managed runtime. Call [`PreparedInstall::activate`]
 /// only after any runtime-specific teardown is complete.
@@ -1335,13 +1354,7 @@ pub async fn prepare_install(
     drop(activation_lock);
 
     let result = install_into(&stage, id, &version, progress).await;
-    let bin_rel = match result {
-        Ok(rel) => rel,
-        Err(e) => {
-            let _ = std::fs::remove_dir_all(&stage);
-            return Err(e);
-        }
-    };
+    let bin_rel = finish_install_into(&stage, progress, result)?;
 
     Ok(PreparedInstall {
         data_dir,
@@ -2943,6 +2956,24 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
                 .count(),
             0
         );
+    }
+
+    #[test]
+    fn cancellation_after_install_completion_removes_the_stage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stage = tmp.path().join("completed-stage");
+        std::fs::create_dir(&stage).unwrap();
+        std::fs::write(stage.join("codex"), "prepared runtime").unwrap();
+        let progress = Progress::default();
+        progress
+            .cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        assert!(matches!(
+            finish_install_into(&stage, &progress, Ok(PathBuf::from("codex"))),
+            Err(InstallError::Cancelled)
+        ));
+        assert!(!stage.exists());
     }
 
     #[test]
