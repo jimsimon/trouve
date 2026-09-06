@@ -227,9 +227,9 @@ Server scope:
   reachability flipped; while offline `/v1/models` lists only models that
   run without internet, and clients gate prompt entry on that list
   (`ServerInfo.online` carries the same state for initial fetches)
-- `settings.git_worktrees_updated` `{settings}` — full replacement snapshot
-  after the session-title model's load policy, installation progress, or
-  runtime state changes
+- `settings.session_naming_updated` `{settings}` — full replacement snapshot
+  after the configured naming model or title-derived branch preference changes;
+  legacy `settings.git_worktrees_updated` rows remain decodable but are ignored
 - `settings.code_review_updated` `{settings}` — full replacement snapshot
   after the automated-review total, reviewer, or final-editor deadline
   changes

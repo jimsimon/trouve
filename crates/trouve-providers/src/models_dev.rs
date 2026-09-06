@@ -80,6 +80,8 @@ struct CatalogModel {
     #[serde(default)]
     tool_call: Option<bool>,
     #[serde(default)]
+    attachment: Option<bool>,
+    #[serde(default)]
     temperature: Option<bool>,
     #[serde(default)]
     reasoning_options: Vec<ReasoningOption>,
@@ -552,6 +554,7 @@ impl CatalogModel {
             },
             context_window: self.limit.context.unwrap_or(0),
             supports_tools: self.tool_call.unwrap_or(false),
+            supports_images: self.attachment.unwrap_or(false),
             input_price_per_mtok: self.cost.input,
             output_price_per_mtok: self.cost.output,
             options_schema: self.options_schema(dialect),
@@ -1166,6 +1169,7 @@ mod tests {
             .unwrap();
         assert_eq!(gpt.context_window, 1_050_000);
         assert_eq!(gpt.input_price_per_mtok, Some(5.0));
+        assert!(gpt.supports_images);
         assert_eq!(
             gpt.options_schema
                 .pointer("/properties/reasoning_effort/enum")

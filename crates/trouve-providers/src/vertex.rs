@@ -94,6 +94,18 @@ impl VertexProvider {
                     "role": "user",
                     "parts": [{"text": text}],
                 })),
+                Message::UserWithImages { content, images } => {
+                    let mut parts = vec![json!({"text": content})];
+                    parts.extend(images.iter().map(|image| {
+                        json!({
+                            "inlineData": {
+                                "mimeType": image.mime,
+                                "data": image.data,
+                            }
+                        })
+                    }));
+                    wire.push(json!({"role": "user", "parts": parts}));
+                }
                 Message::Assistant {
                     content,
                     tool_calls,

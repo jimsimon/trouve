@@ -25,8 +25,8 @@ export type ProtocolForkCheckpointResponse =
   ProtocolComponents["schemas"]["ForkCheckpointResponse"];
 export type ProtocolCreateSessionRequest =
   ProtocolComponents["schemas"]["CreateSessionRequest"];
-export type ProtocolGeneratedSessionTitle =
-  ProtocolComponents["schemas"]["GeneratedSessionTitle"];
+export type ProtocolGeneratedTitle =
+  ProtocolComponents["schemas"]["GeneratedTitle"];
 export type ProtocolUpdateSessionRequest =
   ProtocolComponents["schemas"]["UpdateSessionRequest"];
 export type ProtocolSessionSummary =
@@ -152,10 +152,10 @@ export type ProtocolCodeReviewRepository =
   ProtocolComponents["schemas"]["CodeReviewRepository"];
 export type ProtocolUpdateCodeReviewRepositoryRequest =
   ProtocolComponents["schemas"]["UpdateCodeReviewRepositoryRequest"];
-export type ProtocolGitWorktreeSettings =
-  ProtocolComponents["schemas"]["GitWorktreeSettings"];
-export type ProtocolSetGitWorktreeSettingsRequest =
-  ProtocolComponents["schemas"]["SetGitWorktreeSettingsRequest"];
+export type ProtocolSessionNamingSettings =
+  ProtocolComponents["schemas"]["SessionNamingSettings"];
+export type ProtocolSetSessionNamingSettingsRequest =
+  ProtocolComponents["schemas"]["SetSessionNamingSettingsRequest"];
 
 export interface ProtocolCursorSnapshot<T> {
   readonly cursor: number;
@@ -198,7 +198,7 @@ interface ProtocolValidators {
   readonly session: ValidateFunction;
   readonly sessions: ValidateFunction;
   readonly forkCheckpointResponse: ValidateFunction;
-  readonly generatedSessionTitle: ValidateFunction;
+  readonly generatedTitle: ValidateFunction;
   readonly summaries: ValidateFunction;
   readonly workspace: ValidateFunction;
   readonly workspaces: ValidateFunction;
@@ -237,7 +237,7 @@ interface ProtocolValidators {
   readonly githubAppStatus: ValidateFunction;
   readonly reviewerProfile: ValidateFunction;
   readonly codeReviewRepository: ValidateFunction;
-  readonly gitWorktreeSettings: ValidateFunction;
+  readonly sessionNamingSettings: ValidateFunction;
   readonly githubIntegration: ValidateFunction;
   readonly mcpServers: ValidateFunction;
   readonly mcpLogs: ValidateFunction;
@@ -326,7 +326,6 @@ const validateResponse = async <T>(
     | "Session"
     | "Session[]"
     | "ForkCheckpointResponse"
-    | "GeneratedSessionTitle"
     | "SessionSummariesSnapshot"
     | "Workspace"
     | "Workspace[]"
@@ -367,7 +366,8 @@ const validateResponse = async <T>(
     | "GithubAppStatus"
     | "ReviewerProfile"
     | "CodeReviewRepository"
-    | "GitWorktreeSettings"
+    | "GeneratedTitle"
+    | "SessionNamingSettings"
     | "GithubIntegration"
     | "McpServerInfo[]"
     | "McpLogs"
@@ -433,7 +433,7 @@ const MAX_PROTOCOL_ERROR_FIELD_LENGTH = 512;
 // unions. A newer schema can therefore add a value this bundle cannot decode
 // even when the server labels the change additive. Require the exact schema
 // version this client was generated and tested against.
-export const SUPPORTED_PROTOCOL_VERSION = "8.3";
+export const SUPPORTED_PROTOCOL_VERSION = "9.1";
 
 export const assertProtocolCompatibility = (version: string): void => {
   if (version !== SUPPORTED_PROTOCOL_VERSION) {
@@ -684,17 +684,49 @@ export class ProtocolClient {
     );
   }
 
-  generateSessionTitle(
+  generateTitle(
+    sessionId: string,
     prompt: string,
+    attachments: readonly ProtocolAttachmentUpload[] = [],
     options: { readonly signal?: AbortSignal } = {},
-  ): Promise<ProtocolGeneratedSessionTitle> {
+  ): Promise<ProtocolGeneratedTitle> {
     return this.#validatedMutation(
-      "/v1/session-title",
-      "generate session title",
+      "/v1/title",
+      "generate title",
       "POST",
-      "GeneratedSessionTitle",
-      (loaded) => loaded.generatedSessionTitle,
-      { prompt },
+      "GeneratedTitle",
+      (loaded) => loaded.generatedTitle,
+      { session_id: sessionId, prompt, attachments: [...attachments] },
+      options.signal,
+    );
+  }
+
+  generateSessionTitleSuggestion(
+    sessionId: string,
+    options: { readonly signal?: AbortSignal } = {},
+  ): Promise<ProtocolGeneratedTitle> {
+    return this.#validatedMutation(
+      `/v1/sessions/${encodeURIComponent(sessionId)}/title-suggestion`,
+      "generate session title suggestion",
+      "POST",
+      "GeneratedTitle",
+      (loaded) => loaded.generatedTitle,
+      undefined,
+      options.signal,
+    );
+  }
+
+  generateThreadTitleSuggestion(
+    threadId: string,
+    options: { readonly signal?: AbortSignal } = {},
+  ): Promise<ProtocolGeneratedTitle> {
+    return this.#validatedMutation(
+      `/v1/threads/${encodeURIComponent(threadId)}/title-suggestion`,
+      "generate thread title suggestion",
+      "POST",
+      "GeneratedTitle",
+      (loaded) => loaded.generatedTitle,
+      undefined,
       options.signal,
     );
   }
@@ -1334,65 +1366,49 @@ export class ProtocolClient {
     );
   }
 
-  gitWorktreeSettings(): Promise<ProtocolGitWorktreeSettings> {
+  sessionNamingSettings(): Promise<ProtocolSessionNamingSettings> {
     return this.#validatedJson(
-      "/v1/config/git-worktrees",
+      "/v1/config/session-naming",
       "Session naming settings",
-      "GitWorktreeSettings",
-      (loaded) => loaded.gitWorktreeSettings,
+      "SessionNamingSettings",
+      (loaded) => loaded.sessionNamingSettings,
     );
   }
 
-  gitWorktreeSettingsSnapshot(): Promise<
-    ProtocolCursorSnapshot<ProtocolGitWorktreeSettings>
+  sessionNamingSettingsSnapshot(): Promise<
+    ProtocolCursorSnapshot<ProtocolSessionNamingSettings>
   > {
     return this.#validatedCursorJson(
-      "/v1/config/git-worktrees",
+      "/v1/config/session-naming",
       "Session naming settings",
-      "GitWorktreeSettings",
-      (loaded) => loaded.gitWorktreeSettings,
+      "SessionNamingSettings",
+      (loaded) => loaded.sessionNamingSettings,
     );
   }
 
-  setGitWorktreeSettings(
-    request: ProtocolSetGitWorktreeSettingsRequest,
-  ): Promise<ProtocolGitWorktreeSettings> {
+  setSessionNamingSettings(
+    request: ProtocolSetSessionNamingSettingsRequest,
+  ): Promise<ProtocolSessionNamingSettings> {
     return this.#validatedMutation(
-      "/v1/config/git-worktrees",
+      "/v1/config/session-naming",
       "save session naming settings",
       "PUT",
-      "GitWorktreeSettings",
-      (loaded) => loaded.gitWorktreeSettings,
+      "SessionNamingSettings",
+      (loaded) => loaded.sessionNamingSettings,
       request,
     );
   }
 
-  setGitWorktreeSettingsSnapshot(
-    request: ProtocolSetGitWorktreeSettingsRequest,
-  ): Promise<ProtocolCursorSnapshot<ProtocolGitWorktreeSettings>> {
+  setSessionNamingSettingsSnapshot(
+    request: ProtocolSetSessionNamingSettingsRequest,
+  ): Promise<ProtocolCursorSnapshot<ProtocolSessionNamingSettings>> {
     return this.#validatedCursorMutation(
-      "/v1/config/git-worktrees",
+      "/v1/config/session-naming",
       "save session naming settings",
       "PUT",
-      "GitWorktreeSettings",
-      (loaded) => loaded.gitWorktreeSettings,
+      "SessionNamingSettings",
+      (loaded) => loaded.sessionNamingSettings,
       request,
-    );
-  }
-
-  async installTitleModel(): Promise<void> {
-    await this.#mutation(
-      "/v1/config/git-worktrees/title-model/install",
-      "install title model",
-      "POST",
-    );
-  }
-
-  async cancelTitleModelInstall(): Promise<void> {
-    await this.#mutation(
-      "/v1/config/git-worktrees/title-model/install",
-      "cancel title model install",
-      "DELETE",
     );
   }
 

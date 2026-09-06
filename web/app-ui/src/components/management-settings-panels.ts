@@ -7,7 +7,8 @@ import {
 } from "../contexts/app-contexts.js";
 import type {
   ProtocolGithubIntegration,
-  ProtocolGitWorktreeSettings,
+  ProtocolModelInfo,
+  ProtocolSessionNamingSettings,
   ProtocolMcpLogs,
   ProtocolMcpServerInfo,
   ProtocolUpsertMcpServerRequest,
@@ -21,6 +22,7 @@ import {
   sessionMcpEnvironmentLines,
 } from "./session-mcp-model.js";
 import { fontAwesomeIcon } from "./font-awesome-icon.js";
+import { modelSelectorLabel } from "./model-option-controls.js";
 
 const MCP_REFRESH_MS = 30_000;
 const MCP_LOG_REFRESH_MS = 2_000;
@@ -156,85 +158,6 @@ const panelStyles = css`
 const genericFailure = (action: string): string =>
   `${action} failed. Check server connectivity and configuration, then retry.`;
 
-type TitleModelLoadBehavior =
-  ProtocolGitWorktreeSettings["title_model_load_behavior"];
-type TitleModelResourcePolicy = NonNullable<
-  ProtocolGitWorktreeSettings["title_model_resource_policy"]
->;
-
-interface TitleModelOption<T extends string> {
-  readonly value: T;
-  readonly label: string;
-  readonly description: string;
-}
-
-const TITLE_MODEL_LOAD_OPTIONS = [
-  {
-    value: "auto",
-    label: "Adaptive (Recommended)",
-    description: "Keeps the naming model ready when this computer has comfortable memory headroom; otherwise loads it only when needed.",
-  },
-  {
-    value: "always",
-    label: "Keep Ready",
-    description: "Loads the naming model at startup and keeps it in memory for the fastest new-session creation.",
-  },
-  {
-    value: "on_demand",
-    label: "Load When Needed",
-    description: "Loads the naming model when a session is created, then releases it after a short idle period.",
-  },
-  {
-    value: "off",
-    label: "Rules Only",
-    description: "Uses fast built-in heuristics and never loads the optional naming model.",
-  },
-] as const satisfies readonly TitleModelOption<TitleModelLoadBehavior>[];
-
-const TITLE_MODEL_RESOURCE_OPTIONS = [
-  {
-    value: "adaptive",
-    label: "Adaptive (Recommended)",
-    description: "Uses GPU, CPU, and RAM when no local coding model is active; otherwise uses CPU and RAM only.",
-  },
-  {
-    value: "gpu_cpu_ram",
-    label: "GPU, CPU, & RAM",
-    description: "Lets llama.cpp use available GPU memory and spill remaining work to CPU and system RAM.",
-  },
-  {
-    value: "gpu_only",
-    label: "GPU Only",
-    description: "Requires every model layer to fit on a detected GPU; naming falls back to rules when it cannot.",
-  },
-  {
-    value: "cpu_ram_only",
-    label: "CPU & RAM Only",
-    description: "Keeps session naming entirely off the GPU and uses CPU plus system RAM.",
-  },
-] as const satisfies readonly TitleModelOption<TitleModelResourcePolicy>[];
-
-const isTitleModelLoadBehavior = (value: unknown): value is TitleModelLoadBehavior =>
-  typeof value === "string" &&
-  TITLE_MODEL_LOAD_OPTIONS.some((option) => option.value === value);
-
-const isTitleModelResourcePolicy = (value: unknown): value is TitleModelResourcePolicy =>
-  typeof value === "string" &&
-  TITLE_MODEL_RESOURCE_OPTIONS.some((option) => option.value === value);
-
-const titleModelOptionDescription = <T extends string>(
-  options: readonly TitleModelOption<T>[],
-  value: T,
-): string => options.find((option) => option.value === value)?.description ?? "";
-
-const titleModelLoadDescription = (
-  value: TitleModelLoadBehavior,
-): string => titleModelOptionDescription(TITLE_MODEL_LOAD_OPTIONS, value);
-
-const titleModelResourceDescription = (
-  value: TitleModelResourcePolicy,
-): string => titleModelOptionDescription(TITLE_MODEL_RESOURCE_OPTIONS, value);
-
 const isSafeHttps = (value: string): boolean => {
   try {
     const url = new URL(value);
@@ -265,7 +188,7 @@ const githubConnectionSource = (source: string): string => {
   return "token";
 };
 
-export class TrouveGitWorktreeSettings extends withSignalTracking(LitElement) {
+export class TrouveSessionNamingSettings extends withSignalTracking(LitElement) {
   static override styles = panelStyles;
 
   readonly #services = new ContextConsumer(this, {
@@ -276,31 +199,38 @@ export class TrouveGitWorktreeSettings extends withSignalTracking(LitElement) {
     context: appStoreContext,
     subscribe: true,
   });
-  #settings: ProtocolGitWorktreeSettings | undefined;
+  #settings: ProtocolSessionNamingSettings | undefined;
+  #models: readonly ProtocolModelInfo[] = [];
   #busy = false;
   #message = "";
   #error = false;
-  #draftDeriveBranchName: boolean | undefined;
-  #draftLoadBehavior: TitleModelLoadBehavior | undefined;
-  #draftResourcePolicy: TitleModelResourcePolicy | undefined;
 
   override connectedCallback(): void {
     super.connectedCallback();
     queueMicrotask(() => void this.#load());
   }
 
+  protected override updated(): void {
+    const select = this.renderRoot.querySelector<HTMLSelectElement>('select[name="model"]');
+    const model = this.#currentSettings()?.model ?? "";
+    if (select !== null && [...select.options].some((option) => option.value === model)) {
+      select.value = model;
+    }
+  }
+
   async #load(): Promise<void> {
-    const protocol = this.#services.value?.protocol;
-    if (protocol === undefined) return;
+    const services = this.#services.value;
+    if (services === undefined) return;
     this.#busy = true;
     this.#message = "Loading session naming settings…";
     this.#error = false;
     this.requestUpdate();
     try {
-      const snapshot = await protocol.gitWorktreeSettingsSnapshot();
-      this.#store.value?.replaceGitWorktreeSettings(snapshot.cursor, snapshot.value);
+      const models = services.modelCatalog.refresh("if-stale").catch(() => this.#models);
+      const snapshot = await services.protocol.sessionNamingSettingsSnapshot();
+      this.#store.value?.replaceSessionNamingSettings(snapshot.cursor, snapshot.value);
       this.#settings = snapshot.value;
-      this.#clearDraft();
+      this.#models = await models;
       this.#message = "";
     } catch {
       this.#message = genericFailure("Loading settings");
@@ -315,41 +245,23 @@ export class TrouveGitWorktreeSettings extends withSignalTracking(LitElement) {
     event.preventDefault();
     const protocol = this.#services.value?.protocol;
     if (protocol === undefined || this.#busy) return;
-    const current = this.#currentSettings();
     const data = new FormData(event.currentTarget as HTMLFormElement);
-    const deriveBranchName = this.#draftDeriveBranchName ??
-      data.has("derive_branch_name");
-    const submittedBehavior = data.get("load_behavior");
-    const submittedResources = data.get("resource_policy");
-    const behavior = this.#draftLoadBehavior ?? (
-      isTitleModelLoadBehavior(submittedBehavior)
-        ? submittedBehavior
-        : current?.title_model_load_behavior ?? "auto"
-    );
-    // The resource picker is disabled in Rules Only mode, so FormData omits
-    // it. Preserve the selected resource policy for switching the model back
-    // on instead of silently discarding the submit.
-    const resources = this.#draftResourcePolicy ?? (
-      isTitleModelResourcePolicy(submittedResources)
-        ? submittedResources
-        : current?.title_model_resource_policy ?? "adaptive"
-    );
+    const model = String(data.get("model") ?? "").trim();
+    const deriveBranchName = data.has("derive_branch_name");
+    if (model === "") return;
     this.#busy = true;
     this.#message = "Saving…";
     this.#error = false;
     this.requestUpdate();
     try {
-      const snapshot = await protocol.setGitWorktreeSettingsSnapshot({
+      const snapshot = await protocol.setSessionNamingSettingsSnapshot({
+        model,
         derive_branch_name_from_session_title: deriveBranchName,
-        title_model_load_behavior: behavior,
-        title_model_resource_policy: resources,
       });
-      this.#store.value?.replaceGitWorktreeSettings(snapshot.cursor, snapshot.value);
+      this.#store.value?.replaceSessionNamingSettings(snapshot.cursor, snapshot.value);
       this.#settings = snapshot.value;
-      this.#clearDraft();
-      this.#message = "Session naming settings saved.";
+      this.#message = "Session naming model saved.";
     } catch {
-      this.#clearDraft();
       this.#message = genericFailure("Saving settings");
       this.#error = true;
     } finally {
@@ -358,121 +270,44 @@ export class TrouveGitWorktreeSettings extends withSignalTracking(LitElement) {
     }
   }
 
-  #currentSettings(): ProtocolGitWorktreeSettings | undefined {
+  #currentSettings(): ProtocolSessionNamingSettings | undefined {
     return this.#store.value === undefined
       ? this.#settings
-      : readSignal(this.#store.value.gitWorktreeSettings)?.settings ?? this.#settings;
-  }
-
-  #selectionChanged(event: Event): void {
-    const form = (event.currentTarget as HTMLSelectElement).form;
-    const behaviorSelect = form?.elements.namedItem("load_behavior");
-    const resourceSelect = form?.elements.namedItem("resource_policy");
-    const deriveBranchName = form?.elements.namedItem("derive_branch_name");
-    if (
-      form === null ||
-      !(behaviorSelect instanceof HTMLSelectElement) ||
-      !(resourceSelect instanceof HTMLSelectElement) ||
-      !(deriveBranchName instanceof HTMLInputElement) ||
-      !isTitleModelLoadBehavior(behaviorSelect.value) ||
-      !isTitleModelResourcePolicy(resourceSelect.value)
-    ) return;
-    // Keep both selections locally while the auto-save is in flight. This
-    // makes the selected option and its explanation update in the same frame.
-    this.#draftLoadBehavior = behaviorSelect.value;
-    this.#draftResourcePolicy = resourceSelect.value;
-    this.#draftDeriveBranchName = deriveBranchName.checked;
-    this.requestUpdate();
-    form.requestSubmit();
-  }
-
-  #branchNamingChanged(event: Event): void {
-    const input = event.currentTarget as HTMLInputElement;
-    this.#draftDeriveBranchName = input.checked;
-    this.requestUpdate();
-    input.form?.requestSubmit();
-  }
-
-  #clearDraft(): void {
-    this.#draftDeriveBranchName = undefined;
-    this.#draftLoadBehavior = undefined;
-    this.#draftResourcePolicy = undefined;
-  }
-
-  async #install(cancel: boolean): Promise<void> {
-    const protocol = this.#services.value?.protocol;
-    if (protocol === undefined || this.#busy) return;
-    this.#busy = true;
-    this.#message = cancel ? "Cancelling title model install…" : "Starting title model install…";
-    this.#error = false;
-    this.requestUpdate();
-    try {
-      if (cancel) await protocol.cancelTitleModelInstall();
-      else await protocol.installTitleModel();
-      await this.#load();
-      this.#message = cancel
-        ? "Title model install cancelled."
-        : "Title model install started.";
-      this.requestUpdate();
-    } catch {
-      this.#message = genericFailure(cancel ? "Cancelling install" : "Starting install");
-      this.#error = true;
-      this.#busy = false;
-      this.requestUpdate();
-    }
+      : readSignal(this.#store.value.sessionNamingSettings)?.settings ?? this.#settings;
   }
 
   override render() {
     const settings = this.#currentSettings();
-    const model = settings?.title_model;
-    const total = model?.install_total ?? 0;
-    const value = model?.install_bytes ?? 0;
-    const deriveBranchName = this.#draftDeriveBranchName ??
-      settings?.derive_branch_name_from_session_title ?? false;
-    const behavior = this.#draftLoadBehavior ??
-      settings?.title_model_load_behavior ?? "auto";
-    const resources = this.#draftResourcePolicy ??
-      settings?.title_model_resource_policy ?? "adaptive";
+    const catalog = this.#services.value?.modelCatalog.current;
+    const liveModels = catalog === undefined ? [] : readSignal(catalog);
+    const models = liveModels.length === 0 ? this.#models : liveModels;
     return html`
       <div class="stack">
         <h2>Session naming</h2>
-        <p class="meta">trouve derives a concise title for each session before creating its worktree.</p>
+        <p class="meta">New sessions and threads appear immediately while the selected model names them in the background from their first prompt. Naming uses the model's lowest available reasoning level.</p>
         <form class="card naming-card" @submit=${(event: SubmitEvent) => void this.#save(event)}>
+          <label><span>Model</span><select required name="model" .value=${settings?.model ?? ""} ?disabled=${this.#busy || models.length === 0}>
+            <option value="" disabled>Choose model</option>
+            ${models.map((model) => html`<option value=${model.id}>${modelSelectorLabel(model)}${model.supports_images ? "" : " · Text only"}</option>`)}
+          </select></label>
+          <p class="meta">Text-only models can name requests from the written prompt but cannot inspect attached screenshots.</p>
           <label class="check-row">
             <input
               name="derive_branch_name"
               type="checkbox"
-              .checked=${deriveBranchName}
+              .checked=${settings?.derive_branch_name_from_session_title ?? false}
               ?disabled=${this.#busy}
-              @change=${this.#branchNamingChanged}
             />
             <span>Use session names in branch names</span>
           </label>
-          <p class="meta">Off by default: new branches use a compact name such as <code>trouve/abc123</code>. Turn this on to use names such as <code>trouve/session-name-abc123</code>. Existing branches are not renamed.</p>
-          <hr />
-          <h3>Optional naming model</h3>
-          <label><span class="visually-hidden">Load behavior</span><select name="load_behavior" .value=${behavior} ?disabled=${this.#busy} @change=${this.#selectionChanged}>
-              ${TITLE_MODEL_LOAD_OPTIONS.map((option) => html`<option value=${option.value}>${option.label}</option>`)}
-            </select></label>
-          <p class="meta">${titleModelLoadDescription(behavior)}</p>
-          <label><span>Compute resources</span><select name="resource_policy" .value=${resources} ?disabled=${this.#busy || behavior === "off"} @change=${this.#selectionChanged}>
-              ${TITLE_MODEL_RESOURCE_OPTIONS.map((option) => html`<option value=${option.value}>${option.label}</option>`)}
-            </select></label>
-          <p class="meta">${titleModelResourceDescription(resources)}</p>
-          <p class="meta">The optional model is about 640 MB to download. Changing compute resources restarts it when it is kept ready.</p>
-          <button class="visually-hidden-focusable" type="submit" ?disabled=${this.#busy || settings === undefined}>Save naming settings</button>
-          <hr />
-          <div class="row"><strong class=${model?.state === "error" ? "health-error" : model?.state === "ready" ? "health-ok" : ""}>${model?.state === "ready" ? "Ready" : model?.state === "loading" ? "Loading" : model?.state === "installing" ? "Installing" : model?.state === "stopped" ? "Available" : model?.state === "error" ? "Needs attention" : "Optional model not installed"}</strong><span class="grow"></span>
-          ${model?.state === "installing"
-            ? html`<button type="button" @click=${() => void this.#install(true)} ?disabled=${this.#busy}>Cancel</button>`
-            : model?.runtime_installed === true && model.model_downloaded
-              ? nothing
-              : behavior === "off"
-                ? nothing
-                : html`<button class="primary" type="button" @click=${() => void this.#install(false)} ?disabled=${this.#busy}>Install naming model</button>`}
-          </div>
-          ${model?.detail ? html`<p class="meta">${model.detail}</p>` : nothing}
-          ${model?.state === "installing" && total > 0 ? html`<progress max=${total} value=${value}>${value} / ${total}</progress>` : nothing}
+          <p class="meta">The compact branch is renamed after background naming completes. Existing remote branches are not renamed.</p>
+          ${models.length === 0 && !this.#busy
+            ? html`<div class="row" role="status">
+                <span class="meta">No models are available. Add a provider to choose a naming model.</span>
+                <button class="primary" type="button" @click=${() => this.#services.value?.router.navigate({ kind: "settings", section: "providers" })}>Add provider</button>
+              </div>`
+            : nothing}
+          <div class="row"><button type="submit" ?disabled=${this.#busy || models.length === 0}>Save</button></div>
         </form>
         ${this.#message === "" ? nothing : html`<p class="status ${this.#error ? "error" : ""}" role="status" aria-live="polite">${this.#message}</p>`}
       </div>
@@ -1121,13 +956,13 @@ export class TrouveIntegrationsSettings extends LitElement {
   }
 }
 
-customElements.define("trouve-git-worktree-settings", TrouveGitWorktreeSettings);
+customElements.define("trouve-session-naming-settings", TrouveSessionNamingSettings);
 customElements.define("trouve-mcp-settings", TrouveMcpSettings);
 customElements.define("trouve-integrations-settings", TrouveIntegrationsSettings);
 
 declare global {
   interface HTMLElementTagNameMap {
-    "trouve-git-worktree-settings": TrouveGitWorktreeSettings;
+    "trouve-session-naming-settings": TrouveSessionNamingSettings;
     "trouve-mcp-settings": TrouveMcpSettings;
     "trouve-integrations-settings": TrouveIntegrationsSettings;
   }

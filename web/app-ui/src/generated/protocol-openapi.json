@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "8.3"
+    "version": "9.1"
   },
   "paths": {
     "/v1/approvals": {
@@ -1382,10 +1382,10 @@
         }
       }
     },
-    "/v1/config/git-worktrees": {
+    "/v1/config/session-naming": {
       "get": {
         "tags": [],
-        "operationId": "get_git_worktree_settings",
+        "operationId": "get_session_naming_settings",
         "responses": {
           "200": {
             "description": "",
@@ -1402,7 +1402,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/GitWorktreeSettings"
+                  "$ref": "#/components/schemas/SessionNamingSettings"
                 }
               }
             }
@@ -1411,12 +1411,12 @@
       },
       "put": {
         "tags": [],
-        "operationId": "set_git_worktree_settings",
+        "operationId": "set_session_naming_settings",
         "requestBody": {
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/SetGitWorktreeSettingsRequest"
+                "$ref": "#/components/schemas/SetSessionNamingSettingsRequest"
               }
             }
           },
@@ -1438,57 +1438,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/GitWorktreeSettings"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/v1/config/git-worktrees/title-model/install": {
-      "post": {
-        "tags": [],
-        "operationId": "install_title_model",
-        "responses": {
-          "202": {
-            "description": ""
-          },
-          "409": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          }
-        }
-      },
-      "delete": {
-        "tags": [],
-        "operationId": "cancel_title_model_install",
-        "responses": {
-          "204": {
-            "description": ""
-          },
-          "404": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          },
-          "409": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
+                  "$ref": "#/components/schemas/SessionNamingSettings"
                 }
               }
             }
@@ -2798,34 +2748,6 @@
         }
       }
     },
-    "/v1/session-title": {
-      "post": {
-        "tags": [],
-        "operationId": "generate_session_title",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/GenerateSessionTitleRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/GeneratedSessionTitle"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
     "/v1/sessions": {
       "get": {
         "tags": [],
@@ -3920,6 +3842,55 @@
         }
       }
     },
+    "/v1/sessions/{id}/title-suggestion": {
+      "post": {
+        "tags": [],
+        "operationId": "generate_session_title_from_transcript",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Session whose conversation supplies the naming context",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GeneratedTitle"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/sessions/{id}/undo": {
       "post": {
         "tags": [],
@@ -4694,6 +4665,55 @@
         }
       }
     },
+    "/v1/threads/{id}/title-suggestion": {
+      "post": {
+        "tags": [],
+        "operationId": "generate_thread_title_from_transcript",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Thread whose conversation supplies the naming context",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GeneratedTitle"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/threads/{id}/tools/{call_id}": {
       "get": {
         "tags": [],
@@ -4845,6 +4865,44 @@
             }
           },
           "404": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/title": {
+      "post": {
+        "tags": [],
+        "operationId": "generate_title",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GenerateTitleRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GeneratedTitle"
+                }
+              }
+            }
+          },
+          "400": {
             "description": "",
             "content": {
               "application/json": {
@@ -9172,15 +9230,32 @@
           },
           {
             "type": "object",
-            "description": "The persisted session-naming settings or the session-title model's\ninstall/load state changed. Carries a full replacement snapshot so\nreplay and reconnect reconstruct the settings UI exactly.",
+            "description": "The configured model used for asynchronous session and thread naming changed.\nCarries a full replacement snapshot for replay and reconnect.",
             "required": [
               "settings",
               "type"
             ],
             "properties": {
               "settings": {
-                "$ref": "#/components/schemas/GitWorktreeSettings"
+                "$ref": "#/components/schemas/SessionNamingSettings"
               },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "settings.session_naming_updated"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Legacy protocol 8.1-and-earlier naming lifecycle snapshot. Retained only\nso existing durable event logs remain decodable after upgrading.",
+            "required": [
+              "settings",
+              "type"
+            ],
+            "properties": {
+              "settings": {},
               "type": {
                 "type": "string",
                 "enum": [
@@ -9318,54 +9393,36 @@
           }
         }
       },
-      "GenerateSessionTitleRequest": {
+      "GenerateTitleRequest": {
         "type": "object",
-        "description": "Ask the server to derive a concise title for a new session.",
+        "description": "Ask the configured naming model to derive a concise navigation title.",
         "required": [
+          "session_id",
           "prompt"
         ],
         "properties": {
+          "attachments": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AttachmentUpload"
+            }
+          },
           "prompt": {
             "type": "string"
+          },
+          "session_id": {
+            "$ref": "#/components/schemas/String"
           }
         }
       },
-      "GeneratedSessionTitle": {
+      "GeneratedTitle": {
         "type": "object",
         "required": [
-          "title",
-          "source"
+          "title"
         ],
         "properties": {
-          "source": {
-            "type": "string",
-            "description": "`model` or `heuristic`."
-          },
           "title": {
             "type": "string"
-          }
-        }
-      },
-      "GitWorktreeSettings": {
-        "type": "object",
-        "description": "Global session-naming settings shown under Settings → Sessions & Chat.",
-        "required": [
-          "title_model_load_behavior",
-          "title_model"
-        ],
-        "properties": {
-          "derive_branch_name_from_session_title": {
-            "type": "boolean",
-            "description": "Whether new session branches include a slug derived from the session\ntitle. False uses the compact `trouve/<short-id>` form."
-          },
-          "title_model": {
-            "$ref": "#/components/schemas/TitleModelStatus"
-          },
-          "title_model_load_behavior": {
-            "$ref": "#/components/schemas/TitleModelLoadBehavior"
-          },
-          "title_model_resource_policy": {
-            "$ref": "#/components/schemas/TitleModelResourcePolicy"
           }
         }
       },
@@ -10023,6 +10080,10 @@
               "null"
             ],
             "format": "double"
+          },
+          "supports_images": {
+            "type": "boolean",
+            "description": "Whether the model accepts image inputs. False for unknown/custom\nendpoints so clients do not imply that attachments will be inspected."
           },
           "supports_tools": {
             "type": "boolean"
@@ -12245,17 +12306,17 @@
         "required": [
           "github_pull_requests",
           "session_pull_requests",
-          "git_worktree_settings"
+          "session_naming_settings"
         ],
         "properties": {
-          "git_worktree_settings": {
-            "$ref": "#/components/schemas/GitWorktreeSettings"
-          },
           "github_pull_requests": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/GithubPrHostProjection"
             }
+          },
+          "session_naming_settings": {
+            "$ref": "#/components/schemas/SessionNamingSettings"
           },
           "session_pull_requests": {
             "type": "array",
@@ -12290,7 +12351,7 @@
           },
           "branch": {
             "type": "string",
-            "description": "Branch dedicated to this session. New sessions default to\n`trouve/<short-id>`; users may opt into `trouve/<slug>-<short-id>`."
+            "description": "Branch dedicated to this session. New sessions start as\n`trouve/<short-id>` and may be renamed to `trouve/<slug>-<short-id>`\nafter asynchronous naming."
           },
           "created_at": {
             "type": "string",
@@ -12401,6 +12462,24 @@
           },
           "path": {
             "type": "string"
+          }
+        }
+      },
+      "SessionNamingSettings": {
+        "type": "object",
+        "description": "Global asynchronous naming settings shown under Settings → Sessions & Chat.",
+        "required": [
+          "model",
+          "derive_branch_name_from_session_title"
+        ],
+        "properties": {
+          "derive_branch_name_from_session_title": {
+            "type": "boolean",
+            "description": "Rename the compact worktree branch after the session receives its name."
+          },
+          "model": {
+            "type": "string",
+            "description": "Provider-qualified configured model used for session and thread names."
           }
         }
       },
@@ -12600,28 +12679,6 @@
           }
         }
       },
-      "SetGitWorktreeSettingsRequest": {
-        "type": "object",
-        "description": "Update the Session Naming section under Settings → Sessions & Chat.",
-        "required": [
-          "title_model_load_behavior"
-        ],
-        "properties": {
-          "derive_branch_name_from_session_title": {
-            "type": [
-              "boolean",
-              "null"
-            ],
-            "description": "Omitted by older clients to preserve the current branch-naming mode."
-          },
-          "title_model_load_behavior": {
-            "$ref": "#/components/schemas/TitleModelLoadBehavior"
-          },
-          "title_model_resource_policy": {
-            "$ref": "#/components/schemas/TitleModelResourcePolicy"
-          }
-        }
-      },
       "SetGlobalDefaultsRequest": {
         "type": "object",
         "description": "Atomically replace the global defaults used by new threads\n(`PUT /v1/config/defaults`).",
@@ -12679,6 +12736,22 @@
               "null"
             ],
             "description": "Required for workspace scope: whose `.agents/.mcp.json` to edit."
+          }
+        }
+      },
+      "SetSessionNamingSettingsRequest": {
+        "type": "object",
+        "description": "Update the Session Naming section under Settings → Sessions & Chat.",
+        "required": [
+          "model",
+          "derive_branch_name_from_session_title"
+        ],
+        "properties": {
+          "derive_branch_name_from_session_title": {
+            "type": "boolean"
+          },
+          "model": {
+            "type": "string"
           }
         }
       },
@@ -13767,65 +13840,6 @@
           }
         }
       },
-      "TitleModelLoadBehavior": {
-        "type": "string",
-        "description": "When the dedicated session-title model should occupy memory.",
-        "enum": [
-          "auto",
-          "always",
-          "on_demand",
-          "off"
-        ]
-      },
-      "TitleModelResourcePolicy": {
-        "type": "string",
-        "description": "Compute resources the dedicated session-title model may use.",
-        "enum": [
-          "adaptive",
-          "gpu_cpu_ram",
-          "gpu_only",
-          "cpu_ram_only"
-        ]
-      },
-      "TitleModelStatus": {
-        "type": "object",
-        "description": "Runtime status for the managed session-title model.",
-        "required": [
-          "state",
-          "runtime_installed",
-          "model_downloaded"
-        ],
-        "properties": {
-          "detail": {
-            "type": "string",
-            "description": "Human-readable context for the settings screen."
-          },
-          "install_bytes": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          },
-          "install_stage": {
-            "type": "string",
-            "description": "Empty, `runtime`, or `model`."
-          },
-          "install_total": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          },
-          "model_downloaded": {
-            "type": "boolean"
-          },
-          "runtime_installed": {
-            "type": "boolean"
-          },
-          "state": {
-            "type": "string",
-            "description": "`not_installed`, `installing`, `stopped`, `loading`, `ready`, or\n`error`."
-          }
-        }
-      },
       "TodoItem": {
         "type": "object",
         "description": "One stable item in a thread's current todo list.",
@@ -14079,8 +14093,15 @@
       },
       "UpdateThreadRequest": {
         "type": "object",
-        "description": "Partial thread update between turns (mode/model switching). Rejected with\na conflict while a turn is running. Omitted fields are unchanged.",
+        "description": "Partial thread title/settings update. Title-only updates remain available\nduring a turn; model, mode, option, and permission changes are rejected\nuntil the turn is idle. Omitted fields are unchanged.",
         "properties": {
+          "expected_title": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Apply the generated title only while the persisted title still has this value."
+          },
           "mode": {
             "type": [
               "string",
@@ -14114,6 +14135,12 @@
               {
                 "$ref": "#/components/schemas/PermissionMode"
               }
+            ]
+          },
+          "title": {
+            "type": [
+              "string",
+              "null"
             ]
           }
         }

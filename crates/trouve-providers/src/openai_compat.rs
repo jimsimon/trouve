@@ -283,6 +283,18 @@ impl OpenAiCompatProvider {
             match m {
                 Message::System(s) => wire.push(json!({"role": "system", "content": s})),
                 Message::User(s) => wire.push(json!({"role": "user", "content": s})),
+                Message::UserWithImages { content, images } => {
+                    let mut parts = vec![json!({"type": "text", "text": content})];
+                    parts.extend(images.iter().map(|image| {
+                        json!({
+                            "type": "image_url",
+                            "image_url": {
+                                "url": format!("data:{};base64,{}", image.mime, image.data),
+                            }
+                        })
+                    }));
+                    wire.push(json!({"role": "user", "content": parts}));
+                }
                 Message::Assistant {
                     content,
                     tool_calls,
@@ -383,6 +395,7 @@ fn parse_gateway_models(provider_id: &str, body: &Value) -> Vec<trouve_protocol:
                     .unwrap_or_else(|| name.to_string()),
                 context_window: window,
                 supports_tools,
+                supports_images: false,
                 input_price_per_mtok: price("prompt"),
                 output_price_per_mtok: price("completion"),
                 options_schema: serde_json::json!({}),
@@ -429,6 +442,9 @@ fn apply_ollama_metadata(model: &mut trouve_protocol::ModelInfo, body: &Value) {
         model.supports_tools = capabilities
             .iter()
             .any(|capability| capability.as_str() == Some("tools"));
+        model.supports_images = capabilities
+            .iter()
+            .any(|capability| capability.as_str() == Some("vision"));
     }
 }
 
@@ -887,6 +903,7 @@ mod tests {
             display_name: "qwen3:8b".into(),
             context_window: 0,
             supports_tools: true,
+            supports_images: false,
             input_price_per_mtok: None,
             output_price_per_mtok: None,
             options_schema: json!({}),
@@ -903,6 +920,7 @@ mod tests {
         );
         assert_eq!(model.context_window, 262_144);
         assert!(model.supports_tools);
+        assert!(!model.supports_images);
     }
 
     #[test]
@@ -963,6 +981,7 @@ mod tests {
             display_name: "Stale".into(),
             context_window: 8_192,
             supports_tools: true,
+            supports_images: false,
             input_price_per_mtok: None,
             output_price_per_mtok: None,
             options_schema: json!({}),

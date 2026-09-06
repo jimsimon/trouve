@@ -27,6 +27,7 @@ import {
 } from "./workspace-session-list-model.js";
 
 let nextArchivedListId = 0;
+const TITLE_SUGGESTION_TIMEOUT_MS = 48_000;
 
 type OrganizedSessionListItem = SessionListItem & WorkspaceSessionListFields & {
   readonly pullRequestBadge: SessionPullRequestBadge | undefined;
@@ -71,10 +72,13 @@ export class TrouveSessionList extends withSignalTracking(LitElement) {
   statusFilter = 0b1_1111;
   pullRequestFilter = 0b1_1111;
   #menuSessionId = "";
+  #menuPosition = { x: 0, y: 0 };
   #editingSessionId = "";
   #deleteSessionId = "";
   #modalTitle = "";
   #busySessionId = "";
+  #generatingSessionId = "";
+  #generationAbort: AbortController | undefined;
   #requestError = "";
   readonly #expandedArchivedWorkspaceIds = new Set<string>();
   readonly #collapsedSessionSections = new Set<string>();
@@ -200,10 +204,11 @@ export class TrouveSessionList extends withSignalTracking(LitElement) {
               <form class="session-modal-layout" @submit=${(event: SubmitEvent) => this.#rename(event, this.#editingSessionId)}>
                 <h2 id=${this.#modalTitleId}>Rename session</h2>
                 <label class="visually-hidden" for=${`rename-${this.#editingSessionId}`}>Session title</label>
-                <input id=${`rename-${this.#editingSessionId}`} name="title" .value=${this.#modalTitle} maxlength="200" placeholder="Session title" required />
+                <input id=${`rename-${this.#editingSessionId}`} name="title" .value=${this.#modalTitle} @input=${(event: InputEvent) => { this.#modalTitle = (event.currentTarget as HTMLInputElement).value; }} maxlength="200" placeholder="Session title" required />
                 ${this.#requestError === "" ? nothing : html`<p class="dialog-error" role="alert">${this.#requestError}</p>`}
                 <footer>
                   <button data-session-modal-action="cancel" type="button" @click=${this.#closeActions}>Cancel</button>
+                  <button type="button" ?disabled=${this.#busySessionId === this.#editingSessionId || this.#generatingSessionId === this.#editingSessionId} @click=${() => void this.#generateRename(this.#editingSessionId)}>${this.#generatingSessionId === this.#editingSessionId ? "Generating…" : "Generate"}</button>
                   <button class="primary" type="submit" ?disabled=${this.#busySessionId === this.#editingSessionId}>Rename</button>
                 </footer>
               </form>
@@ -274,6 +279,7 @@ export class TrouveSessionList extends withSignalTracking(LitElement) {
     const pullRequestBadge = session.pullRequestBadge;
     const indicator = sessionIndicatorPresentation(session);
     const age = sessionAgePresentation(session.updatedAt, now);
+    const titleGenerating = this.#store.value?.isSessionTitleGenerating(session.id) ?? false;
     return html`
       <li class="session-entry">
         <div
@@ -281,6 +287,7 @@ export class TrouveSessionList extends withSignalTracking(LitElement) {
             this.showBranches ? "with-branch" : ""
           }"
           data-actions-open=${this.#menuSessionId === session.id}
+          @contextmenu=${(event: MouseEvent) => this.#openContextMenu(event, session.id)}
         >
                 <button
                   type="button"
@@ -288,6 +295,10 @@ export class TrouveSessionList extends withSignalTracking(LitElement) {
                     this.showBranches ? "with-branch" : ""
                   } ${this.showStatus ? "" : "without-status"}"
                   aria-current=${selected ? "page" : "false"}
+                  data-session-row-id=${session.id}
+                  aria-haspopup="menu"
+                  aria-expanded=${this.#menuSessionId === session.id ? "true" : "false"}
+                  @keydown=${(event: KeyboardEvent) => this.#sessionRowKeydown(event, session.id)}
                   @click=${() => this.#open(session)}
                 >
                   ${!this.showStatus
@@ -300,7 +311,9 @@ export class TrouveSessionList extends withSignalTracking(LitElement) {
                         ? nothing
                         : fontAwesomeIcon(indicator.icon)}</span>`}
                   <span class="session-copy">
-                    <strong>${session.title}</strong>
+                    <strong>${titleGenerating
+                      ? html`<span class="naming-title-shimmer session-title-shimmer" aria-hidden="true"></span><span class="visually-hidden">Naming session…</span>`
+                      : session.title}</strong>
                     ${this.showBranches
                       ? html`<small class="session-branch" title=${session.branch}>${session.branch}</small>`
                       : nothing}
@@ -322,20 +335,13 @@ export class TrouveSessionList extends withSignalTracking(LitElement) {
                         aria-label=${age.label}
                       >${age.compact}</time>`}
                 </button>
-                <button
-                  class="session-menu-button"
-                  type="button"
-                  aria-label=${`Actions for ${session.title}`}
-                  aria-expanded=${this.#menuSessionId === session.id}
-                  @click=${() => this.#toggleMenu(session.id)}
-                >${fontAwesomeIcon("ellipsis")}</button>
         </div>
         ${this.#menuSessionId === session.id && this.#editingSessionId === "" && this.#deleteSessionId === ""
           ? html`
-              <div class="session-actions" aria-label=${`Actions for ${session.title}`}>
-                <button type="button" @click=${() => this.#startRename(session)}>Rename</button>
-                <button type="button" ?disabled=${this.#busySessionId === session.id} @click=${() => this.#setArchived(session.id, !session.archived)}>${session.archived ? "Unarchive" : "Archive"}</button>
-                <button class="danger" type="button" @click=${() => this.#confirmDelete(session)}>Delete…</button>
+              <div class="session-actions" role="menu" aria-label=${`Actions for ${session.title}`} style=${`left:${this.#menuPosition.x}px;top:${this.#menuPosition.y}px`} @contextmenu=${(event: Event) => event.preventDefault()} @keydown=${this.#contextMenuKeydown}>
+                <button type="button" role="menuitem" tabindex="-1" @click=${() => this.#startRename(session)}>Rename</button>
+                <button type="button" role="menuitem" tabindex="-1" ?disabled=${this.#busySessionId === session.id} @click=${() => this.#setArchived(session.id, !session.archived)}>${session.archived ? "Unarchive" : "Archive"}</button>
+                <button class="danger" type="button" role="menuitem" tabindex="-1" @click=${() => this.#confirmDelete(session)}>Delete…</button>
               </div>
             `
           : nothing}
@@ -386,18 +392,65 @@ export class TrouveSessionList extends withSignalTracking(LitElement) {
     this.#closeActions();
   }
 
-  #toggleMenu(sessionId: string): void {
-    this.#menuSessionId = this.#menuSessionId === sessionId ? "" : sessionId;
+  #openContextMenu(event: MouseEvent | KeyboardEvent, sessionId: string): void {
+    event.preventDefault();
+    const target = event.currentTarget as HTMLElement;
+    const bounds = target.getBoundingClientRect();
+    const pointerEvent = event instanceof MouseEvent ? event : undefined;
+    const pointerX = pointerEvent !== undefined && pointerEvent.clientX > 0
+      ? pointerEvent.clientX
+      : bounds.left + 12;
+    const pointerY = pointerEvent !== undefined && pointerEvent.clientY > 0
+      ? pointerEvent.clientY
+      : bounds.bottom;
+    this.#menuPosition = {
+      x: Math.max(4, Math.min(pointerX, globalThis.innerWidth - 158)),
+      y: Math.max(4, Math.min(pointerY, globalThis.innerHeight - 118)),
+    };
+    this.#menuSessionId = sessionId;
     this.#editingSessionId = "";
     this.#deleteSessionId = "";
     this.#requestError = "";
     this.requestUpdate();
+    void this.updateComplete.then(() => {
+      this.querySelector<HTMLButtonElement>(".session-actions [role='menuitem']")?.focus();
+    });
+  }
+
+  #sessionRowKeydown(event: KeyboardEvent, sessionId: string): void {
+    if (event.key !== "ContextMenu" && !(event.shiftKey && event.key === "F10")) return;
+    this.#openContextMenu(event, sessionId);
+  }
+
+  #contextMenuKeydown(event: KeyboardEvent): void {
+    const items = [...(event.currentTarget as HTMLElement)
+      .querySelectorAll<HTMLButtonElement>("[role='menuitem']:not(:disabled)")];
+    const current = items.indexOf(document.activeElement as HTMLButtonElement);
+    let next: number | undefined;
+    if (event.key === "ArrowDown") next = (current + 1) % items.length;
+    else if (event.key === "ArrowUp") next = (current - 1 + items.length) % items.length;
+    else if (event.key === "Home") next = 0;
+    else if (event.key === "End") next = items.length - 1;
+    else if (event.key === "Escape") {
+      event.preventDefault();
+      const sessionId = this.#menuSessionId;
+      this.#menuSessionId = "";
+      this.requestUpdate();
+      void this.updateComplete.then(() => {
+        this.querySelector<HTMLButtonElement>(`[data-session-row-id="${CSS.escape(sessionId)}"]`)
+          ?.focus();
+      });
+      return;
+    }
+    if (next === undefined || items.length === 0) return;
+    event.preventDefault();
+    items[next]?.focus();
   }
 
   readonly #dismissPopupFromPointer = (event: PointerEvent): void => {
     if (this.#menuSessionId === "") return;
     const target = event.target;
-    if (target instanceof Element && target.closest(".session-actions, .session-menu-button") !== null) {
+    if (target instanceof Element && target.closest(".session-actions") !== null) {
       return;
     }
     this.#menuSessionId = "";
@@ -413,6 +466,9 @@ export class TrouveSessionList extends withSignalTracking(LitElement) {
   }
 
   readonly #closeActions = (): void => {
+    this.#generationAbort?.abort();
+    this.#generationAbort = undefined;
+    this.#generatingSessionId = "";
     this.#menuSessionId = "";
     this.#editingSessionId = "";
     this.#deleteSessionId = "";
@@ -426,6 +482,36 @@ export class TrouveSessionList extends withSignalTracking(LitElement) {
     const title = String(new FormData(form).get("title") ?? "").trim();
     if (title === "") return;
     await this.#updateSession(sessionId, { title }, "Session could not be renamed.");
+  }
+
+  async #generateRename(sessionId: string): Promise<void> {
+    const services = this.#services.value;
+    if (services === undefined || this.#generatingSessionId !== "") return;
+    const startingTitle = this.#modalTitle;
+    const abort = new AbortController();
+    this.#generationAbort = abort;
+    const timeout = globalThis.setTimeout(() => abort.abort(), TITLE_SUGGESTION_TIMEOUT_MS);
+    this.#generatingSessionId = sessionId;
+    this.#requestError = "";
+    this.requestUpdate();
+    try {
+      const suggestion = await services.protocol.generateSessionTitleSuggestion(sessionId, {
+        signal: abort.signal,
+      });
+      if (this.#editingSessionId !== sessionId || this.#modalTitle !== startingTitle) return;
+      this.#modalTitle = suggestion.title.trim();
+    } catch {
+      if (this.#editingSessionId === sessionId) {
+        this.#requestError = "A title could not be generated. You can still enter one manually.";
+      }
+    } finally {
+      globalThis.clearTimeout(timeout);
+      if (this.#generationAbort === abort) {
+        this.#generationAbort = undefined;
+        this.#generatingSessionId = "";
+        this.requestUpdate();
+      }
+    }
   }
 
   async #setArchived(sessionId: string, archived: boolean): Promise<void> {

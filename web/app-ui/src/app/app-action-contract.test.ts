@@ -124,12 +124,10 @@ const SURFACES: readonly CallbackSurface[] = [
     ],
   },
   {
-    description: "title model and GitHub host management",
+    description: "session naming and GitHub host management",
     callbacks: [
-      "title-model-load-picked",
-      "title-model-resource-picked",
-      "title-model-install",
-      "title-model-cancel",
+      "session-naming-model-picked",
+      "derive-branch-name-toggled",
       "github-host-added",
       "github-host-removed",
     ],
@@ -137,10 +135,9 @@ const SURFACES: readonly CallbackSurface[] = [
       {
         path: "../components/management-settings-panels.ts",
         markers: [
+          "setSessionNamingSettingsSnapshot",
+          "modelCatalog.refresh",
           "derive_branch_name_from_session_title",
-          "title_model_load_behavior",
-          "title_model_resource_policy",
-          "async #install(cancel:",
           "async #addHost(",
           "async #removeHost(",
         ],
@@ -592,7 +589,7 @@ describe("Lit application action contract", () => {
   it("keeps every established action mapped exactly once", () => {
     const callbacks = SURFACES.flatMap((surface) => surface.callbacks);
     expect(new Set(callbacks).size).toBe(callbacks.length);
-    expect(callbacks).toHaveLength(146);
+    expect(callbacks).toHaveLength(144);
   });
 
   for (const surface of SURFACES) {

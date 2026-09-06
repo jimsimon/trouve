@@ -55,6 +55,10 @@ pub struct ToolImage {
 pub enum Message {
     System(String),
     User(String),
+    UserWithImages {
+        content: String,
+        images: Vec<ToolImage>,
+    },
     Assistant {
         content: String,
         tool_calls: Vec<ToolCallRequest>,

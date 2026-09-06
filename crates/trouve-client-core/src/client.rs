@@ -203,14 +203,42 @@ impl ProtocolClient {
             .await
     }
 
-    /// Generate the title that will be used for both the session and its
-    /// branch before either is created.
-    pub async fn generate_session_title(&self, prompt: &str) -> Result<GeneratedSessionTitle> {
+    pub async fn generate_title(&self, session_id: &str, prompt: &str) -> Result<GeneratedTitle> {
         self.post_json(
-            "/session-title",
-            &GenerateSessionTitleRequest {
+            "/title",
+            &GenerateTitleRequest {
+                session_id: session_id.into(),
                 prompt: prompt.into(),
+                attachments: Vec::new(),
             },
+        )
+        .await
+    }
+
+    pub async fn generate_session_title_suggestion(
+        &self,
+        session_id: &str,
+    ) -> Result<GeneratedTitle> {
+        self.post_json(
+            &format!(
+                "/sessions/{}/title-suggestion",
+                urlencode_path_segment(session_id)
+            ),
+            &serde_json::json!({}),
+        )
+        .await
+    }
+
+    pub async fn generate_thread_title_suggestion(
+        &self,
+        thread_id: &str,
+    ) -> Result<GeneratedTitle> {
+        self.post_json(
+            &format!(
+                "/threads/{}/title-suggestion",
+                urlencode_path_segment(thread_id)
+            ),
+            &serde_json::json!({}),
         )
         .await
     }
@@ -735,8 +763,8 @@ impl ProtocolClient {
         decode_cursor_response(response, path).await
     }
 
-    pub async fn git_worktree_settings(&self) -> Result<(u64, GitWorktreeSettings)> {
-        let path = "/config/git-worktrees";
+    pub async fn session_naming_settings(&self) -> Result<(u64, SessionNamingSettings)> {
+        let path = "/config/session-naming";
         let response = self
             .http
             .get(format!("{}{path}", self.base))
@@ -746,35 +774,23 @@ impl ProtocolClient {
         decode_cursor_response(response, path).await
     }
 
-    pub async fn set_git_worktree_settings(
+    pub async fn set_session_naming_settings(
         &self,
-        title_model_load_behavior: TitleModelLoadBehavior,
-        title_model_resource_policy: TitleModelResourcePolicy,
-        derive_branch_name_from_session_title: Option<bool>,
-    ) -> Result<(u64, GitWorktreeSettings)> {
-        let path = "/config/git-worktrees";
+        model: String,
+        derive_branch_name_from_session_title: bool,
+    ) -> Result<(u64, SessionNamingSettings)> {
+        let path = "/config/session-naming";
         let response = self
             .http
             .put(format!("{}{path}", self.base))
-            .json(&SetGitWorktreeSettingsRequest {
+            .json(&SetSessionNamingSettingsRequest {
+                model,
                 derive_branch_name_from_session_title,
-                title_model_load_behavior,
-                title_model_resource_policy,
             })
             .send()
             .await
             .with_context(|| format!("PUT {path}"))?;
         decode_cursor_response(response, path).await
-    }
-
-    pub async fn install_title_model(&self) -> Result<()> {
-        self.post_empty("/config/git-worktrees/title-model/install")
-            .await
-    }
-
-    pub async fn cancel_title_model_install(&self) -> Result<()> {
-        self.delete("/config/git-worktrees/title-model/install")
-            .await
     }
 
     pub async fn session_diff(&self, session_id: &str) -> Result<SessionDiff> {
