@@ -80,7 +80,7 @@ describe("session list component contract", () => {
     expect(component).toContain("Naming session…");
     expect(component).toContain('"title-waiting"');
     expect(component).toContain('role="status"');
-    expect(component).toContain("LOCAL_MODEL_WAITING_LABEL");
+    expect(component).toContain("SESSION_TITLE_WAITING_STATUS");
     expect(styles).toContain(".title-waiting::after");
     expect(component).toContain("sessionAgePresentation(session.updatedAt, now)");
     expect(component).toContain('class="session-age"');

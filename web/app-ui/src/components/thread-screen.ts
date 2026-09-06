@@ -35,6 +35,7 @@ import type {
 import {
   beginTitleGeneration,
   LOCAL_MODEL_WAITING_LABEL,
+  THREAD_TITLE_WAITING_STATUS,
   titleGenerationTimeoutMs,
 } from "../services/title-generation.js";
 import type { ComposerDraft } from "../services/composer-drafts.js";
@@ -1777,7 +1778,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         || (indicator.kind === "busy" ? "Processing" : "");
       const accessibleLabel = titleShimmer
         ? "Naming thread…"
-        : titleWaiting ? `${label}, ${LOCAL_MODEL_WAITING_LABEL}`
+        : titleWaiting ? `${label}. ${THREAD_TITLE_WAITING_STATUS}`
         : statusLabel === "" ? label : `${label}, ${statusLabel}`;
       return html`
         <span class="thread-tab-item" role="presentation" @contextmenu=${(event: MouseEvent) => this.#openThreadTabContextMenu(event, candidate.id)}>
@@ -1818,7 +1819,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
               : html`<span class="thread-todo-progress">${threadTodoProgress(candidate.todos)}</span>`}
           </button>
           ${titleWaiting
-            ? html`<span class="visually-hidden" role="status">${LOCAL_MODEL_WAITING_LABEL}</span>`
+            ? html`<span class="visually-hidden" role="status">${THREAD_TITLE_WAITING_STATUS}</span>`
             : nothing}
           <span
             class="thread-tab-close"

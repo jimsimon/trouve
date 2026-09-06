@@ -5,6 +5,10 @@ export const TITLE_GENERATION_TIMEOUT_MS = 48_000;
 // foreground work and another five minutes for a cold model load.
 export const LOCAL_TITLE_GENERATION_TIMEOUT_MS = 11 * 60_000;
 export const LOCAL_MODEL_WAITING_LABEL = "Waiting for the local model.";
+export const SESSION_TITLE_WAITING_STATUS =
+  `Session name pending. ${LOCAL_MODEL_WAITING_LABEL}`;
+export const THREAD_TITLE_WAITING_STATUS =
+  `Thread name pending. ${LOCAL_MODEL_WAITING_LABEL}`;
 
 type TitleGenerationStore = Pick<
   AppStore,

@@ -6,6 +6,7 @@ import { appServicesContext, appStoreContext } from "../contexts/app-contexts.js
 import { preferredSessionThreadId } from "../services/resume-preferences.js";
 import {
   LOCAL_MODEL_WAITING_LABEL,
+  SESSION_TITLE_WAITING_STATUS,
   titleGenerationTimeoutMs,
 } from "../services/title-generation.js";
 import type { AppStore, SessionListItem } from "../state/app-store.js";
@@ -320,7 +321,7 @@ export class TrouveSessionList extends withSignalTracking(LitElement) {
                       ? html`<span class="naming-title-shimmer session-title-shimmer" aria-hidden="true"></span><span class="visually-hidden">Naming session…</span>`
                       : session.title}</strong>
                     ${titleWaiting
-                      ? html`<span class="visually-hidden" role="status">${LOCAL_MODEL_WAITING_LABEL}</span>`
+                      ? html`<span class="visually-hidden" role="status">${SESSION_TITLE_WAITING_STATUS}</span>`
                       : nothing}
                     ${this.showBranches
                       ? html`<small class="session-branch" title=${session.branch}>${session.branch}</small>`

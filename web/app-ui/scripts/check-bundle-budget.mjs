@@ -48,7 +48,8 @@ const entryLimit = mode === "desktop" ? 856_000 : 850_000;
 // collapsed summary brings them to 3,296,049 B and 3,281,194 B. The
 // protocol 9.2 review-thread collapse state and Contents-permission health
 // schemas bring them to 3,302,298 B and 3,287,443 B. Local naming admission
-// status and context-menu copy actions add roughly 1.8 kB to each clean graph;
+// status, bounded pending jobs, and context-menu copy actions add roughly
+// 1.9 kB to each clean graph;
 // preserve less than 2 kB of headroom for each. Entry, worker, and largest-
 // chunk budgets below still prevent one bundle from hiding in the aggregate.
 const totalJavaScriptLimit = mode === "desktop" ? 3_306_000 : 3_291_000;

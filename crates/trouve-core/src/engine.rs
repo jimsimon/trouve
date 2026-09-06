@@ -597,6 +597,11 @@ const SESSION_TITLE_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 // end-to-end guard just beyond those independent bounded phases.
 const LOCAL_SESSION_TITLE_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(10 * 60 + 45);
+// Naming is cosmetic and authenticated clients may retry while local
+// inference is busy. Bound both distinct work and coalesced followers so a
+// stalled sidecar cannot retain an arbitrary number of request tasks.
+const MAX_PENDING_TITLE_JOBS: usize = 32;
+const MAX_TITLE_JOB_FOLLOWERS: usize = 32;
 #[cfg(not(test))]
 const MODEL_CATALOG_VALIDATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 #[cfg(test)]
@@ -7306,10 +7311,20 @@ impl Engine {
         let follower = {
             let mut jobs = self.title_jobs.lock().unwrap();
             if let Some(job) = jobs.get_mut(&key) {
+                if job.waiters.len() >= MAX_TITLE_JOB_FOLLOWERS {
+                    return Err(EngineError::BadRequest(
+                        "too many callers are waiting for this title".into(),
+                    ));
+                }
                 let (sender, receiver) = tokio::sync::oneshot::channel();
                 job.waiters.push(sender);
                 Some(receiver)
             } else {
+                if jobs.len() >= MAX_PENDING_TITLE_JOBS {
+                    return Err(EngineError::BadRequest(
+                        "too many title generation requests are waiting".into(),
+                    ));
+                }
                 jobs.insert(key.clone(), TitleJobState::default());
                 None
             }
@@ -24793,6 +24808,46 @@ mod tests {
         assert_eq!(first.title, "Prioritize Local Naming");
         assert_eq!(second.title, first.title);
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        {
+            let mut jobs = engine.title_jobs.lock().unwrap();
+            for input_hash in 0..MAX_PENDING_TITLE_JOBS as u64 {
+                jobs.insert(
+                    TitleJobKey {
+                        session_id: format!("se_pending_{input_hash}"),
+                        model: "title-test/model".into(),
+                        input_hash,
+                    },
+                    TitleJobState::default(),
+                );
+            }
+        }
+        let error = engine
+            .generate_title(&session.id, "One title too many", &[])
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("too many title generation requests")
+        );
+
+        engine.title_jobs.lock().unwrap().clear();
+        let follower_key =
+            title_job_key(&session.id, "title-test/model", "Too many followers", &[]);
+        engine.title_jobs.lock().unwrap().insert(
+            follower_key,
+            TitleJobState {
+                waiters: (0..MAX_TITLE_JOB_FOLLOWERS)
+                    .map(|_| tokio::sync::oneshot::channel().0)
+                    .collect(),
+            },
+        );
+        let error = engine
+            .generate_title(&session.id, "Too many followers", &[])
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("too many callers"));
     }
 
     #[tokio::test]
