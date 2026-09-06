@@ -2584,25 +2584,30 @@ pub struct SessionReviewDiffFile {
     /// file. Deleted files intentionally leave this absent so their diffs stay
     /// visible.
     pub generated_header: Option<String>,
-    /// The `linguist-generated` gitattribute for the snapshot-side file:
-    /// `Some(true)` when set or `true`, `Some(false)` when unset or `false`,
-    /// `None` when unspecified. Deleted files and lookup failures leave this
-    /// absent so their diffs stay visible.
+    /// The `linguist-generated` gitattribute for the file, resolved from the
+    /// trusted base revision's attribute files rather than the reviewed
+    /// snapshot, so a change under review cannot mark its own files generated
+    /// to suppress line-by-line review. `Some(true)` when set or `true`,
+    /// `Some(false)` when unset or `false`, `None` when unspecified. Deleted
+    /// files and lookup failures leave this absent so their diffs stay visible.
     pub linguist_generated: Option<bool>,
 }
 
-/// Resolve the `linguist-generated` attribute for `paths` against the snapshot
-/// index (`.gitattributes` as checked in, plus repository-local and global
-/// attribute files). Returns only paths with an explicit value; a failed
-/// lookup yields an empty map so every diff stays reviewable.
+/// Resolve the `linguist-generated` attribute for `paths` against the
+/// attribute files of `source` (a trusted tree-ish, plus repository-local and
+/// global attribute files). Returns only paths with an explicit value; a
+/// failed lookup yields an empty map so every diff stays reviewable, and a
+/// truncated one keeps the records that arrived whole.
 fn review_linguist_generated_attributes(
     worktree: &Path,
+    source: &str,
     paths: &[&str],
-    index: &TemporaryCheckpointIndex,
     operation: &GitOperation<'_>,
 ) -> Result<HashMap<String, bool>> {
     // `git check-attr -z` emits path<NUL>attribute<NUL>value<NUL> per path.
-    const RECORD_OVERHEAD: usize = "linguist-generated".len() + "unspecified".len() + 3;
+    // Values are `set`, `unset`, `unspecified`, or an arbitrary string from
+    // the attribute file; allow a generous string before the bound trips.
+    const RECORD_OVERHEAD: usize = "linguist-generated".len() + 128 + 3;
     let mut attributes = HashMap::new();
     if paths.is_empty() {
         return Ok(attributes);
@@ -2618,21 +2623,16 @@ fn review_linguist_generated_attributes(
             total.saturating_add(path.len().saturating_add(RECORD_OVERHEAD))
         })
         .saturating_add(1);
+    let source = format!("--source={source}");
     let output = match run_git_bounded_with_status(
         worktree,
-        Some(index),
-        &[
-            "check-attr",
-            "--cached",
-            "-z",
-            "--stdin",
-            "linguist-generated",
-        ],
+        None,
+        &["check-attr", &source, "-z", "--stdin", "linguist-generated"],
         Some(GitCommandInput::Bytes(input)),
         max_stdout,
         operation,
     ) {
-        Ok(output) if output.status.success() && !output.stdout.truncated => output.stdout,
+        Ok(output) if output.status.success() => output.stdout,
         Ok(_) => {
             operation.check_cancelled()?;
             return Ok(attributes);
@@ -2645,24 +2645,40 @@ fn review_linguist_generated_attributes(
             return Ok(attributes);
         }
     };
-    let mut fields = output.bytes.split(|byte| *byte == 0);
-    while let (Some(path), Some(_attribute), Some(value)) =
-        (fields.next(), fields.next(), fields.next())
-    {
-        let Ok(path) = std::str::from_utf8(path) else {
+    if output.truncated {
+        tracing::debug!("review linguist-generated attribute output was truncated");
+    }
+    let known = paths.iter().copied().collect::<HashSet<&str>>();
+    parse_review_attribute_output(&output.bytes, &known, &mut attributes);
+    Ok(attributes)
+}
+
+/// Parse `git check-attr -z` records into `attributes`. Only records whose
+/// value was terminated by NUL count, so a truncated tail can never pass a
+/// clipped string such as `settings` off as `set`.
+fn parse_review_attribute_output(
+    bytes: &[u8],
+    known: &HashSet<&str>,
+    attributes: &mut HashMap<String, bool>,
+) {
+    let mut fields = bytes.split(|byte| *byte == 0).collect::<Vec<_>>();
+    // The remainder after the final NUL is either empty or an unterminated
+    // record; either way it is not a complete field.
+    fields.pop();
+    for record in fields.chunks_exact(3) {
+        let Ok(path) = std::str::from_utf8(record[0]) else {
             continue;
         };
-        if !paths.contains(&path) {
+        if !known.contains(path) {
             continue;
         }
-        let generated = match value {
+        let generated = match record[2] {
             b"set" | b"true" => true,
             b"unset" | b"false" => false,
             _ => continue,
         };
         attributes.insert(path.to_owned(), generated);
     }
-    Ok(attributes)
 }
 
 /// Whether one rename-aware review patch removes its path from the snapshot.
@@ -3190,14 +3206,16 @@ where
         let mut headers = review_blob_headers(worktree, &current, index, &operation)?;
         // Attributes cover every surviving path, not only the header-eligible
         // ones: an explicit `linguist-generated` value must be able to override
-        // the heuristics either way.
+        // the heuristics either way. They come from the base revision, never
+        // the reviewed snapshot, so the change under review cannot exempt its
+        // own files from line-by-line review by editing `.gitattributes`.
         let surviving = patches
             .iter()
             .filter(|file| !review_patch_deletes_path(&file.diff))
             .map(|file| file.path.as_str())
             .collect::<Vec<_>>();
         let mut attributes =
-            review_linguist_generated_attributes(worktree, &surviving, index, &operation)?;
+            review_linguist_generated_attributes(worktree, base_ref, &surviving, &operation)?;
         for file in &mut patches {
             file.generated_header = headers.remove(&file.path);
             file.linguist_generated = attributes.remove(&file.path);
@@ -4756,7 +4774,7 @@ line three
     }
 
     #[test]
-    fn review_diff_resolves_linguist_generated_attributes_from_snapshot() {
+    fn review_diff_resolves_linguist_generated_attributes_from_the_base_revision() {
         let tmp = tempfile::tempdir().unwrap();
         init_repo(tmp.path());
         let data = tmp.path().join("data");
@@ -4766,15 +4784,10 @@ line three
             "opted-out.json",
             "plain.json",
             "deleted.json",
+            "source.rs",
         ] {
             std::fs::write(data.join(name), "{\"old\":true}\n").unwrap();
         }
-        run(tmp.path(), &["add", "data"]);
-        run(tmp.path(), &["commit", "-m", "add data"]);
-        let base = run(tmp.path(), &["rev-parse", "HEAD"]);
-
-        // The attributes file is part of the reviewed snapshot itself, so a
-        // pull request may introduce it alongside the artifact it describes.
         std::fs::write(
             tmp.path().join(".gitattributes"),
             "data/snapshot.json linguist-generated=true\n\
@@ -4782,7 +4795,21 @@ line three
              data/opted-out.json -linguist-generated\n",
         )
         .unwrap();
-        for name in ["snapshot.json", "opted-out.json", "plain.json"] {
+        run(tmp.path(), &["add", "."]);
+        run(tmp.path(), &["commit", "-m", "add data"]);
+        let base = run(tmp.path(), &["rev-parse", "HEAD"]);
+
+        // The reviewed change rewrites the attributes file to exempt a source
+        // file and to opt the snapshot back in; neither edit may take effect
+        // until it has landed in a trusted revision.
+        std::fs::write(
+            tmp.path().join(".gitattributes"),
+            "data/source.rs linguist-generated=true\n\
+             data/snapshot.json -linguist-generated\n\
+             data/opted-out.json -linguist-generated\n",
+        )
+        .unwrap();
+        for name in ["snapshot.json", "opted-out.json", "plain.json", "source.rs"] {
             std::fs::write(data.join(name), "{\"new\":true}\n").unwrap();
         }
         std::fs::remove_file(data.join("deleted.json")).unwrap();
@@ -4806,9 +4833,26 @@ line three
         assert_eq!(attribute("data/snapshot.json"), Some(true));
         assert_eq!(attribute("data/opted-out.json"), Some(false));
         assert_eq!(attribute("data/plain.json"), None);
+        assert_eq!(attribute("data/source.rs"), None);
         assert_eq!(attribute(".gitattributes"), None);
         // Deletions keep their diff visible regardless of attributes.
         assert_eq!(attribute("data/deleted.json"), None);
+    }
+
+    #[test]
+    fn review_attribute_parsing_ignores_unterminated_records_and_unknown_paths() {
+        let known = HashSet::from(["a.json", "b.json", "c.json"]);
+        let mut attributes = HashMap::new();
+        parse_review_attribute_output(
+            b"a.json\0linguist-generated\0true\0\
+              other.json\0linguist-generated\0set\0\
+              b.json\0linguist-generated\0custom-string\0\
+              c.json\0linguist-generated\0set",
+            &known,
+            &mut attributes,
+        );
+
+        assert_eq!(attributes, HashMap::from([("a.json".to_string(), true)]));
     }
 
     #[test]

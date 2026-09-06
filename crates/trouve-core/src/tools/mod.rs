@@ -1633,8 +1633,9 @@ pub struct ReviewDiffFileWithMetadata {
     /// snapshot. Raw patch text never populates this field, and deletions keep
     /// their full diff by leaving it absent.
     pub generated_header: Option<String>,
-    /// The `linguist-generated` gitattribute resolved from the current
-    /// snapshot: `Some(true)` when set, `Some(false)` when explicitly unset
+    /// The `linguist-generated` gitattribute resolved from the trusted base
+    /// revision (never from the reviewed snapshot, which could otherwise
+    /// exempt its own files): `Some(true)` when set, `Some(false)` when unset
     /// or `false`, and `None` when unspecified, unavailable, or the path was
     /// deleted. An explicit value overrides every generated-artifact
     /// heuristic.
