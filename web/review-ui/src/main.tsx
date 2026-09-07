@@ -1203,6 +1203,7 @@ function JobDetailPane({
       detail.personas.find((persona) => persona.reviewer_id === reviewerId)?.reviewer_name ||
       "Reviewer persona";
     setBusy(action);
+    setActionNotice("");
     setRetryStatus(`Retrying full review after ${label}…`);
     let replacement: ReviewJob;
     try {
@@ -1218,9 +1219,12 @@ function JobDetailPane({
     if (aliveRef.current !== submittedJobId) return;
     onChanged();
     if (replacement.id === submittedJobId) {
-      setNavigationStatus(
-        "Review publication had already started; the existing review was reconciled instead of retried.",
-      );
+      // Same server refusal as `act("retry")`: the job is mid-publication.
+      const notice =
+        "This review is still publishing, so it was reconciled instead of retried. Retry again once it finishes.";
+      setActionNotice(notice);
+      setNavigationStatus(notice);
+      setRetryStatus(`Full review retry after ${label} was reconciled instead.`);
       try {
         await load();
       } finally {
