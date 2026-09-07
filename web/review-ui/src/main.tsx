@@ -1163,18 +1163,22 @@ function JobDetailPane({
 
   const act = async (action: "cancel" | "request" | "retry"): Promise<void> => {
     if (!detail) return;
+    const submittedJobId = detail.job.id;
     setBusy(action);
     setActionNotice("");
     try {
       const replacement =
         action === "cancel"
-          ? await cancelJob(detail.job.id)
+          ? await cancelJob(submittedJobId)
           : action === "request"
             ? await requestReview(detail.job)
-            : await retryJob(detail.job.id);
+            : await retryJob(submittedJobId);
       onChanged();
+      // The pane may have moved to another job while the request was in
+      // flight; its notices belong to that job now.
+      if (aliveRef.current !== submittedJobId) return;
       if (action !== "cancel") {
-        if (replacement.id === detail.job.id) {
+        if (replacement.id === submittedJobId) {
           // The server refuses to replace a job that is mid-publication; it
           // reconciled the existing review instead, so nothing new opened.
           const notice =
@@ -1189,9 +1193,11 @@ function JobDetailPane({
         }
       } else await load();
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
+      if (aliveRef.current === submittedJobId) {
+        setError(cause instanceof Error ? cause.message : String(cause));
+      }
     } finally {
-      setBusy("");
+      if (aliveRef.current === submittedJobId) setBusy("");
     }
   };
 
@@ -1247,6 +1253,7 @@ function JobDetailPane({
     if (!detail) return;
     const submittedJobId = detail.job.id;
     setBusy("final-editor");
+    setActionNotice("");
     setRetryStatus("Retrying Final review editor…");
     try {
       await retryFinalEditor(submittedJobId);
