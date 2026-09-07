@@ -89,7 +89,7 @@ describe("ThreadIngress", () => {
   });
 
   it("seeds the requested thread from its folded snapshot before folding live events", async () => {
-    const store = new AppStore();
+    const store = new AppStore({ maxThreadViews: 1 });
     let receivedOptions:
       | Parameters<ThreadProtocol["threadEvents"]>[1]
       | undefined;
@@ -116,6 +116,9 @@ describe("ThreadIngress", () => {
     expect(protocol.threadView).toHaveBeenCalledWith("th_2");
     expect(receivedOptions?.after).toBe(11);
     expect(start).toHaveBeenCalledOnce();
+    const activeView = store.threadView("th_2");
+    store.threadView("th_incidental");
+    expect(store.threadView("th_2")).toBe(activeView);
 
     receivedOptions?.onEvent({
       kind: "known",
@@ -299,6 +302,32 @@ describe("ThreadIngress", () => {
       "snapshot unavailable",
     );
     expect(protocol.threadEvents).not.toHaveBeenCalled();
+    expect(ingress.state.get()).toBe("error");
+  });
+
+  it("releases the retained view when stream loading fails", async () => {
+    const store = new AppStore({ maxThreadViews: 1 });
+    const protocol: ThreadProtocol = {
+      threads: vi.fn(async () => [thread("th_1")]),
+      threadView: vi.fn(async () => viewSnapshot(10, [{
+        kind: "user",
+        turn: 1,
+        content: "snapshot",
+        attachments: [],
+      }])),
+      threadEvents: vi.fn(async () => {
+        throw new Error("stream unavailable");
+      }),
+    };
+    const ingress = new ThreadIngress(protocol, store);
+
+    await expect(ingress.openSession("se_1", "th_1")).rejects.toThrow(
+      "stream unavailable",
+    );
+    const failedView = store.threadView("th_1");
+    store.threadView("th_incidental");
+
+    expect(store.threadView("th_1")).not.toBe(failedView);
     expect(ingress.state.get()).toBe("error");
   });
 

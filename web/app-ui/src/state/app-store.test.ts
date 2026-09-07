@@ -762,6 +762,21 @@ describe("AppStore", () => {
     expect(store.threadView("th_second")).not.toBe(second);
   });
 
+  it("does not evict the actively streamed thread projection", () => {
+    const store = new AppStore({ maxThreadViews: 2 });
+    const active = store.threadView("th_active");
+    store.retainThreadView("th_active");
+
+    store.threadView("th_background_1");
+    store.threadView("th_background_2");
+
+    expect(store.threadView("th_active")).toBe(active);
+    store.retainThreadView(undefined);
+    store.threadView("th_background_3");
+    store.threadView("th_background_4");
+    expect(store.threadView("th_active")).not.toBe(active);
+  });
+
   it("atomically replaces replay state with a folded tail and prepends older pages", () => {
     const store = new AppStore();
     store.upsertThread(thread("th_1", [
