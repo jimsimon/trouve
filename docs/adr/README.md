@@ -56,6 +56,8 @@ sequentially.
 | [0044](0044-durable-assistant-produced-artifacts.md) | Durable assistant-produced artifacts | Accepted |
 | [0045](0045-full-branch-review-on-every-head.md) | Full-branch review on every head | Accepted |
 | [0046](0046-detached-descendants-are-session-scoped.md) | Detached descendants of shell calls are session-scoped | Accepted |
-| [0047](0047-cursor-sdk-bridge-transport.md) | Cursor SDK Bridge transport | Accepted |
+| [0047](0047-cursor-sdk-bridge-transport.md) | Cursor SDK Bridge transport | Partially superseded by 0050 |
 | [0048](0048-configured-asynchronous-session-naming.md) | Configured asynchronous session naming | Accepted |
 | [0049](0049-explicit-ownership-for-managed-background-work.md) | Explicit ownership for managed background work | Accepted |
+| [0050](0050-shared-cursor-sdk-bridge-process.md) | One shared Cursor SDK Bridge per backend | Accepted |
+| [0051](0051-cursor-shared-store-transition-and-quarantine.md) | Cursor shared-store transition and callback quarantine | Accepted |
