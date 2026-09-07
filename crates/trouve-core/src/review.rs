@@ -13834,7 +13834,7 @@ fn safe_public_model_markdown(text: &str, maximum: usize, marker: &str) -> Strin
     loop {
         let bounded = bounded_utf8(text, limit, marker);
         let prepared = safe_prompt_fence(&neutralize_active_urls(&redact_public_secrets(&bounded)));
-        let safe = escape_public_markup(&prepared).replace("](", "]\\(");
+        let safe = escape_public_markup(&prepared);
         let overshoot = safe.len().saturating_sub(maximum);
         if overshoot == 0 || limit == 0 {
             return bounded_utf8(&safe, maximum, marker);
@@ -13843,10 +13843,15 @@ fn safe_public_model_markdown(text: &str, maximum: usize, marker: &str) -> Strin
     }
 }
 
-/// Neutralize mentions and escape the characters that can start raw HTML or
-/// an entity reference, but leave well-formed inline code spans verbatim:
-/// GitHub renders their content literally, so nothing inside can activate,
-/// and entities there would show up as `&lt;` instead of `<`.
+/// Neutralize mentions and links and escape the characters that can start
+/// raw HTML or an entity reference, but leave well-formed inline code spans
+/// verbatim: GitHub renders their content literally, so nothing inside can
+/// activate, and entities there would show up as `&lt;` instead of `<`.
+///
+/// The scan mirrors GitHub's inline parser so both agree on what is code: a
+/// backslash escape (`\` before ASCII punctuation) is one literal unit, so
+/// an escaped backtick never opens a span, and a backtick run that fails to
+/// open a span stays literal as a whole rather than being retried shorter.
 fn escape_public_markup(text: &str) -> String {
     let mut escaped = String::with_capacity(text.len());
     let mut rest = text;
@@ -13856,10 +13861,31 @@ fn escape_public_markup(text: &str) -> String {
             rest = tail;
             continue;
         }
+        if let Some(tail) = rest.strip_prefix("](") {
+            escaped.push_str("]\\(");
+            rest = tail;
+            continue;
+        }
+        let run = rest.len() - rest.trim_start_matches('`').len();
+        if run > 0 {
+            escaped.push_str(&rest[..run]);
+            rest = &rest[run..];
+            continue;
+        }
+        let mut characters = rest.chars();
+        let character = characters.next().expect("non-empty string has a character");
+        if character == '\\'
+            && characters
+                .next()
+                .is_some_and(|next| next.is_ascii_punctuation())
+        {
+            escaped.push('\\');
+            rest = &rest[1..];
+        }
         let character = rest
             .chars()
             .next()
-            .expect("non-empty string has a character");
+            .expect("an escape is always followed by a character");
         match character {
             '@' => escaped.push_str("@\u{200b}"),
             '<' => escaped.push_str("&lt;"),
@@ -31172,6 +31198,37 @@ rename to src/new.rs
         // fenced block never shelters raw HTML behind a backtick run.
         let rendered = safe_public_model_markdown("```html\n<script>\n```", 4_000, "…");
         assert_eq!(rendered, "` ` `html\n&lt;script&gt;\n` ` `");
+    }
+
+    #[test]
+    fn public_markdown_never_reopens_a_failed_backtick_run_at_a_shorter_length() {
+        // The double-backtick opener never finds a closer, so GitHub keeps
+        // the whole run literal and the later lone backtick opens nothing.
+        // Retrying the run as a single backtick would pair it with that
+        // stray one and smuggle `<b>` out unescaped.
+        let rendered = safe_public_model_markdown("``<b>`after", 4_000, "…");
+        assert_eq!(rendered, "``&lt;b&gt;`after");
+    }
+
+    #[test]
+    fn public_markdown_backslash_escaped_backticks_do_not_open_code_spans() {
+        // `\`` is a literal backtick, so the payload after it is prose and
+        // must still be neutralized. The stray closer then opens nothing.
+        let rendered = safe_public_model_markdown("\\`@victim <details>x</details>`", 4_000, "…");
+        assert_eq!(
+            rendered,
+            "\\`@\u{200b}victim &lt;details&gt;x&lt;/details&gt;`"
+        );
+
+        // `\\`` is an escaped backslash followed by a real opener.
+        let rendered = safe_public_model_markdown("\\\\`@code <b>`", 4_000, "…");
+        assert_eq!(rendered, "\\\\`@code <b>`");
+    }
+
+    #[test]
+    fn public_markdown_link_breaking_leaves_code_spans_alone() {
+        let rendered = safe_public_model_markdown("`[text](url)` vs [text](url)", 4_000, "…");
+        assert_eq!(rendered, "`[text](url)` vs [text]\\(url)");
     }
 
     #[test]
