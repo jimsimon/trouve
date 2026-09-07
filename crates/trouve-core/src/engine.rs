@@ -148,6 +148,17 @@ fn base64_sextet(byte: u8) -> Option<u8> {
     }
 }
 
+/// Sanitized extension (".png") for an opaque attachment file name, so tools
+/// and vendor CLIs sniff the type naturally without trusting the upload name.
+fn opaque_attachment_extension(name: &str) -> String {
+    Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .filter(|e| e.len() <= 8 && e.chars().all(|c| c.is_ascii_alphanumeric()))
+        .map(|e| format!(".{}", e.to_ascii_lowercase()))
+        .unwrap_or_default()
+}
+
 /// Validate the request envelope, including its exact decoded sizes, before
 /// allocating decoded buffers or creating any durable cleanup/file state.
 fn validate_attachment_uploads(
@@ -351,6 +362,30 @@ impl Drop for PreparedAttachmentCleanup {
             }
         } else if let Err(error) = cleanup {
             tracing::error!(%error, "failed to roll back unstaged attachment files");
+        }
+    }
+}
+
+/// Temporary on-disk copies of naming-request images for backends that only
+/// accept image files by path. The files never enter the durable attachment
+/// store or a session worktree and are removed when the request finishes,
+/// including when its future is dropped by a disconnecting client.
+struct StagedTitleImages {
+    executor: Arc<dyn ToolExecutor>,
+    root: PathBuf,
+    paths: Vec<PathBuf>,
+}
+
+impl Drop for StagedTitleImages {
+    fn drop(&mut self) {
+        if self.paths.is_empty() {
+            return;
+        }
+        if let Err(error) = self
+            .executor
+            .rollback_attachment_files(&self.root, &self.paths)
+        {
+            tracing::warn!(%error, "failed to remove staged naming images");
         }
     }
 }
@@ -597,6 +632,10 @@ const SESSION_TITLE_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 // end-to-end guard just beyond those independent bounded phases.
 const LOCAL_SESSION_TITLE_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(10 * 60 + 45);
+// A staged naming image older than the longest naming budget cannot belong
+// to a live request, so the startup sweep may remove it.
+const STALE_TITLE_IMAGE_AGE: std::time::Duration =
+    std::time::Duration::from_secs(LOCAL_SESSION_TITLE_TIMEOUT.as_secs() + 5 * 60);
 // Naming is cosmetic and authenticated clients may retry while local
 // inference is busy. Bound both distinct work and coalesced followers so a
 // stalled sidecar cannot retain an arbitrary number of request tasks.
@@ -4138,6 +4177,26 @@ impl Engine {
         }
     }
 
+    /// Remove naming images staged by a previous process that died before
+    /// its `StagedTitleImages` guard ran. Only files older than every
+    /// naming budget are touched, so a request still in flight in another
+    /// server instance sharing this data directory keeps its staged copy.
+    pub async fn sweep_stale_title_images(&self) {
+        match self
+            .executor
+            .sweep_stale_staged_files(&self.title_image_root(), STALE_TITLE_IMAGE_AGE)
+            .await
+        {
+            Ok(0) => {}
+            Ok(removed) => tracing::info!(removed, "removed orphaned staged naming images"),
+            Err(error) => tracing::warn!(%error, "failed to sweep staged naming images"),
+        }
+    }
+
+    fn title_image_root(&self) -> PathBuf {
+        self.data_dir.join("title-attachments")
+    }
+
     /// Finish durable persona-file deletions left by an interrupted request.
     /// The intent keeps repository references untouched until the executor
     /// confirms the file is gone; a missing file is success only on replay.
@@ -7371,6 +7430,15 @@ impl Engine {
         if let Some((_, backend, model_name)) = self.backend_for(&settings.model) {
             use base64::Engine as _;
             let cancel = tokio_util::sync::CancellationToken::new();
+            // Naming requests carry raw uploads rather than durable
+            // attachments, so path-only vendors (Codex) get short-lived opaque
+            // copies outside both the durable store and the session worktree.
+            let mut staged = StagedTitleImages {
+                executor: self.executor.clone(),
+                root: self.title_image_root(),
+                paths: Vec::new(),
+            };
+            let stage_locally = backend.requires_local_image_paths();
             let backend_attachments = attachments
                 .iter()
                 .filter(|_| model_info.supports_images)
@@ -7379,11 +7447,25 @@ impl Engine {
                     let bytes = base64::engine::general_purpose::STANDARD
                         .decode(&attachment.data)
                         .map_err(|error| EngineError::BadRequest(error.to_string()))?;
+                    let local_path = if stage_locally {
+                        let path = staged.root.join(format!(
+                            "title_{}{}",
+                            uuid::Uuid::new_v4().simple(),
+                            opaque_attachment_extension(&attachment.name)
+                        ));
+                        self.executor
+                            .prepare_attachment_file(&staged.root, &path, &bytes)
+                            .map_err(|error| EngineError::Internal(anyhow!(error)))?;
+                        staged.paths.push(path.clone());
+                        Some(path)
+                    } else {
+                        None
+                    };
                     Ok(trouve_agents::TurnAttachment {
                         name: attachment.name.clone(),
                         mime: attachment.mime.clone(),
                         bytes: Arc::from(bytes),
-                        local_path: None,
+                        local_path,
                     })
                 })
                 .collect::<Result<Vec<_>, EngineError>>()?;
@@ -13703,13 +13785,7 @@ impl Engine {
             let id = format!("at_{}", uuid::Uuid::new_v4().simple());
             // Store under the opaque id; keep the (sanitized) extension so
             // tools and vendor CLIs sniff the type naturally.
-            let ext = Path::new(&up.name)
-                .extension()
-                .and_then(|e| e.to_str())
-                .filter(|e| e.len() <= 8 && e.chars().all(|c| c.is_ascii_alphanumeric()))
-                .map(|e| format!(".{}", e.to_ascii_lowercase()))
-                .unwrap_or_default();
-            let path = dir.join(format!("{id}{ext}"));
+            let path = dir.join(format!("{id}{}", opaque_attachment_extension(&up.name)));
             let attachment = trouve_protocol::Attachment {
                 id,
                 name: up.name,

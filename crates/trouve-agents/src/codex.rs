@@ -269,6 +269,12 @@ impl AgentBackend for CodexBackend {
         true
     }
 
+    /// The app-server reads `localImage` items from disk itself; there is no
+    /// inline image input.
+    fn requires_local_image_paths(&self) -> bool {
+        true
+    }
+
     async fn startup_activity(&self, turn: &BackendTurn) -> Option<BackendStartupActivity> {
         let mcp_config = thread_mcp_config(&codex_config_override(turn));
         if mcp_config.is_null() {
@@ -296,7 +302,7 @@ impl AgentBackend for CodexBackend {
         for attachment in steer.attachments {
             let path = attachment.local_path.ok_or_else(|| {
                 BackendError::Protocol(format!(
-                    "attachment {} has no verified worktree-local image path",
+                    "attachment {} has no engine-staged local image path",
                     attachment.name
                 ))
             })?;
@@ -514,7 +520,7 @@ impl AgentBackend for CodexBackend {
         for att in &turn.attachments {
             let path = att.local_path.as_ref().ok_or_else(|| {
                 BackendError::Protocol(format!(
-                    "attachment {} has no verified worktree-local image path",
+                    "attachment {} has no engine-staged local image path",
                     att.name
                 ))
             })?;

@@ -2,7 +2,7 @@
 //! event streams, approval flow, checkpointing, and undo — no network, no
 //! real model.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -5528,6 +5528,174 @@ async fn session_naming_settings_persist_and_publish() {
         .await
         .unwrap();
     assert_eq!(conflict.status(), reqwest::StatusCode::CONFLICT);
+}
+
+/// Vendor backend that, like Codex, only accepts images as local files.
+/// Records what the naming turn's attachment looked like on disk while the
+/// turn was running.
+struct LocalImageBackend {
+    seen: std::sync::Mutex<Vec<(PathBuf, Vec<u8>)>>,
+}
+
+#[async_trait::async_trait]
+impl trouve_agents::AgentBackend for LocalImageBackend {
+    fn id(&self) -> &str {
+        "localimage"
+    }
+
+    fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
+        vec![trouve_protocol::ModelInfo {
+            id: "localimage/m".into(),
+            display_name: "Local image".into(),
+            context_window: 100_000,
+            supports_tools: true,
+            supports_images: true,
+            input_price_per_mtok: None,
+            output_price_per_mtok: None,
+            options_schema: serde_json::json!({"type": "object", "properties": {}}),
+        }]
+    }
+
+    fn status(&self) -> trouve_agents::BackendStatus {
+        trouve_agents::BackendStatus {
+            installed: true,
+            has_credentials: true,
+        }
+    }
+
+    fn requires_local_image_paths(&self) -> bool {
+        true
+    }
+
+    async fn start_login(
+        &self,
+    ) -> Result<trouve_agents::BackendLogin, trouve_agents::BackendError> {
+        Err(trouve_agents::BackendError::Auth("not needed".into()))
+    }
+
+    async fn run_turn(
+        &self,
+        turn: trouve_agents::BackendTurn,
+    ) -> Result<trouve_agents::BackendEventStream, trouve_agents::BackendError> {
+        assert!(turn.tool_free);
+        for attachment in &turn.attachments {
+            let path = attachment.local_path.clone().ok_or_else(|| {
+                trouve_agents::BackendError::Protocol(format!(
+                    "attachment {} has no engine-staged local image path",
+                    attachment.name
+                ))
+            })?;
+            let bytes = std::fs::read(&path)
+                .map_err(|error| trouve_agents::BackendError::Protocol(error.to_string()))?;
+            self.seen.lock().unwrap().push((path, bytes));
+        }
+        let events = vec![
+            Ok(trouve_agents::BackendEvent::TextDelta(
+                "Explain Broken Model Picker".into(),
+            )),
+            Ok(trouve_agents::BackendEvent::Completed {
+                usage: Usage::default(),
+            }),
+        ];
+        Ok(Box::pin(futures::stream::iter(events)))
+    }
+}
+
+/// Screenshots on a first prompt reach a path-only naming backend as
+/// temporary staged files that vanish once the title is produced.
+#[tokio::test]
+async fn naming_stages_images_for_path_only_backends() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+    let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
+    let backend = Arc::new(LocalImageBackend {
+        seen: std::sync::Mutex::new(Vec::new()),
+    });
+    let data_dir = tmp.path().join("data");
+    let engine = Arc::new(
+        Engine::new(store, data_dir.clone(), &Config::default())
+            .with_backend("localimage", backend.clone())
+            .with_config_dir(None)
+            .with_config_file(Some(tmp.path().join("config.toml"))),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = trouve_server::build_router(engine.clone());
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let base = format!("http://{addr}/v1");
+    let client = reqwest::Client::new();
+
+    let response = client
+        .put(format!("{base}/config/session-naming"))
+        .json(&serde_json::json!({
+            "model": "localimage/m",
+            "derive_branch_name_from_session_title": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let workspace: serde_json::Value = client
+        .post(format!("{base}/workspaces"))
+        .json(&serde_json::json!({ "path": repo }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let session: serde_json::Value = client
+        .post(format!("{base}/sessions"))
+        .json(&serde_json::json!({ "workspace_id": workspace["id"] }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let response = client
+        .post(format!("{base}/title"))
+        .json(&serde_json::json!({
+            "session_id": session["id"],
+            "prompt": "Explain this screenshot showing a broken model picker.",
+            "attachments": [{
+                "name": "Screenshot 2026-09-06.PNG",
+                "mime": "image/png",
+                "data": "QUJD"
+            }]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let generated: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(generated["title"], "Explain Broken Model Picker");
+
+    let seen = backend.seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1);
+    let (path, bytes) = &seen[0];
+    assert_eq!(bytes, b"ABC");
+    assert_eq!(
+        path.parent(),
+        Some(data_dir.join("title-attachments").as_path())
+    );
+    assert_eq!(path.extension().and_then(|e| e.to_str()), Some("png"));
+    assert!(
+        !path.starts_with(data_dir.join("attachments")),
+        "staged image must not enter the durable attachment store"
+    );
+    assert!(
+        !path.starts_with(session["worktree_path"].as_str().unwrap()),
+        "staged image must not enter the session worktree"
+    );
+    assert!(
+        !path.exists(),
+        "staged image is removed once the title request completes"
+    );
 }
 
 #[tokio::test]

@@ -6,6 +6,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Session naming works when the first prompt has a screenshot**: with a
+  Codex naming model, sessions and threads whose initial prompt attached an
+  image stayed on their "New Session" / "New Thread" placeholders because the
+  Codex app-server only accepts images as local files and the naming request
+  offered none. The engine now stages naming images as short-lived opaque
+  files (outside both the durable attachment store and the session worktree)
+  for path-only backends and removes them when the request finishes.
+
 ## [4.10.0] - 2026-09-06
 
 This release replaces Cursor's legacy ACP transport with its Agent SDK,
