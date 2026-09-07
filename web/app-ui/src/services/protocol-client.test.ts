@@ -80,6 +80,7 @@ describe("ProtocolClient", () => {
         model: "provider/model",
         derive_branch_name_from_session_title: false,
       },
+      provider_order: ["codex", "cursor"],
     };
     const client = new ProtocolClient("http://127.0.0.1:43127", {
       fetch: vi.fn<typeof fetch>(async (input, init) => {
@@ -1257,11 +1258,11 @@ describe("protocol compatibility", () => {
   });
 
   it("accepts the exact generated protocol version", () => {
-    expect(() => assertProtocolCompatibility("9.3")).not.toThrow();
+    expect(() => assertProtocolCompatibility("9.4")).not.toThrow();
   });
 
   it("rejects older, newer, other-major, and malformed servers", () => {
-    for (const version of ["4.0", "5.2", "6.1", "7.0", "7.1", "7.2", "7.3", "7.4", "7.5", "7.6", "7.7", "7.8", "7.9", "7.10", "7.11", "7.12", "7.13", "7.14", "7.15", "7.16", "7.17", "7.18", "7.19", "7.20", "7.21", "7.22", "7.23", "7.24", "7.25", "7.26", "7.27", "7.28", "7.28.1", "7.29", "7.29.1", "7.30", "7.30.1", "7.31", "7.31.1", "7.32", "8.0", "8.1", "8.2", "8.3", "8.4", "9.0", "9.1", "9.2", "9.3.1", "9.4", "unknown", ""]) {
+    for (const version of ["4.0", "5.2", "6.1", "7.0", "7.1", "7.2", "7.3", "7.4", "7.5", "7.6", "7.7", "7.8", "7.9", "7.10", "7.11", "7.12", "7.13", "7.14", "7.15", "7.16", "7.17", "7.18", "7.19", "7.20", "7.21", "7.22", "7.23", "7.24", "7.25", "7.26", "7.27", "7.28", "7.28.1", "7.29", "7.29.1", "7.30", "7.30.1", "7.31", "7.31.1", "7.32", "8.0", "8.1", "8.2", "8.3", "8.4", "9.0", "9.1", "9.2", "9.3", "9.3.1", "unknown", ""]) {
       expect(() => assertProtocolCompatibility(version)).toThrowError(
         expect.objectContaining({ kind: "incompatible-protocol" }),
       );

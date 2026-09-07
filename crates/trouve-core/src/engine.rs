@@ -1358,6 +1358,9 @@ struct TurnScheduler {
 }
 
 struct TurnAdmission {
+    /// Admission currently carries cooldown-wait telemetry only: provider
+    /// turns are deliberately uncapped. Keep it scoped to one route attempt
+    /// so any future provider-capacity lease has the correct handoff lifetime.
     provider_wait_ms: u64,
 }
 
@@ -5342,6 +5345,13 @@ impl Engine {
                 .with_context(|| format!("persisting provider order to {}", path.display()))?;
         }
         *config = next;
+        drop(config);
+        self.store.append_event(
+            Scope::Server,
+            Event::ProviderOrderUpdated {
+                provider_order: self.list_providers().provider_order,
+            },
+        )?;
         Ok(())
     }
 
@@ -10123,12 +10133,14 @@ impl Engine {
         }
 
         let session_naming_settings = self.session_naming_settings();
+        let provider_order = self.list_providers().provider_order;
         Ok((
             cursor,
             trouve_protocol::ServerProjection {
                 github_pull_requests,
                 session_pull_requests,
                 session_naming_settings,
+                provider_order,
             },
         ))
     }

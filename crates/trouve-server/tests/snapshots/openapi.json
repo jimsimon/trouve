@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "9.3"
+    "version": "9.4"
   },
   "paths": {
     "/v1/approvals": {
@@ -9439,6 +9439,28 @@
                 ]
               }
             }
+          },
+          {
+            "type": "object",
+            "description": "The preference order used by provider-neutral model routing changed.\nCarries a full replacement snapshot for replay and reconnect.",
+            "required": [
+              "provider_order",
+              "type"
+            ],
+            "properties": {
+              "provider_order": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "settings.provider_order_updated"
+                ]
+              }
+            }
           }
         ],
         "description": "Every event type in the log. Serialized with a `type` tag using\ndot-namespaced names, per the event-log design doc."
@@ -12557,7 +12579,8 @@
         "required": [
           "github_pull_requests",
           "session_pull_requests",
-          "session_naming_settings"
+          "session_naming_settings",
+          "provider_order"
         ],
         "properties": {
           "github_pull_requests": {
@@ -12565,6 +12588,13 @@
             "items": {
               "$ref": "#/components/schemas/GithubPrHostProjection"
             }
+          },
+          "provider_order": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Full provider preference order used for automatic model routing."
           },
           "session_naming_settings": {
             "$ref": "#/components/schemas/SessionNamingSettings"

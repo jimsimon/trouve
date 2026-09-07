@@ -1319,7 +1319,7 @@ impl Engine {
             guard = session_lifecycle.read() => guard,
         };
         let mut first_candidate = 0;
-        let first_route_admission = if prompt.background {
+        let mut route_admission = Some(if prompt.background {
             let route = candidates
                 .first()
                 .context("background activity route disappeared")?;
@@ -1343,7 +1343,7 @@ impl Engine {
                 }
                 first_candidate += 1;
             }
-        };
+        });
         if first_candidate > 0 {
             candidates.drain(..first_candidate);
         }
@@ -1353,7 +1353,10 @@ impl Engine {
             thread,
             turn,
             background,
-            first_route_admission.provider_wait_ms,
+            route_admission
+                .as_ref()
+                .context("initial model route was not admitted")?
+                .provider_wait_ms,
         )
         .await?;
 
@@ -1494,6 +1497,10 @@ impl Engine {
 
         for (route_index, route) in candidates.iter().enumerate() {
             if route_index > 0 {
+                // One admission lifetime belongs to one concrete attempt.
+                // Today's value is wait telemetry; this explicit handoff also
+                // prevents a future capacity lease from overlapping routes.
+                let _previous_admission = route_admission.take();
                 let capacity_model = format!("{}/{}", route.provider_id, route.provider_model);
                 if self
                     .turn_scheduler
@@ -1502,7 +1509,7 @@ impl Engine {
                 {
                     continue;
                 }
-                self.turn_scheduler.admit(&capacity_model, &cancel).await?;
+                route_admission = Some(self.turn_scheduler.admit(&capacity_model, &cancel).await?);
                 self.store.append_event(
                     scope.clone(),
                     Event::ModelRouteSelected {
@@ -4512,6 +4519,42 @@ mod tests {
         assert_eq!(
             engine.config.lock().unwrap().provider_order,
             vec!["second", "first"]
+        );
+    }
+
+    #[test]
+    fn provider_order_is_published_for_other_clients_and_cold_start() {
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let config = Config {
+            providers: BTreeMap::from([
+                ("first".into(), crate::config::ProviderConfig::default()),
+                ("second".into(), crate::config::ProviderConfig::default()),
+            ]),
+            provider_order: vec!["first".into(), "second".into()],
+            local_enabled: Some(false),
+            ..Default::default()
+        };
+        let engine = Engine::new(store.clone(), data.path().into(), &config);
+        let before = store.latest_event_cursor(&Scope::Server).unwrap();
+
+        engine
+            .set_provider_order(&["second".into(), "first".into()], None)
+            .unwrap();
+
+        let events = store.events_after(&Scope::Server, before).unwrap();
+        assert!(matches!(
+            events.as_slice(),
+            [trouve_protocol::EventEnvelope {
+                event: Event::ProviderOrderUpdated { provider_order },
+                ..
+            }] if provider_order.starts_with(&["second".into(), "first".into()])
+        ));
+        let (_, projection) = engine.server_projection_snapshot().unwrap();
+        assert!(
+            projection
+                .provider_order
+                .starts_with(&["second".into(), "first".into()])
         );
     }
 

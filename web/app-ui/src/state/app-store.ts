@@ -79,6 +79,11 @@ export interface SessionNamingSettingsSnapshot {
   readonly settings: ProtocolSessionNamingSettings;
 }
 
+export interface ProviderOrderSnapshot {
+  readonly cursor: number;
+  readonly providerIds: readonly string[];
+}
+
 const visualState = (
   summary: ProtocolSessionSummary,
   unread: boolean,
@@ -228,6 +233,7 @@ export class AppStore {
   readonly #sessionNamingSettings = createSignal<SessionNamingSettingsSnapshot | undefined>(
     undefined,
   );
+  readonly #providerOrder = createSignal<ProviderOrderSnapshot | undefined>(undefined);
 
   readonly serverInfo: ReadonlySignal<ProtocolServerInfo | undefined> = this.#serverInfo;
   /** Edge-triggered automation events are exposed as a monotonic invalidation
@@ -236,6 +242,7 @@ export class AppStore {
   readonly automationRevision: ReadonlySignal<number> = this.#automationRevision;
   readonly sessionNamingSettings: ReadonlySignal<SessionNamingSettingsSnapshot | undefined> =
     this.#sessionNamingSettings;
+  readonly providerOrder: ReadonlySignal<ProviderOrderSnapshot | undefined> = this.#providerOrder;
 
   constructor(options: { readonly maxThreadViews?: number } = {}) {
     this.#maxThreadViews = Math.max(1, options.maxThreadViews ?? 8);
@@ -426,6 +433,7 @@ export class AppStore {
       );
     }
     this.replaceSessionNamingSettings(cursor, projection.session_naming_settings);
+    this.replaceProviderOrder(cursor, projection.provider_order);
     this.#touch();
     return true;
   }
@@ -911,6 +919,9 @@ export class AppStore {
       case "settings.session_naming_updated":
         this.replaceSessionNamingSettings(envelope.cursor, envelope.settings);
         return false;
+      case "settings.provider_order_updated":
+        this.replaceProviderOrder(envelope.cursor, envelope.provider_order);
+        return false;
       case "automation.fired":
         this.#automationRevision.set(this.#automationRevision.get() + 1);
         // Successful automation runs create sessions. The replacement summary
@@ -962,6 +973,16 @@ export class AppStore {
     if (current !== undefined && current.cursor > cursor) return false;
     const frozen = Object.freeze({ ...settings });
     this.#sessionNamingSettings.set(Object.freeze({ cursor, settings: frozen }));
+    return true;
+  }
+
+  replaceProviderOrder(cursor: number, providerIds: readonly string[]): boolean {
+    const current = this.#providerOrder.get();
+    if (current !== undefined && current.cursor > cursor) return false;
+    this.#providerOrder.set(Object.freeze({
+      cursor,
+      providerIds: Object.freeze([...providerIds]),
+    }));
     return true;
   }
 

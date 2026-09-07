@@ -687,6 +687,10 @@ pub enum Event {
         provider_model: String,
         reason: ModelRouteReason,
     },
+    /// The preference order used by provider-neutral model routing changed.
+    /// Carries a full replacement snapshot for replay and reconnect.
+    #[serde(rename = "settings.provider_order_updated")]
+    ProviderOrderUpdated { provider_order: Vec<String> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -762,6 +766,19 @@ mod tests {
         let value = serde_json::to_value(event).unwrap();
         assert_eq!(value["reason"], "capacity_failover");
         assert!(serde_json::from_value::<ModelRouteReason>(serde_json::json!("other")).is_err());
+    }
+
+    #[test]
+    fn provider_order_event_uses_namespaced_tag() {
+        let event = Event::ProviderOrderUpdated {
+            provider_order: vec!["cursor".into(), "codex".into()],
+        };
+        let value = serde_json::to_value(event).unwrap();
+        assert_eq!(value["type"], "settings.provider_order_updated");
+        assert_eq!(
+            value["provider_order"],
+            serde_json::json!(["cursor", "codex"])
+        );
     }
 
     #[test]

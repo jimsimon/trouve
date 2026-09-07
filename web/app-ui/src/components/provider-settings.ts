@@ -3,6 +3,7 @@ import { css, html, LitElement, nothing } from "lit";
 
 import {
   appServicesContext,
+  appStoreContext,
   type AppServices,
 } from "../contexts/app-contexts.js";
 import type {
@@ -14,6 +15,7 @@ import type {
   ProtocolUpsertProviderRequest,
 } from "../services/protocol-client.js";
 import { requestWithDeadline } from "../services/subscription-health-controller.js";
+import { readSignal, withSignalTracking } from "../state/reactivity.js";
 import "./cli-settings.js";
 import {
   boundedSubscriptionUsage,
@@ -277,7 +279,7 @@ const clearWriteOnlyControls = (form: HTMLFormElement): void => {
 const category = (provider: Pick<ProtocolKnownProvider, "category">): string =>
   provider.category ?? "api";
 
-export class TrouveProviderSettings extends LitElement {
+export class TrouveProviderSettings extends withSignalTracking(LitElement) {
   static override properties = {
     providerCategory: { type: String, attribute: "provider-category" },
     showHeading: { type: Boolean, attribute: "show-heading" },
@@ -424,6 +426,10 @@ export class TrouveProviderSettings extends LitElement {
     context: appServicesContext,
     subscribe: true,
   });
+  readonly #store = new ContextConsumer(this, {
+    context: appStoreContext,
+    subscribe: true,
+  });
   providerCategory: "subscription" | "api" = "subscription";
   showHeading = true;
   #loadedServices: AppServices | undefined;
@@ -447,6 +453,7 @@ export class TrouveProviderSettings extends LitElement {
   #loginPoller: ProviderLoginPoller | undefined;
   #refreshTimer: ReturnType<typeof setInterval> | undefined;
   #retryTimer: ReturnType<typeof setTimeout> | undefined;
+  #providerOrderBoundary = 0;
 
   override connectedCallback(): void {
     super.connectedCallback();
@@ -488,7 +495,8 @@ export class TrouveProviderSettings extends LitElement {
       return html`<div class="settings-card" role="status">Loading providers…</div>`;
     }
 
-    const allConfigured = this.#providers?.providers ?? [];
+    const providers = this.#projectedProviders();
+    const allConfigured = providers?.providers ?? [];
     const automaticConfigured = automaticRoutingProviders(allConfigured);
     const subscriptionPresets = this.#knownProviders.filter(
       (provider) => category(provider) === "subscription" || provider.auth === "oauth" || provider.auth === "cli",
@@ -527,7 +535,7 @@ export class TrouveProviderSettings extends LitElement {
 
         ${automaticConfigured.length < 2
           ? nothing
-          : this.#renderRoutingPriority(automaticConfigured)}
+          : this.#renderRoutingPriority(automaticConfigured, providers)}
 
         ${this.#notice === "" ? nothing : html`
           <p class=${`notice${this.#noticeIsError ? " error" : ""}`} role=${this.#noticeIsError ? "alert" : "status"} aria-live="polite">
@@ -668,11 +676,14 @@ export class TrouveProviderSettings extends LitElement {
     `;
   }
 
-  #renderRoutingPriority(configured: readonly ProtocolProviderInfo[]) {
+  #renderRoutingPriority(
+    configured: readonly ProtocolProviderInfo[],
+    providers: ProtocolProvidersResponse | undefined,
+  ) {
     const ids = configured.map((provider) => provider.id);
-    const allIds = this.#providers?.providers.map((provider) => provider.id) ?? ids;
+    const allIds = providers?.providers.map((provider) => provider.id) ?? ids;
     const order = normalizedProviderOrder(
-      this.#providers?.provider_order ?? [],
+      providers?.provider_order ?? [],
       allIds,
     ).filter((providerId) => ids.includes(providerId));
     return html`
@@ -888,11 +899,26 @@ export class TrouveProviderSettings extends LitElement {
     await this.#load();
   }
 
+  #projectedProviders(): ProtocolProvidersResponse | undefined {
+    const providers = this.#providers;
+    const store = this.#store.value;
+    const projection = store === undefined ? undefined : readSignal(store.providerOrder);
+    if (
+      providers === undefined
+      || projection === undefined
+      || projection.cursor <= this.#providerOrderBoundary
+    ) return providers;
+    return { ...providers, provider_order: [...projection.providerIds] };
+  }
+
   async #load(forceHealth = true): Promise<boolean> {
     const services = this.#services.value;
     if (services === undefined) return false;
     this.#clearRetry();
     const generation = ++this.#loadGeneration;
+    const providerOrderBoundary = this.#store.value === undefined
+      ? 0
+      : readSignal(this.#store.value.providerOrder)?.cursor ?? 0;
     this.#loading = true;
     this.requestUpdate();
     this.#loadKnownProviders(services);
@@ -900,7 +926,13 @@ export class TrouveProviderSettings extends LitElement {
     const [providers] = await Promise.allSettled([services.protocol.providers()]);
     if (generation !== this.#loadGeneration || !this.isConnected) return false;
     this.#loading = false;
-    if (providers.status === "fulfilled") this.#providers = providers.value;
+    if (providers.status === "fulfilled") {
+      this.#providers = providers.value;
+      this.#providerOrderBoundary = Math.max(
+        this.#providerOrderBoundary,
+        providerOrderBoundary,
+      );
+    }
     if (providers.status === "rejected") {
       this.#setNotice(PROVIDERS_ERROR, true);
       this.#scheduleRetry();
@@ -1092,7 +1124,7 @@ export class TrouveProviderSettings extends LitElement {
 
   async #moveProvider(providerId: string, direction: -1 | 1): Promise<void> {
     const services = this.#services.value;
-    const providers = this.#providers;
+    const providers = this.#projectedProviders();
     if (services === undefined || providers === undefined || this.#busy !== "") return;
     const automaticIds = automaticRoutingProviders(providers.providers)
       .map((provider) => provider.id);

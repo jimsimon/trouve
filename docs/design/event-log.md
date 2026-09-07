@@ -238,6 +238,8 @@ Server scope:
 - `settings.code_review_updated` `{settings}` — full replacement snapshot
   after the automated-review total, reviewer, or final-editor deadline
   changes
+- `settings.provider_order_updated` `{provider_order}` — full replacement
+  snapshot after automatic-routing provider priority changes
 
 Code-review-job scope:
 

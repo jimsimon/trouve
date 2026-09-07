@@ -3341,6 +3341,10 @@ export interface components {
             turn: number;
             /** @enum {string} */
             type: "model.route_selected";
+        } | {
+            provider_order: string[];
+            /** @enum {string} */
+            type: "settings.provider_order_updated";
         };
         /** @description The envelope every event is delivered in (and persisted as). */
         EventEnvelope: components["schemas"]["Event"] & {
@@ -4524,6 +4528,8 @@ export interface components {
          */
         ServerProjection: {
             github_pull_requests: components["schemas"]["GithubPrHostProjection"][];
+            /** @description Full provider preference order used for automatic model routing. */
+            provider_order: string[];
             session_naming_settings: components["schemas"]["SessionNamingSettings"];
             session_pull_requests: components["schemas"]["SessionPrProjection"][];
         };

@@ -664,6 +664,7 @@ describe("AppStore", () => {
         model: "provider/model",
         derive_branch_name_from_session_title: false,
       },
+      provider_order: ["codex", "cursor"],
     };
 
     expect(store.replaceServerProjection(21, projection)).toBe(true);
@@ -674,6 +675,29 @@ describe("AppStore", () => {
       expect.objectContaining({ cursor: 20, refreshedAt: "2026-08-01T12:20:00Z" }),
     ]);
     expect(readSignal(store.sessionNamingSettings)).toMatchObject({ cursor: 21 });
+    expect(readSignal(store.providerOrder)).toEqual({
+      cursor: 21,
+      providerIds: ["codex", "cursor"],
+    });
+    store.applyServerEvent({
+      cursor: 22,
+      scope: "server",
+      ts: "2026-08-01T12:22:00Z",
+      type: "settings.provider_order_updated",
+      provider_order: ["cursor", "codex"],
+    });
+    expect(readSignal(store.providerOrder)).toEqual({
+      cursor: 22,
+      providerIds: ["cursor", "codex"],
+    });
+    store.applyServerEvent({
+      cursor: 20,
+      scope: "server",
+      ts: "2026-08-01T12:20:00Z",
+      type: "settings.provider_order_updated",
+      provider_order: ["codex", "cursor"],
+    });
+    expect(readSignal(store.providerOrder)?.providerIds).toEqual(["cursor", "codex"]);
     expect(store.replaceServerProjection(19, {
       ...projection,
       github_pull_requests: [],

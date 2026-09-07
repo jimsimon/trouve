@@ -976,6 +976,8 @@ pub struct ServerProjection {
     pub github_pull_requests: Vec<GithubPrHostProjection>,
     pub session_pull_requests: Vec<SessionPrProjection>,
     pub session_naming_settings: SessionNamingSettings,
+    /// Full provider preference order used for automatic model routing.
+    pub provider_order: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

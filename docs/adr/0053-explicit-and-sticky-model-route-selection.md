@@ -37,6 +37,9 @@ failover rules remain in force.
 - Provider-specific picker entries retain their provider's subscription usage
   annotation. Automatic entries may summarize the best currently reported
   route, but that summary does not override a healthy thread affinity.
+- Provider preference writes emit a durable full-replacement event and the
+  cold-start server projection carries the same order, so connected clients
+  converge without polling.
 - The built-in `local` provider and user-configured local OpenAI-compatible
   endpoints remain concrete choices. They do not merge with hosted automatic
   routes merely because a local model has the same name.
