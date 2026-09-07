@@ -202,6 +202,7 @@ export const projectSessionPullRequests = (
 
 export class AppStore {
   readonly #maxThreadViews: number;
+  #retainedThreadViewId: string | undefined;
   readonly #revision = createSignal(0);
   readonly #sessionMetadata = new Map<string, ProtocolSession>();
   readonly #deletedSessions = new Map<string, number | undefined>();
@@ -624,11 +625,7 @@ export class AppStore {
     this.#revision.get();
     let view = this.#threadViews.get(threadId);
     if (view === undefined) {
-      while (this.#threadViews.size >= this.#maxThreadViews) {
-        const oldest = this.#threadViews.keys().next().value as string | undefined;
-        if (oldest === undefined) break;
-        this.#threadViews.delete(oldest);
-      }
+      this.#evictThreadViewsToFit();
       view = new ThreadViewModel();
       const todoEvent = this.#threadTodoEvents.get(threadId);
       const todos = todoEvent ?? this.#threads.get(threadId)?.todos;
@@ -638,6 +635,13 @@ export class AppStore {
     }
     this.#threadViews.set(threadId, view);
     return view;
+  }
+
+  /** Keep the actively streamed conversation resident while incidental
+   * background consumers touch other thread projections. */
+  retainThreadView(threadId: string | undefined): void {
+    this.#retainedThreadViewId = threadId;
+    this.#evictThreadViewsToFit(0);
   }
 
   /** Merge the server-folded live tail into any retained prefetched history. */
@@ -654,11 +658,7 @@ export class AppStore {
       }
     }
     this.#threadViews.delete(threadId);
-    while (this.#threadViews.size >= this.#maxThreadViews) {
-      const oldest = this.#threadViews.keys().next().value as string | undefined;
-      if (oldest === undefined) break;
-      this.#threadViews.delete(oldest);
-    }
+    this.#evictThreadViewsToFit();
     const view = current ?? new ThreadViewModel();
     view.mergeTailSnapshot(cursor, snapshot);
     if (snapshot.todos === undefined) {
@@ -676,6 +676,16 @@ export class AppStore {
     }
     this.#touch();
     return true;
+  }
+
+  #evictThreadViewsToFit(extraEntries = 1): void {
+    while (this.#threadViews.size + extraEntries > this.#maxThreadViews) {
+      const oldest = [...this.#threadViews.keys()].find(
+        (threadId) => threadId !== this.#retainedThreadViewId,
+      );
+      if (oldest === undefined) break;
+      this.#threadViews.delete(oldest);
+    }
   }
 
   replaceThreadToolDetails(
