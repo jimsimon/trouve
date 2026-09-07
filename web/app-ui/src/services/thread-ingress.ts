@@ -219,6 +219,7 @@ export class ThreadIngress {
         : undefined;
     } catch (error) {
       if (!this.#isCurrentSession(sessionId, generation)) return undefined;
+      this.#store.retainThreadView(undefined);
       this.#state.set("error");
       throw error;
     }

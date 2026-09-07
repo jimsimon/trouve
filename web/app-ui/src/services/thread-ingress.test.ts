@@ -305,6 +305,32 @@ describe("ThreadIngress", () => {
     expect(ingress.state.get()).toBe("error");
   });
 
+  it("releases the retained view when stream loading fails", async () => {
+    const store = new AppStore({ maxThreadViews: 1 });
+    const protocol: ThreadProtocol = {
+      threads: vi.fn(async () => [thread("th_1")]),
+      threadView: vi.fn(async () => viewSnapshot(10, [{
+        kind: "user",
+        turn: 1,
+        content: "snapshot",
+        attachments: [],
+      }])),
+      threadEvents: vi.fn(async () => {
+        throw new Error("stream unavailable");
+      }),
+    };
+    const ingress = new ThreadIngress(protocol, store);
+
+    await expect(ingress.openSession("se_1", "th_1")).rejects.toThrow(
+      "stream unavailable",
+    );
+    const failedView = store.threadView("th_1");
+    store.threadView("th_incidental");
+
+    expect(store.threadView("th_1")).not.toBe(failedView);
+    expect(ingress.state.get()).toBe("error");
+  });
+
   it("reconnects when the same thread is opened again so events use the current generation", async () => {
     const store = new AppStore();
     const eventHandlers: Array<(event: ProtocolIngressEvent) => void> = [];
