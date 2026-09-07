@@ -4178,7 +4178,7 @@ impl Engine {
     }
 
     /// Remove naming images staged by a previous process that died before
-    /// its [`StagedTitleImages`] guard ran. Only files older than every
+    /// its `StagedTitleImages` guard ran. Only files older than every
     /// naming budget are touched, so a request still in flight in another
     /// server instance sharing this data directory keeps its staged copy.
     pub async fn sweep_stale_title_images(&self) {
