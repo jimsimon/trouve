@@ -489,6 +489,7 @@ const installProtocolFixtures = async (
             model: "test/tiny",
             derive_branch_name_from_session_title: false,
           },
+          provider_order: [],
         },
       });
       return;
