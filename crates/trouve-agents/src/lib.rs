@@ -120,8 +120,11 @@ pub struct TurnAttachment {
     pub mime: String,
     /// Owned bytes for protocols that embed image data.
     pub bytes: Arc<[u8]>,
-    /// Opaque, worktree-local path for vendors that require a local-image
-    /// filename. This never names the durable attachment store.
+    /// Opaque, engine-staged path for vendors that require a local-image
+    /// filename (see [`AgentBackend::requires_local_image_paths`]). Turn
+    /// attachments live below the session worktree; short-lived engine
+    /// requests such as naming stage a temporary copy instead. This never
+    /// names the durable attachment store.
     pub local_path: Option<std::path::PathBuf>,
 }
 
@@ -476,6 +479,14 @@ pub trait AgentBackend: Send + Sync {
         false
     }
 
+    /// Whether image attachments must arrive with [`TurnAttachment::local_path`]
+    /// set because the vendor protocol references image files instead of
+    /// embedding their bytes. Callers that hold only in-memory uploads must
+    /// stage them to disk before running a turn on such a backend.
+    fn requires_local_image_paths(&self) -> bool {
+        false
+    }
+
     /// Live subscription usage (plan, metered allowance windows). Codex
     /// answers via its app-server, Claude Code via a stream-json `get_usage`
     /// control request, and Cursor by exchanging its configured API key for
@@ -693,6 +704,10 @@ impl AgentBackend for RetirementAwareBackend {
         self.inner.confines_read_only_turns()
     }
 
+    fn requires_local_image_paths(&self) -> bool {
+        self.inner.requires_local_image_paths()
+    }
+
     async fn subscription_health(&self) -> Option<trouve_protocol::SubscriptionHealth> {
         self.inner.subscription_health().await
     }
@@ -792,6 +807,10 @@ impl AgentBackend for RuntimeLeasedBackend {
 
     fn confines_read_only_turns(&self) -> bool {
         self.inner.confines_read_only_turns()
+    }
+
+    fn requires_local_image_paths(&self) -> bool {
+        self.inner.requires_local_image_paths()
     }
 
     async fn subscription_health(&self) -> Option<trouve_protocol::SubscriptionHealth> {
