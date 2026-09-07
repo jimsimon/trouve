@@ -132,6 +132,10 @@ export const buildChatLayout = (items: readonly ThreadChatItem[]): ChatLayout =>
       continue;
     }
     if (isAgentItem(item)) {
+      // A provider can announce and complete a reasoning block without ever
+      // exposing displayable text. Keep that lifecycle state out of the
+      // transcript instead of rendering an empty Reasoning node.
+      if (item.kind === "thinking" && item.content.trim() === "") continue;
       const explicitTurn =
         item.kind === "assistant"
         || item.kind === "steered"
