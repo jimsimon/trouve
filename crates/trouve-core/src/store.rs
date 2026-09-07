@@ -4141,6 +4141,11 @@ const CURRENT_CODE_REVIEW_JOB_PREDICATE: &str = concat!(
     ")",
 );
 
+/// Whether a review job may still be executing (and therefore publishing).
+pub fn code_review_job_is_active(status: &str) -> bool {
+    matches!(status, "queued" | "running")
+}
+
 const LEGACY_UNADJUDICATED_REASON_MARKER: &str = "did not provide a specific reason";
 const LEGACY_MISSING_REASON_MARKER: &str = "has no recorded reason";
 
@@ -15210,7 +15215,10 @@ impl Store {
                 },
             )));
         }
-        if old.publication_claimed {
+        // A claim only guards an execution that is still publishing. Once the
+        // job has reached a terminal status its publication has settled, and
+        // a retry is simply the next full review of the same head.
+        if old.publication_claimed && code_review_job_is_active(&old.job.status) {
             tx.commit()?;
             return Ok(Some(CodeReviewJobRetryOutcome::PublicationClaimed(old.job)));
         }
@@ -32041,6 +32049,17 @@ mod tests {
                 .mark_code_review_publication_accepted(&accepted.id)
                 .unwrap()
         );
+        // While the claimed execution is still running, a retry must not
+        // race its publication.
+        let running_retry = retry_request_for(&store, &accepted.id, "retry:running");
+        let outcome = store
+            .retry_code_review_job(&accepted.id, &running_retry)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            CodeReviewJobRetryOutcome::PublicationClaimed(ref job) if job.id == accepted.id
+        ));
 
         store.recover_code_review_jobs().unwrap();
         let cases = [
@@ -32069,24 +32088,31 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
-        let dispatched_retry = retry_request_for(&store, &dispatched.id, "retry:dispatched");
-        let outcome = store
-            .retry_code_review_job(&dispatched.id, &dispatched_retry)
-            .unwrap()
-            .unwrap();
-        assert!(matches!(
-            outcome,
-            CodeReviewJobRetryOutcome::PublicationClaimed(ref job) if job.id == dispatched.id
-        ));
-        let accepted_retry = retry_request_for(&store, &accepted.id, "retry:accepted");
-        let outcome = store
-            .retry_code_review_job(&accepted.id, &accepted_retry)
-            .unwrap()
-            .unwrap();
-        assert!(matches!(
-            outcome,
-            CodeReviewJobRetryOutcome::PublicationClaimed(ref job) if job.id == accepted.id
-        ));
+        // Once the claimed execution has settled, its claim is history: the
+        // retry enqueues a linked replacement at the next generation instead
+        // of reconciling the finished job in place.
+        for (job, tag) in [
+            (&dispatched, "retry:dispatched"),
+            (&accepted, "retry:accepted"),
+        ] {
+            let request = retry_request_for(&store, &job.id, tag);
+            let outcome = store
+                .retry_code_review_job(&job.id, &request)
+                .unwrap()
+                .unwrap();
+            let CodeReviewJobRetryOutcome::Replacement(retry) = outcome else {
+                panic!("settled job {} should be retryable", job.id);
+            };
+            assert_eq!(retry.replacement.retry_of.as_deref(), Some(job.id.as_str()));
+            assert_eq!(retry.replacement.status, "queued");
+            assert_eq!(retry.replacement.trigger, "retry");
+            let old = store.code_review_job(&job.id).unwrap().unwrap();
+            assert_eq!(
+                old.job.retried_by.as_deref(),
+                Some(retry.replacement.id.as_str())
+            );
+            assert!(old.publication_claimed, "the settled claim stays recorded");
+        }
     }
 
     #[test]

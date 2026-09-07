@@ -1732,12 +1732,26 @@ struct ReviewCandidateRejection {
 /// before the resolution is accepted. The quote proves the coordinator
 /// examined the current code rather than a stale window; the judgment that
 /// the defect is gone remains the coordinator's.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+///
+/// A finding whose anchor the server could not map into the head revision
+/// (its history entry is marked `anchor_status: unmapped`) is re-anchored by
+/// the claim itself: `current_anchor_path` and `current_anchor_line` name the
+/// head coordinate the coordinator inspected, and the server reads that exact
+/// line before verifying the quote against it.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 struct ResolvedFindingClaim {
     #[serde(default)]
     finding_id: String,
     #[serde(default)]
     current_anchor_quote: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    current_anchor_path: String,
+    #[serde(default, skip_serializing_if = "is_zero_line")]
+    current_anchor_line: u64,
+}
+
+fn is_zero_line(line: &u64) -> bool {
+    *line == 0
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -3163,7 +3177,9 @@ impl Engine {
                     ))
                 });
         }
-        if old.publication_claimed {
+        // Only an execution that is still publishing must not be replaced; a
+        // finished job keeps its claim as history and can be retried freely.
+        if old.publication_claimed && crate::store::code_review_job_is_active(&old.job.status) {
             self.sync_code_review_projection(&old.job).await;
             return self
                 .store
@@ -6707,11 +6723,14 @@ impl Engine {
                 &carried_diff_contents,
                 &carried_anchor_lines,
             );
+            let unmapped_carried =
+                unmapped_carried_finding_ids(&previous_findings, &carried_locations);
             let prompt = validation_prompt(
                 &execution_record,
                 &coordinator_candidates,
                 &finding_history,
                 &carried_history_lines,
+                &unmapped_carried,
                 &prior_candidate_rejections,
                 &advisory_findings,
                 &previous_themes,
@@ -6934,7 +6953,21 @@ impl Engine {
             // Resolution claims for carried blocking findings outside this
             // round's window must verify against the server's own read of
             // the head revision; unverified claims are dropped and those
-            // findings stay open.
+            // findings stay open. Findings no mapping could place in the
+            // head are re-anchored from the coordinator's own claimed
+            // coordinate first, then verified the same way.
+            let mut carried_locations = carried_locations;
+            let mut carried_anchor_lines = carried_anchor_lines;
+            self.reanchor_unmapped_resolution_claims(
+                &job,
+                &validated.resolved_findings,
+                &previous_findings,
+                &mut carried_locations,
+                &mut carried_anchor_lines,
+                repository_path.as_path(),
+                superseded,
+            )
+            .await?;
             let resolved_finding_ids = verified_resolution_ids(
                 validated.resolved_finding_ids,
                 &validated.resolved_findings,
@@ -11271,6 +11304,80 @@ impl Engine {
         Ok((lines, has_more))
     }
 
+    /// Ground the coordinator's re-anchoring claims for unmapped carried
+    /// findings in the server's own read of the head revision. Each claimed
+    /// coordinate that reads successfully becomes the finding's head
+    /// location and its line joins the verifier's evidence, so the ordinary
+    /// quote verification then decides the claim. A read failure or an
+    /// absent line leaves the finding unmapped, and therefore open.
+    #[allow(clippy::too_many_arguments)]
+    async fn reanchor_unmapped_resolution_claims(
+        &self,
+        job: &trouve_protocol::CodeReviewJob,
+        claims: &[ResolvedFindingClaim],
+        findings: &[trouve_protocol::CodeReviewFinding],
+        locations: &mut CarriedAnchorLocations,
+        carried_anchor_lines: &mut HashMap<(String, u64), Option<String>>,
+        repository_path: &std::path::Path,
+        cancel: &CancellationToken,
+    ) -> Result<()> {
+        let unmapped = unmapped_carried_finding_ids(findings, locations);
+        for (finding_id, path, line) in reanchor_claim_targets(claims, &unmapped) {
+            ensure_review_current(cancel)?;
+            let key = (path.clone(), line);
+            let content = match carried_anchor_lines.get(&key) {
+                Some(content) => content.clone(),
+                None => {
+                    match self
+                        .executor
+                        .review_repository_object_line(&crate::tools::ReviewRepositoryObjectLine {
+                            managed_root: self.data_dir.join("review-repositories"),
+                            worktree: repository_path.to_path_buf(),
+                            head_sha: job.head_sha.clone(),
+                            path: path.clone(),
+                            line,
+                            max_bytes: REVIEW_ANCHOR_BLOB_MAX_BYTES,
+                            cancel: cancel.clone(),
+                        })
+                        .await
+                    {
+                        Ok(content) => content,
+                        Err(error) => {
+                            ensure_review_current(cancel)?;
+                            tracing::warn!(
+                                job_id = %job.id,
+                                finding_id,
+                                path,
+                                line,
+                                error = %bounded_utf8(&error, REVIEW_ANCHOR_ERROR_MAX_BYTES, "…"),
+                                "re-anchored resolution claim could not be read from the head \
+                                 revision; the finding stays open"
+                            );
+                            continue;
+                        }
+                    }
+                }
+            };
+            if content.is_none() {
+                tracing::warn!(
+                    job_id = %job.id,
+                    finding_id,
+                    path,
+                    line,
+                    "re-anchored resolution claim names a line absent from the head revision; \
+                     the finding stays open"
+                );
+                continue;
+            }
+            carried_anchor_lines.insert(key, content);
+            locations.insert(
+                finding_id,
+                HistoricalAnchorLocation::HeadLine { path, line },
+            );
+        }
+        Ok(())
+    }
+
     /// Load bounded direct diffs for findings created before durable carried
     /// coordinates existed. These are bootstrap evidence only: failures leave
     /// findings open, and successful coordinates are persisted at this job's
@@ -15603,6 +15710,7 @@ fn validation_prompt(
     candidates: &[CandidateFinding],
     finding_history: &[trouve_protocol::CodeReviewFinding],
     carried_anchor_lines: &HashMap<(String, u64), Option<String>>,
+    unmapped_carried_finding_ids: &HashSet<String>,
     prior_candidate_rejections: &[trouve_protocol::CodeReviewCandidateRejection],
     advisory_findings: &[trouve_protocol::CodeReviewFinding],
     previous_themes: &[trouve_protocol::CodeReviewTheme],
@@ -15660,6 +15768,7 @@ fn validation_prompt(
         finding_history,
         budgets.history_findings_max_bytes,
         carried_anchor_lines,
+        unmapped_carried_finding_ids,
     )?;
     let prior_candidate_rejections = compact_candidate_rejection_history(
         prior_candidate_rejections,
@@ -15821,8 +15930,16 @@ fn validation_prompt(
          finding fixed, add an entry to `resolved_findings` with its id and \
          `current_anchor_quote` copied verbatim from `current_anchor_line` (empty when it is \
          null). The quote is mechanically verified against the head revision; a missing or \
-         mismatching quote leaves the finding open. A carried blocking finding in a file this \
-         diff did not touch can only be resolved this way. An unchanged, moved, \
+         mismatching quote leaves the finding open. A history entry marked \
+         `\"anchor_status\":\"unmapped\"` could not be located in the head revision \
+         automatically: use tools to inspect the head revision, find the code the finding \
+         describes (or the code that now replaces it), and when you judge the finding fixed \
+         add a `resolved_findings` entry with its id, `current_anchor_path`, \
+         `current_anchor_line` (the 1-based head line you inspected), and \
+         `current_anchor_quote` copied verbatim from that line. The server reads exactly that \
+         line; a mismatching quote or a missing line leaves the finding open. A carried \
+         blocking finding in a file this diff did not touch can only be resolved through a \
+         verified claim. An unchanged, moved, \
          already-resolved, or uncertain \
          issue remains open. A historical finding whose status is `dismissed` was closed by a \
          maintainer resolving its review thread; that judgment is final. Never re-report a \
@@ -15893,7 +16010,8 @@ fn validation_prompt(
          \"reason\":\"specific reason this candidate was not retained\"}}],\
          \"resolved_finding_ids\":[\"previous finding id\"],\
          \"resolved_findings\":[{{\"finding_id\":\"carried finding id\",\
-         \"current_anchor_quote\":\"the history entry's current_anchor_line, verbatim; empty when it is null\"}}],\
+         \"current_anchor_quote\":\"the history entry's current_anchor_line, verbatim; empty when it is null\",\
+         \"current_anchor_path\":\"relative/file.rs — only for an unmapped finding\",\"current_anchor_line\":123}}],\
          \"themes\":[{{\"theme_id\":\"existing durable theme id or empty\",\"root_cause\":\"shared mechanism behind multiple findings\",\
          \"recommendation\":\"structural fix that addresses the cause\",\
          \"source_candidate_ids\":[\"candidate id\"],\
@@ -16084,6 +16202,7 @@ fn compact_finding_history(
     findings: &[trouve_protocol::CodeReviewFinding],
     max_bytes: usize,
     carried_anchor_lines: &HashMap<(String, u64), Option<String>>,
+    unmapped_carried_finding_ids: &HashSet<String>,
 ) -> Result<Vec<serde_json::Value>> {
     let values = findings
         .iter()
@@ -16092,6 +16211,7 @@ fn compact_finding_history(
             compact_finding_value(
                 finding,
                 carried_anchor_lines.get(&(finding.path.clone(), finding.line)),
+                unmapped_carried_finding_ids.contains(&finding.id),
             )
         })
         .collect::<Result<Vec<_>>>()?;
@@ -16134,6 +16254,7 @@ fn bounded_json_text(value: &str, max_serialized_bytes: usize, marker: &str) -> 
 fn compact_finding_value(
     finding: &trouve_protocol::CodeReviewFinding,
     current_anchor_line: Option<&Option<String>>,
+    anchor_unmapped: bool,
 ) -> Result<serde_json::Value> {
     let theme_ids = bounded_json_values(
         finding
@@ -16181,6 +16302,11 @@ fn compact_finding_value(
             }
             None => serde_json::Value::Null,
         };
+    } else if anchor_unmapped {
+        // No server-side mapping reached the head revision, so the
+        // coordinator must locate the code itself and re-anchor any
+        // resolution claim with an explicit head coordinate.
+        value["anchor_status"] = serde_json::json!("unmapped");
     }
     Ok(value)
 }
@@ -18675,6 +18801,73 @@ fn carried_anchor_history_lines(
     history_lines
 }
 
+/// Carried open blocking findings whose anchor no server-side mapping could
+/// place in the head revision — typically findings observed at a head that
+/// predates the durable anchor chain and whose bootstrap diff was
+/// unavailable. Their history entries are flagged so the coordinator knows
+/// it must locate the code itself and re-anchor any resolution claim.
+fn unmapped_carried_finding_ids(
+    findings: &[trouve_protocol::CodeReviewFinding],
+    locations: &CarriedAnchorLocations,
+) -> HashSet<String> {
+    findings
+        .iter()
+        .filter(|finding| {
+            finding.status == "open"
+                && finding.line > 0
+                && finding_is_blocking(&finding.severity, &finding.confidence)
+                && finding_gates(&finding.evidence, finding.origin)
+        })
+        .filter(|finding| {
+            matches!(
+                locations.get(&finding.id),
+                None | Some(HistoricalAnchorLocation::Unverifiable)
+                    | Some(HistoricalAnchorLocation::InDiff { head: None })
+            )
+        })
+        .map(|finding| finding.id.clone())
+        .collect()
+}
+
+/// Head coordinates the coordinator supplied for unmapped findings it claims
+/// resolved. Only claims that name a plausible relative path, a positive
+/// line, and a non-empty quote qualify: an empty quote could only verify
+/// against an absent line, and a coordinator-chosen absent line proves
+/// nothing about the finding. Bounded so a runaway claim list cannot turn
+/// into unbounded git reads.
+fn reanchor_claim_targets(
+    claims: &[ResolvedFindingClaim],
+    unmapped: &HashSet<String>,
+) -> Vec<(String, String, u64)> {
+    let mut seen = HashSet::new();
+    claims
+        .iter()
+        .filter(|claim| unmapped.contains(&claim.finding_id))
+        .filter(|claim| {
+            claim.current_anchor_line > 0
+                && !claim.current_anchor_path.is_empty()
+                && !claim.current_anchor_quote.trim().is_empty()
+                && claim.current_anchor_quote.len() <= REVIEW_QUOTE_MAX_BYTES
+        })
+        .filter(|claim| {
+            let relative = std::path::Path::new(&claim.current_anchor_path);
+            !relative.is_absolute()
+                && relative
+                    .components()
+                    .all(|component| matches!(component, std::path::Component::Normal(_)))
+        })
+        .filter(|claim| seen.insert(claim.finding_id.clone()))
+        .take(CARRIED_ANCHOR_PREFETCH_PAGE_SIZE)
+        .map(|claim| {
+            (
+                claim.finding_id.clone(),
+                claim.current_anchor_path.clone(),
+                claim.current_anchor_line,
+            )
+        })
+        .collect()
+}
+
 const CARRIED_ANCHOR_PREFETCH_PAGE_SIZE: usize = 32;
 const CARRIED_ANCHOR_MAX_READ_ATTEMPTS: u32 = 3;
 
@@ -18869,7 +19062,9 @@ JSON only, with no Markdown fence, using exactly this shape:
 "source_candidate_ids":[]}}],"rejected_candidates":[{{"candidate_id":"candidate id",
 "reason":"specific reason this candidate was not retained"}}],"resolved_finding_ids":[],
 "resolved_findings":[{{"finding_id":"carried finding id",
-"current_anchor_quote":"exact current head line, or empty only when absent"}}],
+"current_anchor_quote":"exact current head line, or empty only when absent",
+"current_anchor_path":"relative/file.rs when the claim re-anchors an unmapped finding, else omit",
+"current_anchor_line":123}}],
 "themes":[{{"root_cause":"shared mechanism behind multiple findings",
 "recommendation":"structural fix that addresses the cause","source_candidate_ids":[],
 "previous_finding_ids":[]}}]}}
@@ -21544,6 +21739,7 @@ mod tests {
             std::slice::from_ref(&finding),
             REVIEW_HISTORY_FINDINGS_MAX_BYTES,
             &history_lines,
+            &HashSet::new(),
         )
         .unwrap();
         assert_eq!(history[0]["current_anchor_line"], "fixed_probe();");
@@ -21551,10 +21747,137 @@ mod tests {
         let claim = ResolvedFindingClaim {
             finding_id: finding.id.clone(),
             current_anchor_quote: "fixed_probe();".into(),
+            ..Default::default()
         };
         assert_eq!(
             verified_resolution_ids(Vec::new(), &[claim], &[finding], &locations, &current_lines,),
             vec!["rvf_legacy".to_owned()]
+        );
+    }
+
+    #[test]
+    fn unmapped_carried_findings_resolve_only_through_reanchored_verified_claims() {
+        // A finding observed at a head the durable chain never recorded and
+        // whose bootstrap diff is unavailable has no server-side head
+        // coordinate. Its history entry is flagged instead of silently
+        // omitting `current_anchor_line`, and a claim that names the head
+        // coordinate the coordinator inspected can re-anchor it.
+        let finding = trouve_protocol::CodeReviewFinding {
+            observed_head: "1".repeat(40),
+            ..open_history_finding("rvf_unmapped", "src/lib.rs", 10, "high")
+        };
+        let advisory = trouve_protocol::CodeReviewFinding {
+            observed_head: "1".repeat(40),
+            ..open_history_finding("rvf_advisory", "src/lib.rs", 12, "low")
+        };
+        let files = Vec::new();
+        let diff_contents = HashMap::new();
+        let base_anchors = CarriedFindingAnchorMap::new();
+        let primary = CarriedAnchorMappingContext {
+            files: &files,
+            diff_contents: &diff_contents,
+            review_base_sha: &"2".repeat(40),
+            base_anchors: &base_anchors,
+        };
+        let findings = vec![finding.clone(), advisory];
+        let mut locations = mapped_locations(&findings, &primary);
+        assert_eq!(
+            locations.get(&finding.id),
+            Some(&HistoricalAnchorLocation::Unverifiable)
+        );
+        let unmapped = unmapped_carried_finding_ids(&findings, &locations);
+        assert_eq!(unmapped, HashSet::from(["rvf_unmapped".to_owned()]));
+
+        let history = compact_finding_history(
+            &findings,
+            REVIEW_HISTORY_FINDINGS_MAX_BYTES,
+            &HashMap::new(),
+            &unmapped,
+        )
+        .unwrap();
+        let entry = |id: &str| {
+            history
+                .iter()
+                .find(|value| value["id"] == id)
+                .cloned()
+                .unwrap()
+        };
+        assert_eq!(entry("rvf_unmapped")["anchor_status"], "unmapped");
+        assert!(entry("rvf_unmapped").get("current_anchor_line").is_none());
+        assert!(entry("rvf_advisory").get("anchor_status").is_none());
+
+        let claim = |path: &str, line: u64, quote: &str| ResolvedFindingClaim {
+            finding_id: finding.id.clone(),
+            current_anchor_quote: quote.into(),
+            current_anchor_path: path.into(),
+            current_anchor_line: line,
+        };
+        // Only well-formed, in-repository, non-empty claims for unmapped
+        // findings turn into head reads.
+        let targets = reanchor_claim_targets(
+            &[
+                claim("src/lib.rs", 0, "guarded();"),
+                claim("", 30, "guarded();"),
+                claim("/etc/passwd", 1, "root"),
+                claim("../src/lib.rs", 30, "guarded();"),
+                claim("src/lib.rs", 30, "   "),
+                ResolvedFindingClaim {
+                    finding_id: "rvf_advisory".into(),
+                    current_anchor_path: "src/lib.rs".into(),
+                    current_anchor_line: 12,
+                    current_anchor_quote: "advisory();".into(),
+                },
+                claim("src/lib.rs", 30, "guarded();"),
+                claim("src/lib.rs", 31, "duplicate();"),
+            ],
+            &unmapped,
+        );
+        assert_eq!(
+            targets,
+            vec![("rvf_unmapped".to_owned(), "src/lib.rs".to_owned(), 30)]
+        );
+
+        // Without a server read the claim verifies nothing.
+        let mut current_lines = HashMap::new();
+        assert!(
+            verified_resolution_ids(
+                Vec::new(),
+                &[claim("src/lib.rs", 30, "guarded();")],
+                &findings,
+                &locations,
+                &current_lines,
+            )
+            .is_empty()
+        );
+        // Once the claimed coordinate is read from the head, the ordinary
+        // quote contract decides the claim.
+        current_lines.insert(("src/lib.rs".to_owned(), 30), Some("guarded();".to_owned()));
+        locations.insert(
+            finding.id.clone(),
+            HistoricalAnchorLocation::HeadLine {
+                path: "src/lib.rs".into(),
+                line: 30,
+            },
+        );
+        assert!(
+            verified_resolution_ids(
+                Vec::new(),
+                &[claim("src/lib.rs", 30, "something_else();")],
+                &findings,
+                &locations,
+                &current_lines,
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            verified_resolution_ids(
+                Vec::new(),
+                &[claim("src/lib.rs", 30, "guarded();")],
+                &findings,
+                &locations,
+                &current_lines,
+            ),
+            vec!["rvf_unmapped".to_owned()]
         );
     }
 
@@ -21687,6 +22010,7 @@ mod tests {
         let claim = ResolvedFindingClaim {
             finding_id: finding.id.clone(),
             current_anchor_quote: "register_before_start();".into(),
+            ..Default::default()
         };
 
         assert_eq!(
@@ -21853,6 +22177,7 @@ rename to src/new.rs
         let absent = ResolvedFindingClaim {
             finding_id: finding.id.clone(),
             current_anchor_quote: String::new(),
+            ..Default::default()
         };
         assert!(
             verified_resolution_ids(
@@ -21867,6 +22192,7 @@ rename to src/new.rs
         let matched = ResolvedFindingClaim {
             finding_id: finding.id.clone(),
             current_anchor_quote: "still_broken();".into(),
+            ..Default::default()
         };
         assert_eq!(
             verified_resolution_ids(
@@ -21977,6 +22303,7 @@ rename to src/new.rs
         let mismatched = ResolvedFindingClaim {
             finding_id: finding.id.clone(),
             current_anchor_quote: "different();".into(),
+            ..Default::default()
         };
         assert!(
             verified_resolution_ids(
@@ -21991,6 +22318,7 @@ rename to src/new.rs
         let matched = ResolvedFindingClaim {
             finding_id: finding.id.clone(),
             current_anchor_quote: "replacement();".into(),
+            ..Default::default()
         };
         assert_eq!(
             verified_resolution_ids(
@@ -22071,6 +22399,7 @@ rename to src/new.rs
         let mismatched = ResolvedFindingClaim {
             finding_id: finding.id.clone(),
             current_anchor_quote: "still present".into(),
+            ..Default::default()
         };
         assert!(
             verified_resolution_ids(
@@ -22085,6 +22414,7 @@ rename to src/new.rs
         let matched = ResolvedFindingClaim {
             finding_id: finding.id.clone(),
             current_anchor_quote: String::new(),
+            ..Default::default()
         };
         assert_eq!(
             verified_resolution_ids(
@@ -22129,6 +22459,7 @@ rename to src/new.rs
         let claim = ResolvedFindingClaim {
             finding_id: finding.id.clone(),
             current_anchor_quote: "still_broken();".into(),
+            ..Default::default()
         };
         let stale_line = HashMap::from([(
             ("src/shifted.rs".to_owned(), 100),
@@ -22734,6 +23065,7 @@ rename to src/new.rs
             &[],
             &[],
             &HashMap::new(),
+            &HashSet::new(),
             &[],
             &[],
             &[],
@@ -22758,6 +23090,8 @@ rename to src/new.rs
         assert!(prompt.contains("\"resolved_findings\""));
         assert!(prompt.contains("`current_anchor_line`"));
         assert!(prompt.contains("`current_anchor_quote` copied verbatim"));
+        assert!(prompt.contains("`\"anchor_status\":\"unmapped\"`"));
+        assert!(prompt.contains("\"current_anchor_path\""));
     }
 
     #[test]
@@ -22787,6 +23121,7 @@ rename to src/new.rs
             &[],
             &[],
             &HashMap::new(),
+            &HashSet::new(),
             &[],
             &[],
             &[theme(1)],
@@ -22805,6 +23140,7 @@ rename to src/new.rs
             &[],
             &[],
             &HashMap::new(),
+            &HashSet::new(),
             &[],
             &[],
             &[theme(3)],
@@ -22837,6 +23173,7 @@ rename to src/new.rs
             &[],
             &[],
             &HashMap::new(),
+            &HashSet::new(),
             &[],
             &[],
             &[],
@@ -22856,6 +23193,7 @@ rename to src/new.rs
             &[],
             &[],
             &HashMap::new(),
+            &HashSet::new(),
             &[],
             &[],
             &[],
@@ -22885,6 +23223,7 @@ rename to src/new.rs
                 &[],
                 &[],
                 &HashMap::new(),
+                &HashSet::new(),
                 &[],
                 advisory,
                 &[],
@@ -23022,6 +23361,7 @@ rename to src/new.rs
             &[],
             &[],
             &HashMap::new(),
+            &HashSet::new(),
             &[],
             &[],
             &[],
@@ -23042,6 +23382,7 @@ rename to src/new.rs
             &[],
             &[],
             &HashMap::new(),
+            &HashSet::new(),
             &[],
             &[],
             &[],
@@ -27300,6 +27641,7 @@ rename to src/new.rs
             &findings,
             REVIEW_HISTORY_FINDINGS_MAX_BYTES,
             &HashMap::new(),
+            &HashSet::new(),
         )
         .unwrap();
         let encoded = serde_json::to_string(&compact).unwrap();
@@ -27343,6 +27685,7 @@ rename to src/new.rs
             &[finding],
             REVIEW_HISTORY_FINDINGS_MAX_BYTES,
             &HashMap::new(),
+            &HashSet::new(),
         )
         .unwrap();
         let encoded = serde_json::to_string(&findings).unwrap();
@@ -27483,6 +27826,7 @@ rename to src/new.rs
             &selected,
             REVIEW_HISTORY_FINDINGS_MAX_BYTES,
             &HashMap::new(),
+            &HashSet::new(),
         )
         .unwrap();
         assert!(
@@ -30921,6 +31265,7 @@ rename to src/new.rs
             &[],
             &[],
             &HashMap::new(),
+            &HashSet::new(),
             &[],
             &[],
             &[],
@@ -31367,6 +31712,7 @@ rename to src/new.rs
             &[],
             &[],
             &HashMap::new(),
+            &HashSet::new(),
             &[],
             &[],
             &[],
@@ -33323,6 +33669,7 @@ rename to src/new.rs
             &[],
             &[],
             &HashMap::new(),
+            &HashSet::new(),
             &[],
             &[],
             &[],

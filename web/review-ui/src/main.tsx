@@ -804,6 +804,7 @@ function JobDetailPane({
   const [error, setError] = useState("");
   const [busy, setBusy] = useState("");
   const [retryStatus, setRetryStatus] = useState("");
+  const [actionNotice, setActionNotice] = useState("");
   const [selectedTaskId, setSelectedTaskId] = useState("");
   const [taskDetails, setTaskDetails] = useState<Record<string, ReviewTask>>({});
   const [taskLoading, setTaskLoading] = useState("");
@@ -913,6 +914,7 @@ function JobDetailPane({
     setRoutingOpen(false);
     setBusy("");
     setRetryStatus("");
+    setActionNotice("");
     activityGroupButtonRefs.current = {};
     taskRequestsRef.current.clear();
     void load();
@@ -1162,6 +1164,7 @@ function JobDetailPane({
   const act = async (action: "cancel" | "request" | "retry"): Promise<void> => {
     if (!detail) return;
     setBusy(action);
+    setActionNotice("");
     try {
       const replacement =
         action === "cancel"
@@ -1172,9 +1175,12 @@ function JobDetailPane({
       onChanged();
       if (action !== "cancel") {
         if (replacement.id === detail.job.id) {
-          setNavigationStatus(
-            "Review publication had already started; the existing review was reconciled instead of retried.",
-          );
+          // The server refuses to replace a job that is mid-publication; it
+          // reconciled the existing review instead, so nothing new opened.
+          const notice =
+            "This review is still publishing, so it was reconciled instead of retried. Retry again once it finishes.";
+          setActionNotice(notice);
+          setNavigationStatus(notice);
           await load();
         } else {
           focusReplacementJobIdRef.current = replacement.id;
@@ -1667,6 +1673,11 @@ function JobDetailPane({
         )}
       </div>
       {error && <div class="banner error">{error}</div>}
+      {actionNotice && (
+        <div class="banner warning" role="status">
+          {actionNotice}
+        </div>
+      )}
       {job.error && <div class="banner error">{job.error}</div>}
       <div class="link-row">
         <ExternalLink href={job.pull_url}>Open pull request ↗</ExternalLink>
