@@ -632,6 +632,10 @@ const SESSION_TITLE_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 // end-to-end guard just beyond those independent bounded phases.
 const LOCAL_SESSION_TITLE_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(10 * 60 + 45);
+// A staged naming image older than the longest naming budget cannot belong
+// to a live request, so the startup sweep may remove it.
+const STALE_TITLE_IMAGE_AGE: std::time::Duration =
+    std::time::Duration::from_secs(LOCAL_SESSION_TITLE_TIMEOUT.as_secs() + 5 * 60);
 // Naming is cosmetic and authenticated clients may retry while local
 // inference is busy. Bound both distinct work and coalesced followers so a
 // stalled sidecar cannot retain an arbitrary number of request tasks.
@@ -4173,6 +4177,26 @@ impl Engine {
         }
     }
 
+    /// Remove naming images staged by a previous process that died before
+    /// its [`StagedTitleImages`] guard ran. Only files older than every
+    /// naming budget are touched, so a request still in flight in another
+    /// server instance sharing this data directory keeps its staged copy.
+    pub async fn sweep_stale_title_images(&self) {
+        match self
+            .executor
+            .sweep_stale_staged_files(&self.title_image_root(), STALE_TITLE_IMAGE_AGE)
+            .await
+        {
+            Ok(0) => {}
+            Ok(removed) => tracing::info!(removed, "removed orphaned staged naming images"),
+            Err(error) => tracing::warn!(%error, "failed to sweep staged naming images"),
+        }
+    }
+
+    fn title_image_root(&self) -> PathBuf {
+        self.data_dir.join("title-attachments")
+    }
+
     /// Finish durable persona-file deletions left by an interrupted request.
     /// The intent keeps repository references untouched until the executor
     /// confirms the file is gone; a missing file is success only on replay.
@@ -7411,7 +7435,7 @@ impl Engine {
             // copies outside both the durable store and the session worktree.
             let mut staged = StagedTitleImages {
                 executor: self.executor.clone(),
-                root: self.data_dir.join("title-attachments"),
+                root: self.title_image_root(),
                 paths: Vec::new(),
             };
             let stage_locally = backend.requires_local_image_paths();

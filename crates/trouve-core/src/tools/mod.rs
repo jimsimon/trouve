@@ -864,6 +864,17 @@ pub trait ToolExecutor: Send + Sync {
     fn rollback_attachment_files(&self, _root: &Path, _paths: &[PathBuf]) -> Result<(), String> {
         Err("attachment rollback is unavailable in this executor".into())
     }
+    /// Remove staged files directly below `root` whose modification time is
+    /// older than `older_than`. Used at startup for scratch directories
+    /// whose normal cleanup is an in-process drop guard that a crash can
+    /// skip. A missing root is not an error. Returns the number removed.
+    async fn sweep_stale_staged_files(
+        &self,
+        _root: &Path,
+        _older_than: Duration,
+    ) -> Result<usize, String> {
+        Err("staged file sweeping is unavailable in this executor".into())
+    }
     /// Read one durable opaque attachment without following any path link.
     /// Implementations must require a direct child of `root`, a regular file,
     /// and an exact match with the size committed in the attachment row.
@@ -2811,6 +2822,48 @@ impl ToolExecutor for LocalToolExecutor {
         cleanup_attachments_secure(root, paths)
     }
 
+    async fn sweep_stale_staged_files(
+        &self,
+        root: &Path,
+        older_than: Duration,
+    ) -> Result<usize, String> {
+        let root = root.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            let entries = match std::fs::read_dir(&root) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+                Err(error) => return Err(format!("listing {}: {error}", root.display())),
+            };
+            let now = std::time::SystemTime::now();
+            let mut stale = Vec::new();
+            for entry in entries {
+                let entry =
+                    entry.map_err(|error| format!("listing {}: {error}", root.display()))?;
+                // Entry metadata never follows links, so a planted symlink is
+                // left alone rather than having its target's age consulted.
+                let metadata = match entry.metadata() {
+                    Ok(metadata) => metadata,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(format!("inspecting {}: {error}", root.display())),
+                };
+                let old_enough = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|modified| now.duration_since(modified).ok())
+                    .is_some_and(|age| age >= older_than);
+                if metadata.is_file() && old_enough {
+                    stale.push(entry.path());
+                }
+            }
+            // The secure path re-verifies each entry below an O_NOFOLLOW root
+            // descriptor before unlinking it.
+            cleanup_attachments_secure(&root, &stale)?;
+            Ok(stale.len())
+        })
+        .await
+        .map_err(|error| format!("staged file sweep worker failed: {error}"))?
+    }
+
     async fn read_attachment_file(
         &self,
         root: &Path,
@@ -4012,6 +4065,61 @@ mod tests {
 
         assert!(error.contains("no longer owned"), "{error}");
         assert!(attachment.exists());
+    }
+
+    #[tokio::test]
+    async fn stale_staged_file_sweep_removes_only_old_regular_files() {
+        let container = tempfile::tempdir().unwrap();
+        let executor = LocalToolExecutor::default();
+        let missing = container.path().join("title-attachments");
+        assert_eq!(
+            executor
+                .sweep_stale_staged_files(&missing, Duration::ZERO)
+                .await
+                .unwrap(),
+            0
+        );
+
+        let root = container.path().join("staged");
+        std::fs::create_dir(&root).unwrap();
+        let orphan = root.join("title_orphan.png");
+        std::fs::write(&orphan, b"ABC").unwrap();
+        let nested = root.join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        #[cfg(unix)]
+        let planted = {
+            let target = container.path().join("outside.png");
+            std::fs::write(&target, b"outside").unwrap();
+            let link = root.join("title_link.png");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            (target, link)
+        };
+
+        // Nothing is old enough yet.
+        assert_eq!(
+            executor
+                .sweep_stale_staged_files(&root, Duration::from_secs(3600))
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(orphan.exists());
+
+        assert_eq!(
+            executor
+                .sweep_stale_staged_files(&root, Duration::ZERO)
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(!orphan.exists());
+        assert!(nested.is_dir());
+        #[cfg(unix)]
+        {
+            let (target, link) = planted;
+            assert!(target.exists());
+            assert!(std::fs::symlink_metadata(&link).is_ok());
+        }
     }
 
     #[test]
