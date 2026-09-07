@@ -8,6 +8,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Retry re-runs finished review jobs**: pressing Retry on a review that had
+  already published only reconciled the existing job, so a stale review could
+  not be re-run to clear findings fixed in later pushes. Retry now creates a
+  replacement job for any finished review and only reconciles a job that is
+  still running and publishing; the review UI explains that case instead of
+  silently refreshing.
+- **Carried findings whose anchors no longer map to head can be resolved**: the
+  coordinator only accepted a resolution for a blocking finding when it could
+  read the finding's original line at head, so a fix that moved or removed the
+  anchored code left the finding open indefinitely. The coordinator now marks
+  such findings as unmapped in its prompt, lets the model report the current
+  anchor path and line after inspecting head, and verifies that quote against
+  the repository before resolving.
 - **Session naming works when the first prompt has a screenshot**: with a
   Codex naming model, sessions and threads whose initial prompt attached an
   image stayed on their "New Session" / "New Thread" placeholders because the

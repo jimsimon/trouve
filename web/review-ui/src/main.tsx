@@ -804,6 +804,7 @@ function JobDetailPane({
   const [error, setError] = useState("");
   const [busy, setBusy] = useState("");
   const [retryStatus, setRetryStatus] = useState("");
+  const [actionNotice, setActionNotice] = useState("");
   const [selectedTaskId, setSelectedTaskId] = useState("");
   const [taskDetails, setTaskDetails] = useState<Record<string, ReviewTask>>({});
   const [taskLoading, setTaskLoading] = useState("");
@@ -913,6 +914,7 @@ function JobDetailPane({
     setRoutingOpen(false);
     setBusy("");
     setRetryStatus("");
+    setActionNotice("");
     activityGroupButtonRefs.current = {};
     taskRequestsRef.current.clear();
     void load();
@@ -1161,20 +1163,28 @@ function JobDetailPane({
 
   const act = async (action: "cancel" | "request" | "retry"): Promise<void> => {
     if (!detail) return;
+    const submittedJobId = detail.job.id;
     setBusy(action);
+    setActionNotice("");
     try {
       const replacement =
         action === "cancel"
-          ? await cancelJob(detail.job.id)
+          ? await cancelJob(submittedJobId)
           : action === "request"
             ? await requestReview(detail.job)
-            : await retryJob(detail.job.id);
+            : await retryJob(submittedJobId);
       onChanged();
+      // The pane may have moved to another job while the request was in
+      // flight; its notices belong to that job now.
+      if (aliveRef.current !== submittedJobId) return;
       if (action !== "cancel") {
-        if (replacement.id === detail.job.id) {
-          setNavigationStatus(
-            "Review publication had already started; the existing review was reconciled instead of retried.",
-          );
+        if (replacement.id === submittedJobId) {
+          // The server refuses to replace a job that is mid-publication; it
+          // reconciled the existing review instead, so nothing new opened.
+          const notice =
+            "This review is still publishing, so it was reconciled instead of retried. Retry again once it finishes.";
+          setActionNotice(notice);
+          setNavigationStatus(notice);
           await load();
         } else {
           focusReplacementJobIdRef.current = replacement.id;
@@ -1183,9 +1193,11 @@ function JobDetailPane({
         }
       } else await load();
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
+      if (aliveRef.current === submittedJobId) {
+        setError(cause instanceof Error ? cause.message : String(cause));
+      }
     } finally {
-      setBusy("");
+      if (aliveRef.current === submittedJobId) setBusy("");
     }
   };
 
@@ -1197,6 +1209,7 @@ function JobDetailPane({
       detail.personas.find((persona) => persona.reviewer_id === reviewerId)?.reviewer_name ||
       "Reviewer persona";
     setBusy(action);
+    setActionNotice("");
     setRetryStatus(`Retrying full review after ${label}…`);
     let replacement: ReviewJob;
     try {
@@ -1212,9 +1225,12 @@ function JobDetailPane({
     if (aliveRef.current !== submittedJobId) return;
     onChanged();
     if (replacement.id === submittedJobId) {
-      setNavigationStatus(
-        "Review publication had already started; the existing review was reconciled instead of retried.",
-      );
+      // Same server refusal as `act("retry")`: the job is mid-publication.
+      const notice =
+        "This review is still publishing, so it was reconciled instead of retried. Retry again once it finishes.";
+      setActionNotice(notice);
+      setNavigationStatus(notice);
+      setRetryStatus(`Full review retry after ${label} was reconciled instead.`);
       try {
         await load();
       } finally {
@@ -1237,6 +1253,7 @@ function JobDetailPane({
     if (!detail) return;
     const submittedJobId = detail.job.id;
     setBusy("final-editor");
+    setActionNotice("");
     setRetryStatus("Retrying Final review editor…");
     try {
       await retryFinalEditor(submittedJobId);
@@ -1667,6 +1684,11 @@ function JobDetailPane({
         )}
       </div>
       {error && <div class="banner error">{error}</div>}
+      {actionNotice && (
+        <div class="banner warning" role="status">
+          {actionNotice}
+        </div>
+      )}
       {job.error && <div class="banner error">{job.error}</div>}
       <div class="link-row">
         <ExternalLink href={job.pull_url}>Open pull request ↗</ExternalLink>
