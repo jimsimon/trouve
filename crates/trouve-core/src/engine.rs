@@ -5314,9 +5314,9 @@ impl Engine {
             });
         let mut remaining = known.iter().cloned().collect::<Vec<_>>();
         remaining.sort();
-        for id in remaining {
-            if !current.contains(&id) {
-                current.push(id);
+        for id in &remaining {
+            if !current.contains(id) {
+                current.push(id.clone());
             }
         }
         if expected_provider_ids.is_some_and(|expected| expected != current) {
@@ -5340,6 +5340,12 @@ impl Engine {
         }
         let mut next = config.clone();
         next.provider_order = provider_ids.to_vec();
+        let mut effective_provider_order = provider_ids.to_vec();
+        for id in remaining {
+            if !effective_provider_order.contains(&id) {
+                effective_provider_order.push(id);
+            }
+        }
         if let Some(path) = &self.config_file {
             next.save_to(path)
                 .with_context(|| format!("persisting provider order to {}", path.display()))?;
@@ -5349,7 +5355,7 @@ impl Engine {
         self.store.append_event(
             Scope::Server,
             Event::ProviderOrderUpdated {
-                provider_order: self.list_providers().provider_order,
+                provider_order: effective_provider_order,
             },
         )?;
         Ok(())
