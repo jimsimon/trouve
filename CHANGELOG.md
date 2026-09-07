@@ -6,8 +6,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [4.10.1] - 2026-09-06
+
+This patch keeps active chat transcripts stable, makes review retries and
+carried-finding resolution reliable, preserves inline code in published review
+comments, and restores automatic naming for prompts with screenshots.
+
 ### Fixed
 
+- **Active chat transcripts stay resident while streaming**: switching between
+  chats while a turn was active could let a late panel update evict the
+  displayed thread projection and replace the transcript with an empty view.
+  The active thread view now remains retained until streaming or ingress
+  failure finishes.
 - **Retry re-runs finished review jobs**: pressing Retry on a review that had
   already published only reconciled the existing job, so a stale review could
   not be re-run to clear findings fixed in later pushes. Retry now creates a
@@ -21,6 +32,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   such findings as unmapped in its prompt, lets the model report the current
   anchor path and line after inspecting head, and verifies that quote against
   the repository before resolving.
+- **Published review comments preserve inline code**: GitHub code spans such
+  as `HashSet<&str>` no longer display HTML entities. Public-markup
+  sanitization now preserves well-formed single-line code spans while still
+  escaping ambiguous backticks, raw prose, mentions, and links.
 - **Session naming works when the first prompt has a screenshot**: with a
   Codex naming model, sessions and threads whose initial prompt attached an
   image stayed on their "New Session" / "New Thread" placeholders because the
@@ -1368,6 +1383,7 @@ semble ([BENCHMARKS.md](BENCHMARKS.md)):
 - Incremental reindex (1 file touched): 0.86 s vs ~3 min (212x)
 - Warm query: 0.55 s vs 7.2 s (13x)
 
+[4.10.1]: https://github.com/jimsimon/trouve/compare/v4.10.0...v4.10.1
 [4.10.0]: https://github.com/jimsimon/trouve/compare/v4.9.0...v4.10.0
 [4.9.0]: https://github.com/jimsimon/trouve/compare/v4.8.1...v4.9.0
 [4.8.1]: https://github.com/jimsimon/trouve/compare/v4.8.0...v4.8.1
