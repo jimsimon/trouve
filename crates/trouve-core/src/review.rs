@@ -13825,11 +13825,41 @@ fn neutralize_active_urls(text: &str) -> String {
 /// model-authored text from activating GitHub mentions, links, raw HTML, or
 /// code fences. This is used only for public GitHub rendering; the dashboard
 /// and copy/fix actions retain the original review data.
+///
+/// Escaping can only grow the text, and truncating the escaped result could
+/// cut a code span's closing backtick and expose the raw `<` kept inside it,
+/// so the input is shortened instead until the escaped output fits.
 fn safe_public_model_markdown(text: &str, maximum: usize, marker: &str) -> String {
-    let bounded = bounded_utf8(text, maximum, marker);
-    let redacted = neutralize_active_urls(&redact_public_secrets(&bounded));
-    let mut escaped = String::with_capacity(redacted.len());
-    for character in redacted.chars() {
+    let mut limit = maximum;
+    loop {
+        let bounded = bounded_utf8(text, limit, marker);
+        let prepared = safe_prompt_fence(&neutralize_active_urls(&redact_public_secrets(&bounded)));
+        let safe = escape_public_markup(&prepared).replace("](", "]\\(");
+        let overshoot = safe.len().saturating_sub(maximum);
+        if overshoot == 0 || limit == 0 {
+            return bounded_utf8(&safe, maximum, marker);
+        }
+        limit = limit.saturating_sub(overshoot);
+    }
+}
+
+/// Neutralize mentions and escape the characters that can start raw HTML or
+/// an entity reference, but leave well-formed inline code spans verbatim:
+/// GitHub renders their content literally, so nothing inside can activate,
+/// and entities there would show up as `&lt;` instead of `<`.
+fn escape_public_markup(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    let mut rest = text;
+    while !rest.is_empty() {
+        if let Some((span, tail)) = leading_code_span(rest) {
+            escaped.push_str(span);
+            rest = tail;
+            continue;
+        }
+        let character = rest
+            .chars()
+            .next()
+            .expect("non-empty string has a character");
         match character {
             '@' => escaped.push_str("@\u{200b}"),
             '<' => escaped.push_str("&lt;"),
@@ -13837,13 +13867,52 @@ fn safe_public_model_markdown(text: &str, maximum: usize, marker: &str) -> Strin
             '&' => escaped.push_str("&amp;"),
             _ => escaped.push(character),
         }
+        rest = &rest[character.len_utf8()..];
     }
-    let safe = safe_prompt_fence(&escaped).replace("](", "]\\(");
-    bounded_utf8(&safe, maximum, marker)
+    escaped
 }
 
+/// Split a GFM code span off the front of `text`: an opening backtick string
+/// closed by the next backtick string of exactly the same length. Anything
+/// GitHub might not treat as one span — no closer, or a line break before it
+/// — is rejected so its contents are escaped as prose instead.
+fn leading_code_span(text: &str) -> Option<(&str, &str)> {
+    let opener = text.len() - text.trim_start_matches('`').len();
+    if opener == 0 {
+        return None;
+    }
+    let body = &text[opener..];
+    let mut offset = 0;
+    while offset < body.len() {
+        let rest = &body[offset..];
+        if rest.starts_with(PROMPT_LINE_BREAKS) {
+            return None;
+        }
+        let run = rest.len() - rest.trim_start_matches('`').len();
+        if run == opener {
+            let end = opener + offset + run;
+            return Some((&text[..end], &text[end..]));
+        }
+        if run > 0 {
+            offset += run;
+            continue;
+        }
+        offset += rest.chars().next()?.len_utf8();
+    }
+    None
+}
+
+/// Text the caller wraps in a single backtick pair. Backticks and line
+/// breaks are replaced so the span can neither close early nor split across
+/// a paragraph, which is what lets `<`, `>`, and `&` stay literal inside it.
 fn safe_public_inline_code(text: &str, maximum: usize) -> String {
-    safe_public_model_markdown(text, maximum, "…").replace('`', "ˋ")
+    let bounded = bounded_utf8(text, maximum, "…");
+    let redacted = neutralize_active_urls(&redact_public_secrets(&bounded));
+    let safe = redacted
+        .replace('`', "ˋ")
+        .replace('@', "@\u{200b}")
+        .replace(PROMPT_LINE_BREAKS, " ");
+    bounded_utf8(&safe, maximum, "…")
 }
 
 fn safe_public_prompt_fence(text: &str, maximum: usize, marker: &str) -> String {
@@ -31072,6 +31141,57 @@ rename to src/new.rs
         assert!(!rendered.contains("@user"));
         assert!(!rendered.contains("https://"));
         assert!(!rendered.contains('<'));
+    }
+
+    #[test]
+    fn public_markdown_keeps_inline_code_literal_but_escapes_prose() {
+        let rendered = safe_public_model_markdown(
+            "Build a `HashSet<&str>` once; call ``paths.contains(&path)`` linearly. \
+             Prose <b>&amp;</b> stays escaped, and an unclosed `<script>alert(1) \
+             opener is prose too.",
+            4_000,
+            "…",
+        );
+
+        assert!(rendered.contains("`HashSet<&str>`"));
+        assert!(rendered.contains("``paths.contains(&path)``"));
+        assert!(rendered.contains("Prose &lt;b&gt;&amp;amp;&lt;/b&gt; stays"));
+        assert!(rendered.contains("`&lt;script&gt;alert(1)"));
+        assert!(!rendered.contains("<script>"));
+    }
+
+    #[test]
+    fn public_markdown_code_spans_must_close_on_the_same_line_with_equal_backticks() {
+        // A closer of a different length does not end the span, and a line
+        // break before the real closer means the contents are escaped.
+        let rendered = safe_public_model_markdown("``a<b` c``\n`x<y\nz`", 4_000, "…");
+        assert!(rendered.contains("``a<b` c``"));
+        assert!(rendered.contains("`x&lt;y\nz`"));
+
+        // Fence neutralization happens before span detection, so a would-be
+        // fenced block never shelters raw HTML behind a backtick run.
+        let rendered = safe_public_model_markdown("```html\n<script>\n```", 4_000, "…");
+        assert_eq!(rendered, "` ` `html\n&lt;script&gt;\n` ` `");
+    }
+
+    #[test]
+    fn public_markdown_truncation_never_exposes_a_code_span_interior() {
+        let text = "`<script>alert(1)</script>` trailing prose that pushes past the bound";
+        for maximum in 1..text.len() + 8 {
+            let rendered = safe_public_model_markdown(text, maximum, "…");
+            assert!(rendered.len() <= maximum, "{maximum}: {rendered:?}");
+            let closed = rendered.matches('`').count() == 2;
+            assert!(
+                closed || !rendered.contains('<'),
+                "{maximum}: unclosed span leaked raw HTML: {rendered:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn public_inline_code_keeps_markup_literal_inside_the_callers_backticks() {
+        let rendered = safe_public_inline_code("src/<T>&`x`/@user\r\npath.rs", 512);
+        assert_eq!(rendered, "src/<T>&ˋxˋ/@\u{200b}user  path.rs");
     }
 
     #[test]
