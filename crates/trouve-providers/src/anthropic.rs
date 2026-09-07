@@ -270,6 +270,20 @@ impl AnthropicProvider {
                     system.push_str(s);
                 }
                 Message::User(s) => wire.push(json!({"role": "user", "content": s})),
+                Message::UserWithImages { content, images } => {
+                    let mut blocks = vec![json!({"type": "text", "text": content})];
+                    blocks.extend(images.iter().map(|image| {
+                        json!({
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": image.mime,
+                                "data": image.data,
+                            }
+                        })
+                    }));
+                    wire.push(json!({"role": "user", "content": blocks}));
+                }
                 Message::Assistant {
                     content,
                     tool_calls,
@@ -372,6 +386,7 @@ fn parse_model_list(
                 display_name: entry["display_name"].as_str().unwrap_or(name).to_string(),
                 context_window,
                 supports_tools: true,
+                supports_images: false,
                 input_price_per_mtok: None,
                 output_price_per_mtok: None,
                 options_schema: uncatalogued_model_options_schema(entry.get("capabilities")),
@@ -463,14 +478,7 @@ impl Provider for AnthropicProvider {
 
     fn shared_model_identity(&self, model: &str) -> Option<String> {
         let catalog_provider = self.catalog_provider_id()?;
-        self.catalog
-            .model(
-                &catalog_provider,
-                &self.id,
-                model,
-                OptionsDialect::Anthropic,
-            )
-            .map(|_| model.to_string())
+        self.catalog.shared_model_identity(&catalog_provider, model)
     }
 
     fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
@@ -669,7 +677,14 @@ fn sse_to_events(
                                     .unwrap_or("")
                                     .to_string();
                             }
-                            Some("thinking") => block.is_thinking = true,
+                            Some("thinking") => {
+                                block.is_thinking = true;
+                                let _ = tx
+                                    .send(Ok(ProviderEvent::ThinkingStarted {
+                                        id: idx.to_string(),
+                                    }))
+                                    .await;
+                            }
                             Some("redacted_thinking") => {
                                 block.is_redacted = true;
                                 block.redacted_data = v
@@ -698,7 +713,10 @@ fn sse_to_events(
                                 {
                                     blocks.entry(idx).or_default().thinking_text.push_str(text);
                                     let _ = tx
-                                        .send(Ok(ProviderEvent::ThinkingDelta(text.to_string())))
+                                        .send(Ok(ProviderEvent::ThinkingDelta {
+                                            id: idx.to_string(),
+                                            text: text.to_string(),
+                                        }))
                                         .await;
                                 }
                             }
@@ -755,6 +773,13 @@ fn sse_to_events(
                                         "type": "redacted_thinking",
                                         "data": block.redacted_data,
                                     }))))
+                                    .await;
+                            }
+                            if block.is_thinking {
+                                let _ = tx
+                                    .send(Ok(ProviderEvent::ThinkingCompleted {
+                                        id: idx.to_string(),
+                                    }))
                                     .await;
                             }
                         }

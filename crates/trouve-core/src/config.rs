@@ -56,16 +56,12 @@ pub struct Config {
     /// active. Unset means enabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_enabled: Option<bool>,
-    /// Lifecycle policy for the dedicated session-title model. Unset uses
-    /// adaptive loading.
+    /// Model selector used to name new sessions and threads. This may be an
+    /// automatic `auto/<model>` route or a concrete provider pin. Unset
+    /// inherits `default_model`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub title_model_load_behavior: Option<trouve_protocol::TitleModelLoadBehavior>,
-    /// Compute resources available to the dedicated session-title model.
-    /// Unset preserves the historical CPU-only behavior.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub title_model_resource_policy: Option<trouve_protocol::TitleModelResourcePolicy>,
-    /// Whether new session branches include a slug derived from the session
-    /// title. Unset means compact `trouve/<short-id>` branches.
+    pub session_naming_model: Option<String>,
+    /// Rename a session's compact worktree branch after asynchronous naming.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub derive_branch_name_from_session_title: Option<bool>,
     /// Client id of a GitHub OAuth app (with device flow enabled) for
@@ -128,10 +124,10 @@ pub struct GithubEnterpriseConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
     /// Wire protocol / integration kind:
-    /// - "openai-compat" (chat completions; OpenAI, OpenRouter, Ollama, ...)
+    /// - "openai-compat" (chat completions; OpenRouter, Ollama, ...)
     /// - "anthropic" (Messages API)
-    /// - "codex-app-server", "cursor-cli", "claude-cli" (vendor agent
-    ///   backends driven through their CLIs; auth lives in the vendor CLI)
+    /// - "codex-app-server", "cursor-sdk", "claude-cli" (vendor agent
+    ///   backends; `cursor-cli` remains a legacy migration/recovery state)
     #[serde(default = "default_kind")]
     pub kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -158,15 +154,17 @@ pub struct ProviderConfig {
     /// tokens (refreshed automatically).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oauth: Option<trouve_providers::auth::OAuthConfig>,
-    /// Path/name of the vendor binary for CLI-backed kinds (defaults:
-    /// "codex", "cursor-agent", "claude"). Also how tests point adapters at
-    /// stub binaries.
+    /// Path/name of the vendor runtime binary (defaults: "codex",
+    /// "cursor-sdk-bridge", "claude"). Also how tests point adapters at stub
+    /// binaries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
-    /// Claude Code and Codex: bridge trouve's ToolExecutor in over MCP for
-    /// full tool/permission fidelity. Claude's built-ins are disabled; Codex
-    /// built-ins are confined to a read-only sandbox. Defaults to true for
-    /// those backends; explicit false retains the vendor-native fallback.
+    /// Bridge trouve's ToolExecutor in over MCP for full tool/permission
+    /// fidelity. Claude's built-ins are disabled; Codex built-ins are
+    /// confined to a read-only sandbox. Defaults to true for those backends;
+    /// explicit false retains their vendor-native fallback. Cursor's Agent
+    /// SDK always uses the full bridge and ignores false because its explicit
+    /// tool allowlist makes the bridge the complete capability boundary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_bridge: Option<bool>,
 }
@@ -294,9 +292,7 @@ mod tests {
         assert_eq!(cfg.default_model.as_deref(), Some("openai/gpt"));
         assert_eq!(cfg.default_thinking_level.as_deref(), Some("high"));
         let mut cfg = cfg;
-        cfg.title_model_load_behavior = Some(trouve_protocol::TitleModelLoadBehavior::OnDemand);
-        cfg.title_model_resource_policy =
-            Some(trouve_protocol::TitleModelResourcePolicy::GpuCpuRam);
+        cfg.session_naming_model = Some("openai/gpt-5-mini".into());
         cfg.derive_branch_name_from_session_title = Some(true);
         cfg.code_review_max_parallel_reviews = Some(4);
         cfg.code_review_timeout_seconds = Some(1_200);
@@ -305,12 +301,8 @@ mod tests {
         cfg.save_to(&path).unwrap();
         let cfg = Config::load_from(&path);
         assert_eq!(
-            cfg.title_model_load_behavior,
-            Some(trouve_protocol::TitleModelLoadBehavior::OnDemand)
-        );
-        assert_eq!(
-            cfg.title_model_resource_policy,
-            Some(trouve_protocol::TitleModelResourcePolicy::GpuCpuRam)
+            cfg.session_naming_model.as_deref(),
+            Some("openai/gpt-5-mini")
         );
         assert_eq!(cfg.derive_branch_name_from_session_title, Some(true));
         assert_eq!(cfg.code_review_max_parallel_reviews, Some(4));

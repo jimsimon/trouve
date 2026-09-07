@@ -86,8 +86,10 @@ or appears after its cursor; there is no snapshot/stream race window.
 `GET /v1/server-projection` supplies the durable replacement state not carried
 by `SessionSummary`: the newest cached account PR list per configured GitHub
 host, the branch- and `session.pr_opened`-derived PR associations for every
-session, and session-naming settings. Each host slice retains its source event
-cursor and timestamp, and the response carries the current server cursor in
+session, and session-naming settings. The legacy `session.pr_mentioned` event
+remains decodable for retained logs but is no longer emitted or treated as an
+association. Each host slice retains its source event cursor and timestamp,
+and the response carries the current server cursor in
 `x-trouve-event-cursor`. Clients fetch it after the session-summary boundary,
 apply it before opening SSE, and still resume at the earlier session-summary
 cursor. Any replacement event that raced the projection request is therefore
@@ -143,9 +145,12 @@ requires a protocol version bump.
 
 Thread scope:
 
-- `turn.capacity_acquired` `{turn, wait_ms, background}` — shared/provider
-  capacity was acquired; background review work uses a lane that reserves
-  capacity for interactive desktop turns
+- `turn.admitted` `{turn, provider_wait_ms}` — provider admission completed;
+  the wait measures time spent behind a shared throttling cooldown and is zero
+  for immediate admission
+- `turn.capacity_acquired` `{turn, wait_ms, background}` — legacy protocol
+  7.15-and-earlier marker retained only when replaying existing durable logs;
+  new servers do not emit it
 - `turn.started` `{turn, mode, model, thinking_level?}` (the effective
   provider-native thinking selection for that turn) / `turn.usage_updated`
   `{turn, usage}`
@@ -160,7 +165,10 @@ Thread scope:
   again after each safe capacity, authentication, or availability failover;
   authentication and availability both use `route_failover`, while exhausted
   quota/capacity uses `capacity_failover`
-- `user.message` `{turn, content}`
+- `user.message` `{turn, content}` — user-authored input only; the legacy
+  `background` field is read solely when replaying protocol 7.19–7.26 logs
+- `turn.background_activity` `{turn}` — the server attached a turn to
+  vendor-autonomous activity; no user prompt is implied
 - `subagent.spawned` `{turn, thread_id, session_id, prompt, model, call_id?}` —
   a separately navigable child-agent transcript was attached to the parent
   turn; the optional call id identifies a redundant trouve spawn tool row
@@ -172,6 +180,8 @@ Thread scope:
   `assistant.thinking_completed` `{turn}` — the provider explicitly closed
   the current thinking item, even when no visible output follows immediately
 - `assistant.message` `{turn, content}` — folded final text for the turn
+- `assistant.artifacts` `{turn, call_id?, attachments}` — durable
+  model/tool-produced files stored behind the attachment endpoint
 - `tool.requested` `{turn, call_id, tool, args, requires_approval}`
 - `approval.requested` `{turn, call_id}` / `approval.resolved` `{call_id,
   decision, by}`
@@ -222,9 +232,9 @@ Server scope:
   reachability flipped; while offline `/v1/models` lists only models that
   run without internet, and clients gate prompt entry on that list
   (`ServerInfo.online` carries the same state for initial fetches)
-- `settings.git_worktrees_updated` `{settings}` — full replacement snapshot
-  after the session-title model's load policy, installation progress, or
-  runtime state changes
+- `settings.session_naming_updated` `{settings}` — full replacement snapshot
+  after the configured naming model or title-derived branch preference changes;
+  legacy `settings.git_worktrees_updated` rows remain decodable but are ignored
 - `settings.code_review_updated` `{settings}` — full replacement snapshot
   after the automated-review total, reviewer, or final-editor deadline
   changes

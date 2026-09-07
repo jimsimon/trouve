@@ -197,6 +197,7 @@ const installEventStream = async (page: Page): Promise<void> => {
 interface ProtocolFixtureOptions {
   readonly sentMessages?: Array<Record<string, unknown>>;
   readonly createdThreadRequests?: Array<Record<string, unknown>>;
+  readonly renamedThreadRequests?: Array<Record<string, unknown>>;
   readonly generatedThreadTitle?: string;
   readonly steeredMessages?: Array<Record<string, unknown>>;
   readonly cancelledThreadIds?: string[];
@@ -226,6 +227,7 @@ const installProtocolFixtures = async (
   {
     sentMessages = [],
     createdThreadRequests = [],
+    renamedThreadRequests = [],
     generatedThreadTitle = "Generated thread title",
     steeredMessages = [],
     cancelledThreadIds = [],
@@ -281,9 +283,9 @@ const installProtocolFixtures = async (
       });
       return;
     }
-    if (key === "POST /v1/session-title") {
+    if (key === "POST /v1/title") {
       await route.fulfill({
-        json: { title: generatedThreadTitle, source: "model" },
+        json: { title: generatedThreadTitle },
       });
       return;
     }
@@ -299,6 +301,23 @@ const installProtocolFixtures = async (
           model: body["model"] ?? "test/model",
           model_options: body["model_options"] ?? {},
           permission_mode: body["permission_mode"] ?? "ask",
+          created_at: "2026-08-05T08:00:00Z",
+        },
+      });
+      return;
+    }
+    if (key === "PATCH /v1/threads/th_created") {
+      const body = request.postDataJSON() as Record<string, unknown>;
+      renamedThreadRequests.push(body);
+      await route.fulfill({
+        json: {
+          id: "th_created",
+          session_id: "se_1",
+          title: body["title"],
+          mode: "code",
+          model: "test/model",
+          model_options: {},
+          permission_mode: "ask",
           created_at: "2026-08-05T08:00:00Z",
         },
       });
@@ -466,15 +485,9 @@ const installProtocolFixtures = async (
           session_pull_requests: sessionPullRequests.length === 0
             ? []
             : [{ session_id: "se_1", prs: sessionPullRequests }],
-          git_worktree_settings: {
+          session_naming_settings: {
+            model: "test/tiny",
             derive_branch_name_from_session_title: false,
-            title_model: {
-              model_downloaded: false,
-              runtime_installed: false,
-              state: "not_installed",
-            },
-            title_model_load_behavior: "auto",
-            title_model_resource_policy: "adaptive",
           },
         },
       });
@@ -534,6 +547,11 @@ const installProtocolFixtures = async (
               type: "string",
               enum: ["300k", "1m"],
               default: "300k",
+            },
+            fast: {
+              type: "boolean",
+              default: false,
+              description: "Run faster with increased usage",
             },
           },
         },
@@ -1263,10 +1281,9 @@ test("the Agent header shows live token usage and elapsed time", async ({ page }
       attachments: [],
     }),
     threadEvent(18, {
-      type: "turn.capacity_acquired",
+      type: "turn.admitted",
       turn: 8,
-      wait_ms: 0,
-      background: false,
+      provider_wait_ms: 0,
     }),
     threadEvent(19, {
       type: "assistant.thinking",
@@ -1368,7 +1385,7 @@ test("model picker escapes the composer control strip", async ({ page }) => {
   await expect(popup).toHaveCount(0);
 });
 
-test("subscription status uses hover help without a click disclosure", async ({ page }) => {
+test("subscription status renders complete quota lines in the workspace usage panel", async ({ page }, testInfo) => {
   await installProtocolFixtures(page);
   await page.route("**/v1/subscriptions", async (route) => {
     await route.fulfill({
@@ -1384,20 +1401,88 @@ test("subscription status uses hover help without a click disclosure", async ({ 
   });
   await page.goto("/");
   await replayHistory(page);
+  if (testInfo.project.name.startsWith("mobile")) {
+    const sessionsButton = page.getByRole("button", { name: "Sessions", exact: true });
+    await expect(sessionsButton).toBeVisible();
+    await expect(sessionsButton).toBeEnabled();
+    await sessionsButton.click();
+    await expect(sessionsButton).toHaveAttribute("aria-pressed", "true");
+  }
 
-  const status = page.locator(".composer .model-health-pill");
-  await expect(page.locator(".composer .subscription-option > span")).toHaveText(
-    "Subscription",
-  );
-  await expect(status).toContainText("Pro · 57% used");
-  await expect(status).toHaveAttribute("title", /Weekly: 57% used · resets Monday/u);
-  await expect(status).toHaveAttribute("tabindex", "0");
-  await expect(status.locator("summary")).toHaveCount(0);
-  await expect(page.locator(".model-health-detail")).toHaveCount(0);
+  const panel = page.locator("trouve-session-usage-panel");
+  await expect(panel).toBeVisible();
+  const usageTab = panel.getByRole("tab", { name: "Usage", exact: true });
+  const threadTab = panel.getByRole("tab", { name: "Thread", exact: true });
+  const sessionTab = panel.getByRole("tab", { name: "Session", exact: true });
+  const tabPanel = panel.getByRole("tabpanel");
+  await expect(usageTab).toHaveAttribute("aria-selected", "true");
+  await expect(tabPanel).toHaveAttribute("aria-labelledby", await usageTab.getAttribute("id") ?? "");
+  const subscription = panel.locator('[aria-label="test subscription usage"]');
+  await expect(subscription).toContainText("pro plan");
+  await expect(subscription).toContainText("Weekly");
+  await expect(subscription).toContainText("57% used · resets Monday");
+  await expect(
+    subscription.getByRole("progressbar", { name: "Weekly" }),
+  ).toHaveAttribute("aria-valuenow", "57");
 
-  await status.click();
-  await expect(status).toBeFocused();
-  await expect(page.locator(".model-health-detail")).toHaveCount(0);
+  await threadTab.focus();
+  await threadTab.press("ArrowRight");
+  await expect(sessionTab).toBeFocused();
+  await expect(sessionTab).toHaveAttribute("aria-selected", "true");
+  await expect(tabPanel).toHaveAttribute("aria-labelledby", await sessionTab.getAttribute("id") ?? "");
+  await expect(tabPanel).toContainText("1 turn");
+  await expect(tabPanel).toContainText("No completed usage yet.");
+  await expect(subscription).toHaveCount(0);
+
+  const idState = await panel.evaluate((element) => {
+    const second = document.createElement("trouve-session-usage-panel");
+    second.setAttribute("session-id", "se_1");
+    second.setAttribute("thread-id", "th_1");
+    second.setAttribute("model", "test/model");
+    element.after(second);
+    return second.updateComplete.then(() => {
+      const ids = [...document.querySelectorAll<HTMLElement>(
+        "trouve-session-usage-panel [id]",
+      )].map(({ id }) => id);
+      second.remove();
+      return {
+        ids,
+        duplicateCount: ids.length - new Set(ids).size,
+      };
+    });
+  });
+  expect(idState.ids.filter((id) => id.endsWith("-tab-usage"))).toHaveLength(2);
+  expect(idState.ids.filter((id) => id.endsWith("-tab-thread"))).toHaveLength(2);
+  expect(idState.ids.filter((id) => id.endsWith("-tab-session"))).toHaveLength(2);
+  expect(idState.ids.filter((id) => id.endsWith("-panel"))).toHaveLength(2);
+  expect(idState.duplicateCount).toBe(0);
+  await expect(page.locator(".composer .subscription-option")).toHaveCount(0);
+  await expect(page.locator(".composer .model-health-pill")).toHaveCount(0);
+
+  // The panel keeps a fixed footprint at the bottom of the navigation rail
+  // and collapses to a one-line summary of the most constrained window.
+  const navigation = page.locator(".navigation-panel");
+  const box = panel.locator(".session-usage-box");
+  await expect(box).toHaveCSS("height", "196px");
+  const collapse = panel.getByRole("button", { name: "Collapse usage details" });
+  await collapse.click();
+  await expect(panel.locator(".session-usage-box.collapsed")).toBeVisible();
+  await expect(panel.locator(".session-usage-summary")).toHaveText(/Usage\s+Pro · 57% used/u);
+  await expect(panel.getByRole("tab")).toHaveCount(0);
+  const navigationBounds = await navigation.boundingBox();
+  const panelBounds = await panel.boundingBox();
+  expect(navigationBounds).not.toBeNull();
+  expect(panelBounds).not.toBeNull();
+  expect(Math.round(navigationBounds!.y + navigationBounds!.height - (panelBounds!.y + panelBounds!.height)))
+    .toBeLessThanOrEqual(12);
+  await page.reload();
+  await replayHistory(page);
+  if (testInfo.project.name.startsWith("mobile")) {
+    await page.getByRole("button", { name: "Sessions", exact: true }).click();
+  }
+  await expect(panel.locator(".session-usage-box.collapsed")).toBeVisible();
+  await panel.getByRole("button", { name: "Expand usage details" }).click();
+  await expect(usageTab).toHaveAttribute("aria-selected", "true");
 });
 
 test("new-thread model choices do not wait for subscription health", async ({ page }) => {
@@ -1425,10 +1510,12 @@ test("new-thread model choices do not wait for subscription health", async ({ pa
   }
 });
 
-test("new user threads use the shared server title generator", async ({ page }) => {
+test("new user threads are renamed asynchronously by the shared server title generator", async ({ page }) => {
   const createdThreadRequests: Array<Record<string, unknown>> = [];
+  const renamedThreadRequests: Array<Record<string, unknown>> = [];
   await installProtocolFixtures(page, {
     createdThreadRequests,
+    renamedThreadRequests,
     generatedThreadTitle: "Review streaming cancellation behavior",
   });
   await page.goto("/");
@@ -1441,8 +1528,12 @@ test("new user threads use the shared server title generator", async ({ page }) 
   await setup.getByRole("button", { name: "Start thread" }).click();
 
   await expect.poll(() => createdThreadRequests.length).toBe(1);
-  expect(createdThreadRequests[0]?.["title"])
-    .toBe("Review streaming cancellation behavior");
+  expect(createdThreadRequests[0]?.["title"]).toBe("New Thread");
+  await expect.poll(() => renamedThreadRequests.length).toBe(1);
+  expect(renamedThreadRequests[0]).toMatchObject({
+    title: "Review streaming cancellation behavior",
+    expected_title: "New Thread",
+  });
 });
 
 test("the YOLO warning remains centered and exposes its hover text", async ({ page }) => {
@@ -2188,7 +2279,7 @@ test("interactive subagent tabs accept follow-up prompts", async ({ page }) => {
 
 test("regular thread tabs can be closed and reopened from the session menu", async ({
   page,
-}) => {
+}, testInfo) => {
   await installProtocolFixtures(page, {
     additionalThreads: [{
       id: "th_second",
@@ -2219,6 +2310,15 @@ test("regular thread tabs can be closed and reopened from the session menu", asy
   ).click();
   await expect(page.getByRole("form", { name: "New thread setup (provisional)" }))
     .toBeVisible();
+  await expect(page.getByRole("form", { name: "New thread setup (provisional)" })
+    .getByRole("combobox", { name: "Fast", exact: true })).toBeVisible();
+  const setupUsagePlaceholder = page.getByText(
+    "Subscription and model usage details will show here once a session is started.",
+    { exact: true },
+  );
+  if (!testInfo.project.name.startsWith("mobile")) {
+    await expect(setupUsagePlaceholder).toBeVisible();
+  }
   await expect(page.locator('[data-thread-tab-id="th_fixture"]')).toHaveCount(0);
   await expect(page.locator('[data-thread-tab-id="th_second"]')).toHaveCount(0);
 
@@ -2235,6 +2335,7 @@ test("regular thread tabs can be closed and reopened from the session menu", asy
   await expect(page).toHaveURL(/\/threads\/th_fixture/u);
   await expect(page.locator('.thread-tab-main[aria-selected="true"]'))
     .toHaveAttribute("data-thread-tab-id", "th_fixture");
+  await expect(setupUsagePlaceholder).toHaveCount(0);
   await page.getByRole("button", { name: "Threads (2)" }).click();
   await page.getByRole("treeitem", { name: /Review follow-up/u }).click();
   await expect(page.locator('.thread-tab-main[aria-selected="true"]'))
@@ -2376,9 +2477,12 @@ test("turn cards unify prompt, activity, and response while preserving copy acti
   await page.goto("/");
   await replayHistory(page);
 
-  await expect(page.locator('select[aria-label="Thinking level"]')).toHaveValue("max");
-  await expect(page.locator('select[aria-label="Thinking level"] option:checked')).toHaveText("Max");
-  await expect(page.locator('select[aria-label="Context size"]')).toHaveValue("1m");
+  const thinking = page.getByRole("combobox", { name: "Reasoning", exact: true });
+  await expect(thinking).toHaveValue("max");
+  await expect(thinking.locator("option:checked")).toHaveText("Max");
+  await expect(page.getByRole("combobox", { name: "Context", exact: true })).toHaveValue("1m");
+  await expect(page.getByRole("combobox", { name: "Fast", exact: true })
+    .locator("option:checked")).toHaveText("Model default · Off");
   await expect(page.locator(".conversation-turn")).toHaveCount(1);
   const agentCard = page.locator(".conversation-turn").first();
   await expect(agentCard).toHaveAccessibleName("Turn 7");
@@ -3158,11 +3262,15 @@ test("legacy context compaction tools stay outside collapsed-thinking groups", a
       result: {},
     }),
     threadEvent(47, {
+      type: "assistant.thinking_completed",
+      turn: 11,
+    }),
+    threadEvent(48, {
       type: "assistant.thinking",
       turn: 11,
       text: "Continue from the compacted context",
     }),
-    threadEvent(48, {
+    threadEvent(49, {
       type: "tool.requested",
       turn: 11,
       call_id: "after_legacy_compaction",
@@ -3170,7 +3278,7 @@ test("legacy context compaction tools stay outside collapsed-thinking groups", a
       args: { command: "after" },
       requires_approval: false,
     }),
-    threadEvent(49, {
+    threadEvent(50, {
       type: "tool.completed",
       call_id: "after_legacy_compaction",
       status: "ok",
@@ -3319,10 +3427,9 @@ test("active tools join stable collapsed groups behind a transient tail", async 
       attachments: [],
     }),
     threadEvent(18, {
-      type: "turn.capacity_acquired",
+      type: "turn.admitted",
       turn: 8,
-      wait_ms: 0,
-      background: false,
+      provider_wait_ms: 0,
     }),
     threadEvent(19, {
       type: "tool.requested",
@@ -3464,10 +3571,9 @@ test("context compaction is an animated durable boundary between tool groups", a
       attachments: [],
     }),
     threadEvent(32, {
-      type: "turn.capacity_acquired",
+      type: "turn.admitted",
       turn: 10,
-      wait_ms: 0,
-      background: false,
+      provider_wait_ms: 0,
     }),
     threadEvent(33, {
       type: "tool.requested",
@@ -3876,10 +3982,9 @@ test("thought completion clears stale activity while standalone and grouped tool
       attachments: [],
     }),
     threadEvent(72, {
-      type: "turn.capacity_acquired",
+      type: "turn.admitted",
       turn: 14,
-      wait_ms: 0,
-      background: false,
+      provider_wait_ms: 0,
     }),
     threadEvent(73, {
       type: "assistant.thinking",
@@ -4000,10 +4105,9 @@ test("a progress stream uses its message icon while activity remains visible", a
       attachments: [],
     }),
     threadEvent(72, {
-      type: "turn.capacity_acquired",
+      type: "turn.admitted",
       turn: 14,
-      wait_ms: 0,
-      background: false,
+      provider_wait_ms: 0,
     }),
   ]);
 
@@ -5768,10 +5872,9 @@ test("a queued prompt can interrupt the active turn and run next", async ({ page
       model: "test/model",
     }),
     threadEvent(17, {
-      type: "turn.capacity_acquired",
+      type: "turn.admitted",
       turn: 8,
-      wait_ms: 0,
-      background: false,
+      provider_wait_ms: 0,
     }),
     threadEvent(18, {
       type: "assistant.delta",
@@ -6112,10 +6215,9 @@ test("a steerable running turn accepts guidance and renders it on the turn rail"
     attachments: [],
   }));
   await emit(page, threadEvent(18, {
-    type: "turn.capacity_acquired",
+    type: "turn.admitted",
     turn: 8,
-    wait_ms: 0,
-    background: false,
+    provider_wait_ms: 0,
   }));
 
   const composer = page.getByRole("textbox", { name: "Message", exact: true });
@@ -6218,10 +6320,9 @@ test("turn controls cover start, queue, cancel, and send-after-cancel races", as
     attachments: [],
   }));
   await emit(page, threadEvent(18, {
-    type: "turn.capacity_acquired",
+    type: "turn.admitted",
     turn: 8,
-    wait_ms: 0,
-    background: false,
+    provider_wait_ms: 0,
   }));
   await emit(page, threadEvent(19, {
     type: "assistant.message",
@@ -6335,10 +6436,9 @@ test("turn controls cover start, queue, cancel, and send-after-cancel races", as
     attachments: [],
   }));
   await emit(page, threadEvent(24, {
-    type: "turn.capacity_acquired",
+    type: "turn.admitted",
     turn: 9,
-    wait_ms: 0,
-    background: false,
+    provider_wait_ms: 0,
   }));
   await emit(page, threadEvent(25, {
     type: "assistant.thinking",
@@ -6355,7 +6455,7 @@ test("turn controls cover start, queue, cancel, and send-after-cancel races", as
   ]);
 });
 
-test("cancellation before capacity stays pending until the terminal event", async ({ page }) => {
+test("cancellation before provider admission stays pending until the terminal event", async ({ page }) => {
   const cancelledThreadIds: string[] = [];
   await installProtocolFixtures(page, { cancelledThreadIds });
   await page.goto("/");
@@ -6370,24 +6470,23 @@ test("cancellation before capacity stays pending until the terminal event", asyn
     threadEvent(17, {
       type: "user.message",
       turn: 8,
-      content: "Wait for capacity",
+      content: "Wait for provider admission",
       attachments: [],
     }),
   ]);
 
   const submit = page.locator("wa-button.composer-submit");
   await expect(page.locator(".turn-transient-activity"))
-    .toContainText("Waiting for model capacity…");
+    .toContainText("Waiting for provider admission…");
   await expect(submit).toHaveText("Cancel");
   await submit.click();
   await expect.poll(() => cancelledThreadIds).toEqual(["th_fixture"]);
   await expect(submit).toHaveText("Stopping…");
 
   await emit(page, threadEvent(18, {
-    type: "turn.capacity_acquired",
+    type: "turn.admitted",
     turn: 8,
-    wait_ms: 20,
-    background: false,
+    provider_wait_ms: 20,
   }));
   await expect(submit).toHaveText("Stopping…");
 

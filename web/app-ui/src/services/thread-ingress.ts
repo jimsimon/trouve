@@ -180,6 +180,7 @@ export class ThreadIngress {
     this.#state.set("loading");
     if (this.#store.isSessionTombstoned(sessionId)) {
       this.#activeSessionId = undefined;
+      this.#store.retainThreadView(undefined);
       this.#state.set("idle");
       return undefined;
     }
@@ -207,6 +208,7 @@ export class ThreadIngress {
         ? latestOpen
         : threads.find((thread) => thread.id === requestedThreadId) ?? latestOpen;
       if (selected === undefined) {
+        this.#store.retainThreadView(undefined);
         this.#closeStream();
         this.#state.set("open");
         return undefined;
@@ -217,6 +219,7 @@ export class ThreadIngress {
         : undefined;
     } catch (error) {
       if (!this.#isCurrentSession(sessionId, generation)) return undefined;
+      this.#store.retainThreadView(undefined);
       this.#state.set("error");
       throw error;
     }
@@ -228,6 +231,7 @@ export class ThreadIngress {
     if (this.#activeSessionId !== sessionId) return;
     this.#generation += 1;
     this.#activeSessionId = undefined;
+    this.#store.retainThreadView(undefined);
     this.#closeStream();
     this.#state.set("idle");
   }
@@ -235,6 +239,7 @@ export class ThreadIngress {
   close(): void {
     this.#generation += 1;
     this.#activeSessionId = undefined;
+    this.#store.retainThreadView(undefined);
     this.#closeStream();
     this.#state.set("idle");
   }
@@ -257,6 +262,7 @@ export class ThreadIngress {
       snapshot.cursor,
       snapshot.value,
     );
+    this.#store.retainThreadView(threadId);
     const view = this.#store.threadView(threadId);
     const replayBatcher = new ThreadReplayBatcher(
       (events) => {

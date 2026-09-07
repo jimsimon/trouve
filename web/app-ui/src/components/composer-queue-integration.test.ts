@@ -26,12 +26,14 @@ describe("thread composer and queue integration", () => {
     expect(screen).toContain(".value=${live(this.#composerDraft)}");
   });
 
-  it("renders model-derived thinking, context, and fast controls", () => {
+  it("renders every schema-derived model option through the shared editor", () => {
     expect(screen).toContain("modelOptionControls(selectedModel, thread?.model_options)");
-    expect(screen).toContain('aria-label="Thinking level"');
-    expect(screen).toContain('aria-label="Context size"');
-    expect(screen).toContain('"fast",');
-    expect(screen).toContain("...(thread.model_options ?? {})");
+    expect(screen).toContain("<trouve-model-options-editor");
+    expect(screen).toContain(".controls=${modelControls}");
+    expect(screen).toContain("@trouve-model-option-changed=${(");
+    expect(screen).toContain("event: CustomEvent<ModelOptionChangeDetail>");
+    expect(screen).toContain("#updateThreadModelOption(event.detail)");
+    expect(screen).toContain("changeModelOption(thread.model_options ?? {}, change)");
   });
 
   it("keeps queue mutations disabled, recoverable, and explicit on failure", () => {

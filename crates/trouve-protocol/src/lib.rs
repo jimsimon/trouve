@@ -304,13 +304,77 @@ pub use requests::*;
 // final-editor repair so clients can represent incomplete reviews (additive).
 // 7.15: code-review jobs expose the PR-wide open-finding count captured after
 // publication so a clean incremental round cannot hide older findings.
-// 7.16: provider-neutral `auto/<model>` selections expose their concrete routes,
-// persist sticky thread affinity, and emit route-selection events with a
-// closed reason enum; provider-order updates require an explicit array
-// (additive because all affected routes and wire shapes are new).
-// 7.17: provider-order writes can carry an optimistic concurrency precondition
-// so simultaneous settings clients cannot silently overwrite one another.
-pub const PROTOCOL_VERSION: &str = "7.17";
+// 7.16: findings gate in two tiers — `open_issue_count` counts only blocking
+// findings while `advisory_open_issue_count` tracks recorded advisory debt
+// that no longer posts to GitHub or blocks the check; the check run reports
+// success only when the newest published round also covered the full branch;
+// jobs and repositories carry the implementation-analyst model/thinking
+// configuration and tasks gain the `analyst` role.
+// 7.17 was reserved for an in-flight branch and never released; skipped.
+// 7.18: review stats expose the finding-thread auto-resolve backlog
+// (additive).
+// 7.19: queued prompts, user-message events, and thread-view user items gained
+// an explicit `background` flag for server-dispatched attach turns. The event
+// field remains for replay compatibility but was superseded in 7.27.
+// 7.20: finding evidence carries the coordinator's verification record —
+// anchor quote with a server-derived match verdict, execution-path
+// verification grade, and counterexample search — from which finding
+// confidence is now derived (additive).
+// 7.21: session and thread usage summaries include per-model token, turn,
+// and estimated-cost aggregates (additive).
+// 7.22: finding evidence carries the coordinator's causation claim
+// (`change_causation`) with mechanically verified causal waypoints and a
+// server-derived `change_scope` verdict; only scope-verified findings block
+// the review (additive).
+// 7.23: workspace list entries expose additive repository identity so clients
+// can distinguish repository grouping from workspace grouping.
+// 7.24: turns emit an additive provider-admission marker with explicit
+// cooldown wait telemetry; the former capacity marker remains replay-only.
+// 7.25: model catalogs advertise schema-driven scalar options, and threads,
+// prompts, sessions, and automations accept and persist validated option maps
+// for the selected model (additive).
+// 7.26: PUT /v1/automations/{id}/enabled changes automation scheduling without
+// replacing a concurrently edited definition (additive).
+// 7.27: `turn.background_activity` distinguishes server-dispatched autonomous
+// activity from user-authored `user.message` events (additive).
+// 7.28: `session.pr_mentioned` associates pull request browser URLs appearing
+// in durable user-visible chat without claiming session branch ownership.
+// 7.29: assistant thinking lifecycle events and folded snapshots carry an
+// optional provider-owned identity. Legacy no-id events retain inferred tool
+// boundaries while identity-aware reasoning can span interleaved tools, and
+// delayed deltas append to the correct lifecycle within an older turn.
+// 7.30: chat mentions no longer create session PR associations; the legacy
+// session.pr_mentioned event remains replay-only.
+// 7.31: assistant.artifacts events and folded artifact items expose durable
+// model/tool-produced files without embedding media bytes in the event log.
+// 8.0: new code reviews always cover the complete pull-request branch at the
+// exact head. Manual requests no longer select a scope, and new jobs omit
+// incremental watermarks and raw coverage markers. Historical rows may still
+// expose their legacy scope and review base for compatibility; derived pending
+// and exhausted states describe their bounded full-branch migration (breaking).
+// 8.1: findings below the blocking bar are recorded with the `advisory`
+// status instead of `open`, and finding evidence exposes `anchor_line_claimed`
+// (and `line_claimed` on causal waypoints) when the server re-anchored the
+// coordinator's line to its quoted source (additive).
+// 8.2: the legacy /v1/clis lifecycle also manages non-CLI agent runtimes;
+// Cursor's managed artifact is its standalone Agent SDK Bridge.
+// 8.3: CLI install status can expose a non-fatal durability warning after an
+// atomically committed runtime activation (additive).
+// 9.0: asynchronous provider-backed session/thread naming replaces the
+// dedicated local title model, heuristic titles, pre-creation title-derived
+// branches, and the session-title endpoint; model catalogs advertise image
+// input support so naming-model selection can identify text-only models
+// (breaking).
+// 9.1: sessions and threads can request transcript-derived title suggestions
+// for manual rename recovery (additive).
+// 9.2: code-review findings expose their GitHub thread auto-resolve state
+// (`thread_collapse`), the collapse backlog reports failing/abandoned entries
+// with the latest error, and GitHub App status reports
+// `contents_write_configured` (additive).
+// 9.3: model catalogs expose provider-neutral `auto/<model>` entries alongside
+// concrete provider pins, provider preference writes are versioned, sticky
+// route selection is durable, and turns emit their selected route (additive).
+pub const PROTOCOL_VERSION: &str = "9.3";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";
 pub const ERROR_CODE_GITHUB_REAUTHENTICATION_REQUIRED: &str = "github_reauthentication_required";

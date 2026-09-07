@@ -55,6 +55,7 @@ const readRepositoryFile = (path: string): string =>
 const rustEventToWire = {
   ApprovalRequested: "approval.requested",
   ApprovalResolved: "approval.resolved",
+  AssistantArtifacts: "assistant.artifacts",
   AssistantDelta: "assistant.delta",
   AssistantMessage: "assistant.message",
   AssistantProgress: "assistant.progress",
@@ -75,6 +76,8 @@ const rustEventToWire = {
   ToolRequested: "tool.requested",
   ToolStarted: "tool.started",
   TurnCancelled: "turn.cancelled",
+  TurnAdmitted: "turn.admitted",
+  TurnBackgroundActivity: "turn.background_activity",
   TurnCapacityAcquired: "turn.capacity_acquired",
   TurnCompleted: "turn.completed",
   TurnFailed: "turn.failed",

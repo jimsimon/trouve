@@ -76,6 +76,32 @@ impl BedrockProvider {
                     aws::ConversationRole::User,
                     vec![aws::ContentBlock::Text(text.clone())],
                 ),
+                Message::UserWithImages { content, images } => {
+                    let mut blocks = vec![aws::ContentBlock::Text(content.clone())];
+                    for image in images {
+                        let bytes = base64::engine::general_purpose::STANDARD
+                            .decode(&image.data)
+                            .map_err(|error| ProviderError::Request(error.to_string()))?;
+                        let format = match image.mime.as_str() {
+                            "image/gif" => aws::ImageFormat::Gif,
+                            "image/jpeg" => aws::ImageFormat::Jpeg,
+                            "image/png" => aws::ImageFormat::Png,
+                            "image/webp" => aws::ImageFormat::Webp,
+                            other => {
+                                return Err(ProviderError::Request(format!(
+                                    "Bedrock does not support image type {other}"
+                                )));
+                            }
+                        };
+                        let image = aws::ImageBlock::builder()
+                            .format(format)
+                            .source(aws::ImageSource::Bytes(bytes.into()))
+                            .build()
+                            .map_err(build_error)?;
+                        blocks.push(aws::ContentBlock::Image(image));
+                    }
+                    (aws::ConversationRole::User, blocks)
+                }
                 Message::Assistant {
                     content,
                     tool_calls,
@@ -189,9 +215,7 @@ impl Provider for BedrockProvider {
     }
 
     fn shared_model_identity(&self, model: &str) -> Option<String> {
-        self.catalog
-            .model("amazon-bedrock", &self.id, model, OptionsDialect::Anthropic)
-            .map(|_| model.to_string())
+        self.catalog.shared_model_identity("amazon-bedrock", model)
     }
 
     fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
@@ -366,12 +390,22 @@ fn bedrock_events(
                                 .push_str(delta.input());
                         }
                         Some(aws::ContentBlockDelta::ReasoningContent(delta)) => {
+                            if !reasoning.contains_key(&index) {
+                                let _ = tx
+                                    .send(Ok(ProviderEvent::ThinkingStarted {
+                                        id: index.to_string(),
+                                    }))
+                                    .await;
+                            }
                             let state = reasoning.entry(index).or_default();
                             match delta {
                                 aws::ReasoningContentBlockDelta::Text(text) => {
                                     state.text.push_str(text);
                                     let _ = tx
-                                        .send(Ok(ProviderEvent::ThinkingDelta(text.clone())))
+                                        .send(Ok(ProviderEvent::ThinkingDelta {
+                                            id: index.to_string(),
+                                            text: text.clone(),
+                                        }))
                                         .await;
                                 }
                                 aws::ReasoningContentBlockDelta::Signature(signature) => {
@@ -401,6 +435,11 @@ fn bedrock_events(
                     if let Some(reasoning) = reasoning.remove(&index) {
                         let _ = tx
                             .send(Ok(ProviderEvent::Reasoning(reasoning_json(reasoning))))
+                            .await;
+                        let _ = tx
+                            .send(Ok(ProviderEvent::ThinkingCompleted {
+                                id: index.to_string(),
+                            }))
                             .await;
                     }
                 }

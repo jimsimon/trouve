@@ -35,19 +35,35 @@ test("model discovery does not block unrelated repository and persona saves", ()
     source.indexOf("const loadConfiguration"),
     source.indexOf("const needsConfiguration"),
   );
-  assert.match(configurationLoader, /const staticModels = getModels\(\)/u);
+  assert.match(configurationLoader, /void loadStaticModels\(\);/u);
   assert.doesNotMatch(
     configurationLoader,
     /Promise\.allSettled\(\[\s*getModels\(\)/u,
   );
-  assert.match(configurationLoader, /current\.loaded \? current : \{ \.\.\.current, error \}/u);
+  const staticLoader = source.slice(
+    source.indexOf("const loadStaticModels"),
+    source.indexOf("const loadConfiguration"),
+  );
+  assert.match(staticLoader, /current\.loaded \? current : \{ \.\.\.current, error \}/u);
   assert.match(
-    configurationLoader,
-    /current\.loaded \? current : \{ \.\.\.current, models, loaded: true \}/u,
+    staticLoader,
+    /current\.loaded \? current : \{ \.\.\.current, models, loaded: true, error: "" \}/u,
   );
   assert.doesNotMatch(
     repositoryEditor,
     /disabled=\{busy \|\| !modelsLoaded \|\| reviewerPolicyInvalid/u,
   );
   assert.doesNotMatch(reviewerEditor, /disabled=\{busy \|\| !modelsLoaded\}>/u);
+});
+
+test("static model discovery retries independently after live routes succeed", () => {
+  assert.match(
+    source,
+    /const \[staticModelError, setStaticModelError\] = useState\(""\);/u,
+  );
+  assert.match(
+    source,
+    /if \(!needsConfiguration \|\| !staticModelError\) return;[\s\S]*?void loadStaticModels\(\);/u,
+  );
+  assert.match(source, /modelsError=\{modelCatalog\.error \|\| staticModelError\}/u);
 });

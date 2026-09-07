@@ -1,9 +1,19 @@
 import type {
+  ProtocolAgentPersona,
   ProtocolAutomation,
   ProtocolAutomationSchedule,
   ProtocolAutomationTemplate,
+  ProtocolModelInfo,
+  ProtocolProvidersResponse,
   ProtocolUpsertAutomationRequest,
 } from "../services/protocol-client.js";
+import {
+  copyProtocolModelOptions,
+  updateProtocolModelOption,
+} from "../services/protocol-json.js";
+import {
+  sanitizeModelOptions,
+} from "./model-option-controls.js";
 
 export type AutomationScheduleKind = "hourly" | "daily" | "weekly";
 export type AutomationPermissionMode = NonNullable<
@@ -16,7 +26,7 @@ export interface AutomationDraft {
   readonly workspaceId: string;
   readonly mode: string;
   readonly model: string;
-  readonly thinkingLevel: string;
+  readonly modelOptions: Readonly<Record<string, unknown>>;
   readonly permissionMode: AutomationPermissionMode;
   readonly scheduleKind: AutomationScheduleKind;
   readonly minute: string;
@@ -91,7 +101,7 @@ export const emptyAutomationDraft = (workspaceId = ""): AutomationDraft => ({
   workspaceId,
   mode: "",
   model: "",
-  thinkingLevel: "",
+  modelOptions: {},
   permissionMode: "ask",
   scheduleKind: "daily",
   minute: "0",
@@ -102,17 +112,32 @@ export const emptyAutomationDraft = (workspaceId = ""): AutomationDraft => ({
 
 export const automationDraftFrom = (
   automation: ProtocolAutomation,
-): AutomationDraft => ({
-  name: automation.name,
-  prompt: automation.prompt,
-  workspaceId: automation.workspace_id,
-  mode: automation.mode ?? "",
-  model: automation.model ?? "",
-  thinkingLevel: automation.thinking_level ?? "",
-  permissionMode: permissionMode(automation.permission_mode),
-  ...draftForSchedule(automation.schedule),
-  enabled: automation.enabled,
-});
+): AutomationDraft => {
+  let modelOptions: Readonly<Record<string, unknown>> = copyProtocolModelOptions(
+    automation.model_options ?? {},
+  );
+  if (
+    automation.thinking_level != null
+    && !Object.hasOwn(modelOptions, "thinking_level")
+  ) {
+    modelOptions = updateProtocolModelOption(
+      modelOptions,
+      "thinking_level",
+      automation.thinking_level,
+    );
+  }
+  return {
+    name: automation.name,
+    prompt: automation.prompt,
+    workspaceId: automation.workspace_id,
+    mode: automation.mode ?? "",
+    model: automation.model ?? "",
+    modelOptions,
+    permissionMode: permissionMode(automation.permission_mode),
+    ...draftForSchedule(automation.schedule),
+    enabled: automation.enabled,
+  };
+};
 
 export const automationDraftFromTemplate = (
   template: ProtocolAutomationTemplate,
@@ -181,6 +206,7 @@ const scheduleFromDraft = (draft: AutomationDraft): ProtocolAutomationSchedule =
 
 export const automationRequestFromDraft = (
   draft: AutomationDraft,
+  model: ProtocolModelInfo | null | undefined,
 ): ProtocolUpsertAutomationRequest => {
   const errors = validateAutomationDraft(draft);
   if (hasAutomationDraftErrors(errors)) {
@@ -192,12 +218,41 @@ export const automationRequestFromDraft = (
     workspace_id: draft.workspaceId,
     mode: draft.mode === "" ? null : draft.mode,
     model: draft.model === "" ? null : draft.model,
-    thinking_level: draft.thinkingLevel === "" ? null : draft.thinkingLevel,
+    thinking_level: null,
+    model_options: sanitizeModelOptions(model, draft.modelOptions),
     permission_mode: draft.permissionMode,
     schedule: scheduleFromDraft(draft),
     enabled: draft.enabled,
   };
 };
+
+/** Resolve the effective model identity without requiring a matching catalog
+ * object. A configured mode with unavailable metadata is intentionally
+ * unresolved rather than being mistaken for the global default. */
+export const effectiveAutomationModelId = (
+  draft: Pick<AutomationDraft, "mode" | "model">,
+  modes: readonly Pick<ProtocolAgentPersona, "id" | "default_model">[],
+  providers: Pick<ProtocolProvidersResponse, "default_model"> | undefined,
+): string | undefined => {
+  const explicit = draft.model.trim();
+  if (explicit !== "") return explicit;
+  const mode = modes.find((candidate) => candidate.id === (draft.mode || "code"));
+  if (mode === undefined) return undefined;
+  return mode.default_model?.trim() || providers?.default_model.trim() || undefined;
+};
+
+/** Model options are schema-specific, so they survive only while the effective
+ * model remains unchanged. */
+export const modelOptionsAfterEffectiveModelChange = <Value>(
+  options: Readonly<Record<string, Value>>,
+  previousModelId: string | undefined,
+  nextModelId: string | undefined,
+): Readonly<Record<string, Value>> =>
+  previousModelId !== undefined
+    && previousModelId !== ""
+    && nextModelId === previousModelId
+    ? options
+    : {};
 
 export const automationScheduleSummary = (
   schedule: ProtocolAutomationSchedule,

@@ -40,7 +40,9 @@ These are load-bearing. Do not violate them without a new ADR.
    loopback HTTP + SSE and never touches engine internals.
 2. **One durable event log.** Durable server→client state flows through the
    append-only, persisted, cursor-addressed event log. New durable UI-visible
-   state means a new event type, not a side channel. Explicitly ephemeral
+   state means a new event type, not a side channel. Durable binary artifacts
+   are referenced by events and stored in the attachment store; base64 payloads
+   never enter the event log. Explicitly ephemeral
    transports such as integrated PTY instances and their byte streams may use
    request/SSE endpoints and are not reconstructed after server restart (ADR
    0019).
@@ -56,7 +58,9 @@ These are load-bearing. Do not violate them without a new ADR.
    capabilities never widen mutation paths (ADR 0037). Threads share the
    session worktree and their turns may run concurrently; read-only tools may
    overlap, but mutation-capable tool calls and checkpoints are exclusive per
-   session (ADRs 0030 and 0034).
+   session. Managed background jobs release that lane after launch so later
+   tools can interact with intentionally persistent development services
+   (ADRs 0030, 0034, and 0043).
 5. **Protocol changes are versioned.** `trouve-protocol` is the single
    source of truth; the OpenAPI schema snapshot test must be updated
    deliberately with a version bump. Generated clients require an exact
@@ -91,12 +95,20 @@ These are load-bearing. Do not violate them without a new ADR.
     PTYs, daemons, probes, and system-opener libraries — goes through
     `trouve-process`. Process-tree creation holds that shared macOS boundary
     from sentinel setup through spawn; ordinary callers release it immediately
-    after creating the child and wait outside it (ADR 0038).
+    after creating the child and wait outside it (ADR 0038). A process tree
+    owns everything in the leader's session: where holders can be named
+    (Linux), shell calls release descendants that `setsid()` into their own
+    session, report them, and stop them when the session worktree is
+    evicted; elsewhere, and for every other spawner, terminate-all semantics
+    apply (ADR 0046). Trouve-owned work that intentionally outlives its caller
+    is declared before launch and transferred to a scoped managed-background
+    owner together with its cancellation and resource leases; self-daemonizing
+    is never an implicit ownership transfer (ADR 0049).
 11. **Model identity is separate from execution route.** A concrete
     `provider/model` selection is a hard pin. An `auto/model` selection may use
-    only catalog-compatible routes, preserves thread affinity while healthy,
-    and crosses adapters solely through the durable transcript/worktree
-    boundary under bounded failover (ADRs 0042 and 0043).
+    only catalog-compatible hosted routes, preserves thread affinity while
+    healthy, and crosses adapters solely through the durable transcript and
+    worktree boundary under bounded failover (ADRs 0052 and 0053).
 
 ## Conventions
 

@@ -9,6 +9,11 @@ import {
   type EventSourceFactory,
   type SafeStreamDiagnostic,
 } from "./cursor-event-stream.js";
+import {
+  parseProtocolJson,
+  stringifyProtocolJson,
+  UnsupportedModelOptionNumberError,
+} from "./protocol-json.js";
 
 type ValidateFunction = (value: unknown) => boolean;
 
@@ -20,15 +25,15 @@ export type ProtocolForkCheckpointResponse =
   ProtocolComponents["schemas"]["ForkCheckpointResponse"];
 export type ProtocolCreateSessionRequest =
   ProtocolComponents["schemas"]["CreateSessionRequest"];
-export type ProtocolGeneratedSessionTitle =
-  ProtocolComponents["schemas"]["GeneratedSessionTitle"];
+export type ProtocolGeneratedTitle =
+  ProtocolComponents["schemas"]["GeneratedTitle"];
 export type ProtocolUpdateSessionRequest =
   ProtocolComponents["schemas"]["UpdateSessionRequest"];
 export type ProtocolSessionSummary =
   ProtocolComponents["schemas"]["SessionSummary"];
 export type ProtocolSessionSummariesSnapshot =
   ProtocolComponents["schemas"]["SessionSummariesSnapshot"];
-export type ProtocolWorkspace = ProtocolComponents["schemas"]["Workspace"];
+export type ProtocolWorkspace = ProtocolComponents["schemas"]["WorkspaceListItem"];
 export type ProtocolRegisterWorkspaceRequest =
   ProtocolComponents["schemas"]["RegisterWorkspaceRequest"];
 export type ProtocolBranchList = ProtocolComponents["schemas"]["BranchList"];
@@ -129,10 +134,14 @@ export type ProtocolAutomationTemplate =
   ProtocolComponents["schemas"]["AutomationTemplate"];
 export type ProtocolUpsertAutomationRequest =
   ProtocolComponents["schemas"]["UpsertAutomationRequest"];
+export type ProtocolSetAutomationEnabledRequest =
+  ProtocolComponents["schemas"]["SetAutomationEnabledRequest"];
 export type ProtocolCodeReviewDashboard =
   ProtocolComponents["schemas"]["CodeReviewDashboard"];
 export type ProtocolCodeReviewJob =
   ProtocolComponents["schemas"]["CodeReviewJob"];
+export type ProtocolRequestCodeReviewRequest =
+  ProtocolComponents["schemas"]["RequestCodeReviewRequest"];
 export type ProtocolCodeReviewSettings =
   ProtocolComponents["schemas"]["CodeReviewSettings"];
 export type ProtocolSetCodeReviewSettingsRequest =
@@ -147,10 +156,10 @@ export type ProtocolCodeReviewRepository =
   ProtocolComponents["schemas"]["CodeReviewRepository"];
 export type ProtocolUpdateCodeReviewRepositoryRequest =
   ProtocolComponents["schemas"]["UpdateCodeReviewRepositoryRequest"];
-export type ProtocolGitWorktreeSettings =
-  ProtocolComponents["schemas"]["GitWorktreeSettings"];
-export type ProtocolSetGitWorktreeSettingsRequest =
-  ProtocolComponents["schemas"]["SetGitWorktreeSettingsRequest"];
+export type ProtocolSessionNamingSettings =
+  ProtocolComponents["schemas"]["SessionNamingSettings"];
+export type ProtocolSetSessionNamingSettingsRequest =
+  ProtocolComponents["schemas"]["SetSessionNamingSettingsRequest"];
 
 export interface ProtocolCursorSnapshot<T> {
   readonly cursor: number;
@@ -193,7 +202,7 @@ interface ProtocolValidators {
   readonly session: ValidateFunction;
   readonly sessions: ValidateFunction;
   readonly forkCheckpointResponse: ValidateFunction;
-  readonly generatedSessionTitle: ValidateFunction;
+  readonly generatedTitle: ValidateFunction;
   readonly summaries: ValidateFunction;
   readonly workspace: ValidateFunction;
   readonly workspaces: ValidateFunction;
@@ -233,7 +242,7 @@ interface ProtocolValidators {
   readonly githubAppStatus: ValidateFunction;
   readonly reviewerProfile: ValidateFunction;
   readonly codeReviewRepository: ValidateFunction;
-  readonly gitWorktreeSettings: ValidateFunction;
+  readonly sessionNamingSettings: ValidateFunction;
   readonly githubIntegration: ValidateFunction;
   readonly mcpServers: ValidateFunction;
   readonly mcpLogs: ValidateFunction;
@@ -322,7 +331,6 @@ const validateResponse = async <T>(
     | "Session"
     | "Session[]"
     | "ForkCheckpointResponse"
-    | "GeneratedSessionTitle"
     | "SessionSummariesSnapshot"
     | "Workspace"
     | "Workspace[]"
@@ -364,7 +372,8 @@ const validateResponse = async <T>(
     | "GithubAppStatus"
     | "ReviewerProfile"
     | "CodeReviewRepository"
-    | "GitWorktreeSettings"
+    | "GeneratedTitle"
+    | "SessionNamingSettings"
     | "GithubIntegration"
     | "McpServerInfo[]"
     | "McpLogs"
@@ -430,7 +439,7 @@ const MAX_PROTOCOL_ERROR_FIELD_LENGTH = 512;
 // unions. A newer schema can therefore add a value this bundle cannot decode
 // even when the server labels the change additive. Require the exact schema
 // version this client was generated and tested against.
-export const SUPPORTED_PROTOCOL_VERSION = "7.17";
+export const SUPPORTED_PROTOCOL_VERSION = "9.3";
 
 export const assertProtocolCompatibility = (version: string): void => {
   if (version !== SUPPORTED_PROTOCOL_VERSION) {
@@ -463,13 +472,20 @@ export class ProtocolClient {
     this.#client = createClient<ProtocolPaths>({
       baseUrl: this.#baseUrl,
       fetch: this.#fetch,
+      bodySerializer: stringifyProtocolJson,
     });
+  }
+
+  #protocolUrl(path: string): URL {
+    const baseUrl = new URL(this.#baseUrl);
+    if (!baseUrl.pathname.endsWith("/")) baseUrl.pathname += "/";
+    return new URL(path.replace(/^\/+/u, ""), baseUrl);
   }
 
   async #request(path: string, label: string, init?: RequestInit): Promise<Response> {
     let response: Response;
     try {
-      response = await this.#fetch(new URL(path, this.#baseUrl), init);
+      response = await this.#fetch(this.#protocolUrl(path), init);
     } catch {
       throw new ProtocolClientError("request-failed", `${label} request failed`);
     }
@@ -483,6 +499,25 @@ export class ProtocolClient {
     return response;
   }
 
+  async #requestFailure(response: Response, defaultMessage: string): Promise<ProtocolClientError> {
+    let code: string | undefined;
+    let message = defaultMessage;
+    try {
+      const record = asRecord(JSON.parse(await response.text()));
+      if (record !== undefined && typeof record["code"] === "string") {
+        const candidate = record["code"].trim();
+        if (candidate !== "") code = candidate.slice(0, MAX_PROTOCOL_ERROR_FIELD_LENGTH);
+      }
+      if (record !== undefined && typeof record["message"] === "string") {
+        const candidate = record["message"].trim();
+        if (candidate !== "") message = candidate.slice(0, MAX_PROTOCOL_ERROR_FIELD_LENGTH);
+      }
+    } catch {
+      // Preserve the bounded generic message for malformed error responses.
+    }
+    return new ProtocolClientError("request-failed", message, response.status, code);
+  }
+
   async #validatedResponse<T>(
     response: Response,
     schemaName: Parameters<typeof validateResponse<T>>[0],
@@ -490,8 +525,14 @@ export class ProtocolClient {
   ): Promise<T> {
     let value: unknown;
     try {
-      value = await response.json();
-    } catch {
+      value = parseProtocolJson(await response.text());
+    } catch (error) {
+      if (error instanceof UnsupportedModelOptionNumberError) {
+        throw new ProtocolClientError(
+          "invalid-response",
+          "server returned model option numbers this browser cannot preserve exactly",
+        );
+      }
       throw new ProtocolClientError("invalid-response", `server returned invalid ${schemaName}`);
     }
     return validateResponse<T>(schemaName, value, validate);
@@ -556,7 +597,7 @@ export class ProtocolClient {
   #mutation(
     path: string,
     label: string,
-    method: "POST" | "PUT" | "DELETE",
+    method: "POST" | "PUT" | "PATCH" | "DELETE",
     body?: unknown,
     signal?: AbortSignal,
   ): Promise<Response> {
@@ -567,14 +608,14 @@ export class ProtocolClient {
         ...this.#mutationHeaders(),
         ...(body === undefined ? {} : { "content-type": "application/json" }),
       },
-      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      ...(body === undefined ? {} : { body: stringifyProtocolJson(body) }),
     });
   }
 
   async #validatedMutation<T>(
     path: string,
     label: string,
-    method: "POST" | "PUT" | "DELETE",
+    method: "POST" | "PUT" | "PATCH" | "DELETE",
     schemaName: Parameters<typeof validateResponse<T>>[0],
     validate: (loaded: ProtocolValidators) => ValidateFunction,
     body?: unknown,
@@ -649,17 +690,49 @@ export class ProtocolClient {
     );
   }
 
-  generateSessionTitle(
+  generateTitle(
+    sessionId: string,
     prompt: string,
+    attachments: readonly ProtocolAttachmentUpload[] = [],
     options: { readonly signal?: AbortSignal } = {},
-  ): Promise<ProtocolGeneratedSessionTitle> {
+  ): Promise<ProtocolGeneratedTitle> {
     return this.#validatedMutation(
-      "/v1/session-title",
-      "generate session title",
+      "/v1/title",
+      "generate title",
       "POST",
-      "GeneratedSessionTitle",
-      (loaded) => loaded.generatedSessionTitle,
-      { prompt },
+      "GeneratedTitle",
+      (loaded) => loaded.generatedTitle,
+      { session_id: sessionId, prompt, attachments: [...attachments] },
+      options.signal,
+    );
+  }
+
+  generateSessionTitleSuggestion(
+    sessionId: string,
+    options: { readonly signal?: AbortSignal } = {},
+  ): Promise<ProtocolGeneratedTitle> {
+    return this.#validatedMutation(
+      `/v1/sessions/${encodeURIComponent(sessionId)}/title-suggestion`,
+      "generate session title suggestion",
+      "POST",
+      "GeneratedTitle",
+      (loaded) => loaded.generatedTitle,
+      undefined,
+      options.signal,
+    );
+  }
+
+  generateThreadTitleSuggestion(
+    threadId: string,
+    options: { readonly signal?: AbortSignal } = {},
+  ): Promise<ProtocolGeneratedTitle> {
+    return this.#validatedMutation(
+      `/v1/threads/${encodeURIComponent(threadId)}/title-suggestion`,
+      "generate thread title suggestion",
+      "POST",
+      "GeneratedTitle",
+      (loaded) => loaded.generatedTitle,
+      undefined,
       options.signal,
     );
   }
@@ -837,31 +910,7 @@ export class ProtocolClient {
       throw new ProtocolClientError("request-failed", "pull request detail request failed");
     }
     if (!response.ok) {
-      let code: string | undefined;
-      let message = "pull request detail request failed";
-      try {
-        const error: unknown = await response.json();
-        if (typeof error === "object" && error !== null) {
-          const record = error as Record<string, unknown>;
-          if (typeof record["code"] === "string") {
-            code = record["code"].slice(0, MAX_PROTOCOL_ERROR_FIELD_LENGTH);
-          }
-          if (typeof record["message"] === "string") {
-            const candidate = record["message"].trim();
-            if (candidate !== "") {
-              message = candidate.slice(0, MAX_PROTOCOL_ERROR_FIELD_LENGTH);
-            }
-          }
-        }
-      } catch {
-        // Preserve the bounded generic message for malformed error responses.
-      }
-      throw new ProtocolClientError(
-        "request-failed",
-        message,
-        response.status,
-        code,
-      );
+      throw await this.#requestFailure(response, "pull request detail request failed");
     }
     return this.#parsePrDetail(response);
   }
@@ -983,65 +1032,29 @@ export class ProtocolClient {
     );
   }
 
-  async models(): Promise<readonly ProtocolModelInfo[]> {
-    let result;
-    try {
-      result = await this.#client.GET("/v1/models");
-    } catch {
-      throw new ProtocolClientError("request-failed", "model request failed");
-    }
-    if (!result.response.ok || result.data === undefined) {
-      throw new ProtocolClientError("request-failed", "model request failed");
-    }
-    return validateResponse<readonly ProtocolModelInfo[]>(
+  models(): Promise<readonly ProtocolModelInfo[]> {
+    return this.#validatedJson(
+      "/v1/models",
+      "model",
       "ModelInfo[]",
-      result.data,
       (loaded) => loaded.models,
     );
   }
 
-  async modelRoutes(): Promise<readonly ProtocolRoutedModelInfo[]> {
-    let result;
-    try {
-      result = await this.#client.GET("/v1/model-routes");
-    } catch {
-      throw new ProtocolClientError(
-        "request-failed",
-        "model route request failed",
-      );
-    }
-    if (!result.response.ok || result.data === undefined) {
-      throw new ProtocolClientError(
-        "request-failed",
-        "model route request failed",
-      );
-    }
-    return validateResponse<readonly ProtocolRoutedModelInfo[]>(
+  modelRoutes(): Promise<readonly ProtocolRoutedModelInfo[]> {
+    return this.#validatedJson(
+      "/v1/model-routes",
+      "model route",
       "RoutedModelInfo[]",
-      result.data,
       (loaded) => loaded.modelRoutes,
     );
   }
 
-  async refreshModels(): Promise<readonly ProtocolModelInfo[]> {
-    let result;
-    try {
-      result = await this.#client.GET("/v1/models/refresh");
-    } catch {
-      throw new ProtocolClientError(
-        "request-failed",
-        "live model refresh failed",
-      );
-    }
-    if (!result.response.ok || result.data === undefined) {
-      throw new ProtocolClientError(
-        "request-failed",
-        "live model refresh failed",
-      );
-    }
-    return validateResponse<readonly ProtocolModelInfo[]>(
+  refreshModels(): Promise<readonly ProtocolModelInfo[]> {
+    return this.#validatedJson(
+      "/v1/models/refresh",
+      "live model refresh",
       "ModelInfo[]",
-      result.data,
       (loaded) => loaded.models,
     );
   }
@@ -1245,6 +1258,20 @@ export class ProtocolClient {
     );
   }
 
+  setAutomationEnabled(
+    automationId: string,
+    request: ProtocolSetAutomationEnabledRequest,
+  ): Promise<ProtocolAutomation> {
+    return this.#validatedMutation(
+      `/v1/automations/${encodeURIComponent(automationId)}/enabled`,
+      "set automation enabled state",
+      "PUT",
+      "Automation",
+      (loaded) => loaded.automation,
+      request,
+    );
+  }
+
   async deleteAutomation(automationId: string): Promise<void> {
     await this.#mutation(
       `/v1/automations/${encodeURIComponent(automationId)}`,
@@ -1272,6 +1299,19 @@ export class ProtocolClient {
 
   async refreshCodeReviews(): Promise<void> {
     await this.#mutation("/v1/code-review/refresh", "refresh code reviews", "POST");
+  }
+
+  requestCodeReview(
+    request: ProtocolRequestCodeReviewRequest,
+  ): Promise<ProtocolCodeReviewJob> {
+    return this.#validatedMutation(
+      "/v1/code-review/requests",
+      "request code review",
+      "POST",
+      "CodeReviewJob",
+      (loaded) => loaded.codeReviewJob,
+      request,
+    );
   }
 
   retryCodeReviewJob(jobId: string): Promise<ProtocolCodeReviewJob> {
@@ -1352,65 +1392,49 @@ export class ProtocolClient {
     );
   }
 
-  gitWorktreeSettings(): Promise<ProtocolGitWorktreeSettings> {
+  sessionNamingSettings(): Promise<ProtocolSessionNamingSettings> {
     return this.#validatedJson(
-      "/v1/config/git-worktrees",
+      "/v1/config/session-naming",
       "Session naming settings",
-      "GitWorktreeSettings",
-      (loaded) => loaded.gitWorktreeSettings,
+      "SessionNamingSettings",
+      (loaded) => loaded.sessionNamingSettings,
     );
   }
 
-  gitWorktreeSettingsSnapshot(): Promise<
-    ProtocolCursorSnapshot<ProtocolGitWorktreeSettings>
+  sessionNamingSettingsSnapshot(): Promise<
+    ProtocolCursorSnapshot<ProtocolSessionNamingSettings>
   > {
     return this.#validatedCursorJson(
-      "/v1/config/git-worktrees",
+      "/v1/config/session-naming",
       "Session naming settings",
-      "GitWorktreeSettings",
-      (loaded) => loaded.gitWorktreeSettings,
+      "SessionNamingSettings",
+      (loaded) => loaded.sessionNamingSettings,
     );
   }
 
-  setGitWorktreeSettings(
-    request: ProtocolSetGitWorktreeSettingsRequest,
-  ): Promise<ProtocolGitWorktreeSettings> {
+  setSessionNamingSettings(
+    request: ProtocolSetSessionNamingSettingsRequest,
+  ): Promise<ProtocolSessionNamingSettings> {
     return this.#validatedMutation(
-      "/v1/config/git-worktrees",
+      "/v1/config/session-naming",
       "save session naming settings",
       "PUT",
-      "GitWorktreeSettings",
-      (loaded) => loaded.gitWorktreeSettings,
+      "SessionNamingSettings",
+      (loaded) => loaded.sessionNamingSettings,
       request,
     );
   }
 
-  setGitWorktreeSettingsSnapshot(
-    request: ProtocolSetGitWorktreeSettingsRequest,
-  ): Promise<ProtocolCursorSnapshot<ProtocolGitWorktreeSettings>> {
+  setSessionNamingSettingsSnapshot(
+    request: ProtocolSetSessionNamingSettingsRequest,
+  ): Promise<ProtocolCursorSnapshot<ProtocolSessionNamingSettings>> {
     return this.#validatedCursorMutation(
-      "/v1/config/git-worktrees",
+      "/v1/config/session-naming",
       "save session naming settings",
       "PUT",
-      "GitWorktreeSettings",
-      (loaded) => loaded.gitWorktreeSettings,
+      "SessionNamingSettings",
+      (loaded) => loaded.sessionNamingSettings,
       request,
-    );
-  }
-
-  async installTitleModel(): Promise<void> {
-    await this.#mutation(
-      "/v1/config/git-worktrees/title-model/install",
-      "install title model",
-      "POST",
-    );
-  }
-
-  async cancelTitleModelInstall(): Promise<void> {
-    await this.#mutation(
-      "/v1/config/git-worktrees/title-model/install",
-      "cancel title model install",
-      "DELETE",
     );
   }
 
@@ -1522,7 +1546,7 @@ export class ProtocolClient {
   clis(): Promise<ProtocolCliList> {
     return this.#validatedJson(
       "/v1/clis",
-      "CLI list",
+      "agent runtime list",
       "CliList",
       (loaded) => loaded.cliList,
     );
@@ -1531,7 +1555,7 @@ export class ProtocolClient {
   cliInstallStatus(cliId: string): Promise<ProtocolCliInstallStatus> {
     return this.#validatedJson(
       `/v1/clis/${encodeURIComponent(cliId)}/install`,
-      "CLI install status",
+      "agent runtime install status",
       "CliInstallStatus",
       (loaded) => loaded.cliInstallStatus,
     );
@@ -1540,7 +1564,7 @@ export class ProtocolClient {
   async startCliInstall(cliId: string): Promise<void> {
     await this.#mutation(
       `/v1/clis/${encodeURIComponent(cliId)}/install`,
-      "start CLI install",
+      "start agent runtime install",
       "POST",
     );
   }
@@ -1548,7 +1572,7 @@ export class ProtocolClient {
   async cancelCliInstall(cliId: string): Promise<void> {
     await this.#mutation(
       `/v1/clis/${encodeURIComponent(cliId)}/install`,
-      "cancel CLI install",
+      "cancel agent runtime install",
       "DELETE",
     );
   }
@@ -1556,26 +1580,16 @@ export class ProtocolClient {
   async uninstallCli(cliId: string): Promise<void> {
     await this.#mutation(
       `/v1/clis/${encodeURIComponent(cliId)}`,
-      "uninstall CLI",
+      "uninstall agent runtime",
       "DELETE",
     );
   }
 
-  async threads(sessionId: string): Promise<readonly ProtocolThread[]> {
-    let result;
-    try {
-      result = await this.#client.GET("/v1/threads", {
-        params: { query: { session_id: sessionId } },
-      });
-    } catch {
-      throw new ProtocolClientError("request-failed", "thread request failed");
-    }
-    if (!result.response.ok || result.data === undefined) {
-      throw new ProtocolClientError("request-failed", "thread request failed");
-    }
-    return validateResponse<readonly ProtocolThread[]>(
+  threads(sessionId: string): Promise<readonly ProtocolThread[]> {
+    return this.#validatedJson(
+      `/v1/threads?session_id=${encodeURIComponent(sessionId)}`,
+      "thread",
       "Thread[]",
-      result.data,
       (loaded) => loaded.threads,
     );
   }
@@ -1674,23 +1688,14 @@ export class ProtocolClient {
     return value;
   }
 
-  async createThread(request: ProtocolCreateThreadRequest): Promise<ProtocolThread> {
-    let result;
-    try {
-      result = await this.#client.POST("/v1/threads", {
-        headers: this.#mutationHeaders(),
-        body: request,
-      });
-    } catch {
-      throw new ProtocolClientError("request-failed", "create thread request failed");
-    }
-    if (!result.response.ok || result.data === undefined) {
-      throw new ProtocolClientError("request-failed", "create thread request failed");
-    }
-    return validateResponse<ProtocolThread>(
+  createThread(request: ProtocolCreateThreadRequest): Promise<ProtocolThread> {
+    return this.#validatedMutation(
+      "/v1/threads",
+      "create thread",
+      "POST",
       "Thread",
-      result.data,
       (loaded) => loaded.thread,
+      request,
     );
   }
 
@@ -1698,28 +1703,28 @@ export class ProtocolClient {
     threadId: string,
     request: ProtocolUpdateThreadRequest,
   ): Promise<ProtocolThread> {
-    let result;
+    let response: Response;
     try {
-      result = await this.#client.PATCH("/v1/threads/{id}", {
-        params: { path: { id: threadId } },
-        headers: this.#mutationHeaders(),
-        body: request,
-      });
+      response = await this.#fetch(
+        this.#protocolUrl(`v1/threads/${encodeURIComponent(threadId)}`),
+        {
+          method: "PATCH",
+          headers: {
+            ...this.#mutationHeaders(),
+            "content-type": "application/json",
+          },
+          body: stringifyProtocolJson(request),
+        },
+      );
     } catch {
       throw new ProtocolClientError("request-failed", "update thread request failed");
     }
-    if (!result.response.ok || result.data === undefined) {
-      const error = result.error;
-      throw new ProtocolClientError(
-        "request-failed",
-        error?.message ?? "update thread request failed",
-        result.response.status,
-        error?.code,
-      );
+    if (!response.ok) {
+      throw await this.#requestFailure(response, "update thread request failed");
     }
-    return validateResponse<ProtocolThread>(
+    return this.#validatedResponse<ProtocolThread>(
+      response,
       "Thread",
-      result.data,
       (loaded) => loaded.thread,
     );
   }
@@ -2054,22 +2059,12 @@ export class ProtocolClient {
     );
   }
 
-  async forkCheckpoint(checkpointId: string): Promise<ProtocolForkCheckpointResponse> {
-    let result;
-    try {
-      result = await this.#client.POST("/v1/checkpoints/{id}/fork", {
-        params: { path: { id: checkpointId } },
-        headers: this.#mutationHeaders(),
-      });
-    } catch {
-      throw new ProtocolClientError("request-failed", "checkpoint fork request failed");
-    }
-    if (!result.response.ok || result.data === undefined) {
-      throw new ProtocolClientError("request-failed", "checkpoint fork request failed");
-    }
-    return validateResponse<ProtocolForkCheckpointResponse>(
+  forkCheckpoint(checkpointId: string): Promise<ProtocolForkCheckpointResponse> {
+    return this.#validatedMutation(
+      `/v1/checkpoints/${encodeURIComponent(checkpointId)}/fork`,
+      "checkpoint fork",
+      "POST",
       "ForkCheckpointResponse",
-      result.data,
       (loaded) => loaded.forkCheckpointResponse,
     );
   }

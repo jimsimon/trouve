@@ -17,22 +17,26 @@ import {
 import { readSignal } from "../state/reactivity.js";
 import type { ProtocolSubscriptionHealth } from "../services/protocol-client.js";
 import { modelHealthPresentations } from "./model-health.js";
-import { modelOptionLabel } from "./model-option-controls.js";
 import {
   composerTextareaLayout,
   isComposerCompositionKey,
 } from "./composer-input-model.js";
+import {
+  changeModelOption,
+  type ModelOptionChangeDetail,
+} from "./model-option-controls.js";
 import { fontAwesomeIcon } from "./font-awesome-icon.js";
 import {
   appendNewThreadAttachment,
   createInitialNewThreadDraft,
   createNewThreadSetupEdits,
   createNewThreadSetupSubmission,
+  effectiveNewThreadModel,
   formatNewThreadAttachmentBytes,
   newThreadAttachmentLimitMessage,
   newThreadSetupControls,
-  newThreadThinkingOption,
   reconcileNewThreadDraft,
+  newThreadModelOptionControls,
   selectNewThreadMode,
   selectNewThreadModel,
   type NewThreadPermissionSelection,
@@ -43,6 +47,7 @@ import {
   type NewThreadSetupSubmitDetail,
 } from "./new-thread-setup-model.js";
 import "./image-preview.js";
+import "./model-options-editor.js";
 
 const OPTIONS_RETRY_MS = 5_000;
 import "./model-picker.js";
@@ -113,7 +118,7 @@ export class TrouveNewThreadSetup extends LitElement {
     h2 { margin: 0; color: var(--trouve-text-hi); font-size: 22px; line-height: 1.2; }
     header p { margin: 0; color: var(--trouve-text-dim); font-size: 13px; }
     .option-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
-    .option-grid.no-thinking .permission-field { grid-column: 1 / -1; }
+    .model-options { grid-column: 1 / -1; }
     label, .field-label { min-width: 0; display: grid; gap: 6px; color: var(--trouve-text-mid); font-size: 12px; font-weight: 700; }
     select, textarea {
       width: 100%;
@@ -371,7 +376,7 @@ export class TrouveNewThreadSetup extends LitElement {
       busy: this.busy,
       attachmentLoading: this.#attachmentLoading,
     });
-    const thinking = newThreadThinkingOption(this.#draft, this.#catalog);
+    const modelOptions = newThreadModelOptionControls(this.#draft, this.#catalog);
     const describedBy = [
       this.busy ? "new-thread-progress" : "",
       this.disabled || unavailable ? "new-thread-disabled" : "",
@@ -436,38 +441,6 @@ export class TrouveNewThreadSetup extends LitElement {
               @trouve-model-picked=${this.#modelPicked}
             ></trouve-model-picker>
           </div>
-          <label>
-            <span>${thinking?.budget === undefined
-              ? "Thinking level"
-              : "Thinking budget (tokens)"}</span>
-            ${thinking?.budget === undefined
-              ? html`<select
-                  name="thinking"
-                  .value=${thinking === undefined ? "" : this.#draft.thinking}
-                  ?disabled=${controls.optionControlsDisabled || thinking === undefined}
-                  @change=${this.#thinkingChanged}
-                >
-                  ${thinking === undefined
-                    ? html`<option value="">Not supported</option>`
-                    : thinking.values.map(
-                        (value) => html`<option
-                          value=${value}
-                          .selected=${value === this.#draft.thinking}
-                        >${modelOptionLabel(value)}</option>`,
-                      )}
-                </select>`
-              : html`<input
-                  name="thinking"
-                  type="number"
-                  required
-                  step="1"
-                  min=${thinking.budget.minimum}
-                  max=${thinking.budget.maximum ?? nothing}
-                  .value=${this.#draft.thinking}
-                  ?disabled=${controls.optionControlsDisabled}
-                  @input=${this.#thinkingChanged}
-                />`}
-          </label>
           <label class=${`permission-field ${this.#draft.permissionMode === "yolo" ? "permission-yolo" : ""}`}>
             <span>${this.#draft.permissionMode === "yolo"
               ? fontAwesomeIcon("triangle-exclamation")
@@ -484,6 +457,14 @@ export class TrouveNewThreadSetup extends LitElement {
               <option value="yolo" .selected=${this.#draft.permissionMode === "yolo"}>Yolo</option>
             </select>
           </label>
+          ${modelOptions.length === 0
+            ? nothing
+            : html`<trouve-model-options-editor
+                class="model-options"
+                .controls=${modelOptions}
+                .disabled=${controls.optionControlsDisabled}
+                @trouve-model-option-changed=${this.#modelOptionChanged}
+              ></trouve-model-options-editor>`}
         </div>
 
         ${this.#draft.permissionMode === "yolo"
@@ -703,18 +684,13 @@ export class TrouveNewThreadSetup extends LitElement {
     this.requestUpdate();
   };
 
-  readonly #thinkingChanged = (event: Event): void => {
+  readonly #modelOptionChanged = (event: CustomEvent<ModelOptionChangeDetail>): void => {
     this.#optionEdits = { ...this.#optionEdits, thinking: true };
-    const value = (event.currentTarget as HTMLSelectElement).value;
     this.#draft = {
       ...this.#draft,
-      thinking: value || selectNewThreadModel(
-        this.#draft,
-        this.#draft.modelId,
-        this.#catalog,
-      ).thinking,
-      inheritedThinking: undefined,
+      modelOptions: changeModelOption(this.#draft.modelOptions, event.detail),
     };
+    this.#internalError = "";
     this.requestUpdate();
   };
 

@@ -49,14 +49,14 @@ run_search() { # <cache-dir> <repo-root>
 
 mkdir -p "$OUT"
 
-hyperfine --runs "$RUNS" --export-json "$OUT/cold.json" \
+hyperfine --warmup 1 --runs "$RUNS" --export-json "$OUT/cold.json" \
     --prepare "rm -rf $(q "$CACHE")" -n "cold index + query" "$CMD"
 
 run_search "$CACHE" "$REPO"
 hyperfine --warmup 1 --runs "$((RUNS * 2))" --export-json "$OUT/warm.json" \
     -n "warm query" "$CMD"
 
-hyperfine --runs "$RUNS" --export-json "$OUT/incremental.json" \
+hyperfine --warmup 1 --runs "$RUNS" --export-json "$OUT/incremental.json" \
     --prepare "printf '\n# bench %s\n' \$RANDOM >> $(q "$TOUCH_FILE")" \
     -n "incremental (1 file modified)" "$CMD"
 git -C "$REPO" checkout --quiet -- .

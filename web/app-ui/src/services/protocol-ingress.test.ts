@@ -125,23 +125,17 @@ const githubSnapshotEvent = (
   },
 });
 
-const gitWorktreeSettingsEvent = (cursor: number, state: string): KnownIngressEvent => ({
+const sessionNamingSettingsEvent = (cursor: number, model: string): KnownIngressEvent => ({
   kind: "known",
   cursor,
   envelope: {
     cursor,
     scope: "server",
     ts: `2026-08-01T12:03:${String(cursor).padStart(2, "0")}Z`,
-    type: "settings.git_worktrees_updated",
+    type: "settings.session_naming_updated",
     settings: {
+      model,
       derive_branch_name_from_session_title: false,
-      title_model_load_behavior: "auto",
-      title_model_resource_policy: "adaptive",
-      title_model: {
-        state,
-        runtime_installed: false,
-        model_downloaded: false,
-      },
     },
   },
 });
@@ -197,8 +191,8 @@ describe("ProtocolIngress", () => {
     expect(replay.push(githubSnapshotEvent(1).envelope)).toBe(true);
     expect(replay.push(githubSnapshotEvent(3, "github.com", "new").envelope)).toBe(true);
     expect(replay.push(githubSnapshotEvent(2, "github.example.com", "enterprise").envelope)).toBe(true);
-    expect(replay.push(gitWorktreeSettingsEvent(4, "installing").envelope)).toBe(true);
-    expect(replay.push(gitWorktreeSettingsEvent(5, "ready").envelope)).toBe(true);
+    expect(replay.push(sessionNamingSettingsEvent(4, "installing").envelope)).toBe(true);
+    expect(replay.push(sessionNamingSettingsEvent(5, "ready").envelope)).toBe(true);
     expect(replay.push(lifecycleEvent(6).envelope)).toBe(false);
 
     const buffered = replay.take();
@@ -207,7 +201,7 @@ describe("ProtocolIngress", () => {
       pull_requests: { viewer: "new" },
     });
     expect(buffered.find(({ cursor }) => cursor === 5)).toMatchObject({
-      settings: { title_model: { state: "ready" } },
+      settings: { model: "ready" },
     });
     expect(replay.take()).toEqual([]);
   });
@@ -284,15 +278,9 @@ describe("ProtocolIngress", () => {
             },
           }],
           session_pull_requests: [{ session_id: "se_1", prs: [linkedPr] }],
-          git_worktree_settings: {
+          session_naming_settings: {
+            model: "provider/model",
             derive_branch_name_from_session_title: false,
-            title_model_load_behavior: "auto",
-            title_model_resource_policy: "adaptive",
-            title_model: {
-              state: "ready",
-              runtime_installed: true,
-              model_downloaded: true,
-            },
           },
         },
       })),
@@ -314,7 +302,7 @@ describe("ProtocolIngress", () => {
     expect(readSignal(store.githubPullRequests)).toEqual([
       expect.objectContaining({ cursor: 9, refreshedAt: "2026-08-01T12:02:09Z" }),
     ]);
-    expect(readSignal(store.gitWorktreeSettings)).toMatchObject({ cursor: 10 });
+    expect(readSignal(store.sessionNamingSettings)).toMatchObject({ cursor: 10 });
     ingress.stop();
   });
 
@@ -333,15 +321,9 @@ describe("ProtocolIngress", () => {
           pull_requests: { host: "github.com", viewer, prs: [] },
         }],
         session_pull_requests: [],
-        git_worktree_settings: {
+        session_naming_settings: {
+          model: "provider/model",
           derive_branch_name_from_session_title: false,
-          title_model_load_behavior: "auto",
-          title_model_resource_policy: "adaptive",
-          title_model: {
-            state: "ready",
-            runtime_installed: true,
-            model_downloaded: true,
-          },
         },
       },
     }));
@@ -391,19 +373,13 @@ describe("ProtocolIngress", () => {
           404,
         );
       }),
-      gitWorktreeSettingsSnapshot: vi.fn(async () => {
+      sessionNamingSettingsSnapshot: vi.fn(async () => {
         requestOrder.push("fence");
         return {
           cursor: 12,
           value: {
+            model: "provider/model",
             derive_branch_name_from_session_title: false,
-            title_model_load_behavior: "auto",
-            title_model_resource_policy: "adaptive",
-            title_model: {
-              state: "ready",
-              runtime_installed: true,
-              model_downloaded: true,
-            },
           },
         };
       }),
@@ -480,10 +456,10 @@ describe("ProtocolIngress", () => {
 
     eventOptions?.onEvent(lifecycleEvent(8));
     eventOptions?.onEvent(githubSnapshotEvent(9));
-    eventOptions?.onEvent(gitWorktreeSettingsEvent(10, "ready"));
+    eventOptions?.onEvent(sessionNamingSettingsEvent(10, "ready"));
 
     expect(readSignal(store.githubPullRequests)).toEqual([]);
-    expect(readSignal(store.gitWorktreeSettings)).toBeUndefined();
+    expect(readSignal(store.sessionNamingSettings)).toBeUndefined();
     expect(onKnownEvent).not.toHaveBeenCalled();
 
     eventOptions?.onEvent(lifecycleEvent(11));
@@ -493,9 +469,9 @@ describe("ProtocolIngress", () => {
         pullRequests: expect.objectContaining({ host: "github.com" }),
       }),
     ]);
-    expect(readSignal(store.gitWorktreeSettings)).toMatchObject({
+    expect(readSignal(store.sessionNamingSettings)).toMatchObject({
       cursor: 10,
-      settings: { title_model: { state: "ready" } },
+      settings: { model: "ready" },
     });
     expect(onKnownEvent).toHaveBeenCalledWith(
       expect.objectContaining({ cursor: 11, type: "session.updated" }),

@@ -60,6 +60,13 @@ import {
   thinkingSelectionIsValid,
 } from "./model-settings";
 import {
+  consumeCursorMigrationFocusRequest,
+  cursorSdkPreset,
+  providerNeedsCursorSdkMigration,
+  providerSetupGroups,
+  savedProviderMessage,
+} from "./provider-settings";
+import {
   LIVE_OUTPUT_BATCH_MS,
   appendBoundedReviewOutput,
   boundReviewOutput,
@@ -82,6 +89,7 @@ import type {
   Dashboard,
   DurationStats,
   EventEnvelope,
+  Finding,
   GithubAppStatus,
   JobDetail,
   KnownProvider,
@@ -241,7 +249,7 @@ function taskAttemptLabel(tasks: ReviewTask[], task: ReviewTask): string {
       candidate.role === task.role && candidate.batch_index === task.batch_index,
   );
   const base =
-    task.role === "coordinator"
+    task.role === "coordinator" || task.role === "analyst"
       ? "Attempt"
       : task.role === "router"
         ? `Routing ${task.batch_index + 1}`
@@ -358,6 +366,7 @@ function App() {
     loaded: boolean;
     error: string;
   }>({ models: [], loaded: false, error: "" });
+  const [staticModelError, setStaticModelError] = useState("");
   const models = modelCatalog.models;
   const [personaInfos, setPersonaInfos] = useState<PersonaInfo[]>([]);
   const [dashboardError, setDashboardError] = useState("");
@@ -423,30 +432,36 @@ function App() {
     return request;
   }, []);
 
+  const loadStaticModels = useCallback((): Promise<void> => {
+    if (staticModelLoadRef.current) return staticModelLoadRef.current;
+    const request = getModels()
+      .then((models) => {
+        setStaticModelError("");
+        setModelCatalog((current) =>
+          current.loaded ? current : { ...current, models, loaded: true, error: "" },
+        );
+      })
+      .catch((cause) => {
+        const error = cause instanceof Error ? cause.message : String(cause);
+        setStaticModelError(error);
+        setModelCatalog((current) =>
+          current.loaded ? current : { ...current, error },
+        );
+      });
+    staticModelLoadRef.current = request;
+    void request.finally(() => {
+      if (staticModelLoadRef.current === request) staticModelLoadRef.current = null;
+    });
+    return request;
+  }, []);
+
   const loadConfiguration = useCallback((): Promise<void> => {
     if (configurationLoadRef.current) return configurationLoadRef.current;
     const request = (async (): Promise<void> => {
       // Static model discovery has its own loading/error projection. Publish
       // it independently so a stalled model endpoint cannot hold repository,
       // review, or persona settings behind one aggregate promise.
-      if (!staticModelLoadRef.current) {
-        const staticModels = getModels()
-          .then((models) => {
-            setModelCatalog((current) =>
-              current.loaded ? current : { ...current, models, loaded: true },
-            );
-          })
-          .catch((cause) => {
-            const error = cause instanceof Error ? cause.message : String(cause);
-            setModelCatalog((current) =>
-              current.loaded ? current : { ...current, error },
-            );
-          });
-        staticModelLoadRef.current = staticModels;
-        void staticModels.finally(() => {
-          if (staticModelLoadRef.current === staticModels) staticModelLoadRef.current = null;
-        });
-      }
+      void loadStaticModels();
       const results = await Promise.allSettled([
         getProviders(),
         getReviewSettings(),
@@ -469,7 +484,7 @@ function App() {
       if (configurationLoadRef.current === request) configurationLoadRef.current = null;
     });
     return request;
-  }, [loadModelRoutes]);
+  }, [loadModelRoutes, loadStaticModels]);
 
   useEffect(() => {
     const onHash = (): void => setRoute(routeFromHash());
@@ -517,6 +532,14 @@ function App() {
     }, AUTOMATIC_RETRY_MS);
     return () => window.clearInterval(timer);
   }, [loadModelRoutes, modelCatalog.error, needsConfiguration]);
+
+  useEffect(() => {
+    if (!needsConfiguration || !staticModelError) return;
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === "visible") void loadStaticModels();
+    }, AUTOMATIC_RETRY_MS);
+    return () => window.clearInterval(timer);
+  }, [loadStaticModels, needsConfiguration, staticModelError]);
 
   useEffect(() => {
     if (serverEventAfter === null) return;
@@ -574,7 +597,7 @@ function App() {
           reviewSettings={reviewSettings}
           models={models}
           modelsLoaded={modelCatalog.loaded}
-          modelsError={modelCatalog.error}
+          modelsError={modelCatalog.error || staticModelError}
           reviewPersonaInfo={personaInfos.find(({ persona }) => persona.id === "review")}
           onChanged={() => {
             void loadDashboard(true);
@@ -737,11 +760,17 @@ function EmptyState({ title, body }: { title: string; body: string }) {
 }
 
 function reviewJobAttentionState(
-  job: Pick<ReviewJob, "status" | "open_issue_count">,
-): "open" | "unknown" | null {
+  job: Pick<
+    ReviewJob,
+    "status" | "open_issue_count" | "legacy_coverage_pending" | "legacy_coverage_exhausted"
+  >,
+): "coverage_exhausted" | "coverage_pending" | "open" | "unknown" | null {
   if (job.status !== "succeeded") return null;
+  if (job.legacy_coverage_exhausted) return "coverage_exhausted";
+  if (job.legacy_coverage_pending) return "coverage_pending";
+  if (job.open_issue_count != null && job.open_issue_count > 0) return "open";
   if (job.open_issue_count == null) return "unknown";
-  return job.open_issue_count > 0 ? "open" : null;
+  return null;
 }
 
 function JobRow({ job, now }: { job: ReviewJob; now: number }) {
@@ -750,8 +779,12 @@ function JobRow({ job, now }: { job: ReviewJob; now: number }) {
   const attentionState = reviewJobAttentionState(job);
   return (
     <button class="job-row" type="button" onClick={() => navigate("jobs", job.id)}>
-      {attentionState === "open" ? (
-        <span class="status failed">needs attention</span>
+      {attentionState === "coverage_exhausted" ? (
+        <span class="status warning">full review required</span>
+      ) : attentionState === "coverage_pending" ? (
+        <span class="status warning">full review pending</span>
+      ) : attentionState === "open" ? (
+        <span class="status warning">needs attention</span>
       ) : attentionState === "unknown" ? (
         <span class="status warning">status unknown</span>
       ) : (
@@ -768,7 +801,7 @@ function JobRow({ job, now }: { job: ReviewJob; now: number }) {
         <b>
           {openIssueCount == null
             ? `Open status unknown · ${job.issue_count} new`
-            : `${openIssueCount} open · ${job.issue_count} new`}
+            : `${openIssueCount} blocking · ${job.issue_count} new`}
         </b>
         <small>{job.status === "queued" ? duration(job.pending_elapsed_ms) : duration(elapsed)}</small>
       </span>
@@ -877,6 +910,7 @@ function JobDetailPane({
   const [error, setError] = useState("");
   const [busy, setBusy] = useState("");
   const [retryStatus, setRetryStatus] = useState("");
+  const [actionNotice, setActionNotice] = useState("");
   const [selectedTaskId, setSelectedTaskId] = useState("");
   const [taskDetails, setTaskDetails] = useState<Record<string, ReviewTask>>({});
   const [taskLoading, setTaskLoading] = useState("");
@@ -986,6 +1020,7 @@ function JobDetailPane({
     setRoutingOpen(false);
     setBusy("");
     setRetryStatus("");
+    setActionNotice("");
     activityGroupButtonRefs.current = {};
     taskRequestsRef.current.clear();
     void load();
@@ -1232,22 +1267,30 @@ function JobDetailPane({
     });
   }, [selectedTaskId]);
 
-  const act = async (action: "cancel" | "retry" | "full"): Promise<void> => {
+  const act = async (action: "cancel" | "request" | "retry"): Promise<void> => {
     if (!detail) return;
+    const submittedJobId = detail.job.id;
     setBusy(action);
+    setActionNotice("");
     try {
       const replacement =
         action === "cancel"
-          ? await cancelJob(detail.job.id)
-          : action === "retry"
-            ? await retryJob(detail.job.id)
-            : await requestReview(detail.job, "full");
+          ? await cancelJob(submittedJobId)
+          : action === "request"
+            ? await requestReview(detail.job)
+            : await retryJob(submittedJobId);
       onChanged();
+      // The pane may have moved to another job while the request was in
+      // flight; its notices belong to that job now.
+      if (aliveRef.current !== submittedJobId) return;
       if (action !== "cancel") {
-        if (replacement.id === detail.job.id) {
-          setNavigationStatus(
-            "Review publication had already started; the existing review was reconciled instead of retried.",
-          );
+        if (replacement.id === submittedJobId) {
+          // The server refuses to replace a job that is mid-publication; it
+          // reconciled the existing review instead, so nothing new opened.
+          const notice =
+            "This review is still publishing, so it was reconciled instead of retried. Retry again once it finishes.";
+          setActionNotice(notice);
+          setNavigationStatus(notice);
           await load();
         } else {
           focusReplacementJobIdRef.current = replacement.id;
@@ -1256,9 +1299,11 @@ function JobDetailPane({
         }
       } else await load();
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
+      if (aliveRef.current === submittedJobId) {
+        setError(cause instanceof Error ? cause.message : String(cause));
+      }
     } finally {
-      setBusy("");
+      if (aliveRef.current === submittedJobId) setBusy("");
     }
   };
 
@@ -1270,6 +1315,7 @@ function JobDetailPane({
       detail.personas.find((persona) => persona.reviewer_id === reviewerId)?.reviewer_name ||
       "Reviewer persona";
     setBusy(action);
+    setActionNotice("");
     setRetryStatus(`Retrying full review after ${label}…`);
     let replacement: ReviewJob;
     try {
@@ -1285,9 +1331,12 @@ function JobDetailPane({
     if (aliveRef.current !== submittedJobId) return;
     onChanged();
     if (replacement.id === submittedJobId) {
-      setNavigationStatus(
-        "Review publication had already started; the existing review was reconciled instead of retried.",
-      );
+      // Same server refusal as `act("retry")`: the job is mid-publication.
+      const notice =
+        "This review is still publishing, so it was reconciled instead of retried. Retry again once it finishes.";
+      setActionNotice(notice);
+      setNavigationStatus(notice);
+      setRetryStatus(`Full review retry after ${label} was reconciled instead.`);
       try {
         await load();
       } finally {
@@ -1310,6 +1359,7 @@ function JobDetailPane({
     if (!detail) return;
     const submittedJobId = detail.job.id;
     setBusy("final-editor");
+    setActionNotice("");
     setRetryStatus("Retrying Final review editor…");
     try {
       await retryFinalEditor(submittedJobId);
@@ -1365,6 +1415,81 @@ function JobDetailPane({
   );
   const candidateRejections = detail.candidate_rejections ?? [];
   const unadjudicatedCandidates = detail.unadjudicated_candidates ?? [];
+  // Advisory findings are trouve-internal debt: kept out of the main ledger
+  // and shown only inside a collapsed section.
+  const ledgerFindings = detail.findings.filter((finding) => finding.status !== "advisory");
+  const advisoryFindings = detail.findings.filter((finding) => finding.status === "advisory");
+  const renderFinding = (finding: Finding) => (
+    <article class={`finding ${finding.severity}`} key={finding.id}>
+      <header>
+        <strong>
+          {finding.title}
+          {finding.outside_diff && " · outside diff"}
+        </strong>
+        <StatusPill status={finding.status} />
+      </header>
+      <small>
+        {finding.path}:{finding.line} · Severity: {finding.severity.toUpperCase()} · Confidence: {(finding.confidence ?? "medium").toUpperCase()}
+        {finding.origin && finding.origin !== "new_change" ? ` · ${finding.origin.replaceAll("_", " ").toUpperCase()}` : ""}
+      </small>
+      <p>{finding.body}</p>
+      {finding.resolved_head && finding.status !== "advisory" && (
+        <small>
+          Fixed at {finding.resolved_head.slice(0, 12)} by review {finding.resolved_by_job_id?.slice(0, 12) || "unknown"}
+        </small>
+      )}
+      {finding.resolved_head && finding.status === "advisory" && (
+        <small>
+          Promoted to a blocking finding at {finding.resolved_head.slice(0, 12)} by review {finding.resolved_by_job_id?.slice(0, 12) || "unknown"}
+        </small>
+      )}
+      {finding.github_publication_status === "suppressed_by_policy" && (
+        <small>Retained in Trouve · Not posted to GitHub by confidence policy</small>
+      )}
+      {finding.github_publication_status === "grouped_by_theme" && (
+        <small>Retained in Trouve · Represented by the shared root-cause comment on GitHub</small>
+      )}
+      {finding.thread_collapse?.last_error && (
+        <small class="warning">
+          {finding.thread_collapse.pending
+            ? `GitHub thread not resolved yet (${finding.thread_collapse.attempts ?? 0} failed attempt(s)${
+                finding.thread_collapse.next_attempt_at
+                  ? `, retrying ${new Date(finding.thread_collapse.next_attempt_at).toLocaleString()}`
+                  : ""
+              })`
+            : "GitHub thread left unresolved after repeated failures"}
+          : {finding.thread_collapse.last_error}
+        </small>
+      )}
+      {finding.evidence?.execution_path && (
+        <details>
+          <summary>Verification evidence</summary>
+          <dl>
+            <dt>Preconditions</dt><dd>{finding.evidence.preconditions}</dd>
+            <dt>Execution path</dt><dd>{finding.evidence.execution_path}</dd>
+            <dt>Consequence</dt><dd>{finding.evidence.consequence}</dd>
+            <dt>Introduced by</dt><dd>{finding.evidence.introduction}</dd>
+            <dt>Regression test</dt><dd>{finding.evidence.regression_test}</dd>
+          </dl>
+        </details>
+      )}
+      <small>
+        Found by {finding.sources.map((source) => source.reviewer_name).join(", ") || "legacy review"}
+      </small>
+      <div class="action-row">
+        <CopyButton text={finding.prompt_for_agents} />
+        {finding.status !== "advisory" && (
+          <ExternalLink href={finding.github_comment_url}>
+            {finding.github_comment_id == null
+              ? "Open review comment ↗"
+              : finding.origin === "fix_regression"
+                ? "Open thread reply ↗"
+                : "Open inline comment ↗"}
+          </ExternalLink>
+        )}
+      </div>
+    </article>
+  );
   const routingDecisions = detail.routing_decisions ?? [];
   const unrecordedCandidateDecisions = Math.max(
     0,
@@ -1408,6 +1533,19 @@ function JobDetailPane({
       status: routerStatus,
       subtitle: `${currentRouterTasks.filter((task) => !["queued", "running"].includes(task.status)).length}/${currentRouterTasks.length} batches · ${duration(routerElapsed)}`,
       tasks: routerTasks,
+    });
+  }
+  const analystTasks = detail.tasks.filter((task) => task.role === "analyst");
+  if (analystTasks.length) {
+    const analystTask = analystTasks[analystTasks.length - 1];
+    activityGroups.push({
+      id: "analyst",
+      name: "Change analyst",
+      status: analystTask.status,
+      subtitle: `Full-branch analysis · ${duration(
+        liveElapsed(analystTask.elapsed_ms, analystTask.status, analystTask.started_at, now),
+      )}`,
+      tasks: analystTasks,
     });
   }
   activityGroups.push(
@@ -1519,9 +1657,17 @@ function JobDetailPane({
       </p>
       <header class="detail-header">
         <div>
-          <StatusPill status={job.status} />
-          {attentionState === "open" && <span class="status failed">needs attention</span>}
-          {attentionState === "unknown" && <span class="status warning">status unknown</span>}
+          {attentionState === "coverage_exhausted" ? (
+            <span class="status warning">full review required</span>
+          ) : attentionState === "coverage_pending" ? (
+            <span class="status warning">full review pending</span>
+          ) : attentionState === "open" ? (
+            <span class="status warning">needs attention</span>
+          ) : attentionState === "unknown" ? (
+            <span class="status warning">status unknown</span>
+          ) : (
+            <StatusPill status={job.status} />
+          )}
           <h2 ref={jobHeadingRef} tabIndex={-1}>
             {job.repository} #{job.pull_number}
           </h2>
@@ -1560,6 +1706,14 @@ function JobDetailPane({
           <dd>{job.router_thinking_level || "Review persona default"}</dd>
         </div>
         <div>
+          <dt>Change analyst model</dt>
+          <dd>{job.analyst_model || job.model || "Missing configuration"}</dd>
+        </div>
+        <div>
+          <dt>Change analyst thinking</dt>
+          <dd>{job.analyst_thinking_level || "Review persona default"}</dd>
+        </div>
+        <div>
           <dt>Pending</dt>
           <dd>{duration(job.pending_elapsed_ms)}</dd>
         </div>
@@ -1570,7 +1724,13 @@ function JobDetailPane({
         <div>
           <dt>Revision</dt>
           <dd>
-            <code>{(job.review_base_sha || job.base_ref).slice(0, 8)}</code>…<code>{job.head_sha.slice(0, 8)}</code>
+            {job.review_base_sha ? (
+              <>
+                <code>{job.review_base_sha.slice(0, 8)}</code>…<code>{job.head_sha.slice(0, 8)}</code>
+              </>
+            ) : (
+              <>Preparing merge base for <code>{job.head_sha.slice(0, 8)}</code></>
+            )}
           </dd>
         </div>
         <div>
@@ -1617,16 +1777,24 @@ function JobDetailPane({
                 {busy === "final-editor" ? "Retrying…" : "Retry final editor"}
               </button>
             )}
-            <button type="button" disabled={Boolean(busy)} onClick={() => void act("retry")}>
-              {busy === "retry" ? "Retrying…" : unadjudicatedCandidates.length > 0 ? "Rerun all reviewers" : "Retry"}
-            </button>
+            {job.legacy_coverage_exhausted ? (
+              <button type="button" disabled={Boolean(busy)} onClick={() => void act("request")}>
+                {busy === "request" ? "Queueing…" : "Run whole review"}
+              </button>
+            ) : (
+              <button type="button" disabled={Boolean(busy)} onClick={() => void act("retry")}>
+                {busy === "retry" ? "Retrying…" : unadjudicatedCandidates.length > 0 ? "Rerun all reviewers" : "Retry"}
+              </button>
+            )}
           </>
         )}
-        <button class="ghost" type="button" disabled={Boolean(busy)} onClick={() => void act("full")}>
-          {busy === "full" ? "Requesting…" : "Full branch review"}
-        </button>
       </div>
       {error && <div class="banner error">{error}</div>}
+      {actionNotice && (
+        <div class="banner warning" role="status">
+          {actionNotice}
+        </div>
+      )}
       {job.error && <div class="banner error">{job.error}</div>}
       <div class="link-row">
         <ExternalLink href={job.pull_url}>Open pull request ↗</ExternalLink>
@@ -1634,13 +1802,29 @@ function JobDetailPane({
         <ExternalLink href={job.check_run_url}>Open Check Run ↗</ExternalLink>
       </div>
       {job.check_sync_error && <p class="warning">Check sync: {job.check_sync_error}</p>}
+      {job.legacy_coverage_exhausted && (
+        <div class="banner warning stacked" role="alert">
+          <strong>Automatic full-branch compatibility attempts exhausted</strong>
+          <p>
+            This pre-8.0 partial result cannot establish branch coverage. Use Run whole review above to request the current head with every selected reviewer.
+          </p>
+        </div>
+      )}
+      {job.legacy_coverage_pending && (
+        <div class="banner warning stacked" role="status" aria-live="polite">
+          <strong>Full-branch compatibility review pending</strong>
+          <p>
+            This successful result came from a pre-8.0 partial review. A full-branch compatibility result is still required before the revision can pass; the server schedules at most two automatic attempts.
+          </p>
+        </div>
+      )}
       {hasOpenIssues && (
         <div class="banner warning stacked" role="alert">
           <strong>
-            {openIssueCount} confirmed issue{openIssueCount === 1 ? " remains" : "s remain"} open across this pull request
+            {openIssueCount} blocking issue{openIssueCount === 1 ? " remains" : "s remain"} open across this pull request
           </strong>
           <p>
-            This round found {job.issue_count} new issue{job.issue_count === 1 ? "" : "s"}. A clean incremental result does not resolve findings from earlier rounds unless the final editor verifies their fixes.
+            This round found {job.issue_count} new issue{job.issue_count === 1 ? "" : "s"}. A clean full-branch result does not resolve findings from earlier rounds unless the final editor verifies their fixes.
           </p>
         </div>
       )}
@@ -1710,7 +1894,7 @@ function JobDetailPane({
             <h2>{job.status === "running" || job.status === "queued" ? "Review overview" : "Completed overview"}</h2>
             <p>
               {job.issue_count} new confirmed findings
-              {openIssueCount != null && ` · ${openIssueCount} open across pull request`}
+              {openIssueCount != null && ` · ${openIssueCount} blocking open across pull request`}
               {` · ${acceptedCandidateIds.size} selected candidates`}
               {" · "}
               {candidateRejections.length} rejected · {unadjudicatedCandidates.length} unresolved · {job.fixed_issue_count} fixed
@@ -1758,56 +1942,16 @@ function JobDetailPane({
             ))}
           </div>
         )}
-        {detail.findings.map((finding) => (
-          <article class={`finding ${finding.severity}`} key={finding.id}>
-            <header>
-              <strong>
-                {finding.title}
-                {finding.outside_diff && " · outside diff"}
-              </strong>
-              <StatusPill status={finding.status} />
-            </header>
-            <small>
-              {finding.path}:{finding.line} · Severity: {finding.severity.toUpperCase()} · Confidence: {(finding.confidence ?? "medium").toUpperCase()}
-              {finding.origin && finding.origin !== "new_change" ? ` · ${finding.origin.replaceAll("_", " ").toUpperCase()}` : ""}
-            </small>
-            <p>{finding.body}</p>
-            {finding.resolved_head && (
-              <small>
-                Fixed at {finding.resolved_head.slice(0, 12)} by review {finding.resolved_by_job_id?.slice(0, 12) || "unknown"}
-              </small>
-            )}
-            {finding.github_publication_status === "suppressed_by_policy" && (
-              <small>Retained in Trouve · Not posted to GitHub by confidence policy</small>
-            )}
-            {finding.github_publication_status === "grouped_by_theme" && (
-              <small>Retained in Trouve · Represented by the shared root-cause comment on GitHub</small>
-            )}
-            {finding.evidence?.execution_path && (
-              <details>
-                <summary>Verification evidence</summary>
-                <dl>
-                  <dt>Preconditions</dt><dd>{finding.evidence.preconditions}</dd>
-                  <dt>Execution path</dt><dd>{finding.evidence.execution_path}</dd>
-                  <dt>Consequence</dt><dd>{finding.evidence.consequence}</dd>
-                  <dt>Introduced by</dt><dd>{finding.evidence.introduction}</dd>
-                  <dt>Regression test</dt><dd>{finding.evidence.regression_test}</dd>
-                </dl>
-              </details>
-            )}
-            <small>
-              Found by {finding.sources.map((source) => source.reviewer_name).join(", ") || "legacy review"}
-            </small>
-            <div class="action-row">
-              <CopyButton text={finding.prompt_for_agents} />
-              <ExternalLink href={finding.github_comment_url}>
-                {finding.github_comment_id != null
-                  ? "Open inline comment ↗"
-                  : "Open review comment ↗"}
-              </ExternalLink>
-            </div>
-          </article>
-        ))}
+        {ledgerFindings.map(renderFinding)}
+        {advisoryFindings.length > 0 && (
+          <details class="candidate-decisions">
+            <summary>
+              <strong>Advisory ledger ({advisoryFindings.length})</strong>
+              <span>Below the blocking bar · not posted to GitHub · does not gate</span>
+            </summary>
+            <div class="finding-list">{advisoryFindings.map(renderFinding)}</div>
+          </details>
+        )}
         {candidateRejections.length > 0 && (
           <details class="candidate-decisions">
             <summary>
@@ -2334,6 +2478,10 @@ function RepositoryEditor({
   const coordinatorThinking = thinkingOptions(effectiveCoordinatorModel);
   const effectiveRouterModel = modelForSelection(models, draft.router_model || draft.model);
   const routerThinking = thinkingOptions(effectiveRouterModel);
+  const effectiveAnalystModel = models.find(
+    (model) => model.id === (draft.analyst_model || draft.model),
+  );
+  const analystThinking = thinkingOptions(effectiveAnalystModel);
   const compatibleThinking = (
     configured: string | undefined,
     model: Model | undefined,
@@ -2427,6 +2575,9 @@ function RepositoryEditor({
                   models,
                   draft.router_model || model,
                 );
+                const selectedAnalystModel = models.find(
+                  (candidate) => candidate.id === (draft.analyst_model || model),
+                );
                 setDraft({
                   ...draft,
                   model,
@@ -2437,6 +2588,10 @@ function RepositoryEditor({
                   router_thinking_level: compatibleThinking(
                     draft.router_thinking_level,
                     selectedRouterModel,
+                  ),
+                  analyst_thinking_level: compatibleThinking(
+                    draft.analyst_thinking_level,
+                    selectedAnalystModel,
                   ),
                   reviewer_overrides: (draft.reviewer_overrides ?? []).map((override) => {
                     const profile = reviewers.find(
@@ -2536,6 +2691,60 @@ function RepositoryEditor({
               Controls reasoning for semantic triage. Inherit review default follows the Review
               mode setting.
               {!semanticRouterConfigEnabled && ` ${semanticRouterRequirement}`}
+            </small>
+          </label>
+          <label>
+            Change analyst model
+            <select
+              value={draft.analyst_model ?? ""}
+              onChange={(event) => {
+                const analystModel = event.currentTarget.value || undefined;
+                const selectedAnalystModel = models.find(
+                  (candidate) => candidate.id === (analystModel || draft.model),
+                );
+                setDraft({
+                  ...draft,
+                  analyst_model: analystModel,
+                  analyst_thinking_level: compatibleThinking(
+                    draft.analyst_thinking_level,
+                    selectedAnalystModel,
+                  ),
+                });
+              }}
+            >
+              <option value="">Inherit coordinator/fallback model</option>
+              {models.map((model) => (
+                <option value={model.id} key={model.id}>
+                  {model.display_name} · {model.id}
+                </option>
+              ))}
+            </select>
+            <small>
+              Once per review round, reads the full pull-request branch diff and derives what the
+              PR actually builds. The final review editor uses the result as whole-PR context and
+              as the observed counterpoint to the author's stated intent. It never sees the PR
+              title or description, and its output is advisory only — never evidence for or
+              against a finding.
+            </small>
+          </label>
+          <label>
+            {analystThinking.budget
+              ? "Change analyst thinking budget (tokens)"
+              : "Change analyst thinking"}
+            <ThinkingSetting
+              options={analystThinking}
+              value={draft.analyst_thinking_level ?? ""}
+              inheritLabel="Inherit review default"
+              onChange={(value) =>
+                setDraft({
+                  ...draft,
+                  analyst_thinking_level: value || undefined,
+                })
+              }
+            />
+            <small>
+              Controls reasoning for the PR analysis pass. Inherit review default follows the
+              Review mode setting.
             </small>
           </label>
         </div>
@@ -2988,8 +3197,35 @@ function StatsPage({ repositories }: { repositories: Repository[] }) {
               <Metric label="External duplicates" value={churn.external_duplicate_count} color="green" />
               <Metric label="Weak evidence rejected" value={churn.insufficient_evidence_rejection_count} color="green" />
               <Metric label="Avg rounds to clean" value={Math.round(churn.average_rounds_to_clean * 10) / 10} color="blue" />
+              {(stats?.thread_collapse_backlog?.pending ?? 0) > 0 && (
+                <Metric
+                  label={`Thread resolve backlog${
+                    stats?.thread_collapse_backlog?.oldest_pending_minutes != null
+                      ? ` (oldest ${stats.thread_collapse_backlog.oldest_pending_minutes}m)`
+                      : ""
+                  }${
+                    (stats?.thread_collapse_backlog?.failing ?? 0) > 0
+                      ? `, ${stats?.thread_collapse_backlog?.failing} failing`
+                      : ""
+                  }`}
+                  value={stats?.thread_collapse_backlog?.pending ?? 0}
+                  color="amber"
+                />
+              )}
+              {(stats?.thread_collapse_backlog?.abandoned ?? 0) > 0 && (
+                <Metric
+                  label="Thread resolves abandoned"
+                  value={stats?.thread_collapse_backlog?.abandoned ?? 0}
+                  color="red"
+                />
+              )}
               <Metric label="Max rounds to clean" value={churn.max_rounds_to_clean} color="amber" />
             </div>
+            {stats?.thread_collapse_backlog?.last_error && (
+              <p class="warning">
+                Latest thread resolve failure: {stats.thread_collapse_backlog.last_error}
+              </p>
+            )}
           </section>
           <div class="chart-grid">
             <StatsChart
@@ -3508,6 +3744,11 @@ function GithubAppSettings({
       <div class="health-list">
         <Health ok={app.configured} label="App credentials" detail={app.bot_login || "Not configured"} />
         <Health ok={app.checks_write_configured} label="Checks permission" detail="Read and write required to show a PR check" />
+        <Health
+          ok={app.contents_write_configured === true}
+          label="Contents permission"
+          detail="Read and write required for GitHub to let the bot resolve finding threads"
+        />
         <Health ok={app.webhook_configured} label="Webhook secret" detail="Optional with polling; secures webhook delivery" />
         <Health ok={app.check_run_webhook_configured} optional label="check_run webhook" detail="Optional; enables GitHub Re-run actions" />
       </div>
@@ -3603,6 +3844,9 @@ function ProviderSettings({
   const [cliStatuses, setCliStatuses] = useState<Record<string, CliInstallStatus>>({});
   const [cliBusy, setCliBusy] = useState("");
   const [subscriptionId, setSubscriptionId] = useState("");
+  const [subscriptionApiKey, setSubscriptionApiKey] = useState("");
+  const subscriptionApiKeyInput = useRef<HTMLInputElement>(null);
+  const [cursorMigrationFocusRequest, setCursorMigrationFocusRequest] = useState(0);
   const [apiPresetId, setApiPresetId] = useState("");
   const [providerId, setProviderId] = useState("");
   const [providerKind, setProviderKind] = useState("openai-compat");
@@ -3727,6 +3971,7 @@ function ProviderSettings({
     id: string,
     action: "install" | "cancel" | "uninstall",
   ): Promise<void> => {
+    const label = clis.find((runtime) => runtime.id === id)?.display_name ?? id;
     setCliBusy(id);
     try {
       if (action === "install") {
@@ -3735,14 +3980,14 @@ function ProviderSettings({
           ...current,
           [id]: { status: "pending", received_bytes: 0, total_bytes: 0 },
         }));
-        flash(`Installing ${id}…`);
+        flash(`Installing ${label}…`);
       } else if (action === "cancel") {
         await cancelCliInstall(id);
-        flash(`Cancelling ${id} install…`);
+        flash(`Cancelling ${label} install…`);
       } else {
-        if (!window.confirm(`Remove trouve's managed ${id}?`)) return;
+        if (!window.confirm(`Remove trouve's managed ${label}?`)) return;
         await uninstallCli(id);
-        flash(`Removed managed ${id}`);
+        flash(`Removed managed ${label}`);
         await loadCliData();
       }
     } catch (cause) {
@@ -3751,16 +3996,26 @@ function ProviderSettings({
       setCliBusy("");
     }
   };
-  const subscriptionProviders = knownProviders.filter(
-    (provider) => provider.auth === "cli" || provider.auth === "oauth",
-  );
-  const apiProviders = knownProviders.filter(
-    (provider) => provider.auth !== "cli" && provider.auth !== "oauth",
-  );
+  const { subscriptionProviders, apiProviders } = providerSetupGroups(knownProviders);
   const selectedSubscription = subscriptionProviders.find(
     (provider) => provider.id === subscriptionId,
   );
-  const requiredCli = selectedSubscription
+  useEffect(() => {
+    const remainingRequest = consumeCursorMigrationFocusRequest(
+      cursorMigrationFocusRequest,
+      selectedSubscription,
+      subscriptionApiKeyInput.current,
+    );
+    if (remainingRequest !== cursorMigrationFocusRequest) {
+      setCursorMigrationFocusRequest(remainingRequest);
+    }
+  }, [
+    cursorMigrationFocusRequest,
+    selectedSubscription?.auth,
+    selectedSubscription?.kind,
+  ]);
+  const cursorMigration = cursorSdkPreset(subscriptionProviders);
+  const requiredRuntime = selectedSubscription
     ? clis.find((cli) => cli.kinds.includes(selectedSubscription.kind))
     : undefined;
   const selectedModel = modelForSelection(models, defaultModel);
@@ -3837,7 +4092,25 @@ function ProviderSettings({
               <small>{provider.kind} · {provider.category}</small>
             </span>
             <StatusPill status={provider.has_credentials ? "ready" : "credentials required"} />
-            {(provider.auth === "oauth" || provider.auth === "cli") && (
+            {providerNeedsCursorSdkMigration(provider) ? (
+              cursorMigration ? (
+                <button
+                  class="ghost compact"
+                  type="button"
+                  onClick={() => {
+                    setCursorMigrationFocusRequest((request) => request + 1);
+                    setSubscriptionId(cursorMigration.id);
+                    setSubscriptionApiKey("");
+                    setLogin(null);
+                    flash("Cursor Agent SDK selected; save an API key below to finish migration");
+                  }}
+                >
+                  Migrate to Agent SDK
+                </button>
+              ) : (
+                <small>Cursor Agent SDK setup is unavailable</small>
+              )
+            ) : (provider.auth === "oauth" || provider.auth === "cli") && (
               <button class="ghost compact" type="button" onClick={() => void begin(provider)}>
                 {provider.has_credentials ? "Sign in again" : "Sign in"}
               </button>
@@ -3891,8 +4164,8 @@ function ProviderSettings({
           onSubmit={async (event) => {
             event.preventDefault();
             if (!selectedSubscription) return;
-            if (requiredCli && !cliIsInstalled(requiredCli)) {
-              await runCliAction(requiredCli.id, "install");
+            if (requiredRuntime && !cliIsInstalled(requiredRuntime)) {
+              await runCliAction(requiredRuntime.id, "install");
               return;
             }
             try {
@@ -3900,21 +4173,32 @@ function ProviderSettings({
                 selectedSubscription.id,
                 selectedSubscription.kind,
                 selectedSubscription.base_url,
+                selectedSubscription.auth === "api-key"
+                  ? subscriptionApiKey || undefined
+                  : undefined,
               );
               onChanged();
-              await begin(configured);
+              if (selectedSubscription.auth === "api-key") {
+                setSubscriptionApiKey("");
+                flash(savedProviderMessage(selectedSubscription.display_name, configured));
+              } else {
+                await begin(configured);
+              }
             } catch (cause) {
               flash(cause instanceof Error ? cause.message : String(cause));
             }
           }}
         >
           <h3>Subscription provider</h3>
-          <p class="muted">Configure a vendor subscription and open its sign-in flow.</p>
+          <p class="muted">Configure a membership-backed provider with its supported sign-in or API-key flow.</p>
           <label>
             Provider
             <select
               value={subscriptionId}
-              onChange={(event) => setSubscriptionId(event.currentTarget.value)}
+              onChange={(event) => {
+                setSubscriptionId(event.currentTarget.value);
+                setSubscriptionApiKey("");
+              }}
               required
             >
               <option value="">Choose a provider…</option>
@@ -3925,10 +4209,31 @@ function ProviderSettings({
               ))}
             </select>
           </label>
+          {selectedSubscription?.auth === "api-key" && (
+            <label>
+              API key
+              <input
+                ref={subscriptionApiKeyInput}
+                type="password"
+                autoComplete="new-password"
+                aria-describedby="subscription-api-key-guidance"
+                value={subscriptionApiKey}
+                onInput={(event) => setSubscriptionApiKey(event.currentTarget.value)}
+                placeholder="Stored in trouve's secret store; leave empty to keep"
+              />
+              <small id="subscription-api-key-guidance">
+                {selectedSubscription.api_key_env
+                  ? `Or set ${selectedSubscription.api_key_env} on the server.`
+                  : "A supported vendor API key is required for this subscription."}
+              </small>
+            </label>
+          )}
           <button type="submit" disabled={!selectedSubscription || cliBusy !== ""}>
-            {requiredCli && !cliIsInstalled(requiredCli)
-              ? `Install ${requiredCli.display_name}`
-              : "Configure and sign in"}
+            {requiredRuntime && !cliIsInstalled(requiredRuntime)
+              ? `Install ${requiredRuntime.display_name}`
+              : selectedSubscription?.auth === "api-key"
+                ? "Save provider"
+                : "Configure and sign in"}
           </button>
         </form>
         <form
@@ -4003,11 +4308,12 @@ function ProviderSettings({
             <input
               type="password"
               autoComplete="new-password"
+              aria-describedby="provider-api-key-guidance"
               value={providerApiKey}
               onInput={(event) => setProviderApiKey(event.currentTarget.value)}
               disabled={apiProviders.find((provider) => provider.id === apiPresetId)?.auth === "none"}
             />
-            <small>
+            <small id="provider-api-key-guidance">
               {apiProviders.find((provider) => provider.id === apiPresetId)?.api_key_env
                 ? `Or set ${apiProviders.find((provider) => provider.id === apiPresetId)?.api_key_env} on the server.`
                 : "Stored in trouve's secret store."}
@@ -4019,8 +4325,8 @@ function ProviderSettings({
       <section class="cli-manager">
         <header>
           <div>
-            <h3>Subscription CLI binaries</h3>
-            <p class="muted">Managed versions take precedence over system copies on PATH. Status updates automatically.</p>
+            <h3>Subscription agent runtimes</h3>
+            <p class="muted">Cursor's Agent SDK Bridge and managed vendor CLIs take precedence over system copies on PATH. Status updates automatically.</p>
           </div>
         </header>
         <div class="cli-list">
@@ -4032,6 +4338,7 @@ function ProviderSettings({
                   <strong>{cli.display_name}</strong>
                   <small>{cliVersionLabel(cli)}</small>
                   {status.status === "pending" && <small>{cliProgressLabel(status)}</small>}
+                  {status.warning && <small role="status">{status.warning}</small>}
                   {status.status === "failed" && <small class="error-text">{status.error}</small>}
                 </span>
                 <div class="action-row">

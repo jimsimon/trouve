@@ -80,15 +80,8 @@ const installFixtureEventSource = async (page: Page): Promise<void> => {
 
 const installProtocolFixtures = async (page: Page): Promise<void> => {
   let namingSettings = {
+    model: "test/tiny",
     derive_branch_name_from_session_title: false,
-    title_model_load_behavior: "auto",
-    title_model_resource_policy: "cpu_ram_only",
-    title_model: {
-      state: "not_installed",
-      detail: "Built-in naming rules are active.",
-      runtime_installed: false,
-      model_downloaded: false,
-    },
   };
   await page.route("**/v1/**", async (route) => {
     const request = route.request();
@@ -133,7 +126,28 @@ const installProtocolFixtures = async (page: Page): Promise<void> => {
         default_thinking_level: null,
         providers: [],
       },
-      "GET /v1/models": [],
+      "GET /v1/models": [{
+        id: "test/tiny",
+        display_name: "Tiny",
+        context_window: 32_000,
+        supports_tools: true,
+        options_schema: {},
+      }],
+      "GET /v1/personas": [
+        {
+          id: "code",
+          display_name: "Engineer",
+          group: "general",
+          system_prompt: "Implement the user's request by editing files.",
+        },
+        {
+          id: "plan",
+          display_name: "Planner",
+          group: "general",
+          system_prompt: "Explore the workspace and produce a concrete plan.",
+          read_only: true,
+        },
+      ],
       "GET /v1/persona-infos": [
         {
           origin: "builtin",
@@ -194,14 +208,14 @@ const installProtocolFixtures = async (page: Page): Promise<void> => {
       await route.fulfill({ status: 204 });
       return;
     }
-    if (key === "GET /v1/config/git-worktrees") {
+    if (key === "GET /v1/config/session-naming") {
       await route.fulfill({
         headers: { "x-trouve-event-cursor": "6" },
         json: namingSettings,
       });
       return;
     }
-    if (key === "PUT /v1/config/git-worktrees") {
+    if (key === "PUT /v1/config/session-naming") {
       const update = request.postDataJSON() as Partial<typeof namingSettings>;
       namingSettings = { ...namingSettings, ...update };
       await route.fulfill({
@@ -270,6 +284,11 @@ test("new-session selects stay synchronized with asynchronously loaded defaults"
                 enum: ["low", "high"],
                 default: "low",
               },
+              fast: {
+                type: "boolean",
+                default: false,
+                description: "Run faster with increased usage",
+              },
             },
           },
         },
@@ -296,7 +315,13 @@ test("new-session selects stay synchronized with asynchronously loaded defaults"
     });
   });
   await page.route("**/v1/workspaces/ws_1/branches", async (route) => {
-    await route.fulfill({ json: { branches: ["main"], head: "main" } });
+    await route.fulfill({
+      json: {
+        branches: ["feature", "main", "master"],
+        head: "feature",
+        default_branch: "main",
+      },
+    });
   });
 
   await page.goto("/");
@@ -309,22 +334,49 @@ test("new-session selects stay synchronized with asynchronously loaded defaults"
   }
 
   const screen = page.locator("#new-session-screen");
+  const baseBranch = screen.locator('select[name="base_ref"]');
   const persona = screen.locator('select[name="mode"]');
-  const thinking = screen.locator('select[name="thinking"]');
+  const thinking = screen.getByRole("combobox", { name: "Reasoning", exact: true });
+  const fast = screen.getByRole("combobox", { name: "Fast", exact: true });
   const permission = screen.locator('select[name="permission_mode"]');
+  await expect(baseBranch).toHaveValue("main");
   await expect(persona).toHaveValue("code");
   await expect(thinking).toHaveValue("high");
+  await expect(thinking.locator("option:checked")).toHaveText("High");
+  await expect(thinking.locator('option[data-model-default="true"]')).toHaveCount(0);
+  await expect(fast.locator("option:checked")).toHaveText("Model default · Off");
   await expect(permission).toHaveValue("yolo");
   await expect(screen.getByText("Unattended execution (YOLO) is dangerous"))
     .toBeVisible();
+  const controlGeometry = await screen.evaluate((root) => {
+    const controls = [
+      root.querySelector(".new-session-workspace"),
+      root.querySelector(".new-session-branch"),
+      root.querySelector(".new-session-mode"),
+      root.querySelector(".new-session-model"),
+      root.querySelector(".new-session-model-options"),
+      root.querySelector(".new-session-permission"),
+    ].map((control) => {
+      if (!(control instanceof HTMLElement)) throw new Error("missing new-session control");
+      const bounds = control.getBoundingClientRect();
+      return { top: Math.round(bounds.top), width: bounds.width };
+    });
+    return controls;
+  });
+  expect(Math.max(...controlGeometry.map(({ top }) => top))
+    - Math.min(...controlGeometry.map(({ top }) => top))).toBeLessThanOrEqual(8);
+  expect(controlGeometry.at(-1)?.width).toBeLessThanOrEqual(110);
 
   // Reproduce the browser-side drift caused when option lists are replaced
   // after Lit cached the state value. A later render must repair the DOM even
   // though the application state itself has not changed.
-  await screen.locator('select[name="mode"], select[name="thinking"], select[name="permission_mode"]')
+  await screen.locator('select[name="base_ref"], select[name="mode"], select[name="permission_mode"]')
     .evaluateAll((selects) => {
       for (const select of selects) (select as HTMLSelectElement).selectedIndex = 0;
     });
+  await thinking.evaluate((select) => {
+    (select as HTMLSelectElement).selectedIndex = 1;
+  });
   await page.locator("trouve-app").evaluate(async (app) => {
     const reactive = app as HTMLElement & {
       requestUpdate(): void;
@@ -334,12 +386,20 @@ test("new-session selects stay synchronized with asynchronously loaded defaults"
     await reactive.updateComplete;
   });
 
+  await expect(baseBranch).toHaveValue("main");
   await expect(persona).toHaveValue("code");
   await expect(thinking).toHaveValue("high");
+  await expect(thinking.locator("option:checked")).toHaveText("High");
   await expect(permission).toHaveValue("yolo");
 });
 
-test("session navigation uses compact one-line rows without branch names", async ({ page }, testInfo) => {
+test("session navigation shows configured branch names", async ({ page }, testInfo) => {
+  await page.addInitScript(() => {
+    localStorage.setItem(
+      "trouve.workspace-list-preferences.v1",
+      JSON.stringify({ showBranches: true, showStatus: false }),
+    );
+  });
   await page.goto("/");
   if (testInfo.project.name.startsWith("mobile")) {
     await page.getByRole("button", { name: "Sessions", exact: true }).click();
@@ -347,29 +407,27 @@ test("session navigation uses compact one-line rows without branch names", async
 
   const row = page.locator(".session-row").filter({ hasText: "Protocol ingress" });
   await expect(row).toBeVisible();
-  await expect(row).not.toContainText("feature");
-  await expect(row.locator(".session-copy small")).toHaveCount(0);
-  await expect(row).toHaveCSS("height", "34px");
+  await expect(row.locator(".session-branch")).toHaveText("feature");
+  await expect(row).toHaveCSS("height", "46px");
   await expect(row.locator(".session-copy strong")).toHaveCSS("white-space", "nowrap");
-  const wrapper = row.locator("..");
   const age = row.locator(".session-age");
-  const actions = wrapper.getByRole("button", { name: "Actions for Protocol ingress" });
   await expect(age).toHaveText(/^(?:now|\d+[mhdy])$/u);
+  await expect(row).toHaveClass(/without-status/u);
+  await expect(age).toHaveCSS("grid-column-start", "3");
+  expect(await row.evaluate((element) =>
+    getComputedStyle(element).gridTemplateColumns.split(" ").length)).toBe(3);
   if (testInfo.project.name.startsWith("mobile")) {
     await expect(age).toHaveCSS("opacity", "0");
-    await expect(actions).toHaveCSS("opacity", "1");
   } else {
     await expect(age).toHaveCSS("opacity", "1");
-    await expect(actions).toHaveCSS("opacity", "0");
-    await wrapper.hover();
-    await expect(age).toHaveCSS("opacity", "0");
-    await expect(actions).toHaveCSS("opacity", "1");
-    await page.mouse.move(0, 0);
-    await actions.focus();
-    await expect(age).toHaveCSS("opacity", "0");
-    await expect(actions).toHaveCSS("opacity", "1");
+    await row.click({ button: "right" });
+    await expect(page.getByRole("menu", { name: "Actions for Protocol ingress" })).toBeVisible();
+    await page.keyboard.press("Escape");
 
     const workspace = page.locator(".workspace-row").filter({ hasText: "trouve" }).first();
+    await expect(workspace).toHaveCSS("position", "sticky");
+    await expect(page.locator(".workspace-scroll")).toHaveCSS("overflow-y", "auto");
+    await expect(page.locator(".navigation-panel")).toHaveCSS("overflow-y", "hidden");
     const workspaceOrder = workspace.locator(".workspace-order-controls");
     const workspaceActions = workspace.locator(".workspace-actions-wrap");
     await page.mouse.move(0, 0);
@@ -383,6 +441,70 @@ test("session navigation uses compact one-line rows without branch names", async
     await expect(workspaceOrder).toHaveCSS("opacity", "1");
     await expect(workspaceActions).toHaveCSS("opacity", "1");
   }
+});
+
+test("workspace list options dismiss with Escape and an outside pointer", async ({ page }, testInfo) => {
+  await page.goto("/");
+  if (testInfo.project.name.startsWith("mobile")) {
+    await page.getByRole("button", { name: "Sessions", exact: true }).click();
+  }
+
+  const heading = page.locator(".workspace-list-heading");
+  const openWorkspace = heading.getByRole("button", { name: "Open workspace" });
+  await expect(openWorkspace.locator('[data-font-awesome-icon="plus"]')).toBeVisible();
+  await expect(openWorkspace).toHaveText("+");
+  const optionsBounds = await heading
+    .getByRole("button", { name: "Workspace list options" })
+    .boundingBox();
+  const openBounds = await openWorkspace.boundingBox();
+  expect(optionsBounds).not.toBeNull();
+  expect(openBounds).not.toBeNull();
+  expect(optionsBounds!.x).toBeLessThan(openBounds!.x);
+
+  const toggle = page.getByRole("button", { name: "Workspace list options" });
+  const options = page.getByRole("group", { name: "Workspace list options" });
+  await toggle.click();
+  await expect(options).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(options).toHaveCount(0);
+  await expect(toggle).toBeFocused();
+
+  await toggle.click();
+  await expect(options).toBeVisible();
+  await page.locator(".primary-links").click({ position: { x: 2, y: 2 } });
+  await expect(options).toHaveCount(0);
+});
+
+test("repository grouping exposes nested headings and disables ambiguous workspace reordering", async ({ page }, testInfo) => {
+  await page.route("**/v1/workspaces", async (route) => {
+    await route.fulfill({
+      json: [
+        { id: "ws_1", name: "first", path: "/src/first", repository_key: "remote:github.com/acme/app", repository_name: "app" },
+        { id: "ws_2", name: "other", path: "/src/other", repository_key: "remote:github.com/acme/other", repository_name: "other" },
+        { id: "ws_3", name: "clone", path: "/src/clone", repository_key: "remote:github.com/acme/app", repository_name: "app" },
+      ],
+    });
+  });
+  await page.goto("/");
+  if (testInfo.project.name.startsWith("mobile")) {
+    await page.getByRole("button", { name: "Sessions", exact: true }).click();
+  }
+
+  await expect(page.getByRole("heading", { level: 2, name: "Workspaces" })).toBeVisible();
+  await expect(page.getByRole("heading", { level: 3, name: "app" })).toBeVisible();
+  const groupedWorkspaceHeading = page.getByRole("heading", { level: 4, name: "first" });
+  await expect(groupedWorkspaceHeading).toBeVisible();
+  await expect(groupedWorkspaceHeading).toHaveCSS("margin", "0px");
+  await expect(groupedWorkspaceHeading).toHaveCSS("font-size", "13px");
+  await expect(page.getByRole("heading", { level: 4, name: "clone" })).toBeVisible();
+  await expect(page.locator(".workspace-grip")).toHaveCount(0);
+
+  await page.getByRole("button", { name: "Workspace list options" }).click();
+  await page.getByRole("combobox", { name: "Group sessions by" }).selectOption("workspace");
+  await expect(page.getByRole("heading", { level: 3, name: "first" })).toBeVisible();
+  await expect(page.getByRole("heading", { level: 3, name: "clone" })).toBeVisible();
+  await expect(page.getByRole("heading", { level: 4, name: "first" })).toHaveCount(0);
+  await expect(page.locator(".workspace-grip")).toHaveCount(3);
 });
 
 test("background session updates preserve command-palette scrolling", async ({ page }, testInfo) => {
@@ -573,8 +695,10 @@ test("Sessions & Chat settings preserve grouping and branch-naming choices", asy
     .toBeVisible();
   const branchNames = page.getByLabel("Use session names in branch names");
   await expect(branchNames).not.toBeChecked();
-  await expect(page.getByText(/new branches use a compact name such as trouve\/abc123/u))
-    .toBeVisible();
+  await expect(page.getByText(
+    "The compact branch is renamed after background naming completes. Existing remote branches are not renamed.",
+    { exact: true },
+  )).toBeVisible();
   const sequentialToggle = page.getByLabel("Collapse sequential tool calls.");
   await expect(sequentialToggle).toBeChecked();
   const toggle = page.getByLabel("Collapse thinking output with tool calls.");
@@ -615,10 +739,13 @@ test("Sessions & Chat settings preserve grouping and branch-naming choices", asy
   await expect(todoToggle).toBeChecked();
   const branchUpdate = page.waitForRequest((request) =>
     request.method() === "PUT" &&
-    new URL(request.url()).pathname === "/v1/config/git-worktrees"
+    new URL(request.url()).pathname === "/v1/config/session-naming"
   );
   await branchNames.click();
   await expect(branchNames).toBeChecked();
+  await page.locator("trouve-session-naming-settings")
+    .getByRole("button", { name: "Save", exact: true })
+    .click();
   await expect((await branchUpdate).postDataJSON()).toMatchObject({
     derive_branch_name_from_session_title: true,
   });
@@ -637,6 +764,21 @@ test("Sessions & Chat settings preserve grouping and branch-naming choices", asy
   await expect(page.getByLabel("Collapse context compaction with tool calls.")).toBeChecked();
   await expect(page.getByLabel("Collapse TODO updates with tool calls.")).toBeChecked();
   await expect(page.getByLabel("Use session names in branch names")).toBeChecked();
+});
+test("Session naming directs an empty model catalog to provider setup", async ({ page }) => {
+  await page.route("**/v1/models", async (route) => {
+    await route.fulfill({ json: [] });
+  });
+  await page.goto("/settings/chat");
+
+  await expect(page.getByText(
+    "No models are available. Add a provider to choose a naming model.",
+    { exact: true },
+  )).toBeVisible();
+  await page.getByRole("button", { name: "Add provider", exact: true }).click();
+
+  await expect(page).toHaveURL(/\/settings\/providers$/u);
+  await expect(page.getByRole("heading", { name: "Providers", exact: true })).toBeVisible();
 });
 
 test("Settings reopens the last screen until the app restarts", async ({ page }) => {
@@ -680,7 +822,7 @@ test("Personas & Models uses provider-qualified model labels", async ({ page }) 
     .toHaveCount(0);
 });
 
-test("automation create and edit preserve model and thinking choices", async ({ page }) => {
+test("automation create, edit, and pause preserve model options", async ({ page }) => {
   await page.route("**/v1/models", async (route) => {
     await route.fulfill({
       json: [{
@@ -703,11 +845,20 @@ test("automation create and edit preserve model and thinking choices", async ({ 
   });
 
   const requests: Array<Record<string, unknown>> = [];
+  const enabledRequests: Array<Record<string, unknown>> = [];
   let savedAutomation: Record<string, unknown> | undefined;
   const automationMutation = async (route: Route) => {
     const method = route.request().method();
-    if (method === "GET" && new URL(route.request().url()).pathname === "/v1/automations") {
+    const pathname = new URL(route.request().url()).pathname;
+    if (method === "GET" && pathname === "/v1/automations") {
       await route.fulfill({ json: savedAutomation === undefined ? [] : [savedAutomation] });
+      return;
+    }
+    if (method === "PUT" && pathname.endsWith("/enabled")) {
+      const request = route.request().postDataJSON() as Record<string, unknown>;
+      enabledRequests.push(request);
+      savedAutomation = { ...savedAutomation, enabled: request["enabled"] };
+      await route.fulfill({ json: savedAutomation });
       return;
     }
     if (method !== "POST" && method !== "PUT") {
@@ -743,7 +894,7 @@ test("automation create and edit preserve model and thinking choices", async ({ 
   await modelPicker
     .getByRole("option", { name: "codex/gpt-5.6-sol", exact: true })
     .click();
-  const thinking = page.getByRole("combobox", { name: "Thinking", exact: true });
+  const thinking = page.getByRole("combobox", { name: "Reasoning", exact: true });
   await expect(thinking).toBeEnabled();
   await thinking.selectOption("max");
   await page.getByRole("button", { name: "Create", exact: true }).click();
@@ -751,23 +902,33 @@ test("automation create and edit preserve model and thinking choices", async ({ 
   await expect.poll(() => requests.length).toBe(1);
   expect(requests[0]).toMatchObject({
     model: "codex/gpt-5.6-sol",
-    thinking_level: "max",
+    thinking_level: null,
+    model_options: { reasoning_effort: "max" },
   });
 
   await page.reload();
   await page.getByRole("button", { name: "Edit", exact: true }).click();
   await expect(page.getByRole("combobox", { name: "Automation model" }))
     .toContainText("codex/gpt-5.6-sol");
-  await expect(page.getByRole("combobox", { name: "Thinking", exact: true }))
+  await expect(page.getByRole("combobox", { name: "Reasoning", exact: true }))
     .toHaveValue("max");
-  await page.getByRole("combobox", { name: "Thinking", exact: true })
+  await page.getByRole("combobox", { name: "Reasoning", exact: true })
     .selectOption("ultra");
   await page.getByRole("button", { name: "Save", exact: true }).click();
 
   await expect.poll(() => requests.length).toBe(2);
   expect(requests[1]).toMatchObject({
     model: "codex/gpt-5.6-sol",
-    thinking_level: "ultra",
+    thinking_level: null,
+    model_options: { reasoning_effort: "ultra" },
+  });
+
+  await page.getByRole("button", { name: "Pause", exact: true }).click();
+  await expect.poll(() => enabledRequests.length).toBe(1);
+  expect(enabledRequests[0]).toEqual({ enabled: false });
+  expect(savedAutomation).toMatchObject({
+    enabled: false,
+    model_options: { reasoning_effort: "ultra" },
   });
 });
 

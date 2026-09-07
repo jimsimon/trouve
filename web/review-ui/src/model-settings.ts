@@ -42,7 +42,7 @@ export function modelForSelection<T extends ModelWithOptions>(
   );
 }
 
-/** Map pre-2.2 bare automatic ids to their catalog row; preserve hard pins. */
+/** Map legacy bare automatic ids to their catalog row; preserve hard pins. */
 export function modelSelectionValue(
   models: readonly ModelWithOptions[],
   selection?: string,

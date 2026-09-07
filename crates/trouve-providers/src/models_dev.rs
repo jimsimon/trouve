@@ -80,9 +80,16 @@ struct CatalogModel {
     #[serde(default)]
     tool_call: Option<bool>,
     #[serde(default)]
+    attachment: Option<bool>,
+    #[serde(default)]
     temperature: Option<bool>,
     #[serde(default)]
     reasoning_options: Vec<ReasoningOption>,
+    /// Trouve-owned serving surfaces may advertise transport-specific scalar
+    /// controls that models.dev does not describe (for example Fast mode).
+    /// Each value is the JSON Schema property for that option.
+    #[serde(default)]
+    options: Map<String, Value>,
     #[serde(default)]
     limit: ModelLimit,
     #[serde(default)]
@@ -367,6 +374,27 @@ impl ModelsDevCatalog {
         (!record.is_deprecated()).then(|| record.to_model_info(output_provider, model_id, dialect))
     }
 
+    /// Return the catalog identity used to group equivalent serving routes.
+    ///
+    /// Public catalog entries use their canonical model id. Trouve-owned
+    /// serving-surface overlays participate only when they explicitly inherit
+    /// a public `base_model`; transport-owned entries without that link remain
+    /// concrete-only even when their display id happens to match another
+    /// provider's model.
+    pub fn shared_model_identity(&self, catalog_provider: &str, model_id: &str) -> Option<String> {
+        let state = self.state.read().unwrap();
+        if let Some(patch) = overlay_provider_by_setup_id(&state.owned, catalog_provider)
+            .and_then(|provider| provider.models.get(model_id))
+        {
+            let base = patch.as_object()?.get("base_model")?.as_str()?;
+            let (provider, source_id) = base.split_once('/')?;
+            let record = source_model(&state, provider, source_id)?;
+            return runnable_shared_identity(record, source_id);
+        }
+        let record = source_model(&state, catalog_provider, model_id)?;
+        runnable_shared_identity(record, model_id)
+    }
+
     pub fn provider_models(
         &self,
         catalog_provider: &str,
@@ -547,6 +575,7 @@ impl CatalogModel {
             },
             context_window: self.limit.context.unwrap_or(0),
             supports_tools: self.tool_call.unwrap_or(false),
+            supports_images: self.attachment.unwrap_or(false),
             input_price_per_mtok: self.cost.input,
             output_price_per_mtok: self.cost.output,
             options_schema: self.options_schema(dialect),
@@ -554,7 +583,7 @@ impl CatalogModel {
     }
 
     fn options_schema(&self, dialect: OptionsDialect) -> Value {
-        let mut properties = Map::new();
+        let mut properties = self.options.clone();
         for option in &self.reasoning_options {
             match option.kind.as_str() {
                 "effort" if option.values.len() > 1 => {
@@ -649,6 +678,16 @@ impl CatalogModel {
         }
         json!({"type": "object", "properties": properties})
     }
+}
+
+fn runnable_shared_identity(record: &CatalogModel, fallback_id: &str) -> Option<String> {
+    (!record.is_deprecated() && record.tool_call == Some(true)).then(|| {
+        if record.id.is_empty() {
+            fallback_id.to_string()
+        } else {
+            record.id.clone()
+        }
+    })
 }
 
 impl CatalogProvider {
@@ -1160,7 +1199,8 @@ mod tests {
             .model("openai", "openai", "gpt-5.6", OptionsDialect::OpenAi)
             .unwrap();
         assert_eq!(gpt.context_window, 1_050_000);
-        assert_eq!(gpt.input_price_per_mtok, Some(5.0));
+        assert_eq!(gpt.input_price_per_mtok, Some(4.0));
+        assert!(gpt.supports_images);
         assert_eq!(
             gpt.options_schema
                 .pointer("/properties/reasoning_effort/enum")
@@ -1194,7 +1234,7 @@ mod tests {
     fn trouve_owned_codex_provider_inherits_and_overrides_openai_models() {
         let catalog = ModelsDevCatalog::embedded();
         let models = catalog.provider_models("openai-codex", "codex", OptionsDialect::CodexCli);
-        assert_eq!(models.len(), 7);
+        assert_eq!(models.len(), 8);
 
         let sol = models
             .iter()
@@ -1202,7 +1242,7 @@ mod tests {
             .unwrap();
         assert_eq!(sol.display_name, "GPT-5.6 Sol");
         assert_eq!(sol.context_window, 500_000);
-        assert_eq!(sol.input_price_per_mtok, Some(5.0));
+        assert_eq!(sol.input_price_per_mtok, Some(4.0));
         assert_eq!(
             sol.options_schema
                 .pointer("/properties/reasoning_effort/enum"),
@@ -1212,6 +1252,10 @@ mod tests {
             sol.options_schema
                 .pointer("/properties/reasoning_effort/default"),
             Some(&json!("low"))
+        );
+        assert_eq!(
+            sol.options_schema.pointer("/properties/fast/default"),
+            Some(&json!(false))
         );
 
         let luna = models
@@ -1223,6 +1267,35 @@ mod tests {
             luna.options_schema
                 .pointer("/properties/reasoning_effort/enum"),
             Some(&json!(["low", "medium", "high", "xhigh", "max"]))
+        );
+
+        // Codex serves Astra at its full API window and adds the `ultra`
+        // effort level models.dev does not list for the direct API.
+        let astra = models
+            .iter()
+            .find(|model| model.id == "codex/gpt-6-astra")
+            .unwrap();
+        assert_eq!(astra.display_name, "GPT-6 Astra");
+        assert_eq!(astra.context_window, 1_050_000);
+        assert_eq!(
+            astra
+                .options_schema
+                .pointer("/properties/reasoning_effort/enum"),
+            Some(&json!(["low", "medium", "high", "xhigh", "max", "ultra"]))
+        );
+        assert_eq!(
+            astra
+                .options_schema
+                .pointer("/properties/reasoning_effort/default"),
+            Some(&json!("medium"))
+        );
+        assert_eq!(
+            catalog
+                .model_record("openai-codex", "gpt-6-astra")
+                .unwrap()
+                .limit
+                .output,
+            Some(128_000)
         );
 
         let gpt_55 = catalog
@@ -1258,7 +1331,7 @@ mod tests {
     fn trouve_owned_cursor_provider_is_available_offline() {
         let catalog = ModelsDevCatalog::embedded();
         let models = catalog.provider_models("cursor", "cursor", OptionsDialect::ClaudeCli);
-        assert_eq!(models.len(), 12);
+        assert_eq!(models.len(), 14);
 
         let fable = models
             .iter()
@@ -1271,12 +1344,102 @@ mod tests {
             Some(&json!("medium"))
         );
 
+        // Newer base models must resolve from the embedded snapshot alone;
+        // an unresolvable `base_model` silently drops the overlay entry.
+        let fable_5_1 = models
+            .iter()
+            .find(|model| model.id == "cursor/claude-fable-5-1")
+            .unwrap();
+        assert_eq!(fable_5_1.display_name, "Claude Fable 5.1");
+        assert!(fable_5_1.supports_tools);
+
+        let flash = models
+            .iter()
+            .find(|model| model.id == "cursor/gemini-3.8-flash")
+            .unwrap();
+        assert_eq!(flash.display_name, "Gemini 3.8 Flash");
+        assert_eq!(flash.context_window, 1_000_000);
+        assert_eq!(
+            flash.options_schema.pointer("/properties/effort/default"),
+            Some(&json!("high"))
+        );
+
+        // Cursor documents its own effort ladders and defaults for the Grok
+        // models; they must win over the xai base records.
+        let grok_4_5 = models
+            .iter()
+            .find(|model| model.id == "cursor/grok-4.5")
+            .unwrap();
+        assert_eq!(grok_4_5.context_window, 256_000);
+        assert_eq!(
+            grok_4_5
+                .options_schema
+                .pointer("/properties/effort/default"),
+            Some(&json!("high"))
+        );
+
+        let grok_4_6 = models
+            .iter()
+            .find(|model| model.id == "cursor/grok-4.6")
+            .unwrap();
+        assert_eq!(grok_4_6.display_name, "Grok 4.6");
+        assert_eq!(grok_4_6.context_window, 256_000);
+        assert_eq!(
+            grok_4_6.options_schema.pointer("/properties/effort/enum"),
+            Some(&json!(["low", "medium", "high", "xhigh"]))
+        );
+        assert_eq!(
+            grok_4_6
+                .options_schema
+                .pointer("/properties/effort/default"),
+            Some(&json!("high"))
+        );
+
         let composer = models
             .iter()
             .find(|model| model.id == "cursor/composer-2.5")
             .unwrap();
         assert_eq!(composer.context_window, 200_000);
         assert!(composer.supports_tools);
+        assert_eq!(
+            composer.options_schema.pointer("/properties/fast/default"),
+            Some(&json!(false))
+        );
+    }
+
+    #[test]
+    fn shared_identity_follows_reviewed_base_models_only() {
+        let catalog = ModelsDevCatalog::embedded();
+
+        assert_eq!(
+            catalog.shared_model_identity("openai", "gpt-5.6-sol"),
+            Some("gpt-5.6-sol".into())
+        );
+        assert_eq!(
+            catalog.shared_model_identity("openai-codex", "gpt-5.6-sol"),
+            Some("gpt-5.6-sol".into())
+        );
+        assert_eq!(
+            catalog.shared_model_identity("cursor", "gpt-5.6-sol"),
+            Some("gpt-5.6-sol".into())
+        );
+        assert_eq!(
+            catalog.shared_model_identity("cursor", "gemini-3.1-pro"),
+            Some("gemini-3.1-pro-preview".into())
+        );
+
+        // Cursor-owned choices can still be selected explicitly but must not
+        // acquire an automatic route merely because another provider later
+        // publishes a coincidentally identical id.
+        assert_eq!(catalog.shared_model_identity("cursor", "default"), None);
+        assert_eq!(
+            catalog.shared_model_identity("cursor", "composer-2.5"),
+            None
+        );
+        assert_eq!(
+            catalog.shared_model_identity("cursor", "claude-opus-5"),
+            None
+        );
     }
 
     #[test]
@@ -1342,8 +1505,8 @@ mod tests {
             .model("openai", "openai", "gpt-5.6", OptionsDialect::OpenAi)
             .unwrap();
         let cost = catalog.cost_usd(&model, 200_000, 100_000, 10_000).unwrap();
-        // Long-context tier: $10/M ordinary input, $1/M cached, $45/M output.
-        assert!((cost - 2.55).abs() < 1e-10, "cost was {cost}");
+        // Long-context tier: $8/M ordinary input, $0.80/M cached, $30/M output.
+        assert!((cost - 1.98).abs() < 1e-10, "cost was {cost}");
     }
 
     #[test]
@@ -1478,7 +1641,12 @@ mod tests {
             .filter(|(id, provider)| provider.to_known_provider(id).is_none())
             .map(|(id, _)| id.as_str())
             .collect();
-        assert_eq!(unsupported, ["gitlab", "sap-ai-core"]);
+        // Native AI SDK packages with no documented OpenAI-compatible or
+        // Anthropic-compatible HTTP surface; nothing to adapt yet.
+        assert_eq!(
+            unsupported,
+            ["gitlab", "qvac", "salad-cloud", "sap-ai-core", "watsonx"]
+        );
     }
 
     #[test]

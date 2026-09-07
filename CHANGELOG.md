@@ -4,6 +4,562 @@ All notable changes to this project are documented in this file. The format
 is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [4.10.1] - 2026-09-06
+
+This patch keeps active chat transcripts stable, makes review retries and
+carried-finding resolution reliable, preserves inline code in published review
+comments, and restores automatic naming for prompts with screenshots.
+
+### Fixed
+
+- **Active chat transcripts stay resident while streaming**: switching between
+  chats while a turn was active could let a late panel update evict the
+  displayed thread projection and replace the transcript with an empty view.
+  The active thread view now remains retained until streaming or ingress
+  failure finishes.
+- **Retry re-runs finished review jobs**: pressing Retry on a review that had
+  already published only reconciled the existing job, so a stale review could
+  not be re-run to clear findings fixed in later pushes. Retry now creates a
+  replacement job for any finished review and only reconciles a job that is
+  still running and publishing; the review UI explains that case instead of
+  silently refreshing.
+- **Carried findings whose anchors no longer map to head can be resolved**: the
+  coordinator only accepted a resolution for a blocking finding when it could
+  read the finding's original line at head, so a fix that moved or removed the
+  anchored code left the finding open indefinitely. The coordinator now marks
+  such findings as unmapped in its prompt, lets the model report the current
+  anchor path and line after inspecting head, and verifies that quote against
+  the repository before resolving.
+- **Published review comments preserve inline code**: GitHub code spans such
+  as `HashSet<&str>` no longer display HTML entities. Public-markup
+  sanitization now preserves well-formed single-line code spans while still
+  escaping ambiguous backticks, raw prose, mentions, and links.
+- **Session naming works when the first prompt has a screenshot**: with a
+  Codex naming model, sessions and threads whose initial prompt attached an
+  image stayed on their "New Session" / "New Thread" placeholders because the
+  Codex app-server only accepts images as local files and the naming request
+  offered none. The engine now stages naming images as short-lived opaque
+  files (outside both the durable attachment store and the session worktree)
+  for path-only backends and removes them when the request finishes.
+
+## [4.10.0] - 2026-09-06
+
+This release replaces Cursor's legacy ACP transport with its Agent SDK,
+makes session naming configurable and asynchronous, refreshes the supported
+model catalog, and improves navigation, reasoning display, review automation,
+usage reporting, and process ownership.
+
+### Added
+
+- **Cursor Agent SDK support**: Cursor turns now use a pinned, reusable SDK
+  Bridge with API-key health checks, durable per-thread agents, bounded
+  process pooling, and trouve-owned custom tools. Cursor's native tools remain
+  denied so filesystem, shell, Git, and MCP effects continue through the
+  normal permission and audit boundary. Existing `cursor-cli` configurations
+  must select Cursor (Agent SDK), install its managed runtime, and save a
+  Cursor API key; CLI login credentials are no longer used.
+- **Configured asynchronous naming**: sessions and threads are created
+  immediately, then named in the background by a user-selected provider model
+  using the initial prompt and supported image attachments. Rename menus can
+  generate a suggestion from conversation context, queued work is visible and
+  bounded, and title-derived local branches are renamed only after the title
+  update succeeds.
+- **Expanded model catalog**: the embedded models.dev snapshot now includes
+  current provider metadata, with GPT-6 Astra available for Codex and Claude
+  Fable 5.1 and Gemini 3.8 Flash available for Cursor. Cursor's Grok reasoning
+  levels and defaults now match its documented roster.
+- **Faster session navigation**: the workspace list keeps its scrollbar in
+  the sidebar gutter, session and thread context menus can copy durable IDs,
+  and the fixed usage footer can collapse to the most constrained
+  subscription window with the preference retained locally.
+
+### Changed
+
+- **Process completion and ownership survive background descendants**: Linux
+  and Android process owners now keep enumerating and killing newly inherited
+  sentinel holders until the tree is empty or the existing cleanup deadline
+  expires, closing fork-during-termination races across Git, providers, MCP,
+  probes, and shell calls. Expensive holder rescans run on the blocking pool,
+  back off adaptively, and honor the tree's absolute reap deadline while
+  scanning and signalling. Foreground shell output keeps an activity-resetting
+  idle grace plus an absolute post-exit deadline. Unacknowledged foreground
+  trees transfer through cancellation-safe, counted eviction handoffs, are
+  reaped opportunistically during later shell admission, and reserve bounded
+  registry capacity before process launch.
+- **Background work has an explicit owner**: trouve-owned subsystems can move
+  intentional long-lived work into a cancelling, coalescing registry without
+  trusting arbitrary detached descendants. Review fetches suppress inline Git
+  maintenance, preempt lower-priority managed maintenance without losing the
+  pending pass, and globally limit repository-locked housekeeping instead of
+  disabling it indefinitely.
+- **Non-gating review findings stay off pull requests**: credible findings that
+  are not mechanically tied to the reviewed change remain available in
+  trouve's dashboard and durable review history, but no longer appear in the
+  GitHub lifecycle comment, its actionable counts or summary, or remediation
+  prompts. GitHub result messages now count only new findings that gate the
+  pull request and describe the remaining actionable total without a redundant
+  `blocking` qualifier.
+- **Resolved threadless findings have a distinct visual state**: findings
+  resolved as won't-fix by a maintainer move into a collapsed disclosure in
+  the GitHub lifecycle comment, with struck-through issue text, an explicit
+  disposition label, and an `unresolve` command to reopen them. Findings fixed
+  in code continue to leave the list automatically.
+- **Evidence-driven automated reviews**: review agents retain the full
+  unattended tool catalog and qualification now proves that tool results were
+  used for anchored findings. Generated files honor trusted
+  `linguist-generated` attributes from the base revision, and oversized diff
+  lines are elided before batching so serialized snapshots cannot multiply
+  reviewer fan-out.
+- **Clean reviews publish approvals**: a clean review round now submits an
+  approval alongside its successful Check Run when GitHub permits it, allowing
+  the new verdict to supersede an earlier request for changes without a
+  separate dismissal.
+- **Client/server compatibility**: protocol compatibility advances to 9.2 for
+  review-thread collapse diagnostics and effective GitHub Contents permission
+  reporting. Upgrade the desktop or PWA client, review dashboard, and
+  `trouve-server` together, and grant the GitHub App Contents and Checks
+  read/write permissions to enable review-thread resolution.
+
+### Fixed
+
+- **Subscription usage survives a throttled usage endpoint**: the Usage panel
+  no longer reports "the Claude CLI reported no usage windows" when
+  Anthropic's `/api/oauth/usage` endpoint answers 429 to the Claude CLI's
+  probe. The engine now explains that the endpoint is temporarily
+  rate-limiting requests, keeps the last good reading (up to 15 minutes old,
+  labelled with its age) on screen through the outage, and serves every
+  provider's usage from a per-provider cache with a 60 s fresh window and
+  exponential failure backoff, so many open clients no longer each spawn a
+  vendor probe and trip the limit themselves.
+- **Reasoning stays visible and coherent**: Codex reasoning summaries are
+  rendered when hosted models do not expose raw reasoning, while streamed
+  Cursor fragments remain in one thinking block until completion or assistant
+  output begins.
+- **Provider changes refresh model choices**: successful runtime installs,
+  removals, provider updates, and sign-ins now invalidate the model catalog so
+  newly available models appear without reloading the application.
+- **Review-thread permission failures are actionable**: collapse failures are
+  persisted and surfaced in review statistics and dashboards, missing
+  installation-level Contents write permission fails fast, and affected
+  collapses resume when permission is restored.
+- **Reliable provider and naming admission**: isolated Codex starts retry
+  without contending with review storage, user turns take priority over local
+  naming, and cancellation-safe limits prevent queued naming work from growing
+  without bound.
+
+## [4.9.0] - 2026-09-05
+
+This release makes automated reviews quieter and more reliable, improves large
+review fan-outs, and lets Linux shell-launched daemons remain available for the
+life of their session worktree.
+
+### Changed
+
+- **Only well-supported findings block a review**: a finding gates the
+  pull request only at `high` severity with `high` or `medium` confidence,
+  or `medium` severity with `high` confidence. The SQL projection that
+  counts blocking issues uses the same rule, and existing pull projections
+  are backfilled on upgrade.
+- **Findings are re-anchored to their quoted source**: when the
+  coordinator's anchor quote is found in the reviewed file, the finding
+  (and each causal waypoint) snaps to the line that actually holds the
+  quote before side, diff-membership, deduplication, change-scope, and
+  confidence are derived, so an off-by-N line number no longer caps
+  confidence at `low` or lands the inline comment on the wrong line. The
+  evidence records the original `anchor_line_claimed` when a line moved.
+  Resolution claims (`current_anchor_quote`) are not re-anchored yet.
+- **Below-bar findings are recorded as `advisory`**: they no longer appear
+  in the check-run text, the lifecycle comment, the prompt for agents, or
+  the default review UI (which lists them in a collapsed ledger), and the
+  coordinator receives them only as a compact deduplication list. A later
+  candidate that meets the bar with verified evidence may promote one via
+  `promoted_from_finding_id`; the advisory row leaves the ledger once the
+  promoting review is published.
+- **Documentation-only pushes do not re-review the branch**: an automatic
+  run whose changes since the last reviewed head touch only documentation
+  paths (Markdown, reStructuredText, `docs/`, README/CHANGELOG/LICENSE/
+  NOTICE files; not arbitrary `.txt` files) finishes with no reviewer tasks
+  while still publishing a check run for the new head. New-change findings anchored on code unchanged since
+  the last reviewed head are recorded as `previously_missed`, which never
+  gates the review; a recurrence or fix regression with resolved history
+  keeps its origin.
+- **Fix regressions reply on the original thread**: a `fix_regression`
+  finding whose regressed original was posted inline is published as a
+  reply on that thread (reopening it if it was resolved), framed as a
+  design question about the trade-off, instead of a new inline comment.
+  Fix regressions never gate the review.
+- **Daemons survive the shell call that started them** (Linux): a descendant
+  of a shell command that detaches into its own session (an `sccache` server,
+  a package-manager or build-tool daemon) is no longer killed when the call
+  returns, the job is stopped, or its lifetime cap fires. It is reported in
+  the tool result (`detached`, plus a `note`) and stopped when the session
+  worktree is removed, even when it is handed over while the removal is in
+  progress (reported as `stopped_after_eviction` in that case). Workers a
+  released daemon forks later are stopped with it: the tree's sentinel is
+  retained until the worktree is removed, and whatever holds it is found and
+  stopped then. A daemon is released only once it is bound to a pidfd, and
+  every signal to it goes through that pidfd, so a recycled pid is never
+  hit; where no pidfd can be opened the daemon stays in the tree and is
+  stopped with it. A live daemon is never dropped from the record however
+  many are released, and a worktree's removal stays on record for as long
+  as a call or job started there is still running, so a daemon handed over
+  late is always stopped. Descendants that only leave the process group are still stopped
+  with the call and are now reported as `killed_escaped`. Platforms that
+  cannot tell a detached daemon from the rest of the tree (macOS) keep
+  stopping everything, and the tool description says so.
+- **Bounded process-tree cleanup**: a foreground call or background job whose
+  process tree cannot be confirmed empty now reports the failure after three
+  attempts instead of holding the session's mutation lane indefinitely.
+  `shell_kill` retries the same way and closes the job even when the
+  attempts are exhausted, so `shell_output` no longer reports it as running;
+  removing the worktree retries such a job once more before it is forgotten.
+- **No descriptor leaks into shell children**: process-tree spawns mark every
+  inherited descriptor beyond stdio close-on-exec, so descriptors the desktop
+  host opens without `O_CLOEXEC` no longer reach child processes, including
+  one opened while the spawn was being prepared: without `close_range`, on
+  Linux and Android the child lists its own descriptor table between fork
+  and exec, and macOS and the BSDs walk every descriptor number below the
+  soft `RLIMIT_NOFILE`. A spawn that
+  could only sanitize part of the descriptor table — no `close_range`, no
+  listable `/proc/self/fd`, and a soft `RLIMIT_NOFILE` that is unlimited or
+  above 2^20 — fails with an error naming the limit instead of leaking the
+  rest, and one that meets a descriptor refusing the close-on-exec mark
+  fails with that refusal instead of leaking the descriptor.
+- **Released daemons are logged by pid and name only**: the command line
+  that started one stays out of the lifecycle logs and eviction failure
+  messages, which outlive the call and may otherwise retain secrets. The
+  name is the file name of the process's executable, reduced to printable
+  ASCII of at most 15 characters — never the name the process set for
+  itself, which a daemon could fill with inherited secrets.
+- **Client/server compatibility**: protocol compatibility advances to 8.1
+  for advisory review findings and claimed-line evidence. Upgrade the desktop
+  or PWA client, review dashboard, and `trouve-server` together.
+
+### Fixed
+
+- **Large review fan-outs survive provider startup bursts**: Codex turn
+  startup is paced per backend, an unanswered start no longer retires the
+  shared transport, and admission waits no longer consume reviewer deadlines.
+  Claude prompts are delivered before startup admission is released, keeping
+  the same capacity boundary across supported agent backends.
+- **Review verdicts follow the blocking ledger**: final review outcomes are
+  derived from the stored set of blocking findings, including superseded
+  verdict preparation, instead of a separate state path that could disagree
+  with the ledger.
+
+## [4.8.1] - 2026-09-03
+
+This patch release improves failure diagnostics for Codex-backed sessions and
+keeps blocking review findings visible when prior review history reaches its
+size limit.
+
+### Fixed
+
+- **Protected Codex crash diagnostics**: unexpected app-server shutdowns now
+  retain the final bounded stderr tail and exit status for operators, wait for
+  late diagnostic bytes, and redact arbitrary child output unless sensitive
+  logging is explicitly enabled.
+- **Blocking review history under pressure**: check-gating findings are
+  prioritized ahead of advisory debt when compacting prior review context, so
+  older blockers remain available for resolution even when the history byte
+  budget is full.
+
+## [4.8.0] - 2026-09-02
+
+This release preserves model-produced media in conversations, adds faster and
+clearer model controls, and makes every pull-request review cover the complete
+branch while improving background-job concurrency and session accuracy.
+
+### Added
+
+- **Durable assistant media**: screenshots, audio, video, and embedded binary
+  resources returned by first-party or MCP tools are stored as bounded
+  attachments, recorded in the event log, and rendered in chat with the
+  existing image and video previews.
+- **Schema-driven Fast controls**: supported Codex and Cursor models expose
+  provider-declared Fast options in New Session, New Thread, and the chat
+  composer; Codex selections are forwarded as service-tier overrides.
+
+### Changed
+
+- **Full-branch review on every head**: automatic, manual, and retried reviews
+  now inspect the Git merge-base-to-head branch diff. A successfully published
+  clean round completes the Check Run immediately while durable finding,
+  dismissal, root-cause, rejection, external-thread, and carried-anchor history
+  continues to inform later rounds.
+- **Client/server compatibility**: protocol compatibility advances to 8.0.
+  Upgrade the desktop, PWA, review dashboard, and `trouve-server` together.
+  Derived compatibility-pending and exhausted states keep clean pre-8.0
+  partial results neutral while the server performs a bounded full-branch
+  migration review and surface when a manual retry is required.
+- **Non-blocking managed background jobs**: launching a managed background
+  shell job now releases the session mutation lane immediately, so later tools
+  can poll or stop the process and continue other work without surrendering
+  process-tree ownership or cleanup.
+
+### Fixed
+
+- **Accurate, faster session pull-request associations**: pull requests are
+  associated only through matching branches or verified creation evidence;
+  chat-only URL mentions no longer create associations, and large databases no
+  longer require a historical transcript scan during startup.
+- **Reliable Claude usage and session controls**: compact Max-plan usage
+  buckets, percentage fields, and reset aliases are accepted across Claude CLI
+  surfaces, while New Session restores prompt-first controls, effective
+  reasoning defaults, optional branch labels, and a separate YOLO warning.
+
+### Removed
+
+- **Incremental review coverage state**: review requests no longer select a
+  scope, and jobs no longer expose review watermarks or full-coverage flags.
+  New Check Runs no longer expose a separate full-review action, and new jobs
+  no longer need a coverage-confirmation round. Existing pre-8.0 `full_review`
+  actions remain accepted and request the pull request's current head;
+  `@trouve-ai review full` remains an alias for the standard command.
+
+## [4.7.0] - 2026-09-01
+
+This release keeps pull requests and model reasoning connected to the sessions
+that produced them, while improving recovery from missed events and transport
+shutdown races.
+
+### Added
+
+- **Durable pull-request associations**: pull request URLs mentioned in chat
+  are recorded against their session, normalized across repositories, and
+  shown alongside session-created pull requests without granting mention-only
+  entries mutation authority. Existing transcripts are recovered lazily and
+  paged for large histories.
+- **Continuous provider reasoning**: assistant thinking now retains
+  provider-owned identity across interleaved tool calls, delayed deltas, and
+  rebuilt thread snapshots instead of being split or attached to the wrong
+  lifecycle.
+
+### Changed
+
+- **Client/server compatibility**: protocol compatibility advances to 7.29 for
+  durable pull-request mention events and identity-aware reasoning lifecycles.
+  Upgrade the desktop or PWA client and `trouve-server` together.
+- **Session-governed private web access**: approved private-address fetches now
+  follow the session's Ask, allow-list, or Yolo policy while retaining scheme,
+  redirect, resolution, and connection-pinning safeguards.
+
+### Fixed
+
+- **Reliable review commands**: polling can recover newly missed resolve and
+  unresolve commands exactly once without replaying historical commands or
+  confusing webhook receipts with polling progress.
+- **Clean Codex completion and process shutdown**: observed root completion
+  remains authoritative when transport EOF races collaborator collection, and
+  inert Linux zombies owned by another reaper no longer quarantine a completed
+  app-server process tree.
+
+## [4.6.0] - 2026-08-31
+
+This release adds provider-native control over model options and live turns,
+removes fixed engine turn ceilings, and improves usage and review workflows.
+
+### Added
+
+- **Live boundary steering**: follow-up instructions and image attachments can
+  steer active direct-API and Claude Code turns. Guidance is queued through
+  response and tool boundaries with durable ordering, bounded admission, and
+  the same-turn transcript preserved.
+- **Schema-driven model options**: New Session, New Thread, live chat, and
+  Automations now render provider-declared choices, booleans, text, and exact
+  numeric settings without provider-specific controls. Selections are
+  validated, persisted, inherited, and rechecked before automated runs.
+- **Detailed usage views**: the session usage panel separates provider,
+  active-thread, and session totals into accessible keyboard-navigable tabs.
+
+### Changed
+
+- **Provider-governed turn admission**: ordinary desktop and spawned-agent
+  turns no longer use fixed engine concurrency caps. Providers govern capacity,
+  shared throttling cooldowns remain in effect, and review-job concurrency
+  stays independently bounded. The retired `TROUVE_TURN_CONCURRENCY`,
+  `TROUVE_BACKGROUND_TURN_CONCURRENCY`,
+  `TROUVE_PROVIDER_TURN_CONCURRENCY`, and
+  `TROUVE_PROVIDER_BACKGROUND_TURN_CONCURRENCY` settings are now ignored
+  with a startup warning and should be removed from operator configuration.
+- **Clearer model and persona configuration**: semantic persona selection is
+  grouped separately from repository instructions, and model-specific option
+  contracts remain stable across catalog refreshes and inherited defaults.
+- **Client/server compatibility**: protocol compatibility advances to 7.27.
+  Upgrade the desktop or PWA client and `trouve-server` together.
+
+### Fixed
+
+- **More reliable automated reviews**: review collection accepts large
+  changesets within the existing byte and model-token bounds, decimal-minute
+  timeout inputs no longer fail browser step validation, and opaque GitHub 422
+  verdict rejections retry safely as comment reviews without losing blockers.
+- **Stable session controls and usage**: new sessions retain the resolved
+  repository default branch after asynchronous option loading, while usage
+  refreshes preserve the last successful data and surface partial failures.
+
+## [4.5.0] - 2026-08-30
+
+This release makes large and long-lived workspaces easier to navigate, exposes
+model-level usage, and grounds automated review decisions in evidence from the
+revision being reviewed.
+
+### Added
+
+- **Organized workspace navigation**: workspace sessions can be grouped by
+  repository, filtered by name, date, and branch, and collapsed with preferences
+  that persist across reloads. Repository identity is cached and refreshed
+  without repeatedly invoking Git.
+- **Per-model usage visibility**: the workspace sidebar now shows provider
+  subscription, API, and local-model usage with session- and thread-level
+  breakdowns by model.
+- **Explicit review commands**: maintainers can request a full-branch pass with
+  `@trouve-ai review full` and resolve or reopen threadless findings with
+  attributed, reason-bearing `resolve` and `unresolve` commands.
+
+### Changed
+
+- **Evidence-grounded review gates**: finding confidence and change causation
+  are derived from mechanically verified anchors, execution paths, attempted
+  refutations, and causal waypoints. Only findings verified as caused by the
+  reviewed change block merging; severe pre-existing issues remain visible as
+  non-gating observations.
+- **Broader, convergent reviews**: arbitrary file- and changed-line count
+  cutoffs no longer reject large reviews, while existing byte and model-token
+  budgets still bound work. Carried blockers can be resolved against verified
+  source at the current head even after their fixing commit leaves the
+  incremental window.
+- **Responsive thread reconciliation**: resolved and reopened GitHub review
+  threads prioritize their pull request through a deduplicated, retry-bounded
+  webhook dispatcher. Operators should subscribe the GitHub App to the
+  `Pull request review thread` event; polling remains the fallback.
+- **Higher-quality session titles**: local title generation uses a constrained
+  two-to-five-word grammar, preserves both ends of long prompts, and upgrades
+  legacy Q4 installations to the Qwen3 1.7B Q5 naming model.
+- **Client/server compatibility**: protocol compatibility advances to 7.22.
+  Upgrade the desktop or PWA client and `trouve-server` together.
+
+### Fixed
+
+- **Bounded review publication recovery**: definitively missing or superseded
+  GitHub reviews now reach a safe terminal state instead of retrying forever;
+  current rounds can be reposted only after confirmed absence, and cosmetic
+  thread-collapse retries are abandoned after a bounded attempt window.
+- **Stable workspace and CI behavior**: collapsed workspace session lists are
+  honored, stale usage responses cannot repopulate the wrong scope, and
+  benchmark confirmation compares fresh candidate and base measurements to
+  avoid shared-runner contention false positives.
+
+## [4.4.0] - 2026-08-27
+
+This release surfaces agent-initiated Claude activity as durable turns and
+makes automated review output and prompt sizing more useful across model fleets.
+
+### Added
+
+- **Agent-initiated Claude turns**: Claude Code monitors and scheduled
+  wake-ups now appear as labeled background turns instead of blocking an unread
+  output pipe or leaking stale events into the next interactive turn. Continuous
+  routing, provider-reload recovery, and bounded process cleanup keep autonomous
+  activity attached to the correct thread throughout the process lifetime.
+
+### Changed
+
+- **Focused pull-request review output**: GitHub review surfaces now publish
+  only merge-blocking findings, distinguish new issues from carried-forward
+  blockers, and render remediation context as readable, injection-contained
+  prose. Advisory findings remain durable and visible in the trouve dashboard.
+- **Model-aware review prompt budgets**: reviewer batches, coordinator history,
+  and diff context now scale from the smallest configured model context window.
+  The resolved basis is persisted per job so retries remain deterministic even
+  when provider metadata changes or is temporarily unavailable.
+- **Client/server compatibility**: protocol compatibility advances to 7.19 for
+  the trusted background-turn marker. Upgrade the desktop or PWA client and
+  `trouve-server` together.
+
+## [4.3.0] - 2026-08-26
+
+This release makes automated reviews converge on merge-blocking defects while
+preserving advisory engineering debt and giving maintainers direct control over
+finding dismissal.
+
+### Added
+
+- **Whole-change review context**: each review round can run a configurable
+  Change analyst over the full branch diff, while the final editor receives the
+  pull-request description as untrusted claimed intent and the independent
+  analysis as observed implementation evidence.
+- **Maintainer dismissal controls**: resolving a finding thread now dismisses
+  the finding immediately, and findings without diff threads expose equivalent
+  task-list controls in the lifecycle comment. Restoring either control reopens
+  the finding and its linked root-cause themes.
+
+### Changed
+
+- **Blocking and advisory review gates**: only high-severity findings and
+  sufficiently confident medium-severity findings block merging or publish to
+  GitHub. Lower-severity findings remain durable and visible in trouve without
+  holding the check red.
+- **Full-branch confirmation before success**: a review reports success only
+  when no blocking findings remain and the newest published round covers the
+  entire branch. Clean incremental rounds remain pending until the existing
+  full-coverage recheck confirms the result.
+- **Broader review routing and lifecycle analysis**: user-facing changes are
+  routed per file instead of by a batch's dominant content, and reviewers must
+  trace writers of persisted state and verify re-execution assumptions across
+  startup and migration paths.
+- **Client/server compatibility**: protocol compatibility advances to 7.18.
+  Upgrade the desktop or PWA client and `trouve-server` together.
+
+### Fixed
+
+- **Reliable review reconciliation**: fixed and dismissed findings no longer
+  wait on GitHub thread bookkeeping before full-coverage confirmation, while
+  lifecycle checkbox edits converge transactionally from durable state and
+  survive reordered, replayed, or missed webhook deliveries.
+- **Visible thread-cleanup backlog**: review statistics now report pending
+  thread collapses and the oldest pending age, making a stalled auto-resolution
+  worker visible from the dashboard.
+
+## [4.2.0] - 2026-08-24
+
+This release improves automated review throughput and restores semantic search
+to Cursor-backed reviews.
+
+### Changed
+
+- **Faster parallel reviews**: planned semantic-router and reviewer batches now
+  enter the shared scheduler together, while a separate short-lived lane bounds
+  durable setup bursts without capping active model turns. The obsolete
+  `TROUVE_CODE_REVIEW_TASK_CONCURRENCY` override has been removed; operators
+  should use the global or provider turn limits and
+  `TROUVE_CODE_REVIEW_JOB_CONCURRENCY` when narrowing review capacity.
+
+### Fixed
+
+- **Cursor semantic search**: Cursor ACP sessions again mount trouve's
+  supplemental HTTP MCP bridge, allowing automated reviews to use semantic
+  search within their tool budgets. Sessions reload when bridge credentials or
+  MCP settings rotate, while Cursor's native tools remain read-only confined.
+
+## [4.1.2] - 2026-08-23
+
+### Changed
+
+- **Clearer review outcomes**: successful automated reviews with open findings
+  now use a warning-style “needs attention” status instead of looking like
+  failed review runs, while unavailable open-finding counts remain explicitly
+  marked as unknown.
+
+### Fixed
+
+- **Automated review tool budgets**: repeated ACP lifecycle updates for one
+  logical Cursor tool call are charged only once, and the bounded reviewer
+  allowance accommodates synchronized release manifests without prematurely
+  terminating valid supply-chain reviews.
+
 ## [4.1.1] - 2026-08-23
 
 ### Fixed
@@ -827,6 +1383,18 @@ semble ([BENCHMARKS.md](BENCHMARKS.md)):
 - Incremental reindex (1 file touched): 0.86 s vs ~3 min (212x)
 - Warm query: 0.55 s vs 7.2 s (13x)
 
+[4.10.1]: https://github.com/jimsimon/trouve/compare/v4.10.0...v4.10.1
+[4.10.0]: https://github.com/jimsimon/trouve/compare/v4.9.0...v4.10.0
+[4.9.0]: https://github.com/jimsimon/trouve/compare/v4.8.1...v4.9.0
+[4.8.1]: https://github.com/jimsimon/trouve/compare/v4.8.0...v4.8.1
+[4.8.0]: https://github.com/jimsimon/trouve/compare/v4.7.0...v4.8.0
+[4.7.0]: https://github.com/jimsimon/trouve/compare/v4.6.0...v4.7.0
+[4.6.0]: https://github.com/jimsimon/trouve/compare/v4.5.0...v4.6.0
+[4.5.0]: https://github.com/jimsimon/trouve/compare/v4.4.0...v4.5.0
+[4.4.0]: https://github.com/jimsimon/trouve/compare/v4.3.0...v4.4.0
+[4.3.0]: https://github.com/jimsimon/trouve/compare/v4.2.0...v4.3.0
+[4.2.0]: https://github.com/jimsimon/trouve/compare/v4.1.2...v4.2.0
+[4.1.2]: https://github.com/jimsimon/trouve/compare/v4.1.1...v4.1.2
 [4.1.1]: https://github.com/jimsimon/trouve/compare/v4.1.0...v4.1.1
 [4.1.0]: https://github.com/jimsimon/trouve/compare/v4.0.0...v4.1.0
 [4.0.0]: https://github.com/jimsimon/trouve/compare/v3.8.0...v4.0.0

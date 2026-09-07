@@ -86,6 +86,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/automations/{id}/enabled": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put: operations["set_automation_enabled"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/automations/{id}/run": {
         parameters: {
             query?: never;
@@ -165,7 +181,7 @@ export interface paths {
         put?: never;
         post?: never;
         /**
-         * Remove the managed install of a CLI (a system install found on PATH is
+         * Remove a trouve-managed agent runtime (a system install found on PATH is
          *     untouched and will be used again if present).
          */
         delete: operations["uninstall_cli"];
@@ -184,7 +200,7 @@ export interface paths {
         get: operations["cli_install_status"];
         put?: never;
         post: operations["start_cli_install"];
-        /** Cancel an in-flight install; the CLI returns to its previous state. */
+        /** Cancel an in-flight install; the agent runtime returns to its previous state. */
         delete: operations["cancel_cli_install"];
         options?: never;
         head?: never;
@@ -479,38 +495,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/v1/config/git-worktrees": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get: operations["get_git_worktree_settings"];
-        put: operations["set_git_worktree_settings"];
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/v1/config/git-worktrees/title-model/install": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post: operations["install_title_model"];
-        delete: operations["cancel_title_model_install"];
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/v1/config/provider-order": {
         parameters: {
             query?: never;
@@ -520,6 +504,22 @@ export interface paths {
         };
         get?: never;
         put: operations["set_provider_order"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/config/session-naming": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_session_naming_settings"];
+        put: operations["set_session_naming_settings"];
         post?: never;
         delete?: never;
         options?: never;
@@ -1075,22 +1075,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/v1/session-title": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post: operations["generate_session_title"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/v1/sessions": {
         parameters: {
             query?: never;
@@ -1379,6 +1363,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/sessions/{id}/title-suggestion": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["generate_session_title_from_transcript"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/sessions/{id}/undo": {
         parameters: {
             query?: never;
@@ -1647,6 +1647,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/threads/{id}/title-suggestion": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["generate_thread_title_from_transcript"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/threads/{id}/tools/{call_id}": {
         parameters: {
             query?: never;
@@ -1689,6 +1705,22 @@ export interface paths {
         get: operations["get_thread_view"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/title": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["generate_title"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1803,7 +1835,7 @@ export interface components {
          */
         ApprovalDecision: "approve" | "always_approve" | "deny";
         /**
-         * @description A stored prompt attachment. Bytes are served at
+         * @description A stored transcript attachment. Bytes are served at
          *     `GET /v1/attachments/{id}`.
          */
         Attachment: {
@@ -1847,6 +1879,14 @@ export interface components {
             mode?: string | null;
             /** @description Model for the runs (None = the persona's default). */
             model?: string | null;
+            /**
+             * @description Model-specific values selected from the model's `options_schema`.
+             *     `thinking_level` remains as a compatibility shorthand; values in this
+             *     object take precedence when both select the same model capability.
+             */
+            model_options?: {
+                [key: string]: components["schemas"]["ModelOptionValue"];
+            };
             name: string;
             /** @description Next fire time (RFC3339), when enabled. */
             next_run_at?: string | null;
@@ -1915,16 +1955,19 @@ export interface components {
             status: string;
         };
         /**
-         * @description A vendor CLI trouve can download and manage (cursor-agent, claude,
-         *     codex), with its current install state.
+         * @description A vendor agent runtime trouve can download and manage (Cursor Agent SDK
+         *     Bridge, Claude Code CLI, Codex CLI), with its current install state.
          */
         CliInfo: {
             display_name: string;
-            /** @description Stable id, also the binary name: "cursor-agent", "claude", "codex". */
+            /**
+             * @description Stable artifact id, also the managed binary name:
+             *     "cursor-sdk-bridge", "claude", or "codex".
+             */
             id: string;
-            /** @description Version of the binary trouve would run, when one was resolved. */
+            /** @description Version of the runtime binary trouve would run, when one was resolved. */
             installed_version?: string | null;
-            /** @description Provider kinds served by this CLI (e.g. ["cursor-cli"]). */
+            /** @description Provider kinds served by this runtime (e.g. ["cursor-sdk"]). */
             kinds: string[];
             /** @description Newest version the vendor serves (None when the check failed). */
             latest_version?: string | null;
@@ -1939,6 +1982,7 @@ export interface components {
         };
         /** @description State of a CLI install started with `POST /v1/clis/{id}/install`. */
         CliInstallStatus: {
+            /** @description The terminal error when `status = "failed"`. */
             error?: string | null;
             /**
              * Format: int64
@@ -1954,6 +1998,11 @@ export interface components {
             total_bytes?: number;
             /** @description Version being (or just) installed, when known. */
             version?: string | null;
+            /**
+             * @description A non-fatal activation warning. When present with `status = "success"`,
+             *     the runtime is active but its crash durability could not be confirmed.
+             */
+            warning?: string | null;
         };
         CliList: {
             clis: components["schemas"]["CliInfo"][];
@@ -1979,6 +2028,27 @@ export interface components {
             /** @description Concise, generated one-line summary of the candidate issue. */
             title: string;
         };
+        /**
+         * @description One step of the causal chain from changed code to a finding's anchor,
+         *     quoted by the coordinator and mechanically verified against the reviewed
+         *     revision. A finding anchored outside the diff can only block the review
+         *     when its waypoints verify and at least one lies on a changed line.
+         */
+        CodeReviewCausalWaypoint: {
+            /** Format: int64 */
+            line: number;
+            /**
+             * Format: int64
+             * @description The line the coordinator originally claimed when the server
+             *     re-anchored `line` to where `quote` actually appears in the head
+             *     revision. Absent when the claim was correct or no re-anchoring was
+             *     possible.
+             */
+            line_claimed?: number | null;
+            path: string;
+            /** @description Verbatim source line at `path:line`, from the head revision. */
+            quote?: string;
+        };
         /** @description Signals that measure repeated review work rather than raw issue volume. */
         CodeReviewChurnStats: {
             /** Format: double */
@@ -2001,6 +2071,33 @@ export interface components {
             pull_request_count?: number;
             /** Format: int64 */
             recurrence_issue_count?: number;
+        };
+        /** @description Auto-resolve worker backlog for finding threads. */
+        CodeReviewCollapseBacklog: {
+            /**
+             * Format: int64
+             * @description Entries the worker gave up on after repeated terminal failures; their
+             *     threads stay open on GitHub until resolved by hand.
+             */
+            abandoned?: number;
+            /**
+             * Format: int64
+             * @description Pending entries whose most recent attempt failed.
+             */
+            failing?: number;
+            /** @description Error from the most recently failed attempt across the backlog. */
+            last_error?: string;
+            /**
+             * Format: int64
+             * @description Age of the oldest pending entry, from when its finding was resolved.
+             */
+            oldest_pending_minutes?: number | null;
+            /**
+             * Format: int64
+             * @description Findings marked for thread resolution that the worker has not
+             *     completed yet.
+             */
+            pending: number;
         };
         CodeReviewDashboard: {
             app: components["schemas"]["GithubAppStatus"];
@@ -2066,16 +2163,72 @@ export interface components {
             severity: string;
             side: string;
             sources?: components["schemas"]["CodeReviewFindingSource"][];
-            /** @description `open`, `fixed`, or `dismissed`. */
+            /**
+             * @description `open`, `advisory`, `fixed`, or `dismissed`. Advisory findings fell
+             *     below the blocking bar when they were recorded: they never gate the
+             *     review, are not published to GitHub, and are only surfaced to later
+             *     review rounds so the coordinator can recognise duplicates or promote
+             *     them once verified evidence lifts them over the bar.
+             */
             status: string;
             theme_ids?: string[];
+            thread_collapse?: null | components["schemas"]["CodeReviewThreadCollapse"];
             /** @description Concise, generated one-line summary of the issue. */
             title: string;
         };
         /** @description Concrete evidence that makes a confirmed finding independently verifiable. */
         CodeReviewFindingEvidence: {
+            /**
+             * Format: int64
+             * @description The line the coordinator originally claimed for the finding when the
+             *     server re-anchored it to where `anchor_quote` actually appears in the
+             *     head revision. Absent when the claim was correct or no re-anchoring
+             *     was possible.
+             */
+            anchor_line_claimed?: number | null;
+            /**
+             * @description Server-derived verdict for `anchor_quote`: `matched`, `mismatched`,
+             *     or `unchecked`. Model-provided values are overwritten.
+             */
+            anchor_match?: string;
+            /**
+             * @description Verbatim source line at the finding's anchor, quoted by the
+             *     coordinator while verifying the finding. Mechanically matched against
+             *     the reviewed revision; empty when the anchor was never verified.
+             */
+            anchor_quote?: string;
+            /**
+             * @description The causal chain from changed code to the finding's anchor, required
+             *     to verify an `introduced` claim whose anchor is outside the diff.
+             */
+            causal_waypoints?: components["schemas"]["CodeReviewCausalWaypoint"][];
+            /**
+             * @description Coordinator's causation claim for the finding: `introduced` when this
+             *     change caused the issue, `pre_existing` when the issue predates it and
+             *     is surfaced for awareness only. Empty on legacy records.
+             */
+            change_causation?: string;
+            /**
+             * @description Server-derived scope verdict: `verified` when the causation claim is
+             *     mechanically corroborated (anchor on a changed line, or verified
+             *     waypoints reaching one), `unverified` otherwise. Only scope-verified
+             *     findings block the review. Model-provided values are overwritten;
+             *     empty legacy records block as before.
+             */
+            change_scope?: string;
             consequence?: string;
+            /**
+             * @description The refuting guard, caller, or test the coordinator searched for to
+             *     disprove the finding, and what it found. Empty when no refutation was
+             *     attempted.
+             */
+            counterexample_search?: string;
             execution_path?: string;
+            /**
+             * @description The coordinator's grade of how much of `execution_path` it verified
+             *     against the repository: `verified`, `partial`, or `unverified`.
+             */
+            execution_path_verification?: string;
             introduction?: string;
             preconditions?: string;
             regression_test?: string;
@@ -2099,6 +2252,21 @@ export interface components {
         };
         /** @description A durable execution of one model review against one immutable PR head. */
         CodeReviewJob: {
+            /**
+             * Format: int64
+             * @description Advisory findings (low severity, or medium severity with low
+             *     confidence) still open across the pull request: durable engineering
+             *     debt recorded in trouve, never posted to GitHub and never
+             *     merge-blocking.
+             */
+            advisory_open_issue_count?: number | null;
+            /**
+             * @description Model snapshotted for the per-round implementation analyst. Absent
+             *     inherits `model`.
+             */
+            analyst_model?: string | null;
+            /** @description Thinking level snapshotted for the implementation analyst. */
+            analyst_thinking_level?: string | null;
             base_ref: string;
             cancel_requested?: boolean;
             /** Format: int64 */
@@ -2127,14 +2295,28 @@ export interface components {
             installation_id: number;
             /** Format: int64 */
             issue_count?: number;
+            /**
+             * @description A clean pre-8.0 partial review still lacks full-branch coverage after
+             *     both bounded automatic compatibility attempts ended. A manual whole-
+             *     review retry is required to establish coverage.
+             */
+            legacy_coverage_exhausted?: boolean;
+            /**
+             * @description A successfully published pre-8.0 partial review is waiting for the
+             *     bounded automatic full-branch compatibility review. This is a derived
+             *     migration state, not a scope option for newly created jobs.
+             */
+            legacy_coverage_pending?: boolean;
             lifecycle_comment_url?: string;
             model?: string | null;
             /**
              * Format: int64
-             * @description Total confirmed findings that remained open across the pull request
-             *     after this review was published. Absent while publication is pending
-             *     and for legacy jobs that predate this snapshot. Consumers must treat
-             *     absence on a succeeded job as unknown, never as a clean review.
+             * @description Blocking confirmed findings (high severity, or medium severity with
+             *     at least medium confidence) that remained open across the pull
+             *     request after this review was published. Only these gate the check
+             *     run. Absent while publication is pending and for legacy jobs that
+             *     predate this snapshot. Consumers must treat absence on a succeeded
+             *     job as unknown, never as a clean review.
              */
             open_issue_count?: number | null;
             /** Format: int64 */
@@ -2152,17 +2334,12 @@ export interface components {
             retried_by?: string | null;
             retry_of?: string | null;
             /**
-             * @description Commit used as the left side of this review's diff. For incremental
-             *     jobs this is normally the last successfully published head.
+             * @description Actual pull-request merge base used as the left side of this review's
+             *     diff. Omitted while a queued or early-running job is still preparing
+             *     its repository. Legacy jobs may expose an incremental watermark here.
              */
             review_base_sha?: string;
             review_url?: string;
-            /**
-             * @description Immutable commit from the last successfully published review. This is
-             *     the incremental watermark even when history rewriting makes the
-             *     effective `review_base_sha` fall back to the pull request merge base.
-             */
-            review_watermark_sha?: string;
             /** Format: int64 */
             reviewer_elapsed_ms?: number;
             /**
@@ -2182,6 +2359,7 @@ export interface components {
             routing_mode?: components["schemas"]["CodeReviewRoutingMode"];
             /** Format: int64 */
             running_elapsed_ms?: number;
+            /** @description Historical scope retained for diagnostics. New jobs are always full. */
             scope?: components["schemas"]["CodeReviewJobScope"];
             /**
              * @description Snapshotted Additive semantic-routing choice. Automatic jobs route
@@ -2224,8 +2402,8 @@ export interface components {
             jobs: components["schemas"]["CodeReviewJob"][];
         };
         /**
-         * @description Whether a job reviews only changes since the last successfully published
-         *     head, or the entire pull-request branch against its GitHub base.
+         * @description Historical review scope. All newly created jobs use `Full`; `Incremental`
+         *     remains readable for durable rows created before protocol 8.0.
          * @enum {string}
          */
         CodeReviewJobScope: "incremental" | "full";
@@ -2316,6 +2494,16 @@ export interface components {
          */
         CodeReviewRepository: {
             /**
+             * @description Automatic model selector or provider-qualified pin used by the
+             *     per-round implementation analyst. Absent inherits `model`.
+             */
+            analyst_model?: string | null;
+            /**
+             * @description Preferred thinking level or fixed token budget for the implementation
+             *     analyst. Absent inherits the review mode's default.
+             */
+            analyst_thinking_level?: string | null;
+            /**
              * @description Preferred thinking level or fixed token budget for the final
              *     coordinator/editor. Absent inherits the review mode's default.
              */
@@ -2328,8 +2516,9 @@ export interface components {
             installation_id: number;
             mode?: components["schemas"]["CodeReviewMode"];
             /**
-             * @description Provider-qualified model used by the coordinator and inherited by
-             *     reviewers without an override. Required while reviews are enabled.
+             * @description Automatic model selector or provider-qualified pin used by the
+             *     coordinator and inherited by reviewers without an override. Required
+             *     while reviews are enabled.
              */
             model?: string | null;
             private?: boolean;
@@ -2344,8 +2533,8 @@ export interface components {
              */
             reviewer_overrides?: components["schemas"]["ReviewerOverride"][];
             /**
-             * @description Provider-qualified model used by semantic persona triage. Absent
-             *     inherits `model`.
+             * @description Automatic model selector or provider-qualified pin used by semantic
+             *     persona triage. Absent inherits `model`.
              */
             router_model?: string | null;
             /**
@@ -2440,6 +2629,7 @@ export interface components {
             running_duration?: components["schemas"]["CodeReviewDurationStats"];
             /** @description Current active work plus terminal outcomes in the selected range. */
             status?: components["schemas"]["CodeReviewStatusCounts"];
+            thread_collapse_backlog?: null | components["schemas"]["CodeReviewCollapseBacklog"];
         };
         CodeReviewStatsBucket: {
             /** Format: date-time */
@@ -2507,7 +2697,10 @@ export interface components {
              *     cancellation.
              */
             lifecycle_stage?: components["schemas"]["CodeReviewTaskLifecycleStage"];
-            /** @description The provider-qualified model actually used by the created thread. */
+            /**
+             * @description The automatic model selector or provider-qualified pin stored on the
+             *     created thread. Concrete route choices are reported by route events.
+             */
             model?: string | null;
             /**
              * Format: int64
@@ -2569,7 +2762,7 @@ export interface components {
             tool_call_count: number;
         };
         /** @enum {string} */
-        CodeReviewTaskRole: "router" | "reviewer" | "coordinator";
+        CodeReviewTaskRole: "router" | "analyst" | "reviewer" | "coordinator";
         /** @description A root cause tracked across all review rounds for one pull request. */
         CodeReviewTheme: {
             affected_paths?: string[];
@@ -2605,6 +2798,26 @@ export interface components {
          * @enum {string}
          */
         CodeReviewThemeObservationKind: "new" | "continuation" | "recurrence";
+        /** @description Auto-resolve progress for one finding's GitHub review thread. */
+        CodeReviewThreadCollapse: {
+            /**
+             * Format: int64
+             * @description Failed attempts so far.
+             */
+            attempts?: number;
+            /** @description Error from the most recent failed attempt. */
+            last_error?: string;
+            /**
+             * Format: date-time
+             * @description Earliest time of the next attempt while one is pending.
+             */
+            next_attempt_at?: string | null;
+            /**
+             * @description The worker still owes a collapse attempt. False with a `last_error`
+             *     means the collapse was abandoned after repeated terminal failures.
+             */
+            pending: boolean;
+        };
         /**
          * @description A reviewer candidate the final editor neither retained nor substantively
          *     rejected. This represents incomplete coordinator work, not a negative
@@ -2701,7 +2914,7 @@ export interface components {
             model?: string | null;
             /** @description Model-specific options validated against the model's options schema. */
             model_options?: {
-                [key: string]: unknown;
+                [key: string]: components["schemas"]["ModelOptionValue"];
             };
             permission_mode?: null | components["schemas"]["PermissionMode"];
             session_id: components["schemas"]["String"];
@@ -2729,6 +2942,13 @@ export interface components {
             type: "turn.capacity_acquired";
             /** Format: int64 */
             wait_ms: number;
+        } | {
+            /** Format: int64 */
+            provider_wait_ms: number;
+            /** Format: int64 */
+            turn: number;
+            /** @enum {string} */
+            type: "turn.admitted";
         } | {
             mode: string;
             model: string;
@@ -2782,11 +3002,22 @@ export interface components {
              *     `GET /v1/attachments/{id}`).
              */
             attachments?: components["schemas"]["Attachment"][];
+            /**
+             * @description Legacy protocol 7.19–7.26 marker retained so existing durable logs
+             *     remain replayable. New servers emit `turn.background_activity`
+             *     instead and leave this false for user-authored messages.
+             */
+            background?: boolean;
             content: string;
             /** Format: int64 */
             turn: number;
             /** @enum {string} */
             type: "user.message";
+        } | {
+            /** Format: int64 */
+            turn: number;
+            /** @enum {string} */
+            type: "turn.background_activity";
         } | {
             attachments?: components["schemas"]["Attachment"][];
             content: string;
@@ -2822,12 +3053,14 @@ export interface components {
             /** @enum {string} */
             type: "assistant.progress_completed";
         } | {
+            id?: string | null;
             text: string;
             /** Format: int64 */
             turn: number;
             /** @enum {string} */
             type: "assistant.thinking";
         } | {
+            id?: string | null;
             /** Format: int64 */
             turn: number;
             /** @enum {string} */
@@ -2838,6 +3071,13 @@ export interface components {
             turn: number;
             /** @enum {string} */
             type: "assistant.message";
+        } | {
+            attachments: components["schemas"]["Attachment"][];
+            call_id?: null | components["schemas"]["String"];
+            /** Format: int64 */
+            turn: number;
+            /** @enum {string} */
+            type: "assistant.artifacts";
         } | {
             args: unknown;
             call_id: components["schemas"]["String"];
@@ -3007,6 +3247,17 @@ export interface components {
             type: "session.pr_opened";
             url: string;
         } | {
+            /** Format: int64 */
+            number: number;
+            session_id: components["schemas"]["String"];
+            /** @enum {string} */
+            type: "session.pr_mentioned";
+            /**
+             * @description Canonical browser URL supplied by chat. A number without repository
+             *     identity is not globally unique and does not emit this event.
+             */
+            url: string;
+        } | {
             session_id: components["schemas"]["String"];
             /** @enum {string} */
             type: "session.deleted";
@@ -3070,7 +3321,11 @@ export interface components {
             /** @enum {string} */
             type: "server.connectivity_changed";
         } | {
-            settings: components["schemas"]["GitWorktreeSettings"];
+            settings: components["schemas"]["SessionNamingSettings"];
+            /** @enum {string} */
+            type: "settings.session_naming_updated";
+        } | {
+            settings: unknown;
             /** @enum {string} */
             type: "settings.git_worktrees_updated";
         } | {
@@ -3129,25 +3384,14 @@ export interface components {
             session: components["schemas"]["Session"];
             thread: components["schemas"]["Thread"];
         };
-        /** @description Ask the server to derive a concise title for a new session. */
-        GenerateSessionTitleRequest: {
+        /** @description Ask the configured naming model to derive a concise navigation title. */
+        GenerateTitleRequest: {
+            attachments?: components["schemas"]["AttachmentUpload"][];
             prompt: string;
+            session_id: components["schemas"]["String"];
         };
-        GeneratedSessionTitle: {
-            /** @description `model` or `heuristic`. */
-            source: string;
+        GeneratedTitle: {
             title: string;
-        };
-        /** @description Global session-naming settings shown under Settings → Sessions & Chat. */
-        GitWorktreeSettings: {
-            /**
-             * @description Whether new session branches include a slug derived from the session
-             *     title. False uses the compact `trouve/<short-id>` form.
-             */
-            derive_branch_name_from_session_title?: boolean;
-            title_model: components["schemas"]["TitleModelStatus"];
-            title_model_load_behavior: components["schemas"]["TitleModelLoadBehavior"];
-            title_model_resource_policy?: components["schemas"]["TitleModelResourcePolicy"];
         };
         /**
          * @description Public GitHub App state. Private keys and webhook secrets are never
@@ -3168,6 +3412,13 @@ export interface components {
              */
             checks_write_configured?: boolean;
             configured: boolean;
+            /**
+             * @description Whether the installation token reports `contents: write`. GitHub
+             *     rejects the `resolveReviewThread`/`unresolveReviewThread` mutations
+             *     for installation tokens without it, so fixed findings' threads stay
+             *     open on GitHub until this is granted.
+             */
+            contents_write_configured?: boolean;
             /** Format: int64 */
             installation_count?: number;
             last_error?: string;
@@ -3468,7 +3719,10 @@ export interface components {
             /** Format: int64 */
             context_window: number;
             display_name: string;
-            /** @description Provider-qualified id, e.g. "openai/gpt-4.1-mini". */
+            /**
+             * @description Model selector id: `auto/<model>` for dynamic routing or
+             *     `provider/<model>` for a concrete pin.
+             */
             id: string;
             /**
              * Format: double
@@ -3483,8 +3737,22 @@ export interface components {
             options_schema: unknown;
             /** Format: double */
             output_price_per_mtok?: number | null;
+            /**
+             * @description Whether the model accepts image inputs. False for unknown/custom
+             *     endpoints so clients do not imply that attachments will be inspected.
+             */
+            supports_images?: boolean;
             supports_tools: boolean;
         };
+        /**
+         * @description A scalar value accepted by a model's advertised options schema.
+         *
+         *     Protocol request/response structs retain `serde_json::Value` internally so
+         *     arbitrary-precision JSON number tokens survive deserialization. Their
+         *     OpenAPI fields use this type to advertise the narrower wire contract that
+         *     the engine already enforces.
+         */
+        ModelOptionValue: string | number | boolean;
         /**
          * @description One concrete provider route for an automatic or pinned model selection.
          *     `provider_model` is the provider's own model id, without trouve's
@@ -3499,6 +3767,20 @@ export interface components {
          * @enum {string}
          */
         ModelRouteReason: "initial" | "capacity_failover" | "route_failover";
+        /** @description Aggregated usage for a thread or session. */
+        ModelUsageSummary: {
+            /** Format: int64 */
+            cached_input_tokens: number;
+            /** Format: double */
+            cost_usd: number;
+            /** Format: int64 */
+            input_tokens: number;
+            model: string;
+            /** Format: int64 */
+            output_tokens: number;
+            /** Format: int64 */
+            turns: number;
+        };
         /**
          * @description Initial dimensions for a newly created terminal. The singular compatibility
          *     endpoint ignores these values when it re-attaches to a live terminal.
@@ -4087,6 +4369,11 @@ export interface components {
         QueuedPrompt: {
             /** @description Attachments uploaded with the prompt (already stored server-side). */
             attachments?: components["schemas"]["Attachment"][];
+            /**
+             * @description Server-dispatched attach prompt for vendor-autonomous agent
+             *     activity. Trusted dispatch metadata: never inferred from `content`.
+             */
+            background?: boolean;
             content: string;
             created_at: string;
             id: string;
@@ -4106,18 +4393,13 @@ export interface components {
         ReorderQueueRequest: {
             ids: string[];
         };
-        /**
-         * @description Manual review request. Full scope always compares the current head with
-         *     the pull request's GitHub base; incremental scope uses the saved watermark
-         *     when it remains valid.
-         */
+        /** @description Manual full-branch review request. */
         RequestCodeReviewRequest: {
             /** Format: int64 */
             installation_id: number;
             /** Format: int64 */
             pull_number: number;
             repository: string;
-            scope?: components["schemas"]["CodeReviewJobScope"];
         };
         ResolveApprovalRequest: {
             call_id: components["schemas"]["String"];
@@ -4140,8 +4422,9 @@ export interface components {
         /** @description Repository-specific changes layered over a reusable reviewer profile. */
         ReviewerOverride: {
             /**
-             * @description Provider-qualified model. Absent means inherit the profile, which in
-             *     turn may inherit the repository/default model.
+             * @description Automatic model selector or provider-qualified pin. Absent means
+             *     inherit the profile, which in turn may inherit the repository/default
+             *     model.
              */
             model?: string | null;
             prompt?: string;
@@ -4173,8 +4456,8 @@ export interface components {
         ReviewerPromptMode: "inherit" | "append" | "replace";
         /**
          * @description A model-picker entry. Automatic entries contain every compatible route;
-         *     concrete provider entries contain exactly one. [`ModelInfo`] remains the
-         *     provider-qualified compatibility catalog.
+         *     concrete provider entries contain exactly one. [`ModelInfo`] is the
+         *     compatibility shape for clients that do not consume route details.
          */
         RoutedModelInfo: {
             /**
@@ -4202,6 +4485,8 @@ export interface components {
             /** Format: double */
             output_price_per_mtok?: number | null;
             routes: components["schemas"]["ModelRouteInfo"][];
+            /** @description True only when every eligible route accepts image inputs. */
+            supports_images?: boolean;
             supports_tools: boolean;
         };
         /** @description Which stream an event belongs to. Cursors are monotonic per scope. */
@@ -4238,8 +4523,8 @@ export interface components {
          *     server event stream at the session-summary cursor instead of cursor zero.
          */
         ServerProjection: {
-            git_worktree_settings: components["schemas"]["GitWorktreeSettings"];
             github_pull_requests: components["schemas"]["GithubPrHostProjection"][];
+            session_naming_settings: components["schemas"]["SessionNamingSettings"];
             session_pull_requests: components["schemas"]["SessionPrProjection"][];
         };
         Session: {
@@ -4255,8 +4540,9 @@ export interface components {
             archived?: boolean;
             base_ref: string;
             /**
-             * @description Branch dedicated to this session. New sessions default to
-             *     `trouve/<short-id>`; users may opt into `trouve/<slug>-<short-id>`.
+             * @description Branch dedicated to this session. New sessions start as
+             *     `trouve/<short-id>` and may be renamed to `trouve/<slug>-<short-id>`
+             *     after asynchronous naming.
              */
             branch: string;
             /** Format: date-time */
@@ -4302,6 +4588,13 @@ export interface components {
             diff: string;
             path: string;
         };
+        /** @description Global asynchronous naming settings shown under Settings → Sessions & Chat. */
+        SessionNamingSettings: {
+            /** @description Rename the compact worktree branch after the session receives its name. */
+            derive_branch_name_from_session_title: boolean;
+            /** @description `auto/<model>` selector or provider-qualified pin used for names. */
+            model: string;
+        };
         /**
          * @description A fresh session-level notification edge derived from a durable thread
          *     event. Clients apply their own notification preferences and foreground
@@ -4316,9 +4609,10 @@ export interface components {
          */
         SessionOutcome: "idle" | "running" | "succeeded" | "failed";
         /**
-         * @description Pull requests already associated with one session using durable branch or
-         *     `session.pr_opened` evidence. This is a local projection of the persisted
-         *     account snapshots and never performs a GitHub request.
+         * @description Pull requests associated with one session by its branch or verified
+         *     creation. This is a local projection of the persisted account snapshots
+         *     and never performs a GitHub request. Matching session-branch PRs precede
+         *     cross-branch PRs with durable creation evidence.
          */
         SessionPrProjection: {
             prs: components["schemas"]["PrInfo"][];
@@ -4352,6 +4646,13 @@ export interface components {
              */
             updated_at: string;
             workspace_id: components["schemas"]["String"];
+        };
+        /**
+         * @description Change only whether an automation is scheduled to run. This narrow
+         *     mutation avoids replacing a concurrently edited automation definition.
+         */
+        SetAutomationEnabledRequest: {
+            enabled: boolean;
         };
         /**
          * @description Replace the persisted automated code-review execution settings
@@ -4399,13 +4700,6 @@ export interface components {
         SetDefaultPermissionModeRequest: {
             permission_mode: components["schemas"]["PermissionMode"];
         };
-        /** @description Update the Session Naming section under Settings → Sessions & Chat. */
-        SetGitWorktreeSettingsRequest: {
-            /** @description Omitted by older clients to preserve the current branch-naming mode. */
-            derive_branch_name_from_session_title?: boolean | null;
-            title_model_load_behavior: components["schemas"]["TitleModelLoadBehavior"];
-            title_model_resource_policy?: components["schemas"]["TitleModelResourcePolicy"];
-        };
         /**
          * @description Atomically replace the global defaults used by new threads
          *     (`PUT /v1/config/defaults`).
@@ -4416,7 +4710,7 @@ export interface components {
              *     so the model chooses its own setting.
              */
             default_thinking_level?: string | null;
-            /** @description Provider-qualified id, e.g. "openai/gpt-4.1-mini". */
+            /** @description `auto/<model>` id, or a provider-qualified id to pin a route. */
             model: string;
             permission_mode: components["schemas"]["PermissionMode"];
         };
@@ -4447,6 +4741,11 @@ export interface components {
              */
             expected_provider_ids?: string[] | null;
             provider_ids: string[];
+        };
+        /** @description Update the Session Naming section under Settings → Sessions & Chat. */
+        SetSessionNamingSettingsRequest: {
+            derive_branch_name_from_session_title: boolean;
+            model: string;
         };
         /**
          * @description A steering message accepted by the active vendor turn. Durable display
@@ -4536,7 +4835,7 @@ export interface components {
              *     clients render controls from the model's `options_schema`.
              */
             model_options?: {
-                [key: string]: unknown;
+                [key: string]: components["schemas"]["ModelOptionValue"];
             };
             parent_thread_id?: null | components["schemas"]["String"];
             permission_mode: components["schemas"]["PermissionMode"];
@@ -4635,6 +4934,12 @@ export interface components {
          */
         ThreadViewItem: {
             attachments: components["schemas"]["Attachment"][];
+            /**
+             * @description Background-activity display row. New snapshots derive this from
+             *     `turn.background_activity`; true on user rows remains possible when
+             *     replaying protocol 7.19–7.26 logs.
+             */
+            background?: boolean;
             content: string;
             /** @enum {string} */
             kind: "user";
@@ -4665,6 +4970,13 @@ export interface components {
             /** Format: int64 */
             turn: number;
         } | {
+            attachments: components["schemas"]["Attachment"][];
+            call_id?: null | components["schemas"]["String"];
+            /** @enum {string} */
+            kind: "artifacts";
+            /** Format: int64 */
+            turn: number;
+        } | {
             complete: boolean;
             content: string;
             /** @enum {string} */
@@ -4674,6 +4986,11 @@ export interface components {
         } | {
             complete: boolean;
             content: string;
+            /**
+             * @description Provider-owned reasoning-item identity. Absent for legacy,
+             *     boundary-inferred reasoning streams.
+             */
+            id?: string | null;
             /** @enum {string} */
             kind: "thinking";
             /** Format: int64 */
@@ -4757,6 +5074,11 @@ export interface components {
          *     response and subscribe to the thread event stream after that cursor.
          */
         ThreadViewSnapshot: {
+            /**
+             * @description Provider-owned identity for the active thinking item. Absent for
+             *     snapshots reconstructed from legacy, boundary-inferred events.
+             */
+            active_thinking_id?: string | null;
             active_usage?: null | components["schemas"]["Usage"];
             commands?: components["schemas"]["CommandInfo"][];
             compacting?: boolean;
@@ -4801,34 +5123,6 @@ export interface components {
                 [key: string]: string;
             };
         };
-        /**
-         * @description When the dedicated session-title model should occupy memory.
-         * @enum {string}
-         */
-        TitleModelLoadBehavior: "auto" | "always" | "on_demand" | "off";
-        /**
-         * @description Compute resources the dedicated session-title model may use.
-         * @enum {string}
-         */
-        TitleModelResourcePolicy: "adaptive" | "gpu_cpu_ram" | "gpu_only" | "cpu_ram_only";
-        /** @description Runtime status for the managed session-title model. */
-        TitleModelStatus: {
-            /** @description Human-readable context for the settings screen. */
-            detail?: string;
-            /** Format: int64 */
-            install_bytes?: number;
-            /** @description Empty, `runtime`, or `model`. */
-            install_stage?: string;
-            /** Format: int64 */
-            install_total?: number;
-            model_downloaded: boolean;
-            runtime_installed: boolean;
-            /**
-             * @description `not_installed`, `installing`, `stopped`, `loading`, `ready`, or
-             *     `error`.
-             */
-            state: string;
-        };
         /** @description One stable item in a thread's current todo list. */
         TodoItem: {
             content: string;
@@ -4864,6 +5158,8 @@ export interface components {
          */
         TurnPhase: "processing" | "connecting_tools";
         UpdateCodeReviewRepositoryRequest: {
+            analyst_model?: string | null;
+            analyst_thinking_level?: string | null;
             coordinator_thinking_level?: string | null;
             /** @description Omitted by older clients to preserve existing forced exclusions. */
             excluded_reviewer_ids?: string[] | null;
@@ -4910,10 +5206,13 @@ export interface components {
             title?: string | null;
         };
         /**
-         * @description Partial thread update between turns (mode/model switching). Rejected with
-         *     a conflict while a turn is running. Omitted fields are unchanged.
+         * @description Partial thread title/settings update. Title-only updates remain available
+         *     during a turn; model, mode, option, and permission changes are rejected
+         *     until the turn is idle. Omitted fields are unchanged.
          */
         UpdateThreadRequest: {
+            /** @description Apply the generated title only while the persisted title still has this value. */
+            expected_title?: string | null;
             mode?: string | null;
             /**
              * @description `auto/<model>` selects dynamically; `provider/<model>` is a hard pin.
@@ -4922,9 +5221,10 @@ export interface components {
             model?: string | null;
             /** @description Replaces the thread's model options when present. */
             model_options?: {
-                [key: string]: unknown;
+                [key: string]: components["schemas"]["ModelOptionValue"];
             } | null;
             permission_mode?: null | components["schemas"]["PermissionMode"];
+            title?: string | null;
         };
         /**
          * @description Create or update an automation (`POST /v1/automations`,
@@ -4934,6 +5234,10 @@ export interface components {
             enabled: boolean;
             mode?: string | null;
             model?: string | null;
+            /** @description Model-specific values selected from the model's `options_schema`. */
+            model_options?: {
+                [key: string]: components["schemas"]["ModelOptionValue"];
+            };
             name: string;
             /**
              * @description Permission policy for each fresh automation session. Omitted by older
@@ -5056,7 +5360,6 @@ export interface components {
             /** Format: int64 */
             output_tokens: number;
         };
-        /** @description Aggregated usage for a thread or session. */
         UsageSummary: {
             /** Format: int64 */
             cached_input_tokens: number;
@@ -5064,15 +5367,23 @@ export interface components {
             cost_usd: number;
             /** Format: int64 */
             input_tokens: number;
+            models?: components["schemas"]["ModelUsageSummary"][];
             /** Format: int64 */
             output_tokens: number;
             /** Format: int64 */
             turns: number;
         };
-        Workspace: {
+        /**
+         * @description Workspace presentation returned by the list and registration endpoints.
+         *     Separate checkouts and linked worktrees share repository_key when they
+         *     resolve to the same configured remote or local Git common directory.
+         */
+        WorkspaceListItem: {
             id: components["schemas"]["String"];
             name: string;
             path: string;
+            repository_key?: string | null;
+            repository_name?: string | null;
         };
     };
     responses: never;
@@ -5283,6 +5594,39 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    set_automation_enabled: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetAutomationEnabledRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Automation"];
+                };
             };
             404: {
                 headers: {
@@ -6135,110 +6479,6 @@ export interface operations {
             };
         };
     };
-    get_git_worktree_settings: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    /** @description Server event cursor for this snapshot */
-                    "x-trouve-event-cursor"?: number;
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["GitWorktreeSettings"];
-                };
-            };
-        };
-    };
-    set_git_worktree_settings: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["SetGitWorktreeSettingsRequest"];
-            };
-        };
-        responses: {
-            200: {
-                headers: {
-                    /** @description Server event cursor for this snapshot */
-                    "x-trouve-event-cursor"?: number;
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["GitWorktreeSettings"];
-                };
-            };
-        };
-    };
-    install_title_model: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            202: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            409: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-        };
-    };
-    cancel_title_model_install: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            204: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-            409: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-        };
-    };
     set_provider_order: {
         parameters: {
             query?: never;
@@ -6272,6 +6512,52 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_session_naming_settings: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    /** @description Server event cursor for this snapshot */
+                    "x-trouve-event-cursor"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SessionNamingSettings"];
+                };
+            };
+        };
+    };
+    set_session_naming_settings: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetSessionNamingSettingsRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    /** @description Server event cursor for this snapshot */
+                    "x-trouve-event-cursor"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SessionNamingSettings"];
                 };
             };
         };
@@ -7362,29 +7648,6 @@ export interface operations {
             };
         };
     };
-    generate_session_title: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["GenerateSessionTitleRequest"];
-            };
-        };
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["GeneratedSessionTitle"];
-                };
-            };
-        };
-    };
     list_sessions: {
         parameters: {
             query?: {
@@ -8164,6 +8427,44 @@ export interface operations {
             };
         };
     };
+    generate_session_title_from_transcript: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Session whose conversation supplies the naming context */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GeneratedTitle"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     undo_session: {
         parameters: {
             query?: never;
@@ -8742,6 +9043,44 @@ export interface operations {
             };
         };
     };
+    generate_thread_title_from_transcript: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Thread whose conversation supplies the naming context */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GeneratedTitle"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     get_thread_tool_details: {
         parameters: {
             query?: never;
@@ -8839,6 +9178,37 @@ export interface operations {
             };
         };
     };
+    generate_title: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["GenerateTitleRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GeneratedTitle"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     list_workspaces: {
         parameters: {
             query?: never;
@@ -8853,7 +9223,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["Workspace"][];
+                    "application/json": components["schemas"]["WorkspaceListItem"][];
                 };
             };
         };
@@ -8876,7 +9246,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["Workspace"];
+                    "application/json": components["schemas"]["WorkspaceListItem"];
                 };
             };
             400: {

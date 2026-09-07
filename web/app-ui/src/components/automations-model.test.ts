@@ -1,15 +1,43 @@
 import { describe, expect, it } from "vitest";
+import type {
+  ProtocolAutomation,
+  ProtocolModelInfo,
+} from "../services/protocol-client.js";
+import {
+  parseProtocolJson,
+  stringifyProtocolJson,
+} from "../services/protocol-json.js";
 
 import {
   automationDraftFrom,
   automationDraftFromTemplate,
   automationRequestFromDraft,
   automationScheduleSummary,
+  effectiveAutomationModelId,
   emptyAutomationDraft,
+  modelOptionsAfterEffectiveModelChange,
   validateAutomationDraft,
 } from "./automations-model.js";
 
+const protocolModel = (value: ProtocolModelInfo): ProtocolModelInfo =>
+  parseProtocolJson(JSON.stringify(value)) as ProtocolModelInfo;
+
 describe("automation form model", () => {
+  const model = protocolModel({
+    id: "provider/model",
+    display_name: "Model",
+    context_window: 128_000,
+    supports_tools: true,
+    options_schema: {
+      type: "object",
+      properties: {
+        reasoning_effort: {
+          type: "string",
+          enum: ["low", "high"],
+        },
+      },
+    },
+  });
   it("normalizes optional schedule and permission fields from older responses", () => {
     const draft = automationDraftFrom({
       id: "auto_1",
@@ -57,11 +85,21 @@ describe("automation form model", () => {
       prompt: "  Review recent changes  ",
       mode: "review",
       model: "openai/gpt-5.6",
-      thinkingLevel: "max",
+      modelOptions: { reasoning_effort: "max", fast: true },
       permissionMode: "allow_list",
       scheduleKind: "weekly",
       time: "07:15",
       days: [6, 0, 6, 3],
+    }, {
+      ...model,
+      id: "openai/gpt-5.6",
+      options_schema: {
+        type: "object",
+        properties: {
+          reasoning_effort: { enum: ["low", "max"] },
+          fast: { type: "boolean" },
+        },
+      },
     });
 
     expect(request).toMatchObject({
@@ -70,11 +108,150 @@ describe("automation form model", () => {
       workspace_id: "ws_1",
       mode: "review",
       model: "openai/gpt-5.6",
-      thinking_level: "max",
+      thinking_level: null,
+      model_options: { reasoning_effort: "max", fast: true },
       permission_mode: "allow_list",
       schedule: { kind: "weekly", minute: 0, time: "07:15", days: [0, 3, 6] },
       enabled: true,
     });
+  });
+
+  it("drops stale automation options and translates the legacy thinking key", () => {
+    const draft = {
+      ...emptyAutomationDraft("ws_1"),
+      name: "Check",
+      prompt: "Run it",
+    };
+    expect(automationRequestFromDraft({
+      ...draft,
+      modelOptions: { effort: "missing", removed: true },
+    }, model).model_options).toEqual({});
+    expect(automationRequestFromDraft({
+      ...draft,
+      modelOptions: { thinking_level: "high" },
+    }, model).model_options).toEqual({ reasoning_effort: "high" });
+  });
+
+  it("never perpetuates hidden options when catalog metadata is unavailable", () => {
+    const request = automationRequestFromDraft({
+      ...emptyAutomationDraft("ws_1"),
+      name: "Check",
+      prompt: "Run it",
+      modelOptions: { removed: true, effort: "high" },
+    }, undefined);
+    expect(request.model_options).toEqual({});
+  });
+
+  it("keeps options only while the effective model stays the same", () => {
+    const options = { reasoning_effort: "max", fast: true };
+    expect(modelOptionsAfterEffectiveModelChange(
+      options,
+      "openai/gpt-5.6",
+      "openai/gpt-5.6",
+    )).toBe(options);
+    expect(modelOptionsAfterEffectiveModelChange(
+      options,
+      "openai/gpt-5.6",
+      "anthropic/claude-opus-4.1",
+    )).toEqual({});
+    expect(modelOptionsAfterEffectiveModelChange(options, undefined, undefined)).toEqual({});
+  });
+
+  it("resolves model identity independently from catalog objects", () => {
+    const modes = [
+      { id: "code", default_model: "provider/shared" },
+      { id: "review", default_model: "provider/shared" },
+      { id: "plan", default_model: "provider/plan" },
+    ];
+    const providers = { default_model: "provider/global" };
+    expect(effectiveAutomationModelId(
+      { mode: "review", model: "" },
+      modes,
+      providers,
+    )).toBe("provider/shared");
+    expect(effectiveAutomationModelId(
+      { mode: "review", model: "provider/explicit" },
+      [],
+      providers,
+    )).toBe("provider/explicit");
+    expect(effectiveAutomationModelId(
+      { mode: "missing", model: "" },
+      modes,
+      providers,
+    )).toBeUndefined();
+  });
+
+  it("keeps legacy thinking available until a competing alias is validated", () => {
+    const draft = automationDraftFrom({
+      id: "auto_budget",
+      name: "Budget",
+      prompt: "Run it",
+      workspace_id: "ws_1",
+      thinking_level: "16384",
+      model_options: { thinking_budget_tokens: 8192 },
+      permission_mode: "ask",
+      schedule: { kind: "daily", time: "09:00" },
+      enabled: true,
+      created_at: "2026-08-02T12:00:00Z",
+    });
+    expect(draft.modelOptions).toEqual({
+      thinking_budget_tokens: 8192,
+      thinking_level: "16384",
+    });
+    expect(automationRequestFromDraft(draft, protocolModel({
+      ...model,
+      options_schema: {
+        type: "object",
+        properties: {
+          thinking_budget_tokens: { type: "integer", minimum: 1024 },
+        },
+      },
+    })).model_options).toEqual({ thinking_budget_tokens: 8192 });
+
+    const staleAlias = automationDraftFrom({
+      id: "auto_stale",
+      name: "Stale alias",
+      prompt: "Run it",
+      workspace_id: "ws_1",
+      thinking_level: "high",
+      model_options: { effort: "stale" },
+      permission_mode: "ask",
+      schedule: { kind: "daily", time: "09:00" },
+      enabled: true,
+      created_at: "2026-08-02T12:00:00Z",
+    });
+    expect(automationRequestFromDraft(staleAlias, model).model_options).toEqual({
+      reasoning_effort: "high",
+    });
+  });
+
+  it("preserves verified numeric option tokens through an automation edit", () => {
+    const automation = parseProtocolJson(`{
+      "id": "auto_numeric",
+      "name": "Numeric",
+      "prompt": "Run it",
+      "workspace_id": "ws_1",
+      "model": "provider/model",
+      "model_options": { "temperature": 0.10000000000000000 },
+      "permission_mode": "ask",
+      "schedule": { "kind": "daily", "time": "09:00" },
+      "enabled": true,
+      "created_at": "2026-08-02T12:00:00Z"
+    }`) as ProtocolAutomation;
+    const request = automationRequestFromDraft(
+      automationDraftFrom(automation),
+      protocolModel({
+        ...model,
+        options_schema: {
+          type: "object",
+          properties: { temperature: { type: "number" } },
+        },
+      }),
+    );
+
+    expect(stringifyProtocolJson(request)).toContain(
+      '"model_options":{"temperature":0.10000000000000000}',
+    );
   });
 
   it("applies templates without choosing unsafe permissions for the user", () => {

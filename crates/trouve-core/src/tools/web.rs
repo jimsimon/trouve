@@ -1,6 +1,6 @@
 //! Fetch a URL and return its content as readable text.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 
 use serde_json::{Value, json};
 
@@ -15,55 +15,19 @@ const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const MAX_REDIRECTS: usize = 5;
 
 #[derive(Default)]
-pub struct WebFetch {
-    /// Test hook: hermetic tests fetch from 127.0.0.1, which the SSRF guard
-    /// refuses by default.
-    pub allow_private: bool,
-}
+pub struct WebFetch;
 
-/// Whether an address is publicly routable. The agent must not be able to
-/// reach loopback services, cloud metadata endpoints (169.254.169.254), or
-/// anything on the private network (SSRF).
-fn ip_is_public(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => {
-            let octets = v4.octets();
-            let cgnat = octets[0] == 100 && (octets[1] & 0xc0) == 64; // 100.64/10
-            !(v4.is_loopback()
-                || v4.is_private()
-                || v4.is_link_local()
-                || v4.is_unspecified()
-                || v4.is_broadcast()
-                || v4.is_multicast()
-                || v4.is_documentation()
-                || cgnat
-                || octets[0] == 0)
-        }
-        IpAddr::V6(v6) => {
-            if let Some(mapped) = v6.to_ipv4_mapped() {
-                return ip_is_public(IpAddr::V4(mapped));
-            }
-            let unique_local = (v6.segments()[0] & 0xfe00) == 0xfc00; // fc00::/7
-            let link_local = (v6.segments()[0] & 0xffc0) == 0xfe80; // fe80::/10
-            !(v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_multicast()
-                || unique_local
-                || link_local)
-        }
-    }
-}
-
-/// Resolve the URL's host and return the validated socket addresses to pin
-/// the connection to, or an error naming the offending address.
-async fn checked_addrs(url: &reqwest::Url, allow_private: bool) -> Result<Vec<SocketAddr>, String> {
+/// Resolve the URL's host and return the socket addresses used to pin the
+/// connection. Network access is authorized by the session permission gate;
+/// the fetch tool does not impose a second address-based policy.
+async fn resolved_addrs(url: &reqwest::Url) -> Result<Vec<SocketAddr>, String> {
     let Some(host) = url.host_str() else {
         return Err("URL has no host".to_string());
     };
     let port = url.port_or_known_default().unwrap_or(80);
     // IPv6 literals appear bracketed in host_str.
     let literal = host.trim_start_matches('[').trim_end_matches(']');
-    let addrs: Vec<SocketAddr> = if let Ok(ip) = literal.parse::<IpAddr>() {
+    let addrs: Vec<SocketAddr> = if let Ok(ip) = literal.parse() {
         vec![SocketAddr::new(ip, port)]
     } else {
         match tokio::net::lookup_host((host, port)).await {
@@ -73,13 +37,6 @@ async fn checked_addrs(url: &reqwest::Url, allow_private: bool) -> Result<Vec<So
     };
     if addrs.is_empty() {
         return Err("host resolved to no addresses".to_string());
-    }
-    if !allow_private && let Some(bad) = addrs.iter().find(|a| !ip_is_public(a.ip())) {
-        return Err(format!(
-            "{} resolves to non-public address {}; refusing to fetch",
-            url.host_str().unwrap_or("host"),
-            bad.ip()
-        ));
     }
     Ok(addrs)
 }
@@ -119,11 +76,8 @@ impl Tool for WebFetch {
         }
         let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
 
-        // Follow redirects manually, re-validating the target of every hop:
-        // reqwest's automatic redirects would happily hop from a public URL
-        // to 127.0.0.1 or the cloud metadata service. Connections are pinned
-        // to the validated addresses so DNS can't rebind between the check
-        // and the connect.
+        // Follow redirects manually so scheme and hop limits apply to every
+        // target. Pin each connection to the addresses resolved for that hop.
         let mut current = match reqwest::Url::parse(url) {
             Ok(u) => u,
             Err(e) => return ToolResult::error(format!("invalid URL: {e}")),
@@ -136,7 +90,7 @@ impl Tool for WebFetch {
             let addrs = match tokio::select! {
                 biased;
                 _ = ctx.cancel.cancelled() => return ToolResult::error("fetch cancelled"),
-                result = checked_addrs(&current, self.allow_private) => result,
+                result = resolved_addrs(&current) => result,
             } {
                 Ok(a) => a,
                 Err(e) => return ToolResult::error(e),
@@ -272,40 +226,11 @@ mod tests {
     #[tokio::test]
     async fn rejects_non_http_urls() {
         let ctx = ToolCtx::default();
-        let tool = WebFetch::default();
+        let tool = WebFetch;
         let res = tool.run(&ctx, &json!({"url": "file:///etc/passwd"})).await;
         assert_eq!(res.status, trouve_protocol::ToolStatus::Error);
         let res = tool.run(&ctx, &json!({"url": "ftp://x/y"})).await;
         assert_eq!(res.status, trouve_protocol::ToolStatus::Error);
-    }
-
-    #[tokio::test]
-    async fn refuses_non_public_addresses_by_default() {
-        let ctx = ToolCtx::default();
-        let tool = WebFetch::default();
-        for url in [
-            "http://127.0.0.1/",
-            "http://localhost/",
-            "http://169.254.169.254/latest/meta-data/",
-            "http://10.0.0.1/",
-            "http://192.168.1.1/",
-            "http://100.64.0.1/",
-            "http://[::1]/",
-            "http://[fd00::1]/",
-        ] {
-            let res = tool.run(&ctx, &json!({ "url": url })).await;
-            assert_eq!(
-                res.status,
-                trouve_protocol::ToolStatus::Error,
-                "expected refusal for {url}: {:?}",
-                res.result
-            );
-            let msg = res.result["error"].as_str().unwrap_or_default();
-            assert!(
-                msg.contains("non-public") || msg.contains("cannot resolve"),
-                "unexpected error for {url}: {msg}"
-            );
-        }
     }
 
     #[tokio::test]
@@ -327,11 +252,9 @@ mod tests {
             ..Default::default()
         };
         let fetch = tokio::spawn(async move {
-            WebFetch {
-                allow_private: true,
-            }
-            .run(&ctx, &json!({"url": format!("http://{addr}/hang")}))
-            .await
+            WebFetch
+                .run(&ctx, &json!({"url": format!("http://{addr}/hang")}))
+                .await
         });
         tokio::time::timeout(std::time::Duration::from_secs(1), accepted.notified())
             .await
@@ -343,28 +266,6 @@ mod tests {
             .unwrap();
         assert_eq!(result.status, trouve_protocol::ToolStatus::Error);
         assert_eq!(result.result["error"], "fetch cancelled");
-    }
-
-    #[test]
-    fn public_ip_classification() {
-        for bad in [
-            "127.0.0.1",
-            "10.1.2.3",
-            "172.16.0.1",
-            "192.168.0.1",
-            "169.254.169.254",
-            "100.64.0.1",
-            "0.0.0.0",
-            "::1",
-            "fe80::1",
-            "fd12::1",
-            "::ffff:127.0.0.1",
-        ] {
-            assert!(!ip_is_public(bad.parse().unwrap()), "{bad} must be private");
-        }
-        for good in ["93.184.216.34", "8.8.8.8", "2606:2800:220:1::1"] {
-            assert!(ip_is_public(good.parse().unwrap()), "{good} must be public");
-        }
     }
 
     /// Serve one canned response per connection on an ephemeral port.
@@ -392,7 +293,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetches_html_as_text_and_pages_with_offset() {
+    async fn fetches_loopback_html_as_text_and_pages_with_offset() {
         let addr = serve(|_| {
             let body = "<html><body><h1>Title</h1><p>Hello <b>world</b>.</p></body></html>";
             format!(
@@ -403,9 +304,7 @@ mod tests {
         .await;
 
         let ctx = ToolCtx::default();
-        let tool = WebFetch {
-            allow_private: true,
-        };
+        let tool = WebFetch;
         let res = tool
             .run(&ctx, &json!({"url": format!("http://{addr}/")}))
             .await;
@@ -443,9 +342,7 @@ mod tests {
         .await;
 
         let ctx = ToolCtx::default();
-        let tool = WebFetch {
-            allow_private: true,
-        };
+        let tool = WebFetch;
         let res = tool
             .run(&ctx, &json!({"url": format!("http://{addr}/start")}))
             .await;

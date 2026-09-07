@@ -11,6 +11,10 @@ describe("thread screen provisional setup integration", () => {
     new URL("./new-thread-setup.ts", import.meta.url),
     "utf8",
   );
+  const app = readFileSync(
+    new URL("../app/trouve-app.ts", import.meta.url),
+    "utf8",
+  );
 
   it("opens a provisional tab without eagerly creating a thread", () => {
     expect(screen).toContain("openNewThreadSetup");
@@ -21,14 +25,18 @@ describe("thread screen provisional setup integration", () => {
     );
   });
 
-  it("uses the shared title generator before creating and seeding the thread", () => {
-    expect(screen).toContain("services.protocol.generateSessionTitle(prompt");
-    expect(screen).toContain("request = { ...request, title: generated.title.trim() }");
+  it("creates and seeds the placeholder thread before naming it in the background", () => {
+    expect(screen).toContain("title: NEW_THREAD_TITLE_FALLBACK");
     expect(screen).toContain("services.protocol.createThread(request)");
     expect(screen).toContain("store.upsertThread(thread)");
     expect(screen).toContain(
       "services.protocol.sendMessage(thread.id, event.detail.initialMessage)",
     );
+    expect(screen).toContain("services.protocol.generateTitle(");
+    expect(screen).toContain("event.detail.initialMessage?.attachments ?? []");
+    expect(screen).toContain("expected_title: NEW_THREAD_TITLE_FALLBACK");
+    expect(screen.indexOf("services.protocol.createThread(request)"))
+      .toBeLessThan(screen.indexOf("services.protocol.generateTitle("));
     expect(screen).toContain(
       "Thread was created, but its first message could not be sent.",
     );
@@ -42,6 +50,23 @@ describe("thread screen provisional setup integration", () => {
     );
   });
 
+  it("publishes the effective setup state and clears it across navigation", () => {
+    expect(screen).toContain(
+      "this.#publishNewThreadSetupState(this.#effectiveNewThreadSetupOpen())",
+    );
+    const disconnectStart = screen.indexOf("override disconnectedCallback(): void");
+    const disconnectEnd = screen.indexOf("super.disconnectedCallback()", disconnectStart);
+    const disconnect = screen.slice(disconnectStart, disconnectEnd);
+    expect(disconnect).toContain("this.#newThreadSetupOpen = false");
+    expect(disconnect).toContain("this.#publishNewThreadSetupState(false)");
+    expect(screen).toContain(
+      "if (this.#publishedNewThreadSetupOpen === open) return",
+    );
+    expect(app).toContain(
+      '|| (route.kind === "session" && this.#newThreadSetupOpen)',
+    );
+  });
+
   it("seeds setup controls from the already-loaded chat catalog", () => {
     expect(screen).toContain(".catalogModes=${this.#modes}");
     expect(screen).toContain(".catalogModels=${models}");
@@ -49,12 +74,13 @@ describe("thread screen provisional setup integration", () => {
     expect(screen).not.toContain(
       "this.#threadSettingsPending || this.#models.length === 0 || connectivityBlocked",
     );
-    expect(screen).toContain('class=${`model-health-pill ${subscriptionLoading ? "loading" : "unavailable"}`}');
+    expect(screen).not.toContain('class="composer-option subscription-option"');
   });
 
   it("keeps async new-thread defaults synchronized with native select options", () => {
     expect(setup).toContain(".selected=${mode.id === this.#draft.modeId}");
-    expect(setup).toContain(".selected=${value === this.#draft.thinking}");
+    expect(setup).toContain("const modelOptions = newThreadModelOptionControls(");
+    expect(setup).toContain(".controls=${modelOptions}");
     expect(setup).toContain('.selected=${this.#draft.permissionMode === "ask"}');
     expect(setup).toContain(
       '.selected=${this.#draft.permissionMode === "allow_list"}',

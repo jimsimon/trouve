@@ -719,6 +719,103 @@ pub fn pr_numbers_in_text(text: &str, host: &str, owner: &str, repo: &str) -> Ve
     numbers
 }
 
+/// Pull-request references in user-visible chat for the session repository.
+/// In addition to canonical URLs, accept unambiguous conversational shorthand
+/// such as `PR #123` and `pull request #123`; a bare `#123` may be an issue and
+/// is therefore not enough to create an association.
+pub fn pr_numbers_in_chat_text(text: &str, host: &str, owner: &str, repo: &str) -> Vec<u64> {
+    let mut numbers = pr_numbers_in_text(text, host, owner, repo);
+    for number in pr_shorthand_numbers_in_text(text) {
+        if !numbers.contains(&number) {
+            numbers.push(number);
+        }
+    }
+    numbers
+}
+
+/// Repository-local conversational PR shorthand, excluding ambiguous bare
+/// issue-style numbers.
+pub fn pr_shorthand_numbers_in_text(text: &str) -> Vec<u64> {
+    let mut numbers = Vec::new();
+    let lowercase = text.to_ascii_lowercase();
+    for marker in ["pr #", "pull request #"] {
+        let mut rest = lowercase.as_str();
+        while let Some(index) = rest.find(marker) {
+            let marker_has_boundary = rest[..index]
+                .chars()
+                .next_back()
+                .is_none_or(|ch| !ch.is_alphanumeric() && ch != '_');
+            rest = &rest[index + marker.len()..];
+            let digits = rest
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>();
+            let suffix_has_boundary = rest[digits.len()..]
+                .chars()
+                .next()
+                .is_none_or(|ch| !ch.is_alphanumeric() && ch != '_');
+            if marker_has_boundary
+                && suffix_has_boundary
+                && let Ok(number) = digits.parse()
+                && number > 0
+                && !numbers.contains(&number)
+            {
+                numbers.push(number);
+            }
+        }
+    }
+    numbers
+}
+
+/// Canonical pull-request browser references appearing in user-visible text.
+///
+/// Unlike [`pr_numbers_in_text`], this is repository-neutral so the durable
+/// chat-association path can retain links to PRs outside the session's
+/// workspace. REST endpoints are deliberately excluded: a chat association
+/// must have a safe browser URL that clients can navigate to.
+pub fn pr_browser_references_in_text(text: &str) -> Vec<(String, u64)> {
+    let mut references: Vec<(String, u64)> = Vec::new();
+    let mut rest = text;
+    while let Some(index) = rest.find("https://") {
+        rest = &rest[index..];
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let candidate = rest[..end].trim_end_matches(|ch: char| {
+            matches!(
+                ch,
+                ')' | ']' | '}' | '>' | ',' | '.' | ';' | ':' | '!' | '?' | '"' | '\'' | '`'
+            )
+        });
+        if let Ok(mut url) = reqwest::Url::parse(candidate)
+            && url.username().is_empty()
+            && url.password().is_none()
+        {
+            let segments = url
+                .path_segments()
+                .map(|segments| segments.collect::<Vec<_>>())
+                .unwrap_or_default();
+            if let [owner, repository, "pull", number, ..] = segments.as_slice()
+                && let Ok(number) = number.parse::<u64>()
+                && number > 0
+            {
+                let owner = (*owner).to_string();
+                let repository = (*repository).to_string();
+                url.set_query(None);
+                url.set_fragment(None);
+                url.set_path(&format!("/{owner}/{repository}/pull/{number}"));
+                let canonical = url.to_string().trim_end_matches('/').to_string();
+                if !references
+                    .iter()
+                    .any(|(existing, _)| existing.eq_ignore_ascii_case(&canonical))
+                {
+                    references.push((canonical, number));
+                }
+            }
+        }
+        rest = &rest[end..];
+    }
+    references
+}
+
 /// Browser URL for a repository-local pull request number.
 pub fn pr_url(host: &str, owner: &str, repo: &str, number: u64) -> String {
     format!("https://{host}/{owner}/{repo}/pull/{number}")
@@ -4126,6 +4223,45 @@ mod tests {
             vec![73, 74, 75]
         );
         assert!(pr_numbers_in_text(text, "github.com", "other", "project").is_empty());
+    }
+
+    #[test]
+    fn finds_explicit_pr_shorthand_in_chat_without_treating_issues_as_prs() {
+        assert_eq!(
+            pr_numbers_in_chat_text(
+                "Compare PR #12 and pull request #14 with issue #13; PR #12 is repeated",
+                "github.com",
+                "acme",
+                "widgets",
+            ),
+            vec![12, 14]
+        );
+        assert!(
+            pr_shorthand_numbers_in_text(
+                "repr #15, xPR #16, PR #17abc, and pull request #18_suffix"
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn finds_canonical_browser_pr_references_in_chat_text() {
+        let text = concat!(
+            "Compare [PR #350](https://github.com/JimSimon/trouve/pull/350#discussion), ",
+            "https://github.example.com/acme/widgets/pull/12). ",
+            "\"https://github.com/acme/quoted/pull/13\" ",
+            "`https://github.com/acme/ticked/pull/14` ",
+            "Ignore http://github.com/acme/widgets/pull/9 and https://github.com/acme/widgets/issues/8"
+        );
+        assert_eq!(
+            pr_browser_references_in_text(text),
+            vec![
+                ("https://github.com/JimSimon/trouve/pull/350".into(), 350),
+                ("https://github.example.com/acme/widgets/pull/12".into(), 12),
+                ("https://github.com/acme/quoted/pull/13".into(), 13),
+                ("https://github.com/acme/ticked/pull/14".into(), 14),
+            ]
+        );
     }
 
     #[test]

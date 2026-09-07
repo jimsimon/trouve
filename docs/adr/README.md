@@ -23,8 +23,8 @@ sequentially.
 | [0011](0011-github-app-backed-code-review-service.md) | GitHub App-backed code review service | Accepted |
 | [0012](0012-single-version-monorepo-release-train.md) | Single-version monorepo release train | Accepted |
 | [0013](0013-preact-review-dashboard.md) | Preact application for the review dashboard | Accepted |
-| [0014](0014-durable-code-review-job-artifacts.md) | Durable code-review job artifacts and event streams | Accepted |
-| [0015](0015-read-shared-turns-and-prioritized-capacity.md) | Read-shared turns and prioritized model capacity | Accepted |
+| [0014](0014-durable-code-review-job-artifacts.md) | Durable code-review job artifacts and event streams | Partially superseded by 0045 |
+| [0015](0015-read-shared-turns-and-prioritized-capacity.md) | Read-shared turns and prioritized model capacity | Partially superseded by 0042 |
 | [0016](0016-catalog-backed-provider-transports.md) | Catalog-backed provider transports | Accepted |
 | [0017](0017-server-owned-session-title-model.md) | Server-owned session title model with heuristic fallback | Superseded by 0029 |
 | [0018](0018-bounded-coalesced-event-ingestion.md) | Bounded, coalesced event ingestion | Accepted |
@@ -39,11 +39,11 @@ sequentially.
 | [0027](0027-wry-default-desktop-frontend.md) | Wry as the default desktop frontend | Superseded by 0028 |
 | [0028](0028-retire-slint-frontend.md) | Retire the Slint frontend | Partially superseded by 0039 |
 | [0029](0029-short-session-branch-names.md) | Short session branch names by default | Accepted |
-| [0030](0030-parallel-tool-execution-and-vendor-mutation-confinement.md) | Parallel tool execution with per-session mutation confinement | Accepted |
+| [0030](0030-parallel-tool-execution-and-vendor-mutation-confinement.md) | Parallel tool execution with per-session mutation confinement | Partially superseded by 0034 and 0043 |
 | [0031](0031-acknowledged-turn-cancellation.md) | Acknowledged turn cancellation | Accepted |
 | [0032](0032-single-local-server-owner.md) | Single local server owner per data directory | Accepted |
 | [0033](0033-materialized-pageable-thread-history.md) | Materialized pageable thread history | Accepted |
-| [0034](0034-concurrent-session-turns.md) | Concurrent turns in a shared session worktree | Accepted |
+| [0034](0034-concurrent-session-turns.md) | Concurrent turns in a shared session worktree | Partially superseded by 0042 |
 | [0035](0035-bounded-recursive-subagent-trees.md) | Bounded recursive subagent trees | Accepted |
 | [0036](0036-exact-protocol-version-compatibility.md) | Exact protocol version compatibility | Accepted |
 | [0037](0037-capability-scoped-external-read-roots.md) | Capability-scoped external read roots | Accepted |
@@ -51,5 +51,15 @@ sequentially.
 | [0039](0039-retire-servo-qualification-hosts.md) | Retire Servo qualification hosts | Accepted |
 | [0040](0040-durable-root-cause-history-for-code-review.md) | Durable root-cause history for code review | Accepted |
 | [0041](0041-evidence-backed-review-churn-controls.md) | Evidence-backed review churn controls | Accepted |
-| [0042](0042-policy-ordered-cross-adapter-model-routing.md) | Policy-ordered cross-adapter model routing | Partially superseded by 0043 |
-| [0043](0043-explicit-and-sticky-model-route-selection.md) | Explicit and sticky model route selection | Accepted |
+| [0042](0042-provider-governed-turn-admission.md) | Provider-governed turn admission | Accepted |
+| [0043](0043-background-jobs-release-mutation-lane.md) | Background jobs release the session mutation lane | Partially superseded by 0046 |
+| [0044](0044-durable-assistant-produced-artifacts.md) | Durable assistant-produced artifacts | Accepted |
+| [0045](0045-full-branch-review-on-every-head.md) | Full-branch review on every head | Accepted |
+| [0046](0046-detached-descendants-are-session-scoped.md) | Detached descendants of shell calls are session-scoped | Accepted |
+| [0047](0047-cursor-sdk-bridge-transport.md) | Cursor SDK Bridge transport | Partially superseded by 0050 |
+| [0048](0048-configured-asynchronous-session-naming.md) | Configured asynchronous session naming | Accepted |
+| [0049](0049-explicit-ownership-for-managed-background-work.md) | Explicit ownership for managed background work | Accepted |
+| [0050](0050-shared-cursor-sdk-bridge-process.md) | One shared Cursor SDK Bridge per backend | Accepted |
+| [0051](0051-cursor-shared-store-transition-and-quarantine.md) | Cursor shared-store transition and callback quarantine | Accepted |
+| [0052](0052-policy-ordered-cross-adapter-model-routing.md) | Policy-ordered cross-adapter model routing | Partially superseded by 0053 |
+| [0053](0053-explicit-and-sticky-model-route-selection.md) | Explicit and sticky model route selection | Accepted |

@@ -1,4 +1,4 @@
-# 0042 — Policy-ordered cross-adapter model routing
+# 0052 — Policy-ordered cross-adapter model routing
 
 Status: Accepted (2026-08).
 
@@ -9,8 +9,8 @@ catalog for public models while live providers and vendor CLIs determine
 account availability. The model picker still exposed provider-qualified ids,
 which fixed a thread to one API account or vendor subscription even when
 several routes could run the same catalog-normalized model.
-This decision extends ADRs 0015, 0016, and 0020; it does not reverse or
-supersede any of them.
+This decision extends ADRs 0016, 0020, and 0042. Provider-governed turn
+admission remains authoritative for every attempted concrete route.
 
 Provider capacity is uneven and only some vendor backends report allowance
 windows. With many configured routes, blindly probing in stable order can
@@ -29,7 +29,8 @@ translate provider-private live state or duplicate ambiguous side effects.
   with the same safe, catalog-normalized execution id share a provider-neutral
   id. Local and loopback routes, transport-owned choices such as `default`,
   and namespaced ids retain a provider-qualified picker id. `/v1/models`
-  remains the provider-qualified compatibility catalog.
+  exposes the same selector ids in the legacy `ModelInfo` shape without route
+  details.
 - Provider-qualified selections are explicit hard pins. Provider-neutral
   selections resolve at turn time across both API providers and vendor-agent
   backends.
@@ -42,11 +43,12 @@ translate provider-private live state or duplicate ambiguous side effects.
   exponential cooldowns. Editing or deleting a provider clears its learned
   failures. A turn tries at most four fresh routes and fails fast when all
   routes are cooling down or report exhausted capacity.
-- Each attempt reports a common completed, cancelled, or failed result.
-  Native provider errors can safely hand off because a model stream cannot
-  execute tools itself. A vendor backend's non-capacity error can hand off
-  only before tool activity; a positively classified capacity error may hand
-  off after tool activity once open tool cards are closed as aborted.
+- Each attempt reports a common completed, cancelled, or failed result. A
+  failure may hand off only before a mutating or unknown side effect begins;
+  completed read-only tool activity remains replay-safe across adapters. Once
+  mutation may have started, the failure is terminal even when it is classified
+  as capacity exhaustion. Cancellation is terminal without changing route
+  health.
 - The persisted transcript, event log, and shared session worktree are the
   cross-adapter handoff boundary. A continuation receives the transcript or a
   bounded digest and is told to inspect current state rather than repeat work.
@@ -58,19 +60,23 @@ translate provider-private live state or duplicate ambiguous side effects.
   thinking levels use the canonical `thinking_level` key and are translated
   to each route's native option immediately before execution.
 - Initial choices and failovers are persisted as `model.route_selected`
-  events. Turn capacity remains globally bounded and provider-specific
-  capacity is acquired separately for each attempted route.
+  events. Each attempted route passes through ADR 0042's provider-governed
+  cooldown admission independently; automatic routing skips routes already
+  cooling down rather than waiting behind each one in preference order.
 
 models.dev currently normalizes metadata, option schemas, and public ids but
 does not expose a universal cross-vendor alias graph. The identity function
-therefore remains deliberately conservative; future reviewed aliases can
+therefore remains deliberately conservative: direct catalog records use their
+canonical model id, and a trouve-owned serving-surface record participates only
+when its reviewed `base_model` explicitly points to that public model. Overlay
+records without a public base remain concrete-only. Future reviewed aliases can
 extend grouping without changing the picker or turn protocol.
 
 ## Consequences
 
 - The original picker policy showed a bare hosted model id such as
   `gpt-5.6-sol`, while local and transport-owned entries remained visibly
-  qualified. ADR 0043 supersedes that identifier and concrete-choice policy by
+  qualified. ADR 0053 supersedes that identifier and concrete-choice policy by
   emitting `auto/<model>` alongside concrete `provider/<model>` choices.
 - API routes and vendor-agent backends can replace one another within a turn
   without weakening permission or tool policy.

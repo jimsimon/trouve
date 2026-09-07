@@ -23,11 +23,11 @@ use std::sync::atomic::{AtomicI64, Ordering};
 
 use futures::StreamExt;
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::ChildStdin;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use trouve_protocol::{ModelInfo, TodoItem, TodoStatus, Usage};
-use trouve_providers::codex::completed_raw_reasoning_text;
+use trouve_providers::codex::completed_reasoning_text;
 use trouve_providers::models_dev::{ModelsDevCatalog, OptionsDialect};
 
 use crate::process_env::{ProcessTreeChild, spawn_process_tree};
@@ -43,6 +43,11 @@ use crate::{
 const COLLABORATOR_START_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 #[cfg(test)]
 const COLLABORATOR_START_GRACE: std::time::Duration = std::time::Duration::from_millis(25);
+const APP_SERVER_STDERR_TAIL_BYTES: usize = 8 * 1024;
+const APP_SERVER_STDERR_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+const SENSITIVE_APP_SERVER_STDERR_ENV: &str = "TROUVE_LOG_SENSITIVE_APP_SERVER_STDERR";
+
+type AppServerStderrTail = Arc<std::sync::Mutex<VecDeque<u8>>>;
 
 pub struct CodexBackend {
     id: String,
@@ -221,9 +226,7 @@ impl AgentBackend for CodexBackend {
     }
 
     fn shared_model_identity(&self, model: &str) -> Option<String> {
-        self.catalog
-            .model("openai-codex", &self.id, model, OptionsDialect::CodexCli)
-            .map(|_| model.to_string())
+        self.catalog.shared_model_identity("openai-codex", model)
     }
 
     fn models(&self) -> Vec<ModelInfo> {
@@ -270,6 +273,12 @@ impl AgentBackend for CodexBackend {
         true
     }
 
+    /// The app-server reads `localImage` items from disk itself; there is no
+    /// inline image input.
+    fn requires_local_image_paths(&self) -> bool {
+        true
+    }
+
     async fn startup_activity(&self, turn: &BackendTurn) -> Option<BackendStartupActivity> {
         let mcp_config = thread_mcp_config(&codex_config_override(turn));
         if mcp_config.is_null() {
@@ -297,7 +306,7 @@ impl AgentBackend for CodexBackend {
         for attachment in steer.attachments {
             let path = attachment.local_path.ok_or_else(|| {
                 BackendError::Protocol(format!(
-                    "attachment {} has no verified worktree-local image path",
+                    "attachment {} has no engine-staged local image path",
                     attachment.name
                 ))
             })?;
@@ -396,7 +405,7 @@ impl AgentBackend for CodexBackend {
             (Some(sid), false) => sid.clone(),
             (Some(sid), true) => {
                 let resumed = server
-                    .request_effect_cancellable(
+                    .request_orphanable_effect_cancellable(
                         "thread/resume",
                         with_thread_settings(json!({ "threadId": sid })),
                         &cancel,
@@ -416,11 +425,7 @@ impl AgentBackend for CodexBackend {
                         }
                         fresh_session = true;
                         let v = server
-                            .request_effect_cancellable(
-                                "thread/start",
-                                start_params.clone(),
-                                &cancel,
-                            )
+                            .start_thread_cancellable(start_params.clone(), &cancel)
                             .await?;
                         server.validated_thread_id("thread/start", &v, None).await?
                     }
@@ -429,7 +434,7 @@ impl AgentBackend for CodexBackend {
             (None, _) => {
                 fresh_session = true;
                 let v = server
-                    .request_effect_cancellable("thread/start", start_params.clone(), &cancel)
+                    .start_thread_cancellable(start_params.clone(), &cancel)
                     .await?;
                 server.validated_thread_id("thread/start", &v, None).await?
             }
@@ -519,7 +524,7 @@ impl AgentBackend for CodexBackend {
         for att in &turn.attachments {
             let path = att.local_path.as_ref().ok_or_else(|| {
                 BackendError::Protocol(format!(
-                    "attachment {} has no verified worktree-local image path",
+                    "attachment {} has no engine-staged local image path",
                     att.name
                 ))
             })?;
@@ -535,6 +540,7 @@ impl AgentBackend for CodexBackend {
             turn_params["model"] = json!(model_name);
         }
         apply_reasoning_options(&mut turn_params, effort);
+        apply_service_tier_option(&mut turn_params, &turn.model_options);
         let turn_request_started = std::time::Instant::now();
         let (codex_turn_id, cleanup) = match server
             .start_turn(&codex_thread_id, &route.tx, turn_params, lifecycle, &cancel)
@@ -626,13 +632,22 @@ fn split_effort(model: &str) -> (&str, Option<&str>) {
     }
 }
 
-/// Commentary messages drive trouve's progress blocks. Disable reasoning
-/// summaries so their heading-like text is not generated alongside the
-/// richer commentary stream.
+/// Reasoning summaries are the only reasoning most hosted OpenAI models expose
+/// (raw reasoning stays encrypted), so request them and surface them as
+/// thinking. Commentary messages still drive the separate progress stream;
+/// the two can paraphrase each other, as they do under the Cursor adapter.
 fn apply_reasoning_options(params: &mut Value, effort: Option<&str>) {
-    params["summary"] = json!("none");
+    params["summary"] = json!("auto");
     if let Some(effort) = effort {
         params["effort"] = json!(effort);
+    }
+}
+
+/// Fast mode is a per-turn Codex service-tier override. Omission preserves the
+/// user's Codex default; an explicit Off selection restores the standard tier.
+fn apply_service_tier_option(params: &mut Value, options: &serde_json::Map<String, Value>) {
+    if let Some(fast) = options.get("fast").and_then(Value::as_bool) {
+        params["serviceTier"] = json!(if fast { "priority" } else { "default" });
     }
 }
 
@@ -656,7 +671,57 @@ struct CollaboratorStreamState {
     usage: Usage,
     user_messages: HashSet<String>,
     commentary_messages: HashSet<String>,
-    streamed_raw_reasoning: HashSet<String>,
+    reasoning: ReasoningStreamState,
+}
+
+/// Tracks which reasoning items have already streamed as thinking so the
+/// completion fallback does not repeat them, and so summaries are dropped for
+/// items whose raw reasoning is being streamed (raw wins when both arrive).
+#[derive(Default)]
+struct ReasoningStreamState {
+    raw: HashSet<String>,
+    summary: HashSet<String>,
+}
+
+impl ReasoningStreamState {
+    /// Raw reasoning delta: always shown.
+    fn raw_delta<'a>(&mut self, params: &'a Value) -> Option<&'a str> {
+        let delta = params["delta"].as_str()?;
+        if let Some(id) = params["itemId"].as_str() {
+            self.raw.insert(id.to_string());
+        }
+        Some(delta)
+    }
+
+    /// Summary delta: shown unless raw reasoning already streams for the item.
+    fn summary_delta<'a>(&mut self, params: &'a Value) -> Option<&'a str> {
+        let delta = params["delta"].as_str()?;
+        let id = params["itemId"].as_str().unwrap_or("");
+        if self.raw.contains(id) {
+            return None;
+        }
+        self.summary.insert(id.to_string());
+        Some(delta)
+    }
+
+    /// Summary parts are separate sections; separate every part after the
+    /// first from the text already streamed for the same item.
+    fn summary_part_separator(&self, params: &Value) -> Option<&'static str> {
+        let id = params["itemId"].as_str().unwrap_or("");
+        (params["summaryIndex"].as_i64().unwrap_or(0) > 0
+            && !self.raw.contains(id)
+            && self.summary.contains(id))
+        .then_some("\n\n")
+    }
+
+    /// Whether the completed reasoning item already streamed as thinking.
+    fn complete(&mut self, item: &Value) -> bool {
+        item["id"].as_str().is_some_and(|id| {
+            let raw = self.raw.remove(id);
+            let summary = self.summary.remove(id);
+            raw || summary
+        })
+    }
 }
 
 /// Tracks every provider-native collaborator announced anywhere below the
@@ -818,11 +883,18 @@ fn collaborator_notification(
             }
         }
         "item/reasoning/textDelta" => {
-            if let Some(delta) = params["delta"].as_str() {
-                if let Some(id) = params["itemId"].as_str() {
-                    state.streamed_raw_reasoning.insert(id.to_string());
-                }
+            if let Some(delta) = state.reasoning.raw_delta(params) {
                 events.push(BackendCollaboratorEvent::ThinkingDelta(delta.into()));
+            }
+        }
+        "item/reasoning/summaryTextDelta" => {
+            if let Some(delta) = state.reasoning.summary_delta(params) {
+                events.push(BackendCollaboratorEvent::ThinkingDelta(delta.into()));
+            }
+        }
+        "item/reasoning/summaryPartAdded" => {
+            if let Some(separator) = state.reasoning.summary_part_separator(params) {
+                events.push(BackendCollaboratorEvent::ThinkingDelta(separator.into()));
             }
         }
         "item/started" => {
@@ -874,14 +946,11 @@ fn collaborator_notification(
             {
                 events.push(BackendCollaboratorEvent::UserMessage(content));
             }
-            let raw_reasoning_streamed = kind == "reasoning"
-                && item["id"]
-                    .as_str()
-                    .is_some_and(|id| state.streamed_raw_reasoning.remove(id));
-            let mut thinking_emitted = raw_reasoning_streamed;
+            let reasoning_streamed = kind == "reasoning" && state.reasoning.complete(item);
+            let mut thinking_emitted = reasoning_streamed;
             if kind == "reasoning"
-                && !raw_reasoning_streamed
-                && let Some(text) = completed_raw_reasoning_text(item)
+                && !reasoning_streamed
+                && let Some(text) = completed_reasoning_text(item)
             {
                 thinking_emitted = true;
                 events.push(BackendCollaboratorEvent::ThinkingDelta(text));
@@ -1054,10 +1123,10 @@ fn turn_stream(
         // displayed as thinking or appended to the final answer. Missing
         // phases retain the legacy final-answer behavior.
         let mut commentary_messages = HashSet::new();
-        // Some providers only populate raw reasoning on the completed item.
-        // Track streamed raw items so the completion fallback does not repeat
+        // Some providers only populate reasoning on the completed item.
+        // Track streamed items so the completion fallback does not repeat
         // content already shown.
-        let mut streamed_raw_reasoning = HashSet::new();
+        let mut reasoning = ReasoningStreamState::default();
         let mut client_gone = false;
         let mut cancelled = false;
         let mut route_overloaded = false;
@@ -1293,14 +1362,23 @@ fn turn_stream(
                                 }
                             }
                             // Raw reasoning is only exposed by some models (notably
-                            // open-source models). Summary deltas are deliberately not
-                            // used as thinking; they are section headings, while
-                            // agent-message commentary is the readable progress stream.
+                            // open-source models); hosted OpenAI models expose
+                            // reasoning summaries instead. Either is shown as thinking,
+                            // raw taking precedence when both arrive for an item.
                             "item/reasoning/textDelta" => {
-                                if let Some(d) = params["delta"].as_str() {
-                                    if let Some(id) = params["itemId"].as_str() {
-                                        streamed_raw_reasoning.insert(id.to_string());
-                                    }
+                                if let Some(d) = reasoning.raw_delta(&params) {
+                                    let _ =
+                                        tx.send(Ok(BackendEvent::ThinkingDelta(d.into()))).await;
+                                }
+                            }
+                            "item/reasoning/summaryTextDelta" => {
+                                if let Some(d) = reasoning.summary_delta(&params) {
+                                    let _ =
+                                        tx.send(Ok(BackendEvent::ThinkingDelta(d.into()))).await;
+                                }
+                            }
+                            "item/reasoning/summaryPartAdded" => {
+                                if let Some(d) = reasoning.summary_part_separator(&params) {
                                     let _ =
                                         tx.send(Ok(BackendEvent::ThinkingDelta(d.into()))).await;
                                 }
@@ -1344,14 +1422,12 @@ fn turn_stream(
                             "item/completed" => {
                                 let item = &params["item"];
                                 let ty = item["type"].as_str().unwrap_or("");
-                                let raw_reasoning_streamed = ty == "reasoning"
-                                    && item["id"]
-                                        .as_str()
-                                        .is_some_and(|id| streamed_raw_reasoning.remove(id));
-                                let mut thinking_emitted = raw_reasoning_streamed;
+                                let reasoning_streamed =
+                                    ty == "reasoning" && reasoning.complete(item);
+                                let mut thinking_emitted = reasoning_streamed;
                                 if ty == "reasoning"
-                                    && !raw_reasoning_streamed
-                                    && let Some(text) = completed_raw_reasoning_text(item)
+                                    && !reasoning_streamed
+                                    && let Some(text) = completed_reasoning_text(item)
                                 {
                                     thinking_emitted = true;
                                     let _ = tx.send(Ok(BackendEvent::ThinkingDelta(text))).await;
@@ -1556,9 +1632,13 @@ fn turn_stream(
         if !cancelled
             && !client_gone
             && !route_overloaded
-            && !route_closed
             && let Some(params) = terminal_params
         {
+            // Once the root terminal notification has been consumed it is
+            // authoritative even if the transport closes while we are
+            // waiting for collaborator tails. Core closes any collaborator
+            // that did not publish its own terminal event when this stream
+            // ends; do not turn the completed root into a protocol failure.
             // Publish completion only after active-turn cleanup is serialized
             // with any replacement startup.
             let _lifecycle = server.lock_turn_lifecycle(&codex_thread_id).await;
@@ -2123,6 +2203,43 @@ const REQUEST_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_
 const THREAD_UNSUBSCRIBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const TRANSPORT_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const CHILD_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// What a request's transmitted bytes commit the app-server to, which decides
+/// how losing its response is handled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RequestFence {
+    /// Read-only or idempotent: cancellation and timeouts simply abandon the
+    /// response.
+    None,
+    /// The effect can act on a live turn (steer, unsubscribe). Once written
+    /// the exact response is awaited, and losing it retires the shared
+    /// transport so the effect cannot land on a replacement.
+    Effect,
+    /// The effect creates or loads a thread whose id only the response
+    /// carries (thread/start, thread/resume). Losing the response strands
+    /// that thread where nothing can address it, so only this request fails
+    /// and the transport keeps serving its other turns.
+    OrphanableEffect,
+}
+
+fn request_response_timed_out(
+    error: &BackendError,
+    method: &str,
+    response_timeout: std::time::Duration,
+) -> bool {
+    matches!(
+        error,
+        BackendError::Protocol(message)
+            if message == &request_response_timeout_message(method, response_timeout)
+    )
+}
+
+fn request_response_timeout_message(method: &str, response_timeout: std::time::Duration) -> String {
+    format!(
+        "{method}: no response within {}s",
+        response_timeout.as_secs_f64()
+    )
+}
 
 #[derive(Default)]
 struct CompletedTurnState {
@@ -3203,10 +3320,28 @@ async fn terminate_transport_parts(
         .map_err(BackendError::Io)
 }
 
-fn kill_and_reap_child(child: Arc<std::sync::Mutex<ProcessTreeChild>>) -> std::io::Result<()> {
+/// Exit details retained after the complete app-server process tree is reaped.
+struct AppServerReapOutcome {
+    status: std::process::ExitStatus,
+    termination_requested: bool,
+}
+
+/// Terminates an unusable app-server tree and reports how its leader exited.
+fn kill_and_reap_child(
+    child: Arc<std::sync::Mutex<ProcessTreeChild>>,
+) -> std::io::Result<AppServerReapOutcome> {
     let Ok(mut child) = child.lock() else {
         tracing::warn!("codex: app-server process lock is poisoned");
         return Err(std::io::Error::other("app-server process lock is poisoned"));
+    };
+    let termination_requested = match child.try_wait_leader() {
+        Ok(status) => status.is_none(),
+        Err(error) => {
+            // Failure to inspect the leader must not skip the existing
+            // best-effort termination and tree reaping path.
+            tracing::warn!("codex: failed to inspect app-server exit status: {error}");
+            true
+        }
     };
     let mut terminate_error = child.terminate_now().err();
     if let Some(error) = terminate_error.as_ref() {
@@ -3216,7 +3351,12 @@ fn kill_and_reap_child(child: Arc<std::sync::Mutex<ProcessTreeChild>>) -> std::i
     let mut retried_after_leader_exit = false;
     loop {
         match child.try_wait_tree() {
-            Ok(Some(_)) => return Ok(()),
+            Ok(Some(status)) => {
+                return Ok(AppServerReapOutcome {
+                    status,
+                    termination_requested,
+                });
+            }
             Ok(None) => {
                 if !retried_after_leader_exit {
                     match child.retry_termination_after_leader_exit() {
@@ -3256,6 +3396,99 @@ fn kill_and_reap_child(child: Arc<std::sync::Mutex<ProcessTreeChild>>) -> std::i
     }
 }
 
+/// Owns the stderr drain task until shutdown diagnostics have consumed it.
+struct AppServerStderrCapture {
+    tail: AppServerStderrTail,
+    task: tokio::task::JoinHandle<()>,
+    diagnostics_ready: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for AppServerStderrCapture {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Drains app-server stderr into a bounded rolling buffer.
+async fn capture_app_server_stderr<R: AsyncRead + Unpin>(mut stderr: R, tail: AppServerStderrTail) {
+    let mut chunk = [0_u8; 1024];
+    loop {
+        let read = match stderr.read(&mut chunk).await {
+            Ok(0) => return,
+            Ok(read) => read,
+            Err(error) => {
+                tracing::warn!(%error, "codex: failed to read app-server stderr");
+                return;
+            }
+        };
+        let mut tail = tail.lock().unwrap();
+        tail.extend(&chunk[..read]);
+        while tail.len() > APP_SERVER_STDERR_TAIL_BYTES {
+            tail.pop_front();
+        }
+    }
+}
+
+/// Starts a lifecycle-owned stderr capture for an app-server pipe.
+fn start_app_server_stderr_capture<R>(stderr: R) -> AppServerStderrCapture
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    let tail = Arc::new(std::sync::Mutex::new(VecDeque::new()));
+    let diagnostics_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let task = tokio::spawn(capture_app_server_stderr(stderr, tail.clone()));
+    AppServerStderrCapture {
+        tail,
+        task,
+        diagnostics_ready,
+    }
+}
+
+/// Waits briefly for the final stderr bytes after process cleanup.
+async fn finish_app_server_stderr_capture(
+    mut capture: Option<AppServerStderrCapture>,
+) -> Option<AppServerStderrTail> {
+    let capture = capture.as_mut()?;
+    match tokio::time::timeout(APP_SERVER_STDERR_DRAIN_TIMEOUT, &mut capture.task).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::warn!(%error, "codex: app-server stderr capture task failed"),
+        Err(_) => {
+            tracing::warn!(
+                "codex: app-server stderr did not close within {}s after process cleanup",
+                APP_SERVER_STDERR_DRAIN_TIMEOUT.as_secs()
+            );
+            capture.task.abort();
+            let _ = (&mut capture.task).await;
+        }
+    }
+    capture.diagnostics_ready.store(true, Ordering::Release);
+    Some(capture.tail.clone())
+}
+
+/// Formats stderr for logs without exposing arbitrary child output by default.
+fn app_server_stderr_for_log(tail: Option<&AppServerStderrTail>, expose_sensitive: bool) -> String {
+    let Some(tail) = tail else {
+        return String::new();
+    };
+    let bytes = tail.lock().unwrap().iter().copied().collect::<Vec<_>>();
+    if bytes.is_empty() {
+        return String::new();
+    }
+    if expose_sensitive {
+        String::from_utf8_lossy(&bytes).trim().to_string()
+    } else {
+        format!(
+            "[{} bytes redacted; set {SENSITIVE_APP_SERVER_STDERR_ENV}=1 to include sensitive app-server stderr]",
+            bytes.len()
+        )
+    }
+}
+
+/// Returns whether the operator explicitly opted into sensitive stderr logs.
+fn sensitive_app_server_stderr_logging_enabled() -> bool {
+    std::env::var(SENSITIVE_APP_SERVER_STDERR_ENV).as_deref() == Ok("1")
+}
+
 fn start_kill_child_now(child: &std::sync::Mutex<ProcessTreeChild>) {
     match child.try_lock() {
         Ok(mut child) => {
@@ -3273,12 +3506,15 @@ fn start_kill_child_now(child: &std::sync::Mutex<ProcessTreeChild>) {
     }
 }
 
+/// Shared turn state and diagnostics owned by the stdout router task.
 struct ReaderTurnState {
     active_turns: Option<ActiveTurns>,
     completed_turns: Option<CompletedTurns>,
     turn_lifecycles: Option<TurnLifecycles>,
+    stderr_capture: Option<AppServerStderrCapture>,
 }
 
+/// Routes app-server stdout until closure, then completes transport diagnostics.
 async fn read_stdout<R: AsyncRead + Unpin>(
     stdout: R,
     pending: Pending,
@@ -3292,9 +3528,15 @@ async fn read_stdout<R: AsyncRead + Unpin>(
         active_turns,
         completed_turns,
         turn_lifecycles,
+        stderr_capture,
     } = turn_state;
     let mut lines = BufReader::new(stdout).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
+    let stdout_error = loop {
+        let line = match lines.next_line().await {
+            Ok(Some(line)) => line,
+            Ok(None) => break None,
+            Err(error) => break Some(error),
+        };
         let Ok(msg) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
@@ -3406,16 +3648,39 @@ async fn read_stdout<R: AsyncRead + Unpin>(
                 }
             }
         }
-    }
+    };
     // Dropping stdout means the app-server can never complete any
     // outstanding request or turn. Drop every sender it left behind so
     // request waiters and routed turn streams wake immediately instead of
     // remaining active forever.
+    let unexpected_close = !closed.load(Ordering::Relaxed);
     close_transport(&pending, &routing, active_turns.as_ref(), &closed).await;
     if let Some(child) = child.and_then(|child| child.upgrade()) {
-        match tokio::task::spawn_blocking(move || kill_and_reap_child(child)).await {
-            Ok(Ok(())) => {}
+        let cleanup = tokio::task::spawn_blocking(move || kill_and_reap_child(child)).await;
+        let stderr_tail = finish_app_server_stderr_capture(stderr_capture).await;
+        let stderr = app_server_stderr_for_log(
+            stderr_tail.as_ref(),
+            sensitive_app_server_stderr_logging_enabled(),
+        );
+        match cleanup {
+            Ok(Ok(outcome)) => {
+                if unexpected_close {
+                    tracing::error!(
+                        status = %outcome.status,
+                        termination_requested = outcome.termination_requested,
+                        stdout_error = stdout_error.as_ref().map(std::string::ToString::to_string),
+                        stderr = %stderr,
+                        "codex: app-server stdout closed unexpectedly"
+                    );
+                }
+            }
             Ok(Err(error)) => {
+                tracing::error!(
+                    %error,
+                    stdout_error = stdout_error.as_ref().map(std::string::ToString::to_string),
+                    stderr = %stderr,
+                    "codex: app-server stdout closed and process cleanup failed"
+                );
                 tracing::warn!("codex: stdout EOF cleanup was not acknowledged: {error}");
             }
             Err(error) => {
@@ -3497,6 +3762,10 @@ struct AppServer {
     retired_response_tx: mpsc::Sender<Value>,
     closed: Arc<std::sync::atomic::AtomicBool>,
     transport_cleanup_started: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    stderr_tail: AppServerStderrTail,
+    #[cfg(test)]
+    stderr_diagnostics_ready: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Drop for AppServer {
@@ -3525,19 +3794,22 @@ impl Drop for TransportWriteGuard<'_> {
 }
 
 impl AppServer {
+    /// Spawns one multiplexed Codex app-server and its owned I/O tasks.
     async fn spawn(command: &str) -> Result<Self, BackendError> {
         let mut command_process = crate::process_env::tokio_command(command);
         command_process
             .arg("app-server")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
         let mut child = spawn_process_tree(&mut command_process).map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => BackendError::NotInstalled(command.to_string()),
             _ => BackendError::Io(e),
         })?;
         let stdin = Arc::new(Mutex::new(child.take_stdin().expect("stdin piped")));
         let stdout = child.take_stdout().expect("stdout piped");
+        let stderr = child.take_stderr().expect("stderr piped");
+        let stderr_capture = start_app_server_stderr_capture(stderr);
         let (retired_response_tx, retired_response_rx) = mpsc::channel(ROUTE_EVENT_BUDGET);
 
         let server = Self {
@@ -3554,9 +3826,13 @@ impl AppServer {
             retired_response_tx,
             closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             transport_cleanup_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(test)]
+            stderr_tail: stderr_capture.tail.clone(),
+            #[cfg(test)]
+            stderr_diagnostics_ready: stderr_capture.diagnostics_ready.clone(),
         };
         server.start_response_writer(retired_response_rx);
-        server.start_reader(stdout);
+        server.start_reader(stdout, stderr_capture);
         Ok(server)
     }
 
@@ -3602,7 +3878,7 @@ impl AppServer {
             "thread/unsubscribe",
             json!({ "threadId": thread_id }),
             None,
-            true,
+            RequestFence::Effect,
             THREAD_UNSUBSCRIBE_TIMEOUT,
         )
         .await
@@ -3692,7 +3968,12 @@ impl AppServer {
         let _ = kill_and_reap_child(self.child.clone());
     }
 
-    fn start_reader(&self, stdout: tokio::process::ChildStdout) {
+    /// Starts the stdout router with ownership of the matching stderr drain.
+    fn start_reader(
+        &self,
+        stdout: tokio::process::ChildStdout,
+        stderr_capture: AppServerStderrCapture,
+    ) {
         let closed = self.closed.clone();
         let pending = self.pending.clone();
         let routing = self.routing.clone();
@@ -3706,6 +3987,7 @@ impl AppServer {
                 active_turns: Some(active_turns),
                 completed_turns: Some(self.completed_turns.clone()),
                 turn_lifecycles: Some(self.turn_lifecycles.clone()),
+                stderr_capture: Some(stderr_capture),
             },
             self.retired_response_tx.clone(),
             closed,
@@ -3783,7 +4065,8 @@ impl AppServer {
     }
 
     async fn request(&self, method: &str, params: Value) -> Result<Value, BackendError> {
-        self.request_with_cancel(method, params, None, false).await
+        self.request_with_cancel(method, params, None, RequestFence::None)
+            .await
     }
 
     async fn request_cancellable(
@@ -3792,7 +4075,7 @@ impl AppServer {
         params: Value,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<Value, BackendError> {
-        self.request_with_cancel(method, params, Some(cancel), false)
+        self.request_with_cancel(method, params, Some(cancel), RequestFence::None)
             .await
     }
 
@@ -3809,10 +4092,78 @@ impl AppServer {
             method,
             params,
             Some(cancel),
-            true,
+            RequestFence::Effect,
             REQUEST_RESPONSE_TIMEOUT,
         )
         .await
+    }
+
+    /// Like [`Self::request_effect_cancellable`] for effects whose only
+    /// lasting result is a thread this side never learns the id of when the
+    /// response is lost. Such a thread is unreachable rather than dangerous,
+    /// so a slow or missing response fails this request without retiring
+    /// the app-server under every other turn it is streaming.
+    async fn request_orphanable_effect_cancellable(
+        &self,
+        method: &str,
+        params: Value,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<Value, BackendError> {
+        self.request_with_cancel_timeout(
+            method,
+            params,
+            Some(cancel),
+            RequestFence::OrphanableEffect,
+            REQUEST_RESPONSE_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Retry one isolated `thread/start` response timeout. Each unanswered
+    /// request can only strand an unreachable vendor thread, and the
+    /// orphanable-effect fence keeps the shared app-server available for the
+    /// retry and for turns that are already streaming.
+    async fn start_thread_cancellable(
+        &self,
+        params: Value,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<Value, BackendError> {
+        self.start_thread_cancellable_with_timeout(params, cancel, REQUEST_RESPONSE_TIMEOUT)
+            .await
+    }
+
+    async fn start_thread_cancellable_with_timeout(
+        &self,
+        params: Value,
+        cancel: &tokio_util::sync::CancellationToken,
+        response_timeout: std::time::Duration,
+    ) -> Result<Value, BackendError> {
+        let first = self
+            .request_with_cancel_timeout(
+                "thread/start",
+                params.clone(),
+                Some(cancel),
+                RequestFence::OrphanableEffect,
+                response_timeout,
+            )
+            .await;
+        match first {
+            Err(error) if request_response_timed_out(&error, "thread/start", response_timeout) => {
+                tracing::warn!(
+                    timeout_seconds = response_timeout.as_secs_f64(),
+                    "codex: retrying unanswered thread/start once"
+                );
+                self.request_with_cancel_timeout(
+                    "thread/start",
+                    params,
+                    Some(cancel),
+                    RequestFence::OrphanableEffect,
+                    response_timeout,
+                )
+                .await
+            }
+            result => result,
+        }
     }
 
     async fn validate_effect_id(
@@ -3908,16 +4259,10 @@ impl AppServer {
         method: &str,
         params: Value,
         cancel: Option<&tokio_util::sync::CancellationToken>,
-        fence_after_write: bool,
+        fence: RequestFence,
     ) -> Result<Value, BackendError> {
-        self.request_with_cancel_timeout(
-            method,
-            params,
-            cancel,
-            fence_after_write,
-            REQUEST_RESPONSE_TIMEOUT,
-        )
-        .await
+        self.request_with_cancel_timeout(method, params, cancel, fence, REQUEST_RESPONSE_TIMEOUT)
+            .await
     }
 
     async fn request_with_cancel_timeout(
@@ -3925,7 +4270,7 @@ impl AppServer {
         method: &str,
         params: Value,
         cancel: Option<&tokio_util::sync::CancellationToken>,
-        fence_after_write: bool,
+        fence: RequestFence,
         response_timeout: std::time::Duration,
     ) -> Result<Value, BackendError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
@@ -3952,18 +4297,22 @@ impl AppServer {
             }
             return Err(error);
         }
+        // `closed` distinguishes a reader that exited (the response can never
+        // arrive) from a response that is merely late.
+        let closed = std::sync::atomic::AtomicBool::new(false);
         let response = async {
             match tokio::time::timeout(response_timeout, rx).await {
                 Ok(response) => response.map_err(|_| {
+                    closed.store(true, Ordering::Relaxed);
                     BackendError::Protocol(format!("{method}: app-server closed before responding"))
                 }),
-                Err(_) => Err(BackendError::Protocol(format!(
-                    "{method}: no response within {}s",
-                    response_timeout.as_secs_f64()
+                Err(_) => Err(BackendError::Protocol(request_response_timeout_message(
+                    method,
+                    response_timeout,
                 ))),
             }
         };
-        let response = if fence_after_write {
+        let response = if fence == RequestFence::Effect {
             // Once the complete request has been flushed, its vendor-side
             // effect may already be committed. Fence the exact response
             // instead of reporting that a transmitted effect never happened.
@@ -3978,14 +4327,32 @@ impl AppServer {
                 None => response.await,
             }
         };
-        if response.is_err() && fence_after_write {
+        if response.is_err()
+            && (fence == RequestFence::Effect
+                || (fence == RequestFence::OrphanableEffect && closed.load(Ordering::Relaxed)))
+        {
             // A transmitted effect with no exact response has an ambiguous
             // vendor-side outcome. Invalidate and reap the shared app-server
-            // before returning so a late start/resume/steer cannot surface on
+            // before returning so a late steer/unsubscribe cannot surface on
             // a replacement turn or share its transport with later requests.
+            // An orphanable effect only gets here once the reader is gone,
+            // where reaping the dead process tree lets a replacement spawn.
             self.terminate_transport().await?;
         } else if response.is_err() {
+            // Dropping the pending slot makes the reader discard a late
+            // response. For an orphanable effect that is the whole story:
+            // the thread it may still create is never named to this side,
+            // so it can never be resumed or steered, and the turns sharing
+            // the transport keep streaming. Only this request fails.
             self.pending.lock().await.remove(&id);
+            if fence == RequestFence::OrphanableEffect
+                && !matches!(response, Err(BackendError::Cancelled))
+            {
+                tracing::warn!(
+                    "codex: {method} went unanswered on a shared app-server; any thread it \
+                     created is orphaned"
+                );
+            }
         }
         match response? {
             Ok(v) => Ok(v),
@@ -4415,6 +4782,7 @@ mod tests {
             instructions: None,
             permission: crate::BackendPermission::Ask,
             tool_free: false,
+            attach_background: false,
             mcp_bridge: None,
             mcp_servers: Vec::new(),
         }
@@ -5275,7 +5643,7 @@ mod tests {
     }
 
     #[test]
-    fn extracts_completed_raw_codex_reasoning_as_a_stream_fallback() {
+    fn extracts_completed_codex_reasoning_as_a_stream_fallback() {
         let summarized = json!({
             "id": "reason-1",
             "type": "reasoning",
@@ -5283,15 +5651,12 @@ mod tests {
             "content": ["raw text is secondary"],
         });
         assert_eq!(
-            completed_raw_reasoning_text(&summarized).as_deref(),
+            completed_reasoning_text(&summarized).as_deref(),
             Some("raw text is secondary")
         );
 
         let raw = json!({ "type": "reasoning", "summary": [], "content": ["thinking"] });
-        assert_eq!(
-            completed_raw_reasoning_text(&raw).as_deref(),
-            Some("thinking")
-        );
+        assert_eq!(completed_reasoning_text(&raw).as_deref(), Some("thinking"));
         let response_item = json!({
             "type": "reasoning",
             "summary": [
@@ -5301,12 +5666,129 @@ mod tests {
             "content": [{ "type": "reasoning_text", "text": "raw thought" }],
         });
         assert_eq!(
-            completed_raw_reasoning_text(&response_item).as_deref(),
+            completed_reasoning_text(&response_item).as_deref(),
             Some("raw thought")
         );
+        // Hosted models keep raw reasoning encrypted and only return a summary.
+        let summary_only = json!({
+            "type": "reasoning",
+            "summary": ["**Checking the adapter**", "Looking at the config override."],
+            "content": [],
+        });
         assert_eq!(
-            completed_raw_reasoning_text(&json!({ "type": "reasoning" })),
+            completed_reasoning_text(&summary_only).as_deref(),
+            Some("**Checking the adapter**\n\nLooking at the config override.")
+        );
+        assert_eq!(
+            completed_reasoning_text(&json!({ "type": "reasoning" })),
             None
+        );
+    }
+
+    #[test]
+    fn streams_reasoning_summaries_as_thinking_unless_raw_reasoning_streams() {
+        let mut state = CollaboratorStreamState::default();
+        let delta = |state: &mut CollaboratorStreamState, method: &str, params: Value| {
+            collaborator_notification(method, &params, state)
+                .into_iter()
+                .map(|event| match event {
+                    BackendCollaboratorEvent::ThinkingDelta(text) => text,
+                    BackendCollaboratorEvent::ThinkingCompleted => "<done>".into(),
+                    other => panic!("unexpected event {other:?}"),
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // Summary-only model: parts stream, later parts are paragraph-separated,
+        // and completion closes the item without repeating it.
+        assert!(
+            delta(
+                &mut state,
+                "item/reasoning/summaryPartAdded",
+                json!({ "itemId": "r1", "summaryIndex": 0 }),
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            delta(
+                &mut state,
+                "item/reasoning/summaryTextDelta",
+                json!({ "itemId": "r1", "delta": "**Checking**", "summaryIndex": 0 }),
+            ),
+            ["**Checking**"]
+        );
+        assert_eq!(
+            delta(
+                &mut state,
+                "item/reasoning/summaryPartAdded",
+                json!({ "itemId": "r1", "summaryIndex": 1 }),
+            ),
+            ["\n\n"]
+        );
+        assert_eq!(
+            delta(
+                &mut state,
+                "item/reasoning/summaryTextDelta",
+                json!({ "itemId": "r1", "delta": "Next.", "summaryIndex": 1 }),
+            ),
+            ["Next."]
+        );
+        assert_eq!(
+            delta(
+                &mut state,
+                "item/completed",
+                json!({ "item": {
+                    "id": "r1",
+                    "type": "reasoning",
+                    "summary": ["**Checking**", "Next."],
+                    "content": []
+                } }),
+            ),
+            ["<done>"]
+        );
+
+        // Raw reasoning wins: summary deltas for the same item are dropped.
+        assert_eq!(
+            delta(
+                &mut state,
+                "item/reasoning/textDelta",
+                json!({ "itemId": "r2", "delta": "raw" }),
+            ),
+            ["raw"]
+        );
+        assert!(
+            delta(
+                &mut state,
+                "item/reasoning/summaryTextDelta",
+                json!({ "itemId": "r2", "delta": "summary", "summaryIndex": 0 }),
+            )
+            .is_empty()
+        );
+        assert!(
+            delta(
+                &mut state,
+                "item/reasoning/summaryPartAdded",
+                json!({ "itemId": "r2", "summaryIndex": 1 }),
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            delta(
+                &mut state,
+                "item/completed",
+                json!({ "item": { "id": "r2", "type": "reasoning", "summary": ["summary"], "content": ["raw"] } }),
+            ),
+            ["<done>"]
+        );
+
+        // Nothing streamed: the completed summary is the fallback.
+        assert_eq!(
+            delta(
+                &mut state,
+                "item/completed",
+                json!({ "item": { "id": "r3", "type": "reasoning", "summary": ["only at the end"], "content": [] } }),
+            ),
+            ["only at the end", "<done>"]
         );
     }
 
@@ -5337,16 +5819,36 @@ mod tests {
     }
 
     #[test]
-    fn turn_disables_reasoning_summaries() {
+    fn turn_requests_reasoning_summaries() {
         let mut params = json!({ "threadId": "thread-1", "input": [] });
         apply_reasoning_options(&mut params, Some("high"));
-        assert_eq!(params["summary"], "none");
+        assert_eq!(params["summary"], "auto");
         assert_eq!(params["effort"], "high");
 
         let mut without_effort = json!({});
         apply_reasoning_options(&mut without_effort, None);
-        assert_eq!(without_effort["summary"], "none");
+        assert_eq!(without_effort["summary"], "auto");
         assert!(without_effort["effort"].is_null());
+    }
+
+    #[test]
+    fn turn_maps_fast_mode_to_codex_service_tier() {
+        let mut params = json!({});
+        apply_service_tier_option(
+            &mut params,
+            &serde_json::Map::from_iter([("fast".into(), json!(true))]),
+        );
+        assert_eq!(params["serviceTier"], "priority");
+
+        apply_service_tier_option(
+            &mut params,
+            &serde_json::Map::from_iter([("fast".into(), json!(false))]),
+        );
+        assert_eq!(params["serviceTier"], "default");
+
+        let mut inherited = json!({});
+        apply_service_tier_option(&mut inherited, &serde_json::Map::new());
+        assert!(inherited["serviceTier"].is_null());
     }
 
     #[test]
@@ -6063,6 +6565,8 @@ for line in sys.stdin:
     if method == "turn/start" and first_process:
         while not os.path.exists(close_path):
             time.sleep(0.005)
+        sys.stderr.write("last-moment app-server crash diagnostic\n")
+        sys.stderr.flush()
         os.close(1)
         time.sleep(60)
 "#,
@@ -6159,6 +6663,24 @@ for line in sys.stdin:
         assert!(
             !std::path::Path::new(&format!("/proc/{first_pid}")).exists(),
             "cancelled replacement acquisition returned before stale reap"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !first.stderr_diagnostics_ready.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("stdout cleanup did not finish the stderr drain");
+        assert!(
+            first
+                .stderr_tail
+                .lock()
+                .unwrap()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>()
+                .ends_with(b"last-moment app-server crash diagnostic\n"),
+            "shutdown diagnostics omitted stderr written immediately before stdout EOF"
         );
         assert!(
             !overlap_marker.exists(),
@@ -6262,7 +6784,7 @@ for line in sys.stdin:
                 "thread/start",
                 json!({}),
                 Some(&cancel),
-                true,
+                RequestFence::Effect,
                 std::time::Duration::from_millis(250),
             )
             .await
@@ -6307,7 +6829,7 @@ for line in sys.stdin:
                     "thread/start",
                     json!({}),
                     Some(&tokio_util::sync::CancellationToken::new()),
-                    true,
+                    RequestFence::Effect,
                     std::time::Duration::from_secs(1),
                 )
                 .await
@@ -6358,7 +6880,7 @@ for line in sys.stdin:
                     "thread/turns/list",
                     Value::Null,
                     Some(&cancel),
-                    false,
+                    RequestFence::None,
                     std::time::Duration::from_millis(25),
                 )
                 .await,
@@ -6375,7 +6897,7 @@ for line in sys.stdin:
                     "account/rateLimits/read",
                     Value::Null,
                     None,
-                    false,
+                    RequestFence::None,
                     std::time::Duration::from_secs(1),
                 )
                 .await
@@ -6384,6 +6906,137 @@ for line in sys.stdin:
         );
         assert!(!server.is_closed());
         server.terminate_transport().await.unwrap();
+    }
+
+    /// A `thread/start` that the app-server has not answered strands at most
+    /// one thread nobody can reach. Retry it once on the same shared server:
+    /// the old behavior retired the transport under every streaming turn, so
+    /// one slow start took a whole review fan-out down.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn unanswered_thread_start_is_retried_once_on_the_same_app_server() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let stub = temp.path().join("codex-orphan-start");
+        std::fs::write(
+            &stub,
+            r#"#!/usr/bin/env python3
+import json, sys
+starts = 0
+for line in sys.stdin:
+    msg = json.loads(line)
+    method = msg.get("method")
+    mid = msg.get("id")
+    if method == "initialize":
+        result = {}
+    elif method == "notifications/initialized":
+        continue
+    elif method == "thread/start":
+        starts += 1
+        if starts == 1:
+            # Swallow the first start: its thread is created but never answered.
+            continue
+        result = {"thread": {"id": "answered-thread-%d" % starts}}
+    else:
+        result = {"starts": starts}
+    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": mid, "result": result}) + "\n")
+    sys.stdout.flush()
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let backend = CodexBackend::new("codex", Some(stub.to_string_lossy().into_owned()));
+        let server = backend.server().await.unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let response = server
+            .start_thread_cancellable_with_timeout(
+                json!({}),
+                &cancel,
+                std::time::Duration::from_millis(250),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response["thread"]["id"], "answered-thread-2");
+        assert!(
+            !server.is_closed(),
+            "an unanswered thread/start retired the shared transport"
+        );
+        assert!(
+            server.pending.lock().await.is_empty(),
+            "the unanswered start kept its pending slot"
+        );
+        // The same process served both start attempts and remains available.
+        assert_eq!(
+            server
+                .request("account/rateLimits/read", Value::Null)
+                .await
+                .unwrap()["starts"],
+            2
+        );
+        assert!(Arc::ptr_eq(&server, &backend.server().await.unwrap()));
+        server.terminate_transport().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn app_server_stderr_tail_is_bounded_and_keeps_latest_output() {
+        let (mut writer, reader) = tokio::io::duplex(1024);
+        let capture = start_app_server_stderr_capture(reader);
+        let diagnostic = b"final app-server diagnostic";
+        writer
+            .write_all(&vec![b'x'; APP_SERVER_STDERR_TAIL_BYTES + 256])
+            .await
+            .unwrap();
+        writer.write_all(diagnostic).await.unwrap();
+        writer.shutdown().await.unwrap();
+        let tail = finish_app_server_stderr_capture(Some(capture))
+            .await
+            .unwrap();
+
+        let captured = tail.lock().unwrap();
+        assert_eq!(captured.len(), APP_SERVER_STDERR_TAIL_BYTES);
+        assert!(
+            captured
+                .iter()
+                .copied()
+                .collect::<Vec<_>>()
+                .ends_with(diagnostic)
+        );
+    }
+
+    #[tokio::test]
+    async fn stderr_capture_waits_for_output_written_immediately_before_shutdown() {
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let capture = start_app_server_stderr_capture(reader);
+        let diagnostic = b"last-moment crash diagnostic";
+        let write = tokio::spawn(async move {
+            writer.write_all(diagnostic).await.unwrap();
+            writer.shutdown().await.unwrap();
+        });
+
+        let tail = finish_app_server_stderr_capture(Some(capture))
+            .await
+            .unwrap();
+        write.await.unwrap();
+
+        assert_eq!(
+            tail.lock().unwrap().iter().copied().collect::<Vec<_>>(),
+            diagnostic
+        );
+    }
+
+    #[test]
+    fn app_server_stderr_is_redacted_without_explicit_sensitive_logging_opt_in() {
+        let secret = "credential=secret-token private prompt contents";
+        let tail = Arc::new(std::sync::Mutex::new(secret.bytes().collect()));
+
+        let diagnostic = app_server_stderr_for_log(Some(&tail), false);
+
+        assert!(!diagnostic.contains("secret-token"));
+        assert!(!diagnostic.contains("private prompt"));
+        assert!(diagnostic.contains("bytes redacted"));
+        assert!(diagnostic.contains(SENSITIVE_APP_SERVER_STDERR_ENV));
     }
 
     #[tokio::test]
@@ -6407,6 +7060,7 @@ for line in sys.stdin:
                 active_turns: None,
                 completed_turns: None,
                 turn_lifecycles: None,
+                stderr_capture: None,
             },
             retired_response_tx,
             closed.clone(),
@@ -6457,6 +7111,7 @@ for line in sys.stdin:
                 active_turns: Some(active_turns.clone()),
                 completed_turns: Some(completed_turns.clone()),
                 turn_lifecycles: Some(turn_lifecycles.clone()),
+                stderr_capture: None,
             },
             retired_response_tx,
             closed,
@@ -6590,6 +7245,7 @@ for line in sys.stdin:
                 active_turns: Some(active_turns.clone()),
                 completed_turns: Some(completed_turns),
                 turn_lifecycles: Some(turn_lifecycles),
+                stderr_capture: None,
             },
             retired_response_tx,
             closed,
@@ -6962,7 +7618,7 @@ while IFS= read -r _; do :; done
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn completion_removes_route_before_terminal_event_is_yielded() {
+    async fn completion_survives_transport_close_with_an_active_collaborator() {
         use futures::StreamExt;
         use std::os::unix::fs::PermissionsExt;
 
@@ -7093,6 +7749,49 @@ while IFS= read -r _; do :; done
         assert!(matches!(
             stream.next().await,
             Some(Ok(BackendEvent::CompactionFailed))
+        ));
+        route_tx
+            .try_send(ServerMsg::Notification {
+                method: "item/started".into(),
+                params: json!({
+                    "threadId": "root",
+                    "turnId": "root-turn",
+                    "item": {
+                        "id": "spawn-1",
+                        "type": "collabAgentToolCall",
+                        "tool": "spawn_agent",
+                        "senderThreadId": "root",
+                        "receiverThreadIds": ["child"],
+                        "prompt": "Inspect the review"
+                    }
+                }),
+            })
+            .unwrap();
+        route_tx
+            .try_send(ServerMsg::Notification {
+                method: "turn/started".into(),
+                params: json!({
+                    "threadId": "child",
+                    "turn": { "id": "child-turn", "status": "inProgress" }
+                }),
+            })
+            .unwrap();
+        assert!(matches!(
+            stream.next().await,
+            Some(Ok(BackendEvent::CollaboratorStarted { session_id, .. }))
+                if session_id == "child"
+        ));
+        assert!(matches!(
+            stream.next().await,
+            Some(Ok(BackendEvent::ToolStarted { .. }))
+        ));
+        assert!(matches!(
+            stream.next().await,
+            Some(Ok(BackendEvent::CollaboratorEvent {
+                session_id,
+                event: BackendCollaboratorEvent::TurnStarted,
+                ..
+            })) if session_id == "child"
         ));
         route_tx
             .try_send(ServerMsg::Notification {
@@ -7381,6 +8080,7 @@ cat > /dev/null
                 active_turns: None,
                 completed_turns: None,
                 turn_lifecycles: None,
+                stderr_capture: None,
             },
             retired_response_tx,
             closed.clone(),
@@ -7691,7 +8391,7 @@ for line in sys.stdin:
     async fn listing_models_is_static_and_does_not_spawn_app_server() {
         let backend = CodexBackend::new("codex", Some("definitely-not-a-command".into()));
         let models = backend.list_models().await;
-        assert_eq!(models.len(), 7);
+        assert_eq!(models.len(), 8);
         assert!(backend.server.lock().await.is_none());
     }
 
@@ -7707,7 +8407,7 @@ for line in sys.stdin:
     fn trouve_catalog_owns_codex_roster_metadata_and_settings() {
         let backend = CodexBackend::new("codex", None);
         let models = backend.models();
-        assert_eq!(models.len(), 7);
+        assert_eq!(models.len(), 8);
         let sol = models
             .iter()
             .find(|model| model.id == "codex/gpt-5.6-sol")

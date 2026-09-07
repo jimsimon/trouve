@@ -149,7 +149,24 @@ impl ProtocolClient {
         .await
     }
 
+    /// Register a workspace and retain its repository grouping metadata.
+    pub async fn register_workspace_item(&self, path: &str) -> Result<WorkspaceListItem> {
+        self.post_json(
+            "/workspaces",
+            &RegisterWorkspaceRequest {
+                path: path.into(),
+                name: None,
+            },
+        )
+        .await
+    }
+
     pub async fn list_workspaces(&self) -> Result<Vec<Workspace>> {
+        self.get_json("/workspaces").await
+    }
+
+    /// List workspaces with repository grouping metadata retained.
+    pub async fn list_workspace_items(&self) -> Result<Vec<WorkspaceListItem>> {
         self.get_json("/workspaces").await
     }
 
@@ -186,14 +203,42 @@ impl ProtocolClient {
             .await
     }
 
-    /// Generate the title that will be used for both the session and its
-    /// branch before either is created.
-    pub async fn generate_session_title(&self, prompt: &str) -> Result<GeneratedSessionTitle> {
+    pub async fn generate_title(&self, session_id: &str, prompt: &str) -> Result<GeneratedTitle> {
         self.post_json(
-            "/session-title",
-            &GenerateSessionTitleRequest {
+            "/title",
+            &GenerateTitleRequest {
+                session_id: session_id.into(),
                 prompt: prompt.into(),
+                attachments: Vec::new(),
             },
+        )
+        .await
+    }
+
+    pub async fn generate_session_title_suggestion(
+        &self,
+        session_id: &str,
+    ) -> Result<GeneratedTitle> {
+        self.post_json(
+            &format!(
+                "/sessions/{}/title-suggestion",
+                urlencode_path_segment(session_id)
+            ),
+            &serde_json::json!({}),
+        )
+        .await
+    }
+
+    pub async fn generate_thread_title_suggestion(
+        &self,
+        thread_id: &str,
+    ) -> Result<GeneratedTitle> {
+        self.post_json(
+            &format!(
+                "/threads/{}/title-suggestion",
+                urlencode_path_segment(thread_id)
+            ),
+            &serde_json::json!({}),
         )
         .await
     }
@@ -587,12 +632,12 @@ impl ProtocolClient {
         self.get_json(&format!("/clis/{id}/install")).await
     }
 
-    /// Cancel an in-flight CLI install.
+    /// Cancel an in-flight managed agent-runtime install.
     pub async fn cancel_cli_install(&self, id: &str) -> Result<()> {
         self.delete(&format!("/clis/{id}/install")).await
     }
 
-    /// Remove the managed install of a CLI (PATH installs are untouched).
+    /// Remove a managed agent runtime (PATH installs are untouched).
     pub async fn uninstall_cli(&self, id: &str) -> Result<()> {
         self.delete(&format!("/clis/{id}")).await
     }
@@ -742,8 +787,8 @@ impl ProtocolClient {
         decode_cursor_response(response, path).await
     }
 
-    pub async fn git_worktree_settings(&self) -> Result<(u64, GitWorktreeSettings)> {
-        let path = "/config/git-worktrees";
+    pub async fn session_naming_settings(&self) -> Result<(u64, SessionNamingSettings)> {
+        let path = "/config/session-naming";
         let response = self
             .http
             .get(format!("{}{path}", self.base))
@@ -753,35 +798,23 @@ impl ProtocolClient {
         decode_cursor_response(response, path).await
     }
 
-    pub async fn set_git_worktree_settings(
+    pub async fn set_session_naming_settings(
         &self,
-        title_model_load_behavior: TitleModelLoadBehavior,
-        title_model_resource_policy: TitleModelResourcePolicy,
-        derive_branch_name_from_session_title: Option<bool>,
-    ) -> Result<(u64, GitWorktreeSettings)> {
-        let path = "/config/git-worktrees";
+        model: String,
+        derive_branch_name_from_session_title: bool,
+    ) -> Result<(u64, SessionNamingSettings)> {
+        let path = "/config/session-naming";
         let response = self
             .http
             .put(format!("{}{path}", self.base))
-            .json(&SetGitWorktreeSettingsRequest {
+            .json(&SetSessionNamingSettingsRequest {
+                model,
                 derive_branch_name_from_session_title,
-                title_model_load_behavior,
-                title_model_resource_policy,
             })
             .send()
             .await
             .with_context(|| format!("PUT {path}"))?;
         decode_cursor_response(response, path).await
-    }
-
-    pub async fn install_title_model(&self) -> Result<()> {
-        self.post_empty("/config/git-worktrees/title-model/install")
-            .await
-    }
-
-    pub async fn cancel_title_model_install(&self) -> Result<()> {
-        self.delete("/config/git-worktrees/title-model/install")
-            .await
     }
 
     pub async fn session_diff(&self, session_id: &str) -> Result<SessionDiff> {
@@ -1292,6 +1325,22 @@ impl ProtocolClient {
         decode(resp, &path).await
     }
 
+    pub async fn set_automation_enabled(
+        &self,
+        id: &str,
+        enabled: bool,
+    ) -> Result<trouve_protocol::Automation> {
+        let path = format!("/automations/{id}/enabled");
+        let resp = self
+            .http
+            .put(format!("{}{path}", self.base))
+            .json(&trouve_protocol::SetAutomationEnabledRequest { enabled })
+            .send()
+            .await
+            .with_context(|| format!("PUT {path}"))?;
+        decode(resp, &path).await
+    }
+
     pub async fn delete_automation(&self, id: &str) -> Result<()> {
         self.delete(&format!("/automations/{id}")).await
     }
@@ -1499,6 +1548,19 @@ mod tests {
         ProtocolClient, ProtocolResponseError, decode_terminal_output_data, response_error,
         urlencode, urlencode_path_segment,
     };
+
+    #[test]
+    fn workspace_methods_preserve_their_source_compatible_return_types() {
+        fn assert_result<T>(_: impl Future<Output = anyhow::Result<T>>) {}
+
+        let client = ProtocolClient::new("http://127.0.0.1:1");
+        assert_result::<trouve_protocol::Workspace>(client.register_workspace("/tmp/workspace"));
+        assert_result::<Vec<trouve_protocol::Workspace>>(client.list_workspaces());
+        assert_result::<trouve_protocol::WorkspaceListItem>(
+            client.register_workspace_item("/tmp/workspace"),
+        );
+        assert_result::<Vec<trouve_protocol::WorkspaceListItem>>(client.list_workspace_items());
+    }
 
     #[test]
     fn legacy_terminal_decoder_ignores_json_replay_marker_data() {

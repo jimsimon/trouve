@@ -132,9 +132,9 @@ describe("agent activity presentation", () => {
     expect(presentation({
       items: [status(3, { kind: "waiting-for-capacity" })],
     })).toEqual({
-      label: "Waiting for model capacity…",
+      label: "Waiting for provider admission…",
       detail: "",
-      announcementLabel: "Waiting for model capacity…",
+      announcementLabel: "Waiting for provider admission…",
     });
     expect(presentation({ items: [marker], thinking: true, turnModels: model })).toEqual({
       label: "Thinking…",

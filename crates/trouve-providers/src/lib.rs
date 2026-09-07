@@ -55,6 +55,10 @@ pub struct ToolImage {
 pub enum Message {
     System(String),
     User(String),
+    UserWithImages {
+        content: String,
+        images: Vec<ToolImage>,
+    },
     Assistant {
         content: String,
         tool_calls: Vec<ToolCallRequest>,
@@ -80,8 +84,20 @@ pub enum Message {
 #[derive(Debug, Clone)]
 pub enum ProviderEvent {
     TextDelta(String),
-    /// Reasoning ("thinking") text, where the model/provider exposes it.
-    ThinkingDelta(String),
+    /// A provider-owned reasoning item began. The identifier is scoped to
+    /// this model invocation and remains stable across interleaved events.
+    ThinkingStarted {
+        id: String,
+    },
+    /// Display-only reasoning text belonging to a provider-owned item.
+    ThinkingDelta {
+        id: String,
+        text: String,
+    },
+    /// The provider explicitly closed a reasoning item.
+    ThinkingCompleted {
+        id: String,
+    },
     /// A complete provider-native reasoning block to preserve for replay
     /// (Anthropic signed `thinking`/`redacted_thinking`). Distinct from
     /// `ThinkingDelta`, which is display-only streaming text.
@@ -162,6 +178,16 @@ fn contains_standalone_token(message: &str, token: &str) -> bool {
 
 pub type EventStream = BoxStream<'static, Result<ProviderEvent, ProviderError>>;
 
+/// Admission priority for providers that serialize inference internally.
+/// Most remote providers ignore this distinction; the managed local provider
+/// uses it to keep cosmetic work from delaying user turns.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum InferencePriority {
+    #[default]
+    Foreground,
+    Background,
+}
+
 const PROVIDER_DELTA_WINDOW: std::time::Duration = std::time::Duration::from_millis(16);
 const PROVIDER_DELTA_MAX_BYTES: usize = 64 * 1024;
 
@@ -218,7 +244,9 @@ pub fn coalesce_event_stream(stream: EventStream) -> EventStream {
 
 fn provider_event_delta_len(event: &Result<ProviderEvent, ProviderError>) -> Option<usize> {
     match event {
-        Ok(ProviderEvent::TextDelta(text) | ProviderEvent::ThinkingDelta(text)) => Some(text.len()),
+        Ok(ProviderEvent::TextDelta(text) | ProviderEvent::ThinkingDelta { text, .. }) => {
+            Some(text.len())
+        }
         _ => None,
     }
 }
@@ -234,8 +262,17 @@ fn merge_provider_event(
             current.push_str(&next);
             Ok(())
         }
-        (Ok(ProviderEvent::ThinkingDelta(current)), Ok(ProviderEvent::ThinkingDelta(next)))
-            if current.len().saturating_add(next.len()) <= PROVIDER_DELTA_MAX_BYTES =>
+        (
+            Ok(ProviderEvent::ThinkingDelta {
+                id: current_id,
+                text: current,
+            }),
+            Ok(ProviderEvent::ThinkingDelta {
+                id: next_id,
+                text: next,
+            }),
+        ) if current_id == &next_id
+            && current.len().saturating_add(next.len()) <= PROVIDER_DELTA_MAX_BYTES =>
         {
             current.push_str(&next);
             Ok(())
@@ -281,6 +318,19 @@ pub trait Provider: Send + Sync {
         tools: &[ToolSpec],
         options: &serde_json::Map<String, serde_json::Value>,
     ) -> Result<EventStream, ProviderError>;
+
+    /// Run one model turn with an admission hint. Providers without a shared
+    /// single-model runtime retain their normal behavior.
+    async fn stream_chat_with_priority(
+        &self,
+        model: &str,
+        messages: &[Message],
+        tools: &[ToolSpec],
+        options: &serde_json::Map<String, serde_json::Value>,
+        _priority: InferencePriority,
+    ) -> Result<EventStream, ProviderError> {
+        self.stream_chat(model, messages, tools, options).await
+    }
 }
 
 /// Preserve one provider's concrete model catalog and execution behavior while
@@ -354,16 +404,42 @@ mod tests {
         let source: EventStream = Box::pin(futures::stream::iter(vec![
             Ok(ProviderEvent::TextDelta("a".into())),
             Ok(ProviderEvent::TextDelta("b".into())),
-            Ok(ProviderEvent::ThinkingDelta("c".into())),
-            Ok(ProviderEvent::ThinkingDelta("d".into())),
+            Ok(ProviderEvent::ThinkingStarted { id: "one".into() }),
+            Ok(ProviderEvent::ThinkingDelta {
+                id: "one".into(),
+                text: "c".into(),
+            }),
+            Ok(ProviderEvent::ThinkingDelta {
+                id: "one".into(),
+                text: "d".into(),
+            }),
+            Ok(ProviderEvent::ThinkingCompleted { id: "one".into() }),
+            Ok(ProviderEvent::ThinkingStarted { id: "two".into() }),
+            Ok(ProviderEvent::ThinkingDelta {
+                id: "two".into(),
+                text: "e".into(),
+            }),
             Ok(ProviderEvent::Completed {
                 usage: Usage::default(),
             }),
         ]));
         let events: Vec<_> = coalesce_event_stream(source).collect().await;
-        assert_eq!(events.len(), 3);
+        assert_eq!(events.len(), 7);
         assert!(matches!(&events[0], Ok(ProviderEvent::TextDelta(text)) if text == "ab"));
-        assert!(matches!(&events[1], Ok(ProviderEvent::ThinkingDelta(text)) if text == "cd"));
-        assert!(matches!(&events[2], Ok(ProviderEvent::Completed { .. })));
+        assert!(matches!(&events[1], Ok(ProviderEvent::ThinkingStarted { id }) if id == "one"));
+        assert!(matches!(
+            &events[2],
+            Ok(ProviderEvent::ThinkingDelta { id, text }) if id == "one" && text == "cd"
+        ));
+        assert!(matches!(
+            &events[3],
+            Ok(ProviderEvent::ThinkingCompleted { id }) if id == "one"
+        ));
+        assert!(matches!(&events[4], Ok(ProviderEvent::ThinkingStarted { id }) if id == "two"));
+        assert!(matches!(
+            &events[5],
+            Ok(ProviderEvent::ThinkingDelta { id, text }) if id == "two" && text == "e"
+        ));
+        assert!(matches!(&events[6], Ok(ProviderEvent::Completed { .. })));
     }
 }

@@ -89,10 +89,14 @@ def compare(
 
         display_name = name.replace("|", "\\|")
         if not values:
+            # No history means no screen: treat it like insufficient history
+            # so the workflow confirms against the base revision instead of
+            # letting a brand-new (or renamed) benchmark pass ungated.
             lines.append(
                 f"| {display_name} | {format_value(current.value, current.unit)} "
-                "| — | — | New benchmark |"
+                "| — | — | New benchmark (needs base confirmation) |"
             )
+            exit_code = max(exit_code, 2)
             continue
 
         baseline_median = statistics.median(values)

@@ -44,6 +44,11 @@ import {
 } from "../services/chat-preferences.js";
 import { createBrowserComposerDraftController } from "../services/composer-drafts.js";
 import { createBrowserWorkspaceOrderController } from "../services/workspace-order.js";
+import {
+  createBrowserWorkspaceListPreferencesController,
+  type WorkspaceListGrouping,
+  type WorkspaceListOrdering,
+} from "../services/workspace-list-preferences.js";
 import { createBrowserPullRequestGroupOrderController } from "../services/pull-request-group-order.js";
 import {
   appearanceFontFamilyCssValue,
@@ -101,12 +106,17 @@ import {
 import {
   ProtocolClient,
   type ProtocolAgentPersona,
+  type ProtocolAttachmentUpload,
   type ProtocolEventEnvelope,
-  type ProtocolGeneratedSessionTitle,
+  type ProtocolGeneratedTitle,
   type ProtocolModelInfo,
   type ProtocolProvidersResponse,
   type ProtocolSubscriptionHealth,
 } from "../services/protocol-client.js";
+import {
+  beginTitleGeneration,
+  titleGenerationTimeoutMs,
+} from "../services/title-generation.js";
 import { createBrowserThreadIngress } from "../services/thread-ingress.js";
 import { SubscriptionHealthController } from "../services/subscription-health-controller.js";
 import {
@@ -123,6 +133,7 @@ import { AppStore } from "../state/app-store.js";
 import { createSignal, readSignal, withSignalTracking } from "../state/reactivity.js";
 import { inboxRecoverySession } from "../state/session-inbox-model.js";
 import {
+  applyNewSessionModelOptionChange,
   beginNewSessionSubmission,
   beginNewSessionOptionLoad,
   canSubmitNewSession,
@@ -148,7 +159,8 @@ import {
   resolveNewThreadDefaults,
   openNewSessionSetup,
   openNewSessionSetupForWorkspace,
-  sessionTitleFallback,
+  NEW_SESSION_TITLE_FALLBACK,
+  NEW_THREAD_TITLE_FALLBACK,
   settleNewSessionOptionLoad,
   snapshotNewSessionSubmission,
   thinkingOption,
@@ -179,7 +191,16 @@ import {
 } from "../components/chat-file-link.js";
 import { pickAndRegisterWorkspace } from "../components/workspace-settings-model.js";
 import { modelHealthPresentations } from "../components/model-health.js";
-import { modelOptionLabel } from "../components/model-option-controls.js";
+import {
+  modelOptionControls,
+  sanitizeModelOptions,
+  type ModelOptionChangeDetail,
+} from "../components/model-option-controls.js";
+import {
+  WORKSPACE_PULL_REQUEST_FILTERS,
+  WORKSPACE_STATUS_FILTERS,
+} from "../components/workspace-session-list-model.js";
+import { organizeWorkspaceList } from "../components/workspace-list-model.js";
 import {
   fontAwesomeIcon,
   type FontAwesomeIconName,
@@ -187,10 +208,11 @@ import {
 import "../components/command-palette.js";
 import "../components/image-preview.js";
 import "../components/session-list.js";
+import "../components/session-usage-panel.js";
 import "../components/thread-screen.js";
 import "../components/model-picker.js";
+import "../components/model-options-editor.js";
 
-const SESSION_TITLE_TIMEOUT_MS = 48_000;
 const VIDEO_ATTACHMENT_DOWNLOAD_TIMEOUT_MS = 30_000;
 const VIDEO_ATTACHMENT_OPEN_CONCURRENCY = 1;
 const VIDEO_ATTACHMENT_OPEN_CAPACITY = 8;
@@ -252,6 +274,10 @@ export class TrouveApp extends withSignalTracking(LitElement) {
   readonly #workspaceOrder = createBrowserWorkspaceOrderController(
     deployment !== "desktop",
   );
+  // This is frontend-only presentation state. Keep a same-origin mirror in
+  // desktop WebViews as well as browser/PWA deployments so it survives reloads
+  // without adding sidebar concerns to the harness protocol.
+  readonly #workspaceListPreferences = createBrowserWorkspaceListPreferencesController();
   readonly #pullRequestGroupOrder = createBrowserPullRequestGroupOrderController(
     deployment !== "desktop",
   );
@@ -416,6 +442,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
   #pwaInstallPending = false;
   #pwaInstallStatus = "";
   #newSessionSetup: NewSessionSetupLifecycle = createNewSessionSetupLifecycle();
+  #newThreadSetupOpen = false;
   #newSessionPending = false;
   #newSessionError = "";
   #newSessionWorkspaceId = "";
@@ -437,6 +464,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
   #newSessionInheritedThinking: string | undefined;
   #newSessionOptionsLifecycle = createNewSessionOptionsLifecycle();
   #newSessionOptionEdits: NewThreadOptionEdits = createNewThreadOptionEdits();
+  #newSessionModelOptions: Readonly<Record<string, unknown>> = {};
   #newSessionOptionsError = "";
   #newSessionOptionsStatus = "";
   #newSessionOptionsGeneration = 0;
@@ -450,6 +478,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
   #collapsedWorkspaceIds = new Set<string>();
   #showArchivedWorkspaceIds = new Set<string>();
   #workspaceActionMenuId = "";
+  #workspaceListOptionsOpen = false;
   #workspaceClosePendingId = "";
   #workspaceOrderStatus = "";
   #draggedWorkspaceId = "";
@@ -541,6 +570,16 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       "visibilitychange",
       this.#retryProtocolAfterVisibility,
     );
+    globalThis.document?.addEventListener(
+      "pointerdown",
+      this.#dismissWorkspaceListOptionsFromPointer,
+      true,
+    );
+    globalThis.document?.addEventListener(
+      "keydown",
+      this.#dismissWorkspaceListOptionsFromKeyboard,
+      true,
+    );
     this.#browserWakeLock?.start();
     if (this.#hostClient !== undefined) {
       if (!this.#hostLoadStarted) {
@@ -575,6 +614,16 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     this.#unsubscribeFromNewSessionLiveModels();
     this.#newSessionOptionsLifecycle = interruptNewSessionOptionLoad(
       this.#newSessionOptionsLifecycle,
+    );
+    globalThis.document?.removeEventListener(
+      "pointerdown",
+      this.#dismissWorkspaceListOptionsFromPointer,
+      true,
+    );
+    globalThis.document?.removeEventListener(
+      "keydown",
+      this.#dismissWorkspaceListOptionsFromKeyboard,
+      true,
     );
     this.#protocolIngress.stop();
     this.#threadIngress.close();
@@ -1557,9 +1606,85 @@ export class TrouveApp extends withSignalTracking(LitElement) {
   }
 
   #toggleWorkspaceActions(workspaceId: string): void {
+    this.#workspaceListOptionsOpen = false;
     this.#workspaceActionMenuId = this.#workspaceActionMenuId === workspaceId
       ? ""
       : workspaceId;
+    this.requestUpdate();
+  }
+
+  readonly #toggleWorkspaceListOptions = (): void => {
+    this.#workspaceActionMenuId = "";
+    this.#workspaceListOptionsOpen = !this.#workspaceListOptionsOpen;
+    this.requestUpdate();
+  };
+
+  #closeWorkspaceListOptions(restoreFocus: boolean): void {
+    if (!this.#workspaceListOptionsOpen) return;
+    this.#workspaceListOptionsOpen = false;
+    this.requestUpdate();
+    if (!restoreFocus) return;
+    void this.updateComplete.then(() => {
+      if (!this.isConnected) return;
+      this.querySelector<HTMLButtonElement>(".workspace-list-options-button")?.focus();
+    });
+  }
+
+  readonly #dismissWorkspaceListOptionsFromPointer = (event: PointerEvent): void => {
+    if (!this.#workspaceListOptionsOpen) return;
+    if (event.composedPath().some((target) =>
+      target instanceof Element && target.closest(".workspace-list-options-wrap") !== null
+    )) return;
+    this.#closeWorkspaceListOptions(false);
+  };
+
+  readonly #dismissWorkspaceListOptionsFromKeyboard = (event: KeyboardEvent): void => {
+    if (!this.#workspaceListOptionsOpen || event.key !== "Escape") return;
+    event.preventDefault();
+    event.stopPropagation();
+    this.#closeWorkspaceListOptions(true);
+  };
+
+  #setWorkspaceListGrouping(event: Event): void {
+    const grouping = (event.currentTarget as HTMLSelectElement).value as WorkspaceListGrouping;
+    this.#workspaceListPreferences.update({ grouping });
+    this.requestUpdate();
+  }
+
+  #setWorkspaceListOrdering(event: Event): void {
+    const ordering = (event.currentTarget as HTMLSelectElement).value as WorkspaceListOrdering;
+    this.#workspaceListPreferences.update({ ordering });
+    this.requestUpdate();
+  }
+
+  #toggleWorkspaceListShow(option: "showBranches" | "showStatus"): void {
+    const current = readSignal(this.#workspaceListPreferences.current);
+    this.#workspaceListPreferences.update({ [option]: !current[option] });
+    this.requestUpdate();
+  }
+
+  #toggleWorkspaceListFilter(
+    workspaceId: string,
+    category: "status" | "pullRequest",
+    index: number,
+  ): void {
+    this.#workspaceListPreferences.toggleFilter(workspaceId, category, index);
+    this.requestUpdate();
+  }
+
+  #collapseWorkspaceFromMenu(workspaceId: string): void {
+    const collapsed = new Set(this.#collapsedWorkspaceIds);
+    collapsed.add(workspaceId);
+    this.#collapsedWorkspaceIds = collapsed;
+    this.#workspaceActionMenuId = "";
+    this.requestUpdate();
+  }
+
+  #markWorkspaceRead(workspaceId: string): void {
+    for (const session of readSignal(this.#store.sessions)) {
+      if (session.workspaceId === workspaceId) this.#store.markSessionRead(session.id);
+    }
+    this.#workspaceActionMenuId = "";
     this.requestUpdate();
   }
 
@@ -1589,6 +1714,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       const showArchived = new Set(this.#showArchivedWorkspaceIds);
       showArchived.delete(workspaceId);
       this.#showArchivedWorkspaceIds = showArchived;
+      this.#workspaceListPreferences.removeWorkspace(workspaceId);
       const route = readSignal(this.#router.route);
       if (route.kind === "session" && route.workspaceId === workspaceId) {
         this.#router.navigate({ kind: "inbox" }, true);
@@ -1889,6 +2015,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
 
   #resetNewSessionOptionsForWorkspace(workspaceId: string): void {
     this.#newSessionOptionEdits = createNewThreadOptionEdits();
+    this.#newSessionModelOptions = {};
     if (!newSessionOptionsAreAuthoritative(
       this.#newSessionOptionsLifecycle,
       workspaceId,
@@ -1918,6 +2045,14 @@ export class TrouveApp extends withSignalTracking(LitElement) {
   }
 
   #reconcileNewSessionDefaults(models: readonly ProtocolModelInfo[]): void {
+    const previousMode = this.#newSessionModes.find(
+      (mode) => mode.id === this.#newSessionModeId,
+    );
+    const previousModelId = resolveNewSessionModel(
+      this.#newSessionModelId,
+      previousMode,
+      this.#newSessionProviders,
+    );
     const defaults = reconcileNewThreadDefaults(
       {
         modeId: this.#newSessionModeId,
@@ -1942,16 +2077,32 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     );
     this.#newSessionInheritedThinking = inheritance.inheritedThinking;
     this.#newSessionInheritedPermissionMode = inheritance.inheritedPermissionMode;
+    const nextMode = this.#newSessionModes.find((mode) => mode.id === defaults.modeId);
+    const nextModelId = resolveNewSessionModel(
+      defaults.modelId,
+      nextMode,
+      this.#newSessionProviders,
+    );
+    const nextModel = this.#availableNewSessionModels().find(
+      (model) => model.id === nextModelId,
+    );
+    this.#newSessionModelOptions = previousModelId === nextModelId
+      ? sanitizeModelOptions(nextModel, this.#newSessionModelOptions)
+      : {};
   }
 
-  /** Match the retained controller's bounded title-model request. Session
-   * creation must remain usable when the managed model or a remote provider
-   * accepts a connection but never completes it. */
-  async #generateSessionTitle(prompt: string): Promise<ProtocolGeneratedSessionTitle> {
+  /** Keep cosmetic naming bounded even when a configured provider accepts a
+   * connection but never completes it. */
+  async #generateTitle(
+    sessionId: string,
+    prompt: string,
+    attachments: readonly ProtocolAttachmentUpload[],
+  ): Promise<ProtocolGeneratedTitle> {
     const abort = new AbortController();
-    const timeout = globalThis.setTimeout(() => abort.abort(), SESSION_TITLE_TIMEOUT_MS);
+    const timeoutMs = titleGenerationTimeoutMs();
+    const timeout = globalThis.setTimeout(() => abort.abort(), timeoutMs);
     try {
-      return await this.#protocolClient.generateSessionTitle(prompt, {
+      return await this.#protocolClient.generateTitle(sessionId, prompt, attachments, {
         signal: abort.signal,
       });
     } finally {
@@ -1961,24 +2112,47 @@ export class TrouveApp extends withSignalTracking(LitElement) {
 
   /** Upgrade a prompt-derived title without delaying session creation or the
    * first turn. A manual rename made while generation is in flight wins. */
-  #upgradeSessionTitleInBackground(
-    sessionId: string,
+  #upgradeTitleInBackground(
+    target: "session" | "thread",
+    id: string,
     provisionalTitle: string,
     prompt: string,
+    attachments: readonly ProtocolAttachmentUpload[],
+    sharedGeneration?: Promise<ProtocolGeneratedTitle>,
   ): void {
+    const waitingTimer = beginTitleGeneration(
+      this.#store,
+      id,
+      provisionalTitle,
+      readSignal(this.#store.sessionNamingSettings)?.settings.model,
+    );
     void (async () => {
       try {
-        const generated = await this.#generateSessionTitle(prompt);
+        const sessionId = target === "session"
+          ? id
+          : this.#store.thread(id)?.session_id;
+        if (sessionId === undefined) return;
+        const generated = await (sharedGeneration
+          ?? this.#generateTitle(sessionId, prompt, attachments));
         const title = generated.title.trim();
         if (title === "" || title === provisionalTitle) return;
-        if (this.#store.sessionMetadata(sessionId)?.title !== provisionalTitle) return;
-        const session = await this.#protocolClient.updateSession(sessionId, {
-          title,
-          expected_title: provisionalTitle,
-        });
-        this.#store.upsertSessionMetadata(session);
+        if (target === "session") {
+          if (this.#store.sessionMetadata(id)?.title !== provisionalTitle) return;
+          this.#store.upsertSessionMetadata(await this.#protocolClient.updateSession(id, {
+            title,
+            expected_title: provisionalTitle,
+          }));
+        } else {
+          this.#store.upsertThread(await this.#protocolClient.updateThread(id, {
+            title,
+            expected_title: provisionalTitle,
+          }));
+        }
       } catch {
-        // Naming is cosmetic; the deterministic provisional title remains.
+        // Naming is cosmetic; the placeholder or a user rename remains.
+      } finally {
+        globalThis.clearTimeout(waitingTimer);
+        this.#store.endTitleGeneration(id);
       }
     })();
   }
@@ -1988,6 +2162,15 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     this.#newSessionWorkspaceId = workspaceId;
     this.#resetNewSessionOptionsForWorkspace(workspaceId);
     this.#newSessionPreferredBaseRef = "";
+    // Catalog loads are asynchronous. Drop every workspace-specific selection
+    // before starting them so a fast submit cannot combine the new workspace
+    // with the previous workspace's mode, model, or model options.
+    this.#newSessionModeId = "";
+    this.#newSessionModelId = "";
+    this.#newSessionModelOptions = {};
+    this.#newSessionModes = [];
+    this.#newSessionModels = [];
+    this.#newSessionProviders = undefined;
     void this.#loadNewSessionBranches(workspaceId);
     void this.#loadNewSessionOptions(workspaceId);
   };
@@ -2048,6 +2231,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     this.#newSessionPrompt = "";
     this.#newSessionPromptComposing = false;
     this.#newSessionPermissionMode = "";
+    this.#newSessionModelOptions = {};
     this.#newSessionPreferredBaseRef = "";
   }
 
@@ -2270,6 +2454,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
         thinking: this.#newSessionThinking,
         permissionMode: this.#newSessionPermissionMode,
       },
+      modelOptions: this.#newSessionModelOptions,
       edits: this.#newSessionOptionEdits,
       modes: this.#newSessionModes,
       providers: this.#newSessionProviders,
@@ -2282,7 +2467,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       ),
     });
     const submissionAttachments = this.#newSessionAttachments.map(({ upload }) => upload);
-    const title = retainedCreateRequest?.title ?? sessionTitleFallback(prompt);
+    const title = retainedCreateRequest?.title ?? NEW_SESSION_TITLE_FALLBACK;
     const createRequest = {
       workspaceId,
       title,
@@ -2330,20 +2515,38 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     }
 
     this.#store.upsertSessionMetadata(session);
-    if (retainedCreateRequest === undefined) {
-      this.#upgradeSessionTitleInBackground(session.id, submittedCreateRequest.title, prompt);
+    const sharedGeneratedTitle = retainedCreateRequest === undefined
+      ? this.#generateTitle(session.id, prompt, submissionAttachments)
+      : undefined;
+    if (sharedGeneratedTitle !== undefined) {
+      this.#upgradeTitleInBackground(
+        "session",
+        session.id,
+        submittedCreateRequest.title,
+        prompt,
+        submissionAttachments,
+        sharedGeneratedTitle,
+      );
     }
     let threadId: string | undefined;
     try {
       const thread = await this.#protocolClient.createThread(
         createNewSessionThreadRequestFromSnapshot({
           sessionId: session.id,
-          title: session.title,
+          title: NEW_THREAD_TITLE_FALLBACK,
           snapshot: submissionOptions,
         }),
       );
       this.#store.upsertThread(thread);
       threadId = thread.id;
+      this.#upgradeTitleInBackground(
+        "thread",
+        thread.id,
+        thread.title ?? NEW_THREAD_TITLE_FALLBACK,
+        prompt,
+        submissionAttachments,
+        sharedGeneratedTitle,
+      );
     } catch {
       this.#shellNotice = "Session created, but its first thread could not be created; the prompt was not sent.";
     }
@@ -2376,6 +2579,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     this.#newSessionPrompt = "";
     this.#newSessionAttachments = [];
     this.#newSessionAttachmentGeneration += 1;
+    this.#newSessionModelOptions = {};
     this.#newSessionAttachmentPending = false;
     this.#newSessionPreferredBaseRef = "";
     form.reset();
@@ -2448,7 +2652,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     let createdSession: Awaited<ReturnType<ProtocolClient["createSession"]>> | undefined;
     try {
       if (sessionId === undefined) {
-        const title = sessionTitleFallback(detail.prompt);
+        const title = NEW_SESSION_TITLE_FALLBACK;
         createdSession = await this.#protocolClient.createSession({
           workspace_id: detail.workspaceId,
           title,
@@ -2456,16 +2660,29 @@ export class TrouveApp extends withSignalTracking(LitElement) {
           fetch_latest: true,
         });
         this.#store.upsertSessionMetadata(createdSession);
-        this.#upgradeSessionTitleInBackground(createdSession.id, title, detail.prompt);
+        this.#upgradeTitleInBackground(
+          "session",
+          createdSession.id,
+          title,
+          detail.prompt,
+          [],
+        );
         sessionId = createdSession.id;
       }
 
       const thread = await this.#protocolClient.createThread({
         session_id: sessionId,
-        title: sessionTitleFallback(detail.prompt),
+        title: NEW_THREAD_TITLE_FALLBACK,
         mode: "code",
       });
       this.#store.upsertThread(thread);
+      this.#upgradeTitleInBackground(
+        "thread",
+        thread.id,
+        thread.title ?? NEW_THREAD_TITLE_FALLBACK,
+        detail.prompt,
+        [],
+      );
       let messageSent = true;
       try {
         await this.#protocolClient.sendMessage(thread.id, {
@@ -2850,6 +3067,25 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     const knownWorkspaces = readSignal(this.#store.workspaces);
     readSignal(this.#workspaceOrder.order);
     const orderedWorkspaces = this.#workspaceOrder.ordered(knownWorkspaces);
+    const workspaceListPreferences = readSignal(this.#workspaceListPreferences.current);
+    const workspaceGroups = organizeWorkspaceList(orderedWorkspaces, workspaceListPreferences.grouping);
+    const displayedWorkspaces = workspaceGroups.flatMap(({ workspaces }) => workspaces);
+    const workspaceReorderingEnabled = workspaceGroups.every(
+      ({ workspaces }) => workspaces.length === 1,
+    );
+    const repositoryGroupPresentations = new Map(
+      workspaceGroups.flatMap((group, groupIndex) =>
+        group.repository && group.workspaces.length > 1
+          ? group.workspaces.map((workspace, index) => [
+              workspace.id,
+              {
+                headingId: `repository-group-${groupIndex}`,
+                label: group.label,
+                first: index === 0,
+              },
+            ] as const)
+          : []),
+    );
     const capabilities = readSignal(this.#capabilities.current);
     const directoryPickerAvailable =
       capabilities.directoryPicker &&
@@ -2895,8 +3131,16 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       newSessionModels,
       this.#newSessionSubscriptionHealth,
     );
-    const newSessionThinkingOption = thinkingOption(
-      modelForSelection(newSessionModels, effectiveNewSessionModel),
+    const effectiveNewSessionModelInfo = newSessionModels.find(
+      (model) => model.id === effectiveNewSessionModel,
+    );
+    const newSessionThinkingOption = thinkingOption(effectiveNewSessionModelInfo);
+    const newSessionModelOptions = modelOptionControls(
+      effectiveNewSessionModelInfo,
+      this.#newSessionModelOptions,
+      newSessionThinkingOption === undefined || this.#newSessionThinking === ""
+        ? {}
+        : { [newSessionThinkingOption.key]: this.#newSessionThinking },
     );
     const newSessionOptionsLoading = newSessionOptionsAreLoading(
       this.#newSessionOptionsLifecycle,
@@ -2948,18 +3192,81 @@ export class TrouveApp extends withSignalTracking(LitElement) {
         @trouve-pull-request-chat=${this.#openPullRequestChat}
         @trouve-pull-request-fix=${this.#fixPullRequestReview}
         @trouve-close-full-screen=${this.#closeFullScreenRoute}
+        @trouve-new-thread-setup-state=${(event: CustomEvent<{ readonly open: boolean }>) => {
+          this.#newThreadSetupOpen = event.detail.open;
+          this.requestUpdate();
+        }}
       >
         <nav
           class="navigation-panel"
           aria-label="Workspaces and sessions"
         >
           <div class="primary-links" aria-label="Application sections">
-            <button type="button" aria-current=${route.kind === "reviews" ? "page" : "false"} @click=${() => { this.#router.navigate({ kind: "reviews" }); this.#showMobilePane("thread"); }}>${fontAwesomeIcon("code-pull-request")}<strong>Pull Requests</strong></button>
-            <button type="button" aria-current=${route.kind === "automations" ? "page" : "false"} @click=${() => { this.#router.navigate({ kind: "automations" }); this.#showMobilePane("thread"); }}>${fontAwesomeIcon("stopwatch")}<strong>Automations</strong></button>
-            <button type="button" aria-current=${route.kind === "settings" ? "page" : "false"} @click=${() => { this.#router.navigate({ kind: "settings" }); this.#showMobilePane("thread"); }}>${fontAwesomeIcon("gear", { className: "settings-link-icon" })}<strong>Settings</strong></button>
+            <button class="navigation-icon-button" type="button" aria-label="Pull Requests" data-tooltip="Pull Requests" aria-current=${route.kind === "reviews" ? "page" : "false"} @click=${() => { this.#router.navigate({ kind: "reviews" }); this.#showMobilePane("thread"); }}>${fontAwesomeIcon("code-pull-request")}</button>
+            <button class="navigation-icon-button" type="button" aria-label="Automations" data-tooltip="Automations" aria-current=${route.kind === "automations" ? "page" : "false"} @click=${() => { this.#router.navigate({ kind: "automations" }); this.#showMobilePane("thread"); }}>${fontAwesomeIcon("stopwatch")}</button>
+            <button class="navigation-icon-button" type="button" aria-label="Settings" data-tooltip="Settings" aria-current=${route.kind === "settings" ? "page" : "false"} @click=${() => { this.#router.navigate({ kind: "settings" }); this.#showMobilePane("thread"); }}>${fontAwesomeIcon("gear", { className: "settings-link-icon" })}</button>
           </div>
           <div class="workspace-list-heading">
-            <strong>Workspaces</strong>
+            <h2>Workspaces</h2>
+            <span class="workspace-list-options-wrap">
+              <button
+                class="workspace-list-options-button"
+                type="button"
+                aria-label="Workspace list options"
+                title="Workspace list options"
+                aria-expanded=${this.#workspaceListOptionsOpen ? "true" : "false"}
+                @click=${this.#toggleWorkspaceListOptions}
+              >${fontAwesomeIcon("ellipsis")}</button>
+              ${this.#workspaceListOptionsOpen
+                ? html`<span
+                    class="workspace-list-options-menu"
+                    role="group"
+                    aria-label="Workspace list options"
+                  >
+                    <label>
+                      <span>Grouping</span>
+                      <select
+                        aria-label="Group sessions by"
+                        .value=${workspaceListPreferences.grouping}
+                        @change=${(event: Event) => this.#setWorkspaceListGrouping(event)}
+                      >
+                        <option value="repository">Repository</option>
+                        <option value="workspace">Workspace</option>
+                        <option value="updated">Updated</option>
+                        <option value="status">Status</option>
+                      </select>
+                    </label>
+                    <label>
+                      <span>Ordering</span>
+                      <select
+                        aria-label="Order sessions by"
+                        .value=${workspaceListPreferences.ordering}
+                        @change=${(event: Event) => this.#setWorkspaceListOrdering(event)}
+                      >
+                        <option value="updated">Updated</option>
+                        <option value="status">Status</option>
+                        <option value="created">Created</option>
+                      </select>
+                    </label>
+                    <label class="workspace-list-show-option">
+                      <input
+                        type="checkbox"
+                        .checked=${workspaceListPreferences.showBranches}
+                        @change=${() => this.#toggleWorkspaceListShow("showBranches")}
+                      />
+                      <span>Branch names</span>
+                    </label>
+                    <label class="workspace-list-show-option">
+                      <input
+                        type="checkbox"
+                        .checked=${workspaceListPreferences.showStatus}
+                        @change=${() => this.#toggleWorkspaceListShow("showStatus")}
+                      />
+                      <span>Status indicators</span>
+                    </label>
+                  </span>`
+                : nothing}
+            </span>
             <button
               class="command-palette-compact"
               type="button"
@@ -2969,22 +3276,26 @@ export class TrouveApp extends withSignalTracking(LitElement) {
               title="Command palette (Ctrl/Cmd-K)"
               @click=${this.#openCommandPalette}
             >${fontAwesomeIcon("magnifying-glass")}</button>
-            <wa-button
-              size="s"
+            <button
+              class="workspace-open-button"
+              type="button"
               aria-label="Open workspace"
               title=${directoryPickerAvailable
                 ? "Choose a repository folder"
                 : "Browse is unavailable here; register a server-host path in Settings"}
               ?disabled=${!directoryPickerAvailable || this.#workspacePickerPending}
               @click=${() => void this.#openWorkspace()}
-            >${this.#workspacePickerPending
-              ? "Opening…"
-              : html`${fontAwesomeIcon("plus")} Open`}</wa-button>
+            >${fontAwesomeIcon(this.#workspacePickerPending ? "spinner" : "plus", {
+                spin: this.#workspacePickerPending,
+              })}</button>
           </div>
           <p class="visually-hidden" role="status" aria-live="polite" aria-atomic="true">${this.#workspaceOrderStatus}</p>
-          ${orderedWorkspaces.map(
+          <div class="workspace-scroll">
+          ${displayedWorkspaces.map(
             (workspace, index) => {
               const collapsed = this.#collapsedWorkspaceIds.has(workspace.id);
+              const workspaceFilters = this.#workspaceListPreferences.filtersFor(workspace.id);
+              const repositoryGroup = repositoryGroupPresentations.get(workspace.id);
               const dropTarget = this.#workspaceDropTarget === workspace.id;
               const placeholder = html`<div
                 class="workspace-drop-placeholder"
@@ -2994,10 +3305,15 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                 @drop=${(event: DragEvent) => this.#dropWorkspace(event, workspace.id)}
               ></div>`;
               return html`
+                ${repositoryGroup?.first
+                  ? html`<h3 id=${repositoryGroup.headingId} class="repository-group-heading">${repositoryGroup.label}</h3>`
+                  : nothing}
                 ${dropTarget && !this.#workspaceDropAfter ? placeholder : nothing}
                 <section
                   class="workspace-group"
-                  aria-labelledby=${`workspace-${index}`}
+                  aria-labelledby=${repositoryGroup === undefined
+                    ? `workspace-${index}`
+                    : `${repositoryGroup.headingId} workspace-${index}`}
                   @dragover=${(event: DragEvent) => this.#dragOverWorkspace(event, workspace.id)}
                   @drop=${(event: DragEvent) => this.#dropWorkspace(event, workspace.id)}
                 >
@@ -3016,24 +3332,28 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                       @click=${() => this.#toggleWorkspace(workspace.id)}
                     >
                       ${fontAwesomeIcon(collapsed ? "caret-right" : "caret-down")}
-                      <h2 id=${`workspace-${index}`}>${workspace.name}</h2>
+                      ${repositoryGroup === undefined
+                        ? html`<h3 id=${`workspace-${index}`}>${workspace.name}</h3>`
+                        : html`<h4 id=${`workspace-${index}`}>${workspace.name}</h4>`}
                     </button>
-                    <span
-                      class="workspace-order-controls"
-                      aria-label=${`Position of ${workspace.name}, ${index + 1} of ${orderedWorkspaces.length}`}
-                    >
-                      <button
-                        class="workspace-grip"
-                        type="button"
-                        data-workspace-id=${workspace.id}
-                        .draggable=${orderedWorkspaces.length > 1}
-                        aria-label=${`Reorder ${workspace.name}. Position ${index + 1} of ${orderedWorkspaces.length}. Use Up and Down arrow keys or drag.`}
-                        title="Drag to reorder, or use arrow keys"
-                        @keydown=${(event: KeyboardEvent) => this.#workspaceOrderKeyDown(event, workspace.id)}
-                        @dragstart=${(event: DragEvent) => this.#startWorkspaceDrag(event, workspace.id)}
-                        @dragend=${this.#finishWorkspaceDrag}
-                      >${fontAwesomeIcon("grip-vertical")}</button>
-                    </span>
+                    ${workspaceReorderingEnabled
+                      ? html`<span
+                          class="workspace-order-controls"
+                          aria-label=${`Position of ${workspace.name}, ${index + 1} of ${displayedWorkspaces.length}`}
+                        >
+                          <button
+                            class="workspace-grip"
+                            type="button"
+                            data-workspace-id=${workspace.id}
+                            .draggable=${displayedWorkspaces.length > 1}
+                            aria-label=${`Reorder ${workspace.name}. Position ${index + 1} of ${displayedWorkspaces.length}. Use Up and Down arrow keys or drag.`}
+                            title="Drag to reorder, or use arrow keys"
+                            @keydown=${(event: KeyboardEvent) => this.#workspaceOrderKeyDown(event, workspace.id)}
+                            @dragstart=${(event: DragEvent) => this.#startWorkspaceDrag(event, workspace.id)}
+                            @dragend=${this.#finishWorkspaceDrag}
+                          >${fontAwesomeIcon("grip-vertical")}</button>
+                        </span>`
+                      : nothing}
                     <span class="workspace-actions-wrap">
                       <button
                         class="workspace-actions-button"
@@ -3052,7 +3372,50 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                               aria-checked=${this.#showArchivedWorkspaceIds.has(workspace.id) ? "true" : "false"}
                               @click=${() => this.#toggleArchivedWorkspaceSessions(workspace.id)}
                             ><span>Archived</span><span>${this.#showArchivedWorkspaceIds.has(workspace.id) ? fontAwesomeIcon("check") : nothing}</span></button>
+                            <span class="workspace-actions-menu-section" role="group" aria-label="Status filters">
+                              <strong>Status</strong>
+                              ${WORKSPACE_STATUS_FILTERS.map(([, label], filterIndex) => html`<button
+                                type="button"
+                                role="menuitemcheckbox"
+                                aria-checked=${(workspaceFilters.status & (1 << filterIndex)) !== 0 ? "true" : "false"}
+                                @click=${() => this.#toggleWorkspaceListFilter(
+                                  workspace.id,
+                                  "status",
+                                  filterIndex,
+                                )}
+                              ><span>${label}</span><span>${(workspaceFilters.status & (1 << filterIndex)) !== 0
+                                  ? fontAwesomeIcon("check")
+                                  : nothing}</span></button>`)}
+                            </span>
+                            <span class="workspace-actions-menu-section" role="group" aria-label="Pull request filters">
+                              <strong>Pull request</strong>
+                              ${WORKSPACE_PULL_REQUEST_FILTERS.map(([, label], filterIndex) => html`<button
+                                type="button"
+                                role="menuitemcheckbox"
+                                aria-checked=${(workspaceFilters.pullRequest & (1 << filterIndex)) !== 0 ? "true" : "false"}
+                                @click=${() => this.#toggleWorkspaceListFilter(
+                                  workspace.id,
+                                  "pullRequest",
+                                  filterIndex,
+                                )}
+                              ><span>${label}</span><span>${(workspaceFilters.pullRequest & (1 << filterIndex)) !== 0
+                                  ? fontAwesomeIcon("check")
+                                  : nothing}</span></button>`)}
+                            </span>
+                            <span class="workspace-actions-menu-section" role="group" aria-label="Workspace commands">
+                              <button
+                                type="button"
+                                role="menuitem"
+                                @click=${() => this.#collapseWorkspaceFromMenu(workspace.id)}
+                              ><span>Collapse workspace</span></button>
+                              <button
+                                type="button"
+                                role="menuitem"
+                                @click=${() => this.#markWorkspaceRead(workspace.id)}
+                              ><span>Mark all as read</span></button>
+                            </span>
                             <button
+                              class="danger"
                               type="button"
                               role="menuitem"
                               ?disabled=${this.#workspaceClosePendingId !== ""}
@@ -3073,6 +3436,12 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                     id=${`workspace-sessions-${index}`}
                     workspace-id=${workspace.id}
                     .showArchived=${this.#showArchivedWorkspaceIds.has(workspace.id)}
+                    .grouping=${workspaceListPreferences.grouping}
+                    .ordering=${workspaceListPreferences.ordering}
+                    .showBranches=${workspaceListPreferences.showBranches}
+                    .showStatus=${workspaceListPreferences.showStatus}
+                    .statusFilter=${workspaceFilters.status}
+                    .pullRequestFilter=${workspaceFilters.pullRequest}
                     ?hidden=${collapsed}
                     @trouve-session-open=${() => this.#showMobilePane("thread")}
                   ></trouve-session-list>
@@ -3084,6 +3453,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
           ${orphanWorkspaceIds.map(
             (workspaceId, index) => {
               const collapsed = this.#collapsedWorkspaceIds.has(workspaceId);
+              const workspaceFilters = this.#workspaceListPreferences.filtersFor(workspaceId);
               return html`
                 <section
                   class="workspace-group"
@@ -3098,12 +3468,18 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                       @click=${() => this.#toggleWorkspace(workspaceId)}
                     >
                       ${fontAwesomeIcon(collapsed ? "caret-right" : "caret-down")}
-                      <h2 id=${`workspace-orphan-${index}`}>Workspace</h2>
+                      <h3 id=${`workspace-orphan-${index}`}>Workspace</h3>
                     </button>
                   </header>
                   <trouve-session-list
                     id=${`workspace-orphan-sessions-${index}`}
                     workspace-id=${workspaceId}
+                    .grouping=${workspaceListPreferences.grouping}
+                    .ordering=${workspaceListPreferences.ordering}
+                    .showBranches=${workspaceListPreferences.showBranches}
+                    .showStatus=${workspaceListPreferences.showStatus}
+                    .statusFilter=${workspaceFilters.status}
+                    .pullRequestFilter=${workspaceFilters.pullRequest}
                     ?hidden=${collapsed}
                     @trouve-session-open=${() => this.#showMobilePane("thread")}
                   ></trouve-session-list>
@@ -3121,6 +3497,15 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                     : "Create a session with the + button above."}</span>
               </div>`
             : nothing}
+          </div>
+          <trouve-session-usage-panel
+            session-id=${route.kind === "session" ? route.sessionId : ""}
+            thread-id=${route.kind === "session" ? route.threadId ?? "" : ""}
+            model=${activeThread?.model ?? ""}
+            .placeholder=${sessions.length === 0
+              || this.#newSessionSetup.status === "open"
+              || (route.kind === "session" && this.#newThreadSetupOpen)}
+          ></trouve-session-usage-panel>
         </nav>
 
         <div
@@ -3262,67 +3647,12 @@ export class TrouveApp extends withSignalTracking(LitElement) {
           <form @submit=${this.#createSession}>
             <header>
               <div>
-                <h2 id="new-session-title">New session</h2>
+                <h2 id="new-session-title">New Session</h2>
                 <p>${this.#newSessionSetup.createRequest === undefined
-                  ? "Pick where to work, what to branch from, and how the agent should run."
+                  ? "What do you want to do today?"
                   : "Retrying the original session creation. Its workspace, title, and branch are fixed; you can still edit the first message."}</p>
               </div>
             </header>
-            <label class="new-session-workspace">
-              <span>Workspace</span>
-              <select
-                name="workspace_id"
-                required
-                .value=${this.#newSessionWorkspaceId}
-                @change=${this.#selectNewSessionWorkspace}
-                ?disabled=${this.#newSessionPending
-                  || this.#newSessionSetup.createRequest !== undefined}
-              >
-                ${orderedWorkspaces.map(
-                  (workspace) => html`<option value=${workspace.id}>${workspace.name}</option>`,
-                )}
-              </select>
-            </label>
-            <label class="new-session-branch">
-              <span>Base branch</span>
-              <select
-                name="base_ref"
-                .value=${this.#newSessionBaseRef}
-                @change=${(event: Event) => {
-                  this.#newSessionBaseRef = (event.currentTarget as HTMLSelectElement).value;
-                  this.#newSessionPreferredBaseRef = this.#newSessionBaseRef;
-                }}
-                ?disabled=${this.#newSessionPending
-                  || this.#newSessionBranchesPending
-                  || this.#newSessionSetup.createRequest !== undefined}
-              >
-                ${this.#newSessionBranchesPending
-                  ? html`<option value="">Loading branches…</option>`
-                  : nothing}
-                ${this.#newSessionBranches.map(
-                  (branch) => html`<option value=${branch}>${branch}</option>`,
-                )}
-              </select>
-            </label>
-            ${this.#newSessionBranchError === ""
-              ? nothing
-              : html`<p class="dialog-warning new-session-branch-warning" role="status">${this.#newSessionBranchError}</p>`}
-            <label class="dialog-checkbox">
-              ${this.#newSessionSetup.createRequest === undefined
-                ? html`<input
-                    name="fetch_latest"
-                    type="checkbox"
-                    checked
-                    ?disabled=${this.#newSessionPending}
-                  />`
-                : html`<input
-                    name="fetch_latest"
-                    type="checkbox"
-                    .checked=${this.#newSessionSetup.createRequest.fetchLatest}
-                    disabled
-                  />`}
-              <span>Use latest remote branch</span>
-            </label>
             ${this.#newSessionAttachments.length === 0
               ? nothing
               : html`<ul class="attachment-list pending-attachments" aria-label="Initial prompt attachments">
@@ -3355,13 +3685,13 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                   )}
                 </ul>`}
             <label class="new-session-prompt">
-              <span>First message</span>
+              <span>Prompt</span>
               <textarea
                 name="prompt"
                 maxlength="100000"
                 rows="1"
                 autocomplete="off"
-                placeholder="What should the agent do?  (Shift+Enter for a new line)"
+                placeholder="Message the agent…  (Shift+Enter for a new line)"
                 .value=${this.#newSessionPrompt}
                 ?disabled=${this.#newSessionPending}
                 @input=${this.#newSessionPromptChanged}
@@ -3386,8 +3716,47 @@ export class TrouveApp extends withSignalTracking(LitElement) {
               />
             </label>
             <div class="dialog-option-grid">
+              <label class="new-session-workspace">
+                <span>Workspace</span>
+                <select
+                  name="workspace_id"
+                  required
+                  .value=${this.#newSessionWorkspaceId}
+                  @change=${this.#selectNewSessionWorkspace}
+                  ?disabled=${this.#newSessionPending
+                    || this.#newSessionSetup.createRequest !== undefined}
+                >
+                  ${orderedWorkspaces.map(
+                    (workspace) => html`<option value=${workspace.id}>${workspace.name}</option>`,
+                  )}
+                </select>
+              </label>
+              <label class="new-session-branch">
+                <span>Branch</span>
+                <select
+                  name="base_ref"
+                  .value=${this.#newSessionBaseRef}
+                  @change=${(event: Event) => {
+                    this.#newSessionBaseRef = (event.currentTarget as HTMLSelectElement).value;
+                    this.#newSessionPreferredBaseRef = this.#newSessionBaseRef;
+                  }}
+                  ?disabled=${this.#newSessionPending
+                    || this.#newSessionBranchesPending
+                    || this.#newSessionSetup.createRequest !== undefined}
+                >
+                  ${this.#newSessionBranchesPending
+                    ? html`<option value="">Loading branches…</option>`
+                    : nothing}
+                  ${this.#newSessionBranches.map(
+                    (branch) => html`<option
+                      value=${branch}
+                      .selected=${live(branch === this.#newSessionBaseRef)}
+                    >${branch}</option>`,
+                  )}
+                </select>
+              </label>
               <label class="new-session-mode">
-                <span>Agent persona</span>
+                <span>Persona</span>
                 <select
                   name="mode"
                   .value=${this.#newSessionModeId}
@@ -3396,7 +3765,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                     this.#newSessionOptionEdits = {
                       mode: true,
                       model: false,
-                      thinking: false,
+                      thinking: this.#newSessionOptionEdits.thinking,
                       permission: false,
                     };
                     this.#newSessionModeId =
@@ -3434,6 +3803,11 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                       model: true,
                       thinking: false,
                     };
+                    const previousModel = resolveNewSessionModel(
+                      this.#newSessionModelId,
+                      selectedNewSessionMode,
+                      this.#newSessionProviders,
+                    );
                     const defaults = resolveNewThreadDefaults(
                       this.#newSessionModes,
                       newSessionModels,
@@ -3450,12 +3824,18 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                       newSessionOptionsCatalogWorkspaceId(this.#newSessionOptionsLifecycle),
                       this.#newSessionWorkspaceId,
                     ).inheritedThinking;
+                    const nextModel = resolveNewSessionModel(
+                      defaults.modelId,
+                      selectedNewSessionMode,
+                      this.#newSessionProviders,
+                    );
+                    if (nextModel !== previousModel) this.#newSessionModelOptions = {};
                     this.requestUpdate();
                   }}
                 ></trouve-model-picker>
               </div>
               <label class="new-session-permission">
-                <span class=${this.#newSessionPermissionMode === "yolo" ? "permission-yolo" : ""}>${this.#newSessionPermissionMode === "yolo" ? fontAwesomeIcon("triangle-exclamation") : nothing}Permission mode</span>
+                <span class=${this.#newSessionPermissionMode === "yolo" ? "permission-yolo" : ""}>${this.#newSessionPermissionMode === "yolo" ? fontAwesomeIcon("triangle-exclamation") : nothing}Permissions</span>
                 <select
                   name="permission_mode"
                   class=${this.#newSessionPermissionMode === "yolo" ? "permission-yolo" : ""}
@@ -3486,63 +3866,72 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                   <option value="yolo" .selected=${live(this.#newSessionPermissionMode === "yolo")}>Yolo</option>
                 </select>
               </label>
-              <label class="new-session-thinking">
-                <span>${newSessionThinkingOption?.budget === undefined
-                  ? "Thinking level"
-                  : "Thinking budget (tokens)"}</span>
-                ${newSessionThinkingOption?.budget === undefined
-                  ? html`<select
-                      name="thinking"
-                      .value=${newSessionThinkingOption === undefined ? "" : this.#newSessionThinking}
-                      ?disabled=${this.#newSessionPending || newSessionThinkingOption === undefined}
-                      @change=${(event: Event) => {
-                        this.#newSessionOptionEdits = {
-                          ...this.#newSessionOptionEdits,
-                          thinking: true,
-                        };
-                        const value = (event.currentTarget as HTMLSelectElement).value;
-                        this.#newSessionThinking = value || resolveNewThreadDefaults(
-                          this.#newSessionModes,
-                          newSessionModels,
-                          this.#newSessionProviders,
-                          { modeId: this.#newSessionModeId, modelId: this.#newSessionModelId },
-                        ).thinking;
-                        this.#newSessionInheritedThinking = undefined;
-                        this.requestUpdate();
-                      }}
-                    >
-                      ${newSessionThinkingOption === undefined
-                        ? html`<option value="">Not supported</option>`
-                        : newSessionThinkingOption.values.map(
-                            (value) => html`<option
-                              value=${value}
-                              .selected=${live(value === this.#newSessionThinking)}
-                            >${modelOptionLabel(value)}</option>`,
-                          )}
-                    </select>`
-                  : html`<input
-                      name="thinking"
-                      type="number"
-                      required
-                      step="1"
-                      min=${newSessionThinkingOption.budget.minimum}
-                      max=${newSessionThinkingOption.budget.maximum ?? nothing}
-                      .value=${this.#newSessionThinking}
+              ${newSessionModelOptions.length === 0
+                ? nothing
+                : html`<trouve-model-options-editor
+                    class="new-session-model-options"
+                    compact
+                    .controls=${newSessionModelOptions}
+                    .disabled=${this.#newSessionPending}
+                    @trouve-model-option-changed=${(
+                      event: CustomEvent<ModelOptionChangeDetail>,
+                    ) => {
+                      const defaults = resolveNewThreadDefaults(
+                        this.#newSessionModes,
+                        newSessionModels,
+                        this.#newSessionProviders,
+                        {
+                          modeId: this.#newSessionModeId,
+                          modelId: this.#newSessionModelId,
+                        },
+                      );
+                      const inheritance = newThreadInheritanceForWorkspace(
+                        defaults,
+                        newSessionOptionsCatalogWorkspaceId(
+                          this.#newSessionOptionsLifecycle,
+                        ),
+                        this.#newSessionWorkspaceId,
+                      );
+                      const updated = applyNewSessionModelOptionChange({
+                        modelOptions: this.#newSessionModelOptions,
+                        thinking: this.#newSessionThinking,
+                        inheritedThinking: this.#newSessionInheritedThinking,
+                        change: event.detail,
+                        defaults: {
+                          thinking: defaults.thinking,
+                          inheritedThinking: inheritance.inheritedThinking,
+                        },
+                      });
+                      this.#newSessionModelOptions = updated.modelOptions;
+                      this.#newSessionThinking = updated.thinking;
+                      this.#newSessionInheritedThinking = updated.inheritedThinking;
+                      this.#newSessionOptionEdits = {
+                        ...this.#newSessionOptionEdits,
+                        thinking: updated.thinkingEdit,
+                      };
+                      this.requestUpdate();
+                    }}
+                  ></trouve-model-options-editor>`}
+              <label class="dialog-checkbox new-session-fetch">
+                ${this.#newSessionSetup.createRequest === undefined
+                  ? html`<input
+                      name="fetch_latest"
+                      type="checkbox"
+                      checked
                       ?disabled=${this.#newSessionPending}
-                      @input=${(event: Event) => {
-                        const value = (event.currentTarget as HTMLInputElement).value;
-                        if (value === "") return;
-                        this.#newSessionOptionEdits = {
-                          ...this.#newSessionOptionEdits,
-                          thinking: true,
-                        };
-                        this.#newSessionThinking = value;
-                        this.#newSessionInheritedThinking = undefined;
-                        this.requestUpdate();
-                      }}
+                    />`
+                  : html`<input
+                      name="fetch_latest"
+                      type="checkbox"
+                      .checked=${this.#newSessionSetup.createRequest.fetchLatest}
+                      disabled
                     />`}
+                <span>Use latest remote branch</span>
               </label>
             </div>
+            ${this.#newSessionBranchError === ""
+              ? nothing
+              : html`<p class="dialog-warning new-session-branch-warning" role="status">${this.#newSessionBranchError}</p>`}
             ${this.#newSessionPermissionMode === "yolo"
               ? html`<div class="new-session-yolo-warning" role="note"><strong>${fontAwesomeIcon("triangle-exclamation")} Unattended execution (YOLO) is dangerous</strong><span>The agent can run commands and change or delete files without asking for approval.</span></div>`
               : nothing}

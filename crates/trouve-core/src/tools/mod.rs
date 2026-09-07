@@ -11,6 +11,7 @@ mod fs;
 mod glob;
 mod grep;
 mod hashline;
+mod managed_background;
 mod patch;
 mod search;
 mod shell;
@@ -39,6 +40,8 @@ pub use edit_strategy::for_model as edit_strategy_for_model;
 
 const REVIEW_OPTIONAL_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 const REVIEW_PRIMARY_FETCH_TIMEOUT: Duration = Duration::from_secs(60);
+const REVIEW_MAINTENANCE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const REVIEW_MAINTENANCE_CONCURRENCY: usize = 1;
 const REVIEW_FETCH_TERMINATION_GRACE: Duration = Duration::from_secs(2);
 const REVIEW_HISTORY_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 const REVIEW_FETCH_STDERR_MAX_BYTES: usize = 8 * 1024;
@@ -339,6 +342,32 @@ fn optional_review_fetch_command(
     command
 }
 
+fn primary_review_fetch_args(
+    remote_url: &str,
+    base_sha: &str,
+    pull_number: u64,
+    pull_ref: &str,
+) -> Vec<String> {
+    vec![
+        "fetch".into(),
+        "--force".into(),
+        "--no-tags".into(),
+        // Review fetches own their process tree and repository lock. Do not
+        // let Git detach automatic maintenance that outlives either one.
+        "--no-auto-maintenance".into(),
+        remote_url.into(),
+        format!("+{base_sha}:refs/remotes/origin/trouve-base"),
+        format!("+refs/pull/{pull_number}/head:{pull_ref}"),
+    ]
+}
+
+fn review_repository_maintenance_key(repository_path: &Path) -> String {
+    format!(
+        "review-repository-maintenance:{}",
+        repository_path.display()
+    )
+}
+
 fn authenticated_review_git_command(
     repository_path: &Path,
     auth: &str,
@@ -620,40 +649,6 @@ impl From<tokio::sync::OwnedRwLockWriteGuard<()>> for SessionMutationPermit {
         }
     }
 }
-
-/// One admitted session mutation lane that a tool may transfer to a
-/// background task.
-///
-/// The engine installs this only for a background `shell` call. The shell
-/// waiter takes ownership after the process starts and holds the write guard
-/// until that process exits or is killed and reaped. If the executor rejects
-/// the call before taking it, the guard is released when the call context is
-/// dropped.
-pub struct BackgroundMutationLease {
-    guard: Mutex<Option<SessionMutationPermit>>,
-}
-
-impl std::fmt::Debug for BackgroundMutationLease {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("BackgroundMutationLease")
-            .field("available", &self.guard.lock().unwrap().is_some())
-            .finish()
-    }
-}
-
-impl BackgroundMutationLease {
-    pub(crate) fn new(guard: impl Into<SessionMutationPermit>) -> Self {
-        Self {
-            guard: Mutex::new(Some(guard.into())),
-        }
-    }
-
-    pub(crate) fn take(&self) -> Option<SessionMutationPermit> {
-        self.guard.lock().unwrap().take()
-    }
-}
-
 /// Execution context: everything a tool may touch. Mutation paths resolve
 /// inside the session worktree; explicitly registered host resources are
 /// additionally available to read-only filesystem tools.
@@ -683,11 +678,6 @@ pub struct ToolCtx {
     /// Model-specific editing policy used for both tool advertisement and
     /// execution enforcement.
     pub edit_strategy: EditStrategy,
-    /// Engine-owned session write lease available only to a background shell
-    /// launch. Kept public for `ToolCtx` construction compatibility; custom
-    /// executors must leave it untouched.
-    #[doc(hidden)]
-    pub background_mutation_lease: Option<Arc<BackgroundMutationLease>>,
 }
 
 impl ToolCtx {
@@ -910,6 +900,17 @@ pub trait ToolExecutor: Send + Sync {
     fn rollback_attachment_files(&self, _root: &Path, _paths: &[PathBuf]) -> Result<(), String> {
         Err("attachment rollback is unavailable in this executor".into())
     }
+    /// Remove staged files directly below `root` whose modification time is
+    /// older than `older_than`. Used at startup for scratch directories
+    /// whose normal cleanup is an in-process drop guard that a crash can
+    /// skip. A missing root is not an error. Returns the number removed.
+    async fn sweep_stale_staged_files(
+        &self,
+        _root: &Path,
+        _older_than: Duration,
+    ) -> Result<usize, String> {
+        Err("staged file sweeping is unavailable in this executor".into())
+    }
     /// Read one durable opaque attachment without following any path link.
     /// Implementations must require a direct child of `root`, a regular file,
     /// and an exact match with the size committed in the attachment row.
@@ -967,6 +968,27 @@ pub trait ToolExecutor: Send + Sync {
     ) -> Result<Vec<ReviewDiffFile>, String> {
         Err("review repository diff is unavailable in this executor".into())
     }
+    /// Read one line of an immutable git object at the reviewed revision,
+    /// for anchor-quote verification. Behind the executor so this git
+    /// invocation keeps the audited chokepoint; the implementation disables
+    /// replacement-ref indirection and checks the object's size before
+    /// buffering any content.
+    async fn review_repository_object_line(
+        &self,
+        _request: &ReviewRepositoryObjectLine,
+    ) -> Result<Option<String>, String> {
+        Err("review object reads are unavailable in this executor".into())
+    }
+    /// Read the full text of an immutable git object at the reviewed
+    /// revision, so the orchestrator can re-anchor quoted findings whose
+    /// claimed line number is off. Same chokepoint and guarantees as
+    /// [`review_repository_object_line`](Self::review_repository_object_line).
+    async fn review_repository_object_text(
+        &self,
+        _request: &ReviewRepositoryObjectText,
+    ) -> Result<Option<String>, String> {
+        Err("review object reads are unavailable in this executor".into())
+    }
     /// Read review diffs with optional trusted snapshot metadata. Existing
     /// executors remain compatible by supplying ordinary diff files.
     async fn review_repository_diff_with_metadata(
@@ -980,6 +1002,7 @@ pub trait ToolExecutor: Send + Sync {
                     path: file.path,
                     diff: file.diff,
                     generated_header: None,
+                    linguist_generated: None,
                 })
                 .collect()
         })
@@ -1000,8 +1023,8 @@ pub trait ToolExecutor: Send + Sync {
     ) -> Result<String, String> {
         Err("review repository merge-base is unavailable in this executor".into())
     }
-    /// Drop temporary per-job refs after rewritten-history comparison has
-    /// consumed the historical objects they kept reachable.
+    /// Drop temporary per-job refs after carried-anchor mapping has consumed
+    /// the historical objects they kept reachable.
     async fn cleanup_review_repository_history(
         &self,
         _request: &ReviewRepositoryHistoryCleanup,
@@ -1025,6 +1048,9 @@ pub trait ToolExecutor: Send + Sync {
         _request: &SessionRepositoryPush,
     ) -> Result<String, String> {
         Err("session branch push is unavailable in this executor".into())
+    }
+    async fn rename_session_branch(&self, _request: &SessionBranchRename) -> Result<(), String> {
+        Err("session branch rename is unavailable in this executor".into())
     }
     /// Atomically reserve and create a session worktree. The returned receipt
     /// is opaque outside the executor and is required for finalize/rollback.
@@ -1073,8 +1099,8 @@ pub struct ReviewRepositorySync {
     pub pull_number: u64,
     pub base_sha: String,
     pub head_sha: String,
-    /// Historical commits used only to reduce rewritten-history review
-    /// scope. Failure to fetch one must not prevent the current review.
+    /// Historical commits used only to map carried finding anchors into the
+    /// current head. Failure to fetch one must not narrow or prevent review.
     pub optional_shas: Vec<String>,
     pub token: String,
     pub cancel: tokio_util::sync::CancellationToken,
@@ -1086,9 +1112,26 @@ pub struct ReviewRepositoryDiff {
     pub base_sha: String,
     pub head_sha: String,
     pub cancel: tokio_util::sync::CancellationToken,
-    pub max_files: usize,
-    pub max_changed_lines: u64,
     pub max_bytes: usize,
+}
+
+pub struct ReviewRepositoryObjectLine {
+    pub managed_root: PathBuf,
+    pub worktree: PathBuf,
+    pub head_sha: String,
+    pub path: String,
+    pub line: u64,
+    pub max_bytes: usize,
+    pub cancel: tokio_util::sync::CancellationToken,
+}
+
+pub struct ReviewRepositoryObjectText {
+    pub managed_root: PathBuf,
+    pub worktree: PathBuf,
+    pub head_sha: String,
+    pub path: String,
+    pub max_bytes: usize,
+    pub cancel: tokio_util::sync::CancellationToken,
 }
 
 pub struct ReviewRepositoryAnchors {
@@ -1142,6 +1185,13 @@ pub struct SessionRepositoryPush {
     pub requested_base: Option<String>,
     pub branch: String,
     pub cancel: tokio_util::sync::CancellationToken,
+}
+
+pub struct SessionBranchRename {
+    pub managed_root: PathBuf,
+    pub worktree: PathBuf,
+    pub old_branch: String,
+    pub new_branch: String,
 }
 
 /// One attachment selected from durable metadata for trusted verification and
@@ -1530,7 +1580,7 @@ async fn run_review_command_with_timeout(
             "GIT_CONFIG_GLOBAL",
             if cfg!(windows) { "NUL" } else { "/dev/null" },
         )
-        .env("GIT_CONFIG_COUNT", "7")
+        .env("GIT_CONFIG_COUNT", "8")
         // Reset any repository-local extra-header list before appending the
         // one URL-scoped credential owned by this invocation.
         .env("GIT_CONFIG_KEY_0", "http.extraheader")
@@ -1550,6 +1600,10 @@ async fn run_review_command_with_timeout(
             "GIT_CONFIG_VALUE_6",
             if cfg!(windows) { "NUL" } else { "/dev/null" },
         )
+        // Any Git subcommand that triggers maintenance must keep it inside
+        // the process tree owned by this invocation.
+        .env("GIT_CONFIG_KEY_7", "maintenance.autoDetach")
+        .env("GIT_CONFIG_VALUE_7", "false")
         .env("GIT_ALLOW_PROTOCOL", "https")
         .env("GIT_PROTOCOL_FROM_USER", "0")
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -1655,12 +1709,23 @@ pub struct ReviewDiffFileWithMetadata {
     /// snapshot. Raw patch text never populates this field, and deletions keep
     /// their full diff by leaving it absent.
     pub generated_header: Option<String>,
+    /// The `linguist-generated` gitattribute resolved from the trusted base
+    /// revision (never from the reviewed snapshot, which could otherwise
+    /// exempt its own files): `Some(true)` when set, `Some(false)` when unset
+    /// or `false`, and `None` when unspecified, unavailable, or the path was
+    /// deleted. An explicit value overrides every generated-artifact
+    /// heuristic.
+    pub linguist_generated: Option<bool>,
 }
 
-pub(crate) fn is_conventional_generated_artifact_path(path: &str) -> bool {
+/// Dependency lockfiles are never summarized as generated artifacts by
+/// heuristic: they routinely carry generated markers, yet their content
+/// (resolved versions, checksums, registry URLs) is exactly what review must
+/// see. Only an explicit `linguist-generated` attribute overrides this.
+pub(crate) fn is_review_lockfile_path(path: &str) -> bool {
     let path = path.replace('\\', "/");
     let file_name = path.rsplit('/').next().unwrap_or(path.as_str());
-    if matches!(
+    matches!(
         file_name,
         "Cargo.lock"
             | "Gemfile.lock"
@@ -1674,28 +1739,7 @@ pub(crate) fn is_conventional_generated_artifact_path(path: &str) -> bool {
             | "poetry.lock"
             | "uv.lock"
             | "yarn.lock"
-    ) {
-        return false;
-    }
-    path.split('/').any(|component| {
-        matches!(
-            component,
-            "generated" | "snapshots" | "__snapshots__" | "__screenshots__"
-        )
-    }) || file_name.ends_with(".snap")
-        || file_name.ends_with(".min.js")
-        || file_name.ends_with(".min.css")
-        || [
-            ".js.map",
-            ".mjs.map",
-            ".cjs.map",
-            ".css.map",
-            ".d.ts.map",
-            ".d.mts.map",
-            ".d.cts.map",
-        ]
-        .iter()
-        .any(|suffix| file_name.ends_with(suffix))
+    )
 }
 
 fn split_review_diff_files(
@@ -1742,8 +1786,33 @@ pub struct LocalToolExecutor {
     built_in_specs: Vec<ToolSpec>,
     mcp: crate::mcp::McpManager,
     jobs: Arc<shell::JobRegistry>,
+    managed_background: managed_background::ManagedBackgroundTasks,
     hashline_failures: Mutex<HashMap<String, u8>>,
     review_repository_locks: Mutex<HashMap<PathBuf, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+    review_maintenance_slots: Arc<tokio::sync::Semaphore>,
+}
+
+struct ReviewMaintenanceRescheduler<'a> {
+    executor: &'a LocalToolExecutor,
+    repository_path: PathBuf,
+    armed: bool,
+}
+
+impl ReviewMaintenanceRescheduler<'_> {
+    fn schedule(mut self) {
+        self.executor
+            .schedule_review_repository_maintenance(&self.repository_path);
+        self.armed = false;
+    }
+}
+
+impl Drop for ReviewMaintenanceRescheduler<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.executor
+                .schedule_review_repository_maintenance(&self.repository_path);
+        }
+    }
 }
 
 impl Default for LocalToolExecutor {
@@ -1776,7 +1845,7 @@ impl LocalToolExecutor {
             Arc::new(shell::ShellOutput { jobs: jobs.clone() }),
             Arc::new(shell::ShellKill { jobs: jobs.clone() }),
             Arc::new(grep::Grep),
-            Arc::new(web::WebFetch::default()),
+            Arc::new(web::WebFetch),
             Arc::new(todo::TodoWrite),
             Arc::new(search::Search {
                 cache: search_cache.clone(),
@@ -1798,8 +1867,12 @@ impl LocalToolExecutor {
             built_in_specs,
             mcp: crate::mcp::McpManager::with_logs(logs),
             jobs,
+            managed_background: managed_background::ManagedBackgroundTasks::default(),
             hashline_failures: Mutex::new(HashMap::new()),
             review_repository_locks: Mutex::new(HashMap::new()),
+            review_maintenance_slots: Arc::new(tokio::sync::Semaphore::new(
+                REVIEW_MAINTENANCE_CONCURRENCY,
+            )),
         }
     }
 
@@ -1812,6 +1885,61 @@ impl LocalToolExecutor {
         let lock = Arc::new(tokio::sync::Mutex::new(()));
         locks.insert(path.to_path_buf(), Arc::downgrade(&lock));
         lock
+    }
+
+    fn review_repository_foreground_lock(
+        &self,
+        path: &Path,
+    ) -> (Arc<tokio::sync::Mutex<()>>, bool) {
+        let repository_lock = self.review_repository_lock(path);
+        let maintenance_preempted = self
+            .managed_background
+            .preempt(&review_repository_maintenance_key(path));
+        (repository_lock, maintenance_preempted)
+    }
+
+    fn schedule_review_repository_maintenance(&self, repository_path: &Path) {
+        let repository_path = repository_path.to_path_buf();
+        let repository_lock = self.review_repository_lock(&repository_path);
+        let key = review_repository_maintenance_key(&repository_path);
+        let maintenance_slots = self.review_maintenance_slots.clone();
+        self.managed_background.schedule(key, move |cancel| {
+            let repository_path = repository_path.clone();
+            let repository_lock = repository_lock.clone();
+            let maintenance_slots = maintenance_slots.clone();
+            async move {
+                let repository_guard = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return,
+                    guard = repository_lock.lock_owned() => guard,
+                };
+                let _maintenance_slot = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return,
+                    permit = maintenance_slots.acquire_owned() => {
+                        permit.expect("review maintenance semaphore remains open")
+                    },
+                };
+                let result = run_review_git_with_timeout(
+                    &repository_path,
+                    "",
+                    vec!["maintenance".into(), "run".into(), "--auto".into()],
+                    &cancel,
+                    REVIEW_MAINTENANCE_TIMEOUT,
+                )
+                .await;
+                drop(repository_guard);
+                if let Err(error) = result
+                    && !cancel.is_cancelled()
+                {
+                    tracing::warn!(
+                        repository = %repository_path.display(),
+                        %error,
+                        "managed review repository maintenance failed"
+                    );
+                }
+            }
+        });
     }
 
     fn find(&self, name: &str) -> Option<&Arc<dyn Tool>> {
@@ -2758,6 +2886,48 @@ impl ToolExecutor for LocalToolExecutor {
         cleanup_attachments_secure(root, paths)
     }
 
+    async fn sweep_stale_staged_files(
+        &self,
+        root: &Path,
+        older_than: Duration,
+    ) -> Result<usize, String> {
+        let root = root.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            let entries = match std::fs::read_dir(&root) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+                Err(error) => return Err(format!("listing {}: {error}", root.display())),
+            };
+            let now = std::time::SystemTime::now();
+            let mut stale = Vec::new();
+            for entry in entries {
+                let entry =
+                    entry.map_err(|error| format!("listing {}: {error}", root.display()))?;
+                // Entry metadata never follows links, so a planted symlink is
+                // left alone rather than having its target's age consulted.
+                let metadata = match entry.metadata() {
+                    Ok(metadata) => metadata,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(format!("inspecting {}: {error}", root.display())),
+                };
+                let old_enough = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|modified| now.duration_since(modified).ok())
+                    .is_some_and(|age| age >= older_than);
+                if metadata.is_file() && old_enough {
+                    stale.push(entry.path());
+                }
+            }
+            // The secure path re-verifies each entry below an O_NOFOLLOW root
+            // descriptor before unlinking it.
+            cleanup_attachments_secure(&root, &stale)?;
+            Ok(stale.len())
+        })
+        .await
+        .map_err(|error| format!("staged file sweep worker failed: {error}"))?
+    }
+
     async fn read_attachment_file(
         &self,
         root: &Path,
@@ -2978,7 +3148,13 @@ impl ToolExecutor for LocalToolExecutor {
             .map_err(|error| format!("resolving review root: {error}"))?;
         let requested_repository_path = managed_root.join(owner).join(repository);
         let repository_path = review_repository_identity(&requested_repository_path)?;
-        let repository_lock = self.review_repository_lock(&repository_path);
+        let (repository_lock, maintenance_preempted) =
+            self.review_repository_foreground_lock(&repository_path);
+        let maintenance_rescheduler = ReviewMaintenanceRescheduler {
+            executor: self,
+            repository_path: repository_path.clone(),
+            armed: maintenance_preempted,
+        };
         let mut repository_guard = tokio::select! {
             biased;
             _ = request.cancel.cancelled() => {
@@ -3095,14 +3271,12 @@ impl ToolExecutor for LocalToolExecutor {
         .is_ok();
         if !base_present || !head_present {
             let pull_ref = format!("refs/remotes/origin/trouve-pr-{}", request.pull_number);
-            let fetch_args = vec![
-                "fetch".into(),
-                "--force".into(),
-                "--no-tags".into(),
-                remote_url.clone(),
-                format!("+{}:refs/remotes/origin/trouve-base", request.base_sha),
-                format!("+refs/pull/{}/head:{pull_ref}", request.pull_number),
-            ];
+            let fetch_args = primary_review_fetch_args(
+                &remote_url,
+                &request.base_sha,
+                request.pull_number,
+                &pull_ref,
+            );
             let command =
                 authenticated_review_git_command(&repository_path, &auth, &remote_url, &fetch_args);
             repository_guard = run_managed_authenticated_review_git_command(
@@ -3150,7 +3324,7 @@ impl ToolExecutor for LocalToolExecutor {
                         job_id = %request.job_id,
                         %sha,
                         %error,
-                        "could not pin an already-present review-history commit; continuing with the full diff if reuse is unavailable"
+                        "could not pin an already-present review-history commit; continuing without carried-anchor reuse if necessary"
                     );
                 }
             } else {
@@ -3180,10 +3354,11 @@ impl ToolExecutor for LocalToolExecutor {
                     job_id = %request.job_id,
                     %sha,
                     %error,
-                    "optional review-history fetch failed; continuing with the full diff if reuse is unavailable"
+                    "optional review-history fetch failed; continuing without carried-anchor reuse if necessary"
                 );
             }
         }
+        maintenance_rescheduler.schedule();
         Ok(repository_path)
     }
 
@@ -3293,6 +3468,49 @@ impl ToolExecutor for LocalToolExecutor {
         Ok(())
     }
 
+    async fn review_repository_object_line(
+        &self,
+        request: &ReviewRepositoryObjectLine,
+    ) -> Result<Option<String>, String> {
+        validate_review_commit(&request.head_sha)?;
+        let (_, worktree) = canonical_managed_path(&request.managed_root, &request.worktree)?;
+        let head_sha = request.head_sha.clone();
+        let path = request.path.clone();
+        let line = request.line;
+        let max_bytes = request.max_bytes;
+        let cancel = request.cancel.clone();
+        tokio::task::spawn_blocking(move || {
+            if cancel.is_cancelled() {
+                return Err("review object read cancelled".to_owned());
+            }
+            crate::git::review_object_line(&worktree, &head_sha, &path, line, max_bytes, &cancel)
+                .map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(|error| format!("review object read task failed: {error}"))?
+    }
+
+    async fn review_repository_object_text(
+        &self,
+        request: &ReviewRepositoryObjectText,
+    ) -> Result<Option<String>, String> {
+        validate_review_commit(&request.head_sha)?;
+        let (_, worktree) = canonical_managed_path(&request.managed_root, &request.worktree)?;
+        let head_sha = request.head_sha.clone();
+        let path = request.path.clone();
+        let max_bytes = request.max_bytes;
+        let cancel = request.cancel.clone();
+        tokio::task::spawn_blocking(move || {
+            if cancel.is_cancelled() {
+                return Err("review object read cancelled".to_owned());
+            }
+            crate::git::review_object_text(&worktree, &head_sha, &path, max_bytes, &cancel)
+                .map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(|error| format!("review object read task failed: {error}"))?
+    }
+
     async fn review_repository_diff(
         &self,
         request: &ReviewRepositoryDiff,
@@ -3303,23 +3521,14 @@ impl ToolExecutor for LocalToolExecutor {
         let base_sha = request.base_sha.clone();
         let head_sha = request.head_sha.clone();
         let cancel = request.cancel.clone();
-        let max_files = request.max_files;
-        let max_changed_lines = request.max_changed_lines;
         let max_bytes = request.max_bytes;
         tokio::task::spawn_blocking(move || {
             if cancel.is_cancelled() {
                 return Err("review repository diff cancelled".into());
             }
-            let paths = crate::git::diff_files_between(
-                &worktree,
-                &base_sha,
-                &head_sha,
-                max_files,
-                max_changed_lines,
-                max_bytes,
-                &cancel,
-            )
-            .map_err(|error| error.to_string())?;
+            let paths =
+                crate::git::diff_files_between(&worktree, &base_sha, &head_sha, max_bytes, &cancel)
+                    .map_err(|error| error.to_string())?;
             let path_bytes = paths.iter().try_fold(0_usize, |total, path| {
                 total
                     .checked_add(path.len())
@@ -3349,18 +3558,14 @@ impl ToolExecutor for LocalToolExecutor {
         let (_, worktree) = canonical_managed_path(&request.managed_root, &request.worktree)?;
         let base_sha = request.base_sha.clone();
         let cancel = request.cancel.clone();
-        let max_files = request.max_files;
-        let max_changed_lines = request.max_changed_lines;
         let max_bytes = request.max_bytes;
         tokio::task::spawn_blocking(move || {
             crate::git::session_diff_patches_cancellable(
                 &worktree,
                 &base_sha,
-                max_files,
-                max_changed_lines,
                 max_bytes,
                 &cancel,
-                is_conventional_generated_artifact_path,
+                |path| !is_review_lockfile_path(path),
             )
             .map(|files| {
                 files
@@ -3369,6 +3574,7 @@ impl ToolExecutor for LocalToolExecutor {
                         path: file.path,
                         diff: file.diff,
                         generated_header: file.generated_header,
+                        linguist_generated: file.linguist_generated,
                     })
                     .collect()
             })
@@ -3476,6 +3682,18 @@ impl ToolExecutor for LocalToolExecutor {
         })
         .await
         .map_err(|error| format!("session branch push task failed: {error}"))?
+        .map_err(|error| error.to_string())
+    }
+
+    async fn rename_session_branch(&self, request: &SessionBranchRename) -> Result<(), String> {
+        let (_, worktree) = canonical_managed_path(&request.managed_root, &request.worktree)?;
+        let old_branch = request.old_branch.clone();
+        let new_branch = request.new_branch.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::git::rename_session_branch(&worktree, &old_branch, &new_branch)
+        })
+        .await
+        .map_err(|error| format!("session branch rename task failed: {error}"))?
         .map_err(|error| error.to_string())
     }
 
@@ -3704,7 +3922,7 @@ mod tests {
     }
 
     #[test]
-    fn generated_artifact_paths_exclude_lockfiles_and_unrelated_map_files() {
+    fn review_lockfile_paths_match_by_file_name_only() {
         for lockfile in [
             "Cargo.lock",
             "Gemfile.lock",
@@ -3719,27 +3937,13 @@ mod tests {
             "uv.lock",
             "yarn.lock",
         ] {
-            assert!(!is_conventional_generated_artifact_path(&format!(
-                "generated/{lockfile}"
-            )));
+            assert!(is_review_lockfile_path(lockfile));
+            assert!(is_review_lockfile_path(&format!("generated/{lockfile}")));
+            assert!(is_review_lockfile_path(&format!("web\\app\\{lockfile}")));
         }
-        for source_map in [
-            "assets/app.js.map",
-            "assets/app.mjs.map",
-            "assets/app.cjs.map",
-            "assets/app.css.map",
-            "assets/app.d.ts.map",
-            "assets/app.d.mts.map",
-            "assets/app.d.cts.map",
-        ] {
-            assert!(is_conventional_generated_artifact_path(source_map));
-        }
-        assert!(!is_conventional_generated_artifact_path(
-            "assets/regions.map"
-        ));
-        assert!(is_conventional_generated_artifact_path(
-            "generated/client.rs"
-        ));
+        assert!(!is_review_lockfile_path("generated/client.rs"));
+        assert!(!is_review_lockfile_path("Cargo.lock.bak"));
+        assert!(!is_review_lockfile_path("docs/package-lock.json.md"));
     }
 
     #[test]
@@ -3943,6 +4147,61 @@ mod tests {
         assert!(attachment.exists());
     }
 
+    #[tokio::test]
+    async fn stale_staged_file_sweep_removes_only_old_regular_files() {
+        let container = tempfile::tempdir().unwrap();
+        let executor = LocalToolExecutor::default();
+        let missing = container.path().join("title-attachments");
+        assert_eq!(
+            executor
+                .sweep_stale_staged_files(&missing, Duration::ZERO)
+                .await
+                .unwrap(),
+            0
+        );
+
+        let root = container.path().join("staged");
+        std::fs::create_dir(&root).unwrap();
+        let orphan = root.join("title_orphan.png");
+        std::fs::write(&orphan, b"ABC").unwrap();
+        let nested = root.join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        #[cfg(unix)]
+        let planted = {
+            let target = container.path().join("outside.png");
+            std::fs::write(&target, b"outside").unwrap();
+            let link = root.join("title_link.png");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            (target, link)
+        };
+
+        // Nothing is old enough yet.
+        assert_eq!(
+            executor
+                .sweep_stale_staged_files(&root, Duration::from_secs(3600))
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(orphan.exists());
+
+        assert_eq!(
+            executor
+                .sweep_stale_staged_files(&root, Duration::ZERO)
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(!orphan.exists());
+        assert!(nested.is_dir());
+        #[cfg(unix)]
+        {
+            let (target, link) = planted;
+            assert!(target.exists());
+            assert!(std::fs::symlink_metadata(&link).is_ok());
+        }
+    }
+
     #[test]
     fn review_repository_locks_are_keyed_and_release_stale_entries() {
         let executor = LocalToolExecutor::default();
@@ -3961,6 +4220,144 @@ mod tests {
         assert!(locks.get(Path::new("repo-c")).is_some());
         drop(locks);
         drop(replacement);
+    }
+
+    #[tokio::test]
+    async fn managed_review_maintenance_waits_for_the_repository_owner() {
+        let repository = tempfile::tempdir().unwrap();
+        run_review_git(
+            repository.path(),
+            "",
+            vec!["init".into(), "--template=".into()],
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let executor = LocalToolExecutor::default();
+        let repository_lock = executor.review_repository_lock(repository.path());
+        let repository_guard = repository_lock.lock_owned().await;
+        let key = review_repository_maintenance_key(repository.path());
+
+        executor.schedule_review_repository_maintenance(repository.path());
+        assert!(executor.managed_background.is_running(&key));
+        tokio::task::yield_now().await;
+        assert!(
+            executor.managed_background.is_running(&key),
+            "maintenance bypassed the repository mutex"
+        );
+
+        drop(repository_guard);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while executor.managed_background.is_running(&key) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn review_maintenance_is_globally_concurrency_limited() {
+        let first_repository = tempfile::tempdir().unwrap();
+        let second_repository = tempfile::tempdir().unwrap();
+        for repository in [&first_repository, &second_repository] {
+            run_review_git(
+                repository.path(),
+                "",
+                vec!["init".into(), "--template=".into()],
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        }
+        let executor = LocalToolExecutor::default();
+        let held_slot = executor
+            .review_maintenance_slots
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+        let first_lock = executor.review_repository_lock(first_repository.path());
+        let second_lock = executor.review_repository_lock(second_repository.path());
+        let first_key = review_repository_maintenance_key(first_repository.path());
+        let second_key = review_repository_maintenance_key(second_repository.path());
+
+        executor.schedule_review_repository_maintenance(first_repository.path());
+        executor.schedule_review_repository_maintenance(second_repository.path());
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while first_lock.try_lock().is_ok() || second_lock.try_lock().is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("maintenance tasks did not reach the shared concurrency gate");
+        assert_eq!(executor.review_maintenance_slots.available_permits(), 0);
+
+        drop(held_slot);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while executor.managed_background.is_running(&first_key)
+                || executor.managed_background.is_running(&second_key)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn foreground_review_work_preempts_repository_maintenance() {
+        let repository = tempfile::tempdir().unwrap();
+        let executor = LocalToolExecutor::default();
+        let repository_lock = executor.review_repository_lock(repository.path());
+        let key = review_repository_maintenance_key(repository.path());
+        let acquired = Arc::new(tokio::sync::Semaphore::new(0));
+        let task_lock = repository_lock.clone();
+        let task_acquired = acquired.clone();
+        assert!(
+            executor
+                .managed_background
+                .schedule(key.clone(), move |cancel| {
+                    let task_lock = task_lock.clone();
+                    let task_acquired = task_acquired.clone();
+                    async move {
+                        let _guard = task_lock.lock_owned().await;
+                        task_acquired.add_permits(1);
+                        cancel.cancelled().await;
+                    }
+                })
+        );
+        acquired.acquire().await.unwrap().forget();
+
+        let (foreground_lock, maintenance_preempted) =
+            executor.review_repository_foreground_lock(repository.path());
+        assert!(maintenance_preempted);
+        let maintenance_rescheduler = ReviewMaintenanceRescheduler {
+            executor: &executor,
+            repository_path: repository.path().to_path_buf(),
+            armed: maintenance_preempted,
+        };
+        let foreground_guard = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            foreground_lock.lock_owned(),
+        )
+        .await
+        .expect("foreground work should cancel maintenance and acquire its repository lock");
+        assert!(!executor.managed_background.is_running(&key));
+
+        maintenance_rescheduler.schedule();
+        assert!(
+            executor.managed_background.is_running(&key),
+            "preempted maintenance was not rescheduled"
+        );
+        drop(foreground_guard);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while executor.managed_background.is_running(&key) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
     }
 
     #[cfg(unix)]
@@ -4320,6 +4717,18 @@ mod tests {
 
     #[test]
     fn review_fetch_command_disables_credential_tracing_and_global_fetch_locks() {
+        let primary_args = primary_review_fetch_args(
+            "https://github.com/acme/widgets.git",
+            "abc",
+            42,
+            "refs/remotes/origin/trouve-pr-42",
+        );
+        assert!(
+            primary_args
+                .iter()
+                .any(|arg| arg == "--no-auto-maintenance")
+        );
+
         let command = optional_review_fetch_command(
             Path::new("."),
             "secret-auth",

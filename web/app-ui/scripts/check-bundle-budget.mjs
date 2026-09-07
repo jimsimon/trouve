@@ -25,15 +25,43 @@ const worker = javascript.find(({ name }) => name.startsWith("content-worker-"))
 // presentation preference, and Font Awesome icon UI; the PWA remains on the
 // original entry ceiling. Font assets have their own explicit budget below.
 const entryLimit = mode === "desktop" ? 856_000 : 850_000;
-// The merged locked Vite/Rolldown graph emits 3,226,240 B with automatic-route
-// controls alongside review-history, attachment previews, transcript search,
-// and detailed agent activity. Preserve less than 2 kB of headroom; entry,
-// worker, and largest-chunk budgets still prevent one bundle hiding in the
-// aggregate.
-const totalJavaScriptLimit = 3_228_000;
-// The combined routing and review styling emits 183,511 B. Preserve less than
-// 500 B of headroom.
-const totalStyleLimit = 184_000;
+// The locked Vite/Rolldown graph emits 3,254,430 B with provider-admission
+// telemetry, two-tier finding-gate labels, background-turn labeling, evidence-backed
+// review-history, churn-metrics, implementation-analyst configuration,
+// durable turn-phase, conditional-title, route-scoped new-session lifecycle,
+// outside-diff review, version-check, per-thread transcript-search, detailed
+// agent-activity, attachment-gallery, external-video, managed-agent runtime
+// status, and PR-wide
+// review-state and workspace-organization additions, including lazy previews,
+// mobile playback notices, the route-scoped subscription/API/local usage
+// panel with its generated per-model usage schema and scope breakdowns, and
+// the scope-verdict causal-waypoint evidence schema and schema-driven model-
+// option editors, exact model-option number preservation (including the
+// WebKit fallback), and the dedicated background-activity event. The combined
+// graphs emit 3,280,024 B for desktop and 3,265,169 B for PWA after combining
+// the durable PR-mention event with identity-aware reasoning lifecycle schemas.
+// Durable assistant-artifact events and folded attachment items bring the
+// combined graphs to 3,287,832 B for desktop and 3,272,977 B for PWA. The
+// advisory finding status, re-anchored line evidence, and the managed-agent
+// runtime status bring the combined protocol 8.3 graphs to 3,294,114 B and
+// 3,279,260 B. The collapsible usage footer with its persisted state and
+// collapsed summary brings them to 3,296,049 B and 3,281,194 B. The
+// protocol 9.2 review-thread collapse state and Contents-permission health
+// schemas bring them to 3,302,298 B and 3,287,443 B. Local naming admission
+// status, bounded pending jobs, context-menu copy actions, and provider model-
+// catalog invalidation plus the race-safe client timeout envelope bring the
+// combined graphs to approximately 3,304,156 B and 3,289,301 B. Protocol 9.3's
+// automatic/concrete route catalog, provider-priority settings, route-selection
+// events, and generated validators bring them to 3,320,641 B and 3,305,796 B;
+// preserve less than 2 kB of headroom for each. Entry, worker, and largest-
+// chunk budgets below still prevent one bundle from hiding in the aggregate.
+const totalJavaScriptLimit = mode === "desktop" ? 3_322_500 : 3_307_500;
+// Version-check, transcript-search, compact navigation, and the sticky
+// multi-mode usage panel with thread/session model rows plus workspace
+// organization styling bring the clean artifact to 190,958 B. The pinned
+// sidebar chrome, sticky workspace headers, and collapsible usage footer
+// bring it to 193,215 B. Preserve less than 2 kB of headroom.
+const totalStyleLimit = 195_000;
 const limits = {
   entry: entryLimit,
   worker: 350_000,

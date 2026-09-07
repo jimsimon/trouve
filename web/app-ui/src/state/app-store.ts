@@ -1,7 +1,7 @@
 import type {
   ProtocolEventEnvelope,
   ProtocolGithubPrList,
-  ProtocolGitWorktreeSettings,
+  ProtocolSessionNamingSettings,
   ProtocolPrInfo,
   ProtocolSession,
   ProtocolServerProjection,
@@ -58,6 +58,8 @@ export interface ThreadIndicatorState {
   readonly unread: boolean;
 }
 
+type TitleGenerationState = [provisionalTitle: string, waiting: boolean];
+
 export interface SessionPullRequestIdentity {
   readonly workspaceId: string;
   readonly branch: string;
@@ -72,9 +74,9 @@ export interface GithubPullRequestSnapshot {
   readonly pullRequests: ProtocolGithubPrList;
 }
 
-export interface GitWorktreeSettingsSnapshot {
+export interface SessionNamingSettingsSnapshot {
   readonly cursor: number;
-  readonly settings: ProtocolGitWorktreeSettings;
+  readonly settings: ProtocolSessionNamingSettings;
 }
 
 const visualState = (
@@ -184,14 +186,23 @@ export const projectSessionPullRequests = (
       projected.push(pr);
     }
   }
-  projected.sort((left, right) =>
-    Number(right.state === "open") - Number(left.state === "open") ||
-    right.number - left.number);
+  projected.sort((left, right) => {
+    const leftCreated = left.workspace_id === session.workspaceId && left.head === session.branch;
+    const rightCreated = right.workspace_id === session.workspaceId && right.head === session.branch;
+    const leftKnown = known.findIndex((candidate) => samePullRequest(candidate, left));
+    const rightKnown = known.findIndex((candidate) => samePullRequest(candidate, right));
+    const leftPriority = leftCreated ? 0 : leftKnown >= 0 ? leftKnown + 1 : Number.MAX_SAFE_INTEGER;
+    const rightPriority = rightCreated ? 0 : rightKnown >= 0 ? rightKnown + 1 : Number.MAX_SAFE_INTEGER;
+    return leftPriority - rightPriority
+      || Number(right.state === "open") - Number(left.state === "open")
+      || right.number - left.number;
+  });
   return Object.freeze(projected);
 };
 
 export class AppStore {
   readonly #maxThreadViews: number;
+  #retainedThreadViewId: string | undefined;
   readonly #revision = createSignal(0);
   readonly #sessionMetadata = new Map<string, ProtocolSession>();
   readonly #deletedSessions = new Map<string, number | undefined>();
@@ -201,10 +212,12 @@ export class AppStore {
   #sessionSummaryInitialized = false;
   readonly #workspaces = new Map<string, ProtocolWorkspace>();
   readonly #threads = new Map<string, ProtocolThread>();
+  readonly #generatingTitles = new Map<string, TitleGenerationState>();
   readonly #threadStatuses = new Map<string, ProtocolThreadStatus>();
   readonly #seenThreadCursors = new Map<string, number>();
   readonly #initializedThreadSessions = new Set<string>();
   readonly #initializedThreadStatusSessions = new Set<string>();
+  readonly #sessionUsageRevisions = new Map<string, number>();
   readonly #githubPullRequests = new Map<string, GithubPullRequestSnapshot>();
   readonly #sessionPullRequests = new Map<string, readonly ProtocolPrInfo[]>();
   #serverProjectionCursor = 0;
@@ -212,7 +225,7 @@ export class AppStore {
   readonly #threadTodoEvents = new Map<string, readonly ProtocolTodoItem[]>();
   readonly #serverInfo = createSignal<ProtocolServerInfo | undefined>(undefined);
   readonly #automationRevision = createSignal(0);
-  readonly #gitWorktreeSettings = createSignal<GitWorktreeSettingsSnapshot | undefined>(
+  readonly #sessionNamingSettings = createSignal<SessionNamingSettingsSnapshot | undefined>(
     undefined,
   );
 
@@ -221,8 +234,8 @@ export class AppStore {
    * token. The screen refetches the authoritative list while retaining its
    * 15-second poll as a recovery fallback. */
   readonly automationRevision: ReadonlySignal<number> = this.#automationRevision;
-  readonly gitWorktreeSettings: ReadonlySignal<GitWorktreeSettingsSnapshot | undefined> =
-    this.#gitWorktreeSettings;
+  readonly sessionNamingSettings: ReadonlySignal<SessionNamingSettingsSnapshot | undefined> =
+    this.#sessionNamingSettings;
 
   constructor(options: { readonly maxThreadViews?: number } = {}) {
     this.#maxThreadViews = Math.max(1, options.maxThreadViews ?? 8);
@@ -271,6 +284,10 @@ export class AppStore {
     for (const session of sessions) {
       if (this.#deletedSessions.has(session.id)) continue;
       this.#sessionMetadata.set(session.id, session);
+      const generation = this.#generatingTitles.get(session.id);
+      if (generation !== undefined && session.title !== generation[0]) {
+        this.#generatingTitles.delete(session.id);
+      }
     }
     this.#touch();
   }
@@ -278,6 +295,10 @@ export class AppStore {
   upsertSessionMetadata(session: ProtocolSession): void {
     if (this.#deletedSessions.has(session.id)) return;
     this.#sessionMetadata.set(session.id, session);
+    const generation = this.#generatingTitles.get(session.id);
+    if (generation !== undefined && session.title !== generation[0]) {
+      this.#generatingTitles.delete(session.id);
+    }
     const summary = this.#sessionSummaries.get(session.id);
     if (summary !== undefined && session.archived !== undefined) {
       this.#sessionSummaries.set(session.id, {
@@ -303,6 +324,8 @@ export class AppStore {
     this.#sessionSummaries.delete(sessionId);
     this.#seenSessionCursors.delete(sessionId);
     this.#sessionPullRequests.delete(sessionId);
+    this.#sessionUsageRevisions.delete(sessionId);
+    this.#generatingTitles.delete(sessionId);
     for (const [threadId, thread] of this.#threads) {
       if (thread.session_id === sessionId) {
         this.#threads.delete(threadId);
@@ -310,6 +333,7 @@ export class AppStore {
         this.#threadTodoEvents.delete(threadId);
         this.#threadStatuses.delete(threadId);
         this.#seenThreadCursors.delete(threadId);
+        this.#generatingTitles.delete(threadId);
       }
     }
     // Status snapshots can arrive before (or without) thread metadata. Purge
@@ -321,10 +345,33 @@ export class AppStore {
       this.#seenThreadCursors.delete(threadId);
       this.#threadViews.delete(threadId);
       this.#threadTodoEvents.delete(threadId);
+      this.#generatingTitles.delete(threadId);
     }
     this.#initializedThreadSessions.delete(sessionId);
     this.#initializedThreadStatusSessions.delete(sessionId);
     this.#touch();
+  }
+
+  beginTitleGeneration(id: string, provisionalTitle: string): void {
+    this.#generatingTitles.set(id, [provisionalTitle, false]);
+    this.#touch();
+  }
+
+  markTitleGenerationWaiting(id: string, provisionalTitle: string): void {
+    const current = this.#generatingTitles.get(id);
+    if (current?.[0] !== provisionalTitle || current[1]) return;
+    current[1] = true;
+    this.#touch();
+  }
+
+  endTitleGeneration(id: string): void {
+    if (!this.#generatingTitles.delete(id)) return;
+    this.#touch();
+  }
+
+  titleGenerationWaiting(id: string): boolean | undefined {
+    this.#revision.get();
+    return this.#generatingTitles.get(id)?.[1];
   }
 
   replaceWorkspaces(workspaces: readonly ProtocolWorkspace[]): void {
@@ -378,7 +425,7 @@ export class AppStore {
         Object.freeze([...session.prs]),
       );
     }
-    this.replaceGitWorktreeSettings(cursor, projection.git_worktree_settings);
+    this.replaceSessionNamingSettings(cursor, projection.session_naming_settings);
     this.#touch();
     return true;
   }
@@ -443,6 +490,7 @@ export class AppStore {
       ) continue;
       const current = this.#threadStatuses.get(status.thread_id);
       if (current !== undefined && current.latest_cursor > status.latest_cursor) continue;
+      this.#recordSessionUsageCompletion(current, status);
       this.#threadStatuses.set(status.thread_id, status);
       if (firstSnapshot) {
         this.#seenThreadCursors.set(status.thread_id, status.latest_cursor);
@@ -480,6 +528,14 @@ export class AppStore {
       if (status.session_id === sessionId) ids.add(status.thread_id);
     }
     return Object.freeze([...ids]);
+  }
+
+  /** Monotonic invalidation token for authoritative session usage totals.
+   * Thread status events are server-scoped, so background-thread completions
+   * advance this even when that thread's transcript stream is not open. */
+  sessionUsageRevision(sessionId: string): number {
+    this.#revision.get();
+    return this.#sessionUsageRevisions.get(sessionId) ?? 0;
   }
 
   thread(threadId: string): ProtocolThread | undefined {
@@ -569,11 +625,7 @@ export class AppStore {
     this.#revision.get();
     let view = this.#threadViews.get(threadId);
     if (view === undefined) {
-      while (this.#threadViews.size >= this.#maxThreadViews) {
-        const oldest = this.#threadViews.keys().next().value as string | undefined;
-        if (oldest === undefined) break;
-        this.#threadViews.delete(oldest);
-      }
+      this.#evictThreadViewsToFit();
       view = new ThreadViewModel();
       const todoEvent = this.#threadTodoEvents.get(threadId);
       const todos = todoEvent ?? this.#threads.get(threadId)?.todos;
@@ -583,6 +635,13 @@ export class AppStore {
     }
     this.#threadViews.set(threadId, view);
     return view;
+  }
+
+  /** Keep the actively streamed conversation resident while incidental
+   * background consumers touch other thread projections. */
+  retainThreadView(threadId: string | undefined): void {
+    this.#retainedThreadViewId = threadId;
+    this.#evictThreadViewsToFit(0);
   }
 
   /** Merge the server-folded live tail into any retained prefetched history. */
@@ -599,11 +658,7 @@ export class AppStore {
       }
     }
     this.#threadViews.delete(threadId);
-    while (this.#threadViews.size >= this.#maxThreadViews) {
-      const oldest = this.#threadViews.keys().next().value as string | undefined;
-      if (oldest === undefined) break;
-      this.#threadViews.delete(oldest);
-    }
+    this.#evictThreadViewsToFit();
     const view = current ?? new ThreadViewModel();
     view.mergeTailSnapshot(cursor, snapshot);
     if (snapshot.todos === undefined) {
@@ -621,6 +676,16 @@ export class AppStore {
     }
     this.#touch();
     return true;
+  }
+
+  #evictThreadViewsToFit(extraEntries = 1): void {
+    while (this.#threadViews.size + extraEntries > this.#maxThreadViews) {
+      const oldest = [...this.#threadViews.keys()].find(
+        (threadId) => threadId !== this.#retainedThreadViewId,
+      );
+      if (oldest === undefined) break;
+      this.#threadViews.delete(oldest);
+    }
   }
 
   replaceThreadToolDetails(
@@ -802,6 +867,7 @@ export class AppStore {
             this.#seenThreadCursors.set(next.thread_id, next.latest_cursor);
           }
         }
+        this.#recordSessionUsageCompletion(previous, next);
         this.#threadStatuses.set(next.thread_id, next);
         this.#touch();
         return false;
@@ -842,8 +908,8 @@ export class AppStore {
         this.#touch();
         return false;
       }
-      case "settings.git_worktrees_updated":
-        this.replaceGitWorktreeSettings(envelope.cursor, envelope.settings);
+      case "settings.session_naming_updated":
+        this.replaceSessionNamingSettings(envelope.cursor, envelope.settings);
         return false;
       case "automation.fired":
         this.#automationRevision.set(this.#automationRevision.get() + 1);
@@ -887,21 +953,29 @@ export class AppStore {
 
   /** Apply an HTTP snapshot or durable event only when it is not older than
    * the current projection. The cursor ordering closes the response-versus-
-   * SSE race while a title-model install publishes progress. */
-  replaceGitWorktreeSettings(
+   * SSE race while naming settings are being saved. */
+  replaceSessionNamingSettings(
     cursor: number,
-    settings: ProtocolGitWorktreeSettings,
+    settings: ProtocolSessionNamingSettings,
   ): boolean {
-    const current = this.#gitWorktreeSettings.get();
+    const current = this.#sessionNamingSettings.get();
     if (current !== undefined && current.cursor > cursor) return false;
-    const titleModel = Object.freeze({ ...settings.title_model });
-    const frozen = Object.freeze({ ...settings, title_model: titleModel });
-    this.#gitWorktreeSettings.set(Object.freeze({ cursor, settings: frozen }));
+    const frozen = Object.freeze({ ...settings });
+    this.#sessionNamingSettings.set(Object.freeze({ cursor, settings: frozen }));
     return true;
   }
 
   #touch(): void {
     this.#revision.set(this.#revision.get() + 1);
+  }
+
+  #recordSessionUsageCompletion(
+    previous: ProtocolThreadStatus | undefined,
+    next: ProtocolThreadStatus,
+  ): void {
+    if (next.completed_at == null || next.completed_at === previous?.completed_at) return;
+    const revision = this.#sessionUsageRevisions.get(next.session_id) ?? 0;
+    this.#sessionUsageRevisions.set(next.session_id, revision + 1);
   }
 
   #storeThreadSnapshot(thread: ProtocolThread): void {
@@ -912,6 +986,14 @@ export class AppStore {
       ? thread
       : { ...thread, todos: todos.map((todo) => ({ ...todo })) };
     this.#threads.set(thread.id, stored);
+    const generation = this.#generatingTitles.get(thread.id);
+    if (
+      generation !== undefined
+      && thread.title !== undefined
+      && thread.title !== generation[0]
+    ) {
+      this.#generatingTitles.delete(thread.id);
+    }
     if (todoEvent === undefined && thread.todos !== undefined) {
       this.#threadViews.get(thread.id)?.replaceTodos(thread.todos);
     }

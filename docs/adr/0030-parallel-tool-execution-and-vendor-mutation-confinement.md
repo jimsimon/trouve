@@ -1,6 +1,6 @@
 # ADR 0030: Parallel tool execution with per-session mutation confinement
 
-Status: Accepted (2026-08); whole-turn locking superseded by ADR 0034
+Status: Partially superseded by 0034 and 0043
 
 ## Context
 

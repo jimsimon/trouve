@@ -1,0 +1,295 @@
+# Agent backend conformance and transport qualification
+
+Status: active contract for shipping transports and replacement candidates.
+
+## Product contract
+
+Threads have one Trouve experience regardless of the selected model. The
+frontend consumes the same durable event log, permission flow, worktree,
+attachments, commands, todos, usage, cancellation, and resume semantics for
+every model. Transport ownership is an internal implementation detail and is
+not exposed as a user-facing mode or badge.
+
+There are two internal execution shapes:
+
+- API providers stream model items into Trouve's agent loop. Trouve supplies
+  the prompt, tools, iteration, context replay, and `ToolExecutor` calls.
+- Vendor-agent adapters ask the vendor harness to run a turn, then normalize
+  its sanctioned protocol into `BackendEvent`. Mutation-capable tools still
+  cross Trouve's `ToolExecutor` boundary, normally through the full MCP bridge.
+
+Both shapes converge on the protocol event taxonomy before any client sees
+them. They do not need identical private control flow; they must have the same
+observable behavior and safety invariants.
+
+## Conformance layers
+
+| Layer | Purpose | Automated evidence |
+| --- | --- | --- |
+| Provider transport | Preserve native request/stream semantics without changing the agent loop | Provider unit tests, including typed tool calls, reasoning replay, usage, and truncated streams |
+| Vendor translation | Convert each sanctioned vendor protocol to the complete `BackendEvent` vocabulary | `crates/trouve-agents/tests/adapters.rs` stub-process tests |
+| Cross-path behavior | Ensure API-loop and vendor-agent turns fold to the same visible thread result | `crates/trouve-server/tests/backend_conformance.rs` |
+| Engine safety | Keep permissions, approvals, cancellation, worktree serialization, resume, and checkpoints authoritative | `crates/trouve-server/tests/e2e_api.rs` and core tests |
+| Live qualification | Detect vendor protocol/auth/billing changes that fixtures cannot prove | Manually gated matrix below, run against the exact candidate release before rollout |
+
+The cross-path suite compares folded protocol behavior, not adapter-specific
+event boundaries. For example, a provider may stream five text deltas while a
+vendor emits one; the final assistant content and lifecycle boundaries must
+still agree.
+
+## Required behavior matrix
+
+A shipping adapter, or a replacement transport for one, must pass every
+applicable row.
+
+| Area | Required result |
+| --- | --- |
+| Instructions and modes | The current data-driven persona reaches the model; plan/review turns remain read-only |
+| Text and reasoning | Streaming text, reasoning summaries, and completion boundaries fold without duplicates or stranded activity |
+| Tools | The effective Trouve tool schema is available and every side effect reaches `ToolExecutor` |
+| Permissions | read-only denies mutation; ask/allow-list produce one Trouve approval; yolo does not prompt |
+| External MCP | User/workspace/worktree servers preserve merge order, environment expansion, and first-use policy |
+| Interaction | questions, commands/skills, todos, attachments, steering, and subagents degrade only through an explicit internal capability check |
+| Sessions | a second turn resumes; model A → B → A resumes A; cold process restart does not lose instructions |
+| Cancellation | cancel is acknowledged, pending tools terminate, and a replacement turn cannot overlap stale vendor work |
+| Failure | malformed frames, process exit, timeout, and partial streams end the turn once and leave no pending UI state |
+| Usage | token/context and subscription-health data use the common protocol projection |
+| Durability | events, checkpoints, diffs, and worktree mutations remain reconstructable from Trouve's sources of truth |
+
+## Cursor SDK Bridge qualification
+
+The shipping Cursor integration uses the published Agent SDK Bridge. It
+provides a versioned `sdk.v1` Connect/protobuf contract, resumable agents,
+streaming, cancellation, explicit built-in tool selection, and host-owned
+custom-tool callbacks.
+
+Run the live baseline from the repository root with a Cursor user or service
+API key in the environment:
+
+```sh
+CURSOR_API_KEY=... node scripts/qualify_cursor_sdk_bridge.mjs
+```
+
+Exercise the complete shipping path—including managed runtime installation,
+the secured Trouve server, a real session worktree, approval-gated
+`ToolExecutor` callbacks, warm-process reuse, the durable thread view,
+uninstall, and credential-persistence checks—with:
+
+```sh
+TROUVE_E2E=1 CURSOR_API_KEY=... \
+  cargo test -p trouve-server --test cursor_sdk_live \
+    cursor_sdk_shipping_path_installs_tools_resumes_and_cleans_up -- \
+    --ignored --exact --nocapture
+```
+
+Run the broader promotion probe only when several paid turns are acceptable:
+
+```sh
+CURSOR_API_KEY=... node scripts/qualify_cursor_sdk_bridge_full.mjs
+```
+
+Qualify one Bridge shared across concurrent agents, including distinct
+Trouve-owned workspace routes and tool catalogs, agent-scoped cancellation,
+warm resume, and cold process resume, with six paid turns:
+
+```sh
+CURSOR_API_KEY=... node scripts/qualify_cursor_sdk_bridge_shared.mjs
+```
+
+Run only the direct, non-billable subscription-health qualification (no Bridge
+process) with:
+
+```sh
+CURSOR_API_KEY=... node scripts/qualify_cursor_sdk_bridge_full.mjs --health-only
+```
+
+No mode prints the key. `--health-only` performs only the direct HTTPS
+exchange/dashboard sequence and starts no Bridge process. The
+Bridge probes download and SHA-256-verify the pinned standalone release (or
+accept `--bridge PATH`), use an isolated temporary state store, remove ambient
+setting sources, and confine built-ins to the required MCP capability group.
+The baseline performs two paid SDK turns; the broader probe performs several.
+Both fail before downloading anything when `CURSOR_API_KEY` is absent. The SDK
+deliberately uses API-key authentication rather than a separate CLI login.
+Cursor's native sandbox is disabled in this baseline because the standalone
+runtime does not support it on every host. Confinement instead follows the
+pinned SDK's published `AgentOptions.tools` allow-list contract. Trouve reviews
+the complete public `ToolName` vocabulary for v1.0.28, sends only `mcp`, and
+explicitly denies every other known native tool as defense in depth. Before any
+paid turn, each probe first creates and closes (without running) an agent that
+selects the real native `shell` tool, proving that identifier is recognized by
+the exact Bridge release. It then submits an unknown built-in name and requires
+a `ConnectRpcError` whose structured code is `invalid_argument` and whose
+detail names that exact probe; a generic transport or authentication failure
+cannot pass. The shipping agent is created only with `mcp` allowed and with
+`shell` plus every other known native tool explicitly denied. Stream tool
+telemetry is corroborating evidence only:
+when present it must contain no filesystem, shell, task, or other native
+capability. Cursor may label a custom callback as either the generic `mcp`
+capability or its exact custom-tool name; the probe accepts only those exact
+spellings, correlates the call id with `CallCustomTool`, and rejects every
+additional call id or tool name. Model compliance with a prompt is never
+treated as the sole confinement evidence. Each paid baseline turn and the
+first full-qualification turn also ask for the recognized native `shell` tool
+while the exact shipping options are active; the stream must still contain
+only the requested host callback. That negative exercise corroborates the
+pinned allow-list contract and its deterministic validation.
+
+Qualification is gated in this order:
+
+1. **Authentication and billing.** Prove the supported user API-key flow is an
+   acceptable subscription onboarding experience and is charged to the same
+   request pools users expect.
+2. **Tool confinement.** Run with built-ins removed and expose Trouve tools
+   through SDK custom-tool callbacks. Verify all matrix permission modes and
+   image/tool-result shapes.
+3. **Lifecycle fidelity.** Verify resume, model options, steering, cancellation,
+   process cleanup, usage, and subscription-health equivalents.
+4. **Operational cost.** Track startup latency, idle memory, binary update
+   policy, protocol compatibility, and failure recovery across Bridge releases.
+
+**Current local evidence (2026-08-24): full transport qualification passed.**
+The pinned v1.0.28 archive downloaded, matched its published
+checksum, and reported Bridge version 1.0.0 with protocol `sdk.v1`. Missing and
+intentionally invalid credentials failed closed without being printed, while a
+real user API key authenticated Composer 2 against a 36-model catalog. The
+complete run registered 134 custom tools, including 128 schema stress probes,
+without exposing the explicitly requested native shell capability.
+
+Seven paid turns proved host allow and deny/error results, input images,
+text/structured/image tool results, two genuinely concurrent read callbacks,
+cancellation followed by recovery, and a cold Bridge-process resume. The
+Bridge accepted a per-send plan-mode request and returned a tool-free plan, but
+SDK v1 does not echo the effective mode in run or stream results; qualification
+records that limitation instead of treating model behavior as proof of mode.
+The report places it under `non_gating_observations` with a `not-attested`
+status; it is not a certified SDK capability or a promotion claim. Read-only
+safety remains independently enforced by the MCP-only `ToolExecutor` boundary.
+Every callback id correlated with the generic `mcp` stream event, all seven
+turns reported token usage, and the final run had complete terminal tool
+events. Durable `ObserveRun` replay returned opaque offsets and resumed
+exclusively after an offset. `GetRun`, `ListRuns`, `GetRunConversation`, and
+`ListAgentMessages` also passed. A preceding attempt stopped after one custom
+tool lacked a terminal stream event; the clean rerun makes that an intermittent
+reliability signal to cover in soak testing rather than a deterministic
+contract failure. Isolated Bridge state was removed after each attempt.
+
+One-host measurements were: 115,102,950-byte Bridge binary, 301 ms ready time,
+about 144 MB ready RSS, about 265 MB warm RSS, and 308 ms cold restart. These
+are qualification observations, not benchmark claims.
+
+Subscription health was separately qualified without the CLI. Sending the raw
+user API key directly to `DashboardService` correctly failed with 401; Cursor's
+own SDK v1.0.28 showed the required preceding
+`POST /auth/exchange_user_api_key` step. The live API-key exchange returned
+200, after which `GetCurrentPeriodUsage` and `GetPlanInfo` both returned 200
+with the billing cycle, all three plan meters, spend-limit data, and plan name.
+Trouve now performs that sequence directly, keeps the exchanged access token
+only in memory for the query, and never invokes `cursor-agent` or reads its
+credential files.
+
+The 2026-08-28 shared-process qualification passed six paid Composer 2 turns
+through one v1.0.28 Bridge. Two agents used distinct API-key-bearing options,
+configured Cursor `local.cwd` values, custom-tool catalogs, and exact callback
+routes while their sends ran concurrently. That recorded run did not prove
+Cursor-native filesystem separation. The current probe additionally makes
+each host-owned tool route read a different isolated workspace marker, while
+production Rust adapter tests verify exact session-worktree routing,
+Trouve-owned route settlement, same-process sharing across distinct agents,
+streamed/callback call-id correlation, retired-agent process rotation, and
+fail-closed quarantine. Cancelling agent A left agent B's callback and turn
+healthy; the Bridge did not disconnect A's callback itself. Both agents passed warm
+`CloseAgent`/`ResumeAgent`, cold-process resume from the shared SQLite store,
+and MCP-only native-tool confinement in the direct capability probe. Production
+rotates the sole process before resuming an agent id so an unseen late callback
+cannot bind to a later turn. The run observed exactly one Bridge process and
+about 228 MiB warm RSS.
+
+The shipping-path qualification drives three paid Composer 2.5 turns through
+the production Rust adapter and public HTTP API. It requires one initial
+approval-gated `write_file`, then holds two more approval-gated `write_file`
+callbacks at a barrier in separate session worktrees. Both approvals must be
+observed before either is released, proving callback overlap through the shared
+Bridge. The run also verifies distinct Cursor agent ids, exact tool lifecycles
+and worktree routing, cold resume of the first agent after its callback boundary
+rotates, and at most one private Bridge runtime directory at every observation.
+Managed install/uninstall, live
+subscription health, durable thread views, token usage, and a scan for API-key
+bytes under Trouve's data directory are part of the same required run.
+
+### Evidence-driven automated-review qualification
+
+Automated review treats the immutable diff and supplied review evidence as
+primary. A reviewer forms a concrete defect hypothesis before looking outside
+that evidence, uses the narrowest lookup that can change its verdict, connects
+the result back to changed behavior, and stops once its material hypotheses
+are resolved. The 24-call limit remains an emergency backstop rather than an
+exploration target.
+
+This is a common Trouve review policy, not Cursor-specific prompt tuning. It is
+part of the secured unattended-review persona used by both API-loop providers
+and vendor backends. Vendor turns omit the ordinary semantic-search-first
+instruction for automated-review threads because it conflicts with the diff's
+priority; ordinary coding threads retain that instruction. The existing seven
+unattended tools (`read_file`, `list_dir`, `glob`, `grep`, `search`,
+`find_related`, and `git_diff`) remain available. Tool removal requires replay
+evidence that a specific capability causes waste without supporting findings.
+
+Set a public review job URL to extend the shipping-path test with two synthetic
+cases and a replay of every selected reviewer task at the job's recorded head
+and base commits:
+
+```sh
+TROUVE_E2E=1 CURSOR_API_KEY=... \
+  CURSOR_E2E_REVIEW_JOB_URL='https://review.example/#/jobs/rv_example' \
+  cargo test -p trouve-server --test cursor_sdk_live -- --ignored --nocapture
+```
+
+The UI fragment form above and a direct
+`/v1/code-review/jobs/{id}` API URL are both accepted. The recorded git objects
+must already exist in the local repository. Use
+`CURSOR_E2E_REVIEW_TASK_LIMIT` (1 to 128) for a paid smoke subset and
+`CURSOR_E2E_REVIEW_CONCURRENCY` (default 8, maximum 16) to control parallelism.
+A job with more than 128 selected reviewer tasks requires an explicit
+`CURSOR_E2E_REVIEW_TASK_LIMIT`; an unset limit rejects that replay.
+The test prints aggregate and per-task `tool.requested` counts grouped by tool
+name, so future restrictions can be based on evidence rather than intuition.
+
+Promotion requires all of the following:
+
+- every selected task completes with valid reviewer JSON;
+- zero hard-cap failures and no task reaching 24 calls;
+- median tool calls at most 4 and nearest-rank p90 at most 8;
+- a self-contained synthetic retry defect is detected with no tool call; and
+- a synthetic revocation defect that depends on unchanged code is detected
+  after one to four targeted lookups, without inventory or diff tools.
+
+The pre-guidance Cursor SDK replay of PR 140 established the comparison
+baseline: all 61 selected tasks completed with valid JSON, but they made 1,351
+tool calls and 36 tasks reached the 24-call ceiling. Passing transport and cap
+enforcement therefore does not by itself satisfy the exploration contract.
+
+**Decision: use the SDK Bridge adapter and retire the Cursor CLI transport.**
+Cursor steering remains disabled through the existing per-backend
+capability; Codex and capable providers keep their steering behavior. The lack
+of Cursor's native sandbox is accepted because the explicit MCP-only allow-list
+with host-owned callbacks is the confinement boundary. API-key onboarding is
+the supported SDK flow and uses the same account request pools. Local
+`GetUsage` availability is not a promotion blocker: stream events provide
+per-turn token usage, while the direct exchange/dashboard path supplies
+provider-wide subscription windows.
+
+The fixture suite, permission/approval integration, and repeated live
+qualification remain required whenever the pinned Bridge release changes. See
+ADRs [0047](../adr/0047-cursor-sdk-bridge-transport.md),
+[0050](../adr/0050-shared-cursor-sdk-bridge-process.md), and
+[0051](../adr/0051-cursor-shared-store-transition-and-quarantine.md), plus the official
+[Cursor SDK Bridge contract](https://cursor.com/docs/sdk/bridge).
+
+## Rollout rule
+
+Transport selection stays inside provider/backend construction. No protocol
+field, settings badge, or thread mode tells users which loop or bridge ran.
+Rollout uses an internal guarded configuration, conformance comparison, and
+automatic fallback where safe; after qualification, the better transport can
+replace the old one without changing the thread experience.

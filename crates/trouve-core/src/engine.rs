@@ -6,10 +6,30 @@
 
 mod routing;
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
+
+/// Internal marker prompt for turns that attach to vendor-autonomous agent
+/// activity instead of prompting the model. The durable display boundary is
+/// the dedicated `turn.background_activity` event, not a user message.
+pub const BACKGROUND_ATTACH_PROMPT: &str = "[background agent activity]";
+
+fn background_attach_prompt(backend_id: &str) -> String {
+    format!("{BACKGROUND_ATTACH_PROMPT}\nbackend={backend_id}")
+}
+
+fn background_attach_backend_id(content: &str) -> Option<&str> {
+    let backend_id = content
+        .strip_prefix(BACKGROUND_ATTACH_PROMPT)?
+        .strip_prefix("\nbackend=")?;
+    (!backend_id.is_empty()
+        && backend_id == backend_id.trim()
+        && !backend_id.chars().any(char::is_whitespace))
+    .then_some(backend_id)
+}
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::{Arc, Mutex, RwLock, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, TryLockError, Weak};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -23,25 +43,38 @@ use trouve_protocol::{
     ForkCheckpointResponse, ProviderInfo, ProvidersResponse, RestoreDirection, Scope, Session,
     SessionDiffFileSummary, SessionDiffSummary, SessionFileDiff, Thread, ToolStatus, TurnAccepted,
     TurnPhase, UpdateSessionRequest, UpdateThreadRequest, UpsertProviderRequest, Usage, Workspace,
+    WorkspaceListItem,
 };
-use trouve_providers::{Message, Provider, ProviderEvent, ToolSpec};
+use trouve_providers::{InferencePriority, Message, Provider, ProviderEvent, ToolSpec};
 
 use crate::config::{Config, ProviderConfig};
 use crate::permissions::{
     ApprovalHub, ApprovalResolution, Gate, QuestionHub, QuestionResolution, allow_key, gate,
 };
 use crate::store::{
-    AcceptedPrompt, ArtifactCleanupClaim, ArtifactCleanupJob, CheckpointRow, PromptAcceptance,
-    SessionPrVerificationIntent, Store,
+    ArtifactCleanupClaim, ArtifactCleanupJob, CheckpointRow, PromptAcceptance,
+    ReviewWorkspaceCleanupIntent, SessionBranchRenameIntent, SessionPrVerificationIntent, Store,
 };
 use crate::tools::{
-    AttachmentMaterialization, AttachmentMaterializationFile, BackgroundMutationLease,
-    DeletedSessionCleanup, LocalToolExecutor, MaterializedAttachment, McpConfigMutation,
-    McpConfigMutationOutcome, McpConfigMutationRequest, SessionMutationPermit,
-    SessionRepositoryDiff, SessionRepositoryPush, ToolCtx, ToolExecutor, ToolResult,
-    edit_strategy_for_model, materialized_attachment_relative_path,
+    AttachmentMaterialization, AttachmentMaterializationFile, DeletedSessionCleanup,
+    LocalToolExecutor, MaterializedAttachment, McpConfigMutation, McpConfigMutationOutcome,
+    McpConfigMutationRequest, SessionBranchRename, SessionMutationPermit, SessionRepositoryDiff,
+    SessionRepositoryPush, ToolCtx, ToolExecutor, ToolResult, edit_strategy_for_model,
 };
 use crate::{context, git, new_id, personas};
+
+fn dispatched_prompt_event(turn: u64, prompt: &trouve_protocol::QueuedPrompt) -> Event {
+    if prompt.background {
+        Event::TurnBackgroundActivity { turn }
+    } else {
+        Event::UserMessage {
+            turn,
+            content: prompt.content.clone(),
+            attachments: prompt.attachments.clone(),
+            background: false,
+        }
+    }
+}
 
 /// Safety valve: maximum provider round-trips within a single turn.
 const MAX_ITERATIONS: usize = 32;
@@ -68,6 +101,13 @@ const MAX_SESSION_PR_HEAD_MOVED_ATTEMPTS: u32 = 12;
 const MAX_SESSION_PR_REQUEST_ATTEMPTS: u32 = 48;
 const SESSION_PR_AUTH_RETRY_SECONDS: i64 = 30;
 const SESSION_PR_LEGACY_EVIDENCE_LOCK_TIMEOUT: Duration = Duration::from_secs(1);
+/// Repository identity changes rarely, but Git remotes remain mutable outside
+/// trouve. Revalidate periodically without spawning Git on every list poll.
+const WORKSPACE_LIST_CACHE_TTL: Duration = Duration::from_secs(30);
+/// Repository identity is presentation metadata. Fall back to workspace
+/// identity instead of allowing a hostile or unhealthy Git probe to stall a
+/// workspace-list request indefinitely.
+const WORKSPACE_REPOSITORY_IDENTITY_TIMEOUT: Duration = Duration::from_secs(2);
 const PR_VERIFICATION_FAILURE_AUTH: &str = "authentication";
 const PR_VERIFICATION_FAILURE_CONTENTION: &str = "contention";
 const PR_VERIFICATION_FAILURE_EVIDENCE: &str = "evidence";
@@ -87,11 +127,23 @@ const MAX_ATTACHMENT_MIME_BYTES: usize = 255;
 const TOOL_CANCEL_CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 #[cfg(test)]
 const TOOL_CANCEL_CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+/// A defective backend must not hold the global provider transition forever.
+/// Cursor's own pool cleanup is bounded and has at most three warm processes;
+/// this outer aggregate budget leaves room for that normal path while fencing
+/// every backend implementation at the registry boundary.
+const BACKEND_RETIREMENT_TIMEOUT: Duration = Duration::from_secs(30);
+const BACKEND_RETIREMENT_RETRY_INITIAL: Duration = Duration::from_secs(1);
+const BACKEND_RETIREMENT_RETRY_MAX: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const API_PROVIDER_REFRESH_TIMEOUT: Duration = Duration::from_millis(250);
+#[cfg(not(test))]
+const PROVIDER_TRANSITION_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const PROVIDER_TRANSITION_WAIT_TIMEOUT: Duration = Duration::from_millis(250);
+const RUNTIME_UNINSTALL_LEASE_RETRIES: usize = 4;
+const RUNTIME_UNINSTALL_LEASE_RETRY_DELAY: Duration = Duration::from_millis(25);
 
 type NativeToolCallResult = Result<(String, Vec<trouve_providers::ToolImage>)>;
-type ProviderRegistryEntry = (String, u64, Arc<dyn Provider>);
-type BackendRegistryEntry = (String, u64, Arc<dyn AgentBackend>);
-type ProviderRegistrySnapshot = (Vec<ProviderRegistryEntry>, Vec<BackendRegistryEntry>);
 
 fn attachment_mime_token_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric()
@@ -110,6 +162,17 @@ fn base64_sextet(byte: u8) -> Option<u8> {
         b'/' => Some(63),
         _ => None,
     }
+}
+
+/// Sanitized extension (".png") for an opaque attachment file name, so tools
+/// and vendor CLIs sniff the type naturally without trusting the upload name.
+fn opaque_attachment_extension(name: &str) -> String {
+    Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .filter(|e| e.len() <= 8 && e.chars().all(|c| c.is_ascii_alphanumeric()))
+        .map(|e| format!(".{}", e.to_ascii_lowercase()))
+        .unwrap_or_default()
 }
 
 /// Validate the request envelope, including its exact decoded sizes, before
@@ -319,6 +382,30 @@ impl Drop for PreparedAttachmentCleanup {
     }
 }
 
+/// Temporary on-disk copies of naming-request images for backends that only
+/// accept image files by path. The files never enter the durable attachment
+/// store or a session worktree and are removed when the request finishes,
+/// including when its future is dropped by a disconnecting client.
+struct StagedTitleImages {
+    executor: Arc<dyn ToolExecutor>,
+    root: PathBuf,
+    paths: Vec<PathBuf>,
+}
+
+impl Drop for StagedTitleImages {
+    fn drop(&mut self) {
+        if self.paths.is_empty() {
+            return;
+        }
+        if let Err(error) = self
+            .executor
+            .rollback_attachment_files(&self.root, &self.paths)
+        {
+            tracing::warn!(%error, "failed to remove staged naming images");
+        }
+    }
+}
+
 async fn maintain_artifact_cleanup_claim(
     store: Store,
     claim: ArtifactCleanupClaim,
@@ -477,6 +564,57 @@ const STREAM_EVENT_BATCH_WINDOW: std::time::Duration = std::time::Duration::from
 /// stream can produce output forever without yielding Pending.
 const MAX_BACKEND_EVENTS_BEFORE_STEER: usize = 32;
 
+#[derive(Default)]
+struct ProviderThinkingState {
+    active: Option<(String, bool)>,
+}
+
+impl ProviderThinkingState {
+    fn start(&mut self, id: String, turn: u64, events: &mut Vec<Event>) {
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|(active, _)| active == &id)
+        {
+            return;
+        }
+        self.finish(turn, events);
+        self.active = Some((id, false));
+    }
+
+    fn delta(&mut self, id: String, text: String, turn: u64, events: &mut Vec<Event>) {
+        if !self
+            .active
+            .as_ref()
+            .is_some_and(|(active, _)| active == &id)
+        {
+            self.start(id, turn, events);
+        }
+        if text.is_empty() {
+            return;
+        }
+        if let Some((_, displayed)) = self.active.as_mut() {
+            *displayed = true;
+        }
+        let id = self.active.as_ref().map(|(id, _)| id.clone());
+        events.push(Event::AssistantThinking { turn, id, text });
+    }
+
+    fn complete(&mut self, id: &str, turn: u64, events: &mut Vec<Event>) {
+        if self.active.as_ref().is_some_and(|(active, _)| active == id) {
+            self.finish(turn, events);
+        }
+    }
+
+    fn finish(&mut self, turn: u64, events: &mut Vec<Event>) {
+        if let Some((id, displayed)) = self.active.take()
+            && displayed
+        {
+            events.push(Event::AssistantThinkingCompleted { turn, id: Some(id) });
+        }
+    }
+}
+
 /// SQLite's busy handler does not cover every `SQLITE_LOCKED` collision. A
 /// checkpoint is post-response bookkeeping, so briefly retry those transient
 /// conflicts instead of turning an otherwise successful model turn into a
@@ -505,459 +643,24 @@ const GITHUB_DASHBOARD_REFRESH_FRESHNESS: std::time::Duration = std::time::Durat
 // Leave a little handoff margin beyond those combined budgets so this outer
 // timeout does not silently replace a valid model request with heuristics.
 const SESSION_TITLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+// A managed local naming request may spend five minutes waiting behind user
+// turns and another five minutes loading its configured model. Keep the
+// end-to-end guard just beyond those independent bounded phases.
+const LOCAL_SESSION_TITLE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(10 * 60 + 45);
+// A staged naming image older than the longest naming budget cannot belong
+// to a live request, so the startup sweep may remove it.
+const STALE_TITLE_IMAGE_AGE: std::time::Duration =
+    std::time::Duration::from_secs(LOCAL_SESSION_TITLE_TIMEOUT.as_secs() + 5 * 60);
+// Naming is cosmetic and authenticated clients may retry while local
+// inference is busy. Bound both distinct work and coalesced followers so a
+// stalled sidecar cannot retain an arbitrary number of request tasks.
+const MAX_PENDING_TITLE_JOBS: usize = 32;
+const MAX_TITLE_JOB_FOLLOWERS: usize = 32;
 #[cfg(not(test))]
 const MODEL_CATALOG_VALIDATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 #[cfg(test)]
 const MODEL_CATALOG_VALIDATION_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
-#[cfg(not(test))]
-const MODEL_ROUTE_DISCOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-#[cfg(test)]
-const MODEL_ROUTE_DISCOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
-
-/// Bound automatic failover so one turn cannot churn through every configured
-/// credential. Persisted circuit state advances later turns past failed routes.
-const MAX_ROUTE_ATTEMPTS_PER_TURN: usize = 4;
-/// Live subscription probes can involve a process or network round-trip. Keep
-/// their result briefly while preserving a hard bound on stale refreshes.
-const SUBSCRIPTION_HEALTH_CACHE_TTL: Duration = Duration::from_secs(30);
-const SUBSCRIPTION_HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
-
-#[derive(Clone)]
-struct ModelCandidate {
-    provider_id: String,
-    provider_model: String,
-    provider_generation: u64,
-    info: trouve_protocol::ModelInfo,
-    executor: ModelExecutor,
-    shared_model_id: Option<String>,
-}
-
-#[derive(Clone)]
-struct RoutedAttemptSnapshot {
-    provider_id: String,
-    provider_model: String,
-    provider_generation: u64,
-    attempt_order: i64,
-}
-
-#[derive(Default)]
-struct ConcreteAttemptState {
-    attempt_order: AtomicI64,
-    provider_generation: Mutex<Option<(String, u64)>>,
-}
-
-#[derive(Clone)]
-enum ModelExecutor {
-    Native(Arc<dyn Provider>),
-    Backend(Arc<dyn AgentBackend>),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RouteFailureKind {
-    Capacity,
-    Authentication,
-    Unavailable,
-}
-
-impl RouteFailureKind {
-    fn cooldown(self) -> (i64, i64) {
-        match self {
-            Self::Capacity => (5 * 60, 6 * 60 * 60),
-            Self::Authentication => (60 * 60, 24 * 60 * 60),
-            Self::Unavailable => (30, 30 * 60),
-        }
-    }
-
-    fn failover_reason(self) -> trouve_protocol::ModelRouteReason {
-        match self {
-            Self::Capacity => trouve_protocol::ModelRouteReason::CapacityFailover,
-            Self::Authentication | Self::Unavailable => {
-                trouve_protocol::ModelRouteReason::RouteFailover
-            }
-        }
-    }
-}
-
-#[derive(Debug)]
-struct RouteAttemptFailure {
-    kind: RouteFailureKind,
-    message: String,
-    safe_to_retry: bool,
-}
-
-enum RouteAttemptResult {
-    Completed,
-    Cancelled,
-    Failed(RouteAttemptFailure),
-}
-
-struct TurnAccounting {
-    usage: Usage,
-    context_input_tokens: u64,
-    cost_known: bool,
-}
-
-impl Default for TurnAccounting {
-    fn default() -> Self {
-        Self {
-            usage: Usage::default(),
-            context_input_tokens: 0,
-            cost_known: true,
-        }
-    }
-}
-
-impl TurnAccounting {
-    fn add_native(
-        &mut self,
-        catalog: &trouve_providers::models_dev::ModelsDevCatalog,
-        route: &ModelCandidate,
-        usage: &Usage,
-    ) {
-        self.usage.input_tokens += usage.input_tokens;
-        self.usage.output_tokens += usage.output_tokens;
-        self.usage.cached_input_tokens += usage.cached_input_tokens;
-        match catalog.cost_usd(
-            &route.info,
-            usage.input_tokens,
-            usage.cached_input_tokens,
-            usage.output_tokens,
-        ) {
-            Some(cost) => self.usage.cost_usd = Some(self.usage.cost_usd.unwrap_or(0.0) + cost),
-            None => self.cost_known = false,
-        }
-        if usage.context_window.is_some() {
-            self.usage.context_window = usage.context_window;
-        }
-        self.context_input_tokens = usage
-            .context_input_tokens
-            .unwrap_or_else(|| usage.input_tokens.saturating_add(usage.cached_input_tokens));
-        self.usage.context_input_tokens = Some(self.context_input_tokens);
-    }
-
-    fn add_backend(&mut self, usage: &Usage) {
-        self.usage.input_tokens += usage.input_tokens;
-        self.usage.output_tokens += usage.output_tokens;
-        self.usage.cached_input_tokens += usage.cached_input_tokens;
-        match usage.cost_usd {
-            Some(cost) => self.usage.cost_usd = Some(self.usage.cost_usd.unwrap_or(0.0) + cost),
-            None => self.cost_known = false,
-        }
-        if usage.context_window.is_some() {
-            self.usage.context_window = usage.context_window;
-        }
-        self.context_input_tokens = usage
-            .context_input_tokens
-            .unwrap_or_else(|| usage.input_tokens.saturating_add(usage.cached_input_tokens));
-        self.usage.context_input_tokens = Some(self.context_input_tokens);
-    }
-
-    fn finalize_cost(&mut self) {
-        if !self.cost_known {
-            self.usage.cost_usd = None;
-        }
-    }
-}
-
-impl ModelCandidate {
-    fn automatic_selection_id(&self) -> Option<String> {
-        self.shared_model_id
-            .as_deref()
-            .and_then(neutral_model_id)
-            .map(|model| format!("auto/{model}"))
-    }
-
-    fn concrete_selection_id(&self) -> String {
-        format!("{}/{}", self.provider_id, self.provider_model)
-    }
-}
-
-/// Automatic ids are namespaced in the current protocol. Bare names remain
-/// accepted for clients that stored a selection before that namespace existed.
-fn automatic_model_name(selection: &str) -> Option<&str> {
-    selection
-        .strip_prefix("auto/")
-        .or_else(|| (!selection.contains('/')).then_some(selection))
-}
-
-fn neutral_model_id(provider_model: &str) -> Option<String> {
-    let id = provider_model.trim();
-    if id.is_empty() || id.split('/').any(|segment| segment.trim().is_empty()) {
-        return None;
-    }
-    if matches!(
-        id.to_ascii_lowercase().as_str(),
-        "auto" | "automatic" | "default" | "latest"
-    ) {
-        return None;
-    }
-    Some(id.to_string())
-}
-
-fn model_name_for_provider<'a>(provider_id: &str, qualified_id: &'a str) -> &'a str {
-    qualified_id
-        .strip_prefix(provider_id)
-        .and_then(|rest| rest.strip_prefix('/'))
-        .unwrap_or(qualified_id)
-}
-
-fn fallback_model_info(qualified_id: &str, provider_model: &str) -> trouve_protocol::ModelInfo {
-    trouve_protocol::ModelInfo {
-        id: qualified_id.to_string(),
-        display_name: provider_model.to_string(),
-        context_window: 0,
-        supports_tools: true,
-        input_price_per_mtok: None,
-        output_price_per_mtok: None,
-        options_schema: serde_json::json!({"type": "object", "properties": {}}),
-    }
-}
-
-fn thinking_schema(model: &trouve_protocol::ModelInfo) -> Option<(Vec<String>, Option<String>)> {
-    thinking_option_property(model).map(|(_, property, values)| {
-        (
-            values
-                .iter()
-                .filter_map(|value| value.as_str().map(String::from))
-                .collect(),
-            property["default"].as_str().map(String::from),
-        )
-    })
-}
-
-fn routed_options_schema(models: &[&trouve_protocol::ModelInfo]) -> serde_json::Value {
-    let mut properties = models
-        .first()
-        .and_then(|model| model.options_schema["properties"].as_object())
-        .cloned()
-        .unwrap_or_default();
-    properties.retain(|key, value| {
-        !THINKING_OPTION_KEYS.contains(&key.as_str())
-            && models.iter().skip(1).all(|model| {
-                model.options_schema["properties"]
-                    .get(key)
-                    .is_some_and(|candidate| candidate == value)
-            })
-    });
-
-    let mut schemas = models.iter().map(|model| thinking_schema(model));
-    if let Some(Some((mut common_levels, first_default))) = schemas.next() {
-        let mut shared_default = first_default;
-        let shared_by_every_route = schemas.all(|schema| {
-            let Some((values, default)) = schema else {
-                return false;
-            };
-            common_levels.retain(|value| values.contains(value));
-            if default != shared_default {
-                shared_default = None;
-            }
-            true
-        });
-        if shared_by_every_route && common_levels.len() > 1 {
-            let default = shared_default
-                .filter(|value| common_levels.contains(value))
-                .or_else(|| {
-                    common_levels
-                        .iter()
-                        .find(|value| value.as_str() == "medium")
-                        .cloned()
-                })
-                .unwrap_or_else(|| common_levels[0].clone());
-            properties.insert(
-                "thinking_level".into(),
-                serde_json::json!({
-                    "type": "string",
-                    "enum": common_levels,
-                    "default": default,
-                    "description": "How much thinking the model does before answering"
-                }),
-            );
-        }
-    }
-    serde_json::json!({"type": "object", "properties": properties})
-}
-
-fn common_price(
-    candidates: &[ModelCandidate],
-    get: impl Fn(&trouve_protocol::ModelInfo) -> Option<f64>,
-) -> Option<f64> {
-    let first = get(&candidates.first()?.info)?;
-    candidates
-        .iter()
-        .all(|candidate| get(&candidate.info) == Some(first))
-        .then_some(first)
-}
-
-fn routed_model_info(
-    id: String,
-    mut candidates: Vec<ModelCandidate>,
-) -> trouve_protocol::RoutedModelInfo {
-    candidates.sort_by(|a, b| {
-        a.provider_id
-            .cmp(&b.provider_id)
-            .then_with(|| a.provider_model.cmp(&b.provider_model))
-    });
-    let first = &candidates[0].info;
-    let display_name = if candidates
-        .iter()
-        .all(|candidate| candidate.info.display_name == first.display_name)
-    {
-        first.display_name.clone()
-    } else {
-        id.clone()
-    };
-    let context_window = candidates
-        .iter()
-        .map(|candidate| candidate.info.context_window)
-        .filter(|window| *window > 0)
-        .min()
-        .unwrap_or(0);
-    trouve_protocol::RoutedModelInfo {
-        id,
-        display_name,
-        context_window,
-        supports_tools: candidates
-            .iter()
-            .all(|candidate| candidate.info.supports_tools),
-        input_price_per_mtok: common_price(&candidates, |model| model.input_price_per_mtok),
-        output_price_per_mtok: common_price(&candidates, |model| model.output_price_per_mtok),
-        options_schema: if candidates.len() == 1 {
-            first.options_schema.clone()
-        } else {
-            routed_options_schema(
-                &candidates
-                    .iter()
-                    .map(|candidate| &candidate.info)
-                    .collect::<Vec<_>>(),
-            )
-        },
-        routes: candidates
-            .iter()
-            .map(|candidate| trouve_protocol::ModelRouteInfo {
-                provider_id: candidate.provider_id.clone(),
-                provider_model: candidate.provider_model.clone(),
-            })
-            .collect(),
-    }
-}
-
-fn model_info_for_routed_selection(
-    routed: trouve_protocol::RoutedModelInfo,
-) -> trouve_protocol::ModelInfo {
-    trouve_protocol::ModelInfo {
-        id: routed.id,
-        display_name: routed.display_name,
-        context_window: routed.context_window,
-        supports_tools: routed.supports_tools,
-        input_price_per_mtok: routed.input_price_per_mtok,
-        output_price_per_mtok: routed.output_price_per_mtok,
-        options_schema: routed.options_schema,
-    }
-}
-
-fn routed_model_catalog(candidates: Vec<ModelCandidate>) -> Vec<trouve_protocol::RoutedModelInfo> {
-    let mut grouped = BTreeMap::<String, Vec<ModelCandidate>>::new();
-    for candidate in candidates {
-        grouped
-            .entry(candidate.concrete_selection_id())
-            .or_default()
-            .push(candidate.clone());
-        if let Some(id) = candidate.automatic_selection_id() {
-            grouped.entry(id).or_default().push(candidate);
-        }
-    }
-    grouped
-        .into_iter()
-        .map(|(id, candidates)| routed_model_info(id, candidates))
-        .collect()
-}
-
-fn compatibility_model_catalog(candidates: Vec<ModelCandidate>) -> Vec<trouve_protocol::ModelInfo> {
-    routed_model_catalog(candidates)
-        .into_iter()
-        .map(|model| trouve_protocol::ModelInfo {
-            id: model.id,
-            display_name: model.display_name,
-            context_window: model.context_window,
-            supports_tools: model.supports_tools,
-            input_price_per_mtok: model.input_price_per_mtok,
-            output_price_per_mtok: model.output_price_per_mtok,
-            options_schema: model.options_schema,
-        })
-        .collect()
-}
-
-fn subscription_health_rank(health: &trouve_protocol::SubscriptionHealth) -> (u8, i64) {
-    match health.status.as_str() {
-        "ok" => match health
-            .windows
-            .iter()
-            .map(|window| window.used_percent.max(0))
-            .max()
-        {
-            Some(used) if used >= 100 => (3, used),
-            Some(used) => (0, used),
-            None => (1, 0),
-        },
-        "unavailable" => (2, 0),
-        _ => (1, 0),
-    }
-}
-
-fn native_attempt_failure(
-    error: trouve_providers::ProviderError,
-    side_effect_started: bool,
-) -> RouteAttemptFailure {
-    let kind = if error.is_capacity_exhausted() {
-        RouteFailureKind::Capacity
-    } else if matches!(&error, trouve_providers::ProviderError::Auth(_)) {
-        RouteFailureKind::Authentication
-    } else {
-        RouteFailureKind::Unavailable
-    };
-    RouteAttemptFailure {
-        kind,
-        message: format!("provider error: {error}"),
-        safe_to_retry: !side_effect_started,
-    }
-}
-
-fn backend_attempt_failure(
-    error: trouve_agents::BackendError,
-    side_effect_started: bool,
-) -> RouteAttemptFailure {
-    let capacity = error.is_capacity_exhausted();
-    let kind = if capacity {
-        RouteFailureKind::Capacity
-    } else if matches!(
-        &error,
-        trouve_agents::BackendError::Auth(_) | trouve_agents::BackendError::NotInstalled(_)
-    ) {
-        RouteFailureKind::Authentication
-    } else {
-        RouteFailureKind::Unavailable
-    };
-    RouteAttemptFailure {
-        kind,
-        message: format!("backend error: {error}"),
-        safe_to_retry: !side_effect_started,
-    }
-}
-
-fn backend_permission_policy(tools_enabled: bool, persona_read_only: bool) -> BackendPermission {
-    if !tools_enabled || persona_read_only {
-        BackendPermission::ReadOnly
-    } else {
-        // Always request a pre-execution callback. Trouve's gate still
-        // auto-approves Yolo calls, while the callback acquires the session
-        // mutation lane and supplies creator provenance.
-        BackendPermission::Ask
-    }
-}
-
-fn backend_strict_tool_free_policy(tools_enabled: bool, supports_tool_free_turns: bool) -> bool {
-    !tools_enabled && supports_tool_free_turns
-}
 
 /// Codex collaborators inherit the root thread's MCP URL. Stable Codex sends
 /// its vendor thread id in the MCP request metadata, and app-server separately
@@ -975,15 +678,24 @@ const CODEX_BRIDGE_METADATA_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
 const MAX_SUBAGENT_DEPTH: usize = 4;
 const MAX_CONCURRENT_CHILDREN: usize = 4;
 const MAX_ACTIVE_DESCENDANTS: usize = 16;
-
-const TURN_CONCURRENCY_ENV: &str = "TROUVE_TURN_CONCURRENCY";
-const DEFAULT_TURN_CONCURRENCY: usize = 26;
-const BACKGROUND_TURN_CONCURRENCY_ENV: &str = "TROUVE_BACKGROUND_TURN_CONCURRENCY";
-const DEFAULT_BACKGROUND_TURN_CONCURRENCY: usize = 24;
-const PROVIDER_TURN_CONCURRENCY_ENV: &str = "TROUVE_PROVIDER_TURN_CONCURRENCY";
-const DEFAULT_PROVIDER_TURN_CONCURRENCY: usize = 18;
-const PROVIDER_BACKGROUND_CONCURRENCY_ENV: &str = "TROUVE_PROVIDER_BACKGROUND_TURN_CONCURRENCY";
-const DEFAULT_PROVIDER_BACKGROUND_CONCURRENCY: usize = 16;
+/// Bounds durable task and thread setup bursts across planned review turns.
+/// Permits are released before model dispatch, so this does not cap active
+/// reviewer turns.
+const PLANNED_TURN_SETUP_CONCURRENCY: usize = 24;
+/// Bounds concurrent vendor-side turn startups per agent backend. A shared
+/// app-server (Codex) admits `thread/start` roughly serially, so an
+/// unbounded burst queues every start behind the others until the tail
+/// exceeds the backend's fixed response timeout and fails. Keeping the
+/// queue shallow keeps every start well inside that timeout. The permit is
+/// released once the vendor has accepted the turn, so this paces startups
+/// without capping active turns.
+const BACKEND_TURN_STARTUP_CONCURRENCY: usize = 4;
+const REMOVED_TURN_CONCURRENCY_ENVS: [&str; 4] = [
+    "TROUVE_TURN_CONCURRENCY",
+    "TROUVE_BACKGROUND_TURN_CONCURRENCY",
+    "TROUVE_PROVIDER_TURN_CONCURRENCY",
+    "TROUVE_PROVIDER_BACKGROUND_TURN_CONCURRENCY",
+];
 
 fn session_branch_name(title: &str, session_id: &str, derive_from_session_title: bool) -> String {
     let id = session_id.strip_prefix("se_").unwrap_or(session_id);
@@ -995,12 +707,12 @@ fn session_branch_name(title: &str, session_id: &str, derive_from_session_title:
     }
 }
 
-fn positive_limit_from_env(name: &str, default: usize) -> usize {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(default)
+fn should_replay_session_branch_rename(
+    pending: &SessionBranchRenameIntent,
+    persisted_title: &str,
+    requested_title: &str,
+) -> bool {
+    persisted_title == pending.title && requested_title == pending.title
 }
 
 async fn flush_backend_event_batch(
@@ -1056,11 +768,34 @@ fn enforce_automated_review_backend_boundary(
     Ok(())
 }
 
-fn vendor_tool_uses_automated_review_budget(tools_enabled: bool, tool: &str) -> bool {
+fn append_vendor_search_guidance(
+    instructions: &mut String,
+    has_mcp_bridge: bool,
+    automated_review: bool,
+) {
+    // Automated review has its own evidence-first instruction floor. Adding
+    // the generic search-first rule would contradict the supplied diff's
+    // priority and encourage repository inventory before any hypothesis.
+    if !has_mcp_bridge || automated_review {
+        return;
+    }
+    if !instructions.is_empty() {
+        instructions.push_str("\n\n");
+    }
+    instructions.push_str(crate::tools::VENDOR_SEARCH_GUIDANCE);
+}
+
+fn vendor_tool_uses_automated_review_budget(
+    tools_enabled: bool,
+    tool: &str,
+    first_start: bool,
+) -> bool {
     // A backend that cannot remove native read/search tools is allowed to use
     // them during a logically tool-free turn under its read-only confinement.
-    // Tool-enabled review turns retain their hard per-turn cap.
-    tools_enabled && !trouve_direct_bridge_call(tool)
+    // Tool-enabled review turns retain their hard per-turn cap. ACP backends
+    // may repeat a tool_call update with the same id as its state changes, so
+    // charge the logical call only once.
+    tools_enabled && first_start && !trouve_direct_bridge_call(tool)
 }
 
 struct BackendCollaboratorProjection {
@@ -1358,7 +1093,7 @@ impl BridgedToolOwnerRouter {
     }
 }
 
-/// Return the canonical trouve tool nested in a Codex MCP presentation item.
+/// Return the canonical trouve tool nested in a vendor MCP presentation item.
 /// User-configured MCP servers retain their vendor wrapper; only the reserved
 /// first-party `trouve` server is projected through ToolExecutor instead.
 fn trouve_bridge_wrapper_call<'a>(
@@ -1595,65 +1330,50 @@ async fn flush_backend_collaborator_batches(
 
 #[derive(Clone)]
 struct ProviderTurnCapacity {
-    all: Arc<tokio::sync::Semaphore>,
-    background: Arc<tokio::sync::Semaphore>,
     backoff: Arc<Mutex<ProviderBackoff>>,
 }
 
 #[derive(Default)]
 struct ProviderBackoff {
-    until: Option<Instant>,
+    until: Option<tokio::time::Instant>,
     delay: std::time::Duration,
+    /// Last routed attempt whose outcome was applied. Automatic routes can
+    /// finish out of admission order, so stale completions must not undo a
+    /// newer route's cooldown.
     last_outcome_order: Option<i64>,
 }
 
-/// Capacity shared by interactive desktop turns, spawned agents, and
-/// background review personas. Background work has a smaller second gate, so
-/// it can never occupy all global/provider slots and starve the desktop.
+/// Provider throttle state shared by interactive desktop turns, spawned
+/// agents, and background review personas. Turns are otherwise admitted
+/// immediately: desktop engines rely on provider capacity, while the review
+/// service bounds work through its configurable job scheduler. Vendor-side
+/// turn startup is paced per agent backend so a burst cannot outrun a
+/// shared vendor process's request timeout.
 struct TurnScheduler {
-    all: Arc<tokio::sync::Semaphore>,
-    background: Arc<tokio::sync::Semaphore>,
-    provider_all_limit: usize,
-    provider_background_limit: usize,
+    planned_setups: Arc<tokio::sync::Semaphore>,
+    backend_startups: Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
     providers: Mutex<HashMap<String, ProviderTurnCapacity>>,
-    /// Hybrid logical clock for provider attempts. Wall time keeps values
-    /// comparable with persisted health across restarts; the atomic increment
-    /// makes every admission in this process unique even within one microsecond.
+    /// Hybrid logical clock used to reject out-of-order route outcomes.
     attempt_order: AtomicI64,
 }
 
-struct TurnCapacityGuard {
-    _permits: Vec<tokio::sync::OwnedSemaphorePermit>,
-    wait_ms: u64,
-}
-
-fn positive_attempt_order(attempt_order: &AtomicI64) -> Option<i64> {
-    let attempt_order = attempt_order.load(Ordering::Acquire);
-    (attempt_order > 0).then_some(attempt_order)
+struct TurnAdmission {
+    provider_wait_ms: u64,
 }
 
 impl TurnScheduler {
     fn new() -> Self {
-        let all_limit = positive_limit_from_env(TURN_CONCURRENCY_ENV, DEFAULT_TURN_CONCURRENCY);
-        let background_limit = positive_limit_from_env(
-            BACKGROUND_TURN_CONCURRENCY_ENV,
-            DEFAULT_BACKGROUND_TURN_CONCURRENCY,
-        )
-        .min(all_limit.saturating_sub(1).max(1));
-        let provider_all_limit = positive_limit_from_env(
-            PROVIDER_TURN_CONCURRENCY_ENV,
-            DEFAULT_PROVIDER_TURN_CONCURRENCY,
-        );
-        let provider_background_limit = positive_limit_from_env(
-            PROVIDER_BACKGROUND_CONCURRENCY_ENV,
-            DEFAULT_PROVIDER_BACKGROUND_CONCURRENCY,
-        )
-        .min(provider_all_limit.saturating_sub(1).max(1));
+        for variable in
+            configured_removed_turn_concurrency_settings(|name| std::env::var_os(name).is_some())
+        {
+            tracing::warn!(
+                variable,
+                "removed turn-concurrency setting is ignored; engine turn admission is uncapped"
+            );
+        }
         Self {
-            all: Arc::new(tokio::sync::Semaphore::new(all_limit)),
-            background: Arc::new(tokio::sync::Semaphore::new(background_limit)),
-            provider_all_limit,
-            provider_background_limit,
+            planned_setups: Arc::new(tokio::sync::Semaphore::new(PLANNED_TURN_SETUP_CONCURRENCY)),
+            backend_startups: Mutex::new(HashMap::new()),
             providers: Mutex::new(HashMap::new()),
             attempt_order: AtomicI64::new(chrono::Utc::now().timestamp_micros()),
         }
@@ -1679,9 +1399,58 @@ impl TurnScheduler {
         }
     }
 
-    fn observe_attempt_order(&self, attempt_order: i64) {
-        self.attempt_order
-            .fetch_max(attempt_order, Ordering::AcqRel);
+    fn cooldown_remaining(&self, model: &str) -> Option<Duration> {
+        self.provider(model)
+            .backoff
+            .lock()
+            .unwrap()
+            .until
+            .and_then(|until| until.checked_duration_since(tokio::time::Instant::now()))
+    }
+
+    fn reset_provider_outcomes(&self, provider_id: &str) {
+        self.providers.lock().unwrap().remove(provider_id);
+    }
+
+    async fn acquire_planned_setup(
+        &self,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit> {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => bail!("turn setup cancelled"),
+            permit = self.planned_setups.clone().acquire_owned() => {
+                permit.map_err(|_| anyhow!("turn setup scheduler closed"))
+            }
+        }
+    }
+
+    /// Wait for a vendor turn-startup slot on `backend_id`. Hold the permit
+    /// across the backend's `run_turn` and drop it as soon as the vendor has
+    /// accepted the turn.
+    async fn acquire_backend_startup(
+        &self,
+        backend_id: &str,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit> {
+        let lane = self
+            .backend_startups
+            .lock()
+            .unwrap()
+            .entry(backend_id.to_owned())
+            .or_insert_with(|| {
+                Arc::new(tokio::sync::Semaphore::new(
+                    BACKEND_TURN_STARTUP_CONCURRENCY,
+                ))
+            })
+            .clone();
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => bail!("turn cancelled"),
+            permit = lane.acquire_owned() => {
+                permit.map_err(|_| anyhow!("backend startup scheduler closed"))
+            }
+        }
     }
 
     fn provider(&self, model: &str) -> ProviderTurnCapacity {
@@ -1693,136 +1462,50 @@ impl TurnScheduler {
             .unwrap()
             .entry(provider.to_owned())
             .or_insert_with(|| ProviderTurnCapacity {
-                all: Arc::new(tokio::sync::Semaphore::new(self.provider_all_limit)),
-                background: Arc::new(tokio::sync::Semaphore::new(self.provider_background_limit)),
                 backoff: Arc::new(Mutex::new(ProviderBackoff::default())),
             })
             .clone()
     }
 
-    async fn acquire(
+    async fn admit(
         &self,
         model: &str,
-        background: bool,
         cancel: &tokio_util::sync::CancellationToken,
-    ) -> Result<TurnCapacityGuard> {
-        let started = Instant::now();
+    ) -> Result<TurnAdmission> {
+        let started = tokio::time::Instant::now();
         let provider = self.provider(model);
-        let cooldown = provider
-            .backoff
-            .lock()
-            .unwrap()
-            .until
-            .and_then(|until| until.checked_duration_since(Instant::now()));
-        if let Some(cooldown) = cooldown {
+        loop {
+            let now = tokio::time::Instant::now();
+            let cooldown = provider
+                .backoff
+                .lock()
+                .unwrap()
+                .until
+                .filter(|until| *until > now)
+                .map(|until| until - now);
+            let Some(cooldown) = cooldown else {
+                break;
+            };
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => bail!("turn cancelled"),
                 _ = tokio::time::sleep(cooldown) => {}
             }
         }
-        self.acquire_permits(provider, background, cancel, started)
-            .await
-    }
-
-    /// Acquire a route for automatic failover without waiting out a provider
-    /// cooldown. A route can enter backoff after candidate ranking, so this
-    /// last-moment check turns that race into immediate selection of another
-    /// provider rather than a hidden sleep.
-    async fn acquire_routed(
-        &self,
-        model: &str,
-        background: bool,
-        cancel: &tokio_util::sync::CancellationToken,
-    ) -> Result<Option<TurnCapacityGuard>> {
-        let started = Instant::now();
-        let provider = self.provider(model);
-        if provider
-            .backoff
-            .lock()
-            .unwrap()
-            .until
-            .is_some_and(|until| until > Instant::now())
-        {
-            return Ok(None);
+        if cancel.is_cancelled() {
+            bail!("turn cancelled");
         }
-        let capacity = self
-            .acquire_permits(provider.clone(), background, cancel, started)
-            .await?;
-        // The provider may have entered cooldown while this turn awaited its
-        // provider-specific permit. Recheck after every async admission wait
-        // and release all acquired permits before asking routing to continue.
-        if provider
-            .backoff
-            .lock()
-            .unwrap()
-            .until
-            .is_some_and(|until| until > Instant::now())
-        {
-            drop(capacity);
-            return Ok(None);
-        }
-        Ok(Some(capacity))
-    }
-
-    async fn acquire_permits(
-        &self,
-        provider: ProviderTurnCapacity,
-        background: bool,
-        cancel: &tokio_util::sync::CancellationToken,
-        started: Instant,
-    ) -> Result<TurnCapacityGuard> {
-        // Provider gates come first so a route waiting on saturated provider
-        // capacity never consumes a global slot needed by another provider.
-        let mut permits = Vec::with_capacity(if background { 4 } else { 2 });
-        if background {
-            permits.push(tokio::select! {
-                biased;
-                _ = cancel.cancelled() => bail!("turn cancelled"),
-                permit = provider.background.clone().acquire_owned() => {
-                    permit.map_err(|_| anyhow!("provider background scheduler closed"))?
-                }
-            });
-        }
-        permits.push(tokio::select! {
-            biased;
-            _ = cancel.cancelled() => bail!("turn cancelled"),
-            permit = provider.all.clone().acquire_owned() => {
-                permit.map_err(|_| anyhow!("provider turn scheduler closed"))?
-            }
-        });
-        if background {
-            permits.push(tokio::select! {
-                biased;
-                _ = cancel.cancelled() => bail!("turn cancelled"),
-                permit = self.background.clone().acquire_owned() => {
-                    permit.map_err(|_| anyhow!("background turn scheduler closed"))?
-                }
-            });
-        }
-        permits.push(tokio::select! {
-            biased;
-            _ = cancel.cancelled() => bail!("turn cancelled"),
-            permit = self.all.clone().acquire_owned() => {
-                permit.map_err(|_| anyhow!("turn scheduler closed"))?
-            }
-        });
-        Ok(TurnCapacityGuard {
-            _permits: permits,
-            wait_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+        Ok(TurnAdmission {
+            provider_wait_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
         })
     }
 
-    fn cooldown_remaining(&self, model: &str) -> Option<std::time::Duration> {
-        self.provider(model)
-            .backoff
-            .lock()
-            .unwrap()
-            .until
-            .and_then(|until| until.checked_duration_since(Instant::now()))
+    fn record_outcome(&self, model: &str, error: Option<&str>) {
+        let attempt_order = self.next_attempt_order();
+        self.record_ordered_outcome(model, error, attempt_order);
     }
 
-    fn record_outcome(&self, model: &str, error: Option<&str>, attempt_order: i64) {
+    fn record_ordered_outcome(&self, model: &str, error: Option<&str>, attempt_order: i64) {
         let provider = self.provider(model);
         let mut backoff = provider.backoff.lock().unwrap();
         if backoff
@@ -1851,19 +1534,25 @@ impl TurnScheduler {
             } else {
                 (backoff.delay * 2).min(std::time::Duration::from_secs(30))
             };
-            backoff.until = Some(Instant::now() + backoff.delay);
-        } else if error.is_none() && backoff.until.is_none_or(|until| Instant::now() >= until) {
+            backoff.until = Some(tokio::time::Instant::now() + backoff.delay);
+        } else if error.is_none()
+            && backoff
+                .until
+                .is_none_or(|until| tokio::time::Instant::now() >= until)
+        {
             backoff.delay /= 2;
             backoff.until = None;
         }
     }
+}
 
-    fn reset_provider_outcomes(&self, provider_id: &str) {
-        let provider = self.providers.lock().unwrap().get(provider_id).cloned();
-        if let Some(provider) = provider {
-            *provider.backoff.lock().unwrap() = ProviderBackoff::default();
-        }
-    }
+fn configured_removed_turn_concurrency_settings(
+    mut is_set: impl FnMut(&str) -> bool,
+) -> Vec<&'static str> {
+    REMOVED_TURN_CONCURRENCY_ENVS
+        .into_iter()
+        .filter(|name| is_set(name))
+        .collect()
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1962,8 +1651,16 @@ fn session_diff_executor_error(error: String) -> EngineError {
     }
 }
 
-const THINKING_OPTION_KEYS: [&str; 4] =
+const LEGACY_THINKING_OPTION_KEYS: [&str; 4] =
     ["thinking_level", "reasoning_effort", "effort", "reasoning"];
+const THINKING_BUDGET_OPTION_KEY: &str = "thinking_budget_tokens";
+const THINKING_OPTION_KEYS: [&str; 5] = [
+    LEGACY_THINKING_OPTION_KEYS[0],
+    LEGACY_THINKING_OPTION_KEYS[1],
+    LEGACY_THINKING_OPTION_KEYS[2],
+    LEGACY_THINKING_OPTION_KEYS[3],
+    THINKING_BUDGET_OPTION_KEY,
+];
 
 fn validate_thinking_level(level: Option<&str>) -> Result<(), EngineError> {
     if level.is_some_and(|value| value.trim().is_empty()) {
@@ -1992,13 +1689,14 @@ pub(crate) fn validate_model_selection(model: &str) -> Result<(), EngineError> {
             "model must not have surrounding whitespace".into(),
         ));
     }
-    let invalid_automatic = model
-        .strip_prefix("auto/")
-        .is_some_and(|name| neutral_model_id(name).is_none())
-        || (!model.contains('/') && neutral_model_id(model).is_none());
-    if invalid_automatic {
+    let valid = if model.starts_with("auto/") || !model.contains('/') {
+        routing::automatic_model_name(model).is_some()
+    } else {
+        routing::valid_concrete_selection(model).is_some() && !model.split('/').any(str::is_empty)
+    };
+    if !valid {
         return Err(EngineError::BadRequest(format!(
-            "automatic model selection must name a concrete shared model: {model}"
+            "model must be auto/<model> or provider/<model>: {model}"
         )));
     }
     Ok(())
@@ -2008,7 +1706,448 @@ fn has_thinking_option(options: &serde_json::Map<String, serde_json::Value>) -> 
     THINKING_OPTION_KEYS
         .iter()
         .any(|key| options.contains_key(*key))
-        || options.contains_key("thinking_budget_tokens")
+}
+
+fn validate_thinking_option_aliases(
+    options: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), EngineError> {
+    let aliases = THINKING_OPTION_KEYS
+        .iter()
+        .copied()
+        .filter(|key| options.contains_key(*key))
+        .collect::<Vec<_>>();
+    if aliases.len() > 1 {
+        return Err(EngineError::BadRequest(format!(
+            "model options contain conflicting thinking aliases: {}",
+            aliases.join(", ")
+        )));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum AdvertisedScalarType<'a> {
+    Unspecified,
+    Supported(&'a str),
+    Unsupported,
+}
+
+fn schema_scalar_type(property: &serde_json::Value) -> AdvertisedScalarType<'_> {
+    let supported = |kind| matches!(kind, "string" | "boolean" | "number" | "integer");
+    match property.get("type") {
+        None => AdvertisedScalarType::Unspecified,
+        Some(serde_json::Value::String(kind)) if supported(kind) => {
+            AdvertisedScalarType::Supported(kind)
+        }
+        Some(serde_json::Value::Array(kinds)) => {
+            let mut scalar = None;
+            for kind in kinds {
+                let Some(kind) = kind.as_str() else {
+                    return AdvertisedScalarType::Unsupported;
+                };
+                if kind == "null" {
+                    continue;
+                }
+                if scalar.is_some() || !supported(kind) {
+                    return AdvertisedScalarType::Unsupported;
+                }
+                scalar = Some(kind);
+            }
+            scalar.map_or(
+                AdvertisedScalarType::Unsupported,
+                AdvertisedScalarType::Supported,
+            )
+        }
+        _ => AdvertisedScalarType::Unsupported,
+    }
+}
+
+const UNSUPPORTED_MODEL_OPTION_SCHEMA_KEYWORDS: [&str; 13] = [
+    "multipleOf",
+    "exclusiveMinimum",
+    "exclusiveMaximum",
+    "minLength",
+    "maxLength",
+    "pattern",
+    "format",
+    "allOf",
+    "anyOf",
+    "not",
+    "if",
+    "then",
+    "else",
+];
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct ExactJsonNumber {
+    negative: bool,
+    digits: String,
+    exponent: i64,
+}
+
+impl ExactJsonNumber {
+    fn parse(number: &serde_json::Number) -> Option<Self> {
+        let text = number.to_string();
+        let (negative, unsigned) = text
+            .strip_prefix('-')
+            .map_or((false, text.as_str()), |value| (true, value));
+        let (coefficient, explicit_exponent) = unsigned
+            .find('e')
+            .or_else(|| unsigned.find('E'))
+            .map_or(Some((unsigned, 0_i64)), |index| {
+                Some((
+                    &unsigned[..index],
+                    unsigned[index + 1..].parse::<i64>().ok()?,
+                ))
+            })?;
+        let mut coefficient_parts = coefficient.split('.');
+        let whole = coefficient_parts.next()?;
+        let fraction = coefficient_parts.next().unwrap_or_default();
+        if whole.is_empty()
+            || coefficient_parts.next().is_some()
+            || !whole
+                .bytes()
+                .chain(fraction.bytes())
+                .all(|digit| digit.is_ascii_digit())
+        {
+            return None;
+        }
+        let mut digits = String::with_capacity(whole.len() + fraction.len());
+        digits.push_str(whole);
+        digits.push_str(fraction);
+        let Some(first_nonzero) = digits.find(|digit| digit != '0') else {
+            return Some(Self {
+                negative: false,
+                digits: "0".into(),
+                exponent: 0,
+            });
+        };
+        digits = digits[first_nonzero..].to_owned();
+        let mut exponent = explicit_exponent.checked_sub(i64::try_from(fraction.len()).ok()?)?;
+        while digits.ends_with('0') {
+            digits.pop();
+            exponent = exponent.checked_add(1)?;
+        }
+        Some(Self {
+            negative,
+            digits,
+            exponent,
+        })
+    }
+
+    fn is_integer(&self) -> bool {
+        self.digits == "0" || self.exponent >= 0
+    }
+
+    fn compare(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        let magnitude = self.compare_magnitude(other)?;
+        Some(match (self.negative, other.negative) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            (true, true) => magnitude.reverse(),
+            (false, false) => magnitude,
+        })
+    }
+
+    fn compare_magnitude(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        match (self.digits.as_str() == "0", other.digits.as_str() == "0") {
+            (true, true) => return Some(std::cmp::Ordering::Equal),
+            (true, false) => return Some(std::cmp::Ordering::Less),
+            (false, true) => return Some(std::cmp::Ordering::Greater),
+            (false, false) => {}
+        }
+        let own_order = i64::try_from(self.digits.len())
+            .ok()?
+            .checked_add(self.exponent)?;
+        let other_order = i64::try_from(other.digits.len())
+            .ok()?
+            .checked_add(other.exponent)?;
+        let order = own_order.cmp(&other_order);
+        if order != std::cmp::Ordering::Equal {
+            return Some(order);
+        }
+        let width = self.digits.len().max(other.digits.len());
+        for index in 0..width {
+            let own = self.digits.as_bytes().get(index).copied().unwrap_or(b'0');
+            let other = other.digits.as_bytes().get(index).copied().unwrap_or(b'0');
+            let order = own.cmp(&other);
+            if order != std::cmp::Ordering::Equal {
+                return Some(order);
+            }
+        }
+        Some(std::cmp::Ordering::Equal)
+    }
+}
+
+fn advertised_bound(
+    property: &serde_json::Value,
+    key: &str,
+) -> Result<Option<ExactJsonNumber>, ()> {
+    match property.get(key) {
+        None => Ok(None),
+        Some(serde_json::Value::Number(number)) => {
+            ExactJsonNumber::parse(number).ok_or(()).map(Some)
+        }
+        Some(_) => Err(()),
+    }
+}
+
+fn json_number_is_integer(number: &serde_json::Number) -> bool {
+    ExactJsonNumber::parse(number).is_some_and(|number| number.is_integer())
+}
+
+fn schema_scalar(value: &serde_json::Value) -> bool {
+    matches!(
+        value,
+        serde_json::Value::String(_) | serde_json::Value::Bool(_) | serde_json::Value::Number(_)
+    )
+}
+
+fn schema_scalar_id(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Number(number) => ExactJsonNumber::parse(number).map(|number| {
+            format!(
+                "number:{}{}e{}",
+                if number.negative { "-" } else { "" },
+                number.digits,
+                number.exponent
+            )
+        }),
+        _ => schema_scalar(value).then(|| format!("{}:{value}", value_type_name(value))),
+    }
+}
+
+fn schema_scalars_equal(left: &serde_json::Value, right: &serde_json::Value) -> bool {
+    match (left, right) {
+        (serde_json::Value::Number(left), serde_json::Value::Number(right)) => {
+            ExactJsonNumber::parse(left)
+                .zip(ExactJsonNumber::parse(right))
+                .is_some_and(|(left, right)| {
+                    left.compare(&right) == Some(std::cmp::Ordering::Equal)
+                })
+        }
+        _ => left == right,
+    }
+}
+
+fn value_type_name(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::Null => "null",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+fn valid_choice_values(property: &serde_json::Value) -> Option<Vec<&serde_json::Value>> {
+    if property.get("enum").is_some() && property.get("oneOf").is_some() {
+        return None;
+    }
+    if let Some(values) = property.get("enum").and_then(serde_json::Value::as_array) {
+        if values.len() <= 1
+            || !values.iter().all(schema_scalar)
+            || values
+                .iter()
+                .filter_map(schema_scalar_id)
+                .collect::<HashSet<_>>()
+                .len()
+                != values.len()
+        {
+            return None;
+        }
+        return Some(values.iter().collect());
+    }
+    let choices = property
+        .get("oneOf")
+        .and_then(serde_json::Value::as_array)?;
+    if choices.iter().any(|choice| {
+        UNSUPPORTED_MODEL_OPTION_SCHEMA_KEYWORDS
+            .iter()
+            .any(|keyword| choice.get(*keyword).is_some())
+            || choice.get("enum").is_some()
+            || choice.get("oneOf").is_some()
+            || choice.get("minimum").is_some()
+            || choice.get("maximum").is_some()
+            || match (schema_scalar_type(choice), choice.get("const")) {
+                (AdvertisedScalarType::Unspecified, _) => false,
+                (AdvertisedScalarType::Unsupported, _) => true,
+                (AdvertisedScalarType::Supported("string"), Some(value)) => !value.is_string(),
+                (AdvertisedScalarType::Supported("boolean"), Some(value)) => !value.is_boolean(),
+                (AdvertisedScalarType::Supported("number"), Some(value)) => {
+                    value.as_number().and_then(ExactJsonNumber::parse).is_none()
+                }
+                (AdvertisedScalarType::Supported("integer"), Some(value)) => {
+                    !value.as_number().is_some_and(json_number_is_integer)
+                }
+                (AdvertisedScalarType::Supported(_), None) => true,
+                (AdvertisedScalarType::Supported(_), Some(_)) => true,
+            }
+    }) {
+        return None;
+    }
+    let values: Vec<_> = choices
+        .iter()
+        .filter_map(|choice| choice.get("const"))
+        .collect();
+    if choices.len() <= 1
+        || values.len() != choices.len()
+        || !values.iter().all(|value| schema_scalar(value))
+        || values
+            .iter()
+            .filter_map(|value| schema_scalar_id(value))
+            .collect::<HashSet<_>>()
+            .len()
+            != values.len()
+    {
+        return None;
+    }
+    Some(values)
+}
+
+fn validate_model_options(
+    options: &serde_json::Map<String, serde_json::Value>,
+    model: &trouve_protocol::ModelInfo,
+) -> Result<(), EngineError> {
+    validate_thinking_option_aliases(options)?;
+    let properties = model
+        .options_schema
+        .get("properties")
+        .and_then(serde_json::Value::as_object);
+    for (key, value) in options {
+        let property = properties
+            .and_then(|properties| properties.get(key))
+            .ok_or_else(|| {
+                EngineError::BadRequest(format!(
+                    "model option {key} is not advertised by {}",
+                    model.id
+                ))
+            })?;
+        if property
+            .get("readOnly")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+            || property.get("const").is_some()
+        {
+            return Err(EngineError::BadRequest(format!(
+                "model option {key} cannot be overridden"
+            )));
+        }
+        if UNSUPPORTED_MODEL_OPTION_SCHEMA_KEYWORDS
+            .iter()
+            .any(|keyword| property.get(*keyword).is_some())
+        {
+            return Err(EngineError::BadRequest(format!(
+                "model option {key} uses unsupported advertised constraints"
+            )));
+        }
+        let scalar_type = schema_scalar_type(property);
+        let minimum = advertised_bound(property, "minimum").map_err(|()| {
+            EngineError::BadRequest(format!(
+                "model option {key} has a malformed advertised minimum"
+            ))
+        })?;
+        let maximum = advertised_bound(property, "maximum").map_err(|()| {
+            EngineError::BadRequest(format!(
+                "model option {key} has a malformed advertised maximum"
+            ))
+        })?;
+        if (minimum.is_some() || maximum.is_some())
+            && !matches!(
+                scalar_type,
+                AdvertisedScalarType::Supported("number" | "integer")
+            )
+        {
+            return Err(EngineError::BadRequest(format!(
+                "model option {key} advertises numeric bounds without a numeric scalar type"
+            )));
+        }
+        if minimum
+            .as_ref()
+            .zip(maximum.as_ref())
+            .is_some_and(|(minimum, maximum)| {
+                minimum.compare(maximum) == Some(std::cmp::Ordering::Greater)
+            })
+        {
+            return Err(EngineError::BadRequest(format!(
+                "model option {key} has an inverted advertised numeric range"
+            )));
+        }
+        if !matches!(
+            value,
+            serde_json::Value::String(_)
+                | serde_json::Value::Bool(_)
+                | serde_json::Value::Number(_)
+        ) {
+            return Err(EngineError::BadRequest(format!(
+                "model option {key} must be a scalar value"
+            )));
+        }
+
+        let advertises_choices = property.get("enum").is_some() || property.get("oneOf").is_some();
+        let choice_values = valid_choice_values(property);
+        if advertises_choices && choice_values.is_none() {
+            return Err(EngineError::BadRequest(format!(
+                "model option {key} has a malformed advertised choice schema"
+            )));
+        }
+        let matches_choice = choice_values.as_ref().is_some_and(|values| {
+            values
+                .iter()
+                .any(|candidate| schema_scalars_equal(candidate, value))
+        });
+        let typed = match scalar_type {
+            AdvertisedScalarType::Supported("string") => value.is_string(),
+            AdvertisedScalarType::Supported("boolean") => value.is_boolean(),
+            AdvertisedScalarType::Supported("number") => {
+                value.as_number().and_then(ExactJsonNumber::parse).is_some()
+            }
+            AdvertisedScalarType::Supported("integer") => {
+                value.as_number().is_some_and(json_number_is_integer)
+            }
+            _ => false,
+        };
+        let valid_type = match scalar_type {
+            AdvertisedScalarType::Supported(_) => typed,
+            AdvertisedScalarType::Unspecified => choice_values.is_some(),
+            AdvertisedScalarType::Unsupported => {
+                return Err(EngineError::BadRequest(format!(
+                    "model option {key} has an unsupported advertised scalar type"
+                )));
+            }
+        };
+        if !valid_type {
+            return Err(EngineError::BadRequest(format!(
+                "model option {key} has the wrong scalar type"
+            )));
+        }
+
+        if choice_values.is_some() && !matches_choice {
+            return Err(EngineError::BadRequest(format!(
+                "model option {key} is not one of its advertised values"
+            )));
+        }
+        if let Some(number) = value.as_number().and_then(ExactJsonNumber::parse) {
+            if minimum
+                .as_ref()
+                .is_some_and(|minimum| number.compare(minimum) == Some(std::cmp::Ordering::Less))
+            {
+                return Err(EngineError::BadRequest(format!(
+                    "model option {key} is below its advertised minimum"
+                )));
+            }
+            if maximum
+                .as_ref()
+                .is_some_and(|maximum| number.compare(maximum) == Some(std::cmp::Ordering::Greater))
+            {
+                return Err(EngineError::BadRequest(format!(
+                    "model option {key} is above its advertised maximum"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn inherit_thinking_option(
@@ -2030,7 +2169,7 @@ fn inherit_thinking_option(
 fn thinking_option_property(
     model: &trouve_protocol::ModelInfo,
 ) -> Option<(&'static str, &serde_json::Value, &[serde_json::Value])> {
-    THINKING_OPTION_KEYS.iter().find_map(|key| {
+    LEGACY_THINKING_OPTION_KEYS.iter().find_map(|key| {
         let property = model
             .options_schema
             .pointer(&format!("/properties/{key}"))?;
@@ -2055,7 +2194,7 @@ pub(crate) fn advertised_thinking_budget(
 ) -> Option<(u64, Option<u64>)> {
     let property = model
         .options_schema
-        .pointer("/properties/thinking_budget_tokens")?;
+        .pointer(&format!("/properties/{THINKING_BUDGET_OPTION_KEY}"))?;
     matches!(property["type"].as_str(), Some("integer" | "number")).then(|| {
         (
             property["minimum"].as_u64().unwrap_or(1),
@@ -2126,17 +2265,15 @@ fn normalize_thinking_option(
     let Some(canonical) = options.get("thinking_level").cloned() else {
         return;
     };
+    if options.contains_key(THINKING_BUDGET_OPTION_KEY) {
+        options.remove("thinking_level");
+        return;
+    }
     let property = model.and_then(thinking_option_property);
     let Some((key, property, values)) = property else {
         if let Some(model) = model
             && let Some((minimum, maximum)) = advertised_thinking_budget(model)
         {
-            // An explicit native budget wins over a legacy/inherited canonical
-            // value, just as native enum options do below.
-            if options.contains_key("thinking_budget_tokens") {
-                options.remove("thinking_level");
-                return;
-            }
             let selected = canonical
                 .as_str()
                 .and_then(parse_thinking_budget)
@@ -2144,13 +2281,13 @@ fn normalize_thinking_option(
                 .or_else(|| {
                     model
                         .options_schema
-                        .pointer("/properties/thinking_budget_tokens/default")
+                        .pointer(&format!("/properties/{THINKING_BUDGET_OPTION_KEY}/default"))
                         .and_then(serde_json::Value::as_u64)
                 });
             options.remove("thinking_level");
             if let Some(selected) = selected {
                 options.insert(
-                    "thinking_budget_tokens".into(),
+                    THINKING_BUDGET_OPTION_KEY.into(),
                     serde_json::Value::Number(selected.into()),
                 );
             }
@@ -2178,45 +2315,24 @@ fn normalize_thinking_option(
     }
 }
 
-fn portable_thinking_options(
-    options: &serde_json::Map<String, serde_json::Value>,
-) -> serde_json::Map<String, serde_json::Value> {
-    // Native keys are explicit thread choices and therefore win over the
-    // canonical inherited key when both exist.
-    let selected = THINKING_OPTION_KEYS[1..]
-        .iter()
-        .find_map(|key| options.get(*key).and_then(thinking_value))
-        .or_else(|| {
-            options
-                .get("thinking_budget_tokens")
-                .and_then(thinking_value)
-        })
-        .or_else(|| options.get("thinking_level").and_then(thinking_value));
-    selected
-        .map(|selected| {
-            serde_json::Map::from_iter([(
-                "thinking_level".into(),
-                serde_json::Value::String(selected),
-            )])
-        })
-        .unwrap_or_default()
-}
-
-fn model_options_for_schema(
-    options: &serde_json::Map<String, serde_json::Value>,
+fn validated_automation_options_for_model(
+    legacy_thinking_level: Option<&str>,
+    requested_options: &serde_json::Map<String, serde_json::Value>,
     model: &trouve_protocol::ModelInfo,
-) -> serde_json::Map<String, serde_json::Value> {
-    let thinking = portable_thinking_options(options);
-    let mut filtered = options.clone();
-    for key in THINKING_OPTION_KEYS {
-        filtered.remove(key);
+) -> Result<serde_json::Map<String, serde_json::Value>, EngineError> {
+    let mut options = requested_options.clone();
+    validate_thinking_option_aliases(&options)?;
+    if let Some(level) = legacy_thinking_level
+        && !has_thinking_option(&options)
+    {
+        options.insert(
+            "thinking_level".into(),
+            serde_json::Value::String(level.into()),
+        );
     }
-    filtered.remove("thinking_budget_tokens");
-    filtered.extend(thinking);
-    normalize_thinking_option(&mut filtered, Some(model));
-    let properties = model.options_schema["properties"].as_object();
-    filtered.retain(|key, _| properties.is_some_and(|properties| properties.contains_key(key)));
-    filtered
+    normalize_thinking_option(&mut options, Some(model));
+    validate_model_options(&options, model)?;
+    Ok(options)
 }
 
 fn thinking_value(value: &serde_json::Value) -> Option<String> {
@@ -2235,12 +2351,12 @@ fn resolved_thinking_level(
     options: &serde_json::Map<String, serde_json::Value>,
     model: Option<&trouve_protocol::ModelInfo>,
 ) -> Option<String> {
-    THINKING_OPTION_KEYS
+    LEGACY_THINKING_OPTION_KEYS
         .iter()
         .find_map(|key| options.get(*key).and_then(thinking_value))
         .or_else(|| {
             options
-                .get("thinking_budget_tokens")
+                .get(THINKING_BUDGET_OPTION_KEY)
                 .and_then(thinking_value)
         })
         .or_else(|| {
@@ -2254,7 +2370,7 @@ fn resolved_thinking_level(
                 .and_then(|model| {
                     model
                         .options_schema
-                        .pointer("/properties/thinking_budget_tokens/default")
+                        .pointer(&format!("/properties/{THINKING_BUDGET_OPTION_KEY}/default"))
                 })
                 .and_then(thinking_value)
         })
@@ -2262,7 +2378,6 @@ fn resolved_thinking_level(
 
 type GithubDashboardCacheHandle = Arc<tokio::sync::Mutex<crate::github::GitHubDashboardCache>>;
 type GithubDashboardRefresh = (String, String, GithubDashboardCacheHandle);
-type SubscriptionHealthCacheEntry = Arc<tokio::sync::Mutex<Option<(Instant, (u8, i64))>>>;
 
 const GITHUB_PR_DETAIL_CACHE_CAPACITY: usize = 48;
 
@@ -2403,18 +2518,50 @@ impl GithubPrDetailCache {
     }
 }
 
+const TURN_STEER_PENDING_CAPACITY: usize = 8;
+
+struct SteerResponse {
+    sender: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
+}
+
+impl SteerResponse {
+    fn send(mut self, result: Result<(), String>) {
+        if let Some(sender) = self.sender.take() {
+            let _ = sender.send(result);
+        }
+    }
+}
+
+impl Drop for SteerResponse {
+    fn drop(&mut self) {
+        if let Some(sender) = self.sender.take() {
+            let _ = sender.send(Err(
+                "turn ended before steering was acknowledged".to_string()
+            ));
+        }
+    }
+}
+
 struct SteerTurnCommand {
     content: String,
     attachments: Vec<trouve_protocol::Attachment>,
     attachment_rows: Vec<(trouve_protocol::Attachment, String)>,
     attachment_cleanup: PreparedAttachmentCleanup,
-    response: tokio::sync::oneshot::Sender<Result<(), String>>,
+    response: SteerResponse,
+    _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
 #[derive(Clone)]
 struct ActiveTurnSteerer {
     turn: u64,
     sender: tokio::sync::mpsc::Sender<SteerTurnCommand>,
+    permits: Arc<tokio::sync::Semaphore>,
+    mutation_lane_state: tokio::sync::watch::Sender<SteerMutationLaneState>,
+}
+
+struct PendingTurnSteerer {
+    turn: u64,
+    receiver: tokio::sync::mpsc::Receiver<SteerTurnCommand>,
     mutation_lane_state: tokio::sync::watch::Sender<SteerMutationLaneState>,
 }
 
@@ -2480,7 +2627,33 @@ fn reserve_ready_steer_after_event_budget<T>(
 
 fn reject_pending_steer(pending: &mut Option<SteerTurnCommand>, reason: &str) {
     if let Some(SteerTurnCommand { response, .. }) = pending.take() {
-        let _ = response.send(Err(reason.into()));
+        response.send(Err(reason.into()));
+    }
+}
+
+fn reject_steer_commands(
+    receiver: &mut Option<tokio::sync::mpsc::Receiver<SteerTurnCommand>>,
+    pending: &mut Option<SteerTurnCommand>,
+    deferred: &mut Vec<SteerTurnCommand>,
+    reason: &str,
+) {
+    reject_pending_steer(pending, reason);
+    for SteerTurnCommand { response, .. } in deferred.drain(..) {
+        response.send(Err(reason.into()));
+    }
+    if let Some(receiver) = receiver {
+        while let Ok(SteerTurnCommand { response, .. }) = receiver.try_recv() {
+            response.send(Err(reason.into()));
+        }
+    }
+}
+
+/// Stop every current or previously cloned sender before the terminal drain.
+/// Closing the receiver is what makes a send that raced registry removal fail
+/// promptly instead of enqueueing work that no loop will poll.
+fn close_steer_receiver<T>(receiver: &mut Option<tokio::sync::mpsc::Receiver<T>>) {
+    if let Some(receiver) = receiver {
+        receiver.close();
     }
 }
 
@@ -2532,6 +2705,83 @@ struct GlobalDefaults {
     model: String,
     thinking_level: Option<String>,
     permission_mode: trouve_protocol::PermissionMode,
+}
+struct WorkspaceListCacheEntry {
+    item: WorkspaceListItem,
+    refreshed_at: Instant,
+}
+
+#[derive(Clone)]
+struct ReviewWorkspaceRegistrationCommit {
+    job_id: Option<String>,
+    workspace_id: String,
+    canonical_path: PathBuf,
+    lifecycle: Arc<Mutex<ReviewWorkspaceRegistrationLifecycle>>,
+    lease_id: Option<u64>,
+    cleanup_generation: Option<u64>,
+    provisional_session_id: Option<String>,
+}
+
+#[derive(Default)]
+struct ReviewWorkspaceRegistrationLifecycle {
+    next_lease_id: u64,
+    provisional_workspace_id: Option<String>,
+    provisional_generation: Option<u64>,
+    outstanding_leases: HashSet<u64>,
+}
+
+impl ReviewWorkspaceRegistrationLifecycle {
+    fn register(
+        &mut self,
+        workspace_id: &str,
+        mutated: bool,
+        cleanup_generation: Option<u64>,
+    ) -> Option<u64> {
+        if mutated {
+            self.stabilize();
+            self.provisional_workspace_id = Some(workspace_id.to_string());
+            self.provisional_generation = cleanup_generation;
+        } else if self.provisional_workspace_id.is_none() && cleanup_generation.is_some() {
+            // A fresh engine can recover provisional ownership from the
+            // durable intent even though its process-local lifecycle starts
+            // empty. Cache that generation locally; the store remains the
+            // authority for whether it may be adopted.
+            self.provisional_workspace_id = Some(workspace_id.to_string());
+            self.provisional_generation = cleanup_generation;
+        }
+        if self.provisional_workspace_id.as_deref() != Some(workspace_id)
+            || self.provisional_generation != cleanup_generation
+        {
+            return None;
+        }
+        self.next_lease_id = self
+            .next_lease_id
+            .checked_add(1)
+            .expect("review workspace registration lease overflow");
+        self.outstanding_leases.insert(self.next_lease_id);
+        Some(self.next_lease_id)
+    }
+
+    fn stabilize(&mut self) {
+        self.provisional_workspace_id = None;
+        self.provisional_generation = None;
+        self.outstanding_leases.clear();
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct ReviewWorkspaceRegistrationFence {
+    job_id: Option<String>,
+    committed: Mutex<Option<ReviewWorkspaceRegistrationCommit>>,
+}
+
+impl ReviewWorkspaceRegistrationFence {
+    pub(crate) fn for_job(job_id: String) -> Self {
+        Self {
+            job_id: Some(job_id),
+            committed: Mutex::new(None),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -2625,28 +2875,675 @@ impl Drop for AutomatedReviewToolBudgetGuard {
     }
 }
 
+#[derive(Clone)]
+struct AutomationModelOptionsValidation {
+    model: trouve_protocol::ModelInfo,
+    source_options: serde_json::Map<String, serde_json::Value>,
+    validated_options: serde_json::Map<String, serde_json::Value>,
+    generation: u64,
+    mutation_state: Arc<AutomationMutationState>,
+}
+
+#[derive(Debug)]
+struct AutomationMutationVersion {
+    generation: u64,
+    definition: Option<trouve_protocol::Automation>,
+}
+
+#[derive(Debug)]
+struct AutomationMutationState {
+    version: tokio::sync::Mutex<AutomationMutationVersion>,
+}
+
+#[derive(Clone, Debug)]
+struct AutomationSnapshot {
+    automation: trouve_protocol::Automation,
+    generation: u64,
+    mutation_state: Arc<AutomationMutationState>,
+}
+
+#[derive(Debug)]
+struct AutomationDispatchPlan {
+    snapshot: AutomationSnapshot,
+    validated_model: Option<String>,
+    model_options: serde_json::Map<String, serde_json::Value>,
+}
+
+enum AutomationModelOptionsCacheUpdate {
+    Preserve,
+    Replace(Option<trouve_protocol::ModelInfo>),
+}
+
+fn automation_definition_matches(
+    left: &trouve_protocol::Automation,
+    right: &trouve_protocol::Automation,
+) -> bool {
+    left.id == right.id
+        && left.name == right.name
+        && left.prompt == right.prompt
+        && left.workspace_id == right.workspace_id
+        && left.mode == right.mode
+        && left.model == right.model
+        && left.thinking_level == right.thinking_level
+        && left.model_options == right.model_options
+        && left.permission_mode == right.permission_mode
+        && left.schedule == right.schedule
+        && left.enabled == right.enabled
+}
+
+struct ProviderReloadGuard {
+    _shared: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
+    _exclusive: Option<tokio::sync::OwnedRwLockWriteGuard<()>>,
+}
+
+impl ProviderReloadGuard {
+    fn shared(guard: tokio::sync::OwnedRwLockReadGuard<()>) -> Self {
+        Self {
+            _shared: Some(guard),
+            _exclusive: None,
+        }
+    }
+
+    fn exclusive(guard: tokio::sync::OwnedRwLockWriteGuard<()>) -> Self {
+        Self {
+            _shared: None,
+            _exclusive: Some(guard),
+        }
+    }
+}
+
+/// Owns the registry guards for one backend transition while the previous
+/// active instances are retired. Ordinary provider updates share the global
+/// reload barrier and serialize only the affected ids; runtime-wide changes
+/// retain exclusive admission. Once an active entry is detached, dropping an
+/// unpublished transition is the cancellation and error rollback path: it
+/// rebuilds the affected ids from durable configuration before releasing its
+/// guards. A transition that only retries an older retained owner leaves the
+/// still-active entry untouched on failure.
+struct BackendRetirement {
+    engine: Weak<Engine>,
+    target_ids: HashSet<String>,
+    rollback_on_drop: bool,
+    secret_transaction: Option<ProviderSecretTransaction>,
+    reload: Option<ProviderReloadGuard>,
+    _target_transitions: Vec<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl BackendRetirement {
+    fn new(
+        engine: &Arc<Engine>,
+        target_ids: HashSet<String>,
+        reload: ProviderReloadGuard,
+        target_transitions: Vec<tokio::sync::OwnedMutexGuard<()>>,
+        secret_transaction: Option<ProviderSecretTransaction>,
+    ) -> Self {
+        Self {
+            engine: Arc::downgrade(engine),
+            target_ids,
+            rollback_on_drop: false,
+            secret_transaction,
+            reload: Some(reload),
+            _target_transitions: target_transitions,
+        }
+    }
+
+    /// Publish replacements from the caller's now-current configuration and
+    /// release the serialized transition. Registry construction reads
+    /// keychains and resolves filesystem-backed runtimes, so the complete
+    /// transition moves to the blocking pool. Dropping the awaiting request
+    /// cannot release its guards early because the blocking task owns `self`.
+    async fn publish(self) -> Result<()> {
+        tokio::task::spawn_blocking(move || {
+            let mut retirement = self;
+            if let Some(transaction) = retirement.secret_transaction.take() {
+                transaction.commit();
+            }
+            retirement.rollback_on_drop = false;
+            if let Some(engine) = retirement.engine.upgrade() {
+                engine.replace_provider_registries_for_ids(&retirement.target_ids);
+            }
+        })
+        .await
+        .map_err(|error| anyhow!("provider registry publication task failed: {error}"))
+    }
+
+    /// Durable provider deletion no longer needs the runtime-wide barrier.
+    /// Provider-scoped transition ownership remains held until secret cleanup
+    /// and registry publication finish, preserving same-id serialization.
+    fn release_reload_barrier(&mut self) {
+        drop(self.reload.take());
+    }
+
+    fn arm_rollback(&mut self) {
+        self.rollback_on_drop = true;
+    }
+
+    /// Restore tentative credentials before an old durable definition can be
+    /// republished. Secret-store implementations may block on a keychain or
+    /// filesystem, so the detached retirement task performs that I/O on the
+    /// blocking pool while this owner retains the provider transition fence.
+    async fn rollback(mut self) -> Result<()> {
+        let rebuild = self.rollback_on_drop;
+        if let Some(mut transaction) = self.secret_transaction.take() {
+            let rollback = tokio::task::spawn_blocking(move || {
+                let result = transaction.try_rollback();
+                (transaction, result)
+            })
+            .await;
+            match rollback {
+                Ok((transaction, Ok(()))) => drop(transaction),
+                Ok((transaction, Err(error))) => {
+                    self.secret_transaction = Some(transaction);
+                    let retry_scheduled = self.schedule_secret_rollback_retry(rebuild);
+                    return if retry_scheduled {
+                        Err(error).context("provider secret rollback retry scheduled")
+                    } else {
+                        Err(error)
+                    };
+                }
+                Err(error) => {
+                    return Err(anyhow!("provider secret rollback task failed: {error}"));
+                }
+            }
+        }
+        self.rollback_on_drop = false;
+        if rebuild && let Some(engine) = self.engine.upgrade() {
+            engine.replace_provider_registries_for_ids(&self.target_ids);
+        }
+        Ok(())
+    }
+
+    /// Move a failed rollback and the locks that fence its provider ids into
+    /// a request-independent supervisor. The old backend is not republished
+    /// until the tentative credentials have been restored successfully.
+    fn schedule_secret_rollback_retry(&mut self, rebuild: bool) -> bool {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return false;
+        };
+        let Some(transaction) = self.secret_transaction.take() else {
+            return false;
+        };
+        // The provider-scoped transition guards are sufficient to keep the
+        // tentative credentials unpublished. Release the global reload
+        // barrier before a potentially unbounded secret-store recovery so
+        // unrelated refreshes and runtime operations can still make progress.
+        drop(self.reload.take());
+        let reconciliation = ProviderSecretRollbackReconciliation {
+            engine: self.engine.clone(),
+            target_ids: self.target_ids.clone(),
+            rebuild,
+            transaction,
+            _target_transitions: std::mem::take(&mut self._target_transitions),
+        };
+        self.rollback_on_drop = false;
+        runtime.spawn(reconciliation.run());
+        true
+    }
+}
+
+impl Drop for BackendRetirement {
+    fn drop(&mut self) {
+        let rebuild = self.rollback_on_drop;
+        if self.secret_transaction.is_some() {
+            if !self.schedule_secret_rollback_retry(rebuild) {
+                // BackendRetirement is created and dropped from async engine
+                // paths, so this can only occur after the runtime is already
+                // unavailable. The transaction field retains its final
+                // best-effort synchronous Drop fallback for that shutdown
+                // edge; ordinary Tokio workers never perform the I/O here.
+                tracing::error!(
+                    "provider secret rollback could not be transferred because no retry runtime is available"
+                );
+            }
+            return;
+        }
+        self.rollback_on_drop = false;
+        if rebuild && let Some(engine) = self.engine.upgrade() {
+            engine.replace_provider_registries_for_ids(&self.target_ids);
+        }
+    }
+}
+
+struct ProviderSecretRollbackReconciliation {
+    engine: Weak<Engine>,
+    target_ids: HashSet<String>,
+    rebuild: bool,
+    transaction: ProviderSecretTransaction,
+    _target_transitions: Vec<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl ProviderSecretRollbackReconciliation {
+    async fn run(self) {
+        let Self {
+            engine,
+            target_ids,
+            rebuild,
+            mut transaction,
+            _target_transitions,
+        } = self;
+        let mut retry_delay = None;
+        loop {
+            if let Some(delay) = retry_delay {
+                tokio::time::sleep(delay).await;
+            }
+            let rollback = tokio::task::spawn_blocking(move || {
+                let result = transaction.try_rollback();
+                (transaction, result)
+            })
+            .await;
+            let (returned, result) = match rollback {
+                Ok(result) => result,
+                Err(error) => {
+                    // A panicking blocking task unwinds and drops its
+                    // transaction, whose Drop path makes one final rollback
+                    // attempt before this fence is released.
+                    tracing::error!(
+                        %error,
+                        "provider secret rollback task failed"
+                    );
+                    return;
+                }
+            };
+            transaction = returned;
+            match result {
+                Ok(()) => {
+                    if rebuild && let Some(engine) = engine.upgrade() {
+                        engine.replace_provider_registries_for_ids(&target_ids);
+                    }
+                    return;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "retrying provider secret rollback after bounded backoff"
+                    );
+                    retry_delay = Some(
+                        retry_delay
+                            .map_or(BACKEND_RETIREMENT_RETRY_INITIAL, |delay| delay * 2)
+                            .min(BACKEND_RETIREMENT_RETRY_MAX),
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Finish a committed provider deletion independently of its HTTP request.
+/// The provider id remains fenced until blocking secret-store cleanup and
+/// registry publication have both completed, so cancellation cannot let a
+/// later upsert race with deletion of its new credentials.
+async fn supervise_provider_secret_deletion(
+    task: tokio::task::JoinHandle<()>,
+    retirement: BackendRetirement,
+    _provider_guard: tokio::sync::OwnedMutexGuard<()>,
+    completion: tokio::sync::oneshot::Sender<Result<()>>,
+) {
+    let deletion = task
+        .await
+        .map_err(|error| anyhow!("provider secret deletion task failed: {error}"));
+    let publication = retirement.publish().await;
+    let result = match (deletion, publication) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(deletion), Err(publication)) => Err(anyhow!(
+            "{deletion}; provider registry publication also failed: {publication}"
+        )),
+    };
+    let _ = completion.send(result);
+}
+
+struct ProviderSecretTransaction {
+    store: Arc<dyn trouve_providers::secrets::SecretStore>,
+    previous: Vec<(String, Option<String>)>,
+    committed: bool,
+}
+
+struct ProviderSecretWriteFailure {
+    error: anyhow::Error,
+    transaction: Option<ProviderSecretTransaction>,
+}
+
+type ProviderSecretWriteResult =
+    std::result::Result<ProviderSecretTransaction, ProviderSecretWriteFailure>;
+type ProviderSecretWriteTaskResult =
+    std::result::Result<ProviderSecretWriteResult, tokio::task::JoinError>;
+type ProviderSecretWriteCompletion = (
+    ProviderSecretWriteTaskResult,
+    tokio::sync::OwnedRwLockReadGuard<()>,
+    Vec<tokio::sync::OwnedMutexGuard<()>>,
+);
+
+impl ProviderSecretTransaction {
+    fn commit(mut self) {
+        self.committed = true;
+    }
+
+    fn try_rollback(&mut self) -> Result<()> {
+        restore_provider_secrets(self.store.as_ref(), &self.previous)?;
+        self.committed = true;
+        Ok(())
+    }
+}
+
+impl Drop for ProviderSecretTransaction {
+    fn drop(&mut self) {
+        if !self.committed
+            && let Err(error) = self.try_rollback()
+        {
+            tracing::error!(%error, "provider secret transaction rollback failed");
+        }
+    }
+}
+
+fn restore_provider_secrets(
+    store: &dyn trouve_providers::secrets::SecretStore,
+    previous: &[(String, Option<String>)],
+) -> Result<()> {
+    let rollback_errors = previous
+        .iter()
+        .rev()
+        .filter_map(|(key, value)| {
+            let result = match value {
+                Some(value) => store.set(key, value),
+                None => store.delete(key),
+            };
+            result.err().map(|error| format!("{key}: {error}"))
+        })
+        .collect::<Vec<_>>();
+    if rollback_errors.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow!(rollback_errors.join("; ")))
+    }
+}
+
+fn write_secrets_transactionally(
+    store: Arc<dyn trouve_providers::secrets::SecretStore>,
+    writes: Vec<(String, String)>,
+) -> ProviderSecretWriteResult {
+    let previous = writes
+        .iter()
+        .map(|(key, _)| store.get(key).map(|value| (key.clone(), value)))
+        .collect::<Result<Vec<_>>>()
+        .map_err(|error| ProviderSecretWriteFailure {
+            error,
+            transaction: None,
+        })?;
+    let mut transaction = ProviderSecretTransaction {
+        store,
+        previous,
+        committed: false,
+    };
+
+    for (key, value) in &writes {
+        if let Err(write_error) = transaction.store.set(key, value) {
+            if let Err(rollback_error) = transaction.try_rollback() {
+                return Err(ProviderSecretWriteFailure {
+                    error: anyhow!(
+                        "writing provider secret {key}: {write_error}; secret rollback failed: {rollback_error}"
+                    ),
+                    transaction: Some(transaction),
+                });
+            } else {
+                return Err(ProviderSecretWriteFailure {
+                    error: write_error.context(format!("writing provider secret {key}")),
+                    transaction: None,
+                });
+            }
+        }
+    }
+    Ok(transaction)
+}
+
+/// Keep the provider transition fenced while blocking secret I/O is in
+/// flight, even if the request future is cancelled. A completed transaction
+/// is returned to the live request; an abandoned one is rolled back here
+/// before another update for the same provider can begin.
+async fn supervise_provider_secret_write(
+    engine: Weak<Engine>,
+    target_ids: HashSet<String>,
+    task: tokio::task::JoinHandle<ProviderSecretWriteResult>,
+    reload: tokio::sync::OwnedRwLockReadGuard<()>,
+    target_transitions: Vec<tokio::sync::OwnedMutexGuard<()>>,
+    completion: tokio::sync::oneshot::Sender<ProviderSecretWriteCompletion>,
+) {
+    let result = task.await;
+    let Err((result, reload, target_transitions)) =
+        completion.send((result, reload, target_transitions))
+    else {
+        return;
+    };
+    // The provider-scoped transition remains sufficient to fence this id.
+    // Release the shared global barrier before potentially blocking rollback
+    // so unrelated provider and runtime operations can continue.
+    drop(reload);
+
+    let retry_transaction = match result {
+        Ok(Ok(mut transaction)) => {
+            let rollback = tokio::task::spawn_blocking(move || {
+                let result = transaction.try_rollback();
+                (transaction, result)
+            })
+            .await;
+            match rollback {
+                Ok((transaction, Ok(()))) => {
+                    drop(transaction);
+                    None
+                }
+                Ok((transaction, Err(error))) => {
+                    tracing::warn!(
+                        %error,
+                        "cancelled provider update secret rollback failed; retrying"
+                    );
+                    Some(transaction)
+                }
+                Err(error) => {
+                    tracing::error!(
+                        %error,
+                        "cancelled provider update secret rollback task failed"
+                    );
+                    None
+                }
+            }
+        }
+        Ok(Err(ProviderSecretWriteFailure { error, transaction })) => {
+            if transaction.is_some() {
+                tracing::warn!(
+                    %error,
+                    "cancelled provider update left a failed secret rollback; retrying"
+                );
+            }
+            transaction
+        }
+        Err(error) => {
+            tracing::error!(
+                %error,
+                "cancelled provider update secret transaction task failed"
+            );
+            None
+        }
+    };
+
+    if let Some(transaction) = retry_transaction {
+        // Provider-scoped transition guards remain held by reconciliation.
+        ProviderSecretRollbackReconciliation {
+            engine,
+            target_ids,
+            rebuild: false,
+            transaction,
+            _target_transitions: target_transitions,
+        }
+        .run()
+        .await;
+    }
+}
+
+type RetiringBackendBatch = Vec<(String, Arc<dyn AgentBackend>)>;
+
+/// Complete one detached cleanup batch and drop every backend owner before
+/// handing the transition back to a caller that may immediately remove the
+/// managed runtime those backends leased.
+async fn shutdown_retiring_backend_batch(
+    engine: &Engine,
+    retiring: RetiringBackendBatch,
+    deadline: tokio::time::Instant,
+) -> Vec<String> {
+    let mut failures = Vec::new();
+    // Poll every backend immediately under the same aggregate deadline. A
+    // stalled first entry must not prevent later independent owners from
+    // receiving their shutdown request and releasing their runtime leases.
+    let mut shutdowns = retiring
+        .into_iter()
+        .map(|(id, backend)| async move {
+            let result = tokio::time::timeout_at(deadline, backend.shutdown()).await;
+            (id, backend, result)
+        })
+        .collect::<futures::stream::FuturesUnordered<_>>();
+    while let Some((id, backend, result)) = shutdowns.next().await {
+        match result {
+            Ok(Ok(())) => {
+                engine.release_retiring_backend(&id, &backend);
+            }
+            Ok(Err(error)) => {
+                failures.push(format!("{id}: {error}"));
+            }
+            Err(_) => {
+                failures.push(format!(
+                    "{id}: backend shutdown exceeded the aggregate retirement deadline"
+                ));
+            }
+        }
+        // Drop the wrapper's runtime lease before the caller can proceed to
+        // uninstall. Timer registration and task-output cleanup are not relied
+        // upon for this ownership boundary.
+        drop(backend);
+    }
+    failures
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct TitleJobKey {
+    session_id: String,
+    model: String,
+    input_hash: u64,
+}
+
+type SharedTitleJobResult = Result<trouve_protocol::GeneratedTitle, String>;
+
+#[derive(Default)]
+struct TitleJobState {
+    waiters: Vec<tokio::sync::oneshot::Sender<SharedTitleJobResult>>,
+}
+
+struct TitleJobLeader<'a> {
+    jobs: &'a Mutex<HashMap<TitleJobKey, TitleJobState>>,
+    key: Option<TitleJobKey>,
+}
+
+fn title_job_key(
+    session_id: &str,
+    model: &str,
+    prompt: &str,
+    attachments: &[trouve_protocol::AttachmentUpload],
+) -> TitleJobKey {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    prompt.hash(&mut hasher);
+    for attachment in attachments {
+        attachment.name.hash(&mut hasher);
+        attachment.mime.hash(&mut hasher);
+        attachment.data.hash(&mut hasher);
+    }
+    TitleJobKey {
+        session_id: session_id.into(),
+        model: model.into(),
+        input_hash: hasher.finish(),
+    }
+}
+
+impl TitleJobLeader<'_> {
+    fn complete(mut self, result: SharedTitleJobResult) {
+        let Some(key) = self.key.take() else {
+            return;
+        };
+        let waiters = self
+            .jobs
+            .lock()
+            .unwrap()
+            .remove(&key)
+            .map(|job| job.waiters)
+            .unwrap_or_default();
+        for waiter in waiters {
+            let _ = waiter.send(result.clone());
+        }
+    }
+}
+
+impl Drop for TitleJobLeader<'_> {
+    fn drop(&mut self) {
+        let Some(key) = self.key.take() else {
+            return;
+        };
+        let waiters = self
+            .jobs
+            .lock()
+            .unwrap()
+            .remove(&key)
+            .map(|job| job.waiters)
+            .unwrap_or_default();
+        for waiter in waiters {
+            let _ = waiter.send(Err("title generation was cancelled".into()));
+        }
+    }
+}
+
 pub struct Engine {
     pub(crate) store: Store,
     pub(crate) data_dir: PathBuf,
     pub(crate) config_dir: Option<PathBuf>,
+    /// Cache repository identity so frequent workspace-list polls normally
+    /// avoid Git while still observing external remote changes within a bound.
+    workspace_list_cache: Mutex<HashMap<String, WorkspaceListCacheEntry>>,
+    /// Deduplicate expired repository-identity probes per workspace. Entries
+    /// are weak so closed or inactive workspaces do not grow this registry.
+    workspace_list_refresh_locks: Mutex<HashMap<String, Weak<Mutex<()>>>>,
+    /// Provisional review leases for each canonical workspace path. A
+    /// successful review or foreground registration stabilizes the workspace;
+    /// cancellation compensates only after the final provisional lease ends.
+    workspace_registration_lifecycles:
+        Mutex<HashMap<String, Weak<Mutex<ReviewWorkspaceRegistrationLifecycle>>>>,
     /// Canonical provider/model rosters, metadata, and option-schema catalog
     /// shared by API providers and CLI backends. Explicit integrations may
     /// still contribute newly released or account-specific live models.
     model_catalog: Arc<trouve_providers::models_dev::ModelsDevCatalog>,
     providers: RwLock<HashMap<String, Arc<dyn Provider>>>,
+    /// Identical cosmetic title requests share one provider inference. The
+    /// entry exists only while the leader request is alive and is removed on
+    /// success, failure, or cancellation.
+    title_jobs: Mutex<HashMap<TitleJobKey, TitleJobState>>,
     /// Providers registered programmatically (`with_provider`); preserved
     /// across config-driven registry reloads.
     injected_providers: Mutex<HashMap<String, Arc<dyn Provider>>>,
-    /// External agent backends (Codex app-server, cursor-agent, Claude Code
-    /// CLI), keyed by provider id like `providers`.
-    backends: RwLock<HashMap<String, Arc<dyn AgentBackend>>>,
+    /// External agent backends (Codex app-server, Cursor Agent SDK Bridge,
+    /// Claude Code CLI), keyed by provider id like `providers`.
+    backends: Arc<RwLock<HashMap<String, Arc<dyn AgentBackend>>>>,
+    /// Config-owned backends removed from admission while their asynchronous
+    /// shutdown is running, or retained after a failed shutdown for a later
+    /// retry. Keeping cleanup ownership separate prevents a closed instance
+    /// from remaining selectable without orphaning its vendor processes.
+    retiring_backends: Mutex<HashMap<String, Vec<Arc<dyn AgentBackend>>>>,
+    /// One supervised, bounded-backoff retry worker owns failed backend
+    /// shutdowns independently of later settings or runtime operations.
+    retiring_backend_retry_started: AtomicBool,
     /// Backends registered programmatically (`with_backend`); preserved
     /// across config-driven registry reloads.
     injected_backends: Mutex<HashMap<String, Arc<dyn AgentBackend>>>,
-    /// Short-lived, per-provider live allowance ranks. Each entry has its own
-    /// async lock so concurrent turns share one refresh without serializing
-    /// probes for different providers.
-    subscription_health_cache: Mutex<HashMap<String, SubscriptionHealthCacheEntry>>,
+    /// Background-turn signal receivers awaiting a forwarder task. Provider
+    /// reloads rebuild the backend registry, so receivers are handed off
+    /// through this level-triggered intake instead of being wired once at
+    /// startup; the pump spawned by `start_background_turn_listener` drains
+    /// it whenever `background_turn_intake_notify` fires.
+    background_turn_intake: Mutex<Vec<(String, tokio::sync::mpsc::Receiver<String>)>>,
+    background_turn_intake_notify: Arc<tokio::sync::Notify>,
     pub(crate) executor: Arc<dyn ToolExecutor>,
     approvals: Arc<ApprovalHub>,
     questions: Arc<QuestionHub>,
@@ -2663,14 +3560,22 @@ pub struct Engine {
     /// Serializes retries for one client-generated session-create key before
     /// any worktree mutation or event-writer batch is started.
     session_create_locks: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
+    /// Versioned compare-and-commit state for automation definitions. Provider
+    /// I/O stays outside the short per-automation gate, and cache hits compare
+    /// generations without rereading the durable row. Cached validations and
+    /// in-flight work retain the state through weak-map cleanup.
+    automation_mutation_states: Mutex<HashMap<String, Weak<AutomationMutationState>>>,
+    /// Successful model-option validation for persisted automations. The map
+    /// is bounded by automation ids and entries are retired with deletions.
+    /// Fires reuse the exact validated schema unless the effective model or
+    /// the synchronously observable canonical schema changes.
+    automation_model_options_validations: Mutex<HashMap<String, AutomationModelOptionsValidation>>,
     /// Narrower execution lanes for tools operating on a session worktree.
     /// Read-only tools may overlap; every potential mutation is exclusive.
     /// Weak entries keep completed/deleted sessions from growing this map.
     tool_execution_locks: Mutex<HashMap<String, Weak<tokio::sync::RwLock<()>>>>,
-    /// Mutation admission is separate from execution serialization. A normal
-    /// mutation takes the execution lane first and then a shared admission
-    /// permit. Backend cleanup can queue an exclusive permit before
-    /// cancellation, fencing even mutations already waiting for execution.
+    /// A separate fair gate lets failed vendor turns fence new mutations
+    /// before cancellation cleanup begins.
     tool_mutation_admission_locks: Mutex<HashMap<String, Weak<tokio::sync::RwLock<()>>>>,
     /// Serializes durable PR-intent reconciliation per session. Weak entries
     /// avoid retaining deleted sessions while still preventing duplicate
@@ -2707,6 +3612,10 @@ pub struct Engine {
     /// additional user input during an active turn. The turn number protects
     /// cleanup from removing a newer registration for the same thread.
     turn_steerers: Mutex<HashMap<String, ActiveTurnSteerer>>,
+    /// Provider/backend receivers installed before their steerable
+    /// `turn.started` event becomes visible. `run_turn` claims the receiver;
+    /// the public sender is already ready when clients observe the event.
+    pending_turn_steerers: Mutex<HashMap<String, PendingTurnSteerer>>,
     /// Threads where a new prompt arrived after cancellation was requested.
     /// The cancelling dispatcher consumes this marker and resumes the queue
     /// instead of leaving that explicitly submitted follow-up paused.
@@ -2719,16 +3628,29 @@ pub struct Engine {
     /// add sections to an entry on demand instead of repeating GitHub's rich
     /// nested detail query on every render or pane switch.
     github_pr_detail_cache: Mutex<GithubPrDetailCache>,
+    /// Per-provider subscription-usage readings with freshness and failure
+    /// backoff, so many clients polling do not each spawn a vendor probe
+    /// (and trip Anthropic's usage-endpoint rate limit).
+    subscription_health_cache: Mutex<crate::subscription_health::SubscriptionHealthCache>,
+    /// Serializes usage probes so concurrent requests that all miss the
+    /// cache at once result in one vendor query, not one per client.
+    subscription_health_probe: tokio::sync::Mutex<()>,
     /// Orders authenticated-host capture, cache registration, and snapshot
     /// publication against host removal without holding the cache map lock
     /// across event-log writes.
     github_dashboard_publication: Mutex<()>,
     /// Serializes provider upserts and deletions across config, secret-store,
     /// and registry mutations without blocking unrelated provider ids.
-    provider_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
-    /// Monotonic provider-configuration epochs. Route outcomes are committed
-    /// while holding this lock so an attempt admitted under old credentials
-    /// cannot recreate health or affinity cleared by a later update/delete.
+    provider_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Serializes backend teardown for the same provider id while allowing
+    /// independent providers to retire concurrently.
+    provider_transition_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Coordinates targeted backend transitions with whole-registry refreshes
+    /// and managed-runtime removal. Targeted transitions take shared admission;
+    /// runtime-wide operations take exclusive admission.
+    provider_reload: Arc<tokio::sync::RwLock<()>>,
+    /// Process-local incarnation of each configured execution route. Outcomes
+    /// from a replaced provider are discarded after its generation advances.
     provider_generations: Mutex<HashMap<String, u64>>,
     /// Serializes persona-file mutations with durable deletion replay so a
     /// recreate cannot race a pending cleanup of the same user-level file.
@@ -2737,8 +3659,6 @@ pub struct Engine {
     /// Where provider configuration changes are persisted. `None` disables
     /// persistence (tests).
     config_file: Option<PathBuf>,
-    /// Serializes persistence and runtime application of title-model behavior.
-    title_model_behavior_transition: tokio::sync::Mutex<()>,
     /// One coherent snapshot of the defaults inherited by personas. Keeping
     /// these values under one lock prevents new threads from observing a
     /// partially applied global-defaults update.
@@ -2749,14 +3669,14 @@ pub struct Engine {
     logins: Mutex<HashMap<String, LoginState>>,
     /// In-flight managed vendor-CLI installs, keyed by CLI id.
     cli_installs: Mutex<HashMap<String, CliInstallState>>,
+    #[cfg(test)]
+    test_cli_install_result: Mutex<Option<(String, trouve_agents::install::ActivationOutcome)>>,
+    /// Destructive managed-runtime operations, keyed by canonical CLI id.
+    /// Checked atomically with `cli_installs` so install and uninstall cannot
+    /// pass each other's preconditions concurrently.
+    cli_runtime_operations: Arc<Mutex<HashSet<String>>>,
     /// The llama-server sidecar behind the built-in "local" provider.
     local_manager: Arc<crate::local::LlamaManager>,
-    /// A separate sidecar for session titles with independently configured
-    /// resource placement.
-    title_model: Arc<crate::title_model::TitleModelManager>,
-    /// A timed-out generation stays tracked while its cold start finishes.
-    /// The next request cancels and joins it before starting another.
-    title_model_generation: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// The built-in "local" provider, kept around so enabling re-injects
     /// the same instance after a disable removed it from the registry.
     local_provider: Arc<dyn Provider>,
@@ -2801,6 +3721,19 @@ pub struct Engine {
     connectivity_probe: Option<crate::connectivity::Probe>,
 }
 
+/// Content returned to a vendor harness after a bridged ToolExecutor call.
+/// Images stay out of the durable tool-result event but can be projected as
+/// native MCP image blocks for harnesses that support them.
+pub struct BridgedToolResult {
+    pub content: String,
+    pub images: Vec<BridgedToolImage>,
+}
+
+pub struct BridgedToolImage {
+    pub mime: String,
+    pub data: String,
+}
+
 /// Keeps an idempotent session-create reservation alive with the detached
 /// worktree attempt. Field order is intentional: if the request awaiting the
 /// task is cancelled, the worktree receipt rolls back before the key guard is
@@ -2831,8 +3764,26 @@ enum CliInstallState {
         /// Byte progress + cancel flag, shared with the install task.
         progress: Arc<trouve_agents::install::Progress>,
     },
-    Success(String),
+    Success {
+        version: String,
+        warning: Option<String>,
+    },
     Failed(String),
+}
+
+/// Cancellation-safe reservation for a destructive managed-runtime operation.
+/// Installs reserve themselves in `cli_installs`; this separate set closes the
+/// inverse race by preventing an install from starting after uninstall has
+/// passed its pending-install check.
+struct CliRuntimeOperationGuard {
+    operations: Arc<Mutex<HashSet<String>>>,
+    id: String,
+}
+
+impl Drop for CliRuntimeOperationGuard {
+    fn drop(&mut self) {
+        self.operations.lock().unwrap().remove(&self.id);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2868,36 +3819,75 @@ fn cli_version_matches(reported: &str, version: &str) -> bool {
             .any(|tok| tok == version || tok.strip_prefix('v') == Some(version))
 }
 
-/// The managed CLI serving a backend provider kind, if any.
+/// The managed agent runtime serving a backend provider kind, if any.
 fn cli_for_kind(kind: &str) -> Option<trouve_agents::install::CliId> {
     use trouve_agents::install::CliId;
     match kind {
-        "cursor-cli" => Some(CliId::CursorAgent),
+        "cursor-sdk" | "cursor-cli" => Some(CliId::CursorSdkBridge),
         "claude-cli" => Some(CliId::Claude),
         "codex-app-server" => Some(CliId::Codex),
         _ => None,
     }
 }
 
-/// Resolve the executable for a CLI-backed provider. An explicit command
-/// wins; otherwise a trouve-managed binary takes precedence over PATH.
-fn resolved_cli_command(kind: &str, command: Option<String>, data_dir: &Path) -> Option<String> {
-    command.or_else(|| {
-        cli_for_kind(kind)
-            .map(|cli| trouve_agents::install::managed_bin(data_dir, cli))
-            .filter(|bin| bin.exists())
-            .map(|bin| bin.to_string_lossy().into_owned())
-    })
+fn canonical_cli_runtime_id(id: &str) -> &str {
+    trouve_agents::install::CliId::parse(id).map_or(id, |runtime| runtime.as_str())
+}
+
+/// Resolve the executable for a managed agent runtime. An explicit command
+/// wins unless it is Trouve's retired stable path; otherwise the atomic
+/// managed-install pointer takes precedence over PATH.
+struct ResolvedRuntime {
+    command: Option<String>,
+    lease: Option<trouve_agents::install::RuntimeLease>,
+}
+
+fn resolved_runtime(kind: &str, command: Option<String>, data_dir: &Path) -> ResolvedRuntime {
+    let cli = cli_for_kind(kind);
+    if let Some(command) = command
+        && !cli
+            .is_some_and(|cli| Path::new(&command) == data_dir.join("cli/bin").join(cli.as_str()))
+    {
+        return ResolvedRuntime {
+            command: Some(command),
+            lease: None,
+        };
+    }
+    match cli.and_then(|cli| trouve_agents::install::installed_with_lease(data_dir, cli)) {
+        Some((install, lease)) => ResolvedRuntime {
+            command: Some(install.bin),
+            lease: Some(lease),
+        },
+        None => ResolvedRuntime {
+            command: None,
+            lease: None,
+        },
+    }
+}
+
+/// The old `cursor-cli` kind is retained only as an explicit migration state.
+/// Its command referred to `cursor-agent`, which must never be launched by the
+/// SDK adapter; runtime resolution therefore starts fresh at the managed
+/// Bridge/PATH layers while the backend asks the user for an SDK API key.
+fn configured_runtime_command(pc: &ProviderConfig) -> Option<String> {
+    if pc.kind == "cursor-cli" {
+        None
+    } else {
+        pc.command.clone()
+    }
 }
 
 /// Config kinds handled by the [`AgentBackend`] seam rather than a Provider.
 fn is_backend_kind(kind: &str) -> bool {
-    matches!(kind, "codex-app-server" | "cursor-cli" | "claude-cli")
+    matches!(
+        kind,
+        "codex-app-server" | "cursor-sdk" | "cursor-cli" | "claude-cli"
+    )
 }
 
 /// Config kinds whose auth lives in a vendor CLI.
 fn is_cli_auth_kind(kind: &str) -> bool {
-    is_backend_kind(kind)
+    matches!(kind, "codex-app-server" | "claude-cli")
 }
 
 /// Credential style for a configured provider: "cli" for vendor-CLI-backed
@@ -2912,13 +3902,11 @@ fn provider_auth_kind(pc: &ProviderConfig) -> String {
     ) {
         "gcp".into()
     } else if is_cli_auth_kind(&pc.kind) {
-        // cursor-cli works both ways: subscription login ("cursor" preset)
-        // or an API key ("cursor-api" preset, usage-based billing).
-        if pc.kind == "cursor-cli" && (pc.api_key.is_some() || pc.api_key_env.is_some()) {
-            "api-key".into()
-        } else {
-            "cli".into()
-        }
+        "cli".into()
+    } else if matches!(pc.kind.as_str(), "cursor-sdk" | "cursor-cli") {
+        // The legacy recovery state needs the API-key editor that completes
+        // migration to the Agent SDK; CLI login credentials are incompatible.
+        "api-key".into()
     } else if pc.oauth.is_some() && pc.api_key.is_none() {
         "oauth".into()
     } else if pc.api_key.is_none()
@@ -2941,35 +3929,26 @@ fn is_loopback_base_url(url: &str) -> bool {
     trouve_providers::catalog::endpoint_is_loopback(url)
 }
 
-fn restore_secret_snapshot(
-    secrets: &Arc<dyn trouve_providers::secrets::SecretStore>,
-    snapshot: &[(String, Option<String>)],
-) -> Result<()> {
-    let mut failures = Vec::new();
-    for (key, value) in snapshot.iter().rev() {
-        let result = match value {
-            Some(value) => secrets.set(key, value),
-            None => secrets.delete(key),
-        };
-        if let Err(error) = result {
-            failures.push(format!("{key}: {error:#}"));
-        }
-    }
-    if failures.is_empty() {
-        Ok(())
-    } else {
-        bail!("{}", failures.join("; "))
-    }
-}
-
 /// Build the provider registry from config + zero-config env defaults.
 fn build_all_providers(
     config: &Config,
     secrets: &Arc<dyn trouve_providers::secrets::SecretStore>,
     catalog: &Arc<trouve_providers::models_dev::ModelsDevCatalog>,
 ) -> HashMap<String, Arc<dyn Provider>> {
+    build_providers_for_ids(config, secrets, catalog, None)
+}
+
+fn build_providers_for_ids(
+    config: &Config,
+    secrets: &Arc<dyn trouve_providers::secrets::SecretStore>,
+    catalog: &Arc<trouve_providers::models_dev::ModelsDevCatalog>,
+    target_ids: Option<&HashSet<String>>,
+) -> HashMap<String, Arc<dyn Provider>> {
     let mut providers: HashMap<String, Arc<dyn Provider>> = HashMap::new();
     for (id, pc) in &config.providers {
+        if target_ids.is_some_and(|target_ids| !target_ids.contains(id)) {
+            continue;
+        }
         if is_backend_kind(&pc.kind) {
             continue; // handled by build_all_backends
         }
@@ -2981,12 +3960,14 @@ fn build_all_providers(
         }
     }
     // Zero-config defaults from conventional env vars.
-    if !providers.contains_key("openai")
+    if target_ids.is_none_or(|target_ids| target_ids.contains("openai"))
+        && !providers.contains_key("openai")
         && let Ok(p) = trouve_providers::openai_compat::OpenAiCompatProvider::openai_from_env()
     {
         providers.insert("openai".into(), Arc::new(p.with_catalog(catalog.clone())));
     }
-    if !providers.contains_key("anthropic")
+    if target_ids.is_none_or(|target_ids| target_ids.contains("anthropic"))
+        && !providers.contains_key("anthropic")
         && let Ok(key) = std::env::var("ANTHROPIC_API_KEY")
     {
         providers.insert(
@@ -3011,19 +3992,35 @@ fn build_all_backends(
     data_dir: &Path,
     catalog: &Arc<trouve_providers::models_dev::ModelsDevCatalog>,
 ) -> HashMap<String, Arc<dyn AgentBackend>> {
+    build_backends_for_ids(config, secrets, data_dir, catalog, None)
+}
+
+/// Build only selected config-owned backends during a targeted registry
+/// transition. Avoid constructing and immediately dropping unrelated vendor
+/// pools and managed-runtime leases.
+fn build_backends_for_ids(
+    config: &Config,
+    secrets: &Arc<dyn trouve_providers::secrets::SecretStore>,
+    data_dir: &Path,
+    catalog: &Arc<trouve_providers::models_dev::ModelsDevCatalog>,
+    target_ids: Option<&HashSet<String>>,
+) -> HashMap<String, Arc<dyn AgentBackend>> {
     let mut backends: HashMap<String, Arc<dyn AgentBackend>> = HashMap::new();
     for (id, pc) in &config.providers {
+        if target_ids.is_some_and(|target_ids| !target_ids.contains(id)) {
+            continue;
+        }
         // Explicit command wins; otherwise a trouve-managed install beats
         // whatever is on PATH (distro packages lag behind vendor releases).
-        let command = resolved_cli_command(&pc.kind, pc.command.clone(), data_dir);
+        let runtime = resolved_runtime(&pc.kind, configured_runtime_command(pc), data_dir);
+        let command = runtime.command;
         let backend: Arc<dyn AgentBackend> = match pc.kind.as_str() {
             "codex-app-server" => Arc::new(
                 trouve_agents::codex::CodexBackend::new(id, command).with_catalog(catalog.clone()),
             ),
-            "cursor-cli" => {
+            "cursor-sdk" | "cursor-cli" => {
                 // Same precedence as native providers: inline key > env var >
-                // key saved through settings (secret store). Subscription
-                // login via the CLI still works when all are absent.
+                // key saved through settings (secret store).
                 let api_key = pc
                     .api_key
                     .clone()
@@ -3034,10 +4031,14 @@ fn build_all_backends(
                             .ok()
                             .flatten()
                     });
-                Arc::new(
-                    trouve_agents::cursor::CursorBackend::new(id, command, api_key)
-                        .with_catalog(catalog.clone()),
-                )
+                let backend = trouve_agents::cursor::CursorBackend::new(id, command, api_key)
+                    .with_state_root(data_dir.join("cursor-sdk"))
+                    .with_catalog(catalog.clone());
+                Arc::new(if pc.kind == "cursor-cli" {
+                    backend.requiring_legacy_cli_migration()
+                } else {
+                    backend
+                })
             }
             "claude-cli" => Arc::new(
                 trouve_agents::claude::ClaudeBackend::new(id, command)
@@ -3045,9 +4046,25 @@ fn build_all_backends(
             ),
             _ => continue,
         };
+        let backend: Arc<dyn AgentBackend> = match runtime.lease {
+            Some(lease) => Arc::new(trouve_agents::RuntimeLeasedBackend::new(
+                Arc::new(trouve_agents::RetirementAwareBackend::new(backend)),
+                lease,
+            )),
+            None => Arc::new(trouve_agents::RetirementAwareBackend::new(backend)),
+        };
         backends.insert(id.clone(), backend);
     }
     backends
+}
+
+impl Engine {
+    pub(crate) async fn acquire_planned_turn_setup(
+        &self,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit> {
+        self.turn_scheduler.acquire_planned_setup(cancel).await
+    }
 }
 
 impl Engine {
@@ -3071,17 +4088,6 @@ impl Engine {
         // Construction reaps llama-servers leaked by a crashed previous run
         // (they hold VRAM and would starve this run's model loads).
         let local_manager = Arc::new(crate::local::LlamaManager::new(&data_dir));
-        let title_model = Arc::new(crate::title_model::TitleModelManager::new(
-            data_dir.clone(),
-            config.title_model_load_behavior.unwrap_or_default(),
-            config.title_model_resource_policy.unwrap_or_default(),
-            config
-                .derive_branch_name_from_session_title
-                .unwrap_or(false),
-            &local_manager,
-            store.clone(),
-        ));
-        local_manager.set_adaptive_title(Arc::downgrade(&title_model));
         let local_provider: Arc<dyn Provider> = Arc::new(crate::local::LocalProvider::new(
             data_dir.clone(),
             config_dir.clone(),
@@ -3092,38 +4098,32 @@ impl Engine {
             providers.insert("local".into(), local_provider.clone());
             injected_providers.insert("local".to_string(), local_provider.clone());
         }
-        let turn_scheduler = TurnScheduler::new();
-        match store.route_health() {
-            Ok(health) => {
-                if let Some(latest) = health
-                    .values()
-                    .filter_map(|route| route.last_outcome_order)
-                    .max()
-                {
-                    turn_scheduler.observe_attempt_order(latest);
-                }
-            }
-            Err(error) => {
-                tracing::warn!(%error, "could not seed provider attempt order from route health");
-            }
-        }
         Self {
             store,
             data_dir,
             config_dir,
+            workspace_list_cache: Mutex::new(HashMap::new()),
+            workspace_list_refresh_locks: Mutex::new(HashMap::new()),
+            workspace_registration_lifecycles: Mutex::new(HashMap::new()),
             model_catalog,
             providers: RwLock::new(providers),
+            title_jobs: Mutex::new(HashMap::new()),
             injected_providers: Mutex::new(injected_providers),
-            backends: RwLock::new(backends),
+            backends: Arc::new(RwLock::new(backends)),
+            retiring_backends: Mutex::new(HashMap::new()),
+            retiring_backend_retry_started: AtomicBool::new(false),
             injected_backends: Mutex::new(HashMap::new()),
-            subscription_health_cache: Mutex::new(HashMap::new()),
+            background_turn_intake: Mutex::new(Vec::new()),
+            background_turn_intake_notify: Arc::new(tokio::sync::Notify::new()),
             executor: Arc::new(LocalToolExecutor::with_mcp_logs(mcp_logs.clone())),
             approvals: Arc::new(ApprovalHub::default()),
             questions: Arc::new(QuestionHub::default()),
-            turn_scheduler,
+            turn_scheduler: TurnScheduler::new(),
             automated_review_tool_budgets: Arc::new(AutomatedReviewToolBudgets::default()),
             session_locks: Mutex::new(HashMap::new()),
             session_create_locks: Mutex::new(HashMap::new()),
+            automation_mutation_states: Mutex::new(HashMap::new()),
+            automation_model_options_validations: Mutex::new(HashMap::new()),
             tool_execution_locks: Mutex::new(HashMap::new()),
             tool_mutation_admission_locks: Mutex::new(HashMap::new()),
             session_pr_verification_locks: Mutex::new(HashMap::new()),
@@ -3136,11 +4136,16 @@ impl Engine {
             deleting_sessions: Mutex::new(std::collections::HashSet::new()),
             turn_cancels: Mutex::new(std::collections::HashMap::new()),
             turn_steerers: Mutex::new(HashMap::new()),
+            pending_turn_steerers: Mutex::new(HashMap::new()),
             resume_after_cancel: Mutex::new(HashSet::new()),
             github_dashboard_caches: Mutex::new(HashMap::new()),
             github_pr_detail_cache: Mutex::new(GithubPrDetailCache::default()),
+            subscription_health_cache: Mutex::new(Default::default()),
+            subscription_health_probe: tokio::sync::Mutex::new(()),
             github_dashboard_publication: Mutex::new(()),
             provider_locks: Mutex::new(HashMap::new()),
+            provider_transition_locks: Mutex::new(HashMap::new()),
+            provider_reload: Arc::new(tokio::sync::RwLock::new(())),
             provider_generations: Mutex::new(HashMap::new()),
             persona_mutations: Arc::new(tokio::sync::Mutex::new(())),
             config: Mutex::new(config.clone()),
@@ -3150,12 +4155,11 @@ impl Engine {
             // let test/embedded engines built from synthetic configs
             // clobber the user's config.toml on any provider change.
             config_file: None,
-            title_model_behavior_transition: tokio::sync::Mutex::new(()),
             global_defaults: RwLock::new(GlobalDefaults {
                 model: config
                     .default_model
                     .clone()
-                    .unwrap_or_else(|| "auto/gpt-4.1-mini".into()),
+                    .unwrap_or_else(|| "openai/gpt-4.1-mini".into()),
                 thinking_level: config.default_thinking_level.clone(),
                 permission_mode: config.default_permission_mode.unwrap_or_default(),
             }),
@@ -3163,9 +4167,10 @@ impl Engine {
             code_review: crate::review::CodeReviewRuntime::default(),
             logins: Mutex::new(HashMap::new()),
             cli_installs: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            test_cli_install_result: Mutex::new(None),
+            cli_runtime_operations: Arc::new(Mutex::new(HashSet::new())),
             local_manager,
-            title_model,
-            title_model_generation: tokio::sync::Mutex::new(None),
             local_provider,
             local_downloads: Mutex::new(HashMap::new()),
             hardware: std::sync::OnceLock::new(),
@@ -3255,6 +4260,26 @@ impl Engine {
             )
             .await;
         }
+    }
+
+    /// Remove naming images staged by a previous process that died before
+    /// its `StagedTitleImages` guard ran. Only files older than every
+    /// naming budget are touched, so a request still in flight in another
+    /// server instance sharing this data directory keeps its staged copy.
+    pub async fn sweep_stale_title_images(&self) {
+        match self
+            .executor
+            .sweep_stale_staged_files(&self.title_image_root(), STALE_TITLE_IMAGE_AGE)
+            .await
+        {
+            Ok(0) => {}
+            Ok(removed) => tracing::info!(removed, "removed orphaned staged naming images"),
+            Err(error) => tracing::warn!(%error, "failed to sweep staged naming images"),
+        }
+    }
+
+    fn title_image_root(&self) -> PathBuf {
+        self.data_dir.join("title-attachments")
     }
 
     /// Finish durable persona-file deletions left by an interrupted request.
@@ -3433,6 +4458,185 @@ impl Engine {
     /// while online (going offline is rarely urgent), quickly while offline
     /// (clients unblock prompt entry off the recovery event). No-op without
     /// a probe.
+    /// Listen for vendor-autonomous turn signals from agent backends and
+    /// dispatch attach turns so that activity is persisted and rendered
+    /// live instead of buffering silently inside the adapter. Without this,
+    /// a vendor harness that wakes itself (e.g. Claude Code monitors and
+    /// scheduled tasks) produces output no one is reading: the adapter now
+    /// buffers it, and this listener turns it into an ordinary turn.
+    pub fn start_background_turn_listener(self: &Arc<Self>) {
+        self.intake_background_turn_signals();
+        // The pump and its forwarders hold only a Weak engine reference and
+        // exit when it no longer upgrades: a forever-parked task must not be
+        // what keeps the Engine (and through it every backend) alive.
+        let weak = Arc::downgrade(self);
+        let notify = Arc::clone(&self.background_turn_intake_notify);
+        tokio::spawn(async move {
+            loop {
+                {
+                    let Some(engine) = weak.upgrade() else {
+                        return;
+                    };
+                    let pending: Vec<(String, tokio::sync::mpsc::Receiver<String>)> = {
+                        let mut intake = engine.background_turn_intake.lock().unwrap();
+                        intake.drain(..).collect()
+                    };
+                    for (backend_id, mut signals) in pending {
+                        let weak = weak.clone();
+                        tokio::spawn(async move {
+                            // The forwarder ends when its backend (the
+                            // sender) is dropped by a registry reload; the
+                            // replacement backend's receiver arrives through
+                            // the intake.
+                            while let Some(thread_id) = signals.recv().await {
+                                let Some(engine) = weak.upgrade() else {
+                                    return;
+                                };
+                                engine
+                                    .dispatch_background_attach_turn_with_retry(
+                                        &thread_id,
+                                        &backend_id,
+                                    )
+                                    .await;
+                            }
+                        });
+                    }
+                }
+                notify.notified().await;
+            }
+        });
+    }
+
+    /// Dispatch with one bounded retry: a notification is consumed from the
+    /// signal channel when received, so a transiently failing dispatch (a
+    /// busy store, a mid-write race) must not silently strand the buffered
+    /// autonomous turn until some later boundary happens to re-announce it.
+    async fn dispatch_background_attach_turn_with_retry(
+        self: &Arc<Self>,
+        thread_id: &str,
+        backend_id: &str,
+    ) {
+        for attempt in 0..2_u8 {
+            match self.dispatch_background_attach_turn(thread_id, backend_id) {
+                Ok(()) => return,
+                // The thread is gone; the buffered turns can never attach.
+                // Tell the backend to abandon them so they stop pinning the
+                // process in its pool.
+                Err(EngineError::NotFound(_)) => {
+                    let backend = self.backends.read().unwrap().get(backend_id).cloned();
+                    if let Some(backend) = backend {
+                        backend.abandon_background_turns(thread_id).await;
+                    }
+                    return;
+                }
+                Err(error) if attempt == 0 => {
+                    tracing::debug!(
+                        %thread_id,
+                        backend = %backend_id,
+                        %error,
+                        "background attach-turn dispatch failed; retrying once"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %thread_id,
+                        backend = %backend_id,
+                        %error,
+                        "background attach-turn dispatch failed"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Collect every registered backend's background-turn signal receiver
+    /// into the intake. `take_background_turn_signals` yields a receiver at
+    /// most once per backend instance, so calling this after a registry
+    /// reload arms exactly the new instances.
+    fn intake_background_turn_signals(&self) {
+        let backends: Vec<(String, Arc<dyn AgentBackend>)> = {
+            let map = self.backends.read().unwrap();
+            map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        };
+        let mut taken = Vec::new();
+        for (backend_id, backend) in backends {
+            if let Some(signals) = backend.take_background_turn_signals() {
+                taken.push((backend_id, signals));
+            }
+        }
+        if taken.is_empty() {
+            return;
+        }
+        self.background_turn_intake.lock().unwrap().extend(taken);
+        self.background_turn_intake_notify.notify_one();
+    }
+
+    /// Queue one attach turn for a vendor-autonomous turn the backend
+    /// reported on `thread_id`. The prompt is a fixed marker: the backend
+    /// recognizes it via `BackendTurn::attach_background` and consumes the
+    /// autonomous turn's events instead of prompting the model again.
+    fn dispatch_background_attach_turn(
+        self: &Arc<Self>,
+        thread_id: &str,
+        signaling_backend_id: &str,
+    ) -> Result<(), EngineError> {
+        // Review threads run under strict budgets and their vendor sessions
+        // have no monitors; skip them defensively.
+        if self
+            .store
+            .is_code_review_thread(thread_id)
+            .map_err(EngineError::Internal)?
+        {
+            return Ok(());
+        }
+        // One queued attach drains the backend's buffered turns; backlog
+        // re-announcements for the same buffer coalesce into it instead of
+        // queueing surplus attaches that would surface as empty turns.
+        if self
+            .store
+            .has_queued_background_prompt(thread_id)
+            .map_err(EngineError::Internal)?
+        {
+            return Ok(());
+        }
+        // The thread may have switched models between the signal and this
+        // dispatch. Attaching would then queue the marker prompt for a
+        // backend with no pending autonomous turn — worst case a backend
+        // that treats it as a literal prompt — so confirm the thread still
+        // resolves to the signaling backend.
+        let thread = self.get_thread(thread_id)?;
+        let resolved_backend = if routing::automatic_model_name(&thread.model).is_some() {
+            self.store
+                .thread_route_affinity(&thread.id)?
+                .map(|(provider_id, _)| provider_id)
+        } else {
+            self.backend_for(&thread.model)
+                .map(|(backend_id, _, _)| backend_id)
+        };
+        match resolved_backend {
+            Some(backend_id) if backend_id == signaling_backend_id => {}
+            resolved_backend => {
+                tracing::debug!(
+                    %thread_id,
+                    signaling_backend = %signaling_backend_id,
+                    resolved_backend = resolved_backend.unwrap_or_default(),
+                    "skipping background attach: thread no longer resolves to the signaling backend"
+                );
+                return Ok(());
+            }
+        }
+        self.send_message_inner(
+            thread_id,
+            background_attach_prompt(signaling_backend_id),
+            Vec::new(),
+            true,
+            true,
+            true,
+        )
+        .map(|_| ())
+    }
+
     pub fn start_connectivity_monitor(self: &Arc<Self>) {
         let Some(probe) = self.connectivity_probe.clone() else {
             return;
@@ -3535,9 +4739,12 @@ impl Engine {
     /// Register (or replace) a provider instance under an id. Survives
     /// config-driven registry reloads.
     pub fn with_provider(self, id: &str, provider: Arc<dyn Provider>) -> Self {
-        let mut generations = self.provider_generations.lock().unwrap();
-        let generation = generations.entry(id.to_string()).or_default();
-        *generation = generation.saturating_add(1);
+        if let Err(error) = self.invalidate_provider_route_state(id) {
+            tracing::warn!(
+                provider = id,
+                "could not reset injected provider route state: {error:#}"
+            );
+        }
         self.injected_providers
             .lock()
             .unwrap()
@@ -3546,17 +4753,18 @@ impl Engine {
             .write()
             .unwrap()
             .insert(id.to_string(), provider);
-        drop(generations);
         self
     }
 
     /// Register (or replace) an agent backend instance under an id. Survives
     /// config-driven registry reloads (tests, embedders).
     pub fn with_backend(self, id: &str, backend: Arc<dyn AgentBackend>) -> Self {
-        let mut generations = self.provider_generations.lock().unwrap();
-        let generation = generations.entry(id.to_string()).or_default();
-        *generation = generation.saturating_add(1);
-        self.subscription_health_cache.lock().unwrap().remove(id);
+        if let Err(error) = self.invalidate_provider_route_state(id) {
+            tracing::warn!(
+                provider = id,
+                "could not reset injected backend route state: {error:#}"
+            );
+        }
         self.injected_backends
             .lock()
             .unwrap()
@@ -3565,7 +4773,6 @@ impl Engine {
             .write()
             .unwrap()
             .insert(id.to_string(), backend);
-        drop(generations);
         self
     }
 
@@ -3617,431 +4824,18 @@ impl Engine {
     /// on. Live account and vendor-CLI availability is resolved separately by
     /// refresh_models so first paint never waits for network or CLI startup.
     pub async fn list_models(&self) -> Vec<trouve_protocol::ModelInfo> {
-        // Include the same automatic ids as the live route catalog on first
-        // paint. Their route metadata arrives from `/v1/model-routes`, but
-        // exposing the ids here prevents a configured `auto/<model>` default
-        // from being reconciled away while live discovery is still pending.
-        compatibility_model_catalog(self.available_model_candidates().await)
-    }
-
-    /// Model-selector catalog for current clients. Shared hosted models have
-    /// an `auto/<model>` entry plus one concrete entry per provider. Local,
-    /// user-configured local endpoints, and transport-owned models expose only
-    /// concrete entries. `/models` remains the compatibility catalog.
-    pub async fn list_model_routes(&self) -> Vec<trouve_protocol::RoutedModelInfo> {
-        routed_model_catalog(self.refresh_model_candidates().await)
-    }
-
-    async fn available_model_candidates(&self) -> Vec<ModelCandidate> {
-        let online = self.is_online();
-        let offline_capable = if online {
-            std::collections::HashSet::new()
-        } else {
-            self.offline_capable_provider_ids()
-        };
-        let (providers, backends) = self.provider_registry_snapshot();
-        let providers: Vec<_> = providers
-            .into_iter()
-            .filter(|(id, _, _)| online || offline_capable.contains(id.as_str()))
-            .collect();
-        let mut candidates = Vec::new();
-        for (provider_id, provider_generation, provider) in providers {
-            candidates.extend(provider.models().into_iter().map(|info| {
-                let provider_model = model_name_for_provider(&provider_id, &info.id).to_string();
-                ModelCandidate {
-                    shared_model_id: provider.shared_model_identity(&provider_model),
-                    provider_model,
-                    provider_id: provider_id.clone(),
-                    provider_generation,
-                    info,
-                    executor: ModelExecutor::Native(provider.clone()),
-                }
-            }));
-        }
-        let ready: Vec<_> = if online {
-            backends
-                .into_iter()
-                .filter(|(_, _, backend)| {
-                    let status = backend.status();
-                    status.installed && status.has_credentials
-                })
-                .collect()
-        } else {
-            Vec::new() // vendor backends all need their cloud
-        };
-        for (provider_id, provider_generation, backend) in ready {
-            candidates.extend(backend.models().into_iter().map(|info| {
-                let provider_model = model_name_for_provider(&provider_id, &info.id).to_string();
-                ModelCandidate {
-                    shared_model_id: backend.shared_model_identity(&provider_model),
-                    provider_model,
-                    provider_id: provider_id.clone(),
-                    provider_generation,
-                    info,
-                    executor: ModelExecutor::Backend(backend.clone()),
-                }
-            }));
-        }
-        candidates
+        routing::compatibility_model_catalog(self.available_model_candidates())
     }
 
     /// Resolve live account-visible and vendor-CLI model availability. Clients
     /// call this after painting list_models, then replace the static snapshot
     /// when this richer result arrives.
     pub async fn refresh_models(&self) -> Vec<trouve_protocol::ModelInfo> {
-        compatibility_model_catalog(self.refresh_model_candidates().await)
+        routing::compatibility_model_catalog(self.refresh_model_candidates().await)
     }
 
-    async fn refresh_model_candidates(&self) -> Vec<ModelCandidate> {
-        self.refresh_model_candidates_for(None).await
-    }
-
-    /// Refresh only adapters which can satisfy `selection` when resolving one
-    /// turn or validating settings. This prevents an unrelated broken adapter
-    /// from delaying a provider pin or one automatic model.
-    async fn refresh_model_candidates_for(&self, selection: Option<&str>) -> Vec<ModelCandidate> {
-        let online = self.is_online();
-        if online
-            && self.connectivity_probe.is_some()
-            && let Ok(Err(error)) = tokio::time::timeout(
-                MODEL_ROUTE_DISCOVERY_TIMEOUT,
-                self.model_catalog.refresh_if_stale(),
-            )
-            .await
-        {
-            tracing::debug!("models.dev refresh failed; using cached snapshot: {error:#}");
-        }
-        let automatic = selection.and_then(automatic_model_name);
-        let concrete_provider = selection
-            .filter(|_| automatic.is_none())
-            .and_then(|selection| selection.split_once('/'))
-            .map(|(provider, _)| provider);
-        let offline_capable = if online {
-            std::collections::HashSet::new()
-        } else {
-            self.offline_capable_provider_ids()
-        };
-        let (providers, backends) = self.provider_registry_snapshot();
-        let providers: Vec<_> = providers
-            .into_iter()
-            .filter(|(id, _, _)| online || offline_capable.contains(id.as_str()))
-            .filter(|(id, _, provider)| {
-                automatic.is_none_or(|model| provider.shared_model_identity(model).is_some())
-                    && concrete_provider.is_none_or(|selected| id.as_str() == selected)
-            })
-            .collect();
-        let provider_lists = futures::future::join_all(providers.into_iter().map(
-            |(provider_id, provider_generation, provider)| async move {
-                let models = match tokio::time::timeout(
-                    MODEL_ROUTE_DISCOVERY_TIMEOUT,
-                    provider.list_models(),
-                )
-                .await
-                {
-                    Ok(models) => models,
-                    Err(_) => {
-                        tracing::warn!(
-                            provider = %provider_id,
-                            "model discovery timed out; using the static catalog"
-                        );
-                        provider.models()
-                    }
-                };
-                (provider_id, provider_generation, provider, models)
-            },
-        ))
-        .await;
-        let mut candidates = Vec::new();
-        for (provider_id, provider_generation, provider, models) in provider_lists {
-            candidates.extend(models.into_iter().map(|info| {
-                let provider_model = model_name_for_provider(&provider_id, &info.id).to_string();
-                ModelCandidate {
-                    shared_model_id: provider.shared_model_identity(&provider_model),
-                    provider_model,
-                    provider_id: provider_id.clone(),
-                    provider_generation,
-                    info,
-                    executor: ModelExecutor::Native(provider.clone()),
-                }
-            }));
-        }
-        let ready: Vec<_> = if online {
-            backends
-                .into_iter()
-                .filter(|(_, _, backend)| {
-                    let status = backend.status();
-                    status.installed && status.has_credentials
-                })
-                .filter(|(id, _, backend)| {
-                    automatic.is_none_or(|model| backend.shared_model_identity(model).is_some())
-                        && concrete_provider.is_none_or(|selected| id.as_str() == selected)
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-        let listings = futures::future::join_all(ready.into_iter().map(
-            |(provider_id, provider_generation, backend)| async move {
-                let models = match tokio::time::timeout(
-                    MODEL_ROUTE_DISCOVERY_TIMEOUT,
-                    backend.list_models(),
-                )
-                .await
-                {
-                    Ok(models) => models,
-                    Err(_) => {
-                        tracing::warn!(
-                            provider = %provider_id,
-                            "backend model discovery timed out; using the static catalog"
-                        );
-                        backend.models()
-                    }
-                };
-                (provider_id, provider_generation, backend, models)
-            },
-        ))
-        .await;
-        for (provider_id, provider_generation, backend, models) in listings {
-            candidates.extend(models.into_iter().map(|info| {
-                let provider_model = model_name_for_provider(&provider_id, &info.id).to_string();
-                ModelCandidate {
-                    shared_model_id: backend.shared_model_identity(&provider_model),
-                    provider_model,
-                    provider_id: provider_id.clone(),
-                    provider_generation,
-                    info,
-                    executor: ModelExecutor::Backend(backend.clone()),
-                }
-            }));
-        }
-        candidates
-    }
-
-    /// Resolve an automatic id to runnable routes, applying thread affinity,
-    /// open circuits, reported exhaustion, user preference, live subscription
-    /// headroom, and learned success. A provider-qualified id is an explicit
-    /// pin and resolves to that route only.
-    async fn resolve_model_candidates(
-        &self,
-        thread: &Thread,
-    ) -> Result<Vec<ModelCandidate>, EngineError> {
-        let model = thread.model.as_str();
-        let all = self.refresh_model_candidates_for(Some(model)).await;
-        if let Some(automatic_model) = automatic_model_name(model) {
-            let candidates: Vec<_> = all
-                .into_iter()
-                .filter(|candidate| {
-                    candidate
-                        .automatic_selection_id()
-                        .as_deref()
-                        .and_then(|id| id.strip_prefix("auto/"))
-                        == Some(automatic_model)
-                })
-                .collect();
-            if candidates.is_empty() {
-                return Err(EngineError::BadRequest(format!(
-                    "no provider is configured and available for {model}"
-                )));
-            }
-            let affinity = self
-                .store
-                .thread_route_affinity(&thread.id)
-                .map_err(EngineError::Internal)?;
-            return self
-                .rank_model_candidates(model, candidates, affinity.as_ref())
-                .await;
-        }
-
-        if let Some(candidate) = all
-            .iter()
-            .find(|candidate| candidate.concrete_selection_id() == model)
-        {
-            return Ok(vec![candidate.clone()]);
-        }
-        // Preserve the legacy provider-qualified escape hatch even for
-        // injected/custom providers that can run arbitrary model names and
-        // therefore publish no finite catalog.
-        if let Some((provider_id, provider_model)) = model.split_once('/') {
-            let (providers, backends) = self.provider_registry_snapshot();
-            if let Some((_, provider_generation, provider)) =
-                providers.into_iter().find(|(id, _, _)| id == provider_id)
-            {
-                return Ok(vec![ModelCandidate {
-                    provider_id: provider_id.to_string(),
-                    provider_model: provider_model.to_string(),
-                    provider_generation,
-                    info: fallback_model_info(model, provider_model),
-                    executor: ModelExecutor::Native(provider),
-                    shared_model_id: None,
-                }]);
-            }
-            if let Some((_, provider_generation, backend)) =
-                backends.into_iter().find(|(id, _, _)| id == provider_id)
-            {
-                return Ok(vec![ModelCandidate {
-                    provider_id: provider_id.to_string(),
-                    provider_model: provider_model.to_string(),
-                    provider_generation,
-                    info: fallback_model_info(model, provider_model),
-                    executor: ModelExecutor::Backend(backend),
-                    shared_model_id: None,
-                }]);
-            }
-        }
-        Err(EngineError::BadRequest(format!(
-            "selected provider route {model} is not configured or available"
-        )))
-    }
-
-    async fn rank_model_candidates(
-        &self,
-        selection: &str,
-        mut candidates: Vec<ModelCandidate>,
-        affinity: Option<&(String, String)>,
-    ) -> Result<Vec<ModelCandidate>, EngineError> {
-        let scheduler_cooling = |candidate: &ModelCandidate| {
-            self.turn_scheduler
-                .cooldown_remaining(&candidate.provider_id)
-        };
-        if candidates
-            .iter()
-            .all(|candidate| scheduler_cooling(candidate).is_some())
-        {
-            let retry_after = candidates
-                .iter()
-                .filter_map(&scheduler_cooling)
-                .min()
-                .unwrap_or_default()
-                .as_secs()
-                .max(1);
-            return Err(EngineError::Conflict(format!(
-                "no provider for {selection} is currently available; all providers are backing off; retry in {retry_after} seconds"
-            )));
-        }
-        candidates.retain(|candidate| scheduler_cooling(candidate).is_none());
-
-        let learned = self.store.route_health().map_err(EngineError::Internal)?;
-        let now = chrono::Utc::now().timestamp();
-        let cooling = |candidate: &ModelCandidate| {
-            learned
-                .get(&(
-                    candidate.provider_id.clone(),
-                    candidate.provider_model.clone(),
-                ))
-                .and_then(|health| health.retry_after)
-                .is_some_and(|retry_after| retry_after > now)
-        };
-        if candidates.iter().all(&cooling) {
-            let retry_after = candidates
-                .iter()
-                .filter_map(|candidate| {
-                    learned
-                        .get(&(
-                            candidate.provider_id.clone(),
-                            candidate.provider_model.clone(),
-                        ))
-                        .and_then(|health| health.retry_after)
-                })
-                .min()
-                .unwrap_or(now);
-            return Err(EngineError::Conflict(format!(
-                "no provider for {selection} is currently available; all routes are cooling down; retry in {} seconds",
-                retry_after.saturating_sub(now).max(1)
-            )));
-        }
-        // Do not keep open circuits as tail fallbacks. If every fresh route
-        // fails, the next turn re-ranks from persisted state and advances to
-        // routes that were not exercised yet.
-        candidates.retain(|candidate| !cooling(candidate));
-
-        let provider_order = self.config.lock().unwrap().provider_order.clone();
-        let preference: HashMap<&str, usize> = provider_order
-            .iter()
-            .enumerate()
-            .map(|(index, provider)| (provider.as_str(), index))
-            .collect();
-        let mut scored = futures::future::join_all(candidates.into_iter().map(|candidate| async {
-            let rank = match &candidate.executor {
-                ModelExecutor::Native(_) => (1u8, 0i64),
-                ModelExecutor::Backend(backend) => {
-                    self.cached_subscription_health_rank(&candidate.provider_id, backend)
-                        .await
-                }
-            };
-            let preferred = preference.get(candidate.provider_id.as_str()).copied();
-            let route = learned.get(&(
-                candidate.provider_id.clone(),
-                candidate.provider_model.clone(),
-            ));
-            let last_success = route.and_then(|health| health.last_success_at);
-            let sticky = affinity.is_some_and(|(provider_id, provider_model)| {
-                candidate.provider_id == *provider_id
-                    && candidate.provider_model == *provider_model
-                    && rank.0 < 2
-            });
-            let score = (
-                u8::from(!sticky),
-                u8::from(rank.0 >= 2),
-                u8::from(preferred.is_none()),
-                preferred.unwrap_or(usize::MAX),
-                rank.0,
-                rank.1,
-                u8::from(last_success.is_none()),
-                last_success.map(|timestamp| -timestamp).unwrap_or(i64::MAX),
-            );
-            (score, rank, candidate)
-        }))
-        .await;
-        if scored.iter().all(|(_, rank, _)| rank.0 >= 3) {
-            return Err(EngineError::Conflict(format!(
-                "no provider for {selection} currently has remaining usage"
-            )));
-        }
-        scored.retain(|(_, rank, _)| rank.0 < 3);
-        scored.sort_by(|(score_a, _, a), (score_b, _, b)| {
-            score_a
-                .cmp(score_b)
-                .then_with(|| a.provider_id.cmp(&b.provider_id))
-                .then_with(|| a.provider_model.cmp(&b.provider_model))
-        });
-        Ok(scored
-            .into_iter()
-            .map(|(_, _, candidate)| candidate)
-            .collect())
-    }
-
-    async fn cached_subscription_health_rank(
-        &self,
-        provider_id: &str,
-        backend: &Arc<dyn AgentBackend>,
-    ) -> (u8, i64) {
-        let entry = {
-            let mut cache = self.subscription_health_cache.lock().unwrap();
-            cache
-                .entry(provider_id.to_string())
-                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(None)))
-                .clone()
-        };
-        let mut cached = entry.lock().await;
-        if let Some((at, rank)) = *cached
-            && at.elapsed() < SUBSCRIPTION_HEALTH_CACHE_TTL
-        {
-            return rank;
-        }
-        let rank =
-            match tokio::time::timeout(SUBSCRIPTION_HEALTH_TIMEOUT, backend.subscription_health())
-                .await
-            {
-                Ok(Some(health)) => subscription_health_rank(&health),
-                _ => (1, 0),
-            };
-        *cached = Some((Instant::now(), rank));
-        rank
-    }
-
-    /// Provider ids that keep working without internet: the built-in managed
-    /// `local` provider plus user-configured OpenAI-compatible endpoints on
-    /// localhost or a loopback IP (for example Ollama, llama.cpp, or vLLM).
+    /// Provider ids that keep working without internet: the built-in local
+    /// provider plus configured loopback endpoints.
     fn offline_capable_provider_ids(&self) -> std::collections::HashSet<String> {
         let mut ids: std::collections::HashSet<String> = ["local".to_string()].into();
         let config = self.config.lock().unwrap();
@@ -4083,7 +4877,7 @@ impl Engine {
                     settings: pc.settings.clone(),
                     has_credentials,
                     category: trouve_providers::catalog::provider_category(
-                        id,
+                        &pc.kind,
                         &auth,
                         pc.base_url.as_deref(),
                     ),
@@ -4112,9 +4906,8 @@ impl Engine {
                 });
             }
         }
-        // Programmatically injected agent backends are routable even when
-        // they do not have a config-file entry. Project them into the same
-        // provider identity list used by routing priority settings.
+        // Programmatically injected backends are routable even without a
+        // config-file row. Expose them to the same preference editor.
         for (id, backend) in self.backends.read().unwrap().iter() {
             if !config.providers.contains_key(id) && !infos.iter().any(|info| info.id == *id) {
                 let status = backend.status();
@@ -4143,7 +4936,6 @@ impl Engine {
                 provider_order.push(info.id.clone());
             }
         }
-        drop(config);
         let defaults = self.global_defaults.read().unwrap().clone();
         ProvidersResponse {
             providers: infos,
@@ -4182,7 +4974,11 @@ impl Engine {
                 .ok()
                 .flatten()
                 .is_some(),
-            // Key-authenticated agent backend (cursor-api): not in the
+            // A saved key does not silently opt a legacy CLI config into a
+            // different transport. Saving the Cursor SDK preset completes the
+            // migration and changes the kind deliberately.
+            _ if pc.kind == "cursor-cli" => false,
+            // Key-authenticated agent backend (such as Cursor): not in the
             // provider registry, so check the key channels directly.
             _ if is_backend_kind(&pc.kind) => {
                 pc.api_key.is_some()
@@ -4204,11 +5000,17 @@ impl Engine {
 
     /// Create or update a provider. The API key (when present) goes to the
     /// secret store; the config file only holds non-secret settings.
-    pub fn upsert_provider(
-        &self,
+    pub async fn upsert_provider(
+        self: &Arc<Self>,
         id: &str,
         req: &UpsertProviderRequest,
     ) -> Result<ProviderInfo, EngineError> {
+        if req.kind == "cursor-cli" {
+            return Err(EngineError::BadRequest(
+                "cursor-cli is a read-only legacy migration state; save Cursor as cursor-sdk with an API key"
+                    .into(),
+            ));
+        }
         if !matches!(
             req.kind.as_str(),
             "openai-compat"
@@ -4217,13 +5019,13 @@ impl Engine {
                 | "amazon-bedrock"
                 | "google-vertex"
                 | "google-vertex-anthropic"
-        ) && !is_cli_auth_kind(&req.kind)
+        ) && !is_backend_kind(&req.kind)
         {
             return Err(EngineError::BadRequest(format!(
                 "unknown provider kind {:?} (expected openai-compat, anthropic, \
                  azure-openai, amazon-bedrock, google-vertex, \
                  google-vertex-anthropic, codex-app-server, \
-                 cursor-cli, or claude-cli)",
+                 cursor-sdk (cursor-cli is a legacy migration state), or claude-cli)",
                 req.kind
             )));
         }
@@ -4232,47 +5034,110 @@ impl Engine {
                 "provider id must be non-empty ascii alphanumeric/dashes".into(),
             ));
         }
-        let provider_lock = self.provider_lock(id);
-        let _provider_guard = provider_lock.lock().unwrap();
-        let mut secret_updates = Vec::new();
-        if let Some(value) = req.api_key.as_deref().filter(|value| !value.is_empty()) {
-            secret_updates.push((
-                trouve_providers::secrets::api_key_secret(id),
-                value.to_string(),
+        if id == "auto" {
+            return Err(EngineError::BadRequest(
+                "provider id auto is reserved for automatic model routing".into(),
             ));
         }
-        secret_updates.extend(
-            req.secret_values
-                .iter()
-                .filter(|(_, value)| !value.is_empty())
-                .map(|(name, value)| {
-                    (
-                        trouve_providers::secrets::provider_secret(id, name),
-                        value.clone(),
-                    )
-                }),
-        );
-        let secret_snapshot = secret_updates
+        let provider_lock = self.provider_lock(id);
+        let _provider_guard = provider_lock.lock().await;
+        let target_ids = HashSet::from([id.to_string()]);
+        // Fence API-registry refreshes and same-provider transitions before
+        // the first tentative secret write. These guards move into backend
+        // retirement and, on rollback failure, its detached reconciliation.
+        let (reload, target_transitions) = self
+            .lock_provider_transitions_with_shared_reload(&target_ids)
+            .await?;
+        let mut secret_writes = Vec::new();
+        if let Some(key) = req.api_key.as_deref().filter(|key| !key.is_empty()) {
+            secret_writes.push((
+                trouve_providers::secrets::api_key_secret(id),
+                key.to_string(),
+            ));
+        }
+        for (name, value) in req
+            .secret_values
             .iter()
-            .map(|(key, _)| Ok((key.clone(), self.secrets.get(key)?)))
-            .collect::<Result<Vec<_>>>()
-            .map_err(EngineError::Internal)?;
-        for (key, value) in &secret_updates {
-            if let Err(error) = self.secrets.set(key, value) {
-                if let Err(rollback) = restore_secret_snapshot(&self.secrets, &secret_snapshot) {
-                    return Err(EngineError::Internal(anyhow!(
-                        "updating provider secrets failed: {error:#}; restoring prior secrets also failed: {rollback:#}"
-                    )));
+            .filter(|(_, value)| !value.is_empty())
+        {
+            secret_writes.push((
+                trouve_providers::secrets::provider_secret(id, name),
+                value.clone(),
+            ));
+        }
+        // Validate and commit the secret-store transaction before disturbing
+        // a healthy backend. The guard restores the previous values if this
+        // future is cancelled or any later transition fails.
+        let secret_store = self.secrets.clone();
+        let secret_write = tokio::task::spawn_blocking(move || {
+            write_secrets_transactionally(secret_store, secret_writes)
+        });
+        let (secret_write_tx, secret_write_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(supervise_provider_secret_write(
+            Arc::downgrade(self),
+            target_ids.clone(),
+            secret_write,
+            reload,
+            target_transitions,
+            secret_write_tx,
+        ));
+        let (secret_write, reload, target_transitions) =
+            secret_write_rx.await.map_err(|error| {
+                EngineError::Internal(anyhow!(
+                    "provider secret transaction supervisor failed: {error}"
+                ))
+            })?;
+        let secret_write = secret_write.map_err(|error| {
+            EngineError::Internal(anyhow!("provider secret transaction task failed: {error}"))
+        })?;
+        let secret_transaction = match secret_write {
+            Ok(transaction) => transaction,
+            Err(ProviderSecretWriteFailure { error, transaction }) => {
+                if let Some(transaction) = transaction {
+                    let reconciliation = ProviderSecretRollbackReconciliation {
+                        engine: Arc::downgrade(self),
+                        target_ids,
+                        rebuild: false,
+                        transaction,
+                        _target_transitions: target_transitions,
+                    };
+                    // Provider-scoped guards keep refreshes from observing the
+                    // tentative values. Do not retain the shared global
+                    // barrier across an unbounded secret-store retry.
+                    drop(reload);
+                    tokio::spawn(reconciliation.run());
+                    return Err(EngineError::Internal(
+                        error.context("provider secret rollback retry scheduled"),
+                    ));
                 }
                 return Err(EngineError::Internal(error));
             }
-        }
-        let mut provider_generations = self.provider_generations.lock().unwrap();
+        };
+        // Retire the previous backend before changing its durable definition.
+        // The retirement owns cleanup and registry rollback independently of
+        // this request future, so cancellation cannot expose a closing backend
+        // or lose the previous process tree.
+        let retirement = self
+            .retire_config_backends_matching_ids_locked(
+                &target_ids,
+                BACKEND_RETIREMENT_TIMEOUT,
+                ProviderReloadGuard::shared(reload),
+                target_transitions,
+                Some(secret_transaction),
+            )
+            .await?;
         {
             let mut config = self.config.lock().unwrap();
             let mut next = config.clone();
             let entry = next.providers.entry(id.to_string()).or_default();
+            let runtime_kind_changed = entry.kind != req.kind;
             entry.kind = req.kind.clone();
+            if runtime_kind_changed {
+                // Explicit commands speak one vendor transport. Carrying one
+                // across a kind change can launch a valid but incompatible
+                // executable (for example Codex as the Cursor SDK Bridge).
+                entry.command = None;
+            }
             if let Some(base_url) = req.base_url.clone().filter(|url| !url.is_empty()) {
                 entry.base_url = Some(base_url);
             }
@@ -4312,29 +5177,16 @@ impl Engine {
                     entry.query_params = req.query_params.clone();
                 }
             }
-            if !next.provider_order.is_empty()
-                && !next.provider_order.iter().any(|provider| provider == id)
-            {
-                next.provider_order.push(id.to_string());
-            }
-            if let Err(error) = self.persist_config_result(&next) {
-                if let Err(rollback) = restore_secret_snapshot(&self.secrets, &secret_snapshot) {
-                    return Err(EngineError::Internal(anyhow!(
-                        "persisting provider config failed: {error}; restoring prior secrets also failed: {rollback:#}"
-                    )));
-                }
-                return Err(error);
+            if let Some(path) = &self.config_file {
+                next.save_to(path).with_context(|| {
+                    format!("persisting provider configuration to {}", path.display())
+                })?;
             }
             *config = next;
-            self.reload_providers_from_config(&config);
         }
-        if let Err(error) = self.reset_provider_route_state_locked(id, &mut provider_generations) {
-            tracing::warn!(
-                provider = id,
-                "failed to clear stale route health: {error:#}"
-            );
-        }
-        drop(provider_generations);
+        // Keep the registry transition serialized until the new durable
+        // definition and its credentials are committed.
+        retirement.publish().await?;
         let config = self.config.lock().unwrap();
         let registry = self.providers.read().unwrap();
         let pc = config.providers.get(id).cloned().unwrap_or_default();
@@ -4347,9 +5199,9 @@ impl Engine {
             settings: pc.settings.clone(),
             has_credentials,
             category: trouve_providers::catalog::provider_category(
-                id,
+                &req.kind,
                 &auth,
-                req.base_url.as_deref(),
+                pc.base_url.as_deref(),
             ),
             auth,
             experimental: false,
@@ -4357,54 +5209,92 @@ impl Engine {
     }
 
     /// Remove a provider from the config and its stored API key.
-    pub fn delete_provider(&self, id: &str) -> Result<(), EngineError> {
+    pub async fn delete_provider(self: &Arc<Self>, id: &str) -> Result<(), EngineError> {
         let provider_lock = self.provider_lock(id);
-        let _provider_guard = provider_lock.lock().unwrap();
-        let mut provider_generations = self.provider_generations.lock().unwrap();
-        let secret_names = {
+        let provider_guard = provider_lock.lock_owned().await;
+        let secret_names = self
+            .config
+            .lock()
+            .unwrap()
+            .providers
+            .get(id)
+            .ok_or_else(|| EngineError::NotFound(format!("provider {id}")))?
+            .secret_names
+            .clone();
+        let target_ids = HashSet::from([id.to_string()]);
+        // Teardown is the only fallible part of the registry transition. Do it
+        // before deleting durable configuration or credentials so an error is
+        // reported only while the requested deletion is still uncommitted.
+        let mut retirement = self
+            .retire_config_backends_matching_ids(&target_ids)
+            .await?;
+        {
             let mut config = self.config.lock().unwrap();
             let mut next = config.clone();
-            let removed = next
-                .providers
-                .remove(id)
-                .ok_or_else(|| EngineError::NotFound(format!("provider {id}")))?;
-            next.provider_order.retain(|provider| provider != id);
-            self.persist_config_result(&next)?;
+            next.providers.remove(id);
+            next.provider_order.retain(|provider_id| provider_id != id);
+            if let Some(path) = &self.config_file {
+                next.save_to(path).with_context(|| {
+                    format!("persisting provider configuration to {}", path.display())
+                })?;
+            }
             *config = next;
-            self.reload_providers_from_config(&config);
-            removed.secret_names
         };
-        let _ = self
-            .secrets
-            .delete(&trouve_providers::secrets::api_key_secret(id));
-        let _ = self
-            .secrets
-            .delete(&trouve_providers::secrets::oauth_secret(id));
-        for name in secret_names {
-            let _ = self
-                .secrets
-                .delete(&trouve_providers::secrets::provider_secret(id, &name));
+        // API-backed providers have no backend instance for retirement to
+        // detach. Remove the config-owned request path as soon as the durable
+        // config commit succeeds instead of leaving it callable during
+        // keychain I/O. A programmatically injected provider with the same id
+        // is an independent overlay and must remain continuously available.
+        let injected = self.injected_providers.lock().unwrap().get(id).cloned();
+        {
+            let mut providers = self.providers.write().unwrap();
+            if let Some(injected) = injected {
+                providers.insert(id.to_string(), injected);
+            } else {
+                providers.remove(id);
+            }
         }
-        if let Err(error) = self.reset_provider_route_state_locked(id, &mut provider_generations) {
-            tracing::warn!(
-                provider = id,
-                "failed to clear stale route health: {error:#}"
-            );
-        }
+        // The durable definition is now gone. Keep only the provider-scoped
+        // fences while slow keychain cleanup finishes so unrelated exclusive
+        // runtime transitions and registry refreshes can proceed.
+        retirement.release_reload_barrier();
+        let mut secret_keys = vec![
+            trouve_providers::secrets::api_key_secret(id),
+            trouve_providers::secrets::oauth_secret(id),
+        ];
+        secret_keys.extend(
+            secret_names
+                .into_iter()
+                .map(|name| trouve_providers::secrets::provider_secret(id, &name)),
+        );
+        let secret_store = self.secrets.clone();
+        let deletion = tokio::task::spawn_blocking(move || {
+            for key in secret_keys {
+                let _ = secret_store.delete(&key);
+            }
+        });
+        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(supervise_provider_secret_deletion(
+            deletion,
+            retirement,
+            provider_guard,
+            completion_tx,
+        ));
+        completion_rx.await.map_err(|error| {
+            EngineError::Internal(anyhow!(
+                "provider deletion supervisor failed before acknowledgement: {error}"
+            ))
+        })??;
         Ok(())
     }
 
-    /// Replace the explicit provider preference prefix. Omitted providers
-    /// remain routable after the listed entries.
+    /// Replace the explicit provider preference prefix. Omitted configured
+    /// providers remain eligible after the listed entries.
     pub fn set_provider_order(
         &self,
         provider_ids: &[String],
         expected_provider_ids: Option<&[String]>,
     ) -> Result<(), EngineError> {
-        // Hold the same config boundary used by provider CRUD while deriving
-        // routable identities and committing the order. Provider CRUD updates
-        // registries before releasing this lock, so a concurrent delete can
-        // never leave its stale id in a newly persisted order.
         let mut config = self.config.lock().unwrap();
         let mut known: HashSet<String> = self.providers.read().unwrap().keys().cloned().collect();
         known.extend(self.backends.read().unwrap().keys().cloned());
@@ -4447,85 +5337,92 @@ impl Engine {
         }
         let mut next = config.clone();
         next.provider_order = provider_ids.to_vec();
-        self.persist_config_result(&next)?;
+        if let Some(path) = &self.config_file {
+            next.save_to(path)
+                .with_context(|| format!("persisting provider order to {}", path.display()))?;
+        }
         *config = next;
         Ok(())
     }
 
-    fn provider_lock(&self, id: &str) -> Arc<Mutex<()>> {
+    fn provider_lock(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
         self.provider_locks
             .lock()
             .unwrap()
             .entry(id.to_string())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
     }
 
-    #[cfg(test)]
-    fn provider_generation(&self, id: &str) -> u64 {
-        self.provider_generations
+    fn provider_transition_lock(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.provider_transition_locks
             .lock()
             .unwrap()
-            .get(id)
-            .copied()
-            .unwrap_or(0)
+            .entry(id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
-    fn provider_registry_snapshot(&self) -> ProviderRegistrySnapshot {
-        let generations = self.provider_generations.lock().unwrap();
-        let providers = self
-            .providers
-            .read()
-            .unwrap()
-            .iter()
-            .map(|(id, provider)| {
-                (
-                    id.clone(),
-                    generations.get(id).copied().unwrap_or(0),
-                    provider.clone(),
-                )
-            })
-            .collect();
-        let backends = self
-            .backends
-            .read()
-            .unwrap()
-            .iter()
-            .map(|(id, backend)| {
-                (
-                    id.clone(),
-                    generations.get(id).copied().unwrap_or(0),
-                    backend.clone(),
-                )
-            })
-            .collect();
-        (providers, backends)
-    }
-
-    fn with_current_provider_generation<T>(
+    fn try_lock_provider_transitions(
         &self,
-        id: &str,
-        expected: u64,
-        operation: impl FnOnce() -> Result<T>,
-    ) -> Result<Option<T>> {
-        let generations = self.provider_generations.lock().unwrap();
-        if generations.get(id).copied().unwrap_or(0) != expected {
-            return Ok(None);
+        target_ids: &HashSet<String>,
+    ) -> std::result::Result<Vec<tokio::sync::OwnedMutexGuard<()>>, String> {
+        let mut ids = target_ids.iter().cloned().collect::<Vec<_>>();
+        ids.sort_unstable();
+        let locks = ids
+            .into_iter()
+            .map(|id| {
+                let lock = self.provider_transition_lock(&id);
+                (id, lock)
+            })
+            .collect::<Vec<_>>();
+        let mut guards = Vec::with_capacity(locks.len());
+        for (id, lock) in locks {
+            match lock.try_lock_owned() {
+                Ok(guard) => guards.push(guard),
+                Err(_) => return Err(id),
+            }
         }
-        operation().map(Some)
+        Ok(guards)
     }
 
-    fn reset_provider_route_state_locked(
+    /// Acquire provider-scoped transition locks before retaining the shared
+    /// global reload barrier. Briefly wait for transient credential recovery,
+    /// but surface a conflict instead of leaving an ordinary provider request
+    /// queued forever behind a permanently failing secret store.
+    async fn lock_provider_transitions_with_shared_reload(
         &self,
-        id: &str,
-        generations: &mut HashMap<String, u64>,
-    ) -> Result<()> {
-        let generation = generations.entry(id.to_string()).or_default();
-        *generation = generation
-            .checked_add(1)
-            .context("provider generation exhausted")?;
-        self.turn_scheduler.reset_provider_outcomes(id);
-        self.store.clear_route_health(id)
+        target_ids: &HashSet<String>,
+    ) -> Result<
+        (
+            tokio::sync::OwnedRwLockReadGuard<()>,
+            Vec<tokio::sync::OwnedMutexGuard<()>>,
+        ),
+        EngineError,
+    > {
+        let mut ids = target_ids.iter().cloned().collect::<Vec<_>>();
+        ids.sort_unstable();
+        let mut guards = Vec::with_capacity(ids.len());
+        for id in ids {
+            let lock = self.provider_transition_lock(&id);
+            let guard = tokio::time::timeout(
+                PROVIDER_TRANSITION_WAIT_TIMEOUT,
+                lock.lock_owned(),
+            )
+            .await
+            .map_err(|_| {
+                EngineError::Conflict(format!(
+                    "provider {id} is still reconciling credentials; repair the secret store and retry"
+                ))
+            })?;
+            guards.push(guard);
+        }
+        // Exclusive paths only probe provider locks while holding the global
+        // barrier; they never await them. Acquiring provider locks first is
+        // therefore deadlock-free and, critically, never pins the global
+        // barrier behind a stalled credential reconciliation.
+        let reload = self.provider_reload.clone().read_owned().await;
+        Ok((reload, guards))
     }
 
     // --- OAuth login (subscription providers) ---------------------------------
@@ -4616,7 +5513,7 @@ impl Engine {
             let id = id.to_string();
             tokio::spawn(async move {
                 let result = oauth_flow::device_poll(&oauth, &device).await;
-                engine.finish_login(&id, result);
+                engine.finish_login(&id, result).await;
             });
             Ok(started)
         } else if oauth.authorization_url.is_some() {
@@ -4663,7 +5560,7 @@ impl Engine {
                         .await
                 }
                 .await;
-                engine.finish_login(&id, result);
+                engine.finish_login(&id, result).await;
             });
             Ok(started)
         } else {
@@ -4731,9 +5628,9 @@ impl Engine {
         Ok(started)
     }
 
-    // --- managed vendor CLIs ---------------------------------------------------
+    // --- managed agent runtimes ------------------------------------------------
 
-    /// Install state of every vendor CLI trouve can manage: the binary that
+    /// Install state of every vendor agent runtime trouve can manage: the binary that
     /// would run (managed install beats PATH), its version, and whether the
     /// vendor serves something newer (best-effort network check, cached).
     pub async fn list_clis(&self) -> trouve_protocol::CliList {
@@ -4749,7 +5646,7 @@ impl Engine {
                     .providers
                     .values()
                     .filter(|pc| cli_for_kind(&pc.kind) == Some(id))
-                    .find_map(|pc| pc.command.clone())
+                    .find_map(configured_runtime_command)
             };
             let managed = cli::installed(&self.data_dir, id);
             let (source, path, installed_version) = if let Some(cmd) = explicit {
@@ -4785,7 +5682,7 @@ impl Engine {
         trouve_protocol::CliList { clis }
     }
 
-    /// Latest vendor version for one CLI, cached for an hour; None when the
+    /// Latest vendor version for one managed runtime, cached for an hour; None when the
     /// lookup fails (offline is fine — the UI just can't offer updates).
     async fn cli_latest_version(&self, id: trouve_agents::install::CliId) -> Option<String> {
         const TTL: std::time::Duration = std::time::Duration::from_secs(3600);
@@ -4817,22 +5714,32 @@ impl Engine {
         latest
     }
 
-    /// Start downloading the newest build of a vendor CLI into trouve's
+    /// Start downloading the newest build of a vendor agent runtime into trouve's
     /// managed directory. Progress is reported by `cli_install_status`; on
     /// success the backend registry reloads so new turns use the new binary.
     pub fn start_cli_install(self: &Arc<Self>, id: &str) -> Result<(), EngineError> {
         let cli = trouve_agents::install::CliId::parse(id)
             .ok_or_else(|| EngineError::NotFound(format!("cli {id}")))?;
+        let state_id = cli.as_str();
         let progress = Arc::new(trouve_agents::install::Progress::default());
         {
+            let operations = self.cli_runtime_operations.lock().unwrap();
+            if operations.contains(state_id) {
+                return Err(EngineError::Conflict(format!(
+                    "an uninstall for {id} is already in progress"
+                )));
+            }
             let mut installs = self.cli_installs.lock().unwrap();
-            if matches!(installs.get(id), Some(CliInstallState::Pending { .. })) {
+            if matches!(
+                installs.get(state_id),
+                Some(CliInstallState::Pending { .. })
+            ) {
                 return Err(EngineError::Conflict(format!(
                     "an install for {id} is already in progress"
                 )));
             }
             installs.insert(
-                id.to_string(),
+                state_id.to_string(),
                 CliInstallState::Pending {
                     version: None,
                     progress: progress.clone(),
@@ -4840,12 +5747,30 @@ impl Engine {
             );
         }
         let engine = self.clone();
-        let id_owned = id.to_string();
+        let id_owned = state_id.to_string();
         tokio::spawn(async move {
             let result = async {
-                let version = trouve_agents::install::latest_version(cli)
-                    .await
-                    .map_err(|e| e.to_string())?;
+                #[cfg(test)]
+                let injected_install = engine.test_cli_install_result.lock().unwrap().take();
+                #[cfg(not(test))]
+                let injected_install: Option<(
+                    String,
+                    trouve_agents::install::ActivationOutcome,
+                )> = None;
+                let version = match injected_install.as_ref() {
+                    Some((version, _)) => version.clone(),
+                    None => {
+                        match trouve_agents::install::latest_version_for_install(cli, &progress)
+                            .await
+                        {
+                            Ok(version) => version,
+                            Err(trouve_agents::install::InstallError::Cancelled) => {
+                                return Ok(None);
+                            }
+                            Err(error) => return Err(error.to_string()),
+                        }
+                    }
+                };
                 engine.cli_installs.lock().unwrap().insert(
                     id_owned.clone(),
                     CliInstallState::Pending {
@@ -4853,23 +5778,99 @@ impl Engine {
                         progress: progress.clone(),
                     },
                 );
-                match trouve_agents::install::install(&engine.data_dir, cli, &version, &progress)
+                if cli == trouve_agents::install::CliId::CursorSdkBridge {
+                    // Download and verify without blocking provider settings or
+                    // disturbing any live backend. Only the short activation
+                    // transition needs serialization.
+                    let prepared = match trouve_agents::install::prepare_install(
+                        &engine.data_dir,
+                        cli,
+                        &version,
+                        &progress,
+                    )
                     .await
-                {
-                    Ok(_) => Ok(Some(version)),
-                    Err(trouve_agents::install::InstallError::Cancelled) => Ok(None),
-                    Err(e) => Err(e.to_string()),
+                    {
+                        Ok(prepared) => prepared,
+                        Err(trouve_agents::install::InstallError::Cancelled) => return Ok(None),
+                        Err(error) => return Err(error.to_string()),
+                    };
+
+                    // Cancellation remains responsive while another provider
+                    // transition or the previous backend's bounded teardown is
+                    // in progress. Once retirement starts, its detached task
+                    // completes cleanup and registry rollback independently.
+                    let retirement = engine.retire_config_backends_for_runtime(cli);
+                    tokio::pin!(retirement);
+                    let retirement = tokio::select! {
+                        result = &mut retirement => result.map_err(|error| {
+                            format!("stopping the active Cursor SDK runtime: {error}")
+                        })?,
+                        _ = async {
+                            while !progress.cancelled() {
+                                tokio::time::sleep(Duration::from_millis(25)).await;
+                            }
+                        } => return Ok(None),
+                    };
+                    if progress.cancelled() {
+                        return Ok(None);
+                    }
+
+                    let activation_progress = progress.clone();
+                    let activation = tokio::task::spawn_blocking(move || {
+                        prepared.activate_cancellable(&activation_progress)
+                    })
+                    .await;
+                    let install_result = match activation {
+                        Ok(Ok(outcome)) => {
+                            let (_, warning) = outcome.into_parts();
+                            Ok(Some((version, warning)))
+                        }
+                        Ok(Err(trouve_agents::install::InstallError::Cancelled)) => Ok(None),
+                        Ok(Err(error)) => Err(error.to_string()),
+                        Err(error) => Err(format!(
+                            "managed Cursor runtime activation task failed: {error}"
+                        )),
+                    };
+                    // Activation success, failure, and late cancellation all
+                    // replace the retired Cursor pools before releasing the
+                    // transition lock.
+                    retirement
+                        .publish()
+                        .await
+                        .map_err(|error| format!("publishing the Cursor runtime: {error}"))?;
+                    install_result
+                } else {
+                    let install = match injected_install {
+                        Some((_, outcome)) => Ok(outcome),
+                        None => {
+                            trouve_agents::install::install(
+                                &engine.data_dir,
+                                cli,
+                                &version,
+                                &progress,
+                            )
+                            .await
+                        }
+                    };
+                    match install {
+                        Ok(outcome) => {
+                            let (_, warning) = outcome.into_parts();
+                            let warning = engine
+                                .reload_after_committed_runtime_install(cli, &version, warning)
+                                .await;
+                            Ok(Some((version, warning)))
+                        }
+                        Err(trouve_agents::install::InstallError::Cancelled) => Ok(None),
+                        Err(error) => Err(error.to_string()),
+                    }
                 }
             }
             .await;
             let mut installs = engine.cli_installs.lock().unwrap();
             match result {
-                Ok(Some(version)) => {
-                    // The managed binary now exists; rebuild backends so it
-                    // takes over from any PATH resolution.
-                    engine.reload_providers();
+                Ok(Some((version, warning))) => {
                     engine.cli_latest.lock().unwrap().remove(id_owned.as_str());
-                    installs.insert(id_owned, CliInstallState::Success(version));
+                    installs.insert(id_owned, CliInstallState::Success { version, warning });
                 }
                 // Cancelled: back to "none", like it never started.
                 Ok(None) => {
@@ -4886,12 +5887,16 @@ impl Engine {
     /// Ask an in-flight install started with `start_cli_install` to stop.
     /// The task notices at its next chunk and clears the install state.
     pub fn cancel_cli_install(&self, id: &str) -> Result<(), EngineError> {
-        match self.cli_installs.lock().unwrap().get(id) {
+        let state_id = canonical_cli_runtime_id(id);
+        match self.cli_installs.lock().unwrap().get(state_id) {
             Some(CliInstallState::Pending { progress, .. }) => {
-                progress
-                    .cancel
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
-                Ok(())
+                if progress.cancel_before_activation_commit() {
+                    Ok(())
+                } else {
+                    Err(EngineError::Conflict(format!(
+                        "the {id} install has already committed and can no longer be cancelled"
+                    )))
+                }
             }
             _ => Err(EngineError::NotFound(format!(
                 "no install for {id} is in progress"
@@ -4901,37 +5906,85 @@ impl Engine {
 
     /// Remove the managed install of a CLI (PATH installs are untouched).
     /// For llama-server the sidecar is stopped first.
-    pub async fn uninstall_cli(&self, id: &str) -> Result<(), EngineError> {
+    pub async fn uninstall_cli(self: &Arc<Self>, id: &str) -> Result<(), EngineError> {
         let cli = trouve_agents::install::CliId::parse(id)
             .ok_or_else(|| EngineError::NotFound(format!("cli {id}")))?;
-        {
+        let state_id = cli.as_str();
+        let _runtime_operation = {
+            let mut operations = self.cli_runtime_operations.lock().unwrap();
+            if operations.contains(state_id) {
+                return Err(EngineError::Conflict(format!(
+                    "an uninstall for {id} is already in progress"
+                )));
+            }
             let installs = self.cli_installs.lock().unwrap();
-            if matches!(installs.get(id), Some(CliInstallState::Pending { .. })) {
+            if matches!(
+                installs.get(state_id),
+                Some(CliInstallState::Pending { .. })
+            ) {
                 return Err(EngineError::Conflict(format!(
                     "an install for {id} is in progress — cancel it first"
                 )));
             }
-        }
+            operations.insert(state_id.to_string());
+            CliRuntimeOperationGuard {
+                operations: self.cli_runtime_operations.clone(),
+                id: state_id.to_string(),
+            }
+        };
         if cli == trouve_agents::install::CliId::LlamaServer {
             self.local_manager.stop().await;
-            self.title_model.stop().await;
         }
-        trouve_agents::install::uninstall(&self.data_dir, cli)
-            .map_err(|e| EngineError::Internal(e.into()))?;
+        let retirement = self.retire_config_backends_for_runtime(cli).await?;
+        // Runtime-specific teardown removes the registry's leased wrapper
+        // before returning. There is deliberately no await between detaching
+        // it and publishing its replacement: cancellation cannot strand a
+        // missing registry entry. Delayed turn clones remain protected by the
+        // install layer and surface a retryable conflict.
+        let mut lease_attempt = 0;
+        let uninstall = loop {
+            match trouve_agents::install::uninstall(&self.data_dir, cli) {
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && lease_attempt < RUNTIME_UNINSTALL_LEASE_RETRIES =>
+                {
+                    lease_attempt += 1;
+                    tokio::time::sleep(RUNTIME_UNINSTALL_LEASE_RETRY_DELAY).await;
+                }
+                result => break result,
+            }
+        }
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                EngineError::Conflict(format!(
+                    "managed {} runtime is still in use; retry uninstall after active turns finish",
+                    cli.display_name()
+                ))
+            } else {
+                EngineError::Internal(error.into())
+            }
+        });
         // Drop any stale success/failed state so status reads "none", and
         // rebuild backends so they fall back to PATH resolution (or none).
-        self.cli_installs.lock().unwrap().remove(id);
-        self.reload_providers();
+        if uninstall.is_ok() {
+            self.cli_installs.lock().unwrap().remove(state_id);
+        }
+        // Even on a filesystem error, replace the now-closed backend pool so
+        // the still-installed runtime can accept turns again.
+        retirement.publish().await?;
+        uninstall?;
         Ok(())
     }
 
     /// Report the state of an install started with `start_cli_install`.
     pub fn cli_install_status(&self, id: &str) -> trouve_protocol::CliInstallStatus {
-        match self.cli_installs.lock().unwrap().get(id) {
+        let state_id = canonical_cli_runtime_id(id);
+        match self.cli_installs.lock().unwrap().get(state_id) {
             None => trouve_protocol::CliInstallStatus {
                 status: "none".into(),
                 version: None,
                 error: None,
+                warning: None,
                 received_bytes: 0,
                 total_bytes: 0,
             },
@@ -4941,21 +5994,26 @@ impl Engine {
                     status: "pending".into(),
                     version: version.clone(),
                     error: None,
+                    warning: None,
                     received_bytes: progress.received.load(Relaxed),
                     total_bytes: progress.total.load(Relaxed),
                 }
             }
-            Some(CliInstallState::Success(version)) => trouve_protocol::CliInstallStatus {
-                status: "success".into(),
-                version: Some(version.clone()),
-                error: None,
-                received_bytes: 0,
-                total_bytes: 0,
-            },
+            Some(CliInstallState::Success { version, warning }) => {
+                trouve_protocol::CliInstallStatus {
+                    status: "success".into(),
+                    version: Some(version.clone()),
+                    error: None,
+                    warning: warning.clone(),
+                    received_bytes: 0,
+                    total_bytes: 0,
+                }
+            }
             Some(CliInstallState::Failed(e)) => trouve_protocol::CliInstallStatus {
                 status: "failed".into(),
                 version: None,
                 error: Some(e.clone()),
+                warning: None,
                 received_bytes: 0,
                 total_bytes: 0,
             },
@@ -4969,11 +6027,11 @@ impl Engine {
         Ok(self.store.list_automations()?)
     }
 
-    pub fn create_automation(
+    pub async fn create_automation(
         &self,
         req: trouve_protocol::UpsertAutomationRequest,
     ) -> Result<trouve_protocol::Automation, EngineError> {
-        self.validate_automation(&req)?;
+        let (validated_model, model_options) = self.validate_automation(&req).await?;
         let next_run_at = if req.enabled {
             crate::automations::next_run(&req.schedule, chrono::Local::now())
                 .map(|t| t.to_rfc3339())
@@ -4988,6 +6046,7 @@ impl Engine {
             mode: req.mode,
             model: req.model,
             thinking_level: req.thinking_level,
+            model_options,
             permission_mode: req.permission_mode,
             schedule: req.schedule,
             enabled: req.enabled,
@@ -4997,26 +6056,74 @@ impl Engine {
             last_error: String::new(),
             created_at: chrono::Utc::now().to_rfc3339(),
         };
+        let mutation_state = self.automation_mutation_state(&automation.id);
+        let mut version = mutation_state.version.lock().await;
         self.store.insert_automation(&automation)?;
+        version.generation = version.generation.saturating_add(1);
+        version.definition = Some(automation.clone());
+        self.remember_automation_model_options_validation(
+            &automation,
+            validated_model,
+            automation.model_options.clone(),
+            version.generation,
+            mutation_state.clone(),
+        );
         Ok(automation)
     }
 
-    pub fn update_automation(
+    pub async fn update_automation(
         &self,
         id: &str,
         req: trouve_protocol::UpsertAutomationRequest,
     ) -> Result<trouve_protocol::Automation, EngineError> {
-        self.validate_automation(&req)?;
+        let snapshot = self.automation_snapshot(id).await?;
+        let expected = &snapshot.automation;
+        let pausing_only = expected.enabled
+            && !req.enabled
+            && expected.name == req.name
+            && expected.prompt == req.prompt
+            && expected.workspace_id == req.workspace_id
+            && expected.mode == req.mode
+            && expected.model == req.model
+            && expected.thinking_level == req.thinking_level
+            && expected.model_options == req.model_options
+            && expected.permission_mode == req.permission_mode
+            && expected.schedule == req.schedule;
+        let validation = if pausing_only {
+            None
+        } else {
+            Some(self.validate_automation(&req).await?)
+        };
+        let model_options = validation
+            .as_ref()
+            .map_or_else(|| req.model_options.clone(), |(_, options)| options.clone());
+        let mut version = snapshot.mutation_state.version.lock().await;
+        if version.generation != snapshot.generation
+            || !version
+                .definition
+                .as_ref()
+                .is_some_and(|current| automation_definition_matches(current, expected))
+        {
+            return Err(EngineError::Conflict(format!(
+                "automation {id} changed while its model options were validated; reload and retry"
+            )));
+        }
         let mut automation = self
             .store
             .automation(id)?
             .ok_or_else(|| EngineError::NotFound(format!("automation {id}")))?;
+        if !automation_definition_matches(&automation, expected) {
+            return Err(EngineError::Conflict(format!(
+                "automation {id} changed while its model options were validated; reload and retry"
+            )));
+        }
         automation.name = req.name;
         automation.prompt = req.prompt;
         automation.workspace_id = req.workspace_id;
         automation.mode = req.mode;
         automation.model = req.model;
         automation.thinking_level = req.thinking_level;
+        automation.model_options = model_options;
         automation.permission_mode = req.permission_mode;
         automation.schedule = req.schedule;
         automation.enabled = req.enabled;
@@ -5026,21 +6133,174 @@ impl Engine {
         } else {
             None
         };
-        self.store.update_automation(&automation)?;
+        if !self.store.update_automation(&automation)? {
+            return Err(EngineError::NotFound(format!("automation {id}")));
+        }
+        version.generation = version.generation.saturating_add(1);
+        version.definition = Some(automation.clone());
+        if let Some((validated_model, validated_options)) = validation {
+            self.remember_automation_model_options_validation(
+                &automation,
+                validated_model,
+                validated_options,
+                version.generation,
+                snapshot.mutation_state.clone(),
+            );
+        } else {
+            self.advance_automation_model_options_validation(
+                &automation,
+                version.generation,
+                &snapshot.mutation_state,
+            );
+        }
         Ok(automation)
     }
 
-    pub fn delete_automation(&self, id: &str) -> Result<(), EngineError> {
+    /// Change scheduling state against the latest stored definition. The short
+    /// generation gate lets this narrow mutation commit without waiting for
+    /// provider I/O; any older full edit then fails its stale-generation check.
+    pub async fn set_automation_enabled(
+        &self,
+        id: &str,
+        enabled: bool,
+    ) -> Result<trouve_protocol::Automation, EngineError> {
+        let mutation_state = self.automation_mutation_state(id);
+        let mut version = mutation_state.version.lock().await;
+        let mut automation = self
+            .store
+            .automation(id)?
+            .ok_or_else(|| EngineError::NotFound(format!("automation {id}")))?;
+        if version
+            .definition
+            .as_ref()
+            .is_some_and(|current| !automation_definition_matches(current, &automation))
+        {
+            version.generation = version.generation.saturating_add(1);
+        }
+        automation.enabled = enabled;
+        automation.next_run_at = if enabled {
+            crate::automations::next_run(&automation.schedule, chrono::Local::now())
+                .map(|time| time.to_rfc3339())
+        } else {
+            None
+        };
+        if !self.store.update_automation(&automation)? {
+            return Err(EngineError::NotFound(format!("automation {id}")));
+        }
+        version.generation = version.generation.saturating_add(1);
+        version.definition = Some(automation.clone());
+        self.advance_automation_model_options_validation(
+            &automation,
+            version.generation,
+            &mutation_state,
+        );
+        Ok(automation)
+    }
+
+    fn automation_mutation_state(&self, id: &str) -> Arc<AutomationMutationState> {
+        let mut states = self.automation_mutation_states.lock().unwrap();
+        states.retain(|_, state| state.strong_count() > 0);
+        if let Some(state) = states.get(id).and_then(Weak::upgrade) {
+            return state;
+        }
+        let state = Arc::new(AutomationMutationState {
+            version: tokio::sync::Mutex::new(AutomationMutationVersion {
+                generation: 0,
+                definition: None,
+            }),
+        });
+        states.insert(id.to_owned(), Arc::downgrade(&state));
+        state
+    }
+
+    async fn automation_snapshot(&self, id: &str) -> Result<AutomationSnapshot, EngineError> {
+        let mutation_state = self.automation_mutation_state(id);
+        let mut version = mutation_state.version.lock().await;
+        let automation = self
+            .store
+            .automation(id)?
+            .ok_or_else(|| EngineError::NotFound(format!("automation {id}")))?;
+        if version
+            .definition
+            .as_ref()
+            .is_some_and(|current| !automation_definition_matches(current, &automation))
+        {
+            version.generation = version.generation.saturating_add(1);
+        }
+        version.definition = Some(automation.clone());
+        Ok(AutomationSnapshot {
+            automation,
+            generation: version.generation,
+            mutation_state: mutation_state.clone(),
+        })
+    }
+
+    async fn automation_snapshot_for_fire(
+        &self,
+        candidate: &trouve_protocol::Automation,
+    ) -> Result<AutomationSnapshot, EngineError> {
+        let mutation_state = self.automation_mutation_state(&candidate.id);
+        let mut version = mutation_state.version.lock().await;
+        if let Some(current) = &version.definition {
+            if !automation_definition_matches(current, candidate) {
+                return Err(EngineError::Conflict(format!(
+                    "automation {} changed before it could run; retry the run",
+                    candidate.id
+                )));
+            }
+        } else {
+            let current = self
+                .store
+                .automation(&candidate.id)?
+                .ok_or_else(|| EngineError::NotFound(format!("automation {}", candidate.id)))?;
+            if !automation_definition_matches(&current, candidate) {
+                return Err(EngineError::Conflict(format!(
+                    "automation {} changed before it could run; retry the run",
+                    candidate.id
+                )));
+            }
+            version.definition = Some(current);
+        }
+        Ok(AutomationSnapshot {
+            automation: candidate.clone(),
+            generation: version.generation,
+            mutation_state: mutation_state.clone(),
+        })
+    }
+
+    pub async fn delete_automation(&self, id: &str) -> Result<(), EngineError> {
+        let mutation_state = self.automation_mutation_state(id);
+        let mut version = mutation_state.version.lock().await;
         if !self.store.delete_automation(id)? {
             return Err(EngineError::NotFound(format!("automation {id}")));
+        }
+        version.generation = version.generation.saturating_add(1);
+        version.definition = None;
+        self.automation_model_options_validations
+            .lock()
+            .unwrap()
+            .remove(id);
+        let mut states = self.automation_mutation_states.lock().unwrap();
+        if states
+            .get(id)
+            .and_then(Weak::upgrade)
+            .is_some_and(|current| Arc::ptr_eq(&current, &mutation_state))
+        {
+            states.remove(id);
         }
         Ok(())
     }
 
-    fn validate_automation(
+    async fn validate_automation(
         &self,
         req: &trouve_protocol::UpsertAutomationRequest,
-    ) -> Result<(), EngineError> {
+    ) -> Result<
+        (
+            Option<trouve_protocol::ModelInfo>,
+            serde_json::Map<String, serde_json::Value>,
+        ),
+        EngineError,
+    > {
         if req.name.trim().is_empty() {
             return Err(EngineError::BadRequest("automations need a name".into()));
         }
@@ -5056,16 +6316,53 @@ impl Engine {
                 "automation thinking_level must not be empty".into(),
             ));
         }
-        if self.store.open_workspace(&req.workspace_id)?.is_none() {
-            return Err(EngineError::NotFound(format!(
-                "workspace {}",
-                req.workspace_id
-            )));
-        }
+        let workspace = self
+            .store
+            .open_workspace(&req.workspace_id)?
+            .ok_or_else(|| EngineError::NotFound(format!("workspace {}", req.workspace_id)))?;
         if let Some(complaint) = crate::automations::validate(&req.schedule) {
             return Err(EngineError::BadRequest(complaint));
         }
-        Ok(())
+        self.validated_automation_model_options(
+            &workspace,
+            req.mode.as_deref(),
+            req.model.as_deref(),
+            req.thinking_level.as_deref(),
+            &req.model_options,
+            false,
+        )
+        .await
+    }
+
+    async fn validated_automation_model_options(
+        &self,
+        workspace: &trouve_protocol::Workspace,
+        requested_mode: Option<&str>,
+        requested_model: Option<&str>,
+        legacy_thinking_level: Option<&str>,
+        requested_options: &serde_json::Map<String, serde_json::Value>,
+        validate_legacy_only: bool,
+    ) -> Result<
+        (
+            Option<trouve_protocol::ModelInfo>,
+            serde_json::Map<String, serde_json::Value>,
+        ),
+        EngineError,
+    > {
+        if requested_options.is_empty()
+            && (!validate_legacy_only || legacy_thinking_level.is_none())
+        {
+            return Ok((None, serde_json::Map::new()));
+        }
+        let model_id =
+            self.automation_effective_model_id(workspace, requested_mode, requested_model)?;
+        let model = self.resolve_model_info(&model_id).await?;
+        let options = validated_automation_options_for_model(
+            legacy_thinking_level,
+            requested_options,
+            &model,
+        )?;
+        Ok((Some(model), options))
     }
 
     /// Fire an automation immediately, in the background (creating the
@@ -5202,6 +6499,43 @@ impl Engine {
         self: &Arc<Self>,
         automation: &trouve_protocol::Automation,
     ) -> Result<(String, String, u64), EngineError> {
+        let workspace = self
+            .store
+            .open_workspace(&automation.workspace_id)?
+            .ok_or_else(|| {
+                EngineError::NotFound(format!("workspace {}", automation.workspace_id))
+            })?;
+        let plan = self
+            .automation_model_options_for_fire(&workspace, automation)
+            .await?;
+        self.dispatch_automation_plan(plan).await
+    }
+
+    /// Claim the validated automation generation through the irreversible run
+    /// dispatch. Lifecycle mutations serialize behind this claim; a mutation
+    /// that committed after validation is rejected before a session exists.
+    async fn dispatch_automation_plan(
+        self: &Arc<Self>,
+        plan: AutomationDispatchPlan,
+    ) -> Result<(String, String, u64), EngineError> {
+        let AutomationDispatchPlan {
+            snapshot,
+            validated_model,
+            model_options,
+        } = plan;
+        let version = snapshot.mutation_state.version.lock().await;
+        if version.generation != snapshot.generation
+            || !version
+                .definition
+                .as_ref()
+                .is_some_and(|current| automation_definition_matches(current, &snapshot.automation))
+        {
+            return Err(EngineError::Conflict(format!(
+                "automation {} changed before its validated run could dispatch; retry the run",
+                snapshot.automation.id
+            )));
+        }
+        let automation = &snapshot.automation;
         let session = self
             .create_session(trouve_protocol::CreateSessionRequest {
                 workspace_id: automation.workspace_id.clone(),
@@ -5216,18 +6550,14 @@ impl Engine {
                 fetch_latest: true,
             })
             .await?;
-        let mut model_options = serde_json::Map::new();
-        if let Some(thinking_level) = automation.thinking_level.as_ref() {
-            model_options.insert(
-                "thinking_level".into(),
-                serde_json::Value::String(thinking_level.clone()),
-            );
-        }
         let thread = self.create_thread(trouve_protocol::CreateThreadRequest {
             session_id: session.id.clone(),
             title: Some(automation.name.clone()),
             mode: automation.mode.clone(),
-            model: automation.model.clone(),
+            // Pin the exact model whose option schema was validated. Without
+            // this explicit value, a concurrent default change could make
+            // `create_thread` resolve a different model.
+            model: validated_model.or_else(|| automation.model.clone()),
             model_options,
             // Scoped to this fresh run session; it does not change global
             // mode defaults or carry approvals into future runs.
@@ -5240,7 +6570,228 @@ impl Engine {
                 thread.id
             )));
         }
+        drop(version);
         Ok((session.id, thread.id, accepted.turn))
+    }
+
+    async fn automation_model_options_for_fire(
+        &self,
+        workspace: &trouve_protocol::Workspace,
+        automation: &trouve_protocol::Automation,
+    ) -> Result<AutomationDispatchPlan, EngineError> {
+        let snapshot = self.automation_snapshot_for_fire(automation).await?;
+        let automation = &snapshot.automation;
+        if !automation.model_options.is_empty() {
+            let effective_model = self.automation_effective_model_id(
+                workspace,
+                automation.mode.as_deref(),
+                automation.model.as_deref(),
+            )?;
+            let cached = self
+                .automation_model_options_validations
+                .lock()
+                .unwrap()
+                .get(&automation.id)
+                .filter(|cached| {
+                    cached.generation == snapshot.generation
+                        && Arc::ptr_eq(&cached.mutation_state, &snapshot.mutation_state)
+                        && cached.model.id == effective_model
+                        && cached.source_options == automation.model_options
+                })
+                .cloned();
+            if let Some(cached) = cached {
+                if let Some(current_model) = self.known_model_info(&effective_model)
+                    && current_model.options_schema != cached.model.options_schema
+                {
+                    let options = validated_automation_options_for_model(
+                        automation.thinking_level.as_deref(),
+                        &automation.model_options,
+                        &current_model,
+                    )?;
+                    let model_id = current_model.id.clone();
+                    return self
+                        .complete_automation_model_options_for_fire(
+                            &snapshot,
+                            Some(model_id),
+                            options,
+                            AutomationModelOptionsCacheUpdate::Replace(Some(current_model)),
+                        )
+                        .await;
+                }
+                return self
+                    .complete_automation_model_options_for_fire(
+                        &snapshot,
+                        Some(cached.model.id),
+                        cached.validated_options,
+                        AutomationModelOptionsCacheUpdate::Preserve,
+                    )
+                    .await;
+            }
+        }
+
+        match self
+            .validated_automation_model_options(
+                workspace,
+                automation.mode.as_deref(),
+                automation.model.as_deref(),
+                automation.thinking_level.as_deref(),
+                &automation.model_options,
+                true,
+            )
+            .await
+        {
+            Ok((model, options)) => {
+                let model_id = model.as_ref().map(|model| model.id.clone());
+                self.complete_automation_model_options_for_fire(
+                    &snapshot,
+                    model_id,
+                    options,
+                    AutomationModelOptionsCacheUpdate::Replace(model),
+                )
+                .await
+            }
+            Err(error) if automation.model_options.is_empty() => {
+                tracing::warn!(
+                    automation_id = %automation.id,
+                    %error,
+                    "deferring legacy automation thinking validation until its turn"
+                );
+                let options = automation
+                    .thinking_level
+                    .as_ref()
+                    .map(|level| {
+                        serde_json::Map::from_iter([(
+                            "thinking_level".into(),
+                            serde_json::Value::String(level.clone()),
+                        )])
+                    })
+                    .unwrap_or_default();
+                self.complete_automation_model_options_for_fire(
+                    &snapshot,
+                    None,
+                    options,
+                    AutomationModelOptionsCacheUpdate::Replace(None),
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn automation_effective_model_id(
+        &self,
+        workspace: &trouve_protocol::Workspace,
+        requested_mode: Option<&str>,
+        requested_model: Option<&str>,
+    ) -> Result<String, EngineError> {
+        let all_modes = self.resolve_personas(Some(Path::new(&workspace.path)))?;
+        let mode_id = requested_mode.unwrap_or("code");
+        let mode = personas::find_persona(&all_modes, mode_id)
+            .ok_or_else(|| EngineError::BadRequest(format!("unknown persona: {mode_id}")))?;
+        let global_defaults = self.global_defaults.read().unwrap().clone();
+        Ok(requested_model
+            .map(String::from)
+            .or_else(|| mode.default_model.clone())
+            .unwrap_or(global_defaults.model))
+    }
+
+    fn known_model_info(&self, model_id: &str) -> Option<trouve_protocol::ModelInfo> {
+        if let Some(model) = self.known_automatic_model_info(model_id) {
+            return Some(model);
+        }
+        if let Some((_, backend, _)) = self.backend_for(model_id) {
+            return backend
+                .models()
+                .into_iter()
+                .find(|model| model.id == model_id);
+        }
+        let (provider, _) = self.resolve_provider(model_id).ok()?;
+        provider
+            .models()
+            .into_iter()
+            .find(|model| model.id == model_id)
+    }
+
+    fn remember_automation_model_options_validation(
+        &self,
+        automation: &trouve_protocol::Automation,
+        model: Option<trouve_protocol::ModelInfo>,
+        validated_options: serde_json::Map<String, serde_json::Value>,
+        generation: u64,
+        mutation_state: Arc<AutomationMutationState>,
+    ) {
+        let mut validations = self.automation_model_options_validations.lock().unwrap();
+        if let Some(model) = model {
+            validations.insert(
+                automation.id.clone(),
+                AutomationModelOptionsValidation {
+                    model,
+                    source_options: automation.model_options.clone(),
+                    validated_options,
+                    generation,
+                    mutation_state,
+                },
+            );
+        } else {
+            validations.remove(&automation.id);
+        }
+    }
+
+    fn advance_automation_model_options_validation(
+        &self,
+        automation: &trouve_protocol::Automation,
+        generation: u64,
+        mutation_state: &Arc<AutomationMutationState>,
+    ) {
+        let mut validations = self.automation_model_options_validations.lock().unwrap();
+        let keep = validations.get_mut(&automation.id).is_some_and(|cached| {
+            if Arc::ptr_eq(&cached.mutation_state, mutation_state)
+                && cached.source_options == automation.model_options
+            {
+                cached.generation = generation;
+                true
+            } else {
+                false
+            }
+        });
+        if !keep {
+            validations.remove(&automation.id);
+        }
+    }
+
+    async fn complete_automation_model_options_for_fire(
+        &self,
+        snapshot: &AutomationSnapshot,
+        model_id: Option<String>,
+        validated_options: serde_json::Map<String, serde_json::Value>,
+        cache_update: AutomationModelOptionsCacheUpdate,
+    ) -> Result<AutomationDispatchPlan, EngineError> {
+        let version = snapshot.mutation_state.version.lock().await;
+        if version.generation != snapshot.generation
+            || !version
+                .definition
+                .as_ref()
+                .is_some_and(|current| automation_definition_matches(current, &snapshot.automation))
+        {
+            return Err(EngineError::Conflict(format!(
+                "automation {} changed while its model options were validated; retry the run",
+                snapshot.automation.id
+            )));
+        }
+        if let AutomationModelOptionsCacheUpdate::Replace(model) = cache_update {
+            self.remember_automation_model_options_validation(
+                &snapshot.automation,
+                model,
+                validated_options.clone(),
+                snapshot.generation,
+                snapshot.mutation_state.clone(),
+            );
+        }
+        Ok(AutomationDispatchPlan {
+            snapshot: snapshot.clone(),
+            validated_model: model_id,
+            model_options: validated_options,
+        })
     }
 
     async fn monitor_automation_turn(
@@ -5437,7 +6988,6 @@ impl Engine {
             self.injected_providers.lock().unwrap().remove("local");
             self.providers.write().unwrap().remove("local");
             self.local_manager.stop().await;
-            self.title_model.local_model_stopped().await;
         }
         Ok(())
     }
@@ -5649,7 +7199,6 @@ impl Engine {
             .ok_or_else(|| EngineError::NotFound(format!("local model {id}")))?;
         if self.local_manager.running_model().as_deref() == Some(id) {
             self.local_manager.stop().await;
-            self.title_model.local_model_stopped().await;
         }
         self.local_downloads.lock().unwrap().remove(id);
         let gguf = crate::local::gguf_path(&self.data_dir, &entry);
@@ -5673,7 +7222,6 @@ impl Engine {
     /// local turn restarts it).
     pub async fn stop_local_server(&self) {
         self.local_manager.stop().await;
-        self.title_model.local_model_stopped().await;
     }
 
     /// Restart the llama-server sidecar with the model it is serving. The
@@ -5777,8 +7325,8 @@ impl Engine {
         Ok(self.login_status(id))
     }
 
-    fn finish_login(
-        &self,
+    async fn finish_login(
+        self: &Arc<Self>,
         id: &str,
         result: Result<trouve_providers::auth::OAuthTokens, trouve_providers::ProviderError>,
     ) {
@@ -5789,10 +7337,12 @@ impl Engine {
                     self.secrets
                         .set(&trouve_providers::secrets::oauth_secret(id), &raw)
                 }) {
-                Ok(()) => {
-                    self.reload_providers();
-                    LoginState::Success
-                }
+                Ok(()) => match self.reload_provider(id).await {
+                    Ok(()) => LoginState::Success,
+                    Err(error) => {
+                        LoginState::Failed(format!("reloading providers after login: {error}"))
+                    }
+                },
                 Err(e) => LoginState::Failed(format!("storing tokens: {e}")),
             },
             Err(e) => LoginState::Failed(e.to_string()),
@@ -5817,8 +7367,7 @@ impl Engine {
         }
     }
 
-    /// Set the default model for new threads. Provider-qualified values pin
-    /// one route; `auto/<model>` values are selected dynamically.
+    /// Set the default model for new threads (provider-qualified).
     pub fn set_default_model(
         &self,
         model: &str,
@@ -5849,11 +7398,7 @@ impl Engine {
         thinking_level: Option<&str>,
         permission_mode: trouve_protocol::PermissionMode,
     ) -> Result<(), EngineError> {
-        if !model.contains('/') {
-            return Err(EngineError::BadRequest(format!(
-                "model must be provider-qualified (e.g. openai/gpt-4.1-mini): {model}"
-            )));
-        }
+        validate_model_selection(model)?;
         validate_thinking_level(thinking_level)?;
 
         let next_defaults = GlobalDefaults {
@@ -5892,135 +7437,466 @@ impl Engine {
         Ok(())
     }
 
-    /// Current settings and runtime state for session naming.
-    pub fn git_worktree_settings(&self) -> trouve_protocol::GitWorktreeSettings {
-        self.title_model.settings()
+    pub fn session_naming_settings(&self) -> trouve_protocol::SessionNamingSettings {
+        let config = self.config.lock().unwrap();
+        trouve_protocol::SessionNamingSettings {
+            model: config
+                .session_naming_model
+                .clone()
+                .or_else(|| config.default_model.clone())
+                .unwrap_or_default(),
+            derive_branch_name_from_session_title: config
+                .derive_branch_name_from_session_title
+                .unwrap_or(false),
+        }
     }
 
-    /// Current settings paired with the server cursor they are at least as
-    /// fresh as. Read the cursor first so a concurrent status change can only
-    /// make the returned settings newer than the cursor, never older.
-    pub fn git_worktree_settings_snapshot(
+    pub fn session_naming_settings_snapshot(
         &self,
-    ) -> Result<(u64, trouve_protocol::GitWorktreeSettings), EngineError> {
+    ) -> Result<(u64, trouve_protocol::SessionNamingSettings), EngineError> {
         let cursor = self
             .store
             .latest_event_cursor(&trouve_protocol::Scope::Server)?;
-        Ok((cursor, self.git_worktree_settings()))
+        Ok((cursor, self.session_naming_settings()))
     }
 
-    /// Persist and immediately apply session-title lifecycle and placement.
-    pub async fn set_git_worktree_settings(
+    pub async fn set_session_naming_settings(
         &self,
-        behavior: trouve_protocol::TitleModelLoadBehavior,
-        resources: trouve_protocol::TitleModelResourcePolicy,
-        derive_branch_name_from_session_title: Option<bool>,
-    ) -> Result<trouve_protocol::GitWorktreeSettings, EngineError> {
-        if resources == trouve_protocol::TitleModelResourcePolicy::GpuOnly
-            && self.hardware().await.gpus.is_empty()
-        {
+        model: String,
+        derive_branch_name_from_session_title: bool,
+    ) -> Result<trouve_protocol::SessionNamingSettings, EngineError> {
+        let model = model.trim().to_string();
+        if model.is_empty() {
             return Err(EngineError::BadRequest(
-                "GPU-only session naming requires a detected GPU".into(),
+                "session naming model cannot be empty".into(),
             ));
         }
-        let _transition = self.title_model_behavior_transition.lock().await;
-        let derive_branch_name_from_session_title = derive_branch_name_from_session_title
-            .unwrap_or_else(|| self.title_model.derive_branch_name_from_session_title());
+        self.resolve_model_info(&model).await?;
         {
             let mut config = self.config.lock().unwrap();
-            config.title_model_load_behavior = Some(behavior);
-            config.title_model_resource_policy = Some(resources);
+            config.session_naming_model = Some(model);
             config.derive_branch_name_from_session_title =
                 Some(derive_branch_name_from_session_title);
             self.persist_config(&config);
         }
-        self.title_model
-            .set_configuration(behavior, resources, derive_branch_name_from_session_title)
-            .await;
-        Ok(self.git_worktree_settings())
+        let settings = self.session_naming_settings();
+        self.store.append_event(
+            Scope::Server,
+            Event::SessionNamingSettingsUpdated {
+                settings: settings.clone(),
+            },
+        )?;
+        Ok(settings)
     }
 
-    /// Warm the dedicated title model according to its configured lifecycle.
-    /// This is non-blocking and is safe to call once the Tokio runtime exists.
-    pub fn warm_title_model(&self) {
-        self.title_model.warm_on_start();
-    }
-
-    pub fn install_title_model(self: &Arc<Self>) -> Result<(), EngineError> {
-        let engine = Arc::downgrade(self);
-        self.title_model
-            .start_install(move || {
-                if let Some(engine) = engine.upgrade() {
-                    engine.reload_providers();
-                    engine
-                        .cli_latest
-                        .lock()
-                        .unwrap()
-                        .remove(trouve_agents::install::CliId::LlamaServer.as_str());
-                }
-            })
-            .map_err(|error| EngineError::Conflict(error.to_string()))?;
-        Ok(())
-    }
-
-    pub fn cancel_title_model_install(&self) -> Result<(), EngineError> {
-        match self.title_model.cancel_install() {
-            Ok(()) => Ok(()),
-            Err(error) if error.is::<crate::title_model::NoInstallInProgress>() => {
-                Err(EngineError::NotFound(error.to_string()))
-            }
-            Err(error) => Err(EngineError::Conflict(error.to_string())),
-        }
-    }
-
-    /// Derive a title without ever blocking session creation on optional
-    /// model assets or model-quality failures.
-    pub async fn generate_session_title(
+    pub async fn generate_title(
         &self,
+        session_id: &str,
         prompt: &str,
-    ) -> trouve_protocol::GeneratedSessionTitle {
-        let title_model = self.title_model.clone();
-        let prompt_owned = prompt.to_string();
-        let generated = match tokio::time::timeout(SESSION_TITLE_TIMEOUT, async {
-            let mut generation = self.title_model_generation.lock().await;
-            if let Some(previous) = generation.as_mut() {
-                previous.abort();
-                let _ = previous.await;
+        attachments: &[trouve_protocol::AttachmentUpload],
+    ) -> Result<trouve_protocol::GeneratedTitle, EngineError> {
+        let model = self.session_naming_settings().model;
+        let key = title_job_key(session_id, &model, prompt, attachments);
+        let follower = {
+            let mut jobs = self.title_jobs.lock().unwrap();
+            if let Some(job) = jobs.get_mut(&key) {
+                job.waiters.retain(|waiter| !waiter.is_closed());
+                if job.waiters.len() >= MAX_TITLE_JOB_FOLLOWERS {
+                    return Err(EngineError::BadRequest(
+                        "too many callers are waiting for this title".into(),
+                    ));
+                }
+                let (sender, receiver) = tokio::sync::oneshot::channel();
+                job.waiters.push(sender);
+                Some(receiver)
+            } else {
+                if jobs.len() >= MAX_PENDING_TITLE_JOBS {
+                    return Err(EngineError::BadRequest(
+                        "too many title generation requests are waiting".into(),
+                    ));
+                }
+                jobs.insert(key.clone(), TitleJobState::default());
+                None
             }
-            generation.take();
-
-            let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-            *generation = Some(tokio::spawn(async move {
-                let _ = result_tx.send(title_model.generate(&prompt_owned).await);
-            }));
-            drop(generation);
-
-            result_rx
+        };
+        if let Some(follower) = follower {
+            return follower
                 .await
-                .map_err(|error| anyhow!("session title task failed: {error}"))?
+                .map_err(|_| EngineError::BadRequest("title generation was cancelled".into()))?
+                .map_err(EngineError::BadRequest);
+        }
+
+        let leader = TitleJobLeader {
+            jobs: &self.title_jobs,
+            key: Some(key),
+        };
+        let result = self
+            .generate_title_uncoalesced(session_id, prompt, attachments)
+            .await;
+        let shared = result
+            .as_ref()
+            .cloned()
+            .map_err(std::string::ToString::to_string);
+        leader.complete(shared);
+        result
+    }
+
+    async fn generate_title_uncoalesced(
+        &self,
+        session_id: &str,
+        prompt: &str,
+        attachments: &[trouve_protocol::AttachmentUpload],
+    ) -> Result<trouve_protocol::GeneratedTitle, EngineError> {
+        validate_attachment_uploads(attachments)?;
+        let session = self.get_session(session_id)?;
+        let settings = self.session_naming_settings();
+        if settings.model.is_empty() {
+            return Err(EngineError::BadRequest(
+                "configure a session naming model first".into(),
+            ));
+        }
+        let model_info = self.resolve_model_info(&settings.model).await?;
+        let model_options = crate::title_model::model_options(&model_info);
+        if routing::automatic_model_name(&settings.model).is_some() {
+            return self
+                .generate_automatic_title(
+                    &session,
+                    &settings.model,
+                    prompt,
+                    attachments,
+                    &model_info,
+                    &model_options,
+                )
+                .await;
+        }
+        if let Some((_, backend, model_name)) = self.backend_for(&settings.model) {
+            return self
+                .generate_title_with_backend(
+                    &session,
+                    prompt,
+                    attachments,
+                    model_info.supports_images,
+                    &model_options,
+                    backend,
+                    model_name,
+                )
+                .await;
+        }
+        let (provider, model_name) = self.resolve_provider(&settings.model)?;
+        let timeout = if settings.model.starts_with("local/") {
+            LOCAL_SESSION_TITLE_TIMEOUT
+        } else {
+            SESSION_TITLE_TIMEOUT
+        };
+        self.generate_title_with_provider(
+            prompt,
+            attachments,
+            model_info.supports_images,
+            &model_options,
+            provider,
+            model_name,
+            timeout,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn generate_title_with_backend(
+        &self,
+        session: &Session,
+        prompt: &str,
+        attachments: &[trouve_protocol::AttachmentUpload],
+        supports_images: bool,
+        model_options: &serde_json::Map<String, serde_json::Value>,
+        backend: Arc<dyn AgentBackend>,
+        model_name: String,
+    ) -> Result<trouve_protocol::GeneratedTitle, EngineError> {
+        use base64::Engine as _;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        // Naming requests carry raw uploads rather than durable attachments,
+        // so path-only vendors get short-lived opaque copies outside both the
+        // durable store and the session worktree.
+        let mut staged = StagedTitleImages {
+            executor: self.executor.clone(),
+            root: self.title_image_root(),
+            paths: Vec::new(),
+        };
+        let stage_locally = backend.requires_local_image_paths();
+        let backend_attachments = attachments
+            .iter()
+            .filter(|_| supports_images)
+            .filter(|attachment| attachment.mime.starts_with("image/"))
+            .map(|attachment| {
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(&attachment.data)
+                    .map_err(|error| EngineError::BadRequest(error.to_string()))?;
+                let local_path = if stage_locally {
+                    let path = staged.root.join(format!(
+                        "title_{}{}",
+                        uuid::Uuid::new_v4().simple(),
+                        opaque_attachment_extension(&attachment.name)
+                    ));
+                    self.executor
+                        .prepare_attachment_file(&staged.root, &path, &bytes)
+                        .map_err(|error| EngineError::Internal(anyhow!(error)))?;
+                    staged.paths.push(path.clone());
+                    Some(path)
+                } else {
+                    None
+                };
+                Ok(trouve_agents::TurnAttachment {
+                    name: attachment.name.clone(),
+                    mime: attachment.mime.clone(),
+                    bytes: Arc::from(bytes),
+                    local_path,
+                })
+            })
+            .collect::<Result<Vec<_>, EngineError>>()?;
+        let turn = BackendTurn {
+            cancel: cancel.clone(),
+            thread_id: format!("title_{}", uuid::Uuid::new_v4()),
+            worktree: PathBuf::from(&session.worktree_path),
+            session: None,
+            model: model_name,
+            model_options: model_options.clone(),
+            prompt: crate::title_model::backend_prompt(prompt),
+            attachments: backend_attachments,
+            instructions: None,
+            permission: BackendPermission::ReadOnly,
+            tool_free: true,
+            attach_background: false,
+            mcp_bridge: None,
+            mcp_servers: Vec::new(),
+        };
+        let title = tokio::time::timeout(SESSION_TITLE_TIMEOUT, async {
+            let mut stream = backend
+                .run_turn(turn)
+                .await
+                .map_err(|error| EngineError::BadRequest(error.to_string()))?;
+            let mut output = String::new();
+            while let Some(event) = stream.next().await {
+                match event.map_err(|error| EngineError::BadRequest(error.to_string()))? {
+                    BackendEvent::TextDelta(delta) => {
+                        crate::title_model::append_output(&mut output, &delta)?;
+                    }
+                    BackendEvent::ToolStarted { .. }
+                    | BackendEvent::ToolOutput { .. }
+                    | BackendEvent::ToolCompleted { .. } => {
+                        cancel.cancel();
+                        return Err(EngineError::BadRequest(
+                            "naming backend attempted to use a tool".into(),
+                        ));
+                    }
+                    BackendEvent::ApprovalNeeded { responder, .. } => {
+                        let _ = responder.send(false);
+                    }
+                    BackendEvent::QuestionsNeeded { responder, .. } => {
+                        let _ = responder.send(None);
+                    }
+                    _ => {}
+                }
+            }
+            crate::title_model::title_from_output(prompt, &output)
+                .map_err(|error| EngineError::BadRequest(error.to_string()))
         })
         .await
-        {
-            Ok(result) => result,
-            Err(_) => Err(anyhow!("session title generation timed out")),
-        };
-        match generated {
-            Ok(title) => trouve_protocol::GeneratedSessionTitle {
-                title,
-                source: "model".into(),
-            },
-            Err(error) => {
-                tracing::debug!("using heuristic session title: {error:#}");
-                trouve_protocol::GeneratedSessionTitle {
-                    title: crate::title::summarize_session_title(prompt),
-                    source: "heuristic".into(),
+        .map_err(|_| {
+            cancel.cancel();
+            EngineError::BadRequest("title generation timed out".into())
+        })??;
+        Ok(trouve_protocol::GeneratedTitle { title })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn generate_title_with_provider(
+        &self,
+        prompt: &str,
+        attachments: &[trouve_protocol::AttachmentUpload],
+        supports_images: bool,
+        model_options: &serde_json::Map<String, serde_json::Value>,
+        provider: Arc<dyn Provider>,
+        model_name: String,
+        timeout: Duration,
+    ) -> Result<trouve_protocol::GeneratedTitle, EngineError> {
+        let images = attachments
+            .iter()
+            .filter(|_| supports_images)
+            .filter(|attachment| attachment.mime.starts_with("image/"))
+            .map(|attachment| trouve_providers::ToolImage {
+                mime: attachment.mime.clone(),
+                data: attachment.data.clone(),
+            })
+            .collect();
+        let messages = crate::title_model::messages(prompt, images);
+        let title = tokio::time::timeout(timeout, async {
+            let mut stream = provider
+                .stream_chat_with_priority(
+                    &model_name,
+                    &messages,
+                    &[],
+                    model_options,
+                    InferencePriority::Background,
+                )
+                .await
+                .map_err(|error| EngineError::BadRequest(error.to_string()))?;
+            let mut output = String::new();
+            while let Some(event) = stream.next().await {
+                if let ProviderEvent::TextDelta(delta) =
+                    event.map_err(|error| EngineError::BadRequest(error.to_string()))?
+                {
+                    crate::title_model::append_output(&mut output, &delta)?;
                 }
             }
+            crate::title_model::title_from_output(prompt, &output)
+                .map_err(|error| EngineError::BadRequest(error.to_string()))
+        })
+        .await
+        .map_err(|_| EngineError::BadRequest("title generation timed out".into()))??;
+        Ok(trouve_protocol::GeneratedTitle { title })
+    }
+
+    /// Derive a manual rename suggestion from the user-visible conversation,
+    /// rather than retrying only the session's original prompt. Tool output,
+    /// progress, and reasoning are deliberately excluded from this context.
+    pub async fn generate_session_title_from_transcript(
+        &self,
+        session_id: &str,
+    ) -> Result<trouve_protocol::GeneratedTitle, EngineError> {
+        self.get_session(session_id)?;
+        let mut threads = self.list_threads(session_id)?;
+        threads.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        if threads.len() > 8 {
+            let tail = threads.split_off(threads.len() - 4);
+            threads.truncate(4);
+            threads.extend(tail);
         }
+        self.generate_title_from_transcript_threads(session_id, &threads)
+            .await
+    }
+
+    /// Derive a manual rename suggestion for one thread. The thread remains
+    /// independently nameable even when it is the session's initial thread.
+    pub async fn generate_thread_title_from_transcript(
+        &self,
+        thread_id: &str,
+    ) -> Result<trouve_protocol::GeneratedTitle, EngineError> {
+        let thread = self.get_thread(thread_id)?;
+        let session_id = thread.session_id.clone();
+        self.generate_title_from_transcript_threads(&session_id, &[thread])
+            .await
+    }
+
+    async fn generate_title_from_transcript_threads(
+        &self,
+        session_id: &str,
+        threads: &[trouve_protocol::Thread],
+    ) -> Result<trouve_protocol::GeneratedTitle, EngineError> {
+        use base64::Engine as _;
+
+        let mut context = String::new();
+        let mut attachment_refs = Vec::new();
+        for (index, thread) in threads.iter().enumerate() {
+            let events = self.store.thread_naming_events(&thread.id)?;
+            let mut has_content = false;
+            for event in events {
+                let (role, content, attachments) = match event {
+                    Event::UserMessage {
+                        content,
+                        attachments,
+                        background: false,
+                        ..
+                    }
+                    | Event::TurnSteered {
+                        content,
+                        attachments,
+                        ..
+                    } => ("User", content, attachments),
+                    Event::AssistantMessage { content, .. } => {
+                        ("Assistant outcome", content, Vec::new())
+                    }
+                    _ => continue,
+                };
+                let content = content.trim();
+                if content.is_empty() && attachments.is_empty() {
+                    continue;
+                }
+                if !has_content {
+                    if !context.is_empty() {
+                        context.push_str("\n\n");
+                    }
+                    context.push_str(&format!("Thread {}:\n", index + 1));
+                    has_content = true;
+                }
+                if !content.is_empty() {
+                    context.push_str(role);
+                    context.push_str(": ");
+                    context.push_str(content);
+                    context.push('\n');
+                    context = crate::title_model::capped_prompt(&context).into_owned();
+                }
+                attachment_refs.extend(attachments);
+            }
+        }
+        if context.trim().is_empty() && attachment_refs.is_empty() {
+            return Err(EngineError::BadRequest(
+                "the session has no conversation to name".into(),
+            ));
+        }
+
+        let settings = self.session_naming_settings();
+        if settings.model.is_empty() {
+            return Err(EngineError::BadRequest(
+                "configure a session naming model first".into(),
+            ));
+        }
+        let supports_images = self
+            .resolve_model_info(&settings.model)
+            .await?
+            .supports_images;
+        let mut uploads = Vec::new();
+        let mut retained_bytes = 0_u64;
+        if supports_images {
+            for attachment in attachment_refs
+                .into_iter()
+                .rev()
+                .filter(|attachment| attachment.mime.starts_with("image/"))
+                .take(4)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+            {
+                if retained_bytes.saturating_add(attachment.size_bytes) > 20 * 1024 * 1024 {
+                    continue;
+                }
+                let bytes = match self.attachment(&attachment.id).await {
+                    Ok((_, bytes)) => bytes,
+                    Err(EngineError::NotFound(_)) => {
+                        tracing::debug!(
+                            attachment_id = %attachment.id,
+                            "skipping unreadable attachment during transcript naming"
+                        );
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+                retained_bytes = retained_bytes.saturating_add(attachment.size_bytes);
+                uploads.push(trouve_protocol::AttachmentUpload {
+                    name: attachment.name,
+                    mime: attachment.mime,
+                    data: base64::engine::general_purpose::STANDARD.encode(bytes),
+                });
+            }
+        }
+        self.generate_title(session_id, &context, &uploads).await
     }
 
     async fn generate_subagent_title(
         &self,
+        session_id: &str,
         supplied_name: Option<&str>,
         prompt: Option<&str>,
     ) -> Option<String> {
@@ -6028,7 +7904,10 @@ impl Engine {
             Some(name) => name.to_string(),
             None => {
                 let prompt = prompt.map(str::trim).filter(|prompt| !prompt.is_empty())?;
-                self.generate_session_title(prompt).await.title
+                self.generate_title(session_id, prompt, &[])
+                    .await
+                    .ok()?
+                    .title
             }
         };
         let normalized = name.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -6042,38 +7921,496 @@ impl Engine {
     }
 
     pub(crate) fn persist_config(&self, config: &Config) {
-        if let Err(e) = self.persist_config_result(config) {
+        if let Some(path) = &self.config_file
+            && let Err(e) = config.save_to(path)
+        {
             tracing::warn!("failed to persist config: {e}");
         }
     }
 
-    fn persist_config_result(&self, config: &Config) -> Result<(), EngineError> {
-        if let Some(path) = &self.config_file {
-            config.save_to(path).map_err(EngineError::Internal)?;
+    /// Retire only config-owned backends served by one managed runtime. Runtime
+    /// updates use this narrower scope so unrelated vendor backends stay live.
+    async fn retire_config_backends_for_runtime(
+        self: &Arc<Self>,
+        runtime: trouve_agents::install::CliId,
+    ) -> Result<BackendRetirement, EngineError> {
+        let reload = self.provider_reload.clone().write_owned().await;
+        let target_ids = self.configured_provider_ids_for_runtime(runtime);
+        let target_transitions = self
+            .try_lock_provider_transitions(&target_ids)
+            .map_err(|id| {
+                EngineError::Conflict(format!(
+                    "provider {id} is still reconciling credentials; retry the runtime operation after recovery"
+                ))
+            })?;
+        self.retire_config_backends_matching_ids_locked(
+            &target_ids,
+            BACKEND_RETIREMENT_TIMEOUT,
+            ProviderReloadGuard::exclusive(reload),
+            target_transitions,
+            None,
+        )
+        .await
+    }
+
+    fn configured_provider_ids_for_runtime(
+        &self,
+        runtime: trouve_agents::install::CliId,
+    ) -> HashSet<String> {
+        let retired_stable_command = self.data_dir.join("cli/bin").join(runtime.as_str());
+        self.config
+            .lock()
+            .unwrap()
+            .providers
+            .iter()
+            .filter(|(_, provider)| {
+                cli_for_kind(&provider.kind) == Some(runtime)
+                    && configured_runtime_command(provider)
+                        .is_none_or(|command| Path::new(&command) == retired_stable_command)
+            })
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    /// Retire a selected set of config-owned backends transactionally. Targets
+    /// leave the active registry before the first shutdown await, so new turns
+    /// cannot select a closing instance. The shutdown work owns the transition
+    /// lock in a detached task; request cancellation therefore cannot stop
+    /// cleanup or strand registry publication. Failed instances stay in the
+    /// retiring registry under a supervised bounded-backoff retry; a matching
+    /// user transition also retries them before detaching another generation.
+    async fn retire_config_backends_matching_ids(
+        self: &Arc<Self>,
+        target_ids: &HashSet<String>,
+    ) -> Result<BackendRetirement, EngineError> {
+        self.retire_config_backends_matching_ids_with_timeout(
+            target_ids,
+            BACKEND_RETIREMENT_TIMEOUT,
+        )
+        .await
+    }
+
+    async fn retire_config_backends_matching_ids_with_timeout(
+        self: &Arc<Self>,
+        target_ids: &HashSet<String>,
+        timeout: Duration,
+    ) -> Result<BackendRetirement, EngineError> {
+        let (reload, target_transitions) = self
+            .lock_provider_transitions_with_shared_reload(target_ids)
+            .await?;
+        self.retire_config_backends_matching_ids_locked(
+            target_ids,
+            timeout,
+            ProviderReloadGuard::shared(reload),
+            target_transitions,
+            None,
+        )
+        .await
+    }
+
+    async fn retire_config_backends_matching_ids_locked(
+        self: &Arc<Self>,
+        target_ids: &HashSet<String>,
+        timeout: Duration,
+        reload: ProviderReloadGuard,
+        target_transitions: Vec<tokio::sync::OwnedMutexGuard<()>>,
+        secret_transaction: Option<ProviderSecretTransaction>,
+    ) -> Result<BackendRetirement, EngineError> {
+        let retirement = BackendRetirement::new(
+            self,
+            target_ids.clone(),
+            reload,
+            target_transitions,
+            secret_transaction,
+        );
+        let engine = Arc::clone(self);
+        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+        let _retirement_task = tokio::spawn(async move {
+            let deadline = tokio::time::Instant::now() + timeout;
+            let mut retirement = retirement;
+            let completion = loop {
+                let (retiring, detached_active) =
+                    engine.select_retiring_backends(&retirement.target_ids);
+                if detached_active {
+                    retirement.arm_rollback();
+                }
+                if retiring.is_empty() {
+                    break Ok(retirement);
+                }
+                let failures = shutdown_retiring_backend_batch(&engine, retiring, deadline).await;
+                if !failures.is_empty() {
+                    engine.ensure_retiring_backend_retry();
+                    let failure = failures.join("; ");
+                    break match retirement.rollback().await {
+                        Ok(()) => Err(EngineError::Internal(anyhow!(
+                            "backend retirement failed: {failure}"
+                        ))),
+                        Err(rollback) => Err(EngineError::Internal(anyhow!(
+                            "backend retirement failed: {failure}; provider secret rollback failed: {rollback}"
+                        ))),
+                    };
+                }
+            };
+            let _ = completion_tx.send(completion);
+        });
+        completion_rx.await.map_err(|error| {
+            EngineError::Internal(anyhow!(
+                "backend retirement task exited before reporting completion: {error}"
+            ))
+        })?
+    }
+
+    /// Retry previously failed owners before detaching the currently active
+    /// generation. This keeps at most one failed generation per provider even
+    /// when repeated reload/uninstall requests arrive during an outage.
+    fn select_retiring_backends(
+        &self,
+        target_ids: &HashSet<String>,
+    ) -> (RetiringBackendBatch, bool) {
+        let injected = self
+            .injected_backends
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut backends = self.backends.write().unwrap();
+        let mut retiring_backends = self.retiring_backends.lock().unwrap();
+        let mut selected = Vec::new();
+        let mut detached_active = false;
+        for id in target_ids {
+            if let Some(entries) = retiring_backends.get(id)
+                && !entries.is_empty()
+            {
+                selected.extend(entries.iter().cloned().map(|backend| (id.clone(), backend)));
+                continue;
+            }
+            let detach = backends.get(id).is_some_and(|backend| {
+                !injected
+                    .iter()
+                    .any(|candidate| Arc::ptr_eq(candidate, backend))
+            });
+            if detach && let Some(backend) = backends.remove(id) {
+                retiring_backends
+                    .entry(id.clone())
+                    .or_default()
+                    .push(backend.clone());
+                selected.push((id.clone(), backend));
+                detached_active = true;
+            }
         }
+        (selected, detached_active)
+    }
+
+    /// Start at most one weakly owned cleanup supervisor. Permanent vendor
+    /// failures retain the process owner but neither grow generations nor keep
+    /// the Engine alive after its external owners are gone.
+    fn ensure_retiring_backend_retry(self: &Arc<Self>) {
+        if self
+            .retiring_backend_retry_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let engine = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let mut delay = BACKEND_RETIREMENT_RETRY_INITIAL;
+            loop {
+                tokio::time::sleep(delay).await;
+                let Some(engine) = engine.upgrade() else {
+                    return;
+                };
+                let target_ids = engine
+                    .retiring_backends
+                    .lock()
+                    .unwrap()
+                    .keys()
+                    .cloned()
+                    .collect::<HashSet<_>>();
+                if target_ids.is_empty() {
+                    break;
+                }
+                // Credential reconciliation may retain one provider lock for
+                // an extended recovery. Skip busy providers instead of holding
+                // every unrelated process owner behind that one lock.
+                let mut ids = target_ids.into_iter().collect::<Vec<_>>();
+                ids.sort_unstable();
+                let mut retry_ids = HashSet::with_capacity(ids.len());
+                let mut target_transitions = Vec::with_capacity(ids.len());
+                for id in ids {
+                    match engine.provider_transition_lock(&id).try_lock_owned() {
+                        Ok(guard) => {
+                            retry_ids.insert(id);
+                            target_transitions.push(guard);
+                        }
+                        Err(_) => {
+                            tracing::debug!(
+                                provider_id = %id,
+                                "deferring retained backend cleanup behind an active provider transition"
+                            );
+                        }
+                    }
+                }
+                if retry_ids.is_empty() {
+                    delay = (delay * 2).min(BACKEND_RETIREMENT_RETRY_MAX);
+                    continue;
+                }
+                let reload = engine.provider_reload.clone().read_owned().await;
+                let _reload = reload;
+                let _target_transitions = target_transitions;
+                let retiring = engine.retiring_backend_batch(&retry_ids);
+                if retiring.is_empty() {
+                    continue;
+                }
+                let deadline = tokio::time::Instant::now() + BACKEND_RETIREMENT_TIMEOUT;
+                let failures = shutdown_retiring_backend_batch(&engine, retiring, deadline).await;
+                if failures.is_empty() && engine.retiring_backends.lock().unwrap().is_empty() {
+                    break;
+                }
+                if !failures.is_empty() {
+                    tracing::warn!(
+                        failures = %failures.join("; "),
+                        "retrying retained backend shutdown after bounded backoff"
+                    );
+                }
+                delay = (delay * 2).min(BACKEND_RETIREMENT_RETRY_MAX);
+            }
+            if let Some(engine) = engine.upgrade() {
+                engine
+                    .retiring_backend_retry_started
+                    .store(false, Ordering::Release);
+                if !engine.retiring_backends.lock().unwrap().is_empty() {
+                    engine.ensure_retiring_backend_retry();
+                }
+            }
+        });
+    }
+
+    fn retiring_backend_batch(&self, target_ids: &HashSet<String>) -> RetiringBackendBatch {
+        self.retiring_backends
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(id, _)| target_ids.contains(*id))
+            .flat_map(|(id, entries)| {
+                entries
+                    .iter()
+                    .cloned()
+                    .map(|backend| (id.clone(), backend))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    fn release_retiring_backend(&self, id: &str, backend: &Arc<dyn AgentBackend>) {
+        let mut retiring = self.retiring_backends.lock().unwrap();
+        let remove_entry = if let Some(entries) = retiring.get_mut(id) {
+            entries.retain(|candidate| !Arc::ptr_eq(candidate, backend));
+            entries.is_empty()
+        } else {
+            false
+        };
+        if remove_entry {
+            retiring.remove(id);
+        }
+    }
+
+    /// Rebuild only selected provider/backend ids after their previous
+    /// config-owned backends have completed asynchronous teardown. Unrelated
+    /// instances keep their vendor sessions, process pools, and receivers.
+    fn replace_provider_registries_for_ids(&self, target_ids: &HashSet<String>) {
+        for id in target_ids {
+            if let Err(error) = self.invalidate_provider_route_state(id) {
+                tracing::error!(
+                    provider = id,
+                    "could not reset provider route state: {error:#}"
+                );
+            }
+        }
+        let config = self.config.lock().unwrap().clone();
+        let mut provider_replacements = build_providers_for_ids(
+            &config,
+            &self.secrets,
+            &self.model_catalog,
+            Some(target_ids),
+        );
+        let injected_providers = self.injected_providers.lock().unwrap().clone();
+        let mut providers = self.providers.write().unwrap();
+        for id in target_ids {
+            match injected_providers
+                .get(id)
+                .cloned()
+                .or_else(|| provider_replacements.remove(id))
+            {
+                Some(replacement) => {
+                    providers.insert(id.clone(), replacement);
+                }
+                None => {
+                    providers.remove(id);
+                }
+            }
+        }
+        drop(providers);
+
+        let mut backend_replacements = build_backends_for_ids(
+            &config,
+            &self.secrets,
+            &self.data_dir,
+            &self.model_catalog,
+            Some(target_ids),
+        );
+        let injected_backends = self.injected_backends.lock().unwrap().clone();
+        let mut backends = self.backends.write().unwrap();
+        for id in target_ids {
+            match injected_backends
+                .get(id)
+                .cloned()
+                .or_else(|| backend_replacements.remove(id))
+            {
+                Some(replacement) => {
+                    backends.insert(id.clone(), replacement);
+                }
+                None => {
+                    backends.remove(id);
+                }
+            }
+        }
+        drop(backends);
+        // Rebuilt backends carry fresh background-turn signal channels; hand
+        // their receivers to the listener pump so autonomous-turn attachment
+        // survives the reload (the old instances' forwarders end when their
+        // senders drop).
+        self.intake_background_turn_signals();
+    }
+
+    /// Refresh API-backed providers without touching long-lived vendor
+    /// backends. Local/title-model lifecycle changes historically refreshed
+    /// provider metadata, but they do not change any agent runtime.
+    #[cfg(test)]
+    async fn refresh_api_provider_registry(self: &Arc<Self>) {
+        let _transition = self.provider_reload.clone().write_owned().await;
+        let config = self.config.lock().unwrap().clone();
+        let injected = self.injected_providers.lock().unwrap().clone();
+        let mut target_ids = config.providers.keys().cloned().collect::<HashSet<_>>();
+        target_ids.extend(self.providers.read().unwrap().keys().cloned());
+        target_ids.extend(injected.keys().cloned());
+        // Zero-config providers may enter or leave the registry when their
+        // conventional environment variables change.
+        target_ids.extend(["openai".to_string(), "anthropic".to_string()]);
+
+        // A detached credential reconciliation retains only its provider lock.
+        // Preserve that provider's published instance instead of either
+        // blocking the global refresh or rebuilding it from tentative secrets.
+        let mut ids = target_ids.into_iter().collect::<Vec<_>>();
+        ids.sort_unstable();
+        let mut refresh_ids = HashSet::with_capacity(ids.len());
+        let mut transition_guards = Vec::with_capacity(ids.len());
+        for id in ids {
+            let lock = self.provider_transition_lock(&id);
+            match lock.try_lock_owned() {
+                Ok(guard) => {
+                    refresh_ids.insert(id);
+                    transition_guards.push(guard);
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        provider_id = %id,
+                        "skipping API provider refresh while credential rollback is reconciling"
+                    );
+                }
+            }
+        }
+
+        // Secret-store access can block in OS keychain implementations. Build
+        // from owned snapshots off-runtime, but keep publication in this
+        // supervised async scope. If the blocking task exceeds its deadline,
+        // dropping this scope releases both the global barrier and provider
+        // guards; a late result has no path back into the live registry.
+        let secrets = self.secrets.clone();
+        let model_catalog = self.model_catalog.clone();
+        let build_ids = refresh_ids.clone();
+        let build = tokio::task::spawn_blocking(move || {
+            build_providers_for_ids(&config, &secrets, &model_catalog, Some(&build_ids))
+        });
+        let mut replacements = match tokio::time::timeout(API_PROVIDER_REFRESH_TIMEOUT, build).await
+        {
+            Ok(Ok(replacements)) => replacements,
+            Ok(Err(error)) => {
+                tracing::error!(%error, "API provider registry refresh task failed");
+                return;
+            }
+            Err(_) => {
+                tracing::warn!(
+                    timeout_seconds = API_PROVIDER_REFRESH_TIMEOUT.as_secs_f32(),
+                    "API provider registry refresh exceeded its deadline"
+                );
+                return;
+            }
+        };
+        let mut providers = self.providers.write().unwrap();
+        for id in &refresh_ids {
+            match injected
+                .get(id)
+                .cloned()
+                .or_else(|| replacements.remove(id))
+            {
+                Some(replacement) => {
+                    providers.insert(id.clone(), replacement);
+                }
+                None => {
+                    providers.remove(id);
+                }
+            }
+        }
+        drop(providers);
+        drop(transition_guards);
+    }
+
+    async fn reload_provider(self: &Arc<Self>, id: &str) -> Result<(), EngineError> {
+        let target_ids = HashSet::from([id.to_string()]);
+        let retirement = self
+            .retire_config_backends_matching_ids(&target_ids)
+            .await?;
+        retirement.publish().await?;
         Ok(())
     }
 
-    /// Rebuild the provider registry from the current config (after provider
-    /// CRUD), preserving programmatically injected providers.
-    fn reload_providers(&self) {
-        let config = self.config.lock().unwrap().clone();
-        self.reload_providers_from_config(&config);
+    async fn reload_providers_for_runtime(
+        self: &Arc<Self>,
+        runtime: trouve_agents::install::CliId,
+    ) -> Result<(), EngineError> {
+        let retirement = self.retire_config_backends_for_runtime(runtime).await?;
+        retirement.publish().await?;
+        Ok(())
     }
 
-    fn reload_providers_from_config(&self, config: &Config) {
-        let mut rebuilt = build_all_providers(config, &self.secrets, &self.model_catalog);
-        for (id, p) in self.injected_providers.lock().unwrap().iter() {
-            rebuilt.insert(id.clone(), p.clone());
-        }
-        *self.providers.write().unwrap() = rebuilt;
-        let mut backends =
-            build_all_backends(config, &self.secrets, &self.data_dir, &self.model_catalog);
-        for (id, b) in self.injected_backends.lock().unwrap().iter() {
-            backends.insert(id.clone(), b.clone());
-        }
-        *self.backends.write().unwrap() = backends;
-        self.subscription_health_cache.lock().unwrap().clear();
+    /// Refresh providers after the managed-runtime pointer has committed.
+    /// A teardown failure cannot roll that commit back, so preserve install
+    /// success and surface the registry recovery as an operational warning.
+    async fn reload_after_committed_runtime_install(
+        self: &Arc<Self>,
+        runtime: trouve_agents::install::CliId,
+        version: &str,
+        warning: Option<String>,
+    ) -> Option<String> {
+        let Err(error) = self.reload_providers_for_runtime(runtime).await else {
+            return warning;
+        };
+        tracing::warn!(
+            runtime = runtime.as_str(),
+            version,
+            %error,
+            "managed runtime committed but provider reload did not complete cleanly"
+        );
+        let reload_warning = format!(
+            "{} {version} is active, but its provider registry could not be reloaded cleanly: {error}; Trouve restored the registry from committed configuration",
+            runtime.display_name()
+        );
+        Some(match warning {
+            Some(warning) => format!("{warning}; {reload_warning}"),
+            None => reload_warning,
+        })
     }
 
     pub fn thread_usage(
@@ -7265,10 +9602,26 @@ impl Engine {
             .collect())
     }
 
+    /// Mutation targets must either have a durable session-created link or a
+    /// head commit verified in the session worktree.
+    async fn session_pr_allows_mutation(
+        &self,
+        session_id: &str,
+        pr: &trouve_protocol::PrInfo,
+    ) -> Result<bool, EngineError> {
+        let normalized_url = pr.url.trim_end_matches('/').to_ascii_lowercase();
+        if self
+            .recorded_session_pr_urls(session_id)?
+            .contains(&normalized_url)
+        {
+            return Ok(true);
+        }
+        Ok(self.pr_has_locally_verified_head(session_id, pr).await)
+    }
+
     /// Provider-neutral evidence tying GitHub activity to this session.
-    /// Explicit PR references work for any integration; successful tool args
-    /// and produced commit IDs preserve enough identity to discover a PR that
-    /// the user creates later in GitHub's UI.
+    /// Successful tool arguments and produced commit IDs preserve enough
+    /// identity to discover PRs created through provider-neutral tooling.
     fn session_pr_evidence(
         &self,
         session_id: &str,
@@ -7386,8 +9739,58 @@ impl Engine {
                 }
             }
         }
-        prs.sort_by_key(|pr| (pr.state != "open", std::cmp::Reverse(pr.number)));
+        prs.sort_by_key(|pr| {
+            (
+                if pr.workspace_id == session.workspace_id && pr.head == session.branch {
+                    0
+                } else if evidence.recorded_numbers.contains(&pr.number) {
+                    1
+                } else {
+                    2
+                },
+                pr.state != "open",
+                std::cmp::Reverse(pr.number),
+            )
+        });
         Ok(prs)
+    }
+
+    fn project_session_pr_candidates<'a>(
+        candidates: impl IntoIterator<Item = &'a trouve_protocol::PrInfo>,
+        session: &Session,
+        linked_urls: &HashSet<String>,
+    ) -> Vec<trouve_protocol::PrInfo> {
+        let mut seen = HashSet::new();
+        let mut prs = candidates
+            .into_iter()
+            .filter(|pr| {
+                (pr.workspace_id == session.workspace_id && pr.head == session.branch)
+                    || linked_urls.contains(&pr.url.trim_end_matches('/').to_ascii_lowercase())
+            })
+            .filter(|pr| {
+                seen.insert((
+                    pr.host.to_ascii_lowercase(),
+                    pr.repository.to_ascii_lowercase(),
+                    pr.number,
+                ))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        prs.sort_by_key(|pr| {
+            let url = pr.url.trim_end_matches('/').to_ascii_lowercase();
+            (
+                if pr.workspace_id == session.workspace_id && pr.head == session.branch {
+                    0
+                } else if linked_urls.contains(&url) {
+                    1
+                } else {
+                    2
+                },
+                pr.state != "open",
+                std::cmp::Reverse(pr.number),
+            )
+        });
+        prs
     }
 
     /// Session-to-PR authorization from the newest persisted account
@@ -7400,24 +9803,18 @@ impl Engine {
     ) -> Result<Vec<trouve_protocol::PrInfo>, EngineError> {
         let session = self.get_session(session_id)?;
         let linked_urls = self.recorded_session_pr_urls(session_id)?;
-        let mut seen = HashSet::new();
-        let mut prs = Vec::new();
+        let mut candidates = Vec::new();
         for (host, _) in self.github_hosts() {
             let Some(snapshot) = self.store.latest_github_pr_snapshot(&host)? else {
                 continue;
             };
-            prs.extend(snapshot.prs.into_iter().filter(|pr| {
-                ((pr.workspace_id == session.workspace_id && pr.head == session.branch)
-                    || linked_urls.contains(&pr.url.trim_end_matches('/').to_ascii_lowercase()))
-                    && seen.insert((
-                        pr.host.to_ascii_lowercase(),
-                        pr.repository.to_ascii_lowercase(),
-                        pr.number,
-                    ))
-            }));
+            candidates.extend(snapshot.prs);
         }
-        prs.sort_by_key(|pr| (pr.state != "open", std::cmp::Reverse(pr.number)));
-        Ok(prs)
+        Ok(Self::project_session_pr_candidates(
+            &candidates,
+            &session,
+            &linked_urls,
+        ))
     }
 
     fn projected_session_pr(
@@ -7560,6 +9957,11 @@ impl Engine {
         use trouve_protocol::{PrActionRequest as Action, PrDetailSection as Section};
 
         let (session, pr) = self.projected_session_pr(session_id, number)?;
+        if !self.session_pr_allows_mutation(session_id, &pr).await? {
+            return Err(EngineError::BadRequest(format!(
+                "pull request #{number} is associated for navigation only"
+            )));
+        }
         let key = GithubPrDetailKey::from_info(&pr);
         let required = match action {
             Action::UpdateReview { .. }
@@ -7707,24 +10109,11 @@ impl Engine {
         let mut session_pull_requests = Vec::new();
         for session in self.list_sessions(None)? {
             let linked_urls = self.recorded_session_pr_urls(&session.id)?;
-            let mut seen = HashSet::new();
-            let mut prs = account_prs
-                .iter()
-                .copied()
-                .filter(|pr| {
-                    (pr.workspace_id == session.workspace_id && pr.head == session.branch)
-                        || linked_urls.contains(&pr.url.trim_end_matches('/').to_ascii_lowercase())
-                })
-                .filter(|pr| {
-                    seen.insert((
-                        pr.host.to_ascii_lowercase(),
-                        pr.repository.to_ascii_lowercase(),
-                        pr.number,
-                    ))
-                })
-                .cloned()
-                .collect::<Vec<_>>();
-            prs.sort_by_key(|pr| (pr.state != "open", std::cmp::Reverse(pr.number)));
+            let prs = Self::project_session_pr_candidates(
+                account_prs.iter().copied(),
+                &session,
+                &linked_urls,
+            );
             if !prs.is_empty() {
                 session_pull_requests.push(trouve_protocol::SessionPrProjection {
                     session_id: session.id,
@@ -7733,13 +10122,13 @@ impl Engine {
             }
         }
 
-        let git_worktree_settings = self.git_worktree_settings();
+        let session_naming_settings = self.session_naming_settings();
         Ok((
             cursor,
             trouve_protocol::ServerProjection {
                 github_pull_requests,
                 session_pull_requests,
-                git_worktree_settings,
+                session_naming_settings,
             },
         ))
     }
@@ -8008,32 +10397,22 @@ impl Engine {
 
     /// Subscription usage for every configured subscription provider.
     /// Codex answers via its app-server, Claude Code via its CLI's
-    /// stream-json usage query, and Cursor via the dashboard's undocumented
-    /// usage RPC (read with the CLI's stored login). Kimi Code uses the key
-    /// stored for its provider preset against the same `/usages` endpoint as
-    /// Kimi's open-source CLI.
+    /// stream-json usage query, and Cursor by exchanging its configured API
+    /// key for an ephemeral token before calling the dashboard's undocumented
+    /// usage RPC. Kimi Code uses the key stored for its provider preset
+    /// against the same `/usages` endpoint as Kimi's open-source CLI.
+    ///
+    /// Results are served from a per-provider cache with failure backoff
+    /// (see [`crate::subscription_health`]); probes run one at a time so a
+    /// burst of clients missing the cache together still costs one query.
     pub async fn subscription_health(&self) -> Vec<trouve_protocol::SubscriptionHealth> {
+        let _probe_lane = self.subscription_health_probe.lock().await;
         let backends: Vec<(String, Arc<dyn AgentBackend>)> = {
             let map = self.backends.read().unwrap();
             let mut list: Vec<_> = map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
             list.sort_by(|a, b| a.0.cmp(&b.0));
             list
         };
-        let mut out = Vec::new();
-        for (id, backend) in backends {
-            match backend.subscription_health().await {
-                Some(health) => out.push(health),
-                None => out.push(trouve_protocol::SubscriptionHealth {
-                    provider_id: id,
-                    status: "unsupported".into(),
-                    plan: String::new(),
-                    windows: Vec::new(),
-                    credits: String::new(),
-                    note: "This vendor does not provide subscription usage to third-party apps."
-                        .into(),
-                }),
-            }
-        }
         let kimi_configs: Vec<(String, ProviderConfig)> = {
             let config = self.config.lock().unwrap();
             config
@@ -8048,6 +10427,37 @@ impl Engine {
                 .map(|(id, provider)| (id.clone(), provider.clone()))
                 .collect()
         };
+        {
+            let known: HashSet<&str> = backends
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .chain(kimi_configs.iter().map(|(id, _)| id.as_str()))
+                .collect();
+            self.subscription_health_cache
+                .lock()
+                .unwrap()
+                .retain(|id| known.contains(id));
+        }
+        let mut out = Vec::new();
+        for (id, backend) in backends {
+            let health = self
+                .cached_subscription_health(&id, || async {
+                    backend.subscription_health().await.unwrap_or_else(|| {
+                        trouve_protocol::SubscriptionHealth {
+                            provider_id: id.clone(),
+                            status: "unsupported".into(),
+                            plan: String::new(),
+                            windows: Vec::new(),
+                            credits: String::new(),
+                            note: "This vendor does not provide subscription usage to \
+                                   third-party apps."
+                                .into(),
+                        }
+                    })
+                })
+                .await;
+            out.push(health);
+        }
         for (id, provider) in kimi_configs {
             let Some(api_key) = resolved_api_key(&id, &provider, &self.secrets) else {
                 out.push(trouve_protocol::SubscriptionHealth {
@@ -8065,12 +10475,41 @@ impl Engine {
                 .base_url
                 .as_deref()
                 .unwrap_or(trouve_providers::kimi_usage::KIMI_CODE_BASE_URL);
-            out.push(
-                trouve_providers::kimi_usage::subscription_health(&id, base_url, &api_key).await,
-            );
+            let health = self
+                .cached_subscription_health(&id, || {
+                    trouve_providers::kimi_usage::subscription_health(&id, base_url, &api_key)
+                })
+                .await;
+            out.push(health);
         }
         out.sort_by(|a, b| a.provider_id.cmp(&b.provider_id));
         out
+    }
+
+    /// Serve `provider_id` from the usage cache, running `probe` only when
+    /// its fresh window or failure backoff has lapsed.
+    async fn cached_subscription_health<F, Fut>(
+        &self,
+        provider_id: &str,
+        probe: F,
+    ) -> trouve_protocol::SubscriptionHealth
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = trouve_protocol::SubscriptionHealth>,
+    {
+        let cached = self
+            .subscription_health_cache
+            .lock()
+            .unwrap()
+            .lookup(provider_id, Instant::now());
+        if let Some(health) = cached {
+            return health;
+        }
+        let health = probe().await;
+        self.subscription_health_cache
+            .lock()
+            .unwrap()
+            .record(provider_id, health, Instant::now())
     }
 
     /// Whether GitHub calls can authenticate, per host. The top-level
@@ -8236,10 +10675,19 @@ impl Engine {
     ) -> Result<(), EngineError> {
         let session = self.get_session(session_id)?;
         let github = self.github_for_session(&session)?;
-        let pr = self
-            .session_pr(session_id)
-            .await?
-            .ok_or_else(|| EngineError::NotFound("no open PR for this session".into()))?;
+        let mut pr = None;
+        for candidate in self.session_prs(session_id).await? {
+            if candidate.state == "open"
+                && self
+                    .session_pr_allows_mutation(session_id, &candidate)
+                    .await?
+            {
+                pr = Some(candidate);
+                break;
+            }
+        }
+        let pr =
+            pr.ok_or_else(|| EngineError::NotFound("no mutable open PR for this session".into()))?;
         github
             .merge_pr(pr.number, method.unwrap_or("merge"))
             .await
@@ -8673,8 +11121,8 @@ impl Engine {
     }
 
     async fn tool_mutation_permit(&self, session_id: &str) -> SessionMutationPermit {
-        // Execution comes first so a cleanup writer queued on admission can
-        // overtake mutations that were already waiting for the worktree lane.
+        // Execution comes first so cleanup queued on the exclusive admission
+        // fence can overtake mutations already waiting for the worktree lane.
         let execution = self.tool_execution_lock(session_id).write_owned().await;
         let admission = self
             .tool_mutation_admission_lock(session_id)
@@ -8685,14 +11133,175 @@ impl Engine {
 
     // --- workspaces ---------------------------------------------------------
 
-    pub fn register_workspace(
+    fn resolve_workspace_list_item(workspace: Workspace, timeout: Duration) -> WorkspaceListItem {
+        let repository = Path::new(&workspace.path);
+        let (remote_url, common_directory) =
+            git::workspace_repository_sources(repository, "origin", timeout, |remote| {
+                crate::github::parse_remote(remote).is_some()
+            });
+        let remote_identity = remote_url.and_then(|remote| crate::github::parse_remote(&remote));
+        let (repository_key, repository_name) = if let Some((host, owner, name)) = remote_identity {
+            (
+                format!(
+                    "remote:{host}/{owner}/{name}",
+                    host = host.to_ascii_lowercase(),
+                    owner = owner.to_ascii_lowercase(),
+                    name = name.to_ascii_lowercase(),
+                ),
+                name,
+            )
+        } else {
+            (
+                common_directory
+                    .map(|directory| format!("local:{}", directory.to_string_lossy()))
+                    .unwrap_or_else(|| format!("workspace:{}", workspace.id)),
+                workspace.name.clone(),
+            )
+        };
+        WorkspaceListItem {
+            id: workspace.id,
+            name: workspace.name,
+            path: workspace.path,
+            repository_key: Some(repository_key),
+            repository_name: Some(repository_name),
+        }
+    }
+
+    fn fallback_workspace_list_item(workspace: Workspace) -> WorkspaceListItem {
+        WorkspaceListItem {
+            repository_key: Some(format!("workspace:{}", workspace.id)),
+            repository_name: Some(workspace.name.clone()),
+            id: workspace.id,
+            name: workspace.name,
+            path: workspace.path,
+        }
+    }
+
+    fn workspace_list_refresh_lock(&self, workspace_id: &str) -> Arc<Mutex<()>> {
+        let mut locks = self.workspace_list_refresh_locks.lock().unwrap();
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(workspace_id).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(Mutex::new(()));
+        locks.insert(workspace_id.to_string(), Arc::downgrade(&lock));
+        lock
+    }
+
+    fn cache_workspace_list_item(&self, item: WorkspaceListItem) -> WorkspaceListItem {
+        self.workspace_list_cache.lock().unwrap().insert(
+            item.id.clone(),
+            WorkspaceListCacheEntry {
+                item: item.clone(),
+                refreshed_at: Instant::now(),
+            },
+        );
+        item
+    }
+
+    fn cached_workspace_list_item(
         &self,
-        path: &str,
-        name: Option<String>,
-    ) -> Result<Workspace, EngineError> {
+        workspace: Workspace,
+        request_deadline: Instant,
+    ) -> WorkspaceListItem {
+        self.cached_workspace_list_item_with(
+            workspace,
+            request_deadline,
+            Self::resolve_workspace_list_item,
+        )
+    }
+
+    fn cached_workspace_list_item_with(
+        &self,
+        workspace: Workspace,
+        request_deadline: Instant,
+        resolve: impl FnOnce(Workspace, Duration) -> WorkspaceListItem,
+    ) -> WorkspaceListItem {
+        let cached = self
+            .workspace_list_cache
+            .lock()
+            .unwrap()
+            .get(&workspace.id)
+            .map(|entry| (entry.item.clone(), entry.refreshed_at));
+        if let Some((cached, refreshed_at)) = &cached
+            && refreshed_at.elapsed() < WORKSPACE_LIST_CACHE_TTL
+        {
+            return cached.clone();
+        }
+
+        let refresh_lock = self.workspace_list_refresh_lock(&workspace.id);
+        let Ok(_refresh) = refresh_lock.try_lock() else {
+            return cached
+                .map(|(item, _)| item)
+                .unwrap_or_else(|| Self::fallback_workspace_list_item(workspace));
+        };
+        let cached = self
+            .workspace_list_cache
+            .lock()
+            .unwrap()
+            .get(&workspace.id)
+            .map(|entry| (entry.item.clone(), entry.refreshed_at));
+        if let Some((cached, refreshed_at)) = &cached
+            && refreshed_at.elapsed() < WORKSPACE_LIST_CACHE_TTL
+        {
+            return cached.clone();
+        }
+        let Some(remaining) = request_deadline.checked_duration_since(Instant::now()) else {
+            return cached
+                .map(|(item, _)| item)
+                .unwrap_or_else(|| Self::fallback_workspace_list_item(workspace));
+        };
+        self.cache_workspace_list_item(resolve(workspace, remaining))
+    }
+
+    fn canonical_workspace_registration_path(path: &str) -> Result<PathBuf, EngineError> {
         let canonical = std::fs::canonicalize(path)
             .map_err(|e| EngineError::BadRequest(format!("invalid path {path}: {e}")))?;
-        if !git::is_git_repo(&canonical) {
+        Ok(canonical)
+    }
+
+    fn workspace_registration_lock(&self, canonical: &Path) -> Arc<Mutex<()>> {
+        self.workspace_list_refresh_lock(&format!("registration:{}", canonical.to_string_lossy()))
+    }
+
+    fn workspace_registration_lifecycle(
+        &self,
+        canonical: &Path,
+    ) -> Arc<Mutex<ReviewWorkspaceRegistrationLifecycle>> {
+        let key = canonical.to_string_lossy().to_string();
+        let mut lifecycles = self.workspace_registration_lifecycles.lock().unwrap();
+        lifecycles.retain(|_, lifecycle| lifecycle.strong_count() > 0);
+        if let Some(lifecycle) = lifecycles.get(&key).and_then(Weak::upgrade) {
+            return lifecycle;
+        }
+        let lifecycle = Arc::new(Mutex::new(ReviewWorkspaceRegistrationLifecycle::default()));
+        lifecycles.insert(key, Arc::downgrade(&lifecycle));
+        lifecycle
+    }
+
+    fn acquire_workspace_registration_lock<'a>(
+        registration_lock: &'a Mutex<()>,
+        on_lock_attempt: impl FnOnce(bool),
+    ) -> MutexGuard<'a, ()> {
+        match registration_lock.try_lock() {
+            Ok(guard) => {
+                on_lock_attempt(false);
+                guard
+            }
+            Err(TryLockError::WouldBlock) => {
+                on_lock_attempt(true);
+                registration_lock.lock().unwrap()
+            }
+            Err(TryLockError::Poisoned(error)) => panic!("{error}"),
+        }
+    }
+
+    fn prepare_workspace_registration(
+        &self,
+        canonical: &Path,
+        name: Option<String>,
+    ) -> Result<(Workspace, bool), EngineError> {
+        if !git::is_git_repo(canonical) {
             return Err(EngineError::BadRequest(format!(
                 "{} is not a git repository",
                 canonical.display()
@@ -8700,8 +11309,30 @@ impl Engine {
         }
         let path_str = canonical.to_string_lossy().to_string();
         if let Some(existing) = self.store.workspace_by_path(&path_str)? {
-            if self.store.set_workspace_closed(&existing.id, false)? {
-                for session in self.store.list_sessions(Some(&existing.id))? {
+            return Ok((existing, true));
+        }
+        let workspace = Workspace {
+            id: new_id("ws"),
+            name: name.unwrap_or_else(|| {
+                canonical
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "workspace".into())
+            }),
+            path: path_str.clone(),
+        };
+        Ok((workspace, false))
+    }
+
+    fn commit_workspace_registration(
+        &self,
+        workspace: Workspace,
+        item: WorkspaceListItem,
+        existing: bool,
+    ) -> Result<(WorkspaceListItem, bool), EngineError> {
+        let mutated = if existing {
+            if self.store.set_workspace_closed(&workspace.id, false)? {
+                for session in self.store.list_sessions(Some(&workspace.id))? {
                     if !session.archived {
                         self.terminals.reopen_session(&session.id);
                     }
@@ -8709,36 +11340,363 @@ impl Engine {
                 self.store.append_event(
                     Scope::Server,
                     Event::WorkspaceRegistered {
-                        workspace_id: existing.id.clone(),
-                        path: path_str,
+                        workspace_id: workspace.id.clone(),
+                        path: workspace.path,
                     },
                 )?;
+                true
+            } else {
+                false
             }
-            return Ok(existing);
-        }
-        let ws = Workspace {
-            id: new_id("ws"),
-            name: name.unwrap_or_else(|| {
-                canonical
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "workspace".into())
-            }),
-            path: path_str.clone(),
+        } else {
+            self.store.insert_workspace(&workspace)?;
+            self.store.append_event(
+                Scope::Server,
+                Event::WorkspaceRegistered {
+                    workspace_id: workspace.id.clone(),
+                    path: workspace.path,
+                },
+            )?;
+            true
         };
-        self.store.insert_workspace(&ws)?;
-        self.store.append_event(
-            Scope::Server,
-            Event::WorkspaceRegistered {
-                workspace_id: ws.id.clone(),
-                path: path_str,
-            },
-        )?;
-        Ok(ws)
+        Ok((self.cache_workspace_list_item(item), mutated))
     }
 
-    pub fn list_workspaces(&self) -> Result<Vec<Workspace>, EngineError> {
-        Ok(self.store.list_workspaces()?)
+    pub fn register_workspace(
+        &self,
+        path: &str,
+        name: Option<String>,
+    ) -> Result<WorkspaceListItem, EngineError> {
+        self.register_workspace_with(path, name, |_| {}, || {})
+    }
+
+    fn register_workspace_with(
+        &self,
+        path: &str,
+        name: Option<String>,
+        on_lock_attempt: impl FnOnce(bool),
+        after_prepare: impl FnOnce(),
+    ) -> Result<WorkspaceListItem, EngineError> {
+        let canonical = Self::canonical_workspace_registration_path(path)?;
+        let registration_lock = self.workspace_registration_lock(&canonical);
+        let lifecycle = self.workspace_registration_lifecycle(&canonical);
+        let _registration =
+            Self::acquire_workspace_registration_lock(&registration_lock, on_lock_attempt);
+        let (workspace, existing) = self.prepare_workspace_registration(&canonical, name)?;
+        after_prepare();
+        let refresh_lock = self.workspace_list_refresh_lock(&workspace.id);
+        let _refresh = refresh_lock.lock().unwrap();
+        let item = Self::resolve_workspace_list_item(
+            workspace.clone(),
+            WORKSPACE_REPOSITORY_IDENTITY_TIMEOUT,
+        );
+        let (item, _mutated) = self.commit_workspace_registration(workspace, item, existing)?;
+        self.store.stabilize_workspace_registration(&item.id)?;
+        lifecycle.lock().unwrap().stabilize();
+        Ok(item)
+    }
+
+    pub(crate) fn register_review_workspace(
+        &self,
+        path: &str,
+        name: Option<String>,
+        cancel: &tokio_util::sync::CancellationToken,
+        commit_fence: &ReviewWorkspaceRegistrationFence,
+    ) -> Result<WorkspaceListItem, EngineError> {
+        self.register_review_workspace_with(path, name, cancel, commit_fence, || {}, || {})
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cancel_review_workspace_registration(
+        &self,
+        cancel: &tokio_util::sync::CancellationToken,
+        commit_fence: &ReviewWorkspaceRegistrationFence,
+    ) -> Result<(), EngineError> {
+        cancel.cancel();
+        let committed = commit_fence.committed.lock().unwrap().take();
+        if let Some(committed) = committed {
+            self.compensate_review_workspace_registration(committed)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn cancel_review_workspace_registration_and_session(
+        &self,
+        cancel: &tokio_util::sync::CancellationToken,
+        commit_fence: &ReviewWorkspaceRegistrationFence,
+    ) -> Result<(), EngineError> {
+        self.cancel_review_workspace_registration_and_session_with(cancel, commit_fence, || {})
+            .await
+    }
+
+    async fn cancel_review_workspace_registration_and_session_with(
+        &self,
+        cancel: &tokio_util::sync::CancellationToken,
+        commit_fence: &ReviewWorkspaceRegistrationFence,
+        after_first_snapshot: impl FnOnce() + Send,
+    ) -> Result<(), EngineError> {
+        cancel.cancel();
+        let mut after_first_snapshot = Some(after_first_snapshot);
+        loop {
+            let committed = commit_fence.committed.lock().unwrap().clone();
+            let Some(committed) = committed else {
+                return Ok(());
+            };
+            if let Some(after_first_snapshot) = after_first_snapshot.take() {
+                after_first_snapshot();
+            }
+            let session_cleanup =
+                if let Some(session_id) = committed.provisional_session_id.as_deref() {
+                    match self.store.session(session_id) {
+                        Ok(Some(_)) => self.delete_session(session_id).await,
+                        Ok(None) => Ok(()),
+                        Err(error) => Err(error.into()),
+                    }
+                } else {
+                    Ok(())
+                };
+            let workspace_compensation =
+                self.compensate_review_workspace_registration(committed.clone());
+            if Self::finish_review_workspace_cancellation(
+                commit_fence,
+                &committed,
+                session_cleanup,
+                workspace_compensation,
+            )? {
+                return Ok(());
+            }
+        }
+    }
+
+    fn finish_review_workspace_cancellation(
+        commit_fence: &ReviewWorkspaceRegistrationFence,
+        committed: &ReviewWorkspaceRegistrationCommit,
+        session_cleanup: Result<(), EngineError>,
+        workspace_compensation: Result<(), EngineError>,
+    ) -> Result<bool, EngineError> {
+        let session_cleaned = session_cleanup.is_ok();
+        let workspace_compensated = workspace_compensation.is_ok();
+        let finished = {
+            let mut current = commit_fence.committed.lock().unwrap();
+            if let Some(current_commit) = current.as_mut()
+                && current_commit.job_id == committed.job_id
+                && current_commit.workspace_id == committed.workspace_id
+                && current_commit.lease_id == committed.lease_id
+                && current_commit.cleanup_generation == committed.cleanup_generation
+                && Arc::ptr_eq(&current_commit.lifecycle, &committed.lifecycle)
+                && current_commit.provisional_session_id == committed.provisional_session_id
+            {
+                if session_cleaned {
+                    current_commit.provisional_session_id = None;
+                }
+                if session_cleaned && workspace_compensated {
+                    current.take();
+                }
+            }
+            current.is_none()
+        };
+
+        match (session_cleanup, workspace_compensation) {
+            (Ok(()), Ok(())) => Ok(finished),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Err(session_error), Err(workspace_error)) => {
+                Err(EngineError::Internal(anyhow::anyhow!(
+                    "review workspace cleanup failed: session cleanup failed: {session_error}; workspace compensation failed: {workspace_error}"
+                )))
+            }
+        }
+    }
+
+    fn compensate_review_workspace_registration(
+        &self,
+        committed: ReviewWorkspaceRegistrationCommit,
+    ) -> Result<(), EngineError> {
+        if let (Some(job_id), Some(cleanup_generation)) =
+            (committed.job_id.as_deref(), committed.cleanup_generation)
+        {
+            if let Some(intent) = self.store.review_workspace_cleanup_intent(job_id)?
+                && intent.workspace_id == committed.workspace_id
+                && intent.generation == cleanup_generation
+            {
+                self.reconcile_review_workspace_cleanup(&intent)?;
+            }
+            if let Some(lease_id) = committed.lease_id {
+                let mut lifecycle = committed.lifecycle.lock().unwrap();
+                lifecycle.outstanding_leases.remove(&lease_id);
+                if lifecycle.outstanding_leases.is_empty() {
+                    lifecycle.stabilize();
+                }
+            }
+            return Ok(());
+        }
+        if let Some(lease_id) = committed.lease_id {
+            let registration_lock = self.workspace_registration_lock(&committed.canonical_path);
+            let _registration = registration_lock.lock().unwrap();
+            let mut lifecycle = committed.lifecycle.lock().unwrap();
+            if lifecycle.outstanding_leases.contains(&lease_id)
+                && lifecycle.outstanding_leases.len() == 1
+                && lifecycle.provisional_workspace_id.as_deref()
+                    == Some(committed.workspace_id.as_str())
+            {
+                self.commit_workspace_close(&committed.workspace_id)?;
+                lifecycle.stabilize();
+            } else {
+                lifecycle.outstanding_leases.remove(&lease_id);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn reconcile_review_workspace_cleanup(
+        &self,
+        intent: &ReviewWorkspaceCleanupIntent,
+    ) -> Result<(), EngineError> {
+        let Some(workspace) = self.store.workspace(&intent.workspace_id)? else {
+            self.store.complete_review_workspace_cleanup(intent)?;
+            return Ok(());
+        };
+        let canonical_path = PathBuf::from(&workspace.path);
+        let registration_lock = self.workspace_registration_lock(&canonical_path);
+        let lifecycle = self.workspace_registration_lifecycle(&canonical_path);
+        let _registration = registration_lock.lock().unwrap();
+        let Some(current) = self.store.review_workspace_cleanup_intent(&intent.job_id)? else {
+            return Ok(());
+        };
+        if current.workspace_id != intent.workspace_id || current.generation != intent.generation {
+            return Ok(());
+        }
+        if self.store.review_workspace_cleanup_should_close(&current)? {
+            self.commit_workspace_close(&current.workspace_id)?;
+            lifecycle.lock().unwrap().stabilize();
+        }
+        self.store.complete_review_workspace_cleanup(&current)?;
+        Ok(())
+    }
+
+    pub(crate) fn complete_review_workspace_registration(
+        &self,
+        cancel: &tokio_util::sync::CancellationToken,
+        commit_fence: &ReviewWorkspaceRegistrationFence,
+    ) -> Result<(), EngineError> {
+        if cancel.is_cancelled() {
+            return Err(EngineError::BadRequest(
+                "stale: review workspace registration was cancelled".into(),
+            ));
+        }
+        let committed = commit_fence.committed.lock().unwrap().clone();
+        if let Some(committed) = committed
+            .as_ref()
+            .filter(|committed| committed.lease_id.is_some())
+        {
+            let registration_lock = self.workspace_registration_lock(&committed.canonical_path);
+            let _registration = registration_lock.lock().unwrap();
+            // This is the review's admission point. Recheck cancellation while
+            // holding the same guard that protects lease compensation so
+            // cancellation before admission cannot race lease stabilization.
+            if cancel.is_cancelled() {
+                return Err(EngineError::BadRequest(
+                    "stale: review workspace registration was cancelled".into(),
+                ));
+            }
+            let lease_id = committed.lease_id.unwrap();
+            let mut lifecycle = committed.lifecycle.lock().unwrap();
+            if lifecycle.outstanding_leases.contains(&lease_id) {
+                self.store
+                    .stabilize_workspace_registration(&committed.workspace_id)?;
+                lifecycle.stabilize();
+            }
+        }
+        commit_fence.committed.lock().unwrap().take();
+        Ok(())
+    }
+
+    fn register_review_workspace_with(
+        &self,
+        path: &str,
+        name: Option<String>,
+        cancel: &tokio_util::sync::CancellationToken,
+        commit_fence: &ReviewWorkspaceRegistrationFence,
+        before_commit: impl FnOnce(),
+        after_cancel_check: impl FnOnce(),
+    ) -> Result<WorkspaceListItem, EngineError> {
+        if cancel.is_cancelled() {
+            return Err(EngineError::BadRequest(
+                "stale: review workspace registration was cancelled".into(),
+            ));
+        }
+        let canonical = Self::canonical_workspace_registration_path(path)?;
+        let registration_lock = self.workspace_registration_lock(&canonical);
+        let lifecycle = self.workspace_registration_lifecycle(&canonical);
+        let _registration = registration_lock.lock().unwrap();
+        if cancel.is_cancelled() {
+            return Err(EngineError::BadRequest(
+                "stale: review workspace registration was cancelled".into(),
+            ));
+        }
+        let (workspace, existing) = self.prepare_workspace_registration(&canonical, name)?;
+        let refresh_lock = self.workspace_list_refresh_lock(&workspace.id);
+        let _refresh = refresh_lock.lock().unwrap();
+        let item = Self::resolve_workspace_list_item(
+            workspace.clone(),
+            WORKSPACE_REPOSITORY_IDENTITY_TIMEOUT,
+        );
+        before_commit();
+        let mut committed = commit_fence.committed.lock().unwrap();
+        if cancel.is_cancelled() {
+            return Err(EngineError::BadRequest(
+                "stale: review workspace registration was cancelled".into(),
+            ));
+        }
+        after_cancel_check();
+        let inherited_generation = lifecycle.lock().unwrap().provisional_generation;
+        let (item, mutated, cleanup_generation) = if let Some(job_id) =
+            commit_fence.job_id.as_deref()
+        {
+            let result = self.store.commit_review_workspace_registration(
+                job_id,
+                &workspace,
+                inherited_generation,
+            )?;
+            if result.mutated {
+                for session in self.store.list_sessions(Some(&workspace.id))? {
+                    if !session.archived {
+                        self.terminals.reopen_session(&session.id);
+                    }
+                }
+            }
+            (
+                self.cache_workspace_list_item(item),
+                result.mutated,
+                result.cleanup_generation,
+            )
+        } else {
+            let (item, mutated) = self.commit_workspace_registration(workspace, item, existing)?;
+            (item, mutated, None)
+        };
+        let lease_id = lifecycle
+            .lock()
+            .unwrap()
+            .register(&item.id, mutated, cleanup_generation);
+        *committed = Some(ReviewWorkspaceRegistrationCommit {
+            job_id: commit_fence.job_id.clone(),
+            workspace_id: item.id.clone(),
+            canonical_path: canonical,
+            lifecycle,
+            lease_id,
+            cleanup_generation,
+            provisional_session_id: None,
+        });
+        Ok(item)
+    }
+
+    pub fn list_workspaces(&self) -> Result<Vec<WorkspaceListItem>, EngineError> {
+        let request_deadline = Instant::now() + WORKSPACE_REPOSITORY_IDENTITY_TIMEOUT;
+        Ok(self
+            .store
+            .list_workspaces()?
+            .into_iter()
+            .map(|workspace| self.cached_workspace_list_item(workspace, request_deadline))
+            .collect())
     }
 
     /// Capture authenticated hosts and register their cache handles as one
@@ -8917,9 +11875,33 @@ impl Engine {
     /// while retaining existing sessions, worktrees, and automation records.
     /// Registering the same path later reopens it.
     pub fn close_workspace(&self, id: &str) -> Result<(), EngineError> {
-        if self.store.workspace(id)?.is_none() {
-            return Err(EngineError::NotFound(format!("workspace {id}")));
-        }
+        self.close_workspace_with(id, |_| {})
+    }
+
+    fn close_workspace_with(
+        &self,
+        id: &str,
+        on_lock_attempt: impl FnOnce(bool),
+    ) -> Result<(), EngineError> {
+        let workspace = self
+            .store
+            .workspace(id)?
+            .ok_or_else(|| EngineError::NotFound(format!("workspace {id}")))?;
+        // Re-registration may spend time resolving repository identity between
+        // reading and reopening an existing row. Serialize close against that
+        // whole lifecycle so whichever operation completes last owns the
+        // durable visibility and terminal state.
+        let registration_lock = self.workspace_registration_lock(Path::new(&workspace.path));
+        let lifecycle = self.workspace_registration_lifecycle(Path::new(&workspace.path));
+        let _registration =
+            Self::acquire_workspace_registration_lock(&registration_lock, on_lock_attempt);
+        self.commit_workspace_close(id)?;
+        self.store.stabilize_workspace_registration(id)?;
+        lifecycle.lock().unwrap().stabilize();
+        Ok(())
+    }
+
+    fn commit_workspace_close(&self, id: &str) -> Result<(), EngineError> {
         if self.store.set_workspace_closed(id, true)? {
             for session in self.store.list_sessions(Some(id))? {
                 self.terminals.remove_session(&session.id);
@@ -8931,6 +11913,7 @@ impl Engine {
                 },
             )?;
         }
+        self.workspace_list_cache.lock().unwrap().remove(id);
         Ok(())
     }
 
@@ -8982,6 +11965,35 @@ impl Engine {
         .map_err(|error| EngineError::Internal(error.into()))
     }
 
+    fn workspace_for_session_creation(
+        &self,
+        workspace_id: &str,
+        adopt_registration: bool,
+    ) -> Result<Workspace, EngineError> {
+        let workspace = self
+            .store
+            .workspace(workspace_id)?
+            .ok_or_else(|| EngineError::NotFound(format!("workspace {workspace_id}")))?;
+        if !adopt_registration {
+            return self
+                .store
+                .open_workspace(workspace_id)?
+                .ok_or_else(|| EngineError::NotFound(format!("workspace {workspace_id}")));
+        }
+
+        let canonical_path = PathBuf::from(&workspace.path);
+        let registration_lock = self.workspace_registration_lock(&canonical_path);
+        let lifecycle = self.workspace_registration_lifecycle(&canonical_path);
+        let _registration = registration_lock.lock().unwrap();
+        let workspace = self
+            .store
+            .open_workspace(workspace_id)?
+            .ok_or_else(|| EngineError::NotFound(format!("workspace {workspace_id}")))?;
+        self.store.stabilize_workspace_registration(workspace_id)?;
+        lifecycle.lock().unwrap().stabilize();
+        Ok(workspace)
+    }
+
     async fn rollback_failed_session_creation(
         &self,
         worktree: &Path,
@@ -9015,6 +12027,58 @@ impl Engine {
     }
 
     pub async fn create_session(&self, req: CreateSessionRequest) -> Result<Session, EngineError> {
+        self.create_session_with_workspace_adoption(req, true, None)
+            .await
+    }
+
+    pub(crate) async fn create_review_session(
+        &self,
+        req: CreateSessionRequest,
+        cancel: &tokio_util::sync::CancellationToken,
+        commit_fence: &ReviewWorkspaceRegistrationFence,
+    ) -> Result<Session, EngineError> {
+        let session = self
+            .create_session_with_workspace_adoption(req, false, commit_fence.job_id.as_deref())
+            .await?;
+        let (recorded, cancelled) = {
+            let mut committed = commit_fence.committed.lock().unwrap();
+            let cancelled = cancel.is_cancelled();
+            let recorded = if let Some(committed) = committed
+                .as_mut()
+                .filter(|committed| committed.workspace_id == session.workspace_id)
+            {
+                // Record ownership before observing cancellation so the
+                // retryable outer cleanup retains this session even if its
+                // first deletion attempt fails.
+                committed.provisional_session_id = Some(session.id.clone());
+                true
+            } else {
+                false
+            };
+            (recorded, cancelled)
+        };
+        if recorded && !cancelled {
+            return Ok(session);
+        }
+
+        if recorded {
+            return Err(EngineError::BadRequest(
+                "stale: review workspace registration was cancelled".into(),
+            ));
+        }
+
+        self.delete_session(&session.id).await?;
+        Err(EngineError::BadRequest(
+            "stale: review workspace registration was cancelled".into(),
+        ))
+    }
+
+    async fn create_session_with_workspace_adoption(
+        &self,
+        req: CreateSessionRequest,
+        adopt_workspace_registration: bool,
+        review_job_id: Option<&str>,
+    ) -> Result<Session, EngineError> {
         let create_started = Instant::now();
         let idempotency_key = match req.idempotency_key.as_deref() {
             Some(key)
@@ -9049,21 +12113,27 @@ impl Engine {
                     "session idempotency key was already used for a different request".into(),
                 ));
             }
+            if let Some(review_job_id) = review_job_id
+                && !self.store.bind_review_job_to_idempotent_session(
+                    review_job_id,
+                    key,
+                    &request_fingerprint,
+                    &existing.id,
+                )?
+            {
+                return Err(EngineError::BadRequest(
+                    "stale: review job cannot adopt the idempotent session".into(),
+                ));
+            }
             return self.get_session(&existing.id);
         }
-        let ws = self
-            .store
-            .open_workspace(&req.workspace_id)?
-            .ok_or_else(|| EngineError::NotFound(format!("workspace {}", req.workspace_id)))?;
+        let ws =
+            self.workspace_for_session_creation(&req.workspace_id, adopt_workspace_registration)?;
         let repo = PathBuf::from(&ws.path);
-        let title = req.title.unwrap_or_else(|| "New session".into());
+        let title = req.title.unwrap_or_else(|| "New Session".into());
         let session_id = new_id("se");
         let checkpoint_id = new_id("cp");
-        let branch = session_branch_name(
-            &title,
-            &session_id,
-            self.title_model.derive_branch_name_from_session_title(),
-        );
+        let branch = session_branch_name(&title, &session_id, false);
         let worktree_path = git::worktree_dir(&self.data_dir, &session_id);
         let fetch_latest = req.fetch_latest;
         if self.store.session(&session_id)?.is_some() {
@@ -9140,6 +12210,7 @@ impl Engine {
             idempotency_key
                 .as_deref()
                 .map(|key| (key, request_fingerprint.as_str())),
+            review_job_id,
             vec![
                 (
                     Scope::Server,
@@ -9338,6 +12409,7 @@ impl Engine {
             self.store.update_session_with_event(
                 id,
                 req.title.as_deref(),
+                None,
                 req.archived,
                 req.expected_title.as_deref(),
                 Event::SessionUpdated {
@@ -9366,6 +12438,128 @@ impl Engine {
             session
         };
         Ok(updated)
+    }
+
+    pub async fn update_session_and_rename_branch(
+        &self,
+        session_id: &str,
+        req: &UpdateSessionRequest,
+    ) -> Result<Session, EngineError> {
+        let Some(title) = req.title.as_deref() else {
+            return self.update_session(session_id, req);
+        };
+        if !self
+            .session_naming_settings()
+            .derive_branch_name_from_session_title
+        {
+            return self.update_session(session_id, req);
+        }
+
+        // Branch changes mutate the session worktree. Hold both the lifecycle
+        // lease and the same exclusive execution lane used by agent tools so
+        // deletion, restore, and active turns cannot race the rename.
+        let _lifecycle = self.session_lock(session_id).read_owned().await;
+        let _execution = self.tool_mutation_permit(session_id).await;
+        let mut session = self.get_session(session_id)?;
+        if let Some(pending) = self.store.session_branch_rename_intent(session_id)? {
+            if should_replay_session_branch_rename(&pending, &session.title, title) {
+                let rename = SessionBranchRename {
+                    managed_root: git::worktree_dir(&self.data_dir, ""),
+                    worktree: PathBuf::from(&session.worktree_path),
+                    old_branch: pending.old_branch.clone(),
+                    new_branch: pending.new_branch.clone(),
+                };
+                self.executor
+                    .rename_session_branch(&rename)
+                    .await
+                    .map_err(|error| EngineError::Internal(anyhow!(error)))?;
+                self.store.complete_session_branch_rename_with_event(
+                    pending,
+                    session.workspace_id.clone(),
+                )?;
+                session = self.get_session(session_id)?;
+            } else {
+                // A new title supersedes a failed rename. Do not make users
+                // repair an obsolete branch target before they can choose a
+                // different one; staging below atomically replaces the intent.
+                self.store.clear_session_branch_rename_intent(session_id)?;
+            }
+        }
+        let desired = session_branch_name(title, session_id, true);
+        if desired == session.branch {
+            return self.update_session(session_id, req);
+        }
+        let intent = SessionBranchRenameIntent {
+            session_id: session_id.to_string(),
+            old_branch: session.branch.clone(),
+            new_branch: desired,
+            title: title.to_string(),
+        };
+        self.store.stage_session_branch_rename(&intent)?;
+        let updated = match self.update_session(session_id, req) {
+            Ok(session) => session,
+            Err(error) => {
+                let _ = self.store.clear_session_branch_rename_intent(session_id);
+                return Err(error);
+            }
+        };
+        let rename = SessionBranchRename {
+            managed_root: git::worktree_dir(&self.data_dir, ""),
+            worktree: PathBuf::from(&session.worktree_path),
+            old_branch: intent.old_branch.clone(),
+            new_branch: intent.new_branch.clone(),
+        };
+        if let Err(error) = self.executor.rename_session_branch(&rename).await {
+            // The title update is already durable. Keep the intent so startup
+            // reconciliation can retry, and return the committed session
+            // instead of reporting that the whole PATCH failed.
+            tracing::warn!(session_id, %error, "session branch rename deferred for recovery");
+            return Ok(updated);
+        }
+        self.store
+            .complete_session_branch_rename_with_event(intent, session.workspace_id)?;
+        self.get_session(session_id)
+    }
+
+    /// Finish branch renames whose durable title update survived a crash or a
+    /// transient Git failure. Git rename is idempotent when it already won.
+    pub async fn reconcile_session_branch_renames(&self) {
+        let intents = match self.store.session_branch_rename_intents() {
+            Ok(intents) => intents,
+            Err(error) => {
+                tracing::warn!(%error, "failed to load session branch rename intents");
+                return;
+            }
+        };
+        for intent in intents {
+            let session_id = intent.session_id.clone();
+            let _lifecycle = self.session_lock(&session_id).read_owned().await;
+            let _execution = self.tool_mutation_permit(&session_id).await;
+            let Some(session) = self.store.session(&session_id).ok().flatten() else {
+                let _ = self.store.clear_session_branch_rename_intent(&session_id);
+                continue;
+            };
+            if session.title != intent.title {
+                let _ = self.store.clear_session_branch_rename_intent(&session_id);
+                continue;
+            }
+            let rename = SessionBranchRename {
+                managed_root: git::worktree_dir(&self.data_dir, ""),
+                worktree: PathBuf::from(&session.worktree_path),
+                old_branch: intent.old_branch.clone(),
+                new_branch: intent.new_branch.clone(),
+            };
+            if let Err(error) = self.executor.rename_session_branch(&rename).await {
+                tracing::warn!(session_id, %error, "session branch rename reconciliation deferred");
+                continue;
+            }
+            if let Err(error) = self
+                .store
+                .complete_session_branch_rename_with_event(intent, session.workspace_id)
+            {
+                tracing::warn!(session_id, %error, "failed to commit reconciled session branch rename");
+            }
+        }
     }
 
     pub async fn delete_session(&self, id: &str) -> Result<(), EngineError> {
@@ -9505,7 +12699,6 @@ impl Engine {
             .model
             .or_else(|| mode.default_model.clone())
             .unwrap_or_else(|| global_defaults.model.clone());
-        validate_model_selection(&model)?;
         let mut model_options = req.model_options;
         // `thinking_level` is the canonical inherited key. Before a turn it
         // is resolved to the selected model's advertised key
@@ -9516,12 +12709,14 @@ impl Engine {
             mode.default_thinking_level.as_deref(),
             global_defaults.thinking_level.as_deref(),
         );
+        validate_thinking_option_aliases(&model_options)?;
         let thread = Thread {
             id: new_id("th"),
             session_id: session.id.clone(),
             parent_thread_id: spawn.map(|(parent, _)| parent.to_string()),
             title: req
                 .title
+                .or_else(|| Some("New Thread".into()))
                 .map(|title| title.split_whitespace().collect::<Vec<_>>().join(" "))
                 .map(|title| title.chars().take(96).collect::<String>())
                 .filter(|title| !title.is_empty()),
@@ -9749,14 +12944,32 @@ impl Engine {
         Ok(self.store.list_thread_statuses(session_id)?)
     }
 
-    /// Change thread settings (mode/model/options) between turns. Conflicts
-    /// only while a turn is running on this thread.
+    /// Change a thread title or settings. Cosmetic title-only updates may run
+    /// during a turn; changes that affect inference wait for the thread to be
+    /// idle.
     pub fn update_thread(
         &self,
         id: &str,
         req: &UpdateThreadRequest,
     ) -> Result<Thread, EngineError> {
+        if req.expected_title.is_some() && req.title.is_none() {
+            return Err(EngineError::BadRequest(
+                "expected_title requires a title update".into(),
+            ));
+        }
+        let title_only = req.title.is_some()
+            && req.mode.is_none()
+            && req.model.is_none()
+            && req.model_options.is_none()
+            && req.permission_mode.is_none();
         let thread = self.get_thread(id)?;
+        if let Some(expected_title) = req.expected_title.as_deref()
+            && thread.title.as_deref() != Some(expected_title)
+        {
+            return Err(EngineError::Conflict(format!(
+                "thread {id} title changed before the generated title was ready"
+            )));
+        }
         if self.subagent_is_read_only(&thread)? {
             return Err(EngineError::Conflict(
                 "this subagent uses a read-only exploration, audit, or review mode".into(),
@@ -9768,7 +12981,7 @@ impl Engine {
         // this thread until its settings update has been persisted. Sibling
         // threads have independent settings and do not block one another.
         let active_threads = self.active_threads.lock().unwrap();
-        if active_threads.contains_key(id) {
+        if active_threads.contains_key(id) && !title_only {
             return Err(EngineError::Conflict(
                 "cannot change thread settings while this thread is running a turn".into(),
             ));
@@ -9788,6 +13001,13 @@ impl Engine {
             .store
             .session(&thread.session_id)?
             .ok_or_else(|| EngineError::NotFound(format!("session {}", thread.session_id)))?;
+        if let Some(expected_title) = req.expected_title.as_deref()
+            && thread.title.as_deref() != Some(expected_title)
+        {
+            return Err(EngineError::Conflict(format!(
+                "thread {id} title changed before the generated title was ready"
+            )));
+        }
 
         if let Some(mode_id) = req.mode.as_deref() {
             let ws = self.store.workspace(&session.workspace_id)?.unwrap();
@@ -9798,22 +13018,12 @@ impl Engine {
         if let Some(model) = req.model.as_deref() {
             validate_model_selection(model)?;
         }
-        let inherited_model_options = req
-            .model
-            .as_deref()
-            .filter(|model| *model != thread.model)
-            .filter(|_| req.model_options.is_none())
-            .map(|_| portable_thinking_options(&thread.model_options));
-        let model_options = req
-            .model_options
-            .as_ref()
-            .or(inherited_model_options.as_ref());
+        if let Some(model_options) = req.model_options.as_ref() {
+            validate_thinking_option_aliases(model_options)?;
+        }
         self.store.update_thread_with_event(
             id,
-            req.mode.as_deref(),
-            req.model.as_deref(),
-            model_options,
-            req.permission_mode,
+            req,
             Event::ThreadUpdated {
                 thread_id: id.to_string(),
                 session_id: session.id,
@@ -9845,83 +13055,12 @@ impl Engine {
         Ok((provider, model_name.to_string()))
     }
 
-    /// Resolve one pinned execution route while the provider-generation lock
-    /// fences registry replacement. The executor instance and generation must
-    /// come from the same snapshot: otherwise an old Arc can be attributed to
-    /// a newly configured provider generation when the registry changes
-    /// between two independent reads.
-    fn resolve_concrete_executor(
-        &self,
-        model: &str,
-    ) -> Result<(String, u64, ModelExecutor, String), EngineError> {
-        let (provider_id, model_name) = model.split_once('/').ok_or_else(|| {
-            EngineError::BadRequest(format!(
-                "model must be provider-qualified (e.g. openai/gpt-4.1-mini): {model}"
-            ))
-        })?;
-        let (providers, backends) = self.provider_registry_snapshot();
-        if let Some((id, generation, backend)) =
-            backends.into_iter().find(|(id, _, _)| id == provider_id)
-        {
-            return Ok((
-                id,
-                generation,
-                ModelExecutor::Backend(backend),
-                model_name.to_string(),
-            ));
-        }
-        if let Some((id, generation, provider)) =
-            providers.into_iter().find(|(id, _, _)| id == provider_id)
-        {
-            return Ok((
-                id,
-                generation,
-                ModelExecutor::Native(provider),
-                model_name.to_string(),
-            ));
-        }
-        Err(EngineError::BadRequest(format!(
-            "provider {provider_id} is not configured (configured: {})",
-            self.provider_ids().join(", ")
-        )))
-    }
-
     pub(crate) async fn resolve_model_info(
         &self,
         model: &str,
     ) -> Result<trouve_protocol::ModelInfo, EngineError> {
-        if let Some(automatic_model) = automatic_model_name(model) {
-            let catalog_id = format!("auto/{automatic_model}");
-            let candidates = tokio::time::timeout(
-                MODEL_CATALOG_VALIDATION_TIMEOUT,
-                self.refresh_model_candidates_for(Some(model)),
-            )
-            .await
-            .map_err(|_| {
-                EngineError::BadRequest(format!("timed out loading model metadata for {model}"))
-            })?;
-            let candidates = candidates
-                .into_iter()
-                .filter(|candidate| {
-                    candidate.automatic_selection_id().as_deref() == Some(catalog_id.as_str())
-                })
-                .collect::<Vec<_>>();
-            return (!candidates.is_empty())
-                .then(|| routed_model_info(catalog_id, candidates))
-                .map(|candidate| trouve_protocol::ModelInfo {
-                    id: candidate.id,
-                    display_name: candidate.display_name,
-                    context_window: candidate.context_window,
-                    supports_tools: candidate.supports_tools,
-                    input_price_per_mtok: candidate.input_price_per_mtok,
-                    output_price_per_mtok: candidate.output_price_per_mtok,
-                    options_schema: candidate.options_schema,
-                })
-                .ok_or_else(|| {
-                    EngineError::BadRequest(format!(
-                        "model {model} has no available provider route"
-                    ))
-                });
+        if let Some(info) = self.resolve_automatic_model_info(model).await? {
+            return Ok(info);
         }
         if let Some((_, backend, _)) = self.backend_for(model) {
             let models =
@@ -10257,36 +13396,23 @@ impl Engine {
         self.send_message_with_tools(thread_id, content, Vec::new(), false, false)
     }
 
+    fn turn_supports_steering(&self, thread: &Thread, tools_enabled: bool) -> bool {
+        tools_enabled
+            && routing::automatic_model_name(&thread.model).is_none()
+            && self
+                .backend_for(&thread.model)
+                .is_none_or(|(_, backend, _)| backend.supports_steering())
+    }
+
     fn turn_shell_events(
         &self,
         thread: &Thread,
         turn: u64,
         prompt: &trouve_protocol::QueuedPrompt,
-        tools_enabled: bool,
+        supports_steering: bool,
     ) -> Result<Vec<Event>, EngineError> {
         let mut model_options = self.store.thread_model_options(&thread.id)?;
-        let (selected_model, supports_steering) =
-            if let Some((_backend_id, backend, _model_name)) = self.backend_for(&thread.model) {
-                (
-                    backend
-                        .models()
-                        .into_iter()
-                        .find(|model| model.id == thread.model),
-                    tools_enabled && backend.supports_steering(),
-                )
-            } else {
-                (
-                    self.resolve_provider(&thread.model)
-                        .ok()
-                        .and_then(|(provider, _)| {
-                            provider
-                                .models()
-                                .into_iter()
-                                .find(|model| model.id == thread.model)
-                        }),
-                    false,
-                )
-            };
+        let selected_model = self.known_model_info(&thread.model);
         if selected_model.is_some() {
             normalize_thinking_option(&mut model_options, selected_model.as_ref());
         }
@@ -10299,12 +13425,97 @@ impl Engine {
                 thinking_level,
                 supports_steering,
             },
-            Event::UserMessage {
-                turn,
-                content: prompt.content.clone(),
-                attachments: prompt.attachments.clone(),
-            },
+            dispatched_prompt_event(turn, prompt),
         ])
+    }
+
+    fn register_turn_steerer(&self, thread_id: &str, turn: u64) {
+        let (sender, receiver) = tokio::sync::mpsc::channel(TURN_STEER_PENDING_CAPACITY);
+        let permits = Arc::new(tokio::sync::Semaphore::new(TURN_STEER_PENDING_CAPACITY));
+        let (mutation_lane_state, _) = tokio::sync::watch::channel(SteerMutationLaneState::Idle);
+        let pending = PendingTurnSteerer {
+            turn,
+            receiver,
+            mutation_lane_state: mutation_lane_state.clone(),
+        };
+        if let Some(replaced) = self
+            .pending_turn_steerers
+            .lock()
+            .unwrap()
+            .insert(thread_id.to_string(), pending)
+        {
+            replaced
+                .mutation_lane_state
+                .send_replace(SteerMutationLaneState::Ended);
+        }
+        if let Some(replaced) = self.turn_steerers.lock().unwrap().insert(
+            thread_id.to_string(),
+            ActiveTurnSteerer {
+                turn,
+                sender,
+                permits,
+                mutation_lane_state,
+            },
+        ) {
+            replaced
+                .mutation_lane_state
+                .send_replace(SteerMutationLaneState::Ended);
+        }
+    }
+
+    fn take_turn_steerer(&self, thread_id: &str, turn: u64) -> Option<PendingTurnSteerer> {
+        let mut pending = self.pending_turn_steerers.lock().unwrap();
+        pending
+            .get(thread_id)
+            .is_some_and(|entry| entry.turn == turn)
+            .then(|| pending.remove(thread_id).expect("matching pending steerer"))
+    }
+
+    fn unregister_turn_steerer(&self, thread_id: &str, turn: u64) {
+        if let Some(pending) = self.take_turn_steerer(thread_id, turn) {
+            pending
+                .mutation_lane_state
+                .send_replace(SteerMutationLaneState::Ended);
+        }
+        let mut active = self.turn_steerers.lock().unwrap();
+        if active
+            .get(thread_id)
+            .is_some_and(|entry| entry.turn == turn)
+            && let Some(removed) = active.remove(thread_id)
+        {
+            removed
+                .mutation_lane_state
+                .send_replace(SteerMutationLaneState::Ended);
+        }
+    }
+
+    /// Returns whether the exact turn has installed its steering receiver.
+    /// This is a narrow lifecycle diagnostic used by integration tests to
+    /// verify that the advertised capability and receiver become visible at
+    /// the same commit boundary.
+    #[doc(hidden)]
+    pub fn turn_accepts_steering(&self, thread_id: &str, turn: u64) -> bool {
+        self.turn_steerers
+            .lock()
+            .unwrap()
+            .get(thread_id)
+            .is_some_and(|steerer| steerer.turn == turn)
+    }
+
+    /// Returns the number of steering commands admitted but not yet
+    /// acknowledged for an exact turn. Integration tests use this instead of
+    /// a scheduling delay when they need to observe bounded queued or
+    /// boundary-deferred work.
+    #[doc(hidden)]
+    pub fn pending_turn_steers(&self, thread_id: &str, turn: u64) -> usize {
+        self.turn_steerers
+            .lock()
+            .unwrap()
+            .get(thread_id)
+            .filter(|steerer| steerer.turn == turn)
+            .map_or(0, |steerer| {
+                TURN_STEER_PENDING_CAPACITY - steerer.permits.available_permits()
+            })
     }
 
     /// Append user guidance to the exact backend turn currently running on a
@@ -10340,6 +13551,9 @@ impl Engine {
             .ok_or_else(|| {
                 EngineError::Conflict(format!("thread {thread_id} has no steerable turn ready"))
             })?;
+        let permit = active.permits.clone().try_acquire_owned().map_err(|_| {
+            EngineError::Conflict(format!("turn {} steering queue is full", active.turn))
+        })?;
         let (prepared, attachment_cleanup) = self.prepare_attachments(uploads)?;
         let attachments = prepared
             .iter()
@@ -10357,7 +13571,10 @@ impl Engine {
                 attachments,
                 attachment_rows,
                 attachment_cleanup,
-                response,
+                response: SteerResponse {
+                    sender: Some(response),
+                },
+                _permit: permit,
             })
             .await
             .is_err()
@@ -10383,6 +13600,116 @@ impl Engine {
             thread_id: thread_id.to_string(),
             turn: active.turn,
         })
+    }
+
+    async fn accept_native_steer_command(
+        &self,
+        session: &Session,
+        thread: &Thread,
+        turn: u64,
+        cancel: &tokio_util::sync::CancellationToken,
+        mutation_lane_state: &tokio::sync::watch::Sender<SteerMutationLaneState>,
+        command: SteerTurnCommand,
+    ) -> Result<()> {
+        let scope = Scope::Thread(thread.id.clone());
+        let SteerTurnCommand {
+            content,
+            attachments,
+            attachment_rows,
+            mut attachment_cleanup,
+            response,
+            _permit,
+        } = command;
+        if cancel.is_cancelled() {
+            response.send(Err("turn cancelled".into()));
+            return Ok(());
+        }
+
+        let staged = attachment_rows
+            .iter()
+            .map(|(attachment, path)| AttachmentMaterializationFile {
+                attachment: attachment.clone(),
+                source: PathBuf::from(path),
+            })
+            .collect::<Vec<_>>();
+        let materialized = if staged.is_empty() {
+            Vec::new()
+        } else {
+            mutation_lane_state.send_replace(SteerMutationLaneState::Waiting);
+            let permit = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    mutation_lane_state.send_replace(SteerMutationLaneState::Idle);
+                    response.send(Err("turn cancelled".into()));
+                    return Ok(());
+                }
+                permit = self.tool_mutation_permit(&session.id) => permit,
+            };
+            mutation_lane_state.send_replace(SteerMutationLaneState::Idle);
+            let result = self
+                .executor
+                .materialize_attachments(&AttachmentMaterialization {
+                    source_root: self.data_dir.join("attachments"),
+                    managed_worktree_root: self.data_dir.join("worktrees"),
+                    worktree: PathBuf::from(&session.worktree_path),
+                    files: staged,
+                    cancel: cancel.clone(),
+                })
+                .await;
+            drop(permit);
+            match result {
+                Ok(materialized) => materialized,
+                Err(error) => {
+                    response.send(Err(error.clone()));
+                    return Ok(());
+                }
+            }
+        };
+
+        let prompt_files = materialized
+            .iter()
+            .map(|file| (file.attachment.clone(), file.relative_path.clone()))
+            .collect::<Vec<_>>();
+        let provider_prompt = annotate_attachments(content.clone(), &prompt_files);
+        let payload = match serde_json::to_value(Message::User(provider_prompt)) {
+            Ok(payload) => payload,
+            Err(error) => {
+                let mut message = error.to_string();
+                if let Err(cleanup) = self.rollback_materialized_attachments(session, &materialized)
+                {
+                    message.push_str(&format!(
+                        "; materialized attachment rollback failed: {cleanup}"
+                    ));
+                }
+                let error = anyhow!(message);
+                response.send(Err(error.to_string()));
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.store.append_event_with_message(
+            scope,
+            Event::TurnSteered {
+                turn,
+                content,
+                attachments,
+            },
+            &thread.id,
+            &payload,
+            attachment_rows,
+            attachment_cleanup.claim(),
+        ) {
+            let mut message = error.to_string();
+            if let Err(cleanup) = self.rollback_materialized_attachments(session, &materialized) {
+                message.push_str(&format!(
+                    "; materialized attachment rollback failed: {cleanup}"
+                ));
+            }
+            response.send(Err(message));
+            return Err(error);
+        }
+        attachment_cleanup.disarm();
+        response.send(Ok(()));
+        Ok(())
     }
 
     /// Whether the current turn has accepted attachment-bearing steering and
@@ -10418,6 +13745,29 @@ impl Engine {
         uploads: Vec<trouve_protocol::AttachmentUpload>,
         tools_enabled: bool,
         allow_spawned: bool,
+    ) -> Result<TurnAccepted, EngineError> {
+        self.send_message_inner(
+            thread_id,
+            content,
+            uploads,
+            tools_enabled,
+            allow_spawned,
+            false,
+        )
+    }
+
+    /// Full prompt-submission path. `background` marks a server-dispatched
+    /// attach turn for vendor-autonomous activity; it is trusted dispatch
+    /// metadata carried on the queued prompt, never inferred from content.
+    #[allow(clippy::too_many_arguments)]
+    fn send_message_inner(
+        self: &Arc<Self>,
+        thread_id: &str,
+        content: String,
+        uploads: Vec<trouve_protocol::AttachmentUpload>,
+        tools_enabled: bool,
+        allow_spawned: bool,
+        background: bool,
     ) -> Result<TurnAccepted, EngineError> {
         let thread = self.get_thread(thread_id)?; // 404 for unknown threads
         if !allow_spawned && self.subagent_is_read_only(&thread)? {
@@ -10455,6 +13805,7 @@ impl Engine {
             thread_id: thread_id.to_string(),
             position,
             content,
+            background,
             attachments,
             created_at: chrono::Utc::now().to_rfc3339(),
         };
@@ -10483,7 +13834,6 @@ impl Engine {
                     attachments: attachment_rows,
                     claim_prompt_id: None,
                     expected_previous_turn: None,
-                    accepted_prompt: None,
                     staging_cleanup_claim: attachment_cleanup.claim(),
                 },
                 vec![(
@@ -10540,13 +13890,29 @@ impl Engine {
                 prompts: visible_queue,
             },
         ));
+        let turn_steering = self.turn_supports_steering(&thread, started_tools_enabled);
+        if turn_steering {
+            // Install the receiver before even constructing TurnStarted. This
+            // keeps capability publication and readiness in one visibly
+            // ordered lifecycle: every path after this point unregisters on
+            // failure until the spawned turn takes ownership.
+            self.register_turn_steerer(thread_id, turn);
+        }
+        let shell_events =
+            match self.turn_shell_events(&thread, turn, &started_prompt, turn_steering) {
+                Ok(events) => events,
+                Err(error) => {
+                    if turn_steering {
+                        self.unregister_turn_steerer(thread_id, turn);
+                    }
+                    return Err(error);
+                }
+            };
         events.extend(
-            self.turn_shell_events(&thread, turn, &started_prompt, started_tools_enabled)?
+            shell_events
                 .into_iter()
                 .map(|event| (Scope::Thread(thread_id.to_string()), event)),
         );
-        let accepted_message =
-            accepted_prompt_message(&started_prompt).map_err(EngineError::Internal)?;
 
         active.insert(thread_id.to_string(), thread.session_id.clone());
         let cancel = self.register_cancel(thread_id);
@@ -10557,16 +13923,14 @@ impl Engine {
                 attachments: attachment_rows,
                 claim_prompt_id: Some(started_prompt.id.clone()),
                 expected_previous_turn: Some(previous_turn),
-                accepted_prompt: Some(AcceptedPrompt {
-                    id: started_prompt.id.clone(),
-                    turn,
-                    message: accepted_message,
-                }),
                 staging_cleanup_claim: attachment_cleanup.claim(),
             },
             events,
         );
         if let Err(error) = accepted {
+            if turn_steering {
+                self.unregister_turn_steerer(thread_id, turn);
+            }
             active.remove(thread_id);
             self.clear_cancel(thread_id);
             drop(active);
@@ -10612,13 +13976,7 @@ impl Engine {
             let id = format!("at_{}", uuid::Uuid::new_v4().simple());
             // Store under the opaque id; keep the (sanitized) extension so
             // tools and vendor CLIs sniff the type naturally.
-            let ext = Path::new(&up.name)
-                .extension()
-                .and_then(|e| e.to_str())
-                .filter(|e| e.len() <= 8 && e.chars().all(|c| c.is_ascii_alphanumeric()))
-                .map(|e| format!(".{}", e.to_ascii_lowercase()))
-                .unwrap_or_default();
-            let path = dir.join(format!("{id}{ext}"));
+            let path = dir.join(format!("{id}{}", opaque_attachment_extension(&up.name)));
             let attachment = trouve_protocol::Attachment {
                 id,
                 name: up.name,
@@ -10733,30 +14091,33 @@ impl Engine {
             .map_err(|error| EngineError::Internal(anyhow!(error)))
     }
 
-    /// Publish attachment paths into the provider transcript only after the
-    /// executor has created those files. Before this transition the accepted
-    /// transcript contains only the user's original text, so an early setup
-    /// failure or restart never advertises a nonexistent worktree path.
-    fn publish_materialized_attachment_paths(
+    fn rollback_materialized_attachments(
         &self,
-        thread_id: &str,
-        turn: u64,
-        prompt_id: &str,
-        content: &str,
-        attachments: &[trouve_protocol::Attachment],
-    ) -> Result<()> {
-        if attachments.is_empty() {
+        session: &Session,
+        materialized: &[MaterializedAttachment],
+    ) -> Result<(), String> {
+        if materialized.is_empty() {
             return Ok(());
         }
-        let expected = serde_json::to_string(&Message::User(content.to_string()))?;
-        let materialized = serde_json::to_string(&accepted_user_message(content, attachments)?)?;
-        self.store.materialize_accepted_prompt_message(
-            thread_id,
-            prompt_id,
-            turn,
-            &expected,
-            &materialized,
-        )
+        let paths = materialized
+            .iter()
+            .map(|file| file.absolute_path.clone())
+            .collect::<Vec<_>>();
+        self.rollback_materialized_attachment_paths(session, &paths)
+    }
+
+    fn rollback_materialized_attachment_paths(
+        &self,
+        session: &Session,
+        paths: &[PathBuf],
+    ) -> Result<(), String> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let root = PathBuf::from(&session.worktree_path)
+            .join(".trouve")
+            .join("attachments");
+        self.executor.rollback_attachment_files(&root, paths)
     }
 
     /// Publish the thread's current queue on its event stream.
@@ -11187,10 +14548,10 @@ impl Engine {
                 .take()
                 .expect("an active queue prompt must have a cancellation token");
             let prompt_persisted = AtomicBool::new(shell_persisted);
-            let concrete_attempt = ConcreteAttemptState::default();
             let routed_attempt = Mutex::new(None);
+            let automatic = routing::automatic_model_name(&thread.model).is_some();
             let turn_future = async {
-                if automatic_model_name(&thread.model).is_some() {
+                if automatic {
                     self.run_routed_turn(
                         &thread,
                         turn,
@@ -11201,15 +14562,8 @@ impl Engine {
                     )
                     .await
                 } else {
-                    self.run_turn(
-                        &thread,
-                        turn,
-                        &prompt,
-                        cancel.clone(),
-                        &prompt_persisted,
-                        &concrete_attempt,
-                    )
-                    .await
+                    self.run_turn(&thread, turn, &prompt, cancel.clone(), &prompt_persisted)
+                        .await
                 }
             };
             let result = std::panic::AssertUnwindSafe(turn_future)
@@ -11219,40 +14573,18 @@ impl Engine {
                 Ok(result) => result,
                 Err(_) => {
                     tracing::error!("turn {turn} of {} panicked", thread.id);
-                    let failure = Event::TurnFailed {
-                        turn,
-                        error: "internal error".into(),
-                    };
-                    if !cancel.is_cancelled()
-                        && automatic_model_name(&thread.model).is_none()
-                        && let Some(attempt_order) =
-                            positive_attempt_order(&concrete_attempt.attempt_order)
-                        && let Some((provider_id, provider_generation)) =
-                            concrete_attempt.provider_generation.lock().unwrap().clone()
-                    {
-                        self.with_current_provider_generation(
-                            &provider_id,
-                            provider_generation,
-                            || {
-                                self.turn_scheduler.record_outcome(
-                                    &thread.model,
-                                    Some("internal error"),
-                                    attempt_order,
-                                );
-                                Ok(())
-                            },
-                        )?;
-                    }
                     if !cancel.is_cancelled()
                         && let Some(attempt) = routed_attempt.lock().unwrap().take()
                     {
-                        let (base, max) = RouteFailureKind::Unavailable.cooldown();
+                        let (base, max) = routing::RouteFailureKind::Unavailable.cooldown();
                         self.with_current_provider_generation(
                             &attempt.provider_id,
                             attempt.provider_generation,
                             || {
-                                self.turn_scheduler.record_outcome(
-                                    &attempt.provider_id,
+                                let concrete =
+                                    format!("{}/{}", attempt.provider_id, attempt.provider_model);
+                                self.turn_scheduler.record_ordered_outcome(
+                                    &concrete,
                                     Some("internal error"),
                                     attempt.attempt_order,
                                 );
@@ -11272,37 +14604,21 @@ impl Engine {
                             },
                         )?;
                     }
-                    if prompt_persisted.load(Ordering::Acquire) {
-                        // Once the user message is durable, this queue row is
-                        // the failed turn rather than a retryable dispatch.
-                        // Consume it in the same transaction as the terminal
-                        // event so neither side can become stranded alone.
-                        self.store
-                            .append_event_finishing_queued_prompt(
-                                Scope::Thread(thread.id.clone()),
-                                failure,
-                                &prompt.id,
+                    self.store
+                        .append_event(
+                            Scope::Thread(thread.id.clone()),
+                            Event::TurnFailed {
+                                turn,
+                                error: "internal error".into(),
+                            },
+                        )
+                        .with_context(|| {
+                            format!(
+                                "persisting failure after panic in turn {turn} of {}",
+                                thread.id
                             )
-                            .with_context(|| {
-                                format!(
-                                    "persisting failure after panic in turn {turn} of {}",
-                                    thread.id
-                                )
-                            })?;
-                    } else {
-                        self.store
-                            .append_event_releasing_queued_prompt(
-                                Scope::Thread(thread.id.clone()),
-                                failure,
-                                &prompt.id,
-                            )
-                            .with_context(|| {
-                                format!(
-                                    "persisting failure after panic in turn {turn} of {}",
-                                    thread.id
-                                )
-                            })?;
-                    }
+                        })?;
+                    let _ = self.store.release_queued_prompt(&prompt.id);
                     let _ = self.emit_queue(&thread.id);
                     self.clear_cancel(&thread.id);
                     self.release_thread(&thread.id)?;
@@ -11310,21 +14626,10 @@ impl Engine {
                 }
             };
             let cancelled = cancel.is_cancelled();
-            if !cancelled
-                && automatic_model_name(&thread.model).is_none()
-                && let Some(attempt_order) = positive_attempt_order(&concrete_attempt.attempt_order)
-                && let Some((provider_id, provider_generation)) =
-                    concrete_attempt.provider_generation.lock().unwrap().clone()
-            {
+            if !cancelled && !automatic {
                 let outcome_error = result.as_ref().err().map(ToString::to_string);
-                self.with_current_provider_generation(&provider_id, provider_generation, || {
-                    self.turn_scheduler.record_outcome(
-                        &thread.model,
-                        outcome_error.as_deref(),
-                        attempt_order,
-                    );
-                    Ok(())
-                })?;
+                self.turn_scheduler
+                    .record_outcome(&thread.model, outcome_error.as_deref());
             }
             // Cancellation wins a race with startup/stream errors only after
             // run_turn has returned, which is the adapter/tool acknowledgement
@@ -11337,6 +14642,9 @@ impl Engine {
                         thread.id
                     );
                 }
+                // A cancellation can arrive before run_turn consumes the
+                // claimed queue row. Remove it here as an idempotent fallback.
+                let _ = self.store.finish_queued_prompt(&prompt.id);
                 let mut terminal_events = Vec::with_capacity(3);
                 if !prompt_persisted.load(Ordering::Acquire) {
                     // Cancellation becomes available as soon as dispatch is
@@ -11351,33 +14659,16 @@ impl Engine {
                             thinking_level: None,
                             supports_steering: false,
                         },
-                        Event::UserMessage {
-                            turn,
-                            content: prompt.content.clone(),
-                            attachments: prompt.attachments.clone(),
-                        },
+                        dispatched_prompt_event(turn, &prompt),
                     ]);
                 }
                 terminal_events.push(Event::TurnCancelled { turn });
-                if prompt_persisted.load(Ordering::Acquire) {
-                    self.store
-                        .append_events_finishing_queued_prompt(
-                            Scope::Thread(thread.id.clone()),
-                            terminal_events,
-                            &prompt.id,
-                        )
-                        .await?;
-                } else {
-                    self.store
-                        .append_events_accepting_and_finishing_queued_prompt(
-                            &thread.id,
-                            turn,
-                            &prompt.id,
-                            accepted_prompt_message(&prompt)?,
-                            terminal_events,
-                        )
-                        .await?;
-                }
+                self.store
+                    .append_events_async(Scope::Thread(thread.id.clone()), terminal_events)
+                    .await
+                    .with_context(|| {
+                        format!("persisting cancellation for turn {turn} of {}", thread.id)
+                    })?;
                 let resume = self.finish_interrupted_turn(&thread.id)?;
                 if !resume {
                     return Ok(());
@@ -11385,34 +14676,18 @@ impl Engine {
             }
             let resume_after_failure = if !cancelled && let Err(e) = result {
                 tracing::error!("turn {turn} of {} failed: {e}", thread.id);
-                let failure = Event::TurnFailed {
-                    turn,
-                    error: e.to_string(),
-                };
-                if prompt_persisted.load(Ordering::Acquire) {
-                    // The accepted prompt already owns this failed turn.
-                    // Only pre-acceptance setup failures may return a row to
-                    // the queue for a fresh dispatch attempt.
-                    self.store
-                        .append_event_finishing_queued_prompt(
-                            Scope::Thread(thread.id.clone()),
-                            failure,
-                            &prompt.id,
-                        )
-                        .with_context(|| {
-                            format!("persisting failure for turn {turn} of {}", thread.id)
-                        })?;
-                } else {
-                    self.store
-                        .append_event_releasing_queued_prompt(
-                            Scope::Thread(thread.id.clone()),
-                            failure,
-                            &prompt.id,
-                        )
-                        .with_context(|| {
-                            format!("persisting failure for turn {turn} of {}", thread.id)
-                        })?;
-                }
+                self.store
+                    .append_event(
+                        Scope::Thread(thread.id.clone()),
+                        Event::TurnFailed {
+                            turn,
+                            error: e.to_string(),
+                        },
+                    )
+                    .with_context(|| {
+                        format!("persisting failure for turn {turn} of {}", thread.id)
+                    })?;
+                let _ = self.store.release_queued_prompt(&prompt.id);
                 let _ = self.emit_queue(&thread.id);
                 let resume = self.finish_interrupted_turn(&thread.id)?;
                 if !resume {
@@ -11573,12 +14848,26 @@ impl Engine {
         }
     }
 
+    /// Arm the hard tool-call boundary before an automated-review turn is
+    /// dispatched.
     pub(crate) fn begin_automated_review_tool_budget(
         &self,
         thread_id: &str,
         limit: u64,
     ) -> Result<AutomatedReviewToolBudgetGuard> {
         self.automated_review_tool_budgets.arm(thread_id, limit)
+    }
+
+    /// Test hook for exercising the production backend/bridge boundary from
+    /// an external shipping-path qualification. Product code uses the
+    /// crate-private entry point above through the review runner.
+    #[doc(hidden)]
+    pub fn begin_automated_review_tool_budget_for_qualification(
+        &self,
+        thread_id: &str,
+        limit: u64,
+    ) -> Result<impl Drop> {
+        self.begin_automated_review_tool_budget(thread_id, limit)
     }
 
     /// Server-scope `session.activity` event — session lists light up (or
@@ -11607,20 +14896,45 @@ impl Engine {
         prompt: &trouve_protocol::QueuedPrompt,
         cancel: tokio_util::sync::CancellationToken,
         prompt_persisted: &AtomicBool,
-        concrete_attempt: &ConcreteAttemptState,
     ) -> Result<()> {
         let content = prompt.content.clone();
         let attachments = prompt.attachments.clone();
         let tools_enabled = self.store.queued_prompt_tools_enabled(&prompt.id)?;
+        let turn_steering = self.turn_supports_steering(thread, tools_enabled);
+        if turn_steering && !prompt_persisted.load(Ordering::Acquire) {
+            // Queued prompts publish their shell only when claimed. Register
+            // before that publication for the same readiness guarantee as an
+            // immediately-started prompt.
+            self.register_turn_steerer(&thread.id, turn);
+        }
+        let pending_turn_steerer = if turn_steering {
+            self.take_turn_steerer(&thread.id, turn).or_else(|| {
+                // Defensive recovery for a process-local registry loss: keep
+                // the active turn steerable, though ordinary sends always
+                // install this before TurnStarted is committed.
+                self.register_turn_steerer(&thread.id, turn);
+                self.take_turn_steerer(&thread.id, turn)
+            })
+        } else {
+            None
+        };
+        let (mut turn_steer_rx, turn_steer_mutation_lane_state) =
+            if let Some(pending) = pending_turn_steerer {
+                (Some(pending.receiver), pending.mutation_lane_state)
+            } else {
+                let (state, _) = tokio::sync::watch::channel(SteerMutationLaneState::Idle);
+                (None, state)
+            };
+        let turn_steerer_guard = turn_steering.then(|| ActiveTurnSteererGuard {
+            registry: &self.turn_steerers,
+            thread_id: thread.id.clone(),
+            turn,
+        });
         if !prompt_persisted.load(Ordering::Acquire) {
-            let message = accepted_prompt_message(prompt)?;
             self.store
-                .append_events_accepting_claimed_prompt(
-                    &thread.id,
-                    turn,
-                    &prompt.id,
-                    message,
-                    self.turn_shell_events(thread, turn, prompt, tools_enabled)?,
+                .append_events_async(
+                    Scope::Thread(thread.id.clone()),
+                    self.turn_shell_events(thread, turn, prompt, turn_steering)?,
                 )
                 .await?;
             prompt_persisted.store(true, Ordering::Release);
@@ -11650,7 +14964,6 @@ impl Engine {
             config_dir: self.config_dir.clone(),
             workspace_root: Some(PathBuf::from(&ws.path)),
             edit_strategy: edit_strategy_for_model(&thread.model),
-            background_mutation_lease: None,
         };
 
         let all_modes = self.resolve_personas(Some(Path::new(&ws.path)))?;
@@ -11672,50 +14985,22 @@ impl Engine {
             _ = cancel.cancelled() => bail!("turn cancelled"),
             guard = session_lifecycle.read() => guard,
         };
-        let turn_capacity = self
-            .turn_scheduler
-            .acquire(&thread.model, background, &cancel)
-            .await?;
-        if background
-            && let Some(progress) = self
-                .store
-                .set_code_review_task_provider_wait(&thread.id, turn_capacity.wait_ms)?
-        {
-            self.emit_code_review_task_progress(progress).await?;
-        }
-        self.store
-            .append_event_async(
-                scope.clone(),
-                Event::TurnCapacityAcquired {
-                    turn,
-                    wait_ms: turn_capacity.wait_ms,
-                    background,
-                },
-            )
-            .await?;
-
-        let _turn_capacity = turn_capacity;
-
-        let (provider_id, provider_generation, executor, model_name) = self
-            .resolve_concrete_executor(&thread.model)
-            .map_err(|error| anyhow!(error.to_string()))?;
-        *concrete_attempt.provider_generation.lock().unwrap() =
-            Some((provider_id.clone(), provider_generation));
-        concrete_attempt
-            .attempt_order
-            .store(self.turn_scheduler.next_attempt_order(), Ordering::Release);
+        let admission = self.turn_scheduler.admit(&thread.model, &cancel).await?;
 
         // External agent backend? The vendor harness owns the loop; we
         // stream its events and bridge approvals. The shared lifecycle lease
         // stays held; mutation tools take the exclusive execution lane.
-        if let ModelExecutor::Backend(backend) = executor {
+        // Admission is published there, once the backend's startup lane has
+        // also been passed, so the reported wait covers every queue the turn
+        // stood in before the vendor saw it.
+        if let Some((backend_id, backend, model_name)) = self.backend_for(&thread.model) {
             return self
                 .run_backend_turn(
                     &session,
                     thread,
                     turn,
                     &mode,
-                    &provider_id,
+                    &backend_id,
                     backend,
                     model_name,
                     content,
@@ -11723,13 +15008,19 @@ impl Engine {
                     cancel,
                     &prompt.id,
                     tools_enabled,
+                    prompt.background,
+                    admission.provider_wait_ms,
+                    turn_steer_rx,
+                    turn_steer_mutation_lane_state,
                 )
                 .await;
         }
+        self.publish_turn_admission(thread, turn, background, admission.provider_wait_ms)
+            .await?;
 
-        let ModelExecutor::Native(provider) = executor else {
-            unreachable!("backend execution returned above")
-        };
+        let (provider, model_name) = self
+            .resolve_provider(&thread.model)
+            .map_err(|e| anyhow!(e.to_string()))?;
         let mut model_options = self.store.thread_model_options(&thread.id)?;
         let model_catalog = tokio::select! {
             biased;
@@ -11739,11 +15030,11 @@ impl Engine {
         let selected_model = model_catalog.iter().find(|m| m.id == thread.model);
         normalize_thinking_option(&mut model_options, selected_model);
 
-        // Compact earlier transcript messages when the accepted turn nears
-        // the model's context window. `maybe_compact` preserves the current
-        // user message as the final transcript row.
+        // Compact the transcript when it nears the model's context window,
+        // before this turn's user message joins it (the stored transcript —
+        // the event above is display-only).
         if let Err(e) = self
-            .maybe_compact(thread, turn, &provider, &model_name, 0, &cancel)
+            .maybe_compact(thread, turn, &provider, &model_name, None, &cancel)
             .await
         {
             // Compaction is best-effort; the turn proceeds with full history.
@@ -11754,17 +15045,17 @@ impl Engine {
         // follow. Copy them into the worktree first: the file tools reject
         // absolute paths (the sandbox), so a data-dir path the model can't
         // open is useless — a worktree-relative copy is reachable.
-        let _materialized = self
+        let materialized = self
             .materialize_attachments_for_turn(&session, &attachments, &cancel)
             .await
             .map_err(|error| anyhow!(error.to_string()))?;
-        self.publish_materialized_attachment_paths(
-            &thread.id,
-            turn,
-            &prompt.id,
-            &prompt.content,
-            &prompt.attachments,
-        )?;
+        let prompt_files = materialized
+            .iter()
+            .map(|file| (file.attachment.clone(), file.relative_path.clone()))
+            .collect::<Vec<_>>();
+        let content = annotate_attachments(content, &prompt_files);
+        self.store
+            .append_message(&thread.id, &serde_json::to_value(Message::User(content))?)?;
         if !self.store.finish_queued_prompt(&prompt.id)? {
             bail!("queued prompt {} vanished before turn start", prompt.id);
         }
@@ -11810,8 +15101,8 @@ impl Engine {
         if background {
             // Context assembly intentionally layers trusted workspace
             // instructions after the persona. Repeat the immutable review
-            // guard last so no configurable layer can weaken it.
-            personas::append_automated_review_security_prompt(&mut system);
+            // guidance floor last so no configurable layer can weaken it.
+            personas::append_automated_review_guidance(&mut system);
         }
         let live_models = tokio::select! {
             biased;
@@ -11863,6 +15154,28 @@ impl Engine {
                 hit_iteration_limit = false;
                 break;
             }
+            // Guidance received while tools were finishing belongs before the
+            // next model invocation. Drain every already-accepted message so
+            // the rebuilt transcript presents them in arrival order.
+            loop {
+                let command = match turn_steer_rx.as_mut().map(|rx| rx.try_recv()) {
+                    Some(Ok(command)) => command,
+                    Some(Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)) => {
+                        turn_steer_rx = None;
+                        break;
+                    }
+                    Some(Err(tokio::sync::mpsc::error::TryRecvError::Empty)) | None => break,
+                };
+                self.accept_native_steer_command(
+                    &session,
+                    thread,
+                    turn,
+                    &cancel,
+                    &turn_steer_mutation_lane_state,
+                    command,
+                )
+                .await?;
+            }
             // Rebuild the transcript each iteration; the store is the truth.
             let mut messages = vec![Message::System(system.clone())];
             for payload in self.store.messages(&thread.id)? {
@@ -11888,42 +15201,69 @@ impl Engine {
 
             let mut text = String::new();
             let mut tool_calls = Vec::new();
-            // Provider-native reasoning blocks (Anthropic signed thinking) to
-            // persist and replay verbatim — Anthropic rejects a follow-up
-            // tool-use turn whose thinking blocks aren't preserved.
+            // Provider-native reasoning blocks (for example Anthropic signed
+            // thinking and OpenAI encrypted reasoning items) to persist and
+            // replay verbatim across stateless tool-use turns.
             let mut reasoning: Vec<serde_json::Value> = Vec::new();
-            let mut thinking_streamed = false;
+            let mut thinking = ProviderThinkingState::default();
             let mut pending_events = Vec::new();
             let mut persist_deadline = None;
+            let mut pending_native_steer = None;
+            let mut consecutive_provider_events = 0usize;
+            let mut boundary_steers = Vec::new();
             loop {
                 let flush_at = persist_deadline.unwrap_or_else(Instant::now);
+                let steer_reserved = !cancel.is_cancelled()
+                    && reserve_ready_steer_after_event_budget(
+                        &mut turn_steer_rx,
+                        &mut pending_native_steer,
+                        &mut consecutive_provider_events,
+                    );
                 let ev = tokio::select! {
                     biased;
                     _ = cancel.cancelled() => None,
+                    ev = stream.next(), if !steer_reserved => ev,
                     _ = tokio::time::sleep_until(flush_at.into()), if persist_deadline.is_some() => {
                         flush_backend_event_batch(&self.store, &scope, &mut pending_events).await?;
                         persist_deadline = None;
                         continue;
                     }
-                    ev = stream.next() => ev,
+                    steer = receive_steer_command(
+                        &mut turn_steer_rx,
+                        &mut pending_native_steer,
+                        true,
+                    ), if !cancel.is_cancelled() => {
+                        match steer {
+                            Some(command) => boundary_steers.push(command),
+                            None => turn_steer_rx = None,
+                        }
+                        continue;
+                    }
                 };
                 let Some(ev) = ev else { break };
                 let event = match ev {
                     Ok(event) => event,
                     Err(error) => {
+                        thinking.finish(turn, &mut pending_events);
                         flush_backend_event_batch(&self.store, &scope, &mut pending_events).await?;
                         return Err(anyhow!("provider stream error: {error}"));
                     }
                 };
+                consecutive_provider_events += 1;
                 match event {
                     ProviderEvent::TextDelta(delta) => {
                         text.push_str(&delta);
                         pending_events.push(Event::AssistantDelta { turn, text: delta });
                     }
                     // Display-only; never joins the provider transcript.
-                    ProviderEvent::ThinkingDelta(delta) => {
-                        thinking_streamed = true;
-                        pending_events.push(Event::AssistantThinking { turn, text: delta });
+                    ProviderEvent::ThinkingStarted { id } => {
+                        thinking.start(id, turn, &mut pending_events);
+                    }
+                    ProviderEvent::ThinkingDelta { id, text } => {
+                        thinking.delta(id, text, turn, &mut pending_events);
+                    }
+                    ProviderEvent::ThinkingCompleted { id } => {
+                        thinking.complete(&id, turn, &mut pending_events);
                     }
                     // Kept out of the UI (already streamed as ThinkingDelta);
                     // carried in the transcript for replay only.
@@ -11946,15 +15286,32 @@ impl Engine {
                     persist_deadline = Some(Instant::now() + STREAM_EVENT_BATCH_WINDOW);
                 }
             }
-            if thinking_streamed {
-                pending_events.push(Event::AssistantThinkingCompleted { turn });
-            }
+            // Malformed or legacy-compatible streams may end without an
+            // explicit item completion. Close only the still-active item.
+            thinking.finish(turn, &mut pending_events);
             flush_backend_event_batch(&self.store, &scope, &mut pending_events).await?;
+
+            // Catch every message that arrived at the exact response boundary.
+            // They remain pending until this provider turn, including its tool
+            // batch, has settled.
+            if !cancel.is_cancelled() {
+                loop {
+                    match turn_steer_rx.as_mut().map(|rx| rx.try_recv()) {
+                        Some(Ok(command)) => boundary_steers.push(command),
+                        Some(Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)) => {
+                            turn_steer_rx = None;
+                            break;
+                        }
+                        Some(Err(tokio::sync::mpsc::error::TryRecvError::Empty)) | None => break,
+                    }
+                }
+            }
 
             // Interrupted mid-stream: keep any streamed text for display, but
             // drop the (unexecuted) tool calls so we don't strand tool_use
             // without results, and stop the turn.
             if cancel.is_cancelled() {
+                reject_pending_steer(&mut pending_native_steer, "turn cancelled");
                 if !text.is_empty() {
                     self.store
                         .append_event_async(
@@ -11974,6 +15331,12 @@ impl Engine {
                         })?,
                     )?;
                 }
+                reject_steer_commands(
+                    &mut turn_steer_rx,
+                    &mut pending_native_steer,
+                    &mut boundary_steers,
+                    "turn cancelled",
+                );
                 hit_iteration_limit = false;
                 break;
             }
@@ -12013,9 +15376,24 @@ impl Engine {
                 )?;
             }
 
+            let had_boundary_steers = !boundary_steers.is_empty();
+            for command in boundary_steers.drain(..) {
+                self.accept_native_steer_command(
+                    &session,
+                    thread,
+                    turn,
+                    &cancel,
+                    &turn_steer_mutation_lane_state,
+                    command,
+                )
+                .await?;
+            }
             if tool_calls.is_empty() {
-                hit_iteration_limit = false;
-                break;
+                if !had_boundary_steers {
+                    hit_iteration_limit = false;
+                    break;
+                }
+                continue;
             }
 
             // Providers may request independent calls in one response. Poll
@@ -12023,11 +15401,52 @@ impl Engine {
             // transcript remains valid for APIs that require ordered
             // tool-result blocks. Tool events retain their real start and
             // completion ordering through the durable event log.
-            let results = self
-                .handle_tool_calls_parallel(
-                    &session, thread, turn, &mode, &ctx, tool_calls, &cancel,
-                )
-                .await;
+            let tool_batch = self.handle_tool_calls_parallel(
+                &session, thread, turn, &mode, &ctx, tool_calls, &cancel,
+            );
+            tokio::pin!(tool_batch);
+            let results = loop {
+                tokio::select! {
+                    biased;
+                    results = &mut tool_batch => break results,
+                    steer = receive_steer_command(
+                        &mut turn_steer_rx,
+                        &mut pending_native_steer,
+                        true,
+                    ), if !cancel.is_cancelled() => {
+                        let Some(command) = steer else {
+                            turn_steer_rx = None;
+                            continue;
+                        };
+                        if command.attachment_rows.is_empty() {
+                            self.accept_native_steer_command(
+                                &session,
+                                thread,
+                                turn,
+                                &cancel,
+                                &turn_steer_mutation_lane_state,
+                                command,
+                            )
+                            .await?;
+                        } else {
+                            // Attachment materialization uses the session
+                            // mutation lane held by mutating tools. Keep the
+                            // bounded command (and its queue permit) until the
+                            // whole tool batch has durably recorded its
+                            // results, then accept it at that safe boundary.
+                            boundary_steers.push(command);
+                        }
+                    }
+                }
+            };
+            if cancel.is_cancelled() {
+                reject_steer_commands(
+                    &mut turn_steer_rx,
+                    &mut pending_native_steer,
+                    &mut boundary_steers,
+                    "turn cancelled",
+                );
+            }
             for (call_id, result) in results {
                 let (result_content, images) = result?;
                 self.store.append_message(
@@ -12039,7 +15458,37 @@ impl Engine {
                     })?,
                 )?;
             }
+            for command in boundary_steers.drain(..) {
+                self.accept_native_steer_command(
+                    &session,
+                    thread,
+                    turn,
+                    &cancel,
+                    &turn_steer_mutation_lane_state,
+                    command,
+                )
+                .await?;
+            }
         }
+
+        // The bounded final-report pass is not an agent loop and cannot apply
+        // further guidance. Close the receiver before removing its registry
+        // entry: a request that already cloned the sender must fail or join
+        // this final drain instead of waiting behind a response-only call.
+        close_steer_receiver(&mut turn_steer_rx);
+        drop(turn_steerer_guard);
+        let mut no_pending = None;
+        let mut deferred = Vec::new();
+        reject_steer_commands(
+            &mut turn_steer_rx,
+            &mut no_pending,
+            &mut deferred,
+            if cancel.is_cancelled() {
+                "turn cancelled"
+            } else {
+                "turn no longer accepts steering"
+            },
+        );
 
         // Truncated mid-work at the iteration budget: make one final
         // tool-free provider pass over the last tool results so the user gets
@@ -12067,7 +15516,7 @@ impl Engine {
                 None => {}
                 Some(Ok(stream)) => {
                     let mut stream = trouve_providers::coalesce_event_stream(stream);
-                    let mut thinking_streamed = false;
+                    let mut thinking = ProviderThinkingState::default();
                     let mut pending_events = Vec::new();
                     let mut persist_deadline = None;
                     loop {
@@ -12090,9 +15539,14 @@ impl Engine {
                                 final_text.push_str(&delta);
                                 pending_events.push(Event::AssistantDelta { turn, text: delta });
                             }
-                            Ok(ProviderEvent::ThinkingDelta(delta)) => {
-                                thinking_streamed = true;
-                                pending_events.push(Event::AssistantThinking { turn, text: delta });
+                            Ok(ProviderEvent::ThinkingStarted { id }) => {
+                                thinking.start(id, turn, &mut pending_events);
+                            }
+                            Ok(ProviderEvent::ThinkingDelta { id, text }) => {
+                                thinking.delta(id, text, turn, &mut pending_events);
+                            }
+                            Ok(ProviderEvent::ThinkingCompleted { id }) => {
+                                thinking.complete(&id, turn, &mut pending_events);
                             }
                             Ok(ProviderEvent::Reasoning(block)) => final_reasoning.push(block),
                             Ok(ProviderEvent::Completed { mut usage }) => {
@@ -12122,9 +15576,7 @@ impl Engine {
                             persist_deadline = Some(Instant::now() + STREAM_EVENT_BATCH_WINDOW);
                         }
                     }
-                    if thinking_streamed {
-                        pending_events.push(Event::AssistantThinkingCompleted { turn });
-                    }
+                    thinking.finish(turn, &mut pending_events);
                     flush_backend_event_batch(&self.store, &scope, &mut pending_events).await?;
                 }
                 Some(Err(e)) => tracing::warn!("iteration-limit summary failed: {e}"),
@@ -12165,6 +15617,7 @@ impl Engine {
             &session.id,
             &thread.id,
             turn,
+            &thread.model,
             &usage_total,
             context_input_tokens,
         )?;
@@ -12201,39 +15654,46 @@ impl Engine {
         Some((backend_id.to_string(), backend, model_name.to_string()))
     }
 
-    /// MCP tool-bridge config for a backend turn. Claude Code and Codex use
-    /// the full bridge by default so mutation-capable work crosses the same
-    /// ToolExecutor and per-session execution lane as native provider calls.
-    /// An explicit `tool_bridge = false` retains the vendor-native fallback.
     fn full_tool_bridge_available_for(&self, backend_id: &str) -> bool {
         let configured = {
             let config = self.config.lock().unwrap();
             config.providers.get(backend_id).is_some_and(|provider| {
-                matches!(provider.kind.as_str(), "claude-cli" | "codex-app-server")
-                    && provider.tool_bridge.unwrap_or(true)
+                matches!(
+                    provider.kind.as_str(),
+                    "claude-cli" | "codex-app-server" | "cursor-sdk" | "cursor-cli"
+                ) && (matches!(provider.kind.as_str(), "cursor-sdk" | "cursor-cli")
+                    || provider.tool_bridge.unwrap_or(true))
             })
         };
         configured && self.base_url.read().unwrap().is_some()
     }
 
+    /// MCP tool-bridge config for a backend turn. Claude Code and Codex use
+    /// the full bridge by default so mutation-capable work crosses the same
+    /// ToolExecutor and per-session execution lane as native provider calls.
+    /// Cursor's Agent SDK always uses the full bridge: its explicit `mcp`
+    /// allowlist replaces every vendor-native tool with host-owned callbacks.
+    /// An explicit `tool_bridge = false` retains the vendor-native fallback
+    /// only where the backend architecture supports one.
     fn mcp_bridge_for(
         &self,
-        backend_or_model: &str,
+        model: &str,
         thread_id: &str,
     ) -> Option<trouve_agents::McpBridgeConfig> {
-        // Concrete turns historically pass `provider/model`, while automatic
-        // routing already resolved the provider and passes just its id.
-        let backend_id = backend_or_model
-            .split_once('/')
-            .map_or(backend_or_model, |(backend_id, _)| backend_id);
-        let (kind, bridge_tools) = {
+        let backend_id = model.split_once('/')?.0;
+        let (kind, configured_bridge_tools) = {
             let config = self.config.lock().unwrap();
             let pc = config.providers.get(backend_id)?;
             (pc.kind.clone(), pc.tool_bridge.unwrap_or(true))
         };
-        if kind != "claude-cli" && kind != "codex-app-server" {
+        if !matches!(
+            kind.as_str(),
+            "claude-cli" | "codex-app-server" | "cursor-sdk" | "cursor-cli"
+        ) {
             return None;
         }
+        let cursor_sdk = matches!(kind.as_str(), "cursor-sdk" | "cursor-cli");
+        let bridge_tools = cursor_sdk || configured_bridge_tools;
         let Some(base_url) = self.base_url.read().unwrap().clone() else {
             tracing::warn!(
                 "MCP bridge wanted for {backend_id} but the server base URL is unknown; \
@@ -12241,9 +15701,9 @@ impl Engine {
             );
             return None;
         };
-        // Codex approvals are native RPCs; serving Claude's permission-gate
-        // tool would only tempt the model to call it.
-        let serve_approval = kind != "codex-app-server";
+        // Codex approval RPCs and Cursor's host-owned tool callbacks do not
+        // need Claude's permission-gate MCP tool.
+        let serve_approval = kind == "claude-cli";
         let claims = BridgeTicketClaims {
             bridge_tools,
             serve_approval,
@@ -12347,7 +15807,7 @@ impl Engine {
         thread_id: &str,
         name: &str,
         arguments: &serde_json::Value,
-    ) -> Result<String, EngineError> {
+    ) -> Result<BridgedToolResult, EngineError> {
         let cancel = self.active_bridge_cancel(thread_id)?;
         self.bridged_tool_call_for(thread_id, name, arguments, cancel)
             .await
@@ -12363,7 +15823,7 @@ impl Engine {
         vendor_call_id: Option<&str>,
         name: &str,
         arguments: &serde_json::Value,
-    ) -> Result<String, EngineError> {
+    ) -> Result<BridgedToolResult, EngineError> {
         let vendor_thread_id = vendor_thread_id
             .filter(|thread_id| !thread_id.is_empty())
             .ok_or_else(|| {
@@ -12488,7 +15948,7 @@ impl Engine {
         name: &str,
         arguments: &serde_json::Value,
         cancel: tokio_util::sync::CancellationToken,
-    ) -> Result<String, EngineError> {
+    ) -> Result<BridgedToolResult, EngineError> {
         let (session, thread, mode, ctx) =
             self.bridged_context_with_cancel(thread_id, cancel.clone())?;
         let turn = self.store.last_turn(thread_id)?;
@@ -12497,15 +15957,20 @@ impl Engine {
             name: name.to_string(),
             arguments: arguments.clone(),
         };
-        // Bridged responses are text-only (MCP content blocks could carry
-        // images, but no bridged vendor consumes them yet); the summary the
-        // engine leaves in place of "_images" still tells the model the
-        // image was read.
-        let (content, _images) = self
+        let (content, images) = self
             .handle_tool_call(&session, &thread, turn, &mode, &ctx, &call, &cancel)
             .await
             .map_err(EngineError::Internal)?;
-        Ok(content)
+        Ok(BridgedToolResult {
+            content,
+            images: images
+                .into_iter()
+                .map(|image| BridgedToolImage {
+                    mime: image.mime,
+                    data: image.data,
+                })
+                .collect(),
+        })
     }
 
     fn announce_trouve_bridge_wrapper(
@@ -12874,7 +16339,6 @@ impl Engine {
             config_dir: self.config_dir.clone(),
             workspace_root: Some(PathBuf::from(&ws.path)),
             edit_strategy: edit_strategy_for_model(&thread.model),
-            background_mutation_lease: None,
         };
         Ok((session, thread, mode, ctx))
     }
@@ -12940,6 +16404,7 @@ impl Engine {
                 turn: collaborator.turn,
                 content: content.clone(),
                 attachments: Vec::new(),
+                background: false,
             }
         };
         collaborator.persisted.push(event);
@@ -12977,10 +16442,9 @@ impl Engine {
             .append_events_async(
                 Scope::Thread(collaborator.thread.id.clone()),
                 vec![
-                    Event::TurnCapacityAcquired {
+                    Event::TurnAdmitted {
                         turn: collaborator.turn,
-                        wait_ms: 0,
-                        background: false,
+                        provider_wait_ms: 0,
                     },
                     Event::TurnStarted {
                         turn: collaborator.turn,
@@ -13136,7 +16600,7 @@ impl Engine {
             })
         });
         let title = self
-            .generate_subagent_title(name.as_deref(), prompt.as_deref())
+            .generate_subagent_title(&session.id, name.as_deref(), prompt.as_deref())
             .await;
         let child_mode = self.backend_collaborator_mode(session, &inherited_thread, access)?;
         let collaborator_mode = personas::find_persona(&all_modes, &child_mode)
@@ -13338,6 +16802,7 @@ impl Engine {
                     &session.id,
                     &collaborator.thread.id,
                     collaborator.turn,
+                    &collaborator.thread.model,
                     &usage,
                     context_input_tokens,
                 )?;
@@ -13432,6 +16897,7 @@ impl Engine {
                     turn: collaborator.turn,
                     content: content.clone(),
                     attachments: Vec::new(),
+                    background: false,
                 });
                 collaborator.last_user_message = Some(content);
                 flush_backend_event_batch(
@@ -13477,13 +16943,20 @@ impl Engine {
                         content: std::mem::take(&mut collaborator.segment),
                     });
                 }
+                collaborator.persisted.push(Event::AssistantThinking {
+                    turn,
+                    id: Some("reasoning".into()),
+                    text: delta,
+                });
+            }
+            BackendCollaboratorEvent::ThinkingCompleted => {
                 collaborator
                     .persisted
-                    .push(Event::AssistantThinking { turn, text: delta });
+                    .push(Event::AssistantThinkingCompleted {
+                        turn,
+                        id: Some("reasoning".into()),
+                    })
             }
-            BackendCollaboratorEvent::ThinkingCompleted => collaborator
-                .persisted
-                .push(Event::AssistantThinkingCompleted { turn }),
             BackendCollaboratorEvent::ToolStarted {
                 call_id,
                 tool,
@@ -13638,6 +17111,36 @@ impl Engine {
         Ok(())
     }
 
+    /// Publish that every queue between dispatch and the vendor has been
+    /// passed. `provider_wait_ms` is the total time the turn spent in them;
+    /// a code-review task records it before the thread event is visible so
+    /// observers never see admission without the wait that preceded it.
+    async fn publish_turn_admission(
+        &self,
+        thread: &Thread,
+        turn: u64,
+        automated_review: bool,
+        provider_wait_ms: u64,
+    ) -> Result<()> {
+        if automated_review
+            && let Some(progress) = self
+                .store
+                .set_code_review_task_provider_wait(&thread.id, provider_wait_ms)?
+        {
+            self.emit_code_review_task_progress(progress).await?;
+        }
+        self.store
+            .append_event_async(
+                Scope::Thread(thread.id.clone()),
+                Event::TurnAdmitted {
+                    turn,
+                    provider_wait_ms,
+                },
+            )
+            .await?;
+        Ok(())
+    }
+
     /// Run one turn through an external agent backend. The vendor harness
     /// plans, calls tools, and edits the worktree; we persist its events,
     /// gate its approval requests through our permission layer, and keep the
@@ -13660,6 +17163,10 @@ impl Engine {
         cancel: tokio_util::sync::CancellationToken,
         queued_prompt_id: &str,
         tools_enabled: bool,
+        attach_background: bool,
+        provider_wait_ms: u64,
+        mut steer_rx: Option<tokio::sync::mpsc::Receiver<SteerTurnCommand>>,
+        steer_mutation_lane_state: tokio::sync::watch::Sender<SteerMutationLaneState>,
     ) -> Result<()> {
         let startup_started = Instant::now();
         let scope = Scope::Thread(thread.id.clone());
@@ -13679,13 +17186,11 @@ impl Engine {
         );
         let selected_model = model_catalog.iter().find(|m| m.id == thread.model);
         normalize_thinking_option(&mut model_options, selected_model);
-        let supports_steering = tools_enabled && backend.supports_steering();
         // Some vendor protocols cannot remove their built-in read/search
         // tools. Keep those turns restricted (no mounted MCP tools and
         // read-only permission), but reserve strict tool-use rejection for
         // backends that can actually guarantee a tool-free surface.
-        let strict_tool_free =
-            backend_strict_tool_free_policy(tools_enabled, backend.supports_tool_free_turns());
+        let strict_tool_free = !tools_enabled && backend.supports_tool_free_turns();
         // Vendor sessions are per (thread, backend): each vendor keeps its
         // own history, and switching models away and back resumes it.
         // Vendors can't read our transcript, so whatever part of the
@@ -13695,45 +17200,14 @@ impl Engine {
         // A vendor session retains the tools it was created with. Restricted
         // repair turns therefore start fresh; their prompt carries the
         // malformed output explicitly, so they do not need vendor history.
-        // Materialize before reading the accepted transcript. The durable row
-        // starts as the user's unannotated text and gains worktree paths only
-        // after those paths are real.
-        let materialized = self
-            .materialize_attachments_for_turn(session, &attachments, &cancel)
-            .await
-            .map_err(|error| anyhow!(error.to_string()))?;
-        self.publish_materialized_attachment_paths(
-            &thread.id,
-            turn,
-            queued_prompt_id,
-            &content,
-            &attachments,
-        )?;
-        let mut submitted_transcript_messages = 0;
         let (resume, handoff) = if tools_enabled {
             let resume = self.store.backend_session(&thread.id, backend_id)?;
             let payloads = self.store.messages(&thread.id)?;
-            submitted_transcript_messages =
-                u64::try_from(payloads.len()).context("backend transcript length exceeds u64")?;
-            // Prompt acceptance already appended this turn's user message.
-            // It is sent as `BackendTurn::prompt`, not repeated in the
-            // cross-adapter history digest.
-            let (current_user, prior_payloads) = payloads
-                .split_last()
-                .context("accepted user message is missing before backend turn")?;
-            let expected_user =
-                serde_json::to_value(accepted_user_message(&content, &attachments)?)?;
-            anyhow::ensure!(
-                current_user == &expected_user,
-                "accepted user message is not the final transcript row before backend turn"
-            );
             let unseen = match &resume {
                 // A compaction can shrink the transcript below the watermark;
                 // handing off the fresh summary again covers that.
-                Some((_, seen)) => prior_payloads
-                    .get(*seen as usize..)
-                    .unwrap_or(prior_payloads),
-                None => prior_payloads,
+                Some((_, seen)) => payloads.get(*seen as usize..).unwrap_or(&payloads),
+                None => &payloads[..],
             };
             let messages: Vec<Message> = unseen
                 .iter()
@@ -13754,6 +17228,10 @@ impl Engine {
         // Images go to the vendor protocol as native image inputs; other
         // files become path references in the prompt text (vendor agents
         // run on this filesystem and can read them with their tools).
+        let materialized = self
+            .materialize_attachments_for_turn(session, &attachments, &cancel)
+            .await
+            .map_err(|error| anyhow!(error.to_string()))?;
         let (images, files): (Vec<_>, Vec<_>) = materialized
             .into_iter()
             .partition(|file| file.attachment.mime.starts_with("image/"));
@@ -13771,30 +17249,37 @@ impl Engine {
                 local_path: Some(file.absolute_path),
             })
             .collect();
+        self.store.append_message(
+            &thread.id,
+            &serde_json::to_value(Message::User(content.clone()))?,
+        )?;
         if !self.store.finish_queued_prompt(queued_prompt_id)? {
             bail!("queued prompt {queued_prompt_id} vanished before turn start");
         }
 
         let effective_read_only = !tools_enabled || mode.read_only;
-        let permission = backend_permission_policy(tools_enabled, mode.read_only);
+        let permission = if effective_read_only {
+            BackendPermission::ReadOnly
+        } else {
+            // Always request a pre-execution callback. Trouve's gate still
+            // auto-approves Yolo calls, while the callback acquires the
+            // session mutation lane and supplies creator provenance.
+            BackendPermission::Ask
+        };
 
         let mcp_bridge = tools_enabled
             .then(|| self.mcp_bridge_for(&thread.model, &thread.id))
             .flatten();
+        let automated_review = self.store.is_code_review_thread(&thread.id)?;
         // Vendor agents get the mode prompt plus, when the bridge serves
         // trouve's search tools, guidance to prefer them over built-ins
-        // (MCP instructions alone are too weak a signal).
+        // (MCP instructions alone are too weak a signal). Automated review
+        // instead keeps its evidence-first instruction floor.
         let mut instructions = mode.system_prompt.trim().to_string();
-        if mcp_bridge.is_some() {
-            if !instructions.is_empty() {
-                instructions.push_str("\n\n");
-            }
-            instructions.push_str(crate::tools::VENDOR_SEARCH_GUIDANCE);
-        }
+        append_vendor_search_guidance(&mut instructions, mcp_bridge.is_some(), automated_review);
         let full_tool_bridge = mcp_bridge
             .as_ref()
             .is_some_and(|bridge| bridge.bridge_tools);
-        let automated_review = self.store.is_code_review_thread(&thread.id)?;
         enforce_automated_review_backend_boundary(
             automated_review,
             tools_enabled,
@@ -13834,10 +17319,45 @@ impl Engine {
             instructions: (!instructions.is_empty()).then_some(instructions),
             permission,
             tool_free: strict_tool_free,
+            attach_background,
             mcp_bridge,
             mcp_servers,
         };
 
+        // Queue behind the backend's startup lane before publishing admission
+        // so the turn stays visibly waiting, and its reported wait includes
+        // the lane, until the vendor is actually about to see it.
+        let startup_wait_started = Instant::now();
+        let startup_permit = match self
+            .turn_scheduler
+            .acquire_backend_startup(backend_id, &cancel)
+            .await
+        {
+            Ok(permit) => permit,
+            Err(_) if cancel.is_cancelled() => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let startup_wait_ms: u64 = startup_wait_started
+            .elapsed()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX);
+        if startup_wait_ms > 0 {
+            tracing::info!(
+                thread_id = %thread.id,
+                turn,
+                backend = %backend_id,
+                elapsed_ms = startup_wait_ms,
+                "agent startup timing: waited for backend startup lane"
+            );
+        }
+        self.publish_turn_admission(
+            thread,
+            turn,
+            automated_review,
+            provider_wait_ms.saturating_add(startup_wait_ms),
+        )
+        .await?;
         let startup_activity = backend.startup_activity(&backend_turn).await;
         if matches!(
             startup_activity,
@@ -13859,6 +17379,9 @@ impl Engine {
             Err(BackendError::Cancelled) if cancel.is_cancelled() => return Ok(()),
             Err(error) => return Err(anyhow!("backend error: {error}")),
         };
+        // The vendor has accepted the turn; the startup slot is free for the
+        // next waiter while this turn streams.
+        drop(startup_permit);
         if startup_activity.is_some() {
             self.store
                 .append_event_async(
@@ -13878,34 +17401,6 @@ impl Engine {
             since_turn_started_ms = startup_started.elapsed().as_millis(),
             "agent startup timing: vendor turn accepted"
         );
-
-        let mut steer_rx = None;
-        let (steer_mutation_lane_state, _) =
-            tokio::sync::watch::channel(SteerMutationLaneState::Idle);
-        let _steerer_guard = if supports_steering {
-            let (sender, receiver) = tokio::sync::mpsc::channel(8);
-            let replaced = self.turn_steerers.lock().unwrap().insert(
-                thread.id.clone(),
-                ActiveTurnSteerer {
-                    turn,
-                    sender,
-                    mutation_lane_state: steer_mutation_lane_state.clone(),
-                },
-            );
-            if let Some(replaced) = replaced {
-                replaced
-                    .mutation_lane_state
-                    .send_replace(SteerMutationLaneState::Ended);
-            }
-            steer_rx = Some(receiver);
-            Some(ActiveTurnSteererGuard {
-                registry: &self.turn_steerers,
-                thread_id: thread.id.clone(),
-                turn,
-            })
-        } else {
-            None
-        };
 
         // `text` records the whole turn for the transcript; `segment` is the
         // current streamed block, flushed (finalized) at each tool boundary
@@ -14037,14 +17532,12 @@ impl Engine {
                     } else if let Some(permit) = pending_steer_permit.take() {
                         Some(permit)
                     } else {
-                        // Wait for actual lane and admission availability as
-                        // another select branch. Backend events and approval
-                        // outcomes continue to flow while this future is
-                        // pending, including the completion that releases an
-                        // in-flight vendor mutation.
+                        // Wait for actual lane availability as another select
+                        // branch. Backend events and approval outcomes continue
+                        // to flow while the future is pending, including the
+                        // completion that releases an in-flight mutation.
                         pending_steer = Some(command);
-                        steer_mutation_lane_state
-                            .send_replace(SteerMutationLaneState::Waiting);
+                        steer_mutation_lane_state.send_replace(SteerMutationLaneState::Waiting);
                         let engine = self.clone();
                         let session_id = session.id.clone();
                         pending_steer_lane = Some(
@@ -14061,12 +17554,13 @@ impl Engine {
                         attachment_rows,
                         mut attachment_cleanup,
                         response,
+                        _permit,
                     } = command;
                     // Cancellation can arrive while the selected steer command
                     // flushes pending backend events. Reject it before either
                     // persisting the user message or calling the backend.
                     if cancel.is_cancelled() {
-                        let _ = response.send(Err("turn cancelled".into()));
+                        response.send(Err("turn cancelled".into()));
                         continue;
                     }
                     let staged = attachment_rows
@@ -14095,11 +17589,16 @@ impl Engine {
                         ).await {
                             Ok(materialized) => materialized,
                             Err(error) => {
-                                let _ = response.send(Err(error.clone()));
-                                bail!("steering attachment materialization failed: {error}");
+                                response.send(Err(error.clone()));
+                                consecutive_backend_events = 0;
+                                continue;
                             }
                         }
                     };
+                    let materialized_paths = materialized
+                        .iter()
+                        .map(|file| file.absolute_path.clone())
+                        .collect::<Vec<_>>();
                     let (images, files): (Vec<_>, Vec<_>) = materialized
                         .into_iter()
                         .partition(|file| file.attachment.mime.starts_with("image/"));
@@ -14120,11 +17619,47 @@ impl Engine {
                     let payload = match serde_json::to_value(Message::User(backend_prompt.clone())) {
                         Ok(payload) => payload,
                         Err(error) => {
-                            let error = anyhow::Error::from(error);
-                            let _ = response.send(Err(error.to_string()));
+                            let mut message = error.to_string();
+                            if let Err(cleanup) = self.rollback_materialized_attachment_paths(
+                                session,
+                                &materialized_paths,
+                            ) {
+                                message.push_str(&format!(
+                                    "; materialized attachment rollback failed: {cleanup}"
+                                ));
+                            }
+                            let error = anyhow!(message);
+                            response.send(Err(error.to_string()));
                             return Err(error);
                         }
                     };
+                    let backend_result = backend
+                        .steer_turn(BackendSteer {
+                            cancel: cancel.clone(),
+                            session: active_vendor_session
+                                .clone()
+                                .expect("steering branch requires a backend session"),
+                            prompt: backend_prompt.clone(),
+                            attachments: backend_attachments,
+                        })
+                        .await;
+                    if let Err(error) = backend_result {
+                        let mut message = error.to_string();
+                        if let Err(cleanup) = self.rollback_materialized_attachment_paths(
+                            session,
+                            &materialized_paths,
+                        ) {
+                            message.push_str(&format!(
+                                "; materialized attachment rollback failed: {cleanup}"
+                            ));
+                        }
+                        response.send(Err(message.clone()));
+                        consecutive_backend_events = 0;
+                        continue;
+                    }
+                    // Only vendor-accepted guidance becomes durable. If this
+                    // commit fails after delivery, fail the turn: continuing
+                    // would let later context diverge from the event log.
                     if let Err(error) = self.store.append_event_with_message(
                         scope.clone(),
                         Event::TurnSteered {
@@ -14137,30 +17672,20 @@ impl Engine {
                         attachment_rows,
                         attachment_cleanup.claim(),
                     ) {
-                        let message = error.to_string();
-                        let _ = response.send(Err(message));
+                        let mut message = error.to_string();
+                        if let Err(cleanup) = self.rollback_materialized_attachment_paths(
+                            session,
+                            &materialized_paths,
+                        ) {
+                            message.push_str(&format!(
+                                "; materialized attachment rollback failed: {cleanup}"
+                            ));
+                        }
+                        response.send(Err(message));
                         return Err(error);
                     }
                     attachment_cleanup.disarm();
-                    // Durable transcript order is established before the
-                    // vendor sees the guidance. A rejection therefore fails
-                    // the owning turn instead of erasing accepted input.
-                    let backend_result = backend
-                        .steer_turn(BackendSteer {
-                            cancel: cancel.clone(),
-                            session: active_vendor_session
-                                .clone()
-                                .expect("steering branch requires a backend session"),
-                            prompt: backend_prompt.clone(),
-                            attachments: backend_attachments,
-                        })
-                        .await;
-                    if let Err(error) = backend_result {
-                        let message = error.to_string();
-                        let _ = response.send(Err(message.clone()));
-                        bail!("backend rejected durable steering input: {message}");
-                    }
-                    let _ = response.send(Ok(()));
+                    response.send(Ok(()));
                     consecutive_backend_events = 0;
                     continue;
                 }
@@ -14287,12 +17812,8 @@ impl Engine {
                         .map_err(anyhow::Error::msg)?;
                     if tools_enabled {
                         flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
-                        self.store.set_backend_session_at_watermark(
-                            &thread.id,
-                            backend_id,
-                            &session_id,
-                            submitted_transcript_messages,
-                        )?;
+                        self.store
+                            .set_backend_session(&thread.id, backend_id, &session_id)?;
                     }
                 }
                 BackendEvent::TextDelta(delta) => {
@@ -14324,10 +17845,17 @@ impl Engine {
                             content: std::mem::take(&mut segment),
                         });
                     }
-                    persisted.push(Event::AssistantThinking { turn, text: delta });
+                    persisted.push(Event::AssistantThinking {
+                        turn,
+                        id: Some("reasoning".into()),
+                        text: delta,
+                    });
                 }
                 BackendEvent::ThinkingCompleted => {
-                    persisted.push(Event::AssistantThinkingCompleted { turn });
+                    persisted.push(Event::AssistantThinkingCompleted {
+                        turn,
+                        id: Some("reasoning".into()),
+                    });
                 }
                 BackendEvent::ToolStarted {
                     call_id,
@@ -14349,7 +17877,7 @@ impl Engine {
                                 tracing::warn!(
                                     root_thread_id = %thread.id,
                                     call_id,
-                                    "Codex MCP wrapper arrived before its root vendor thread identity"
+                                    "MCP wrapper arrived before its root vendor thread identity"
                                 );
                             }
                         }
@@ -14359,11 +17887,12 @@ impl Engine {
                         flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
                         bail!("backend requested tool {tool} during a tool-free turn");
                     }
+                    let first_start = seen_tool_cards.insert(call_id.clone());
                     // First-party MCP calls reserve inside handle_tool_call;
                     // Claude mirrors them here under mcp__trouve__*. Native
                     // reads on a backend without a true tool-free mode are
                     // confined but intentionally outside the zero-call cap.
-                    if vendor_tool_uses_automated_review_budget(tools_enabled, &tool) {
+                    if vendor_tool_uses_automated_review_budget(tools_enabled, &tool, first_start) {
                         self.automated_review_tool_budgets.reserve(&thread.id)?;
                     }
                     tool_started_at.insert(call_id.clone(), Instant::now());
@@ -14399,9 +17928,7 @@ impl Engine {
                     // still un-edited at announcement time, so resolve line
                     // hints now for the UI's diff gutter.
                     annotate_edit_lines(Path::new(&session.worktree_path), &mut args);
-                    if seen_tool_cards.insert(call_id.clone())
-                        && !self.tool_card_exists(&thread.id, turn, &call_id)
-                    {
+                    if first_start && !self.tool_card_exists(&thread.id, turn, &call_id) {
                         persisted.push(Event::ToolRequested {
                             turn,
                             call_id: call_id.clone(),
@@ -14938,6 +18465,7 @@ impl Engine {
             &session.id,
             &thread.id,
             turn,
+            &thread.model,
             &usage_total,
             context_input_tokens,
         )?;
@@ -15171,7 +18699,7 @@ impl Engine {
         turn: u64,
         provider: &Arc<dyn Provider>,
         model_name: &str,
-        context_window_hint: u64,
+        context_window_override: Option<u64>,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<()> {
         // The live listing knows gateway models (kilocode, openrouter, ...)
@@ -15184,14 +18712,13 @@ impl Engine {
             models = provider.list_models() => models,
         };
         let known = provider.models();
-        let reported_context_window = live.iter().chain(known.iter()).find_map(|m| {
-            (model_name_for_provider(provider.id(), &m.id) == model_name && m.context_window > 0)
-                .then_some(m.context_window)
-        });
-        let context_window = (context_window_hint > 0)
-            .then_some(context_window_hint)
-            .or(reported_context_window);
-        let Some(context_window) = context_window else {
+        let Some(context_window) = context_window_override.or_else(|| {
+            live.iter()
+                .chain(known.iter())
+                .filter(|m| m.id == thread.model)
+                .map(|m| m.context_window)
+                .find(|w| *w > 0)
+        }) else {
             if self
                 .compaction_warnings
                 .lock()
@@ -15205,17 +18732,7 @@ impl Engine {
             }
             return Ok(());
         };
-        let mut payloads = self.store.messages(&thread.id)?;
-        let current_user = payloads
-            .pop()
-            .context("accepted user message is missing before compaction")?;
-        anyhow::ensure!(
-            matches!(
-                serde_json::from_value::<Message>(current_user.clone())?,
-                Message::User(_)
-            ),
-            "accepted user message is not the final transcript row before compaction"
-        );
+        let payloads = self.store.messages(&thread.id)?;
         if payloads.len() < 2 {
             return Ok(());
         }
@@ -15224,7 +18741,6 @@ impl Engine {
         let estimated_tokens = self.store.last_input_tokens(&thread.id)?.unwrap_or(0).max(
             payloads
                 .iter()
-                .chain(std::iter::once(&current_user))
                 .map(|p| p.to_string().len() as u64)
                 .sum::<u64>()
                 / 4,
@@ -15294,8 +18810,7 @@ impl Engine {
              (error text, file paths, command output) are recoverable with the \
              search_transcript tool.]\n\n{summary}"
         )))?;
-        self.store
-            .replace_messages(&thread.id, &[replacement, current_user])?;
+        self.store.replace_messages(&thread.id, &[replacement])?;
         self.store.append_event(
             scope,
             Event::CompactionCompleted {
@@ -15738,19 +19253,7 @@ impl Engine {
                 )
                 .await?;
             let executor = self.executor.clone();
-            let mut tool_ctx = ctx.clone();
-            if call.name == "shell"
-                && call
-                    .arguments
-                    .get("run_in_background")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false)
-                && let Some(ExecutionPermit::Write { guard }) = permit.as_mut()
-                && let Some(guard) = guard.take()
-            {
-                tool_ctx.background_mutation_lease =
-                    Some(Arc::new(BackgroundMutationLease::new(guard)));
-            }
+            let tool_ctx = ctx.clone();
             let tool_name = call.name.clone();
             let tool_arguments = call.arguments.clone();
             let execution_started = std::time::Instant::now();
@@ -15846,10 +19349,14 @@ impl Engine {
         } else {
             (ToolResult::error("tool call cancelled"), None, None)
         };
-        // Peel vision content ("_images") out of the result: megabytes of
-        // base64 must not land in the event log or the text transcript —
-        // it becomes native image input on the tool-result message instead.
-        let images = take_tool_images(&mut outcome.result);
+        // Peel media bytes out of the result before it reaches the event log.
+        // Images remain native provider vision input; all accepted media also
+        // becomes a durable attachment-backed artifact row.
+        let (images, artifact_uploads) = take_tool_media(&mut outcome.result);
+        let mut prepared_artifacts =
+            prepare_tool_artifacts(&mut outcome.result, artifact_uploads, |uploads| {
+                self.prepare_attachments(uploads)
+            });
         let todos = self.persist_todos_from_result(
             &thread.id,
             &call.name,
@@ -15859,7 +19366,7 @@ impl Engine {
         )?;
         let model_result = outcome.result.to_string();
         let mut completion_events = vec![Event::ToolCompleted {
-            call_id,
+            call_id: call_id.clone(),
             status: outcome.status,
             result: outcome.result,
             execution_duration_ms,
@@ -15867,7 +19374,36 @@ impl Engine {
         if let Some(todos) = todos {
             completion_events.push(Event::TodosUpdated { todos });
         }
-        if let Some(intents) = verification {
+        if let Some((prepared, cleanup)) = prepared_artifacts.as_mut() {
+            let attachments = prepared
+                .iter()
+                .map(|(attachment, _)| attachment.clone())
+                .collect::<Vec<_>>();
+            let rows = prepared
+                .iter()
+                .map(|(attachment, path)| (attachment.clone(), path.to_string_lossy().into_owned()))
+                .collect();
+            completion_events.push(Event::AssistantArtifacts {
+                turn,
+                call_id: Some(call_id.clone()),
+                attachments,
+            });
+            self.store.append_events_with_attachments(
+                scope,
+                completion_events,
+                &thread.id,
+                rows,
+                verification.clone().unwrap_or_default(),
+                cleanup.claim(),
+            )?;
+            if verification
+                .as_ref()
+                .is_some_and(|intents| !intents.is_empty())
+            {
+                self.session_pr_verification_wake.notify_one();
+            }
+            cleanup.disarm();
+        } else if let Some(intents) = verification {
             self.store
                 .append_events_with_session_pr_verification_intents(
                     scope,
@@ -15996,6 +19532,7 @@ impl Engine {
             .and_then(serde_json::Value::as_str)
             .unwrap_or(&thread.model)
             .to_string();
+        validate_model_selection(&child_model).map_err(|error| anyhow!(error.to_string()))?;
         // Same model: the parent's option choices (thinking level, …) carry
         // over. A different model validates its own options; start clean.
         let model_options = if child_model == thread.model {
@@ -16019,12 +19556,16 @@ impl Engine {
         let generated_title = if supplied_child_name.is_none()
             || (name == "spawn_session" && explicit_session_title.is_none())
         {
-            Some(self.generate_session_title(prompt).await.title)
+            self.generate_title(&session.id, prompt, &[])
+                .await
+                .ok()
+                .map(|generated| generated.title)
         } else {
             None
         };
         let child_title = self
             .generate_subagent_title(
+                &session.id,
                 supplied_child_name
                     .as_deref()
                     .or(generated_title.as_deref()),
@@ -16721,53 +20262,203 @@ fn annotate_attachments(
     out
 }
 
-fn accepted_prompt_message(prompt: &trouve_protocol::QueuedPrompt) -> Result<String> {
-    serde_json::to_string(&Message::User(prompt.content.clone()))
-        .context("serializing accepted user prompt")
-}
-
-fn accepted_user_message(
-    content: &str,
-    attachments: &[trouve_protocol::Attachment],
-) -> Result<Message> {
-    let files = attachments
-        .iter()
-        .map(|attachment| {
-            materialized_attachment_relative_path(attachment)
-                .map(|path| (attachment.clone(), path))
-                .map_err(anyhow::Error::msg)
-        })
-        .collect::<Result<Vec<_>>>()?;
-    Ok(Message::User(annotate_attachments(
-        content.to_string(),
-        &files,
-    )))
-}
-
-/// Remove the `_images` vision payload from a tool result, leaving a small
-/// summary in its place (the event log and text transcript stay lean; the
-/// images travel on the provider message as native vision content).
-fn take_tool_images(result: &mut serde_json::Value) -> Vec<trouve_providers::ToolImage> {
-    let Some(payload) = result.as_object_mut().and_then(|o| o.remove("_images")) else {
-        return Vec::new();
-    };
-    let images: Vec<trouve_providers::ToolImage> =
-        serde_json::from_value(payload).unwrap_or_default();
-    if !images.is_empty() {
-        result["images"] = serde_json::json!(
-            images
-                .iter()
-                .map(|img| {
-                    serde_json::json!({
-                        "mime": img.mime,
-                        // Base64 expands bytes 4:3; report the real size.
-                        "bytes": img.data.len() * 3 / 4,
-                    })
-                })
-                .collect::<Vec<_>>()
-        );
+fn artifact_extension(mime: &str) -> &'static str {
+    match mime.to_ascii_lowercase().as_str() {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "video/mp4" => "mp4",
+        "video/webm" => "webm",
+        "audio/mpeg" => "mp3",
+        "audio/wav" | "audio/x-wav" => "wav",
+        "audio/ogg" => "ogg",
+        "application/pdf" => "pdf",
+        _ => "bin",
     }
-    images
+}
+
+fn artifact_upload(
+    index: usize,
+    kind: &str,
+    mime: String,
+    data: String,
+) -> trouve_protocol::AttachmentUpload {
+    trouve_protocol::AttachmentUpload {
+        name: format!("tool-{kind}-{}.{}", index + 1, artifact_extension(&mime)),
+        mime,
+        data,
+    }
+}
+
+fn tool_media_persistence_failed(result: &mut serde_json::Value) {
+    const MESSAGE: &str =
+        "Agent-produced media could not be stored; the tool itself completed normally.";
+    match result {
+        serde_json::Value::Object(fields) => {
+            fields.insert(
+                "artifact_persistence_error".into(),
+                serde_json::Value::String(MESSAGE.into()),
+            );
+        }
+        serde_json::Value::Array(blocks) => blocks.push(serde_json::json!({
+            "type": "text",
+            "text": MESSAGE,
+            "artifact_persistence_error": true,
+        })),
+        other => {
+            *other = serde_json::json!({
+                "result": std::mem::take(other),
+                "artifact_persistence_error": MESSAGE,
+            });
+        }
+    }
+}
+
+/// Artifact storage is supplemental to an already-completed tool call. Keep
+/// the terminal result durable even when staging the media bytes fails.
+fn prepare_tool_artifacts<T>(
+    result: &mut serde_json::Value,
+    uploads: Vec<trouve_protocol::AttachmentUpload>,
+    prepare: impl FnOnce(Vec<trouve_protocol::AttachmentUpload>) -> Result<T, EngineError>,
+) -> Option<T> {
+    if uploads.is_empty() {
+        return None;
+    }
+    match prepare(uploads) {
+        Ok(prepared) => Some(prepared),
+        Err(error) => {
+            tracing::warn!(%error, "tool media could not be staged for durable presentation");
+            tool_media_persistence_failed(result);
+            None
+        }
+    }
+}
+
+fn accept_tool_media_upload(
+    uploads: &mut Vec<trouve_protocol::AttachmentUpload>,
+    upload: trouve_protocol::AttachmentUpload,
+) -> Result<(), String> {
+    uploads.push(upload);
+    if let Err(error) = validate_attachment_uploads(uploads) {
+        uploads.pop();
+        return Err(error.to_string());
+    }
+    Ok(())
+}
+
+/// Remove inline media bytes from a tool result. Images continue to travel to
+/// the provider as native vision content; every accepted media block is also
+/// returned as an attachment upload for durable UI presentation.
+fn take_tool_media(
+    result: &mut serde_json::Value,
+) -> (
+    Vec<trouve_providers::ToolImage>,
+    Vec<trouve_protocol::AttachmentUpload>,
+) {
+    let payload = result
+        .as_object_mut()
+        .and_then(|object| object.remove("_images"));
+    let mut images = Vec::new();
+    let mut uploads = Vec::new();
+    let mut image_summaries = Vec::new();
+    if let Some(payload) = payload {
+        let blocks = payload.as_array().cloned().unwrap_or_default();
+        for block in blocks {
+            let Ok(image) = serde_json::from_value::<trouve_providers::ToolImage>(block) else {
+                image_summaries.push(serde_json::json!({
+                    "media_omitted": true,
+                    "media_error": "invalid tool image metadata",
+                }));
+                continue;
+            };
+            let upload = artifact_upload(
+                uploads.len(),
+                "image",
+                image.mime.clone(),
+                image.data.clone(),
+            );
+            let rejection = accept_tool_media_upload(&mut uploads, upload).err();
+            let accepted = rejection.is_none();
+            image_summaries.push(serde_json::json!({
+                "mime": image.mime,
+                "bytes": image.data.len().saturating_mul(3) / 4,
+                "media_omitted": true,
+                "media_error": rejection,
+            }));
+            if accepted {
+                images.push(image);
+            }
+        }
+        if image_summaries.is_empty() {
+            image_summaries.push(serde_json::json!({
+                "media_omitted": true,
+                "media_error": "invalid tool image payload",
+            }));
+        }
+        result["images"] = serde_json::Value::Array(image_summaries);
+    }
+
+    if let Some(blocks) = result.as_array_mut() {
+        for block in blocks {
+            let Some(object) = block.as_object_mut() else {
+                continue;
+            };
+            let kind = object
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let source = if kind == "resource" {
+                object
+                    .get_mut("resource")
+                    .and_then(serde_json::Value::as_object_mut)
+            } else {
+                Some(&mut *object)
+            };
+            let Some(source) = source else {
+                continue;
+            };
+            let media_kind = match kind.as_str() {
+                "image" => "image",
+                "audio" => "audio",
+                "resource" if source.get("blob").is_some() => "artifact",
+                _ => continue,
+            };
+            let mime = source
+                .get("mimeType")
+                .or_else(|| source.get("mime_type"))
+                .or_else(|| source.get("mime"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("application/octet-stream")
+                .to_string();
+            let data_key = if kind == "resource" { "blob" } else { "data" };
+            let Some(data) = source
+                .get(data_key)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            let upload = artifact_upload(uploads.len(), media_kind, mime.clone(), data.clone());
+            let rejection = accept_tool_media_upload(&mut uploads, upload).err();
+            source.remove(data_key);
+            source.insert("media_omitted".into(), serde_json::Value::Bool(true));
+            source.insert(
+                "size_bytes".into(),
+                serde_json::json!(data.len().saturating_mul(3) / 4),
+            );
+            if let Some(error) = rejection {
+                source.insert("media_error".into(), serde_json::Value::String(error));
+            } else if media_kind == "image" {
+                images.push(trouve_providers::ToolImage {
+                    mime: mime.clone(),
+                    data,
+                });
+            }
+        }
+    }
+    (images, uploads)
 }
 
 /// Repository-local PR numbers found recursively in structured tool data.
@@ -17683,7 +21374,7 @@ impl SessionPrEvidence {
     }
 }
 
-/// Collect PR references, successful branch activity, and commits from events.
+/// Collect successful PR creation, branch activity, and commits from events.
 fn pr_evidence_from_events(
     events: impl IntoIterator<Item = Event>,
     host: &str,
@@ -17800,22 +21491,35 @@ fn sanitize_transcript(messages: Vec<Message>) -> Vec<Message> {
                 if ids.is_empty() {
                     continue;
                 }
-                // Absorb the contiguous run of results that follow, tracking
-                // which call ids they answer.
+                // Steering can be durably accepted while this tool batch is
+                // still executing, so its user message may be stored before
+                // the results. Defer intervening non-assistant messages until
+                // every available result has been paired with this call set.
                 let mut answered = std::collections::HashSet::new();
-                while matches!(iter.peek(), Some(Message::ToolResult { .. })) {
-                    if let Some(Message::ToolResult {
-                        call_id,
-                        content,
-                        images,
-                    }) = iter.next()
-                    {
-                        answered.insert(call_id.clone());
-                        out.push(Message::ToolResult {
-                            call_id,
-                            content,
-                            images,
-                        });
+                let mut deferred = Vec::new();
+                while answered.len() < ids.len() {
+                    match iter.peek() {
+                        Some(Message::ToolResult { .. }) => {
+                            if let Some(Message::ToolResult {
+                                call_id,
+                                content,
+                                images,
+                            }) = iter.next()
+                            {
+                                if ids.contains(&call_id) {
+                                    answered.insert(call_id.clone());
+                                }
+                                out.push(Message::ToolResult {
+                                    call_id,
+                                    content,
+                                    images,
+                                });
+                            }
+                        }
+                        Some(Message::Assistant { .. }) | None => break,
+                        Some(_) => {
+                            deferred.push(iter.next().expect("peeked message"));
+                        }
                     }
                 }
                 for id in ids {
@@ -17827,6 +21531,7 @@ fn sanitize_transcript(messages: Vec<Message>) -> Vec<Message> {
                         });
                     }
                 }
+                out.extend(deferred);
             }
             other => out.push(other),
         }
@@ -18526,6 +22231,370 @@ fn expand_provider_template(
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_new_title_supersedes_a_failed_branch_rename() {
+        let pending = SessionBranchRenameIntent {
+            session_id: "se_pending".into(),
+            old_branch: "trouve/old".into(),
+            new_branch: "trouve/conflicting".into(),
+            title: "Conflicting Title".into(),
+        };
+
+        assert!(should_replay_session_branch_rename(
+            &pending,
+            "Conflicting Title",
+            "Conflicting Title",
+        ));
+        assert!(!should_replay_session_branch_rename(
+            &pending,
+            "Conflicting Title",
+            "Replacement Title",
+        ));
+    }
+
+    #[test]
+    fn dispatched_background_activity_is_not_a_user_message() {
+        let routed_content = background_attach_prompt("cursor");
+        assert_eq!(
+            background_attach_backend_id(&routed_content),
+            Some("cursor")
+        );
+        assert_eq!(background_attach_backend_id(BACKGROUND_ATTACH_PROMPT), None);
+
+        let prompt = trouve_protocol::QueuedPrompt {
+            id: "qp_background".into(),
+            thread_id: "th_background".into(),
+            position: 0,
+            content: routed_content,
+            background: true,
+            attachments: Vec::new(),
+            created_at: "2026-08-30T00:00:00Z".into(),
+        };
+        assert!(matches!(
+            dispatched_prompt_event(7, &prompt),
+            Event::TurnBackgroundActivity { turn: 7 }
+        ));
+
+        let foreground = trouve_protocol::QueuedPrompt {
+            background: false,
+            content: "User prompt".into(),
+            ..prompt
+        };
+        assert!(matches!(
+            dispatched_prompt_event(8, &foreground),
+            Event::UserMessage {
+                turn: 8,
+                content,
+                background: false,
+                ..
+            } if content == "User prompt"
+        ));
+    }
+
+    #[test]
+    fn tool_media_becomes_bounded_artifact_uploads_without_inline_bytes() {
+        let mut result = serde_json::json!([
+            {
+                "type": "image",
+                "mimeType": "image/png",
+                "data": "aGVsbG8="
+            },
+            {
+                "type": "audio",
+                "mimeType": "audio/mpeg",
+                "data": "d29ybGQ="
+            },
+            {
+                "type": "resource",
+                "resource": {
+                    "mimeType": "application/pdf",
+                    "blob": "IQ=="
+                }
+            }
+        ]);
+
+        let (images, uploads) = take_tool_media(&mut result);
+
+        assert_eq!(images.len(), 1);
+        assert_eq!(uploads.len(), 3);
+        assert_eq!(uploads[0].name, "tool-image-1.png");
+        assert_eq!(uploads[1].name, "tool-audio-2.mp3");
+        assert_eq!(uploads[2].name, "tool-artifact-3.pdf");
+        assert_eq!(result[0]["media_omitted"], true);
+        assert_eq!(result[1]["media_omitted"], true);
+        assert_eq!(result[2]["resource"]["media_omitted"], true);
+        assert!(result[0].get("data").is_none());
+        assert!(result[1].get("data").is_none());
+        assert!(result[2]["resource"].get("blob").is_none());
+    }
+
+    #[test]
+    fn first_party_tool_images_remain_provider_images_and_become_artifacts() {
+        let mut result = serde_json::json!({
+            "note": "screenshot",
+            "_images": [{ "mime": "image/png", "data": "aGVsbG8=" }]
+        });
+
+        let (images, uploads) = take_tool_media(&mut result);
+
+        assert_eq!(images.len(), 1);
+        assert_eq!(uploads.len(), 1);
+        assert_eq!(uploads[0].name, "tool-image-1.png");
+        assert!(result.get("_images").is_none());
+        assert_eq!(result["images"][0]["mime"], "image/png");
+    }
+
+    #[test]
+    fn rejected_tool_media_is_not_forwarded_or_persisted() {
+        let mut result = serde_json::json!([
+            {
+                "type": "image",
+                "mimeType": "not-a-mime",
+                "data": "aGVsbG8="
+            }
+        ]);
+
+        let (images, uploads) = take_tool_media(&mut result);
+
+        assert!(images.is_empty());
+        assert!(uploads.is_empty());
+        assert!(result[0].get("data").is_none());
+        assert_eq!(result[0]["media_omitted"], true);
+        assert!(result[0]["media_error"].as_str().is_some());
+    }
+
+    #[test]
+    fn artifact_staging_failure_preserves_a_terminal_tool_result() {
+        let upload = artifact_upload(0, "image", "image/png".into(), "aGVsbG8=".into());
+        let mut result = serde_json::json!({ "note": "tool finished" });
+
+        let prepared: Option<()> = prepare_tool_artifacts(&mut result, vec![upload], |_| {
+            Err(EngineError::Internal(anyhow!("injected staging failure")))
+        });
+        let terminal = Event::ToolCompleted {
+            call_id: "call_with_media".into(),
+            status: ToolStatus::Ok,
+            result,
+            execution_duration_ms: Some(1),
+        };
+
+        assert!(prepared.is_none());
+        assert!(matches!(
+            terminal,
+            Event::ToolCompleted {
+                status: ToolStatus::Ok,
+                result,
+                ..
+            } if result["artifact_persistence_error"].as_str().is_some()
+        ));
+    }
+
+    #[tokio::test]
+    async fn closing_steer_receiver_rejects_a_previously_cloned_sender() {
+        let (sender, receiver) = tokio::sync::mpsc::channel(2);
+        let raced_sender = sender.clone();
+        sender.send("already queued").await.unwrap();
+        let mut receiver = Some(receiver);
+
+        close_steer_receiver(&mut receiver);
+
+        assert!(
+            raced_sender.send("too late").await.is_err(),
+            "a sender cloned before the terminal transition must fail closed"
+        );
+        assert_eq!(
+            receiver.as_mut().unwrap().try_recv().unwrap(),
+            "already queued"
+        );
+        assert!(receiver.as_mut().unwrap().try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn planned_turn_setup_lane_bounds_only_setup_admission() {
+        let scheduler = TurnScheduler::new();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut permits = Vec::with_capacity(PLANNED_TURN_SETUP_CONCURRENCY);
+        for _ in 0..PLANNED_TURN_SETUP_CONCURRENCY {
+            permits.push(scheduler.acquire_planned_setup(&cancel).await.unwrap());
+        }
+
+        let blocked_cancel = tokio_util::sync::CancellationToken::new();
+        let blocked = scheduler.acquire_planned_setup(&blocked_cancel);
+        tokio::pin!(blocked);
+        tokio::select! {
+            biased;
+            result = &mut blocked => panic!("setup lane admitted excess work: {result:?}"),
+            _ = tokio::task::yield_now() => {}
+        }
+        blocked_cancel.cancel();
+        assert_eq!(
+            blocked.await.unwrap_err().to_string(),
+            "turn setup cancelled"
+        );
+
+        drop(permits.pop());
+        let _replacement = scheduler.acquire_planned_setup(&cancel).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn backend_startup_lane_paces_each_backend_independently() {
+        let scheduler = TurnScheduler::new();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut permits = Vec::with_capacity(BACKEND_TURN_STARTUP_CONCURRENCY);
+        for _ in 0..BACKEND_TURN_STARTUP_CONCURRENCY {
+            permits.push(
+                scheduler
+                    .acquire_backend_startup("codex", &cancel)
+                    .await
+                    .unwrap(),
+            );
+        }
+
+        // Another backend owns its own lane and is not blocked by Codex.
+        let _other = scheduler
+            .acquire_backend_startup("claude-cli", &cancel)
+            .await
+            .unwrap();
+
+        let blocked_cancel = tokio_util::sync::CancellationToken::new();
+        let blocked = scheduler.acquire_backend_startup("codex", &blocked_cancel);
+        tokio::pin!(blocked);
+        tokio::select! {
+            biased;
+            result = &mut blocked => panic!("startup lane admitted excess work: {result:?}"),
+            _ = tokio::task::yield_now() => {}
+        }
+        blocked_cancel.cancel();
+        assert_eq!(blocked.await.unwrap_err().to_string(), "turn cancelled");
+
+        // A vendor-accepted turn frees its slot for the next waiter.
+        drop(permits.pop());
+        let _replacement = scheduler
+            .acquire_backend_startup("codex", &cancel)
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn removed_turn_concurrency_settings_are_detected_for_migration_warnings() {
+        let configured = configured_removed_turn_concurrency_settings(|name| {
+            name == "TROUVE_TURN_CONCURRENCY"
+                || name == "TROUVE_PROVIDER_BACKGROUND_TURN_CONCURRENCY"
+        });
+
+        assert_eq!(
+            configured,
+            vec![
+                "TROUVE_TURN_CONCURRENCY",
+                "TROUVE_PROVIDER_BACKGROUND_TURN_CONCURRENCY"
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn provider_cooldown_wait_observes_extensions() {
+        let scheduler = Arc::new(TurnScheduler::new());
+        scheduler.record_outcome("provider/model", Some("429 rate limit"));
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let waiter = {
+            let scheduler = Arc::clone(&scheduler);
+            tokio::spawn(async move { scheduler.admit("provider/model", &cancel).await })
+        };
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(500)).await;
+        scheduler.record_outcome("provider/model", Some("429 rate limit"));
+        tokio::time::advance(Duration::from_millis(500)).await;
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+
+        tokio::time::advance(Duration::from_millis(1_500)).await;
+        tokio::task::yield_now().await;
+        assert!(waiter.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn provider_capacity_rejects_an_already_cancelled_turn() {
+        let scheduler = TurnScheduler::new();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+
+        let result = scheduler.admit("provider/model", &cancel).await;
+
+        assert_eq!(
+            result.err().map(|error| error.to_string()).as_deref(),
+            Some("turn cancelled")
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_admission_exceeds_the_former_global_and_provider_limits() {
+        const TURN_COUNT: usize = 27;
+        let scheduler = Arc::new(TurnScheduler::new());
+        let admitted = Arc::new(tokio::sync::Semaphore::new(0));
+        let provider_release = Arc::new(tokio::sync::Barrier::new(TURN_COUNT + 1));
+        let mut turns = Vec::with_capacity(TURN_COUNT);
+
+        for _ in 0..TURN_COUNT {
+            let scheduler = Arc::clone(&scheduler);
+            let admitted = Arc::clone(&admitted);
+            let provider_release = Arc::clone(&provider_release);
+            turns.push(tokio::spawn(async move {
+                let cancel = tokio_util::sync::CancellationToken::new();
+                scheduler.admit("provider/model", &cancel).await.unwrap();
+                admitted.add_permits(1);
+                provider_release.wait().await;
+            }));
+        }
+
+        let all_admitted = tokio::time::timeout(
+            Duration::from_secs(1),
+            admitted.acquire_many(TURN_COUNT.try_into().unwrap()),
+        )
+        .await
+        .expect("all turns should pass admission before provider work is released")
+        .unwrap();
+        drop(all_admitted);
+        provider_release.wait().await;
+        for turn in turns {
+            turn.await.unwrap();
+        }
+    }
+
+    #[test]
+    fn provider_reasoning_identity_survives_interleaved_tool_events() {
+        let mut thinking = ProviderThinkingState::default();
+        let mut events = Vec::new();
+
+        thinking.start("reasoning-a".into(), 7, &mut events);
+        thinking.delta("reasoning-a".into(), "first".into(), 7, &mut events);
+        events.push(Event::ToolRequested {
+            turn: 7,
+            call_id: "read".into(),
+            tool: "read_file".into(),
+            args: serde_json::json!({}),
+            requires_approval: false,
+        });
+        thinking.delta("reasoning-a".into(), " second".into(), 7, &mut events);
+        thinking.complete("reasoning-a", 7, &mut events);
+        thinking.start("reasoning-b".into(), 7, &mut events);
+        thinking.delta("reasoning-b".into(), "separate".into(), 7, &mut events);
+
+        assert!(matches!(
+            events.as_slice(),
+            [
+                Event::AssistantThinking { text: first, .. },
+                Event::ToolRequested { call_id, .. },
+                Event::AssistantThinking { text: second, .. },
+                Event::AssistantThinkingCompleted { .. },
+                Event::AssistantThinking { text: separate, .. },
+            ] if first == "first"
+                && call_id == "read"
+                && second == " second"
+                && separate == "separate"
+        ));
+    }
+
     fn persona_request(display_name: &str) -> trouve_protocol::UpsertPersonaRequest {
         trouve_protocol::UpsertPersonaRequest {
             display_name: display_name.into(),
@@ -18816,6 +22885,8 @@ mod tests {
                 coordinator_thinking_level: None,
                 router_model: None,
                 router_thinking_level: None,
+                analyst_model: None,
+                analyst_thinking_level: None,
                 prompt: "preserve this".into(),
                 reviewer_ids: Some(vec!["custom".into()]),
                 routing_mode: Some(trouve_protocol::CodeReviewRoutingMode::Manual),
@@ -18966,6 +23037,8 @@ mod tests {
                 coordinator_thinking_level: None,
                 router_model: None,
                 router_thinking_level: None,
+                analyst_model: None,
+                analyst_thinking_level: None,
                 prompt: String::new(),
                 reviewer_ids: Some(vec!["custom".into()]),
                 routing_mode: Some(trouve_protocol::CodeReviewRoutingMode::Manual),
@@ -19190,13 +23263,32 @@ mod tests {
                 Vec::new(),
                 None,
             ),
-            response,
+            response: SteerResponse {
+                sender: Some(response),
+            },
+            _permit: Arc::new(tokio::sync::Semaphore::new(1))
+                .try_acquire_owned()
+                .unwrap(),
         });
 
         reject_pending_steer(&mut pending, "turn cancelled");
 
         assert_eq!(received.await.unwrap().unwrap_err(), "turn cancelled");
         assert!(pending.is_none());
+    }
+
+    #[test]
+    fn steering_permits_bound_channel_and_deferred_storage_together() {
+        let permits = Arc::new(tokio::sync::Semaphore::new(TURN_STEER_PENDING_CAPACITY));
+        let held = (0..TURN_STEER_PENDING_CAPACITY)
+            .map(|_| permits.clone().try_acquire_owned().unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            permits.clone().try_acquire_owned().is_err(),
+            "draining commands from the receiver must not create new capacity"
+        );
+        drop(held);
+        assert!(permits.try_acquire_owned().is_ok());
     }
 
     fn init_engine_test_repo(path: &Path) {
@@ -19543,12 +23635,39 @@ mod tests {
             enforce_automated_review_backend_boundary(true, true, false, false, "unsafe").is_err()
         );
 
-        assert!(vendor_tool_uses_automated_review_budget(true, "read_file"));
-        assert!(!vendor_tool_uses_automated_review_budget(false, "search"));
+        assert!(vendor_tool_uses_automated_review_budget(
+            true,
+            "read_file",
+            true
+        ));
         assert!(!vendor_tool_uses_automated_review_budget(
             true,
-            "mcp__trouve__read_file"
+            "read_file",
+            false
         ));
+        assert!(!vendor_tool_uses_automated_review_budget(
+            false, "search", true
+        ));
+        assert!(!vendor_tool_uses_automated_review_budget(
+            true,
+            "mcp__trouve__read_file",
+            true
+        ));
+    }
+
+    #[test]
+    fn automated_review_omits_conflicting_vendor_search_first_guidance() {
+        let mut ordinary = "ordinary persona".to_string();
+        append_vendor_search_guidance(&mut ordinary, true, false);
+        assert!(ordinary.contains(crate::tools::VENDOR_SEARCH_GUIDANCE));
+
+        let mut review = "review persona".to_string();
+        append_vendor_search_guidance(&mut review, true, true);
+        assert_eq!(review, "review persona");
+
+        let mut no_bridge = "ordinary persona".to_string();
+        append_vendor_search_guidance(&mut no_bridge, false, false);
+        assert_eq!(no_bridge, "ordinary persona");
     }
 
     #[test]
@@ -19609,10 +23728,25 @@ mod tests {
 
     struct CatalogTestProvider {
         live_calls: Arc<std::sync::atomic::AtomicUsize>,
+        live_queries_allowed: Arc<std::sync::atomic::AtomicBool>,
+        static_options_advertised: Arc<std::sync::atomic::AtomicBool>,
     }
 
-    struct ReasoningThenStallProvider {
-        stalled: Arc<tokio::sync::Semaphore>,
+    struct BlockingAutomationProvider {
+        started: Arc<tokio::sync::Semaphore>,
+        release: Arc<tokio::sync::Semaphore>,
+    }
+
+    struct BlockingTitleProvider {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        started: Arc<tokio::sync::Semaphore>,
+        release: Arc<tokio::sync::Semaphore>,
+    }
+
+    struct RoutedTitleProvider {
+        id: String,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        fail: bool,
     }
 
     fn catalog_test_model(id: &str, display_name: &str) -> trouve_protocol::ModelInfo {
@@ -19621,9 +23755,33 @@ mod tests {
             display_name: display_name.into(),
             context_window: 100_000,
             supports_tools: true,
+            supports_images: false,
             input_price_per_mtok: None,
             output_price_per_mtok: None,
-            options_schema: serde_json::json!({}),
+            options_schema: if id.ends_with("/static") {
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "fast": {"type": "boolean"},
+                        "reasoning_effort": {
+                            "type": "string",
+                            "enum": ["low", "high"]
+                        }
+                    }
+                })
+            } else {
+                serde_json::json!({})
+            },
+        }
+    }
+
+    impl CatalogTestProvider {
+        fn new(live_calls: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+            Self {
+                live_calls,
+                live_queries_allowed: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                static_options_advertised: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            }
         }
     }
 
@@ -19633,18 +23791,23 @@ mod tests {
             "catalog-test"
         }
 
-        fn shared_model_identity(&self, model: &str) -> Option<String> {
-            matches!(model, "static" | "live").then(|| model.to_string())
-        }
-
         fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
-            vec![catalog_test_model(
-                "catalog-test/static",
-                "Static catalog model",
-            )]
+            let mut model = catalog_test_model("catalog-test/static", "Static catalog model");
+            if !self
+                .static_options_advertised
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                model.options_schema = serde_json::json!({});
+            }
+            vec![model]
         }
 
         async fn list_models(&self) -> Vec<trouve_protocol::ModelInfo> {
+            assert!(
+                self.live_queries_allowed
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                "live catalog discovery is unavailable"
+            );
             self.live_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             vec![catalog_test_model(
@@ -19665,421 +23828,18 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl Provider for ReasoningThenStallProvider {
+    impl Provider for BlockingAutomationProvider {
         fn id(&self) -> &str {
-            "reasoning-stall"
-        }
-
-        fn shared_model_identity(&self, model: &str) -> Option<String> {
-            (model == "shared").then(|| model.to_string())
-        }
-
-        fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
-            vec![catalog_test_model(
-                "reasoning-stall/shared",
-                "Reasoning stall model",
-            )]
-        }
-
-        async fn stream_chat(
-            &self,
-            _model: &str,
-            _messages: &[trouve_providers::Message],
-            _tools: &[trouve_providers::ToolSpec],
-            _options: &serde_json::Map<String, serde_json::Value>,
-        ) -> Result<trouve_providers::EventStream, trouve_providers::ProviderError> {
-            let stalled = self.stalled.clone();
-            let reasoning: Result<ProviderEvent, trouve_providers::ProviderError> =
-                Ok(ProviderEvent::Reasoning(serde_json::json!({
-                    "type": "thinking",
-                    "thinking": "preserve me",
-                    "signature": "signed",
-                })));
-            Ok(futures::stream::iter([reasoning])
-                .chain(futures::stream::once(async move {
-                    stalled.add_permits(1);
-                    std::future::pending::<Result<ProviderEvent, trouve_providers::ProviderError>>()
-                        .await
-                }))
-                .boxed())
-        }
-    }
-
-    struct StallingCatalogProvider {
-        live_calls: Arc<std::sync::atomic::AtomicUsize>,
-    }
-
-    struct ListedTestBackend;
-
-    struct StartupTestBackend;
-
-    struct ReviewSafeTestProvider {
-        calls: Arc<std::sync::atomic::AtomicUsize>,
-        tools: Arc<Mutex<Vec<String>>>,
-        system: Arc<Mutex<String>>,
-    }
-
-    struct ReviewRoutingBackend {
-        turns: Arc<Mutex<Vec<(bool, BackendPermission, String)>>>,
-        strict_tool_free: bool,
-        confined_read_only: bool,
-    }
-
-    struct StartupPersistenceFailureBackend {
-        store: Store,
-        cleanup_started: Arc<tokio::sync::Semaphore>,
-        cleanup_release: Arc<tokio::sync::Semaphore>,
-    }
-
-    struct EventFailureUsageBackend {
-        cleanup_started: Arc<tokio::sync::Semaphore>,
-        cleanup_release: Arc<tokio::sync::Semaphore>,
-    }
-
-    #[async_trait::async_trait]
-    impl AgentBackend for ListedTestBackend {
-        fn id(&self) -> &str {
-            "listed-backend"
-        }
-
-        fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
-            vec![catalog_test_model(
-                "listed-backend/shared",
-                "Listed backend model",
-            )]
-        }
-
-        fn status(&self) -> trouve_agents::BackendStatus {
-            trouve_agents::BackendStatus {
-                installed: true,
-                has_credentials: true,
-            }
-        }
-
-        async fn start_login(
-            &self,
-        ) -> Result<trouve_agents::BackendLogin, trouve_agents::BackendError> {
-            unreachable!("provider-list test never starts login")
-        }
-
-        async fn run_turn(
-            &self,
-            _turn: BackendTurn,
-        ) -> Result<trouve_agents::BackendEventStream, trouve_agents::BackendError> {
-            unreachable!("provider-list test never starts a turn")
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl AgentBackend for StartupTestBackend {
-        fn id(&self) -> &str {
-            "startup-backend"
-        }
-
-        fn shared_model_identity(&self, model: &str) -> Option<String> {
-            (model == "shared").then(|| model.to_string())
-        }
-
-        fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
-            vec![catalog_test_model(
-                "startup-backend/shared",
-                "Startup backend model",
-            )]
-        }
-
-        fn status(&self) -> trouve_agents::BackendStatus {
-            trouve_agents::BackendStatus {
-                installed: true,
-                has_credentials: true,
-            }
-        }
-
-        async fn startup_activity(&self, _turn: &BackendTurn) -> Option<BackendStartupActivity> {
-            Some(BackendStartupActivity::ConnectingTools)
-        }
-
-        async fn start_login(
-            &self,
-        ) -> Result<trouve_agents::BackendLogin, trouve_agents::BackendError> {
-            unreachable!("startup phase test never starts login")
-        }
-
-        async fn run_turn(
-            &self,
-            _turn: BackendTurn,
-        ) -> Result<trouve_agents::BackendEventStream, trouve_agents::BackendError> {
-            Ok(futures::stream::iter([Ok(BackendEvent::Completed {
-                usage: Usage::default(),
-            })])
-            .boxed())
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl Provider for ReviewSafeTestProvider {
-        fn id(&self) -> &str {
-            "review-native"
-        }
-
-        fn shared_model_identity(&self, model: &str) -> Option<String> {
-            (model == "shared").then(|| model.to_string())
-        }
-
-        fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
-            vec![catalog_test_model(
-                "review-native/shared",
-                "Review-safe native model",
-            )]
-        }
-
-        async fn stream_chat(
-            &self,
-            _model: &str,
-            messages: &[trouve_providers::Message],
-            tools: &[trouve_providers::ToolSpec],
-            _options: &serde_json::Map<String, serde_json::Value>,
-        ) -> Result<trouve_providers::EventStream, trouve_providers::ProviderError> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            *self.tools.lock().unwrap() = tools.iter().map(|tool| tool.name.clone()).collect();
-            *self.system.lock().unwrap() = messages
-                .iter()
-                .find_map(|message| match message {
-                    trouve_providers::Message::System(system) => Some(system.clone()),
-                    _ => None,
-                })
-                .unwrap_or_default();
-            Ok(futures::stream::iter([
-                Ok(ProviderEvent::TextDelta("reviewed".into())),
-                Ok(ProviderEvent::Completed {
-                    usage: Usage::default(),
-                }),
-            ])
-            .boxed())
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl AgentBackend for ReviewRoutingBackend {
-        fn id(&self) -> &str {
-            "tool-free-backend"
-        }
-
-        fn shared_model_identity(&self, model: &str) -> Option<String> {
-            (model == "shared").then(|| model.to_string())
-        }
-
-        fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
-            vec![catalog_test_model(
-                "tool-free-backend/shared",
-                "Tool-free review backend",
-            )]
-        }
-
-        fn status(&self) -> trouve_agents::BackendStatus {
-            trouve_agents::BackendStatus {
-                installed: true,
-                has_credentials: true,
-            }
-        }
-
-        fn supports_tool_free_turns(&self) -> bool {
-            self.strict_tool_free
-        }
-
-        fn confines_read_only_turns(&self) -> bool {
-            self.confined_read_only
-        }
-
-        async fn start_login(
-            &self,
-        ) -> Result<trouve_agents::BackendLogin, trouve_agents::BackendError> {
-            unreachable!("tool-free routing test never starts login")
-        }
-
-        async fn run_turn(
-            &self,
-            turn: BackendTurn,
-        ) -> Result<trouve_agents::BackendEventStream, trouve_agents::BackendError> {
-            self.turns.lock().unwrap().push((
-                turn.tool_free,
-                turn.permission,
-                turn.instructions.unwrap_or_default(),
-            ));
-            Ok(futures::stream::iter([Ok(BackendEvent::Completed {
-                usage: Usage::default(),
-            })])
-            .boxed())
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl AgentBackend for StartupPersistenceFailureBackend {
-        fn id(&self) -> &str {
-            "startup-persistence-failure-backend"
-        }
-
-        fn shared_model_identity(&self, model: &str) -> Option<String> {
-            (model == "shared").then(|| model.to_string())
-        }
-
-        fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
-            vec![catalog_test_model(
-                "startup-persistence-failure-backend/shared",
-                "Startup persistence failure backend model",
-            )]
-        }
-
-        fn status(&self) -> trouve_agents::BackendStatus {
-            trouve_agents::BackendStatus {
-                installed: true,
-                has_credentials: true,
-            }
-        }
-
-        async fn startup_activity(&self, _turn: &BackendTurn) -> Option<BackendStartupActivity> {
-            Some(BackendStartupActivity::ConnectingTools)
-        }
-
-        async fn start_login(
-            &self,
-        ) -> Result<trouve_agents::BackendLogin, trouve_agents::BackendError> {
-            unreachable!("startup persistence failure test never starts login")
-        }
-
-        async fn run_turn(
-            &self,
-            turn: BackendTurn,
-        ) -> Result<trouve_agents::BackendEventStream, trouve_agents::BackendError> {
-            self.store.fail_next_async_append();
-            let cleanup_started = self.cleanup_started.clone();
-            let cleanup_release = self.cleanup_release.clone();
-            let (events, stream) = futures::channel::mpsc::unbounded::<
-                Result<BackendEvent, trouve_agents::BackendError>,
-            >();
-            tokio::spawn(async move {
-                turn.cancel.cancelled().await;
-                cleanup_started.add_permits(1);
-                cleanup_release
-                    .acquire_owned()
-                    .await
-                    .expect("cleanup release semaphore remains open")
-                    .forget();
-                drop(events);
-            });
-            Ok(stream.boxed())
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl AgentBackend for EventFailureUsageBackend {
-        fn id(&self) -> &str {
-            "event-failure-backend"
-        }
-
-        fn shared_model_identity(&self, model: &str) -> Option<String> {
-            (model == "shared").then(|| model.to_string())
-        }
-
-        fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
-            vec![catalog_test_model(
-                "event-failure-backend/shared",
-                "Event failure backend model",
-            )]
-        }
-
-        fn status(&self) -> trouve_agents::BackendStatus {
-            trouve_agents::BackendStatus {
-                installed: true,
-                has_credentials: true,
-            }
-        }
-
-        async fn start_login(
-            &self,
-        ) -> Result<trouve_agents::BackendLogin, trouve_agents::BackendError> {
-            unreachable!("event failure test never starts login")
-        }
-
-        async fn run_turn(
-            &self,
-            turn: BackendTurn,
-        ) -> Result<trouve_agents::BackendEventStream, trouve_agents::BackendError> {
-            let cleanup_started = self.cleanup_started.clone();
-            let cleanup_release = self.cleanup_release.clone();
-            let (events, stream) = futures::channel::mpsc::unbounded::<
-                Result<BackendEvent, trouve_agents::BackendError>,
-            >();
-            tokio::spawn(async move {
-                let (responder, decision) = tokio::sync::oneshot::channel();
-                if events
-                    .unbounded_send(Ok(BackendEvent::ApprovalNeeded {
-                        call_id: "approved-mutation".into(),
-                        tool: "vendor-write".into(),
-                        args: serde_json::json!({}),
-                        responder,
-                    }))
-                    .is_err()
-                {
-                    return;
-                }
-                if decision.await != Ok(true) {
-                    return;
-                }
-                let emitted = [
-                    BackendEvent::Completed {
-                        usage: Usage {
-                            input_tokens: 23,
-                            cached_input_tokens: 4,
-                            output_tokens: 7,
-                            cost_usd: Some(0.5),
-                            ..Usage::default()
-                        },
-                    },
-                    BackendEvent::CollaboratorStarted {
-                        session_id: "invalid-child".into(),
-                        parent_session_id: "root".into(),
-                        name: Some("Invalid child".into()),
-                        prompt: Some("Trigger event projection failure".into()),
-                        model: Some("auto/".into()),
-                        thinking_level: None,
-                        access: BackendCollaboratorAccess::Inherit,
-                    },
-                ];
-                for event in emitted {
-                    if events.unbounded_send(Ok(event)).is_err() {
-                        return;
-                    }
-                }
-                turn.cancel.cancelled().await;
-                cleanup_started.add_permits(1);
-                cleanup_release
-                    .acquire_owned()
-                    .await
-                    .expect("cleanup release semaphore remains open")
-                    .forget();
-            });
-            Ok(stream.boxed())
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl Provider for StallingCatalogProvider {
-        fn id(&self) -> &str {
-            "stall"
-        }
-
-        fn shared_model_identity(&self, model: &str) -> Option<String> {
-            (model == "stalled").then(|| model.to_string())
-        }
-
-        fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
-            vec![catalog_test_model("stall/stalled", "Stalled static model")]
+            "blocking-automation"
         }
 
         async fn list_models(&self) -> Vec<trouve_protocol::ModelInfo> {
-            self.live_calls
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            std::future::pending().await
+            self.started.add_permits(1);
+            self.release.acquire().await.unwrap().forget();
+            vec![catalog_test_model(
+                "blocking-automation/static",
+                "Blocking automation model",
+            )]
         }
 
         async fn stream_chat(
@@ -20089,96 +23849,82 @@ mod tests {
             _tools: &[trouve_providers::ToolSpec],
             _options: &serde_json::Map<String, serde_json::Value>,
         ) -> Result<trouve_providers::EventStream, trouve_providers::ProviderError> {
-            unreachable!("model catalog tests never start a provider turn")
+            unreachable!("automation update tests never start a provider turn")
         }
     }
 
-    fn routing_test_thread(store: &Store, path: &Path, suffix: &str, model: &str) -> Thread {
-        let workspace = Workspace {
-            id: format!("ws_{suffix}"),
-            name: format!("routing {suffix}"),
-            path: path.to_string_lossy().into_owned(),
-        };
-        store.insert_workspace(&workspace).unwrap();
-        let session = Session {
-            id: format!("se_{suffix}"),
-            workspace_id: workspace.id.clone(),
-            title: format!("Routing {suffix}"),
-            branch: "main".into(),
-            worktree_path: workspace.path,
-            base_ref: "main".into(),
-            archived: false,
-            active: false,
-            created_at: chrono::Utc::now(),
-        };
-        store.insert_session(&session).unwrap();
-        let thread = Thread {
-            id: format!("th_{suffix}"),
-            session_id: session.id,
-            parent_thread_id: None,
-            title: None,
-            mode: "code".into(),
-            model: model.into(),
-            model_options: Default::default(),
-            permission_mode: trouve_protocol::PermissionMode::Yolo,
-            created_at: chrono::Utc::now(),
-            spawned: false,
-            todos: Vec::new(),
-        };
-        store.insert_thread(&thread, &Default::default()).unwrap();
-        thread
+    #[async_trait::async_trait]
+    impl Provider for BlockingTitleProvider {
+        fn id(&self) -> &str {
+            "title-test"
+        }
+
+        fn shared_model_identity(&self, model: &str) -> Option<String> {
+            (model == "model").then(|| model.to_string())
+        }
+
+        fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
+            vec![catalog_test_model("title-test/model", "Title test model")]
+        }
+
+        async fn stream_chat(
+            &self,
+            _model: &str,
+            _messages: &[trouve_providers::Message],
+            _tools: &[trouve_providers::ToolSpec],
+            _options: &serde_json::Map<String, serde_json::Value>,
+        ) -> Result<trouve_providers::EventStream, trouve_providers::ProviderError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.started.add_permits(1);
+            self.release.acquire().await.unwrap().forget();
+            Ok(Box::pin(futures::stream::iter(vec![
+                Ok(ProviderEvent::TextDelta("Prioritize Local Naming".into())),
+                Ok(ProviderEvent::Completed {
+                    usage: Usage::default(),
+                }),
+            ])))
+        }
     }
 
-    fn mark_routing_test_thread_as_review(store: &Store, thread: &Thread, suffix: &str) {
-        let job = store
-            .enqueue_code_review_job(&crate::store::NewCodeReviewJob {
-                dedupe_key: format!("acme/widgets#42:{suffix}"),
-                installation_id: 7,
-                repository: "acme/widgets".into(),
-                pull_number: 42,
-                pull_title: "Review automatic routing".into(),
-                pull_url: "https://github.com/acme/widgets/pull/42".into(),
-                head_sha: "2222222222222222222222222222222222222222".into(),
-                review_base_sha: "1111111111111111111111111111111111111111".into(),
-                base_ref: "main".into(),
-                head_ref: "routing".into(),
-                scope: trouve_protocol::CodeReviewJobScope::Incremental,
-                trigger: "automatic".into(),
-                retry_of: None,
-                model: Some(thread.model.clone()),
-                coordinator_thinking_level: None,
-                router_model: None,
-                router_thinking_level: None,
-                prompt: "Review it".into(),
-                reviewers: crate::reviewers::built_in_reviewers()
-                    .into_iter()
-                    .take(1)
-                    .collect(),
-                routing_mode: trouve_protocol::CodeReviewRoutingMode::Manual,
-                semantic_routing: false,
-                included_reviewer_ids: Vec::new(),
-                excluded_reviewer_ids: Vec::new(),
-                config_hash: "config".into(),
-            })
-            .unwrap()
-            .unwrap();
-        store.claim_code_review_job().unwrap().unwrap();
-        let task = store
-            .create_code_review_task(&crate::store::NewCodeReviewTask {
-                job_id: job.id,
-                role: trouve_protocol::CodeReviewTaskRole::Reviewer,
-                reviewer_id: Some("correctness".into()),
-                reviewer_name: "Correctness".into(),
-                batch_index: 0,
-                batch_count: 1,
-                model: Some(thread.model.clone()),
-                prompt: "Review automatic routing".into(),
-            })
-            .unwrap();
-        store
-            .start_code_review_task(&task.id, &thread.session_id, &thread.id, &thread.model)
-            .unwrap()
-            .unwrap();
+    #[async_trait::async_trait]
+    impl Provider for RoutedTitleProvider {
+        fn id(&self) -> &str {
+            &self.id
+        }
+
+        fn shared_model_identity(&self, model: &str) -> Option<String> {
+            (model == "model").then(|| model.to_string())
+        }
+
+        fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
+            vec![catalog_test_model(
+                &format!("{}/model", self.id),
+                "Routed title model",
+            )]
+        }
+
+        async fn stream_chat(
+            &self,
+            model: &str,
+            _messages: &[trouve_providers::Message],
+            tools: &[trouve_providers::ToolSpec],
+            _options: &serde_json::Map<String, serde_json::Value>,
+        ) -> Result<trouve_providers::EventStream, trouve_providers::ProviderError> {
+            assert_eq!(model, "model");
+            assert!(tools.is_empty());
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fail {
+                return Err(trouve_providers::ProviderError::Request(
+                    "injected naming failure".into(),
+                ));
+            }
+            Ok(Box::pin(futures::stream::iter(vec![
+                Ok(ProviderEvent::TextDelta("Recover Routed Naming".into())),
+                Ok(ProviderEvent::Completed {
+                    usage: Usage::default(),
+                }),
+            ])))
+        }
     }
 
     struct BlockingToolExecutor {
@@ -20886,6 +24632,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_idempotency_replay_is_side_effect_free_after_workspace_close() {
+        let temp = tempfile::tempdir().unwrap();
+        let repository = temp.path().join("repository");
+        let data_dir = temp.path().join("data");
+        init_engine_test_repo(&repository);
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data_dir,
+            &Config::default(),
+        );
+        let workspace = engine
+            .register_workspace(repository.to_str().unwrap(), None)
+            .unwrap();
+        let request = CreateSessionRequest {
+            workspace_id: workspace.id.clone(),
+            idempotency_key: Some("closed-workspace-replay".into()),
+            title: Some("closed workspace replay".into()),
+            base_ref: Some("main".into()),
+            checkout_ref: None,
+            fetch_latest: false,
+        };
+        let first = engine.create_session(request.clone()).await.unwrap();
+        engine.create_terminal(&first.id, 80, 24).unwrap();
+        assert_eq!(engine.list_terminals(&first.id).unwrap().len(), 1);
+
+        engine.close_workspace(&workspace.id).unwrap();
+        assert!(engine.list_workspaces().unwrap().is_empty());
+        assert!(engine.list_terminals(&first.id).unwrap().is_empty());
+        let registrations_before_replay = engine
+            .store
+            .events_after(&Scope::Server, 0)
+            .unwrap()
+            .into_iter()
+            .filter(|envelope| {
+                matches!(
+                    &envelope.event,
+                    Event::WorkspaceRegistered { workspace_id, .. }
+                        if workspace_id == &workspace.id
+                )
+            })
+            .count();
+
+        let replay = engine.create_session(request).await.unwrap();
+
+        assert_eq!(replay.id, first.id);
+        assert!(engine.list_workspaces().unwrap().is_empty());
+        assert!(engine.list_terminals(&first.id).unwrap().is_empty());
+        assert_eq!(
+            engine
+                .store
+                .events_after(&Scope::Server, 0)
+                .unwrap()
+                .into_iter()
+                .filter(|envelope| {
+                    matches!(
+                        &envelope.event,
+                        Event::WorkspaceRegistered { workspace_id, .. }
+                            if workspace_id == &workspace.id
+                    )
+                })
+                .count(),
+            registrations_before_replay
+        );
+        engine.delete_session(&first.id).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn session_creation_idempotency_key_rejects_a_different_request() {
         let probe = Arc::new(SessionCreationProbeExecutor::new(
             false,
@@ -21273,30 +25086,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn configured_loopback_catalog_provider_is_concrete_only() {
-        let data = tempfile::tempdir().unwrap();
-        let engine = Engine::new(
-            Store::open_in_memory().unwrap(),
-            data.path().into(),
-            &Config {
-                providers: BTreeMap::from([(
-                    "openai".into(),
-                    ProviderConfig {
-                        base_url: Some("http://[::ffff:127.0.0.1]:9/v1".into()),
-                        ..Default::default()
-                    },
-                )]),
-                local_enabled: Some(false),
-                ..Default::default()
-            },
-        );
-
-        let models = engine.list_models().await;
-        assert!(models.iter().any(|model| model.id.starts_with("openai/")));
-        assert!(models.iter().all(|model| !model.id.starts_with("auto/")));
-    }
-
-    #[tokio::test]
     async fn static_model_catalog_does_not_wait_for_live_discovery() {
         let data = tempfile::tempdir().unwrap();
         let live_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -21310,9 +25099,7 @@ mod tests {
         )
         .with_provider(
             "catalog-test",
-            Arc::new(CatalogTestProvider {
-                live_calls: live_calls.clone(),
-            }),
+            Arc::new(CatalogTestProvider::new(live_calls.clone())),
         );
 
         let static_models = engine.list_models().await;
@@ -21321,7 +25108,6 @@ mod tests {
                 .iter()
                 .any(|model| model.id == "catalog-test/static")
         );
-        assert!(static_models.iter().any(|model| model.id == "auto/static"));
         assert_eq!(live_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
 
         let live_models = engine.refresh_models().await;
@@ -21333,719 +25119,247 @@ mod tests {
         assert_eq!(live_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
-    #[test]
-    fn provider_list_projects_programmatically_injected_backends() {
-        let data = tempfile::tempdir().unwrap();
-        let engine = Engine::new(
-            Store::open_in_memory().unwrap(),
-            data.path().into(),
-            &Config {
-                local_enabled: Some(false),
-                provider_order: vec!["listed-backend".into()],
-                ..Default::default()
-            },
-        )
-        .with_backend("listed-backend", Arc::new(ListedTestBackend));
-
-        let listed = engine.list_providers();
-        let backend = listed
-            .providers
-            .iter()
-            .find(|provider| provider.id == "listed-backend")
-            .expect("injected backend should be exposed as a provider identity");
-        assert_eq!(backend.kind, "agent-backend");
-        assert_eq!(backend.auth, "cli");
-        assert_eq!(backend.category, "subscription");
-        assert!(backend.has_credentials);
-        assert_eq!(listed.provider_order.first().unwrap(), "listed-backend");
-    }
-
     #[tokio::test]
-    async fn live_route_discovery_times_out_each_adapter_and_uses_static_metadata() {
+    async fn automatic_session_naming_fails_over_between_provider_routes() {
         let data = tempfile::tempdir().unwrap();
-        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let engine = Engine::new(
-            Store::open_in_memory().unwrap(),
-            data.path().into(),
-            &Config {
-                local_enabled: Some(false),
-                ..Default::default()
-            },
-        )
-        .with_provider(
-            "stall",
-            Arc::new(StallingCatalogProvider {
-                live_calls: calls.clone(),
-            }),
-        );
-
-        let routes = tokio::time::timeout(Duration::from_secs(1), engine.list_model_routes())
-            .await
-            .expect("one stalled adapter must not hang route discovery");
-        assert!(routes.iter().any(|model| model.id == "stall/stalled"));
-        assert!(routes.iter().any(|model| model.id == "auto/stalled"));
-        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn automatic_metadata_validation_skips_unrelated_adapters() {
-        let data = tempfile::tempdir().unwrap();
-        let stalled_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let engine = Engine::new(
-            Store::open_in_memory().unwrap(),
-            data.path().into(),
-            &Config {
-                local_enabled: Some(false),
-                ..Default::default()
-            },
-        )
-        .with_provider(
-            "catalog-test",
-            Arc::new(CatalogTestProvider {
-                live_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            }),
-        )
-        .with_provider(
-            "stall",
-            Arc::new(StallingCatalogProvider {
-                live_calls: stalled_calls.clone(),
-            }),
-        );
-
-        let model = engine.resolve_model_info("auto/live").await.unwrap();
-        assert_eq!(model.id, "auto/live");
-        assert_eq!(stalled_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn cancelled_native_route_preserves_reasoning_only_transcript() {
-        let data = tempfile::tempdir().unwrap();
-        init_engine_test_repo(data.path());
         let store = Store::open_in_memory().unwrap();
-        let thread = routing_test_thread(&store, data.path(), "cancelled_reasoning", "auto/shared");
-        let stalled = Arc::new(tokio::sync::Semaphore::new(0));
-        let engine = Arc::new(
-            Engine::new(
-                store.clone(),
-                data.path().into(),
-                &Config {
-                    local_enabled: Some(false),
-                    ..Default::default()
-                },
-            )
-            .with_provider(
-                "reasoning-stall",
-                Arc::new(ReasoningThenStallProvider {
-                    stalled: stalled.clone(),
-                }),
-            ),
+        let workspace = Workspace {
+            id: "ws_routed_title".into(),
+            name: "routed title".into(),
+            path: data.path().to_string_lossy().into_owned(),
+        };
+        store.insert_workspace(&workspace).unwrap();
+        let session = Session {
+            id: "se_routed_title".into(),
+            workspace_id: workspace.id,
+            title: "New Session".into(),
+            branch: "trouve/routed-title".into(),
+            worktree_path: data.path().to_string_lossy().into_owned(),
+            base_ref: "main".into(),
+            archived: false,
+            active: false,
+            created_at: chrono::Utc::now(),
+        };
+        store.insert_session(&session).unwrap();
+        let failed_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let healthy_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let engine = Engine::new(
+            store,
+            data.path().into(),
+            &Config {
+                provider_order: vec!["failed".into(), "healthy".into()],
+                session_naming_model: Some("auto/model".into()),
+                local_enabled: Some(false),
+                ..Default::default()
+            },
+        )
+        .with_provider(
+            "failed",
+            Arc::new(RoutedTitleProvider {
+                id: "failed".into(),
+                calls: failed_calls.clone(),
+                fail: true,
+            }),
+        )
+        .with_provider(
+            "healthy",
+            Arc::new(RoutedTitleProvider {
+                id: "healthy".into(),
+                calls: healthy_calls.clone(),
+                fail: false,
+            }),
         );
 
-        engine
-            .send_message(&thread.id, "Think until cancelled".into(), Vec::new())
+        let title = engine
+            .generate_title(&session.id, "Route naming automatically", &[])
+            .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(2), stalled.acquire())
-            .await
-            .expect("provider should stall after emitting reasoning")
-            .expect("stall semaphore remains open")
-            .forget();
-        engine.cancel_turn(&thread.id).unwrap();
-
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                let cancelled = store
-                    .events_after(&Scope::Thread(thread.id.clone()), 0)
-                    .unwrap()
-                    .iter()
-                    .any(|event| matches!(event.event, Event::TurnCancelled { turn: 1 }));
-                let inactive = !engine
-                    .active_threads
-                    .lock()
-                    .unwrap()
-                    .contains_key(&thread.id);
-                if cancelled && inactive {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("cancelled routed turn should settle");
-
-        let expected_reasoning = serde_json::json!({
-            "type": "thinking",
-            "thinking": "preserve me",
-            "signature": "signed",
-        });
-        assert!(
-            store
-                .messages(&thread.id)
-                .unwrap()
-                .into_iter()
-                .any(|payload| {
-                    matches!(
-                        serde_json::from_value::<trouve_providers::Message>(payload),
-                        Ok(trouve_providers::Message::Assistant {
-                            content,
-                            tool_calls,
-                            reasoning,
-                        }) if content.is_empty()
-                            && tool_calls.is_empty()
-                            && reasoning == vec![expected_reasoning.clone()]
-                    )
-                })
-        );
-        assert!(store.route_health().unwrap().is_empty());
+        assert_eq!(title.title, "Recover Routed Naming");
+        assert_eq!(failed_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(healthy_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
-    async fn automatic_review_routes_skip_unbridged_backends_and_enforce_security() {
+    async fn identical_title_requests_share_one_provider_inference() {
         let data = tempfile::tempdir().unwrap();
-        init_engine_test_repo(data.path());
         let store = Store::open_in_memory().unwrap();
-        let thread = routing_test_thread(&store, data.path(), "secure_review_route", "auto/shared");
-        mark_routing_test_thread_as_review(&store, &thread, "secure-review-route");
+        let workspace = Workspace {
+            id: "ws_title".into(),
+            name: "title".into(),
+            path: data.path().to_string_lossy().into_owned(),
+        };
+        store.insert_workspace(&workspace).unwrap();
+        let session = Session {
+            id: "se_title".into(),
+            workspace_id: workspace.id,
+            title: "New Session".into(),
+            branch: "trouve/title".into(),
+            worktree_path: data.path().to_string_lossy().into_owned(),
+            base_ref: "main".into(),
+            archived: false,
+            active: false,
+            created_at: chrono::Utc::now(),
+        };
+        store.insert_session(&session).unwrap();
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let tools = Arc::new(Mutex::new(Vec::new()));
-        let system = Arc::new(Mutex::new(String::new()));
+        let started = Arc::new(tokio::sync::Semaphore::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
         let engine = Arc::new(
             Engine::new(
-                store.clone(),
+                store,
                 data.path().into(),
                 &Config {
                     local_enabled: Some(false),
-                    provider_order: vec!["startup-backend".into(), "review-native".into()],
+                    session_naming_model: Some("auto/model".into()),
                     ..Default::default()
                 },
             )
-            .with_backend("startup-backend", Arc::new(StartupTestBackend))
             .with_provider(
-                "review-native",
-                Arc::new(ReviewSafeTestProvider {
+                "title-test",
+                Arc::new(BlockingTitleProvider {
                     calls: calls.clone(),
-                    tools: tools.clone(),
-                    system: system.clone(),
-                }),
-            ),
-        );
-        let _budget = engine
-            .begin_automated_review_tool_budget(&thread.id, 10)
-            .unwrap();
-
-        engine
-            .send_message(&thread.id, "Review safely".into(), Vec::new())
-            .unwrap();
-
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                let completed = store
-                    .events_after(&Scope::Thread(thread.id.clone()), 0)
-                    .unwrap()
-                    .iter()
-                    .any(|event| matches!(event.event, Event::TurnCompleted { turn: 1, .. }));
-                let inactive = !engine
-                    .active_threads
-                    .lock()
-                    .unwrap()
-                    .contains_key(&thread.id);
-                if completed && inactive {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("secure automatic review route should complete");
-
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-        let events = store
-            .events_after(&Scope::Thread(thread.id.clone()), 0)
-            .unwrap();
-        assert!(events.iter().any(|event| matches!(
-            &event.event,
-            Event::ModelRouteSelected { provider_id, .. } if provider_id == "review-native"
-        )));
-        assert!(events.iter().any(|event| matches!(
-            event.event,
-            Event::TurnCompleted {
-                checkpoint_id: None,
-                ..
-            }
-        )));
-        assert!(
-            system
-                .lock()
-                .unwrap()
-                .contains("Security boundary for unattended code review")
-        );
-        let tools = tools.lock().unwrap();
-        assert!(tools.iter().any(|tool| tool == "read_file"));
-        assert!(tools.iter().all(|tool| matches!(
-            tool.as_str(),
-            "read_file" | "list_dir" | "glob" | "grep" | "search" | "find_related" | "git_diff"
-        )));
-    }
-
-    #[tokio::test]
-    async fn automatic_tool_free_review_routes_skip_backends_that_cannot_disable_tools() {
-        let data = tempfile::tempdir().unwrap();
-        init_engine_test_repo(data.path());
-        let store = Store::open_in_memory().unwrap();
-        let thread =
-            routing_test_thread(&store, data.path(), "tool_free_review_route", "auto/shared");
-        mark_routing_test_thread_as_review(&store, &thread, "tool-free-review-route");
-        let turns = Arc::new(Mutex::new(Vec::new()));
-        let engine = Arc::new(
-            Engine::new(
-                store.clone(),
-                data.path().into(),
-                &Config {
-                    local_enabled: Some(false),
-                    provider_order: vec!["startup-backend".into(), "tool-free-backend".into()],
-                    ..Default::default()
-                },
-            )
-            .with_backend("startup-backend", Arc::new(StartupTestBackend))
-            .with_backend(
-                "tool-free-backend",
-                Arc::new(ReviewRoutingBackend {
-                    turns: turns.clone(),
-                    strict_tool_free: true,
-                    confined_read_only: false,
-                }),
-            ),
-        );
-        let _budget = engine
-            .begin_automated_review_tool_budget(&thread.id, 0)
-            .unwrap();
-
-        engine
-            .send_message_without_tools(&thread.id, "Route personas".into())
-            .unwrap();
-
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                let completed = store
-                    .events_after(&Scope::Thread(thread.id.clone()), 0)
-                    .unwrap()
-                    .iter()
-                    .any(|event| matches!(event.event, Event::TurnCompleted { turn: 1, .. }));
-                let inactive = !engine
-                    .active_threads
-                    .lock()
-                    .unwrap()
-                    .contains_key(&thread.id);
-                if completed && inactive {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("secure tool-free review route should complete");
-
-        let turns = turns.lock().unwrap();
-        assert_eq!(turns.len(), 1);
-        let (tool_free, permission, instructions) = &turns[0];
-        assert!(*tool_free);
-        assert!(matches!(permission, BackendPermission::ReadOnly));
-        assert!(instructions.contains("Security boundary for unattended code review"));
-        let events = store
-            .events_after(&Scope::Thread(thread.id.clone()), 0)
-            .unwrap();
-        assert!(events.iter().any(|event| matches!(
-            &event.event,
-            Event::ModelRouteSelected { provider_id, .. } if provider_id == "tool-free-backend"
-        )));
-    }
-
-    #[tokio::test]
-    async fn automatic_review_routes_accept_confined_read_only_backends() {
-        let data = tempfile::tempdir().unwrap();
-        init_engine_test_repo(data.path());
-        let store = Store::open_in_memory().unwrap();
-        let thread =
-            routing_test_thread(&store, data.path(), "confined_review_route", "auto/shared");
-        mark_routing_test_thread_as_review(&store, &thread, "confined-review-route");
-        let turns = Arc::new(Mutex::new(Vec::new()));
-        let engine = Arc::new(
-            Engine::new(
-                store.clone(),
-                data.path().into(),
-                &Config {
-                    local_enabled: Some(false),
-                    provider_order: vec!["tool-free-backend".into()],
-                    ..Default::default()
-                },
-            )
-            .with_backend(
-                "tool-free-backend",
-                Arc::new(ReviewRoutingBackend {
-                    turns: turns.clone(),
-                    strict_tool_free: false,
-                    confined_read_only: true,
-                }),
-            ),
-        );
-        let _budget = engine
-            .begin_automated_review_tool_budget(&thread.id, 10)
-            .unwrap();
-
-        engine
-            .send_message(&thread.id, "Review under confinement".into(), Vec::new())
-            .unwrap();
-
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                let completed = store
-                    .events_after(&Scope::Thread(thread.id.clone()), 0)
-                    .unwrap()
-                    .iter()
-                    .any(|event| matches!(event.event, Event::TurnCompleted { turn: 1, .. }));
-                let inactive = !engine
-                    .active_threads
-                    .lock()
-                    .unwrap()
-                    .contains_key(&thread.id);
-                if completed && inactive {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("confined automatic review route should complete");
-
-        let turns = turns.lock().unwrap();
-        assert_eq!(turns.len(), 1);
-        let (tool_free, permission, instructions) = &turns[0];
-        assert!(!*tool_free);
-        assert!(matches!(permission, BackendPermission::ReadOnly));
-        assert!(instructions.contains("Security boundary for unattended code review"));
-        let events = store
-            .events_after(&Scope::Thread(thread.id.clone()), 0)
-            .unwrap();
-        assert!(events.iter().any(|event| matches!(
-            &event.event,
-            Event::ModelRouteSelected { provider_id, .. } if provider_id == "tool-free-backend"
-        )));
-    }
-
-    #[tokio::test]
-    async fn routed_backend_publishes_its_startup_phase() {
-        let data = tempfile::tempdir().unwrap();
-        init_engine_test_repo(data.path());
-        let store = Store::open_in_memory().unwrap();
-        let thread = routing_test_thread(&store, data.path(), "startup_phase", "auto/shared");
-        let engine = Arc::new(
-            Engine::new(
-                store.clone(),
-                data.path().into(),
-                &Config {
-                    local_enabled: Some(false),
-                    ..Default::default()
-                },
-            )
-            .with_backend("startup-backend", Arc::new(StartupTestBackend)),
-        );
-
-        engine
-            .send_message(&thread.id, "Exercise startup".into(), Vec::new())
-            .unwrap();
-
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                let events = store
-                    .events_after(&Scope::Thread(thread.id.clone()), 0)
-                    .unwrap();
-                let completed = events
-                    .iter()
-                    .any(|event| matches!(event.event, Event::TurnCompleted { turn: 1, .. }));
-                let inactive = !engine
-                    .active_threads
-                    .lock()
-                    .unwrap()
-                    .contains_key(&thread.id);
-                if completed && inactive {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("routed backend turn should complete");
-
-        let phases = store
-            .events_after(&Scope::Thread(thread.id.clone()), 0)
-            .unwrap()
-            .into_iter()
-            .filter_map(|event| match event.event {
-                Event::TurnPhaseChanged { turn: 1, phase } => Some(phase),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(phases, [TurnPhase::ConnectingTools, TurnPhase::Processing]);
-    }
-
-    #[tokio::test]
-    async fn routed_post_start_persistence_failure_bounds_and_quarantines_cleanup() {
-        let data = tempfile::tempdir().unwrap();
-        init_engine_test_repo(data.path());
-        let store = Store::open_in_memory().unwrap();
-        let thread = routing_test_thread(
-            &store,
-            data.path(),
-            "startup_persistence_failure",
-            "auto/shared",
-        );
-        let cleanup_started = Arc::new(tokio::sync::Semaphore::new(0));
-        let cleanup_release = Arc::new(tokio::sync::Semaphore::new(0));
-        let engine = Arc::new(
-            Engine::new(
-                store.clone(),
-                data.path().into(),
-                &Config {
-                    local_enabled: Some(false),
-                    ..Default::default()
-                },
-            )
-            .with_backend(
-                "startup-persistence-failure-backend",
-                Arc::new(StartupPersistenceFailureBackend {
-                    store: store.clone(),
-                    cleanup_started: cleanup_started.clone(),
-                    cleanup_release: cleanup_release.clone(),
+                    started: started.clone(),
+                    release: release.clone(),
                 }),
             ),
         );
 
-        // Reproduce the fair-lock ordering hazard: a competing mutation is
-        // already queued ahead of backend finalization on the execution lane.
-        let mutation_lane = engine.tool_execution_lock(&thread.session_id);
-        let holder = mutation_lane.clone().write_owned().await;
-        let mut competing_mutation = Box::pin(engine.tool_mutation_permit(&thread.session_id));
-        let first_poll = futures::future::poll_fn(|context| {
-            std::task::Poll::Ready(
-                match std::future::Future::poll(competing_mutation.as_mut(), context) {
-                    std::task::Poll::Ready(permit) => Some(permit),
-                    std::task::Poll::Pending => None,
-                },
-            )
-        })
-        .await;
-        assert!(
-            first_poll.is_none(),
-            "competing mutation must be queued behind the held execution lane"
-        );
-
-        engine
-            .send_message(&thread.id, "Fail after backend startup".into(), Vec::new())
-            .unwrap();
-
-        tokio::time::timeout(Duration::from_secs(1), cleanup_started.acquire())
-            .await
-            .expect("post-start persistence failure should cancel backend cleanup")
-            .expect("cleanup semaphore remains open")
-            .forget();
-        let failure = tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                let failure = store
-                    .events_after(&Scope::Thread(thread.id.clone()), 0)
-                    .unwrap()
-                    .into_iter()
-                    .find_map(|event| match event.event {
-                        Event::TurnFailed { turn: 1, error } => Some(error),
-                        _ => None,
-                    });
-                let inactive = !engine
-                    .active_threads
-                    .lock()
-                    .unwrap()
-                    .contains_key(&thread.id);
-                if let (Some(failure), true) = (failure, inactive) {
-                    break failure;
-                }
-                tokio::task::yield_now().await;
+        let first = tokio::spawn({
+            let engine = engine.clone();
+            let session_id = session.id.clone();
+            async move {
+                engine
+                    .generate_title(&session_id, "Schedule local naming", &[])
+                    .await
             }
-        })
-        .await
-        .expect("cleanup deadline should release turn scheduler resources");
-        assert!(failure.contains("cleanup did not finish"), "{failure}");
-
-        let phases = store
-            .events_after(&Scope::Thread(thread.id.clone()), 0)
-            .unwrap()
-            .into_iter()
-            .filter_map(|event| match event.event {
-                Event::TurnPhaseChanged { turn: 1, phase } => Some(phase),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(phases, [TurnPhase::ConnectingTools]);
-
-        drop(holder);
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), competing_mutation.as_mut())
-                .await
-                .is_err(),
-            "a mutation queued before finalization must not pass the cleanup admission fence"
-        );
-        cleanup_release.add_permits(1);
-        let _released = tokio::time::timeout(Duration::from_secs(1), competing_mutation)
-            .await
-            .expect("late backend cleanup should release the queued mutation");
-    }
-
-    #[test]
-    fn routed_event_processing_errors_use_a_neutral_collaborator_reason() {
-        let error = anyhow!("projection unavailable");
-        assert_eq!(
-            super::routing::unfinished_collaborator_reason(false, Some(&error), None),
-            "parent turn event processing failed: projection unavailable"
-        );
-    }
-
-    #[tokio::test]
-    async fn routed_event_processing_failure_records_accrued_usage() {
-        let data = tempfile::tempdir().unwrap();
-        init_engine_test_repo(data.path());
-        let store = Store::open_in_memory().unwrap();
-        let thread =
-            routing_test_thread(&store, data.path(), "event_processing_usage", "auto/shared");
-        let cleanup_started = Arc::new(tokio::sync::Semaphore::new(0));
-        let cleanup_release = Arc::new(tokio::sync::Semaphore::new(0));
-        let engine = Arc::new(
-            Engine::new(
-                store.clone(),
-                data.path().into(),
-                &Config {
-                    local_enabled: Some(false),
-                    ..Default::default()
-                },
-            )
-            .with_backend(
-                "event-failure-backend",
-                Arc::new(EventFailureUsageBackend {
-                    cleanup_started: cleanup_started.clone(),
-                    cleanup_release: cleanup_release.clone(),
-                }),
-            ),
-        );
-
-        engine
-            .send_message(&thread.id, "Trigger event failure".into(), Vec::new())
-            .unwrap();
-
-        tokio::time::timeout(Duration::from_secs(2), cleanup_started.acquire())
-            .await
-            .expect("backend cleanup should start after event processing fails")
-            .expect("cleanup semaphore remains open")
-            .forget();
-        let mutation_lane = engine.tool_execution_lock(&thread.session_id);
-        assert!(
-            mutation_lane.clone().try_write_owned().is_err(),
-            "approved mutation permit was released before backend cleanup acknowledged"
-        );
-        cleanup_release.add_permits(1);
-
-        let failure = tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                let failure = store
-                    .events_after(&Scope::Thread(thread.id.clone()), 0)
-                    .unwrap()
-                    .into_iter()
-                    .find_map(|event| match event.event {
-                        Event::TurnFailed { turn: 1, error } => Some(error),
-                        _ => None,
-                    });
-                let inactive = !engine
-                    .active_threads
-                    .lock()
-                    .unwrap()
-                    .contains_key(&thread.id);
-                if let (Some(failure), true) = (failure, inactive) {
-                    break failure;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap_or_else(|_| {
-            let events = store
-                .events_after(&Scope::Thread(thread.id.clone()), 0)
-                .unwrap();
-            panic!(
-                "routed backend turn should fail after event processing fails; events: {events:?}"
-            )
         });
-        assert!(failure.contains("automatic model"), "{failure}");
-
-        let summary = store
-            .usage_summary(crate::store::UsageScope::Thread(&thread.id))
-            .unwrap();
-        assert_eq!(summary.turns, 1);
-        assert_eq!(summary.input_tokens, 23);
-        assert_eq!(summary.cached_input_tokens, 4);
-        assert_eq!(summary.output_tokens, 7);
-        assert_eq!(summary.cost_usd, 0.5);
-        assert!(store.route_health().unwrap().is_empty());
-        assert!(
-            mutation_lane.try_write_owned().is_ok(),
-            "mutation permit should be released after backend cleanup"
-        );
-    }
-
-    #[tokio::test]
-    async fn panicked_automatic_route_is_marked_unhealthy() {
-        let data = tempfile::tempdir().unwrap();
-        let store = Store::open_in_memory().unwrap();
-        let thread = routing_test_thread(&store, data.path(), "route_panic", "auto/live");
-        let engine = Arc::new(
-            Engine::new(
-                store.clone(),
-                data.path().into(),
-                &Config {
-                    local_enabled: Some(false),
-                    ..Default::default()
-                },
-            )
-            .with_provider(
-                "catalog-test",
-                Arc::new(CatalogTestProvider {
-                    live_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                }),
-            ),
-        );
-
-        engine
-            .send_message(&thread.id, "Trigger provider panic".into(), Vec::new())
-            .unwrap();
-
-        tokio::time::timeout(Duration::from_secs(2), async {
+        started.acquire().await.unwrap().forget();
+        let second = tokio::spawn({
+            let engine = engine.clone();
+            let session_id = session.id.clone();
+            async move {
+                engine
+                    .generate_title(&session_id, "Schedule local naming", &[])
+                    .await
+            }
+        });
+        let coalesced_key = title_job_key(&session.id, "auto/model", "Schedule local naming", &[]);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
             loop {
-                let failed = store
-                    .events_after(&Scope::Thread(thread.id.clone()), 0)
-                    .unwrap()
-                    .iter()
-                    .any(|event| matches!(event.event, Event::TurnFailed { turn: 1, .. }));
-                let inactive = !engine
-                    .active_threads
+                let waiter_count = engine
+                    .title_jobs
                     .lock()
                     .unwrap()
-                    .contains_key(&thread.id);
-                if failed && inactive {
+                    .get(&coalesced_key)
+                    .map(|job| job.waiters.len());
+                if waiter_count == Some(1) {
                     break;
                 }
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("panicked route should settle as a failed turn");
+        .expect("the second request should coalesce as a follower");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 
-        let health = store.route_health().unwrap();
-        let route = &health[&("catalog-test".to_string(), "live".to_string())];
-        assert_eq!(route.consecutive_failures, 1);
-        assert!(route.retry_after.is_some());
+        release.add_permits(1);
+        let first = first.await.unwrap().unwrap();
+        let second = second.await.unwrap().unwrap();
+        assert_eq!(first.title, "Prioritize Local Naming");
+        assert_eq!(second.title, first.title);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        {
+            let mut jobs = engine.title_jobs.lock().unwrap();
+            for input_hash in 0..MAX_PENDING_TITLE_JOBS as u64 {
+                jobs.insert(
+                    TitleJobKey {
+                        session_id: format!("se_pending_{input_hash}"),
+                        model: "title-test/model".into(),
+                        input_hash,
+                    },
+                    TitleJobState::default(),
+                );
+            }
+        }
+        let error = engine
+            .generate_title(&session.id, "One title too many", &[])
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("too many title generation requests")
+        );
+
+        engine.title_jobs.lock().unwrap().clear();
+        let follower_key = title_job_key(&session.id, "auto/model", "Too many followers", &[]);
+        let mut follower_receivers = Vec::with_capacity(MAX_TITLE_JOB_FOLLOWERS);
+        let follower_senders = (0..MAX_TITLE_JOB_FOLLOWERS)
+            .map(|_| {
+                let (sender, receiver) = tokio::sync::oneshot::channel();
+                follower_receivers.push(receiver);
+                sender
+            })
+            .collect();
+        engine.title_jobs.lock().unwrap().insert(
+            follower_key.clone(),
+            TitleJobState {
+                waiters: follower_senders,
+            },
+        );
+        let error = engine
+            .generate_title(&session.id, "Too many followers", &[])
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("too many callers"));
+
+        drop(follower_receivers);
+        let follower = tokio::spawn({
+            let engine = engine.clone();
+            let session_id = session.id.clone();
+            async move {
+                engine
+                    .generate_title(&session_id, "Too many followers", &[])
+                    .await
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let waiter_count = engine
+                    .title_jobs
+                    .lock()
+                    .unwrap()
+                    .get(&follower_key)
+                    .map(|job| job.waiters.len());
+                if waiter_count == Some(1) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let live_waiter = engine
+            .title_jobs
+            .lock()
+            .unwrap()
+            .remove(&follower_key)
+            .unwrap()
+            .waiters;
+        assert_eq!(live_waiter.len(), 1);
+        live_waiter
+            .into_iter()
+            .next()
+            .unwrap()
+            .send(Ok(trouve_protocol::GeneratedTitle {
+                title: "Follower Capacity Recovered".into(),
+            }))
+            .unwrap();
+        assert_eq!(
+            follower.await.unwrap().unwrap().title,
+            "Follower Capacity Recovered"
+        );
     }
 
     #[tokio::test]
@@ -22076,7 +25390,7 @@ mod tests {
             parent_thread_id: None,
             title: None,
             mode: "code".into(),
-            model: "auto/missing".into(),
+            model: "test/model".into(),
             model_options: Default::default(),
             permission_mode: trouve_protocol::PermissionMode::Yolo,
             created_at: chrono::Utc::now(),
@@ -22118,36 +25432,6 @@ mod tests {
                 ..
             }) if content == "Visible immediately"
         ));
-
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                let failed = store
-                    .events_after(&Scope::Thread(thread.id.clone()), 0)
-                    .unwrap()
-                    .iter()
-                    .any(|event| matches!(event.event, Event::TurnFailed { turn: 1, .. }));
-                let inactive = !engine
-                    .active_threads
-                    .lock()
-                    .unwrap()
-                    .contains_key(&thread.id);
-                if failed && inactive {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("startup failure should settle the accepted prompt");
-        assert!(store.queued_prompts(&thread.id).unwrap().is_empty());
-        assert_eq!(engine.dispatch_queue(&thread.id).unwrap(), None);
-        let user_messages = store
-            .events_after(&Scope::Thread(thread.id.clone()), 0)
-            .unwrap()
-            .into_iter()
-            .filter(|event| matches!(event.event, Event::UserMessage { .. }))
-            .count();
-        assert_eq!(user_messages, 1);
     }
 
     #[test]
@@ -22392,10 +25676,10 @@ mod tests {
         let mut collaborators = HashMap::new();
         assert_eq!(
             engine
-                .generate_subagent_title(None, Some("Investigate the failing test"))
-                .await
-                .as_deref(),
-            Some("Subagent: Investigate failing test")
+                .generate_subagent_title("se_test", None, Some("Investigate the failing test"))
+                .await,
+            None,
+            "prompt-derived subagent names require a configured naming model"
         );
         engine
             .start_backend_collaborator(
@@ -22470,27 +25754,26 @@ mod tests {
         let child_lifecycle = store
             .events_after(&Scope::Thread(child.id.clone()), 0)
             .unwrap();
-        let capacity_cursor = child_lifecycle
+        let admission_cursor = child_lifecycle
             .iter()
             .find_map(|event| {
                 matches!(
                     event.event,
-                    Event::TurnCapacityAcquired {
+                    Event::TurnAdmitted {
                         turn: 1,
-                        wait_ms: 0,
-                        background: false,
+                        provider_wait_ms: 0,
                     }
                 )
                 .then_some(event.cursor)
             })
-            .expect("native collaborator inherits the parent turn's capacity");
+            .expect("native collaborator inherits the parent turn's admission");
         let started_cursor = child_lifecycle
             .iter()
             .find_map(|event| {
                 matches!(event.event, Event::TurnStarted { turn: 1, .. }).then_some(event.cursor)
             })
             .expect("native collaborator turn starts");
-        assert!(capacity_cursor < started_cursor);
+        assert!(admission_cursor < started_cursor);
 
         // Child activity can create the projection before Codex emits its
         // formal collaborator-start notification. Publishing is tracked
@@ -22635,12 +25918,15 @@ default_permission_mode = "ask"
             .bridged_tool_owners
             .bind_vendor_thread(&parent.id, "vendor-audit", &audit_child.id)
             .unwrap();
-        let missing_owner = engine
+        let missing_owner = match engine
             .bridged_codex_tool_call(&parent.id, None, None, "read_file", &bridge_arguments)
             .await
-            .unwrap_err();
+        {
+            Ok(_) => panic!("missing owner metadata should be rejected"),
+            Err(error) => error,
+        };
         assert!(missing_owner.to_string().contains("_meta.threadId"));
-        let unknown_owner = engine
+        let unknown_owner = match engine
             .bridged_codex_tool_call(
                 &parent.id,
                 Some("vendor-external"),
@@ -22649,7 +25935,10 @@ default_permission_mode = "ask"
                 &bridge_arguments,
             )
             .await
-            .unwrap_err();
+        {
+            Ok(_) => panic!("unknown owner metadata should be rejected"),
+            Err(error) => error,
+        };
         assert!(unknown_owner.to_string().contains("unknown, external"));
         let thread_only_output = engine
             .bridged_codex_tool_call(
@@ -22661,7 +25950,7 @@ default_permission_mode = "ask"
             )
             .await
             .unwrap();
-        assert!(thread_only_output.contains("owned by the child"));
+        assert!(thread_only_output.content.contains("owned by the child"));
         {
             let projection = collaborators.get_mut("vendor-child").unwrap();
             assert!(engine.suppress_collaborator_bridge_wrapper(
@@ -22685,7 +25974,7 @@ default_permission_mode = "ask"
             )
             .await
             .unwrap();
-        assert!(bridge_output.contains("owned by the child"));
+        assert!(bridge_output.content.contains("owned by the child"));
         {
             let projection = collaborators.get_mut("vendor-child").unwrap();
             assert!(engine.suppress_collaborator_bridge_wrapper(
@@ -22813,7 +26102,7 @@ default_permission_mode = "ask"
             )
             .await
             .unwrap();
-        assert!(review_result.contains("not permitted in this mode"));
+        assert!(review_result.content.contains("not permitted in this mode"));
         assert_eq!(
             std::fs::read_to_string(data.path().join("metadata-owner.txt")).unwrap(),
             "written by interactive child"
@@ -22936,7 +26225,7 @@ default_permission_mode = "ask"
         )));
         assert!(events.iter().any(|event| matches!(
             &event.event,
-            Event::AssistantThinking { turn: 1, text }
+            Event::AssistantThinking { turn: 1, text, .. }
                 if text == "Checking the suite."
         )));
         assert!(events.iter().any(|event| matches!(
@@ -23274,24 +26563,23 @@ default_permission_mode = "ask"
         let grandchild_events = store
             .events_after(&Scope::Thread(grandchild.id.clone()), 0)
             .unwrap();
-        let grandchild_capacity = grandchild_events
+        let grandchild_admission = grandchild_events
             .iter()
             .position(|event| {
                 matches!(
                     event.event,
-                    Event::TurnCapacityAcquired {
+                    Event::TurnAdmitted {
                         turn: 1,
-                        wait_ms: 0,
-                        background: false,
+                        provider_wait_ms: 0,
                     }
                 )
             })
-            .expect("nested collaborator inherits capacity");
+            .expect("nested collaborator inherits admission");
         let grandchild_started = grandchild_events
             .iter()
             .position(|event| matches!(event.event, Event::TurnStarted { turn: 1, .. }))
             .expect("nested collaborator starts");
-        assert!(grandchild_capacity < grandchild_started);
+        assert!(grandchild_admission < grandchild_started);
         engine
             .publish_backend_collaborator_spawn(&parent, 1, "vendor-grandchild", &mut collaborators)
             .await
@@ -23662,14 +26950,16 @@ default_permission_mode = "ask"
     }
 
     struct BlockingProviderSecretStore {
+        blocked_key: String,
         values: Mutex<HashMap<String, String>>,
         delete_started: std::sync::Barrier,
         allow_delete: std::sync::Barrier,
     }
 
     impl BlockingProviderSecretStore {
-        fn new() -> Self {
+        fn new(provider_id: &str) -> Self {
             Self {
+                blocked_key: trouve_providers::secrets::api_key_secret(provider_id),
                 values: Mutex::new(HashMap::new()),
                 delete_started: std::sync::Barrier::new(2),
                 allow_delete: std::sync::Barrier::new(2),
@@ -23691,13 +26981,351 @@ default_permission_mode = "ask"
         }
 
         fn delete(&self, key: &str) -> anyhow::Result<()> {
-            if key == trouve_providers::secrets::api_key_secret("serialized") {
+            if key == self.blocked_key {
                 self.delete_started.wait();
                 self.allow_delete.wait();
             }
             self.values.lock().unwrap().remove(key);
             Ok(())
         }
+    }
+
+    #[derive(Default)]
+    struct BlockingReadState {
+        started: bool,
+        allowed: bool,
+    }
+
+    struct BlockingReadProviderSecretStore {
+        values: Mutex<HashMap<String, String>>,
+        read_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        read_state: Mutex<BlockingReadState>,
+        read_state_changed: std::sync::Condvar,
+        reads_before_block: std::sync::atomic::AtomicUsize,
+        block_once: std::sync::atomic::AtomicBool,
+    }
+
+    impl BlockingReadProviderSecretStore {
+        fn new() -> (Self, tokio::sync::oneshot::Receiver<()>) {
+            Self::after_unblocked_reads(0)
+        }
+
+        fn after_unblocked_reads(
+            reads_before_block: usize,
+        ) -> (Self, tokio::sync::oneshot::Receiver<()>) {
+            let (read_started_tx, read_started_rx) = tokio::sync::oneshot::channel();
+            (
+                Self {
+                    values: Mutex::new(HashMap::new()),
+                    read_started: Mutex::new(Some(read_started_tx)),
+                    read_state: Mutex::new(BlockingReadState::default()),
+                    read_state_changed: std::sync::Condvar::new(),
+                    reads_before_block: std::sync::atomic::AtomicUsize::new(reads_before_block),
+                    block_once: std::sync::atomic::AtomicBool::new(true),
+                },
+                read_started_rx,
+            )
+        }
+
+        fn release_read(&self) {
+            self.read_state.lock().unwrap().allowed = true;
+            self.read_state_changed.notify_all();
+        }
+
+        fn release_read_after_progress(
+            &self,
+            progress: std::sync::mpsc::Receiver<()>,
+            timeout: Duration,
+        ) -> bool {
+            let mut state = self.read_state.lock().unwrap();
+            while !state.started && !state.allowed {
+                state = self.read_state_changed.wait(state).unwrap();
+            }
+            if state.allowed {
+                return false;
+            }
+            drop(state);
+            // A correctly offloaded read leaves the current-thread runtime
+            // free to send this signal. The timeout releases a synchronous
+            // regression without turning the test itself into a deadlock.
+            let progressed = progress.recv_timeout(timeout).is_ok();
+            self.release_read();
+            progressed
+        }
+    }
+
+    impl trouve_providers::secrets::SecretStore for BlockingReadProviderSecretStore {
+        fn get(&self, key: &str) -> anyhow::Result<Option<String>> {
+            let deferred = self
+                .reads_before_block
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |remaining| remaining.checked_sub(1),
+                )
+                .is_ok();
+            if !deferred
+                && self
+                    .block_once
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                if let Some(read_started) = self.read_started.lock().unwrap().take() {
+                    let _ = read_started.send(());
+                }
+                let mut state = self.read_state.lock().unwrap();
+                state.started = true;
+                self.read_state_changed.notify_all();
+                while !state.allowed {
+                    state = self.read_state_changed.wait(state).unwrap();
+                }
+            }
+            Ok(self.values.lock().unwrap().get(key).cloned())
+        }
+
+        fn set(&self, key: &str, value: &str) -> anyhow::Result<()> {
+            self.values
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), value.to_string());
+            Ok(())
+        }
+
+        fn delete(&self, key: &str) -> anyhow::Result<()> {
+            self.values.lock().unwrap().remove(key);
+            Ok(())
+        }
+    }
+
+    async fn observe_blocked_secret_read<T: std::fmt::Debug>(
+        secret_store: &BlockingReadProviderSecretStore,
+        read_started: &mut tokio::sync::oneshot::Receiver<()>,
+        task: &mut tokio::task::JoinHandle<T>,
+        operation: &str,
+    ) {
+        tokio::select! {
+            started = read_started => started.expect("secret-store read notification closed"),
+            result = &mut *task => {
+                secret_store.release_read();
+                panic!("{operation} finished before secret-store I/O was observed: {result:?}");
+            }
+            _ = tokio::time::sleep(Duration::from_secs(2)) => {
+                secret_store.release_read();
+                task.abort();
+                panic!("{operation} did not reach secret-store I/O");
+            }
+        }
+    }
+
+    struct RegistryObservingFailingSecretStore {
+        engine: Mutex<Weak<Engine>>,
+        saw_published_backend: std::sync::atomic::AtomicBool,
+    }
+
+    impl RegistryObservingFailingSecretStore {
+        fn new() -> Self {
+            Self {
+                engine: Mutex::new(Weak::new()),
+                saw_published_backend: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+    }
+
+    impl trouve_providers::secrets::SecretStore for RegistryObservingFailingSecretStore {
+        fn get(&self, _key: &str) -> anyhow::Result<Option<String>> {
+            Ok(None)
+        }
+
+        fn set(&self, _key: &str, _value: &str) -> anyhow::Result<()> {
+            if self
+                .engine
+                .lock()
+                .unwrap()
+                .upgrade()
+                .is_some_and(|engine| engine.backends.read().unwrap().contains_key("cursor"))
+            {
+                self.saw_published_backend
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            Err(anyhow!("injected secret-store failure"))
+        }
+
+        fn delete(&self, _key: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct PartiallyFailingProviderSecretStore {
+        values: Mutex<HashMap<String, String>>,
+        fail_key: String,
+    }
+
+    impl trouve_providers::secrets::SecretStore for PartiallyFailingProviderSecretStore {
+        fn get(&self, key: &str) -> anyhow::Result<Option<String>> {
+            Ok(self.values.lock().unwrap().get(key).cloned())
+        }
+
+        fn set(&self, key: &str, value: &str) -> anyhow::Result<()> {
+            self.values
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), value.to_string());
+            if key == self.fail_key {
+                return Err(anyhow!("injected partial secret-store failure"));
+            }
+            Ok(())
+        }
+
+        fn delete(&self, key: &str) -> anyhow::Result<()> {
+            self.values.lock().unwrap().remove(key);
+            Ok(())
+        }
+    }
+
+    struct TransientRollbackFailingProviderSecretStore {
+        rollback_key: String,
+        values: Mutex<HashMap<String, String>>,
+        reads: Mutex<Vec<(String, Option<String>)>>,
+        rollback_attempts: std::sync::atomic::AtomicUsize,
+    }
+
+    struct BlockingRollbackProviderSecretStore {
+        rollback_key: String,
+        values: Mutex<HashMap<String, String>>,
+        rollback_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        allow_rollback: std::sync::Barrier,
+    }
+
+    impl trouve_providers::secrets::SecretStore for BlockingRollbackProviderSecretStore {
+        fn get(&self, key: &str) -> anyhow::Result<Option<String>> {
+            Ok(self.values.lock().unwrap().get(key).cloned())
+        }
+
+        fn set(&self, key: &str, value: &str) -> anyhow::Result<()> {
+            if key == self.rollback_key && value == "old-key" {
+                if let Some(started) = self.rollback_started.lock().unwrap().take() {
+                    let _ = started.send(());
+                }
+                self.allow_rollback.wait();
+            }
+            self.values
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), value.to_string());
+            Ok(())
+        }
+
+        fn delete(&self, key: &str) -> anyhow::Result<()> {
+            self.values.lock().unwrap().remove(key);
+            Ok(())
+        }
+    }
+
+    impl trouve_providers::secrets::SecretStore for TransientRollbackFailingProviderSecretStore {
+        fn get(&self, key: &str) -> anyhow::Result<Option<String>> {
+            let value = self.values.lock().unwrap().get(key).cloned();
+            self.reads
+                .lock()
+                .unwrap()
+                .push((key.to_string(), value.clone()));
+            Ok(value)
+        }
+
+        fn set(&self, key: &str, value: &str) -> anyhow::Result<()> {
+            if key == self.rollback_key && value == "old-key" {
+                let attempt = self
+                    .rollback_attempts
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if attempt == 0 {
+                    return Err(anyhow!("injected transient rollback failure"));
+                }
+            }
+            self.values
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), value.to_string());
+            Ok(())
+        }
+
+        fn delete(&self, key: &str) -> anyhow::Result<()> {
+            self.values.lock().unwrap().remove(key);
+            Ok(())
+        }
+    }
+
+    struct RecoverableInitialWriteFailureSecretStore {
+        rollback_key: String,
+        forward_failure_key: String,
+        values: Mutex<HashMap<String, String>>,
+        reads: Mutex<Vec<(String, Option<String>)>>,
+        allow_rollback: std::sync::atomic::AtomicBool,
+        rollback_attempts: std::sync::atomic::AtomicUsize,
+    }
+
+    impl trouve_providers::secrets::SecretStore for RecoverableInitialWriteFailureSecretStore {
+        fn get(&self, key: &str) -> anyhow::Result<Option<String>> {
+            let value = self.values.lock().unwrap().get(key).cloned();
+            self.reads
+                .lock()
+                .unwrap()
+                .push((key.to_string(), value.clone()));
+            Ok(value)
+        }
+
+        fn set(&self, key: &str, value: &str) -> anyhow::Result<()> {
+            if key == self.rollback_key && value == "old-key" {
+                self.rollback_attempts
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if !self
+                    .allow_rollback
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    return Err(anyhow!("injected recoverable rollback failure"));
+                }
+            }
+            self.values
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), value.to_string());
+            if key == self.forward_failure_key && value == "new-team" {
+                return Err(anyhow!("injected later secret-write failure"));
+            }
+            Ok(())
+        }
+
+        fn delete(&self, key: &str) -> anyhow::Result<()> {
+            self.values.lock().unwrap().remove(key);
+            Ok(())
+        }
+    }
+
+    async fn wait_for_provider_secret_reconciliation(
+        engine: &Arc<Engine>,
+        store: &TransientRollbackFailingProviderSecretStore,
+        api_key: &str,
+    ) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let restored = store
+                    .values
+                    .lock()
+                    .unwrap()
+                    .get(api_key)
+                    .is_some_and(|value| value == "old-key");
+                let republished = engine.backends.read().unwrap().contains_key("cursor");
+                if restored
+                    && republished
+                    && store
+                        .rollback_attempts
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                        >= 2
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("provider secret rollback was not reconciled");
     }
 
     #[tokio::test]
@@ -23780,6 +27408,7 @@ default_permission_mode = "ask"
         store.insert_session(&session).unwrap();
         let exact = projection_pr(10, &session.workspace_id, &session.branch);
         let linked = projection_pr(11, &session.workspace_id, "external-branch");
+        let mentioned = projection_pr(12, &session.workspace_id, "mentioned-branch");
         store
             .append_event(
                 Scope::Server,
@@ -23787,8 +27416,18 @@ default_permission_mode = "ask"
                     pull_requests: trouve_protocol::GithubPrList {
                         viewer: "octocat".into(),
                         host: "github.com".into(),
-                        prs: vec![exact, linked.clone()],
+                        prs: vec![exact, linked.clone(), mentioned.clone()],
                     },
+                },
+            )
+            .unwrap();
+        store
+            .append_event(
+                Scope::Server,
+                Event::SessionPrMentioned {
+                    session_id: session.id.clone(),
+                    number: mentioned.number,
+                    url: mentioned.url,
                 },
             )
             .unwrap();
@@ -23806,14 +27445,14 @@ default_permission_mode = "ask"
         let local = engine.projected_session_prs(&session.id).unwrap();
         assert_eq!(
             local.iter().map(|pr| pr.number).collect::<Vec<_>>(),
-            vec![11, 10]
+            vec![10, 11]
         );
 
         let (cursor, projection) = engine.server_projection_snapshot().unwrap();
 
         assert!(cursor > 0);
         assert_eq!(projection.github_pull_requests.len(), 1);
-        assert_eq!(projection.github_pull_requests[0].cursor, cursor);
+        assert!(projection.github_pull_requests[0].cursor < cursor);
         assert_eq!(projection.session_pull_requests.len(), 1);
         assert_eq!(projection.session_pull_requests[0].session_id, session.id);
         assert_eq!(
@@ -23822,7 +27461,7 @@ default_permission_mode = "ask"
                 .iter()
                 .map(|pr| pr.number)
                 .collect::<Vec<_>>(),
-            vec![11, 10]
+            vec![10, 11]
         );
     }
 
@@ -23912,779 +27551,6 @@ default_permission_mode = "ask"
         let cleared = store.latest_github_pr_snapshot(HOST).unwrap().unwrap();
         assert!(cleared.viewer.is_empty());
         assert!(cleared.prs.is_empty());
-    }
-
-    #[test]
-    fn neutral_ids_merge_only_stable_catalog_names() {
-        assert_eq!(
-            neutral_model_id("gpt-5.6-sol").as_deref(),
-            Some("gpt-5.6-sol")
-        );
-        assert_eq!(
-            neutral_model_id("qwen2.5-coder:7b").as_deref(),
-            Some("qwen2.5-coder:7b")
-        );
-        assert_eq!(neutral_model_id("default"), None);
-        assert_eq!(neutral_model_id("AUTO"), None);
-        assert_eq!(
-            neutral_model_id("anthropic/claude-sonnet-4.5").as_deref(),
-            Some("anthropic/claude-sonnet-4.5")
-        );
-        assert_eq!(neutral_model_id("/gpt-5.6-sol"), None);
-        assert_eq!(neutral_model_id("openai//gpt-5.6-sol"), None);
-        assert_eq!(neutral_model_id("openai/gpt-5.6-sol/"), None);
-    }
-
-    fn test_model_candidate(
-        provider_id: &str,
-        provider_model: &str,
-        shared_model: bool,
-    ) -> ModelCandidate {
-        let qualified_id = format!("{provider_id}/{provider_model}");
-        ModelCandidate {
-            provider_id: provider_id.into(),
-            provider_model: provider_model.into(),
-            provider_generation: 0,
-            info: fallback_model_info(&qualified_id, provider_model),
-            executor: ModelExecutor::Native(Arc::new(CatalogTestProvider {
-                live_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            })),
-            shared_model_id: shared_model.then(|| provider_model.to_string()),
-        }
-    }
-
-    #[test]
-    fn routed_accounting_preserves_authoritative_latest_context_size() {
-        let route = test_model_candidate("hosted", "shared", true);
-        let usage = Usage {
-            input_tokens: 10,
-            cached_input_tokens: 20,
-            context_input_tokens: Some(77),
-            ..Usage::default()
-        };
-        let mut native = TurnAccounting::default();
-        native.add_native(
-            &trouve_providers::models_dev::ModelsDevCatalog::embedded(),
-            &route,
-            &usage,
-        );
-        assert_eq!(native.context_input_tokens, 77);
-        assert_eq!(native.usage.context_input_tokens, Some(77));
-
-        let mut backend = TurnAccounting::default();
-        backend.add_backend(&usage);
-        assert_eq!(backend.context_input_tokens, 77);
-        assert_eq!(backend.usage.context_input_tokens, Some(77));
-    }
-
-    #[test]
-    fn compatibility_catalog_includes_automatic_and_pinned_routes() {
-        let models = compatibility_model_catalog(vec![
-            test_model_candidate("openai", "shared", true),
-            test_model_candidate("codex", "shared", true),
-        ]);
-        let ids = models
-            .iter()
-            .map(|model| model.id.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(ids, ["auto/shared", "codex/shared", "openai/shared"]);
-    }
-
-    #[test]
-    fn native_failure_is_not_retryable_after_a_side_effect() {
-        let retryable = native_attempt_failure(
-            trouve_providers::ProviderError::Request("connection reset".into()),
-            false,
-        );
-        assert!(retryable.safe_to_retry);
-
-        let unsafe_to_retry = native_attempt_failure(
-            trouve_providers::ProviderError::Api("HTTP 429 Too Many Requests".into()),
-            true,
-        );
-        assert_eq!(unsafe_to_retry.kind, RouteFailureKind::Capacity);
-        assert!(!unsafe_to_retry.safe_to_retry);
-    }
-
-    #[test]
-    fn backend_policy_keeps_mutations_behind_callbacks_and_tool_free_guards() {
-        assert!(matches!(
-            backend_permission_policy(true, false),
-            BackendPermission::Ask
-        ));
-        assert!(matches!(
-            backend_permission_policy(false, false),
-            BackendPermission::ReadOnly
-        ));
-        assert!(backend_strict_tool_free_policy(false, true));
-        assert!(!backend_strict_tool_free_policy(false, false));
-        assert!(!backend_strict_tool_free_policy(true, true));
-    }
-
-    #[test]
-    fn terminal_routed_failure_records_accrued_usage() {
-        let data = tempfile::tempdir().unwrap();
-        let store = Store::open_in_memory().unwrap();
-        let workspace = Workspace {
-            id: "workspace".into(),
-            name: "workspace".into(),
-            path: data.path().to_string_lossy().into_owned(),
-        };
-        store.insert_workspace(&workspace).unwrap();
-        let session = Session {
-            id: "session".into(),
-            workspace_id: workspace.id,
-            title: "routing".into(),
-            branch: "main".into(),
-            worktree_path: data.path().to_string_lossy().into_owned(),
-            base_ref: "main".into(),
-            archived: false,
-            active: false,
-            created_at: chrono::Utc::now(),
-        };
-        store.insert_session(&session).unwrap();
-        let thread = Thread {
-            id: "thread".into(),
-            session_id: session.id.clone(),
-            parent_thread_id: None,
-            title: None,
-            mode: "code".into(),
-            model: "auto/shared".into(),
-            model_options: Default::default(),
-            permission_mode: trouve_protocol::PermissionMode::Ask,
-            created_at: chrono::Utc::now(),
-            spawned: false,
-            todos: Vec::new(),
-        };
-        store.insert_thread(&thread, &Default::default()).unwrap();
-        let engine = Engine::new(store, data.path().to_path_buf(), &Config::default());
-        let mut accounting = TurnAccounting {
-            usage: Usage {
-                input_tokens: 17,
-                cached_input_tokens: 3,
-                output_tokens: 5,
-                cost_usd: Some(0.25),
-                ..Usage::default()
-            },
-            context_input_tokens: 20,
-            cost_known: true,
-        };
-
-        engine
-            .record_routed_usage(&session.id, &thread.id, 4, &mut accounting, false)
-            .unwrap();
-
-        let summary = engine
-            .store
-            .usage_summary(crate::store::UsageScope::Thread("thread"))
-            .unwrap();
-        assert_eq!(summary.turns, 1);
-        assert_eq!(summary.input_tokens, 17);
-        assert_eq!(summary.cached_input_tokens, 3);
-        assert_eq!(summary.output_tokens, 5);
-        assert_eq!(summary.cost_usd, 0.25);
-    }
-
-    #[test]
-    fn backend_capacity_failure_after_a_side_effect_never_fails_over() {
-        let failure = backend_attempt_failure(
-            BackendError::Protocol("HTTP 429 Too Many Requests".into()),
-            true,
-        );
-        assert_eq!(failure.kind, RouteFailureKind::Capacity);
-        assert!(!failure.safe_to_retry);
-    }
-
-    #[test]
-    fn automatic_selection_requires_a_real_shared_model_name() {
-        for invalid in ["auto", "automatic", "auto/", "auto/default", "auto/latest"] {
-            assert!(validate_model_selection(invalid).is_err(), "{invalid}");
-        }
-        assert!(validate_model_selection("auto/gpt-5.6-sol").is_ok());
-        assert!(validate_model_selection("auto/anthropic/claude-sonnet-4.5").is_ok());
-        assert!(validate_model_selection("auto/anthropic//claude-sonnet-4.5").is_err());
-        assert!(validate_model_selection("codex/gpt-5.6-sol").is_ok());
-    }
-
-    #[test]
-    fn provider_order_is_not_published_when_config_persistence_fails() {
-        let data = tempfile::tempdir().unwrap();
-        let config = Config {
-            providers: BTreeMap::from([
-                ("first".into(), ProviderConfig::default()),
-                ("second".into(), ProviderConfig::default()),
-            ]),
-            provider_order: vec!["first".into(), "second".into()],
-            local_enabled: Some(false),
-            ..Default::default()
-        };
-        let engine = Engine::new(
-            Store::open_in_memory().unwrap(),
-            data.path().into(),
-            &config,
-        )
-        // Saving TOML to a directory is guaranteed to fail.
-        .with_config_file(Some(data.path().to_path_buf()));
-
-        assert!(
-            engine
-                .set_provider_order(&["second".into(), "first".into()], None)
-                .is_err()
-        );
-        assert_eq!(
-            engine.config.lock().unwrap().provider_order,
-            vec!["first", "second"]
-        );
-    }
-
-    #[test]
-    fn provider_order_rejects_a_stale_snapshot() {
-        let data = tempfile::tempdir().unwrap();
-        let config = Config {
-            providers: BTreeMap::from([
-                ("first".into(), ProviderConfig::default()),
-                ("second".into(), ProviderConfig::default()),
-            ]),
-            provider_order: vec!["first".into(), "second".into()],
-            local_enabled: Some(false),
-            ..Default::default()
-        };
-        let engine = Engine::new(
-            Store::open_in_memory().unwrap(),
-            data.path().into(),
-            &config,
-        );
-        let observed = engine.list_providers().provider_order;
-
-        engine
-            .set_provider_order(&["second".into(), "first".into()], Some(&observed))
-            .unwrap();
-        let error = engine
-            .set_provider_order(&["first".into(), "second".into()], Some(&observed))
-            .unwrap_err();
-
-        assert!(matches!(error, EngineError::Conflict(_)));
-        assert_eq!(
-            engine.config.lock().unwrap().provider_order,
-            vec!["second", "first"]
-        );
-    }
-
-    #[test]
-    fn stale_provider_outcome_cannot_restore_cleared_route_health() {
-        let data = tempfile::tempdir().unwrap();
-        let store = Store::open_in_memory().unwrap();
-        let engine = Engine::new(store.clone(), data.path().into(), &Config::default());
-        let stale_generation = engine.provider_generation("provider");
-        store
-            .record_route_failure("provider", "shared", 1, 10, 30)
-            .unwrap();
-
-        {
-            let mut generations = engine.provider_generations.lock().unwrap();
-            engine
-                .reset_provider_route_state_locked("provider", &mut generations)
-                .unwrap();
-        }
-        assert!(store.route_health().unwrap().is_empty());
-
-        let applied = engine
-            .with_current_provider_generation("provider", stale_generation, || {
-                store.record_route_failure("provider", "shared", 2, 10, 30)?;
-                Ok(())
-            })
-            .unwrap();
-
-        assert!(applied.is_none());
-        assert!(store.route_health().unwrap().is_empty());
-    }
-
-    #[test]
-    fn concrete_executor_snapshot_keeps_instance_and_generation_together() {
-        let data = tempfile::tempdir().unwrap();
-        let old_provider: Arc<dyn Provider> = Arc::new(CatalogTestProvider {
-            live_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        });
-        let replacement: Arc<dyn Provider> = Arc::new(CatalogTestProvider {
-            live_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        });
-        let engine = Engine::new(
-            Store::open_in_memory().unwrap(),
-            data.path().into(),
-            &Config::default(),
-        )
-        .with_provider("provider", old_provider.clone());
-
-        let (provider_id, stale_generation, executor, model) =
-            engine.resolve_concrete_executor("provider/model").unwrap();
-        let ModelExecutor::Native(resolved_provider) = executor else {
-            panic!("expected a native provider")
-        };
-        assert!(Arc::ptr_eq(&resolved_provider, &old_provider));
-        assert_eq!(provider_id, "provider");
-        assert_eq!(model, "model");
-
-        // Model the same fenced registry replacement performed by provider
-        // CRUD while the already-resolved old turn remains in flight.
-        {
-            let mut generations = engine.provider_generations.lock().unwrap();
-            engine
-                .providers
-                .write()
-                .unwrap()
-                .insert("provider".into(), replacement);
-            *generations.entry("provider".into()).or_default() += 1;
-        }
-
-        let attributed_to_replacement = std::sync::atomic::AtomicBool::new(false);
-        let applied = engine
-            .with_current_provider_generation("provider", stale_generation, || {
-                attributed_to_replacement.store(true, Ordering::SeqCst);
-                Ok(())
-            })
-            .unwrap();
-        assert!(applied.is_none());
-        assert!(!attributed_to_replacement.load(Ordering::SeqCst));
-    }
-
-    #[test]
-    fn failed_provider_upsert_preserves_config_and_route_health() {
-        let data = tempfile::tempdir().unwrap();
-        let store = Store::open_in_memory().unwrap();
-        store
-            .record_route_failure(
-                "provider",
-                "shared",
-                chrono::Utc::now().timestamp_micros(),
-                10,
-                30,
-            )
-            .unwrap();
-        let config = Config {
-            providers: BTreeMap::from([("provider".into(), ProviderConfig::default())]),
-            local_enabled: Some(false),
-            ..Default::default()
-        };
-        let secrets: Arc<dyn trouve_providers::secrets::SecretStore> = Arc::new(
-            trouve_providers::secrets::FileStore::new(data.path().join("secrets.json")),
-        );
-        let api_key = trouve_providers::secrets::api_key_secret("provider");
-        let named_secret = trouve_providers::secrets::provider_secret("provider", "tenant");
-        secrets.set(&api_key, "old-key").unwrap();
-        let mut engine = Engine::new(store, data.path().into(), &config)
-            // Saving TOML to a directory is guaranteed to fail.
-            .with_config_file(Some(data.path().to_path_buf()));
-        engine.secrets = secrets.clone();
-
-        assert!(
-            engine
-                .upsert_provider(
-                    "provider",
-                    &UpsertProviderRequest {
-                        kind: "openai-compat".into(),
-                        api_key: Some("new-key".into()),
-                        secret_values: BTreeMap::from([("tenant".into(), "new-tenant".into())]),
-                        ..Default::default()
-                    },
-                )
-                .is_err()
-        );
-        assert_eq!(
-            engine.config.lock().unwrap().providers["provider"].kind,
-            ProviderConfig::default().kind
-        );
-        assert!(
-            engine
-                .store
-                .route_health()
-                .unwrap()
-                .contains_key(&("provider".into(), "shared".into()))
-        );
-        assert_eq!(secrets.get(&api_key).unwrap().as_deref(), Some("old-key"));
-        assert_eq!(secrets.get(&named_secret).unwrap(), None);
-    }
-
-    #[tokio::test]
-    async fn provider_wait_does_not_reserve_global_capacity() {
-        let scheduler = Arc::new(TurnScheduler {
-            all: Arc::new(tokio::sync::Semaphore::new(2)),
-            background: Arc::new(tokio::sync::Semaphore::new(1)),
-            provider_all_limit: 1,
-            provider_background_limit: 1,
-            providers: Mutex::new(HashMap::new()),
-            attempt_order: AtomicI64::new(0),
-        });
-        let cancel = tokio_util::sync::CancellationToken::new();
-        let first = scheduler
-            .acquire("busy/shared", false, &cancel)
-            .await
-            .unwrap();
-        assert_eq!(scheduler.all.available_permits(), 1);
-
-        let waiting_scheduler = Arc::clone(&scheduler);
-        let waiting_cancel = cancel.clone();
-        let waiter = tokio::spawn(async move {
-            waiting_scheduler
-                .acquire("busy/shared", false, &waiting_cancel)
-                .await
-        });
-        for _ in 0..20 {
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(
-            scheduler.all.available_permits(),
-            1,
-            "a provider waiter consumed the remaining global permit"
-        );
-
-        let other = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            scheduler.acquire("idle/shared", false, &cancel),
-        )
-        .await
-        .expect("an idle provider should still receive global capacity")
-        .unwrap();
-        drop(other);
-
-        drop(first);
-        tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn routed_capacity_skips_a_provider_that_enters_backoff() {
-        let scheduler = TurnScheduler {
-            all: Arc::new(tokio::sync::Semaphore::new(1)),
-            background: Arc::new(tokio::sync::Semaphore::new(1)),
-            provider_all_limit: 1,
-            provider_background_limit: 1,
-            providers: Mutex::new(HashMap::new()),
-            attempt_order: AtomicI64::new(0),
-        };
-        let cancel = tokio_util::sync::CancellationToken::new();
-        scheduler.record_outcome(
-            "busy",
-            Some("429 rate limit"),
-            chrono::Utc::now().timestamp_micros(),
-        );
-
-        let capacity = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            scheduler.acquire_routed("busy/shared", false, &cancel),
-        )
-        .await
-        .expect("automatic routing must not sleep through provider backoff")
-        .unwrap();
-
-        assert!(capacity.is_none());
-    }
-
-    #[tokio::test]
-    async fn routed_capacity_rechecks_backoff_after_waiting_for_a_permit() {
-        let scheduler = Arc::new(TurnScheduler {
-            all: Arc::new(tokio::sync::Semaphore::new(1)),
-            background: Arc::new(tokio::sync::Semaphore::new(1)),
-            provider_all_limit: 1,
-            provider_background_limit: 1,
-            providers: Mutex::new(HashMap::new()),
-            attempt_order: AtomicI64::new(0),
-        });
-        let cancel = tokio_util::sync::CancellationToken::new();
-        let occupied = scheduler
-            .acquire_routed("busy/shared", false, &cancel)
-            .await
-            .unwrap()
-            .unwrap();
-
-        let mut waiter = Box::pin(scheduler.acquire_routed("busy/shared", false, &cancel));
-        assert!(matches!(
-            futures::poll!(&mut waiter),
-            std::task::Poll::Pending
-        ));
-        scheduler.record_outcome(
-            "busy",
-            Some("429 rate limit"),
-            scheduler.next_attempt_order(),
-        );
-        drop(occupied);
-
-        let capacity = tokio::time::timeout(std::time::Duration::from_secs(1), &mut waiter)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(capacity.is_none());
-        assert_eq!(scheduler.all.available_permits(), 1);
-    }
-
-    #[test]
-    fn scheduler_ignores_an_older_failure_after_a_newer_success() {
-        let scheduler = TurnScheduler {
-            all: Arc::new(tokio::sync::Semaphore::new(1)),
-            background: Arc::new(tokio::sync::Semaphore::new(1)),
-            provider_all_limit: 1,
-            provider_background_limit: 1,
-            providers: Mutex::new(HashMap::new()),
-            attempt_order: AtomicI64::new(0),
-        };
-        let older_attempt = chrono::Utc::now().timestamp_micros();
-        scheduler.record_outcome("busy", None, older_attempt.saturating_add(1));
-        scheduler.record_outcome("busy", Some("429 rate limit"), older_attempt);
-
-        assert_eq!(scheduler.cooldown_remaining("busy/shared"), None);
-    }
-
-    #[test]
-    fn scheduler_assigns_unique_orders_to_concurrent_attempts() {
-        let scheduler = Arc::new(TurnScheduler::new());
-        let handles = (0..16)
-            .map(|_| {
-                let scheduler = Arc::clone(&scheduler);
-                std::thread::spawn(move || scheduler.next_attempt_order())
-            })
-            .collect::<Vec<_>>();
-        let mut orders = handles
-            .into_iter()
-            .map(|handle| handle.join().unwrap())
-            .collect::<Vec<_>>();
-        orders.sort_unstable();
-
-        assert!(orders.windows(2).all(|orders| orders[0] < orders[1]));
-    }
-
-    #[test]
-    fn one_concrete_route_retains_its_provider_option_schema() {
-        let mut candidate = test_model_candidate("provider", "shared", true);
-        candidate.info.options_schema = serde_json::json!({
-            "type": "object",
-            "properties": {
-                "reasoning_effort": {"type": "string", "enum": ["low", "high"]},
-                "provider_only": {"type": "boolean"}
-            }
-        });
-        let routed = routed_model_info("provider/shared".into(), vec![candidate.clone()]);
-        assert_eq!(routed.options_schema, candidate.info.options_schema);
-    }
-
-    #[test]
-    fn picker_automatic_ids_require_explicit_shared_catalog_identity() {
-        let local = test_model_candidate("local", "qwen2.5-coder:7b", false);
-        assert_eq!(local.automatic_selection_id(), None);
-        assert_eq!(local.concrete_selection_id(), "local/qwen2.5-coder:7b");
-
-        let hosted = test_model_candidate("openrouter", "qwen2.5-coder:7b", true);
-        assert_eq!(
-            hosted.automatic_selection_id().as_deref(),
-            Some("auto/qwen2.5-coder:7b")
-        );
-        assert_eq!(
-            hosted.concrete_selection_id(),
-            "openrouter/qwen2.5-coder:7b"
-        );
-
-        let namespaced = test_model_candidate("kilocode", "anthropic/claude-sonnet-4.5", true);
-        assert_eq!(
-            namespaced.automatic_selection_id().as_deref(),
-            Some("auto/anthropic/claude-sonnet-4.5")
-        );
-        assert_eq!(
-            namespaced.concrete_selection_id(),
-            "kilocode/anthropic/claude-sonnet-4.5"
-        );
-
-        let transport_owned = test_model_candidate("cursor", "default", false);
-        assert_eq!(transport_owned.automatic_selection_id(), None);
-        assert_eq!(transport_owned.concrete_selection_id(), "cursor/default");
-
-        let uncatalogued = test_model_candidate("custom", "gpt-5.6-sol", false);
-        assert_eq!(uncatalogued.automatic_selection_id(), None);
-    }
-
-    #[test]
-    fn models_dev_normalizes_hosted_routes_to_one_picker_id() {
-        let catalog = trouve_providers::models_dev::ModelsDevCatalog::embedded();
-        let api = catalog
-            .model(
-                "openai",
-                "openai",
-                "gpt-5.6-sol",
-                trouve_providers::models_dev::OptionsDialect::OpenAi,
-            )
-            .unwrap();
-        let codex = catalog
-            .model(
-                "openai",
-                "codex",
-                "gpt-5.6-sol",
-                trouve_providers::models_dev::OptionsDialect::CodexCli,
-            )
-            .unwrap();
-
-        let api_candidate =
-            test_model_candidate("openai", model_name_for_provider("openai", &api.id), true);
-        let codex_candidate =
-            test_model_candidate("codex", model_name_for_provider("codex", &codex.id), true);
-        assert_eq!(
-            api_candidate.automatic_selection_id().as_deref(),
-            Some("auto/gpt-5.6-sol")
-        );
-        assert_eq!(
-            codex_candidate.automatic_selection_id().as_deref(),
-            Some("auto/gpt-5.6-sol")
-        );
-        assert_eq!(api_candidate.concrete_selection_id(), "openai/gpt-5.6-sol");
-        assert_eq!(codex_candidate.concrete_selection_id(), "codex/gpt-5.6-sol");
-        assert_eq!(api.display_name, codex.display_name);
-        assert_eq!(api.context_window, codex.context_window);
-    }
-
-    #[test]
-    fn subscription_routes_rank_known_headroom_before_unknown_capacity() {
-        let health = |status: &str, windows: &[i64]| trouve_protocol::SubscriptionHealth {
-            provider_id: "test".into(),
-            status: status.into(),
-            plan: String::new(),
-            windows: windows
-                .iter()
-                .map(|used_percent| trouve_protocol::SubscriptionWindow {
-                    label: "window".into(),
-                    used_percent: *used_percent,
-                    resets: String::new(),
-                })
-                .collect(),
-            credits: String::new(),
-            note: String::new(),
-        };
-
-        assert_eq!(subscription_health_rank(&health("ok", &[10, 40])), (0, 40));
-        assert_eq!(subscription_health_rank(&health("ok", &[])), (1, 0));
-        assert_eq!(
-            subscription_health_rank(&health("unavailable", &[])),
-            (2, 0)
-        );
-        assert_eq!(subscription_health_rank(&health("ok", &[100])), (3, 100));
-    }
-
-    #[test]
-    fn routed_schema_keeps_only_options_shared_by_every_provider() {
-        let model = |id: &str, thinking_key: &str, default: &str, provider_only: bool| {
-            let mut properties = serde_json::Map::from_iter([
-                (
-                    thinking_key.to_string(),
-                    serde_json::json!({
-                        "type": "string",
-                        "enum": ["low", "medium", "high"],
-                        "default": default
-                    }),
-                ),
-                (
-                    "fast".into(),
-                    serde_json::json!({"type": "boolean", "default": false}),
-                ),
-            ]);
-            if provider_only {
-                properties.insert(
-                    "provider_only".into(),
-                    serde_json::json!({"type": "boolean"}),
-                );
-            }
-            trouve_protocol::ModelInfo {
-                id: id.into(),
-                display_name: id.into(),
-                context_window: 100_000,
-                supports_tools: true,
-                input_price_per_mtok: None,
-                output_price_per_mtok: None,
-                options_schema: serde_json::json!({
-                    "type": "object",
-                    "properties": properties
-                }),
-            }
-        };
-        let codex = model("codex/shared", "reasoning_effort", "high", true);
-        let cursor = model("cursor/shared", "thinking_level", "low", false);
-        let schema = routed_options_schema(&[&codex, &cursor]);
-
-        assert!(schema.pointer("/properties/fast").is_some());
-        assert!(schema.pointer("/properties/thinking_level").is_some());
-        assert_eq!(schema["properties"]["thinking_level"]["default"], "medium");
-        assert!(schema.pointer("/properties/reasoning_effort").is_none());
-        assert!(schema.pointer("/properties/provider_only").is_none());
-    }
-
-    #[test]
-    fn routed_options_are_filtered_through_shared_and_route_schemas() {
-        let shared = trouve_protocol::ModelInfo {
-            id: "auto/shared".into(),
-            display_name: "Shared".into(),
-            context_window: 100_000,
-            supports_tools: true,
-            input_price_per_mtok: None,
-            output_price_per_mtok: None,
-            options_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "thinking_level": {
-                        "type": "string",
-                        "enum": ["low", "medium", "high"],
-                        "default": "medium"
-                    },
-                    "fast": {"type": "boolean"}
-                }
-            }),
-        };
-        let route = trouve_protocol::ModelInfo {
-            id: "provider/shared".into(),
-            display_name: "Shared".into(),
-            context_window: 100_000,
-            supports_tools: true,
-            input_price_per_mtok: None,
-            output_price_per_mtok: None,
-            options_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "reasoning_effort": {
-                        "type": "string",
-                        "enum": ["low", "medium", "high"],
-                        "default": "medium"
-                    },
-                    "fast": {"type": "boolean"},
-                    "provider_only": {"type": "string"}
-                }
-            }),
-        };
-        let stored = serde_json::Map::from_iter([
-            ("reasoning_effort".into(), serde_json::json!("high")),
-            ("fast".into(), serde_json::json!(true)),
-            ("provider_only".into(), serde_json::json!("stale")),
-            ("removed".into(), serde_json::json!(true)),
-        ]);
-
-        let shared_options = model_options_for_schema(&stored, &shared);
-        assert_eq!(shared_options["thinking_level"], "high");
-        assert_eq!(shared_options["fast"], true);
-        assert!(!shared_options.contains_key("provider_only"));
-        assert!(!shared_options.contains_key("removed"));
-
-        let route_options = model_options_for_schema(&shared_options, &route);
-        assert_eq!(route_options["reasoning_effort"], "high");
-        assert_eq!(route_options["fast"], true);
-        assert!(!route_options.contains_key("provider_only"));
-    }
-
-    #[test]
-    fn model_change_retains_only_portable_thinking() {
-        let stored = serde_json::Map::from_iter([
-            ("effort".into(), serde_json::json!("high")),
-            ("provider_only".into(), serde_json::json!(true)),
-        ]);
-
-        assert_eq!(
-            portable_thinking_options(&stored),
-            serde_json::Map::from_iter([("thinking_level".into(), serde_json::json!("high"))])
-        );
     }
 
     #[test]
@@ -24784,6 +27650,7 @@ default_permission_mode = "ask"
                 turn: 2,
                 content: "Please compare with repos/o/r/pulls/73".into(),
                 attachments: vec![],
+                background: false,
             },
         ];
         let evidence = pr_evidence_from_events(events, "github.com", "o", "r");
@@ -25547,6 +28414,1126 @@ default_permission_mode = "ask"
     }
 
     #[test]
+    fn workspace_list_items_cache_normalized_remote_identity() {
+        let first_directory = tempfile::tempdir().unwrap();
+        let second_directory = tempfile::tempdir().unwrap();
+        for repository in [first_directory.path(), second_directory.path()] {
+            let mut init = std::process::Command::new("git");
+            init.args(["init", "-b", "main"]).arg(repository);
+            assert!(trouve_process::output(&mut init).unwrap().status.success());
+            let mut remote = std::process::Command::new("git");
+            remote.arg("-C").arg(repository).args([
+                "remote",
+                "add",
+                "origin",
+                "git@GitHub.com:Acme/Widgets.git",
+            ]);
+            assert!(
+                trouve_process::output(&mut remote)
+                    .unwrap()
+                    .status
+                    .success()
+            );
+        }
+
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &Config::default(),
+        );
+        let first = engine
+            .register_workspace(
+                first_directory.path().to_str().unwrap(),
+                Some("first clone".into()),
+            )
+            .unwrap();
+        let second = engine
+            .register_workspace(
+                second_directory.path().to_str().unwrap(),
+                Some("second clone".into()),
+            )
+            .unwrap();
+
+        assert_eq!(first.repository_key, second.repository_key);
+        assert_eq!(first.repository_name.as_deref(), Some("Widgets"));
+        assert_eq!(second.repository_name.as_deref(), Some("Widgets"));
+
+        let mut remote = std::process::Command::new("git");
+        remote.arg("-C").arg(second_directory.path()).args([
+            "remote",
+            "set-url",
+            "origin",
+            "git@github.com:Acme/Other.git",
+        ]);
+        assert!(
+            trouve_process::output(&mut remote)
+                .unwrap()
+                .status
+                .success()
+        );
+        engine
+            .workspace_list_cache
+            .lock()
+            .unwrap()
+            .get_mut(&second.id)
+            .unwrap()
+            .refreshed_at = Instant::now() - WORKSPACE_LIST_CACHE_TTL;
+
+        let listed = engine.list_workspaces().unwrap();
+        let refreshed = listed
+            .iter()
+            .find(|workspace| workspace.id == second.id)
+            .unwrap();
+        assert_ne!(refreshed.repository_key, first.repository_key);
+        assert_eq!(refreshed.repository_name.as_deref(), Some("Other"));
+
+        drop(first_directory);
+        drop(second_directory);
+        let cached = engine.list_workspaces().unwrap();
+        assert_eq!(cached.len(), 2);
+        assert_eq!(
+            cached
+                .iter()
+                .find(|workspace| workspace.id == second.id)
+                .and_then(|workspace| workspace.repository_name.as_deref()),
+            Some("Other")
+        );
+    }
+
+    #[test]
+    fn concurrent_first_workspace_registrations_share_one_workspace() {
+        let repository = tempfile::tempdir().unwrap();
+        let mut init = std::process::Command::new("git");
+        init.args(["init", "-b", "main"]).arg(repository.path());
+        assert!(trouve_process::output(&mut init).unwrap().status.success());
+
+        let data = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &Config::default(),
+        ));
+        let repository_path = repository.path().to_path_buf();
+        let (first_prepared_tx, first_prepared_rx) = std::sync::mpsc::channel();
+        let (release_first_tx, release_first_rx) = std::sync::mpsc::channel();
+        let first_engine = Arc::clone(&engine);
+        let first_path = repository_path.clone();
+        let first = std::thread::spawn(move || {
+            first_engine.register_workspace_with(
+                first_path.to_str().unwrap(),
+                Some("first registration".into()),
+                |contended| assert!(!contended),
+                || {
+                    first_prepared_tx.send(()).unwrap();
+                    release_first_rx.recv().unwrap();
+                },
+            )
+        });
+        first_prepared_rx.recv().unwrap();
+
+        let (second_lock_tx, second_lock_rx) = std::sync::mpsc::channel();
+        let second_engine = Arc::clone(&engine);
+        let second = std::thread::spawn(move || {
+            second_engine.register_workspace_with(
+                repository_path.to_str().unwrap(),
+                Some("second registration".into()),
+                |contended| second_lock_tx.send(contended).unwrap(),
+                || {},
+            )
+        });
+        assert!(second_lock_rx.recv().unwrap());
+        release_first_tx.send(()).unwrap();
+
+        let registrations = [
+            first.join().unwrap().unwrap(),
+            second.join().unwrap().unwrap(),
+        ];
+
+        assert_eq!(registrations[0].id, registrations[1].id);
+        assert_eq!(engine.list_workspaces().unwrap().len(), 1);
+        assert_eq!(
+            engine
+                .store
+                .events_after(&Scope::Server, 0)
+                .unwrap()
+                .into_iter()
+                .filter(|envelope| matches!(envelope.event, Event::WorkspaceRegistered { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn workspace_close_waits_for_reregistration_and_remains_final() {
+        let repository = tempfile::tempdir().unwrap();
+        let mut init = std::process::Command::new("git");
+        init.args(["init", "-b", "main"]).arg(repository.path());
+        assert!(trouve_process::output(&mut init).unwrap().status.success());
+
+        let data = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &Config::default(),
+        ));
+        let workspace = engine
+            .register_workspace(repository.path().to_str().unwrap(), None)
+            .unwrap();
+        let workspace_id = workspace.id.clone();
+        let repository_path = repository.path().to_path_buf();
+        let (prepared_tx, prepared_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let registration_engine = Arc::clone(&engine);
+        let registration = std::thread::spawn(move || {
+            registration_engine.register_workspace_with(
+                repository_path.to_str().unwrap(),
+                None,
+                |_| {},
+                || {
+                    prepared_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                },
+            )
+        });
+        prepared_rx.recv().unwrap();
+
+        let (close_lock_tx, close_lock_rx) = std::sync::mpsc::channel();
+        let close_engine = Arc::clone(&engine);
+        let close_workspace_id = workspace_id.clone();
+        let close = std::thread::spawn(move || {
+            close_engine.close_workspace_with(&close_workspace_id, |contended| {
+                close_lock_tx.send(contended).unwrap();
+            })
+        });
+        assert!(close_lock_rx.recv().unwrap());
+        release_tx.send(()).unwrap();
+        registration.join().unwrap().unwrap();
+        close.join().unwrap().unwrap();
+
+        assert!(engine.list_workspaces().unwrap().is_empty());
+        let lifecycle = engine
+            .store
+            .events_after(&Scope::Server, 0)
+            .unwrap()
+            .into_iter()
+            .filter_map(|envelope| match envelope.event {
+                Event::WorkspaceRegistered {
+                    workspace_id: registered_id,
+                    ..
+                } if registered_id == workspace_id => Some("registered"),
+                Event::WorkspaceClosed {
+                    workspace_id: closed_id,
+                } if closed_id == workspace_id => Some("closed"),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(lifecycle, ["registered", "closed"]);
+    }
+
+    #[test]
+    fn workspace_list_identity_refresh_is_single_flight_per_workspace() {
+        let data = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &Config::default(),
+        ));
+        let workspace = Workspace {
+            id: "ws_single_flight".into(),
+            name: "single flight".into(),
+            path: data.path().to_string_lossy().into_owned(),
+        };
+        engine.workspace_list_cache.lock().unwrap().insert(
+            workspace.id.clone(),
+            WorkspaceListCacheEntry {
+                item: WorkspaceListItem {
+                    id: workspace.id.clone(),
+                    name: workspace.name.clone(),
+                    path: workspace.path.clone(),
+                    repository_key: Some("remote:github.com/acme/widgets".into()),
+                    repository_name: Some("widgets".into()),
+                },
+                refreshed_at: Instant::now() - WORKSPACE_LIST_CACHE_TTL,
+            },
+        );
+        let start = Arc::new(std::sync::Barrier::new(3));
+        let resolutions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handles = (0..2)
+            .map(|_| {
+                let engine = Arc::clone(&engine);
+                let workspace = workspace.clone();
+                let start = Arc::clone(&start);
+                let resolutions = Arc::clone(&resolutions);
+                std::thread::spawn(move || {
+                    start.wait();
+                    engine.cached_workspace_list_item_with(
+                        workspace,
+                        Instant::now() + Duration::from_secs(1),
+                        move |workspace, _timeout| {
+                            resolutions.fetch_add(1, Ordering::SeqCst);
+                            std::thread::sleep(Duration::from_millis(50));
+                            WorkspaceListItem {
+                                id: workspace.id,
+                                name: workspace.name,
+                                path: workspace.path,
+                                repository_key: Some("remote:github.com/acme/widgets".into()),
+                                repository_name: Some("widgets".into()),
+                            }
+                        },
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        start.wait();
+        let items = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(resolutions.load(Ordering::SeqCst), 1);
+        assert!(items.iter().all(|item| {
+            item.repository_key.as_deref() == Some("remote:github.com/acme/widgets")
+        }));
+    }
+
+    #[test]
+    fn workspace_list_identity_refreshes_share_one_request_deadline() {
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &Config::default(),
+        );
+        let first = Workspace {
+            id: "ws_budget_first".into(),
+            name: "first".into(),
+            path: data.path().join("first").to_string_lossy().into_owned(),
+        };
+        let second = Workspace {
+            id: "ws_budget_second".into(),
+            name: "second".into(),
+            path: data.path().join("second").to_string_lossy().into_owned(),
+        };
+        let resolutions = std::sync::atomic::AtomicUsize::new(0);
+        let deadline = Instant::now() + Duration::from_millis(30);
+        let first_item =
+            engine.cached_workspace_list_item_with(first, deadline, |workspace, remaining| {
+                resolutions.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(remaining + Duration::from_millis(10));
+                Engine::fallback_workspace_list_item(workspace)
+            });
+        let second_item =
+            engine.cached_workspace_list_item_with(second, deadline, |workspace, _remaining| {
+                resolutions.fetch_add(1, Ordering::SeqCst);
+                Engine::fallback_workspace_list_item(workspace)
+            });
+
+        assert_eq!(resolutions.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            first_item.repository_key.as_deref(),
+            Some("workspace:ws_budget_first")
+        );
+        assert_eq!(
+            second_item.repository_key.as_deref(),
+            Some("workspace:ws_budget_second")
+        );
+    }
+
+    #[test]
+    fn cancelled_review_workspace_registration_does_not_commit() {
+        let repository = tempfile::tempdir().unwrap();
+        let mut init = std::process::Command::new("git");
+        init.args(["init", "-b", "main"]).arg(repository.path());
+        assert!(trouve_process::output(&mut init).unwrap().status.success());
+
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &Config::default(),
+        );
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let commit_fence = ReviewWorkspaceRegistrationFence::default();
+        let error = engine
+            .register_review_workspace_with(
+                repository.path().to_str().unwrap(),
+                Some("cancelled review".into()),
+                &cancel,
+                &commit_fence,
+                || cancel.cancel(),
+                || {},
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().starts_with("stale:"));
+        assert!(engine.list_workspaces().unwrap().is_empty());
+    }
+
+    #[test]
+    fn cancellation_before_workspace_admission_preserves_compensation() {
+        let repository = tempfile::tempdir().unwrap();
+        let mut init = std::process::Command::new("git");
+        init.args(["init", "-b", "main"]).arg(repository.path());
+        assert!(trouve_process::output(&mut init).unwrap().status.success());
+
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &Config::default(),
+        );
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let commit_fence = ReviewWorkspaceRegistrationFence::default();
+        engine
+            .register_review_workspace(
+                repository.path().to_str().unwrap(),
+                Some("cancelled before admission".into()),
+                &cancel,
+                &commit_fence,
+            )
+            .unwrap();
+        assert!(!cancel.is_cancelled());
+
+        // Model the cancellation becoming visible after the caller's
+        // preceding check but before the guarded admission point.
+        cancel.cancel();
+        let error = engine
+            .complete_review_workspace_registration(&cancel, &commit_fence)
+            .unwrap_err();
+        assert!(error.to_string().starts_with("stale:"));
+        engine
+            .cancel_review_workspace_registration(&cancel, &commit_fence)
+            .unwrap();
+
+        assert!(engine.list_workspaces().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancellation_removes_the_provisional_review_session_and_worktree() {
+        let temp = tempfile::tempdir().unwrap();
+        let repository = temp.path().join("repository");
+        let data_dir = temp.path().join("data");
+        init_engine_test_repo(&repository);
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data_dir,
+            &Config::default(),
+        );
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let commit_fence = ReviewWorkspaceRegistrationFence::default();
+        let workspace = engine
+            .register_review_workspace(
+                repository.to_str().unwrap(),
+                Some("provisional review".into()),
+                &cancel,
+                &commit_fence,
+            )
+            .unwrap();
+        let session = engine
+            .create_review_session(
+                CreateSessionRequest {
+                    workspace_id: workspace.id.clone(),
+                    idempotency_key: None,
+                    title: Some("provisional review".into()),
+                    base_ref: Some("main".into()),
+                    checkout_ref: None,
+                    fetch_latest: false,
+                },
+                &cancel,
+                &commit_fence,
+            )
+            .await
+            .unwrap();
+        let worktree = PathBuf::from(&session.worktree_path);
+        assert!(engine.store.session(&session.id).unwrap().is_some());
+        assert!(worktree.exists());
+
+        engine
+            .cancel_review_workspace_registration_and_session(&cancel, &commit_fence)
+            .await
+            .unwrap();
+
+        assert!(engine.store.session(&session.id).unwrap().is_none());
+        assert!(engine.list_workspaces().unwrap().is_empty());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while worktree.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("provisional review worktree was not cleaned up");
+    }
+
+    #[tokio::test]
+    async fn cancelled_review_session_is_recorded_before_retryable_cleanup() {
+        let temp = tempfile::tempdir().unwrap();
+        let repository = temp.path().join("repository");
+        let data_dir = temp.path().join("data");
+        init_engine_test_repo(&repository);
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data_dir,
+            &Config::default(),
+        );
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let commit_fence = ReviewWorkspaceRegistrationFence::default();
+        let workspace = engine
+            .register_review_workspace(
+                repository.to_str().unwrap(),
+                Some("cancelled review session".into()),
+                &cancel,
+                &commit_fence,
+            )
+            .unwrap();
+
+        // Model cancellation becoming visible after durable session creation
+        // but before create_review_session records ownership in the fence.
+        cancel.cancel();
+        let error = engine
+            .create_review_session(
+                CreateSessionRequest {
+                    workspace_id: workspace.id,
+                    idempotency_key: None,
+                    title: Some("cancelled review session".into()),
+                    base_ref: Some("main".into()),
+                    checkout_ref: None,
+                    fetch_latest: false,
+                },
+                &cancel,
+                &commit_fence,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().starts_with("stale:"));
+
+        let session_id = commit_fence
+            .committed
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|commit| commit.provisional_session_id.clone())
+            .expect("cancelled review session must remain cleanup-addressable");
+        let session = engine.store.session(&session_id).unwrap().unwrap();
+        let worktree = PathBuf::from(&session.worktree_path);
+        assert!(worktree.exists());
+
+        engine
+            .cancel_review_workspace_registration_and_session(&cancel, &commit_fence)
+            .await
+            .unwrap();
+
+        assert!(engine.store.session(&session_id).unwrap().is_none());
+        assert!(engine.list_workspaces().unwrap().is_empty());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while worktree.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cancelled review session worktree was not cleaned up");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancellation_retries_when_a_session_is_published_after_its_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let repository = temp.path().join("repository");
+        let data_dir = temp.path().join("data");
+        init_engine_test_repo(&repository);
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data_dir,
+            &Config::default(),
+        ));
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let commit_fence = Arc::new(ReviewWorkspaceRegistrationFence::default());
+        let workspace = engine
+            .register_review_workspace(
+                repository.to_str().unwrap(),
+                Some("racing review cancellation".into()),
+                &cancel,
+                &commit_fence,
+            )
+            .unwrap();
+        let (snapshot_tx, snapshot_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let cancellation = tokio::spawn({
+            let engine = Arc::clone(&engine);
+            let cancel = cancel.clone();
+            let commit_fence = Arc::clone(&commit_fence);
+            async move {
+                engine
+                    .cancel_review_workspace_registration_and_session_with(
+                        &cancel,
+                        &commit_fence,
+                        move || {
+                            snapshot_tx.send(()).unwrap();
+                            release_rx.recv().unwrap();
+                        },
+                    )
+                    .await
+            }
+        });
+        snapshot_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("cancellation did not snapshot the empty session handle");
+
+        let error = engine
+            .create_review_session(
+                CreateSessionRequest {
+                    workspace_id: workspace.id,
+                    idempotency_key: None,
+                    title: Some("racing review cancellation".into()),
+                    base_ref: Some("main".into()),
+                    checkout_ref: None,
+                    fetch_latest: false,
+                },
+                &cancel,
+                &commit_fence,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().starts_with("stale:"));
+        let session_id = commit_fence
+            .committed
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|commit| commit.provisional_session_id.clone())
+            .expect("the newly published session must remain cleanup-addressable");
+        let session = engine.store.session(&session_id).unwrap().unwrap();
+        let worktree = PathBuf::from(&session.worktree_path);
+        assert!(worktree.exists());
+
+        release_tx.send(()).unwrap();
+        cancellation.await.unwrap().unwrap();
+
+        assert!(commit_fence.committed.lock().unwrap().is_none());
+        assert!(engine.store.session(&session_id).unwrap().is_none());
+        assert!(engine.list_workspaces().unwrap().is_empty());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while worktree.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("racing review session worktree was not cleaned up");
+    }
+
+    #[test]
+    fn cancellation_cleanup_failures_remain_retryable_after_workspace_compensation() {
+        for failure_stage in ["session lookup", "session deletion"] {
+            let repository = tempfile::tempdir().unwrap();
+            let mut init = std::process::Command::new("git");
+            init.args(["init", "-b", "main"]).arg(repository.path());
+            assert!(trouve_process::output(&mut init).unwrap().status.success());
+
+            let data = tempfile::tempdir().unwrap();
+            let engine = Engine::new(
+                Store::open_in_memory().unwrap(),
+                data.path().to_path_buf(),
+                &Config::default(),
+            );
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let commit_fence = ReviewWorkspaceRegistrationFence::default();
+            engine
+                .register_review_workspace(
+                    repository.path().to_str().unwrap(),
+                    Some(format!("{failure_stage} failure")),
+                    &cancel,
+                    &commit_fence,
+                )
+                .unwrap();
+            commit_fence
+                .committed
+                .lock()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .provisional_session_id = Some("provisional-session".into());
+            let committed = commit_fence.committed.lock().unwrap().clone().unwrap();
+
+            let mut compensation_attempts = 0;
+            compensation_attempts += 1;
+            let workspace_compensation =
+                engine.compensate_review_workspace_registration(committed.clone());
+            let error = Engine::finish_review_workspace_cancellation(
+                &commit_fence,
+                &committed,
+                Err(EngineError::Internal(anyhow::anyhow!(
+                    "injected {failure_stage} failure"
+                ))),
+                workspace_compensation,
+            )
+            .unwrap_err();
+
+            assert!(error.to_string().contains(failure_stage));
+            assert_eq!(compensation_attempts, 1);
+            assert!(engine.list_workspaces().unwrap().is_empty());
+            assert_eq!(
+                commit_fence
+                    .committed
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(|commit| commit.provisional_session_id.as_deref()),
+                Some("provisional-session")
+            );
+
+            let committed = commit_fence.committed.lock().unwrap().clone().unwrap();
+            compensation_attempts += 1;
+            let workspace_compensation =
+                engine.compensate_review_workspace_registration(committed.clone());
+            Engine::finish_review_workspace_cancellation(
+                &commit_fence,
+                &committed,
+                Ok(()),
+                workspace_compensation,
+            )
+            .unwrap();
+
+            assert_eq!(compensation_attempts, 2);
+            assert!(commit_fence.committed.lock().unwrap().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_session_creation_adopts_a_provisional_review_workspace() {
+        let temp = tempfile::tempdir().unwrap();
+        let repository = temp.path().join("repository");
+        let data_dir = temp.path().join("data");
+        init_engine_test_repo(&repository);
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data_dir,
+            &Config::default(),
+        );
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let commit_fence = ReviewWorkspaceRegistrationFence::default();
+        let workspace = engine
+            .register_review_workspace(
+                repository.to_str().unwrap(),
+                Some("adopted review workspace".into()),
+                &cancel,
+                &commit_fence,
+            )
+            .unwrap();
+        let session = engine
+            .create_session(CreateSessionRequest {
+                workspace_id: workspace.id.clone(),
+                idempotency_key: None,
+                title: Some("independent work".into()),
+                base_ref: Some("main".into()),
+                checkout_ref: None,
+                fetch_latest: false,
+            })
+            .await
+            .unwrap();
+        engine.create_terminal(&session.id, 80, 24).unwrap();
+
+        engine
+            .cancel_review_workspace_registration_and_session(&cancel, &commit_fence)
+            .await
+            .unwrap();
+
+        assert_eq!(engine.list_workspaces().unwrap().len(), 1);
+        assert!(engine.store.session(&session.id).unwrap().is_some());
+        assert_eq!(engine.list_terminals(&session.id).unwrap().len(), 1);
+        engine.delete_session(&session.id).await.unwrap();
+    }
+
+    #[test]
+    fn cancellation_compensates_registration_admitted_before_timeout() {
+        let repository = tempfile::tempdir().unwrap();
+        let mut init = std::process::Command::new("git");
+        init.args(["init", "-b", "main"]).arg(repository.path());
+        assert!(trouve_process::output(&mut init).unwrap().status.success());
+
+        let data = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &Config::default(),
+        ));
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let commit_fence = Arc::new(ReviewWorkspaceRegistrationFence::default());
+        let (admitted_tx, admitted_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let registration_engine = Arc::clone(&engine);
+        let registration_cancel = cancel.clone();
+        let registration_fence = Arc::clone(&commit_fence);
+        let repository_path = repository.path().to_path_buf();
+        let registration = std::thread::spawn(move || {
+            registration_engine.register_review_workspace_with(
+                repository_path.to_str().unwrap(),
+                Some("timed out review".into()),
+                &registration_cancel,
+                &registration_fence,
+                || {},
+                || {
+                    admitted_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                },
+            )
+        });
+        admitted_rx.recv().unwrap();
+
+        let cancellation_engine = Arc::clone(&engine);
+        let cancellation_token = cancel.clone();
+        let cancellation_fence = Arc::clone(&commit_fence);
+        let (cancelled_tx, cancelled_rx) = std::sync::mpsc::channel();
+        let cancellation = std::thread::spawn(move || {
+            let result = cancellation_engine
+                .cancel_review_workspace_registration(&cancellation_token, &cancellation_fence);
+            cancelled_tx.send(()).unwrap();
+            result
+        });
+        assert!(matches!(
+            cancelled_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        release_tx.send(()).unwrap();
+
+        let workspace = registration.join().unwrap().unwrap();
+        cancellation.join().unwrap().unwrap();
+
+        assert!(cancel.is_cancelled());
+        assert!(engine.list_workspaces().unwrap().is_empty());
+        let lifecycle = engine
+            .store
+            .events_after(&Scope::Server, 0)
+            .unwrap()
+            .into_iter()
+            .filter_map(|envelope| match envelope.event {
+                Event::WorkspaceRegistered { workspace_id, .. } if workspace_id == workspace.id => {
+                    Some("registered")
+                }
+                Event::WorkspaceClosed { workspace_id } if workspace_id == workspace.id => {
+                    Some("closed")
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(lifecycle, ["registered", "closed"]);
+    }
+
+    #[test]
+    fn cancellation_recloses_workspace_reopened_before_timeout() {
+        let repository = tempfile::tempdir().unwrap();
+        let mut init = std::process::Command::new("git");
+        init.args(["init", "-b", "main"]).arg(repository.path());
+        assert!(trouve_process::output(&mut init).unwrap().status.success());
+
+        let data = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &Config::default(),
+        ));
+        let workspace = engine
+            .register_workspace(repository.path().to_str().unwrap(), None)
+            .unwrap();
+        engine.close_workspace(&workspace.id).unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let commit_fence = Arc::new(ReviewWorkspaceRegistrationFence::default());
+        let (admitted_tx, admitted_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let registration_engine = Arc::clone(&engine);
+        let registration_cancel = cancel.clone();
+        let registration_fence = Arc::clone(&commit_fence);
+        let repository_path = repository.path().to_path_buf();
+        let registration = std::thread::spawn(move || {
+            registration_engine.register_review_workspace_with(
+                repository_path.to_str().unwrap(),
+                None,
+                &registration_cancel,
+                &registration_fence,
+                || {},
+                || {
+                    admitted_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                },
+            )
+        });
+        admitted_rx.recv().unwrap();
+
+        let cancellation_engine = Arc::clone(&engine);
+        let cancellation_token = cancel.clone();
+        let cancellation_fence = Arc::clone(&commit_fence);
+        let cancellation = std::thread::spawn(move || {
+            cancellation_engine
+                .cancel_review_workspace_registration(&cancellation_token, &cancellation_fence)
+        });
+        release_tx.send(()).unwrap();
+
+        let reopened = registration.join().unwrap().unwrap();
+        cancellation.join().unwrap().unwrap();
+
+        assert_eq!(reopened.id, workspace.id);
+        assert!(engine.list_workspaces().unwrap().is_empty());
+        let lifecycle = engine
+            .store
+            .events_after(&Scope::Server, 0)
+            .unwrap()
+            .into_iter()
+            .filter_map(|envelope| match envelope.event {
+                Event::WorkspaceRegistered { workspace_id, .. } if workspace_id == workspace.id => {
+                    Some("registered")
+                }
+                Event::WorkspaceClosed { workspace_id } if workspace_id == workspace.id => {
+                    Some("closed")
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(lifecycle, ["registered", "closed", "registered", "closed"]);
+    }
+
+    #[test]
+    fn later_review_registration_adopts_workspace_before_earlier_cancellation() {
+        let repository = tempfile::tempdir().unwrap();
+        let mut init = std::process::Command::new("git");
+        init.args(["init", "-b", "main"]).arg(repository.path());
+        assert!(trouve_process::output(&mut init).unwrap().status.success());
+
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &Config::default(),
+        );
+        let first_cancel = tokio_util::sync::CancellationToken::new();
+        let first_fence = ReviewWorkspaceRegistrationFence::default();
+        let workspace = engine
+            .register_review_workspace(
+                repository.path().to_str().unwrap(),
+                Some("first review".into()),
+                &first_cancel,
+                &first_fence,
+            )
+            .unwrap();
+        let second_cancel = tokio_util::sync::CancellationToken::new();
+        let second_fence = ReviewWorkspaceRegistrationFence::default();
+        let adopted = engine
+            .register_review_workspace(
+                repository.path().to_str().unwrap(),
+                Some("second review".into()),
+                &second_cancel,
+                &second_fence,
+            )
+            .unwrap();
+
+        engine
+            .cancel_review_workspace_registration(&first_cancel, &first_fence)
+            .unwrap();
+        engine
+            .complete_review_workspace_registration(&second_cancel, &second_fence)
+            .unwrap();
+
+        assert_eq!(adopted.id, workspace.id);
+        assert_eq!(engine.list_workspaces().unwrap().len(), 1);
+        let lifecycle = engine
+            .store
+            .events_after(&Scope::Server, 0)
+            .unwrap()
+            .into_iter()
+            .filter_map(|envelope| match envelope.event {
+                Event::WorkspaceRegistered { workspace_id, .. } if workspace_id == workspace.id => {
+                    Some("registered")
+                }
+                Event::WorkspaceClosed { workspace_id } if workspace_id == workspace.id => {
+                    Some("closed")
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(lifecycle, ["registered"]);
+    }
+
+    #[test]
+    fn later_cancelled_review_inherits_workspace_compensation() {
+        let repository = tempfile::tempdir().unwrap();
+        let mut init = std::process::Command::new("git");
+        init.args(["init", "-b", "main"]).arg(repository.path());
+        assert!(trouve_process::output(&mut init).unwrap().status.success());
+
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &Config::default(),
+        );
+        let first_cancel = tokio_util::sync::CancellationToken::new();
+        let first_fence = ReviewWorkspaceRegistrationFence::default();
+        let workspace = engine
+            .register_review_workspace(
+                repository.path().to_str().unwrap(),
+                None,
+                &first_cancel,
+                &first_fence,
+            )
+            .unwrap();
+        let second_cancel = tokio_util::sync::CancellationToken::new();
+        let second_fence = ReviewWorkspaceRegistrationFence::default();
+        engine
+            .register_review_workspace(
+                repository.path().to_str().unwrap(),
+                None,
+                &second_cancel,
+                &second_fence,
+            )
+            .unwrap();
+
+        engine
+            .cancel_review_workspace_registration(&first_cancel, &first_fence)
+            .unwrap();
+        assert_eq!(engine.list_workspaces().unwrap().len(), 1);
+        engine
+            .cancel_review_workspace_registration(&second_cancel, &second_fence)
+            .unwrap();
+
+        assert!(engine.list_workspaces().unwrap().is_empty());
+        let lifecycle = engine
+            .store
+            .events_after(&Scope::Server, 0)
+            .unwrap()
+            .into_iter()
+            .filter_map(|envelope| match envelope.event {
+                Event::WorkspaceRegistered { workspace_id, .. } if workspace_id == workspace.id => {
+                    Some("registered")
+                }
+                Event::WorkspaceClosed { workspace_id } if workspace_id == workspace.id => {
+                    Some("closed")
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(lifecycle, ["registered", "closed"]);
+    }
+
+    #[test]
+    fn later_review_cancellation_preserves_active_or_completed_earlier_review() {
+        for complete_first_before_cancel in [false, true] {
+            let repository = tempfile::tempdir().unwrap();
+            let mut init = std::process::Command::new("git");
+            init.args(["init", "-b", "main"]).arg(repository.path());
+            assert!(trouve_process::output(&mut init).unwrap().status.success());
+
+            let data = tempfile::tempdir().unwrap();
+            let engine = Engine::new(
+                Store::open_in_memory().unwrap(),
+                data.path().to_path_buf(),
+                &Config::default(),
+            );
+            let first_cancel = tokio_util::sync::CancellationToken::new();
+            let first_fence = ReviewWorkspaceRegistrationFence::default();
+            let workspace = engine
+                .register_review_workspace(
+                    repository.path().to_str().unwrap(),
+                    None,
+                    &first_cancel,
+                    &first_fence,
+                )
+                .unwrap();
+            let second_cancel = tokio_util::sync::CancellationToken::new();
+            let second_fence = ReviewWorkspaceRegistrationFence::default();
+            engine
+                .register_review_workspace(
+                    repository.path().to_str().unwrap(),
+                    None,
+                    &second_cancel,
+                    &second_fence,
+                )
+                .unwrap();
+
+            if complete_first_before_cancel {
+                engine
+                    .complete_review_workspace_registration(&first_cancel, &first_fence)
+                    .unwrap();
+            }
+            engine
+                .cancel_review_workspace_registration(&second_cancel, &second_fence)
+                .unwrap();
+            if !complete_first_before_cancel {
+                engine
+                    .complete_review_workspace_registration(&first_cancel, &first_fence)
+                    .unwrap();
+            }
+
+            assert_eq!(engine.list_workspaces().unwrap().len(), 1);
+            let lifecycle = engine
+                .store
+                .events_after(&Scope::Server, 0)
+                .unwrap()
+                .into_iter()
+                .filter_map(|envelope| match envelope.event {
+                    Event::WorkspaceRegistered { workspace_id, .. }
+                        if workspace_id == workspace.id =>
+                    {
+                        Some("registered")
+                    }
+                    Event::WorkspaceClosed { workspace_id } if workspace_id == workspace.id => {
+                        Some("closed")
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(lifecycle, ["registered"]);
+        }
+    }
+
+    #[test]
+    fn foreground_registration_adopts_workspace_before_review_cancellation() {
+        let repository = tempfile::tempdir().unwrap();
+        let mut init = std::process::Command::new("git");
+        init.args(["init", "-b", "main"]).arg(repository.path());
+        assert!(trouve_process::output(&mut init).unwrap().status.success());
+
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &Config::default(),
+        );
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let commit_fence = ReviewWorkspaceRegistrationFence::default();
+        let workspace = engine
+            .register_review_workspace(
+                repository.path().to_str().unwrap(),
+                Some("review".into()),
+                &cancel,
+                &commit_fence,
+            )
+            .unwrap();
+        let adopted = engine
+            .register_workspace(repository.path().to_str().unwrap(), None)
+            .unwrap();
+
+        engine
+            .cancel_review_workspace_registration(&cancel, &commit_fence)
+            .unwrap();
+
+        assert_eq!(adopted.id, workspace.id);
+        assert_eq!(engine.list_workspaces().unwrap().len(), 1);
+        let lifecycle = engine
+            .store
+            .events_after(&Scope::Server, 0)
+            .unwrap()
+            .into_iter()
+            .filter_map(|envelope| match envelope.event {
+                Event::WorkspaceRegistered { workspace_id, .. } if workspace_id == workspace.id => {
+                    Some("registered")
+                }
+                Event::WorkspaceClosed { workspace_id } if workspace_id == workspace.id => {
+                    Some("closed")
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(lifecycle, ["registered"]);
+    }
+
+    #[test]
     fn archive_and_workspace_close_tear_down_terminals_until_reopened() {
         let dir = tempfile::tempdir().unwrap();
         let mut command = std::process::Command::new("git");
@@ -25659,10 +29646,11 @@ default_permission_mode = "ask"
         for url in [
             "http://localhost:11434",
             "http://LOCALHOST:11434/v1",
+            "http://localhost.:11434/v1",
             "http://127.0.0.1:8080/v1",
             "https://127.1.2.3", // whole 127/8 block is loopback
             "http://[::1]:8000",
-            "http://[::ffff:127.0.0.1]:8000",
+            "http://[::ffff:127.0.0.1]:8000/v1",
         ] {
             assert!(is_loopback_base_url(url), "should be loopback: {url}");
         }
@@ -25684,30 +29672,83 @@ default_permission_mode = "ask"
     }
 
     #[test]
-    fn cli_command_prefers_explicit_then_managed_binary() {
+    fn runtime_command_prefers_explicit_then_managed_binary() {
         let tmp = tempfile::tempdir().unwrap();
-        let managed =
-            trouve_agents::install::managed_bin(tmp.path(), trouve_agents::install::CliId::Codex);
+        let root = tmp.path().join("cli/codex");
+        let managed = root.join(".generations/runtime-current/codex");
         std::fs::create_dir_all(managed.parent().unwrap()).unwrap();
         std::fs::write(&managed, b"stub").unwrap();
+        let canonical_managed = std::fs::canonicalize(&managed).unwrap();
+        std::fs::write(
+            root.join("installed.json"),
+            serde_json::to_vec(&trouve_agents::install::InstalledCli {
+                version: "1.0.0".into(),
+                bin: managed.to_string_lossy().into_owned(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let obsolete_stable = tmp.path().join("cli/bin/codex");
+        std::fs::create_dir_all(obsolete_stable.parent().unwrap()).unwrap();
+        std::fs::write(&obsolete_stable, b"uncommitted").unwrap();
 
         assert_eq!(
-            resolved_cli_command("codex-app-server", None, tmp.path()),
-            Some(managed.to_string_lossy().into_owned())
+            resolved_runtime("codex-app-server", None, tmp.path()).command,
+            Some(canonical_managed.to_string_lossy().into_owned())
         );
         assert_eq!(
-            resolved_cli_command(
+            resolved_runtime(
+                "codex-app-server",
+                Some(obsolete_stable.to_string_lossy().into_owned()),
+                tmp.path()
+            )
+            .command,
+            Some(canonical_managed.to_string_lossy().into_owned())
+        );
+        assert_eq!(
+            resolved_runtime(
                 "codex-app-server",
                 Some("/opt/custom/codex".into()),
                 tmp.path()
             )
+            .command
             .as_deref(),
             Some("/opt/custom/codex")
         );
         assert_eq!(
-            resolved_cli_command("openai-compat", None, tmp.path()),
+            resolved_runtime("openai-compat", None, tmp.path()).command,
             None
         );
+
+        let legacy_cursor = ProviderConfig {
+            kind: "cursor-cli".into(),
+            command: Some("/opt/custom/cursor-agent".into()),
+            ..Default::default()
+        };
+        assert_eq!(configured_runtime_command(&legacy_cursor), None);
+        let cursor_sdk = ProviderConfig {
+            kind: "cursor-sdk".into(),
+            command: Some("/opt/custom/cursor-sdk-bridge".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            configured_runtime_command(&cursor_sdk).as_deref(),
+            Some("/opt/custom/cursor-sdk-bridge")
+        );
+    }
+
+    #[test]
+    fn legacy_cursor_runtime_id_maps_to_the_sdk_bridge() {
+        assert_eq!(
+            canonical_cli_runtime_id("cursor-agent"),
+            "cursor-sdk-bridge"
+        );
+        assert_eq!(
+            canonical_cli_runtime_id("cursor-sdk-bridge"),
+            "cursor-sdk-bridge"
+        );
+        assert_eq!(canonical_cli_runtime_id("unknown"), "unknown");
     }
 
     #[tokio::test]
@@ -26074,6 +30115,27 @@ default_permission_mode = "ask"
         }
         assert!(matches!(&out[4], Message::User(u) if u == "next"));
 
+        // A steer persisted while a tool is running is presented to the next
+        // model invocation only after the matching tool result.
+        let out = sanitize_transcript(vec![
+            Message::Assistant {
+                content: String::new(),
+                tool_calls: vec![call("steered")],
+                reasoning: vec![],
+            },
+            Message::User("change direction".into()),
+            Message::ToolResult {
+                call_id: "steered".into(),
+                content: "done".into(),
+                images: vec![],
+            },
+        ]);
+        assert!(matches!(
+            &out[1],
+            Message::ToolResult { call_id, .. } if call_id == "steered"
+        ));
+        assert!(matches!(&out[2], Message::User(u) if u == "change direction"));
+
         // An empty assistant message is dropped entirely.
         let out = sanitize_transcript(vec![
             Message::User("hi".into()),
@@ -26145,6 +30207,7 @@ default_permission_mode = "ask"
             display_name: "GPT".into(),
             context_window: 100_000,
             supports_tools: true,
+            supports_images: false,
             input_price_per_mtok: None,
             output_price_per_mtok: None,
             options_schema: serde_json::json!({
@@ -26214,7 +30277,6 @@ default_permission_mode = "ask"
             Some(&serde_json::json!(8192))
         );
         assert!(!explicit_budget.contains_key("thinking_level"));
-
         options.remove("reasoning_effort");
         options.insert("thinking_level".into(), serde_json::json!("16384"));
         normalize_thinking_option(&mut options, Some(&fixed_model));
@@ -26249,6 +30311,851 @@ default_permission_mode = "ask"
         options.insert("thinking_level".into(), serde_json::json!("high"));
         normalize_thinking_option(&mut options, None);
         assert!(options.is_empty());
+    }
+
+    #[test]
+    fn model_options_follow_the_advertised_scalar_schema() {
+        let model = trouve_protocol::ModelInfo {
+            id: "test/options".into(),
+            display_name: "Options".into(),
+            context_window: 100_000,
+            supports_tools: true,
+            supports_images: false,
+            input_price_per_mtok: None,
+            output_price_per_mtok: None,
+            options_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "effort": {
+                        "enum": ["low", "high"]
+                    },
+                    "reasoning_effort": {
+                        "enum": ["low", "high"]
+                    },
+                    "budget": {
+                        "type": "integer",
+                        "minimum": 4,
+                        "maximum": 16
+                    },
+                    "temperature": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 1
+                    },
+                    "large_budget": {
+                        "type": "integer",
+                        "maximum": 9007199254740992_u64
+                    },
+                    "large_choice": {
+                        "type": "integer",
+                        "enum": [9007199254740992_u64, 9007199254740993_u64]
+                    },
+                    "huge_integer": {"type": "integer"},
+                    "fast": {"type": "boolean"},
+                    "context": {
+                        "oneOf": [
+                            {"const": "short"},
+                            {"const": "long"}
+                        ]
+                    },
+                    "mixed": {"enum": ["300k", 1]},
+                    "conflicting": {
+                        "type": "string",
+                        "enum": [1, 2]
+                    },
+                    "malformed_enum": {
+                        "enum": ["valid", {"nested": true}]
+                    },
+                    "malformed_one_of": {
+                        "oneOf": [
+                            {"const": "valid"},
+                            {"title": "missing const"}
+                        ]
+                    },
+                    "composed_choice": {
+                        "enum": ["low", "high"],
+                        "oneOf": [
+                            {"const": "low"},
+                            {"const": "medium"}
+                        ]
+                    },
+                    "nested_choice": {
+                        "oneOf": [
+                            {"const": "low", "enum": ["low"]},
+                            {"const": "high", "enum": ["high"]}
+                        ]
+                    },
+                    "missing_schema": {"description": "No scalar contract"},
+                    "locked": {"type": "string", "readOnly": true},
+                    "constant": {"type": "string", "const": "owned"},
+                    "nullable": {"type": ["string", "null"]},
+                    "ambiguous": {"type": ["string", "number"]},
+                    "patterned": {"type": "string", "pattern": "^[a-z]+$"},
+                    "stepped": {"type": "number", "multipleOf": 0.5}
+                }
+            }),
+        };
+        let valid = serde_json::Map::from_iter([
+            ("effort".into(), serde_json::json!("high")),
+            ("budget".into(), serde_json::json!(8)),
+            ("temperature".into(), serde_json::json!(0.4)),
+            (
+                "large_budget".into(),
+                serde_json::json!(9007199254740992_u64),
+            ),
+            (
+                "large_choice".into(),
+                serde_json::json!(9007199254740993_u64),
+            ),
+            ("fast".into(), serde_json::json!(true)),
+            ("context".into(), serde_json::json!("long")),
+            ("mixed".into(), serde_json::json!(1)),
+            ("nullable".into(), serde_json::json!("value")),
+        ]);
+        assert!(validate_model_options(&valid, &model).is_ok());
+
+        let conflicting_thinking = serde_json::json!({
+            "reasoning_effort": "low",
+            "effort": "high"
+        });
+        let conflicting_thinking_error =
+            validate_model_options(conflicting_thinking.as_object().unwrap(), &model)
+                .unwrap_err()
+                .to_string();
+        assert!(conflicting_thinking_error.contains("conflicting thinking aliases"));
+        let conflicting_budget = serde_json::json!({
+            "reasoning_effort": "low",
+            "thinking_budget_tokens": 8
+        });
+        let conflicting_budget_error =
+            validate_model_options(conflicting_budget.as_object().unwrap(), &model)
+                .unwrap_err()
+                .to_string();
+        assert!(conflicting_budget_error.contains("conflicting thinking aliases"));
+
+        for valid_integer in [
+            r#"{"huge_integer":1e20}"#,
+            r#"{"huge_integer":100000000000000000000}"#,
+        ] {
+            let options: serde_json::Value = serde_json::from_str(valid_integer).unwrap();
+            assert!(
+                validate_model_options(options.as_object().unwrap(), &model).is_ok(),
+                "{valid_integer} is mathematically integral"
+            );
+        }
+
+        let wrong_choice = serde_json::json!({"effort": "medium"});
+        let wrong_choice_error = validate_model_options(wrong_choice.as_object().unwrap(), &model)
+            .unwrap_err()
+            .to_string();
+        assert!(wrong_choice_error.contains("is not one of its advertised values"));
+        let wrong_type = serde_json::json!({"fast": "yes"});
+        let wrong_type_error = validate_model_options(wrong_type.as_object().unwrap(), &model)
+            .unwrap_err()
+            .to_string();
+        assert!(wrong_type_error.contains("has the wrong scalar type"));
+
+        for invalid in [
+            serde_json::json!({"removed": true}),
+            serde_json::json!({"fast": "yes"}),
+            serde_json::json!({"context": "missing"}),
+            serde_json::json!({"conflicting": 1}),
+            serde_json::json!({"malformed_enum": "valid"}),
+            serde_json::json!({"malformed_one_of": "valid"}),
+            serde_json::json!({"composed_choice": "high"}),
+            serde_json::json!({"nested_choice": "high"}),
+            serde_json::json!({"missing_schema": "anything"}),
+            serde_json::json!({"effort": "medium"}),
+            serde_json::json!({"budget": 4.5}),
+            serde_json::json!({"budget": 3}),
+            serde_json::json!({"budget": 17}),
+            serde_json::json!({"large_budget": 9007199254740993_u64}),
+            serde_json::json!({"fast": {"nested": true}}),
+            serde_json::json!({"locked": "override"}),
+            serde_json::json!({"constant": "override"}),
+            serde_json::json!({"ambiguous": "value"}),
+            serde_json::json!({"patterned": "UPPER"}),
+            serde_json::json!({"stepped": 0.25}),
+        ] {
+            let options = invalid.as_object().unwrap();
+            assert!(
+                validate_model_options(options, &model).is_err(),
+                "{invalid} should be rejected"
+            );
+        }
+
+        for fractional in [
+            r#"{"huge_integer":9007199254740990.6}"#,
+            r#"{"huge_integer":9007199254740992.5}"#,
+        ] {
+            let options: serde_json::Value = serde_json::from_str(fractional).unwrap();
+            assert!(
+                validate_model_options(options.as_object().unwrap(), &model).is_err(),
+                "{fractional} must not pass integer validation"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_automation_options_do_not_require_a_configured_provider() {
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &Config::default(),
+        )
+        .with_config_dir(None)
+        .with_default_model("unconfigured/model");
+        let workspace = trouve_protocol::Workspace {
+            id: "ws_offline_automation".into(),
+            name: "offline".into(),
+            path: data.path().display().to_string(),
+        };
+        let (model, options) = engine
+            .validated_automation_model_options(
+                &workspace,
+                None,
+                None,
+                Some("high"),
+                &serde_json::Map::new(),
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(model.is_none());
+        assert!(options.is_empty());
+    }
+
+    #[tokio::test]
+    async fn automation_mutations_persist_normalized_model_options() {
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let workspace = trouve_protocol::Workspace {
+            id: "ws_normalized_automation".into(),
+            name: "normalized".into(),
+            path: data.path().display().to_string(),
+        };
+        store.insert_workspace(&workspace).unwrap();
+        let engine = Engine::new(store.clone(), data.path().to_path_buf(), &Config::default())
+            .with_config_dir(None)
+            .with_provider(
+                "catalog-test",
+                Arc::new(CatalogTestProvider::new(Arc::new(
+                    std::sync::atomic::AtomicUsize::new(0),
+                ))),
+            )
+            .with_default_model("catalog-test/static");
+        let mut request = trouve_protocol::UpsertAutomationRequest {
+            name: "Normalized options".into(),
+            prompt: "Run later".into(),
+            workspace_id: workspace.id,
+            mode: None,
+            model: None,
+            thinking_level: None,
+            model_options: serde_json::Map::from_iter([(
+                "thinking_level".into(),
+                serde_json::json!("high"),
+            )]),
+            permission_mode: trouve_protocol::PermissionMode::Ask,
+            schedule: trouve_protocol::AutomationSchedule {
+                kind: "daily".into(),
+                minute: 0,
+                time: "09:00".into(),
+                days: Vec::new(),
+            },
+            enabled: true,
+        };
+
+        let created = engine.create_automation(request.clone()).await.unwrap();
+        assert_eq!(
+            created.model_options,
+            serde_json::Map::from_iter([("reasoning_effort".into(), serde_json::json!("high"))])
+        );
+        request
+            .model_options
+            .insert("thinking_level".into(), serde_json::json!("low"));
+        let updated = engine
+            .update_automation(&created.id, request)
+            .await
+            .unwrap();
+        assert_eq!(
+            updated.model_options,
+            serde_json::Map::from_iter([("reasoning_effort".into(), serde_json::json!("low"))])
+        );
+        assert_eq!(
+            store
+                .automation(&created.id)
+                .unwrap()
+                .unwrap()
+                .model_options,
+            updated.model_options
+        );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_only_automation_updates_do_not_require_model_metadata() {
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let workspace = trouve_protocol::Workspace {
+            id: "ws_retired_automation".into(),
+            name: "retired".into(),
+            path: data.path().display().to_string(),
+        };
+        store.insert_workspace(&workspace).unwrap();
+        let automation = trouve_protocol::Automation {
+            id: "auto_retired_model".into(),
+            name: "Retired model".into(),
+            prompt: "Run later".into(),
+            workspace_id: workspace.id,
+            mode: None,
+            model: Some("retired/model".into()),
+            thinking_level: None,
+            model_options: serde_json::Map::from_iter([(
+                "removed_option".into(),
+                serde_json::json!(true),
+            )]),
+            permission_mode: trouve_protocol::PermissionMode::Ask,
+            schedule: trouve_protocol::AutomationSchedule {
+                kind: "daily".into(),
+                minute: 0,
+                time: "09:00".into(),
+                days: Vec::new(),
+            },
+            enabled: true,
+            next_run_at: None,
+            last_run_at: None,
+            last_session_id: None,
+            last_error: String::new(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+        store.insert_automation(&automation).unwrap();
+        let engine = Engine::new(store, data.path().to_path_buf(), &Config::default())
+            .with_config_dir(None)
+            .with_default_model("unconfigured/model");
+        let request = trouve_protocol::UpsertAutomationRequest {
+            name: automation.name.clone(),
+            prompt: automation.prompt.clone(),
+            workspace_id: automation.workspace_id.clone(),
+            mode: automation.mode.clone(),
+            model: automation.model.clone(),
+            thinking_level: automation.thinking_level.clone(),
+            model_options: automation.model_options.clone(),
+            permission_mode: automation.permission_mode,
+            schedule: automation.schedule.clone(),
+            enabled: false,
+        };
+
+        let updated = engine
+            .update_automation(&automation.id, request)
+            .await
+            .unwrap();
+        assert!(!updated.enabled);
+        assert_eq!(updated.model_options, automation.model_options);
+    }
+
+    #[tokio::test]
+    async fn automation_fires_reuse_validation_until_the_schema_changes() {
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let workspace = trouve_protocol::Workspace {
+            id: "ws_cached_automation".into(),
+            name: "cached".into(),
+            path: data.path().display().to_string(),
+        };
+        store.insert_workspace(&workspace).unwrap();
+        let live_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider = Arc::new(CatalogTestProvider::new(live_calls.clone()));
+        let live_queries_allowed = provider.live_queries_allowed.clone();
+        let static_options_advertised = provider.static_options_advertised.clone();
+        let engine = Engine::new(store, data.path().to_path_buf(), &Config::default())
+            .with_config_dir(None)
+            .with_provider("catalog-test", provider)
+            .with_default_model("catalog-test/static");
+        let automation = engine
+            .create_automation(trouve_protocol::UpsertAutomationRequest {
+                name: "Cached options".into(),
+                prompt: "Run later".into(),
+                workspace_id: workspace.id.clone(),
+                mode: None,
+                model: None,
+                thinking_level: None,
+                model_options: serde_json::Map::from_iter([(
+                    "fast".into(),
+                    serde_json::json!(true),
+                )]),
+                permission_mode: trouve_protocol::PermissionMode::Ask,
+                schedule: trouve_protocol::AutomationSchedule {
+                    kind: "daily".into(),
+                    minute: 0,
+                    time: "09:00".into(),
+                    days: Vec::new(),
+                },
+                enabled: true,
+            })
+            .await
+            .unwrap();
+        assert_eq!(live_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let initial_generation = engine
+            .automation_model_options_validations
+            .lock()
+            .unwrap()
+            .get(&automation.id)
+            .unwrap()
+            .generation;
+        let stale_snapshot = engine
+            .automation_snapshot_for_fire(&automation)
+            .await
+            .unwrap();
+        let stale_cached = engine
+            .automation_model_options_validations
+            .lock()
+            .unwrap()
+            .get(&automation.id)
+            .unwrap()
+            .clone();
+        let paused = engine
+            .set_automation_enabled(&automation.id, false)
+            .await
+            .unwrap();
+        let stale_error = engine
+            .complete_automation_model_options_for_fire(
+                &stale_snapshot,
+                Some(stale_cached.model.id),
+                stale_cached.validated_options,
+                AutomationModelOptionsCacheUpdate::Preserve,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(stale_error.contains("changed while its model options were validated"));
+        let automation = engine
+            .set_automation_enabled(&paused.id, true)
+            .await
+            .unwrap();
+        let current_generation = engine
+            .automation_model_options_validations
+            .lock()
+            .unwrap()
+            .get(&automation.id)
+            .unwrap()
+            .generation;
+        assert!(current_generation > initial_generation);
+
+        live_queries_allowed.store(false, std::sync::atomic::Ordering::SeqCst);
+        for _ in 0..2 {
+            let plan = engine
+                .automation_model_options_for_fire(&workspace, &automation)
+                .await
+                .unwrap();
+            assert_eq!(plan.validated_model.as_deref(), Some("catalog-test/static"));
+            assert_eq!(plan.model_options, automation.model_options);
+        }
+        assert_eq!(
+            live_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "unchanged fires must not repeat live catalog discovery"
+        );
+
+        live_queries_allowed.store(true, std::sync::atomic::Ordering::SeqCst);
+        engine.set_default_model("catalog-test/live", None).unwrap();
+        let model_drift_error = engine
+            .automation_model_options_for_fire(&workspace, &automation)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(model_drift_error.contains("model option fast is not advertised"));
+        assert_eq!(
+            live_calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "an inherited model change must trigger revalidation"
+        );
+        engine
+            .set_default_model("catalog-test/static", None)
+            .unwrap();
+        live_queries_allowed.store(false, std::sync::atomic::Ordering::SeqCst);
+        static_options_advertised.store(false, std::sync::atomic::Ordering::SeqCst);
+        let error = engine
+            .automation_model_options_for_fire(&workspace, &automation)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("model option fast is not advertised"));
+    }
+
+    #[tokio::test]
+    async fn stale_automation_updates_fail_after_model_validation() {
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let workspace = trouve_protocol::Workspace {
+            id: "ws_serialized_automation".into(),
+            name: "serialized".into(),
+            path: data.path().display().to_string(),
+        };
+        store.insert_workspace(&workspace).unwrap();
+        let automation = trouve_protocol::Automation {
+            id: "auto_serialized".into(),
+            name: "Original".into(),
+            prompt: "Run later".into(),
+            workspace_id: workspace.id,
+            mode: None,
+            model: Some("blocking-automation/static".into()),
+            thinking_level: None,
+            model_options: serde_json::Map::new(),
+            permission_mode: trouve_protocol::PermissionMode::Ask,
+            schedule: trouve_protocol::AutomationSchedule {
+                kind: "daily".into(),
+                minute: 0,
+                time: "09:00".into(),
+                days: Vec::new(),
+            },
+            enabled: true,
+            next_run_at: None,
+            last_run_at: None,
+            last_session_id: None,
+            last_error: String::new(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+        store.insert_automation(&automation).unwrap();
+        let started = Arc::new(tokio::sync::Semaphore::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let engine = Arc::new(
+            Engine::new(store.clone(), data.path().to_path_buf(), &Config::default())
+                .with_config_dir(None)
+                .with_provider(
+                    "blocking-automation",
+                    Arc::new(BlockingAutomationProvider {
+                        started: started.clone(),
+                        release: release.clone(),
+                    }),
+                ),
+        );
+        let request = trouve_protocol::UpsertAutomationRequest {
+            name: automation.name.clone(),
+            prompt: automation.prompt.clone(),
+            workspace_id: automation.workspace_id.clone(),
+            mode: automation.mode.clone(),
+            model: automation.model.clone(),
+            thinking_level: automation.thinking_level.clone(),
+            model_options: automation.model_options.clone(),
+            permission_mode: automation.permission_mode,
+            schedule: automation.schedule.clone(),
+            enabled: true,
+        };
+
+        let first_engine = engine.clone();
+        let mut first_request = request.clone();
+        first_request.name = "Edited while pause waited".into();
+        first_request
+            .model_options
+            .insert("fast".into(), serde_json::json!(true));
+        let first = tokio::spawn(async move {
+            first_engine
+                .update_automation("auto_serialized", first_request)
+                .await
+        });
+        started.acquire().await.unwrap().forget();
+
+        let second_engine = engine.clone();
+        let second = tokio::spawn(async move {
+            second_engine
+                .set_automation_enabled("auto_serialized", false)
+                .await
+        });
+        let updated = tokio::time::timeout(std::time::Duration::from_secs(1), second)
+            .await
+            .expect("provider I/O must stay outside the mutation lock")
+            .unwrap()
+            .unwrap();
+        assert!(!updated.enabled);
+        assert_eq!(updated.name, "Original");
+
+        release.add_permits(1);
+        let error = first.await.unwrap().unwrap_err().to_string();
+        assert!(error.contains("changed while its model options were validated"));
+        let stored = store.automation(&automation.id).unwrap().unwrap();
+        assert!(!stored.enabled);
+        assert_eq!(stored.name, "Original");
+        assert!(stored.model_options.is_empty());
+    }
+
+    #[tokio::test]
+    async fn legacy_automation_thinking_defers_transient_model_resolution_failures() {
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let engine = Engine::new(store.clone(), data.path().to_path_buf(), &Config::default())
+            .with_config_dir(None)
+            .with_default_model("unconfigured/model");
+        let workspace = trouve_protocol::Workspace {
+            id: "ws_legacy_automation".into(),
+            name: "legacy".into(),
+            path: data.path().display().to_string(),
+        };
+        store.insert_workspace(&workspace).unwrap();
+        let mut automation = trouve_protocol::Automation {
+            id: "auto_legacy_thinking".into(),
+            name: "Legacy thinking".into(),
+            prompt: "Run later".into(),
+            workspace_id: workspace.id.clone(),
+            mode: None,
+            model: None,
+            thinking_level: Some("high".into()),
+            model_options: serde_json::Map::new(),
+            permission_mode: trouve_protocol::PermissionMode::Ask,
+            schedule: trouve_protocol::AutomationSchedule {
+                kind: "daily".into(),
+                minute: 0,
+                time: "09:00".into(),
+                days: Vec::new(),
+            },
+            enabled: true,
+            next_run_at: None,
+            last_run_at: None,
+            last_session_id: None,
+            last_error: String::new(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+        store.insert_automation(&automation).unwrap();
+
+        let plan = engine
+            .automation_model_options_for_fire(&workspace, &automation)
+            .await
+            .unwrap();
+        assert_eq!(plan.validated_model, None);
+        assert_eq!(
+            plan.model_options,
+            serde_json::Map::from_iter([("thinking_level".into(), serde_json::json!("high"))])
+        );
+
+        automation
+            .model_options
+            .insert("fast".into(), serde_json::json!(true));
+        assert!(
+            engine
+                .automation_model_options_for_fire(&workspace, &automation)
+                .await
+                .is_err(),
+            "explicit persisted options must remain strict when model metadata is unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_automation_validation_cannot_dispatch_after_lifecycle_mutations() {
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let workspace = trouve_protocol::Workspace {
+            id: "ws_stale_dispatch".into(),
+            name: "stale dispatch".into(),
+            path: data.path().display().to_string(),
+        };
+        store.insert_workspace(&workspace).unwrap();
+        let engine = Arc::new(
+            Engine::new(store, data.path().to_path_buf(), &Config::default())
+                .with_config_dir(None)
+                .with_provider(
+                    "catalog-test",
+                    Arc::new(CatalogTestProvider::new(Arc::new(
+                        std::sync::atomic::AtomicUsize::new(0),
+                    ))),
+                )
+                .with_default_model("catalog-test/static"),
+        );
+        let automation = trouve_protocol::Automation {
+            id: "auto_stale_dispatch".into(),
+            name: "Stale dispatch".into(),
+            prompt: "Run later".into(),
+            workspace_id: workspace.id.clone(),
+            mode: None,
+            model: Some("catalog-test/static".into()),
+            thinking_level: None,
+            model_options: serde_json::Map::from_iter([("fast".into(), serde_json::json!(true))]),
+            permission_mode: trouve_protocol::PermissionMode::Ask,
+            schedule: trouve_protocol::AutomationSchedule {
+                kind: "daily".into(),
+                minute: 0,
+                time: "09:00".into(),
+                days: Vec::new(),
+            },
+            enabled: true,
+            next_run_at: None,
+            last_run_at: None,
+            last_session_id: None,
+            last_error: String::new(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+        engine.store.insert_automation(&automation).unwrap();
+
+        let plan = engine
+            .automation_model_options_for_fire(&workspace, &automation)
+            .await
+            .unwrap();
+        let paused = engine
+            .set_automation_enabled(&automation.id, false)
+            .await
+            .unwrap();
+        let current = engine
+            .set_automation_enabled(&paused.id, true)
+            .await
+            .unwrap();
+        assert!(
+            engine.dispatch_automation_plan(plan).await.is_err(),
+            "a pause must invalidate validation even when the automation is re-enabled"
+        );
+
+        let plan = engine
+            .automation_model_options_for_fire(&workspace, &current)
+            .await
+            .unwrap();
+        let mut request = trouve_protocol::UpsertAutomationRequest {
+            name: current.name.clone(),
+            prompt: current.prompt.clone(),
+            workspace_id: current.workspace_id.clone(),
+            mode: current.mode.clone(),
+            model: current.model.clone(),
+            thinking_level: current.thinking_level.clone(),
+            model_options: current.model_options.clone(),
+            permission_mode: current.permission_mode,
+            schedule: current.schedule.clone(),
+            enabled: current.enabled,
+        };
+        request.prompt = "Edited after validation".into();
+        let updated = engine
+            .update_automation(&current.id, request)
+            .await
+            .unwrap();
+        assert!(
+            engine.dispatch_automation_plan(plan).await.is_err(),
+            "an edit committed after validation must cancel dispatch"
+        );
+
+        let plan = engine
+            .automation_model_options_for_fire(&workspace, &updated)
+            .await
+            .unwrap();
+        engine.delete_automation(&updated.id).await.unwrap();
+        assert!(
+            engine.dispatch_automation_plan(plan).await.is_err(),
+            "a deletion committed after validation must cancel dispatch"
+        );
+        assert!(
+            engine
+                .list_sessions(Some(&workspace.id))
+                .unwrap()
+                .is_empty(),
+            "stale dispatch attempts must not create sessions"
+        );
+    }
+
+    #[tokio::test]
+    async fn deleted_automation_cannot_republish_validation_after_catalog_io() {
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let workspace = trouve_protocol::Workspace {
+            id: "ws_deleted_validation".into(),
+            name: "deleted validation".into(),
+            path: data.path().display().to_string(),
+        };
+        store.insert_workspace(&workspace).unwrap();
+        let automation = trouve_protocol::Automation {
+            id: "auto_deleted_validation".into(),
+            name: "Delete during validation".into(),
+            prompt: "Run later".into(),
+            workspace_id: workspace.id.clone(),
+            mode: None,
+            model: Some("blocking-automation/static".into()),
+            thinking_level: None,
+            model_options: serde_json::Map::from_iter([("fast".into(), serde_json::json!(true))]),
+            permission_mode: trouve_protocol::PermissionMode::Ask,
+            schedule: trouve_protocol::AutomationSchedule {
+                kind: "daily".into(),
+                minute: 0,
+                time: "09:00".into(),
+                days: Vec::new(),
+            },
+            enabled: true,
+            next_run_at: None,
+            last_run_at: None,
+            last_session_id: None,
+            last_error: String::new(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+        store.insert_automation(&automation).unwrap();
+        let started = Arc::new(tokio::sync::Semaphore::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let engine = Arc::new(
+            Engine::new(store, data.path().to_path_buf(), &Config::default())
+                .with_config_dir(None)
+                .with_provider(
+                    "blocking-automation",
+                    Arc::new(BlockingAutomationProvider {
+                        started: started.clone(),
+                        release: release.clone(),
+                    }),
+                ),
+        );
+        let fire_engine = engine.clone();
+        let fire_workspace = workspace.clone();
+        let fire_automation = automation.clone();
+        let fire = tokio::spawn(async move {
+            fire_engine
+                .automation_model_options_for_fire(&fire_workspace, &fire_automation)
+                .await
+        });
+        started.acquire().await.unwrap().forget();
+
+        engine.delete_automation(&automation.id).await.unwrap();
+        release.add_permits(1);
+        let error = fire.await.unwrap().unwrap_err().to_string();
+        assert!(error.contains("automation auto_deleted_validation"));
+        assert!(
+            !engine
+                .automation_model_options_validations
+                .lock()
+                .unwrap()
+                .contains_key(&automation.id),
+            "a deleted automation must not regain a cache entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn automation_options_are_revalidated_after_default_model_drift() {
+        let data = tempfile::tempdir().unwrap();
+        let live_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &Config::default(),
+        )
+        .with_config_dir(None)
+        .with_provider(
+            "catalog-test",
+            Arc::new(CatalogTestProvider::new(live_calls)),
+        )
+        .with_default_model("catalog-test/static");
+        let workspace = trouve_protocol::Workspace {
+            id: "ws_drift_automation".into(),
+            name: "drift".into(),
+            path: data.path().display().to_string(),
+        };
+        let options = serde_json::Map::from_iter([("fast".into(), serde_json::json!(true))]);
+        let (validated_model, validated_options) = engine
+            .validated_automation_model_options(&workspace, None, None, None, &options, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            validated_model.as_ref().map(|model| model.id.as_str()),
+            Some("catalog-test/static")
+        );
+        assert_eq!(validated_options, options);
+
+        engine.set_default_model("catalog-test/live", None).unwrap();
+        assert!(
+            engine
+                .validated_automation_model_options(&workspace, None, None, None, &options, true,)
+                .await
+                .is_err(),
+            "fire-time validation must reject options after the inherited model changes"
+        );
     }
 
     #[tokio::test]
@@ -26331,7 +31238,7 @@ default_permission_mode = "ask"
     }
 
     #[test]
-    fn codex_and_claude_default_to_the_full_tool_bridge() {
+    fn vendor_backends_receive_their_supported_tool_bridge_surface() {
         let data = tempfile::tempdir().unwrap();
         let mut config = Config::default();
         config.providers.insert(
@@ -26356,11 +31263,21 @@ default_permission_mode = "ask"
                 ..Default::default()
             },
         );
-        let engine = Engine::new(
+        config.providers.insert(
+            "cursor".into(),
+            ProviderConfig {
+                kind: "cursor-sdk".into(),
+                // Cursor's SDK adapter always uses the full Trouve bridge;
+                // a stale opt-out must not re-enable vendor-native tools.
+                tool_bridge: Some(false),
+                ..Default::default()
+            },
+        );
+        let engine = Arc::new(Engine::new(
             Store::open_in_memory().unwrap(),
             data.path().to_path_buf(),
             &config,
-        );
+        ));
         engine.set_base_url("http://127.0.0.1:4000");
         let _cancel = engine.register_cancel("th_1");
 
@@ -26430,6 +31347,12 @@ default_permission_mode = "ask"
             .unwrap();
         assert!(!native.bridge_tools);
         assert!(native.url.contains("tools=0"));
+
+        let cursor = engine.mcp_bridge_for("cursor/model", "th_1").unwrap();
+        assert!(cursor.bridge_tools);
+        assert!(cursor.url.contains("tools=1"));
+        assert!(cursor.url.contains("approval=0"));
+        assert!(cursor.disallowed_tools.is_empty());
         engine.clear_cancel("th_1");
     }
 
@@ -26896,47 +31819,6 @@ default_permission_mode = "ask"
         );
     }
 
-    #[tokio::test]
-    async fn gpu_only_title_settings_require_a_detected_gpu_before_transition() {
-        let data = tempfile::tempdir().unwrap();
-        let engine = Engine::new(
-            Store::open_in_memory().unwrap(),
-            data.path().to_path_buf(),
-            &Config::default(),
-        );
-        engine
-            .hardware
-            .set(crate::local::Hardware {
-                ram_bytes: 16 * 1024 * 1024 * 1024,
-                gpus: Vec::new(),
-            })
-            .unwrap();
-
-        let _transition = engine.title_model_behavior_transition.lock().await;
-        let error = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            engine.set_git_worktree_settings(
-                trouve_protocol::TitleModelLoadBehavior::Always,
-                trouve_protocol::TitleModelResourcePolicy::GpuOnly,
-                None,
-            ),
-        )
-        .await
-        .expect("hardware validation must run before waiting for the transition lock")
-        .unwrap_err();
-
-        assert!(matches!(error, EngineError::BadRequest(ref message)
-                if message == "GPU-only session naming requires a detected GPU"));
-        let config = engine.config.lock().unwrap();
-        assert_eq!(config.title_model_load_behavior, None);
-        assert_eq!(config.title_model_resource_policy, None);
-        drop(config);
-        assert_eq!(
-            engine.git_worktree_settings().title_model_resource_policy,
-            trouve_protocol::TitleModelResourcePolicy::CpuRamOnly
-        );
-    }
-
     #[test]
     fn provider_templates_expand_without_shell_semantics() {
         let values = std::collections::BTreeMap::from([
@@ -26966,8 +31848,29 @@ default_permission_mode = "ask"
         unsafe { std::env::remove_var(ENV_ONLY) };
     }
 
-    #[test]
-    fn preset_upsert_preserves_existing_transport_templates_when_omitted() {
+    #[tokio::test]
+    async fn automatic_selector_namespace_cannot_be_a_provider_id() {
+        let data = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &Config::default(),
+        ));
+        let error = engine
+            .upsert_provider(
+                "auto",
+                &UpsertProviderRequest {
+                    kind: "openai-compat".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("reserved"));
+    }
+
+    #[tokio::test]
+    async fn preset_upsert_preserves_existing_transport_templates_when_omitted() {
         let data = tempfile::tempdir().unwrap();
         let custom_base_url = "https://custom.azure.test/openai".to_string();
         let custom_headers =
@@ -26985,11 +31888,11 @@ default_permission_mode = "ask"
                 ..Default::default()
             },
         );
-        let engine = Engine::new(
+        let engine = Arc::new(Engine::new(
             Store::open_in_memory().unwrap(),
             data.path().to_path_buf(),
             &config,
-        );
+        ));
         engine
             .upsert_provider(
                 "azure",
@@ -26998,6 +31901,7 @@ default_permission_mode = "ask"
                     ..Default::default()
                 },
             )
+            .await
             .unwrap();
 
         let config = engine.config.lock().unwrap();
@@ -27005,6 +31909,2586 @@ default_permission_mode = "ask"
         assert_eq!(provider.base_url.as_deref(), Some(custom_base_url.as_str()));
         assert_eq!(provider.headers, custom_headers);
         assert_eq!(provider.query_params, custom_query);
+    }
+
+    #[tokio::test]
+    async fn partial_upsert_classifies_the_resulting_kimi_endpoint() {
+        const ID: &str = "custom-kimi";
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            ID.into(),
+            ProviderConfig {
+                kind: "openai-compat".into(),
+                base_url: Some(trouve_providers::kimi_usage::KIMI_CODE_BASE_URL.into()),
+                api_key: Some("test-key".into()),
+                ..Default::default()
+            },
+        );
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        ));
+
+        let updated = engine
+            .upsert_provider(
+                ID,
+                &UpsertProviderRequest {
+                    kind: "openai-compat".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(updated.category, "subscription");
+        let listed = engine
+            .list_providers()
+            .providers
+            .into_iter()
+            .find(|provider| provider.id == ID)
+            .unwrap();
+        assert_eq!(listed.category, updated.category);
+        assert_eq!(listed.base_url, updated.base_url);
+    }
+
+    #[tokio::test]
+    async fn cursor_sdk_migration_clears_the_legacy_acp_command() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            "cursor".into(),
+            ProviderConfig {
+                kind: "cursor-cli".into(),
+                command: Some("/legacy/bin/cursor-agent".into()),
+                ..Default::default()
+            },
+        );
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        ));
+
+        engine
+            .upsert_provider(
+                "cursor",
+                &UpsertProviderRequest {
+                    kind: "cursor-sdk".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let config = engine.config.lock().unwrap();
+        let provider = config.providers.get("cursor").unwrap();
+        assert_eq!(provider.kind, "cursor-sdk");
+        assert_eq!(provider.command, None);
+        assert_eq!(configured_runtime_command(provider), None);
+    }
+
+    #[tokio::test]
+    async fn provider_kind_change_clears_an_incompatible_runtime_command() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            "agent".into(),
+            ProviderConfig {
+                kind: "codex-app-server".into(),
+                command: Some("/opt/custom/bin/codex".into()),
+                ..Default::default()
+            },
+        );
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        ));
+
+        engine
+            .upsert_provider(
+                "agent",
+                &UpsertProviderRequest {
+                    kind: "cursor-sdk".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let config = engine.config.lock().unwrap();
+        let provider = config.providers.get("agent").unwrap();
+        assert_eq!(provider.kind, "cursor-sdk");
+        assert_eq!(provider.command, None);
+        assert_eq!(configured_runtime_command(provider), None);
+    }
+
+    #[tokio::test]
+    async fn public_provider_upsert_rejects_the_legacy_cursor_cli_kind() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            "cursor".into(),
+            ProviderConfig {
+                kind: "cursor-cli".into(),
+                command: Some("cursor-agent".into()),
+                ..Default::default()
+            },
+        );
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        ));
+
+        let error = engine
+            .upsert_provider(
+                "cursor",
+                &UpsertProviderRequest {
+                    kind: "cursor-cli".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("legacy migration state"));
+        let config = engine.config.lock().unwrap();
+        assert_eq!(config.providers["cursor"].kind, "cursor-cli");
+        assert_eq!(
+            config.providers["cursor"].command.as_deref(),
+            Some("cursor-agent")
+        );
+    }
+
+    #[test]
+    fn targeted_provider_rebuild_constructs_only_requested_api_providers() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        for id in ["target-api", "unrelated-api"] {
+            config.providers.insert(
+                id.into(),
+                ProviderConfig {
+                    kind: "openai-compat".into(),
+                    base_url: Some(format!("https://{id}.example.test/v1")),
+                    api_key: Some("test-key".into()),
+                    ..Default::default()
+                },
+            );
+        }
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        );
+        let replacements = build_providers_for_ids(
+            &config,
+            &engine.secrets,
+            &engine.model_catalog,
+            Some(&HashSet::from(["target-api".to_string()])),
+        );
+
+        assert_eq!(replacements.len(), 1);
+        assert!(replacements.contains_key("target-api"));
+    }
+
+    #[tokio::test]
+    async fn title_model_provider_refresh_waits_for_provider_transition() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            "old-api".into(),
+            ProviderConfig {
+                kind: "openai-compat".into(),
+                base_url: Some("https://old.example.test/v1".into()),
+                api_key: Some("test-key".into()),
+                ..Default::default()
+            },
+        );
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        ));
+        let transition = engine.provider_reload.clone().write_owned().await;
+        let refresh = {
+            let engine = engine.clone();
+            tokio::spawn(async move {
+                engine.refresh_api_provider_registry().await;
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(
+            !refresh.is_finished(),
+            "title-model refresh bypassed the provider transition"
+        );
+
+        {
+            let mut config = engine.config.lock().unwrap();
+            config.providers.remove("old-api");
+            config.providers.insert(
+                "new-api".into(),
+                ProviderConfig {
+                    kind: "openai-compat".into(),
+                    base_url: Some("https://new.example.test/v1".into()),
+                    api_key: Some("test-key".into()),
+                    ..Default::default()
+                },
+            );
+        }
+        engine.replace_provider_registries_for_ids(&HashSet::from([
+            "old-api".to_string(),
+            "new-api".to_string(),
+        ]));
+        drop(transition);
+        tokio::time::timeout(Duration::from_secs(3), refresh)
+            .await
+            .expect("serialized title-model refresh did not finish")
+            .unwrap();
+
+        let providers = engine.providers.read().unwrap();
+        assert!(!providers.contains_key("old-api"));
+        assert!(providers.contains_key("new-api"));
+    }
+
+    struct FailingShutdownBackend {
+        shutdowns: std::sync::atomic::AtomicUsize,
+    }
+
+    struct TransientShutdownBackend {
+        shutdowns: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentBackend for TransientShutdownBackend {
+        fn id(&self) -> &str {
+            "transient-shutdown"
+        }
+
+        fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
+            Vec::new()
+        }
+
+        fn status(&self) -> trouve_agents::BackendStatus {
+            trouve_agents::BackendStatus::default()
+        }
+
+        async fn shutdown(&self) -> Result<(), BackendError> {
+            let attempt = self
+                .shutdowns
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if attempt == 0 {
+                Err(BackendError::Protocol("transient shutdown failure".into()))
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn start_login(&self) -> Result<trouve_agents::BackendLogin, BackendError> {
+            Err(BackendError::Protocol("not used".into()))
+        }
+
+        async fn run_turn(
+            &self,
+            _turn: BackendTurn,
+        ) -> Result<trouve_agents::BackendEventStream, BackendError> {
+            Err(BackendError::Protocol("not used".into()))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AgentBackend for FailingShutdownBackend {
+        fn id(&self) -> &str {
+            "failing-shutdown"
+        }
+
+        fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
+            Vec::new()
+        }
+
+        fn status(&self) -> trouve_agents::BackendStatus {
+            trouve_agents::BackendStatus::default()
+        }
+
+        async fn shutdown(&self) -> Result<(), BackendError> {
+            self.shutdowns
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(BackendError::Protocol("injected shutdown failure".into()))
+        }
+
+        async fn start_login(&self) -> Result<trouve_agents::BackendLogin, BackendError> {
+            Err(BackendError::Protocol("not used".into()))
+        }
+
+        async fn run_turn(
+            &self,
+            _turn: BackendTurn,
+        ) -> Result<trouve_agents::BackendEventStream, BackendError> {
+            Err(BackendError::Protocol("not used".into()))
+        }
+    }
+
+    struct BlockingShutdownBackend {
+        entered: Arc<tokio::sync::Semaphore>,
+        release: Arc<tokio::sync::Semaphore>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentBackend for BlockingShutdownBackend {
+        fn id(&self) -> &str {
+            "blocking-shutdown"
+        }
+
+        fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
+            Vec::new()
+        }
+
+        fn status(&self) -> trouve_agents::BackendStatus {
+            trouve_agents::BackendStatus::default()
+        }
+
+        async fn shutdown(&self) -> Result<(), BackendError> {
+            self.entered.add_permits(1);
+            self.release.acquire().await.unwrap().forget();
+            Ok(())
+        }
+
+        async fn start_login(&self) -> Result<trouve_agents::BackendLogin, BackendError> {
+            Err(BackendError::Protocol("not used".into()))
+        }
+
+        async fn run_turn(
+            &self,
+            _turn: BackendTurn,
+        ) -> Result<trouve_agents::BackendEventStream, BackendError> {
+            Err(BackendError::Protocol("not used".into()))
+        }
+    }
+
+    #[test]
+    fn targeted_backend_build_skips_unrelated_vendor_runtimes() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        for (id, kind) in [("cursor", "cursor-sdk"), ("claude", "claude-cli")] {
+            config.providers.insert(
+                id.into(),
+                ProviderConfig {
+                    kind: kind.into(),
+                    ..Default::default()
+                },
+            );
+        }
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        );
+
+        let replacements = build_backends_for_ids(
+            &config,
+            &engine.secrets,
+            data.path(),
+            &engine.model_catalog,
+            Some(&HashSet::from(["cursor".to_string()])),
+        );
+
+        assert_eq!(replacements.len(), 1);
+        assert!(replacements.contains_key("cursor"));
+    }
+
+    #[tokio::test]
+    async fn provider_secret_failure_preserves_the_active_backend() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            "cursor".into(),
+            ProviderConfig {
+                kind: "cursor-sdk".into(),
+                ..Default::default()
+            },
+        );
+        let observing_store = Arc::new(RegistryObservingFailingSecretStore::new());
+        let mut engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        );
+        engine.secrets = observing_store.clone();
+        let engine = Arc::new(engine);
+        *observing_store.engine.lock().unwrap() = Arc::downgrade(&engine);
+        let entered = Arc::new(tokio::sync::Semaphore::new(0));
+        let active: Arc<dyn AgentBackend> = Arc::new(BlockingShutdownBackend {
+            entered: entered.clone(),
+            release: Arc::new(tokio::sync::Semaphore::new(1)),
+        });
+        engine
+            .backends
+            .write()
+            .unwrap()
+            .insert("cursor".into(), active.clone());
+
+        let result = engine
+            .upsert_provider(
+                "cursor",
+                &UpsertProviderRequest {
+                    kind: "cursor-sdk".into(),
+                    api_key: Some("replacement-key".into()),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert!(
+            observing_store
+                .saw_published_backend
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "the healthy backend was retired before the secret write succeeded"
+        );
+        assert_eq!(
+            entered.available_permits(),
+            0,
+            "secret-store rejection attempted backend shutdown"
+        );
+        assert!(Arc::ptr_eq(
+            &engine.backends.read().unwrap()["cursor"],
+            &active
+        ));
+        assert_eq!(
+            engine.config.lock().unwrap().providers["cursor"].kind,
+            "cursor-sdk"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn provider_secret_io_runs_off_the_async_worker() {
+        let data = tempfile::tempdir().unwrap();
+        let (secret_store, mut read_started_rx) = BlockingReadProviderSecretStore::new();
+        let secret_store = Arc::new(secret_store);
+        let mut engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &Config::default(),
+        );
+        engine.secrets = secret_store.clone();
+        let engine = Arc::new(engine);
+        let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+        let release = {
+            let secret_store = secret_store.clone();
+            std::thread::spawn(move || {
+                secret_store.release_read_after_progress(progress_rx, Duration::from_secs(2))
+            })
+        };
+        let mut update = tokio::spawn({
+            let engine = engine.clone();
+            async move {
+                engine
+                    .upsert_provider(
+                        "blocking-secret",
+                        &UpsertProviderRequest {
+                            kind: "openai-compat".into(),
+                            api_key: Some("test-key".into()),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            }
+        });
+
+        observe_blocked_secret_read(
+            &secret_store,
+            &mut read_started_rx,
+            &mut update,
+            "provider update",
+        )
+        .await;
+        let _ = progress_tx.send(());
+        let update_result = tokio::time::timeout(Duration::from_secs(3), update).await;
+        let async_worker_progressed = release.join().unwrap();
+        assert!(
+            async_worker_progressed,
+            "synchronous secret-store I/O blocked the async runtime worker"
+        );
+        update_result
+            .expect("provider update did not finish after secret I/O resumed")
+            .expect("provider update task failed")
+            .expect("provider update failed");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn provider_registry_publication_runs_off_the_async_worker() {
+        const ID: &str = "blocking-publication";
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            ID.into(),
+            ProviderConfig {
+                kind: "openai-compat".into(),
+                base_url: Some("https://old.example.test/v1".into()),
+                ..Default::default()
+            },
+        );
+        let (secret_store, mut read_started_rx) = BlockingReadProviderSecretStore::new();
+        let secret_store = Arc::new(secret_store);
+        let mut engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        );
+        engine.secrets = secret_store.clone();
+        let engine = Arc::new(engine);
+        let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+        let release = {
+            let secret_store = secret_store.clone();
+            std::thread::spawn(move || {
+                secret_store.release_read_after_progress(progress_rx, Duration::from_secs(2))
+            })
+        };
+        let mut update = tokio::spawn({
+            let engine = engine.clone();
+            async move {
+                engine
+                    .upsert_provider(
+                        ID,
+                        &UpsertProviderRequest {
+                            kind: "openai-compat".into(),
+                            base_url: Some("https://new.example.test/v1".into()),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            }
+        });
+
+        observe_blocked_secret_read(
+            &secret_store,
+            &mut read_started_rx,
+            &mut update,
+            "provider registry publication",
+        )
+        .await;
+        let _ = progress_tx.send(());
+        let update_result = tokio::time::timeout(Duration::from_secs(3), update).await;
+        let async_worker_progressed = release.join().unwrap();
+        assert!(
+            async_worker_progressed,
+            "registry construction blocked the async runtime worker"
+        );
+        update_result
+            .expect("provider update did not finish after registry construction resumed")
+            .expect("provider update task failed")
+            .expect("provider update failed");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_provider_publication_keeps_config_and_credentials_on_one_revision() {
+        const ID: &str = "cancelled-publication";
+        let data = tempfile::tempdir().unwrap();
+        let config_file = data.path().join("config.toml");
+        let mut config = Config::default();
+        config.providers.insert(
+            ID.into(),
+            ProviderConfig {
+                kind: "openai-compat".into(),
+                base_url: Some("https://old.example.test/v1".into()),
+                ..Default::default()
+            },
+        );
+        config.save_to(&config_file).unwrap();
+        // The first read snapshots the old credential for the transaction;
+        // block the second read while the detached publication rebuilds the
+        // live registry from the newly committed revision.
+        let (secret_store, mut read_started_rx) =
+            BlockingReadProviderSecretStore::after_unblocked_reads(1);
+        let api_key = trouve_providers::secrets::api_key_secret(ID);
+        secret_store
+            .values
+            .lock()
+            .unwrap()
+            .insert(api_key.clone(), "old-key".into());
+        let secret_store = Arc::new(secret_store);
+        let mut engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        )
+        .with_config_file(Some(config_file.clone()));
+        engine.secrets = secret_store.clone();
+        let engine = Arc::new(engine);
+        let mut update = tokio::spawn({
+            let engine = engine.clone();
+            async move {
+                engine
+                    .upsert_provider(
+                        ID,
+                        &UpsertProviderRequest {
+                            kind: "openai-compat".into(),
+                            base_url: Some("https://new.example.test/v1".into()),
+                            api_key: Some("new-key".into()),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            }
+        });
+
+        observe_blocked_secret_read(
+            &secret_store,
+            &mut read_started_rx,
+            &mut update,
+            "provider registry publication",
+        )
+        .await;
+        assert_eq!(
+            engine.config.lock().unwrap().providers[ID]
+                .base_url
+                .as_deref(),
+            Some("https://new.example.test/v1")
+        );
+        assert_eq!(
+            secret_store.values.lock().unwrap().get(&api_key),
+            Some(&"new-key".to_string())
+        );
+
+        update.abort();
+        assert!(update.await.unwrap_err().is_cancelled());
+        secret_store.release_read();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if engine.provider_transition_lock(ID).try_lock_owned().is_ok() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached provider publication did not finish after cancellation");
+
+        let persisted = Config::load_from(&config_file);
+        assert_eq!(
+            persisted.providers[ID].base_url.as_deref(),
+            Some("https://new.example.test/v1")
+        );
+        assert_eq!(
+            secret_store.values.lock().unwrap().get(&api_key),
+            Some(&"new-key".to_string())
+        );
+        assert!(engine.providers.read().unwrap().contains_key(ID));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn api_provider_refresh_runs_off_the_async_worker() {
+        const ID: &str = "blocking-refresh";
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            ID.into(),
+            ProviderConfig {
+                kind: "openai-compat".into(),
+                base_url: Some("https://example.test/v1".into()),
+                ..Default::default()
+            },
+        );
+        let (secret_store, mut read_started_rx) = BlockingReadProviderSecretStore::new();
+        let secret_store = Arc::new(secret_store);
+        let mut engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        );
+        engine.secrets = secret_store.clone();
+        let engine = Arc::new(engine);
+        let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+        let release = {
+            let secret_store = secret_store.clone();
+            std::thread::spawn(move || {
+                secret_store.release_read_after_progress(progress_rx, Duration::from_secs(2))
+            })
+        };
+        let mut refresh = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.refresh_api_provider_registry().await }
+        });
+
+        observe_blocked_secret_read(
+            &secret_store,
+            &mut read_started_rx,
+            &mut refresh,
+            "API provider refresh",
+        )
+        .await;
+        let _ = progress_tx.send(());
+        let refresh_result = tokio::time::timeout(Duration::from_secs(3), refresh).await;
+        let async_worker_progressed = release.join().unwrap();
+        assert!(
+            async_worker_progressed,
+            "API provider refresh blocked the async runtime worker"
+        );
+        refresh_result
+            .expect("API provider refresh did not finish after secret I/O resumed")
+            .expect("API provider refresh task failed");
+    }
+
+    #[tokio::test]
+    async fn api_provider_refresh_releases_its_barrier_after_blocking_io_times_out() {
+        const ID: &str = "timed-out-refresh";
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            ID.into(),
+            ProviderConfig {
+                kind: "openai-compat".into(),
+                base_url: Some("https://example.test/v1".into()),
+                ..Default::default()
+            },
+        );
+        let (secret_store, mut read_started_rx) = BlockingReadProviderSecretStore::new();
+        let secret_store = Arc::new(secret_store);
+        let mut engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        );
+        engine.secrets = secret_store.clone();
+        let engine = Arc::new(engine);
+        let published: Arc<dyn Provider> = Arc::new(CatalogTestProvider::new(Arc::new(
+            std::sync::atomic::AtomicUsize::new(0),
+        )));
+        engine
+            .providers
+            .write()
+            .unwrap()
+            .insert(ID.into(), published.clone());
+        let mut refresh = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.refresh_api_provider_registry().await }
+        });
+
+        observe_blocked_secret_read(
+            &secret_store,
+            &mut read_started_rx,
+            &mut refresh,
+            "timed API provider refresh",
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(1), &mut refresh)
+            .await
+            .expect("API provider refresh did not honor its blocking-I/O deadline")
+            .expect("API provider refresh task failed");
+        let transition = tokio::time::timeout(
+            Duration::from_millis(100),
+            engine.provider_reload.clone().write_owned(),
+        )
+        .await
+        .expect("timed-out API refresh retained the global provider barrier");
+        drop(transition);
+
+        secret_store.release_read();
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(Arc::ptr_eq(
+            &engine.providers.read().unwrap()[ID],
+            &published
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_provider_secret_write_retains_transition_until_rollback() {
+        let data = tempfile::tempdir().unwrap();
+        let (secret_store, mut read_started_rx) = BlockingReadProviderSecretStore::new();
+        let secret_store = Arc::new(secret_store);
+        let mut engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &Config::default(),
+        );
+        engine.secrets = secret_store.clone();
+        let engine = Arc::new(engine);
+        let mut first = tokio::spawn({
+            let engine = engine.clone();
+            async move {
+                engine
+                    .upsert_provider(
+                        "cancelled-secret",
+                        &UpsertProviderRequest {
+                            kind: "openai-compat".into(),
+                            api_key: Some("cancelled-value".into()),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            }
+        });
+
+        observe_blocked_secret_read(
+            &secret_store,
+            &mut read_started_rx,
+            &mut first,
+            "cancelled provider update",
+        )
+        .await;
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+
+        let second = tokio::spawn({
+            let engine = engine.clone();
+            async move {
+                engine
+                    .upsert_provider(
+                        "cancelled-secret",
+                        &UpsertProviderRequest {
+                            kind: "openai-compat".into(),
+                            api_key: Some("durable-value".into()),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !second.is_finished(),
+            "a later provider update bypassed the cancelled write's transition guard"
+        );
+
+        secret_store.release_read();
+        tokio::time::timeout(Duration::from_secs(5), second)
+            .await
+            .expect("later provider update stayed fenced after rollback")
+            .expect("later provider update task failed")
+            .expect("later provider update failed");
+        assert_eq!(
+            secret_store
+                .values
+                .lock()
+                .unwrap()
+                .get(&trouve_providers::secrets::api_key_secret(
+                    "cancelled-secret"
+                ))
+                .map(String::as_str),
+            Some("durable-value")
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_upsert_rolls_back_partial_secret_writes() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            "cursor".into(),
+            ProviderConfig {
+                kind: "cursor-sdk".into(),
+                ..Default::default()
+            },
+        );
+        let api_key = trouve_providers::secrets::api_key_secret("cursor");
+        let fail_key = trouve_providers::secrets::provider_secret("cursor", "team");
+        let secret_store = Arc::new(PartiallyFailingProviderSecretStore {
+            values: Mutex::new(HashMap::from([(api_key.clone(), "old-key".into())])),
+            fail_key: fail_key.clone(),
+        });
+        let mut engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        );
+        engine.secrets = secret_store.clone();
+        let engine = Arc::new(engine);
+
+        let result = engine
+            .upsert_provider(
+                "cursor",
+                &UpsertProviderRequest {
+                    kind: "cursor-sdk".into(),
+                    api_key: Some("new-key".into()),
+                    secret_values: std::collections::BTreeMap::from([(
+                        "team".into(),
+                        "new-team".into(),
+                    )]),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        assert!(result.is_err());
+        let values = secret_store.values.lock().unwrap();
+        assert_eq!(values.get(&api_key).map(String::as_str), Some("old-key"));
+        assert!(!values.contains_key(&fail_key));
+        drop(values);
+        assert!(engine.backends.read().unwrap().contains_key("cursor"));
+    }
+
+    #[tokio::test]
+    async fn initial_secret_write_failure_retains_rollback_until_reconciled() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            "cursor".into(),
+            ProviderConfig {
+                kind: "openai-compat".into(),
+                base_url: Some("https://cursor.example.test/v1".into()),
+                ..Default::default()
+            },
+        );
+        let api_key = trouve_providers::secrets::api_key_secret("cursor");
+        let team_key = trouve_providers::secrets::provider_secret("cursor", "team");
+        let secret_store = Arc::new(RecoverableInitialWriteFailureSecretStore {
+            rollback_key: api_key.clone(),
+            forward_failure_key: team_key.clone(),
+            values: Mutex::new(HashMap::from([(api_key.clone(), "old-key".into())])),
+            reads: Mutex::new(Vec::new()),
+            allow_rollback: std::sync::atomic::AtomicBool::new(false),
+            rollback_attempts: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        );
+        engine.secrets = secret_store.clone();
+        let engine = Arc::new(engine);
+        engine.replace_provider_registries_for_ids(&HashSet::from(["cursor".to_string()]));
+        let published = engine.providers.read().unwrap()["cursor"].clone();
+
+        let result = engine
+            .upsert_provider(
+                "cursor",
+                &UpsertProviderRequest {
+                    kind: "openai-compat".into(),
+                    api_key: Some("new-key".into()),
+                    secret_values: std::collections::BTreeMap::from([(
+                        "team".into(),
+                        "new-team".into(),
+                    )]),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(result.is_err());
+        assert_eq!(
+            secret_store.values.lock().unwrap().get(&api_key),
+            Some(&"new-key".to_string())
+        );
+        assert!(!secret_store.values.lock().unwrap().contains_key(&team_key));
+
+        secret_store.reads.lock().unwrap().clear();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            engine.refresh_api_provider_registry(),
+        )
+        .await
+        .expect("an unrelated API registry refresh waited for secret reconciliation");
+        assert!(secret_store.reads.lock().unwrap().is_empty());
+        assert!(Arc::ptr_eq(
+            &engine.providers.read().unwrap()["cursor"],
+            &published
+        ));
+
+        let blocked_update = tokio::time::timeout(
+            Duration::from_secs(1),
+            engine.upsert_provider(
+                "cursor",
+                &UpsertProviderRequest {
+                    kind: "openai-compat".into(),
+                    base_url: Some("https://later.example.test/v1".into()),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .expect("a provider update waited indefinitely for credential recovery")
+        .unwrap_err();
+        assert!(
+            matches!(blocked_update, EngineError::Conflict(message) if message.contains("reconciling credentials"))
+        );
+
+        secret_store
+            .allow_rollback
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if secret_store
+                    .values
+                    .lock()
+                    .unwrap()
+                    .get(&api_key)
+                    .is_some_and(|value| value == "old-key")
+                    && secret_store
+                        .rollback_attempts
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                        >= 2
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the retained initial-write transaction was not reconciled");
+    }
+
+    #[tokio::test]
+    async fn failed_retirement_retries_secret_rollback_before_republishing_the_old_backend() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            "cursor".into(),
+            ProviderConfig {
+                kind: "cursor-sdk".into(),
+                ..Default::default()
+            },
+        );
+        let api_key = trouve_providers::secrets::api_key_secret("cursor");
+        let secret_store = Arc::new(TransientRollbackFailingProviderSecretStore {
+            rollback_key: api_key.clone(),
+            values: Mutex::new(HashMap::from([(api_key.clone(), "old-key".into())])),
+            reads: Mutex::new(Vec::new()),
+            rollback_attempts: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        );
+        engine.secrets = secret_store.clone();
+        let engine = Arc::new(engine);
+        engine.backends.write().unwrap().insert(
+            "cursor".into(),
+            Arc::new(FailingShutdownBackend {
+                shutdowns: std::sync::atomic::AtomicUsize::new(0),
+            }),
+        );
+
+        let result = engine
+            .upsert_provider(
+                "cursor",
+                &UpsertProviderRequest {
+                    kind: "openai-compat".into(),
+                    base_url: Some("https://replacement.example.test/v1".into()),
+                    api_key: Some("new-key".into()),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        assert!(result.is_err());
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            engine.refresh_api_provider_registry(),
+        )
+        .await
+        .expect("API provider refresh waited for secret reconciliation");
+        wait_for_provider_secret_reconciliation(&engine, secret_store.as_ref(), &api_key).await;
+        assert_eq!(
+            secret_store.values.lock().unwrap().get(&api_key),
+            Some(&"old-key".to_string())
+        );
+        assert_eq!(
+            secret_store
+                .rollback_attempts
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+        let reads = secret_store.reads.lock().unwrap();
+        assert!(
+            reads
+                .iter()
+                .filter(|(key, _)| key == &api_key)
+                .all(|(_, value)| value.as_deref() != Some("new-key")),
+            "registry rebuild observed tentative credentials: {reads:?}"
+        );
+        drop(reads);
+        assert!(engine.backends.read().unwrap().contains_key("cursor"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_retirement_keeps_blocking_secret_rollback_off_the_runtime_worker() {
+        const ID: &str = "cursor";
+
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            ID.into(),
+            ProviderConfig {
+                kind: "cursor-sdk".into(),
+                ..Default::default()
+            },
+        );
+        let api_key = trouve_providers::secrets::api_key_secret(ID);
+        let (rollback_started, rollback_started_rx) = tokio::sync::oneshot::channel();
+        let secret_store = Arc::new(BlockingRollbackProviderSecretStore {
+            rollback_key: api_key.clone(),
+            values: Mutex::new(HashMap::from([(api_key.clone(), "old-key".into())])),
+            rollback_started: Mutex::new(Some(rollback_started)),
+            allow_rollback: std::sync::Barrier::new(2),
+        });
+        let mut engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        );
+        engine.secrets = secret_store.clone();
+        let engine = Arc::new(engine);
+        engine.backends.write().unwrap().insert(
+            ID.into(),
+            Arc::new(FailingShutdownBackend {
+                shutdowns: std::sync::atomic::AtomicUsize::new(0),
+            }),
+        );
+
+        let releaser = {
+            let secret_store = secret_store.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_secs(1));
+                secret_store.allow_rollback.wait();
+            })
+        };
+        let update = {
+            let engine = engine.clone();
+            tokio::spawn(async move {
+                engine
+                    .upsert_provider(
+                        ID,
+                        &UpsertProviderRequest {
+                            kind: "openai-compat".into(),
+                            api_key: Some("new-key".into()),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            })
+        };
+
+        let started = std::time::Instant::now();
+        rollback_started_rx.await.unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "blocking secret rollback stalled the current-thread runtime"
+        );
+
+        assert!(update.await.unwrap().is_err());
+        releaser.join().unwrap();
+        assert_eq!(
+            secret_store.values.lock().unwrap().get(&api_key),
+            Some(&"old-key".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn later_provider_upsert_writes_secrets_after_earlier_reconciliation() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            "cursor".into(),
+            ProviderConfig {
+                kind: "cursor-sdk".into(),
+                ..Default::default()
+            },
+        );
+        let api_key = trouve_providers::secrets::api_key_secret("cursor");
+        let secret_store = Arc::new(TransientRollbackFailingProviderSecretStore {
+            rollback_key: api_key.clone(),
+            values: Mutex::new(HashMap::from([(api_key.clone(), "old-key".into())])),
+            reads: Mutex::new(Vec::new()),
+            rollback_attempts: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        );
+        engine.secrets = secret_store.clone();
+        let engine = Arc::new(engine);
+        let shutdowns = Arc::new(TransientShutdownBackend {
+            shutdowns: std::sync::atomic::AtomicUsize::new(0),
+        });
+        engine
+            .backends
+            .write()
+            .unwrap()
+            .insert("cursor".into(), shutdowns.clone());
+
+        let first = engine
+            .upsert_provider(
+                "cursor",
+                &UpsertProviderRequest {
+                    kind: "openai-compat".into(),
+                    base_url: Some("https://first.example.test/v1".into()),
+                    api_key: Some("first-key".into()),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(first.is_err());
+
+        let second = {
+            let engine = engine.clone();
+            tokio::spawn(async move {
+                engine
+                    .upsert_provider(
+                        "cursor",
+                        &UpsertProviderRequest {
+                            kind: "openai-compat".into(),
+                            base_url: Some("https://second.example.test/v1".into()),
+                            api_key: Some("second-key".into()),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            })
+        };
+        let second = match tokio::time::timeout(Duration::from_secs(8), second).await {
+            Ok(second) => second.unwrap().unwrap(),
+            Err(_) => panic!(
+                "the later provider update remained blocked after reconciliation (rollbacks={}, shutdowns={}, retiring={})",
+                secret_store
+                    .rollback_attempts
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                shutdowns
+                    .shutdowns
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                engine.retiring_backends.lock().unwrap().len(),
+            ),
+        };
+
+        assert_eq!(
+            second.base_url.as_deref(),
+            Some("https://second.example.test/v1")
+        );
+        assert_eq!(
+            secret_store.values.lock().unwrap().get(&api_key),
+            Some(&"second-key".to_string())
+        );
+        assert_eq!(
+            engine.config.lock().unwrap().providers["cursor"]
+                .base_url
+                .as_deref(),
+            Some("https://second.example.test/v1")
+        );
+        assert!(engine.providers.read().unwrap().contains_key("cursor"));
+        assert_eq!(
+            secret_store
+                .reads
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .find(|(key, _)| key == &api_key)
+                .and_then(|(_, value)| value.as_deref()),
+            Some("second-key")
+        );
+    }
+
+    #[tokio::test]
+    async fn abandoned_retirement_retries_secret_rollback_before_republishing_the_old_backend() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            "cursor".into(),
+            ProviderConfig {
+                kind: "cursor-sdk".into(),
+                ..Default::default()
+            },
+        );
+        let api_key = trouve_providers::secrets::api_key_secret("cursor");
+        let secret_store = Arc::new(TransientRollbackFailingProviderSecretStore {
+            rollback_key: api_key.clone(),
+            values: Mutex::new(HashMap::from([(api_key.clone(), "old-key".into())])),
+            reads: Mutex::new(Vec::new()),
+            rollback_attempts: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        );
+        engine.secrets = secret_store.clone();
+        let engine = Arc::new(engine);
+        let entered = Arc::new(tokio::sync::Semaphore::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        engine.backends.write().unwrap().insert(
+            "cursor".into(),
+            Arc::new(BlockingShutdownBackend {
+                entered: entered.clone(),
+                release: release.clone(),
+            }),
+        );
+
+        let update = {
+            let engine = engine.clone();
+            tokio::spawn(async move {
+                engine
+                    .upsert_provider(
+                        "cursor",
+                        &UpsertProviderRequest {
+                            kind: "openai-compat".into(),
+                            base_url: Some("https://replacement.example.test/v1".into()),
+                            api_key: Some("new-key".into()),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            })
+        };
+        entered.acquire().await.unwrap().forget();
+        update.abort();
+        assert!(update.await.unwrap_err().is_cancelled());
+        release.add_permits(1);
+
+        wait_for_provider_secret_reconciliation(&engine, secret_store.as_ref(), &api_key).await;
+        let reads = secret_store.reads.lock().unwrap();
+        assert!(
+            reads
+                .iter()
+                .filter(|(key, _)| key == &api_key)
+                .all(|(_, value)| value.as_deref() != Some("new-key")),
+            "registry rebuild observed tentative credentials: {reads:?}"
+        );
+        drop(reads);
+        assert_eq!(
+            secret_store
+                .rollback_attempts
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_retirement_does_not_block_an_unrelated_provider_update() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            "cursor".into(),
+            ProviderConfig {
+                kind: "cursor-sdk".into(),
+                ..Default::default()
+            },
+        );
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        ));
+        let entered = Arc::new(tokio::sync::Semaphore::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        engine.backends.write().unwrap().insert(
+            "cursor".into(),
+            Arc::new(BlockingShutdownBackend {
+                entered: entered.clone(),
+                release: release.clone(),
+            }),
+        );
+        let retiring = {
+            let engine = engine.clone();
+            tokio::spawn(async move {
+                engine
+                    .retire_config_backends_matching_ids(&HashSet::from(["cursor".to_string()]))
+                    .await
+            })
+        };
+        entered.acquire().await.unwrap().forget();
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            engine.upsert_provider(
+                "unrelated",
+                &UpsertProviderRequest {
+                    kind: "openai-compat".into(),
+                    base_url: Some("https://unrelated.example.test/v1".into()),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .expect("an unrelated provider update waited for backend shutdown")
+        .unwrap();
+
+        release.add_permits(1);
+        retiring.await.unwrap().unwrap().publish().await.unwrap();
+        assert!(
+            engine
+                .config
+                .lock()
+                .unwrap()
+                .providers
+                .contains_key("unrelated")
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_retirement_selects_targets_after_transition_admission() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            "cursor".into(),
+            ProviderConfig {
+                kind: "cursor-sdk".into(),
+                ..Default::default()
+            },
+        );
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        ));
+        let shutdowns = Arc::new(FailingShutdownBackend {
+            shutdowns: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let backend: Arc<dyn AgentBackend> = shutdowns.clone();
+        engine
+            .backends
+            .write()
+            .unwrap()
+            .insert("cursor".into(), backend.clone());
+        let transition = engine.provider_reload.clone().write_owned().await;
+        let retiring = engine
+            .retire_config_backends_for_runtime(trouve_agents::install::CliId::CursorSdkBridge);
+        tokio::pin!(retiring);
+        assert!(futures::poll!(retiring.as_mut()).is_pending());
+        engine
+            .config
+            .lock()
+            .unwrap()
+            .providers
+            .get_mut("cursor")
+            .unwrap()
+            .kind = "claude-cli".into();
+        drop(transition);
+
+        retiring.await.unwrap().publish().await.unwrap();
+
+        assert_eq!(
+            shutdowns
+                .shutdowns
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert!(Arc::ptr_eq(
+            &engine.backends.read().unwrap()["cursor"],
+            &backend
+        ));
+    }
+
+    #[tokio::test]
+    async fn runtime_retirement_conflicts_with_provider_reconciliation_without_blocking_refresh() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            "cursor".into(),
+            ProviderConfig {
+                kind: "cursor-sdk".into(),
+                ..Default::default()
+            },
+        );
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        ));
+        let _reconciliation = engine.provider_transition_lock("cursor").lock_owned().await;
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            engine
+                .retire_config_backends_for_runtime(trouve_agents::install::CliId::CursorSdkBridge),
+        )
+        .await
+        .expect("runtime retirement waited on a provider-scoped reconciliation");
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("runtime retirement bypassed provider-scoped reconciliation"),
+        };
+        assert!(
+            matches!(error, EngineError::Conflict(message) if message.contains("reconciling credentials"))
+        );
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            engine.refresh_api_provider_registry(),
+        )
+        .await
+        .expect("API registry refresh was blocked by provider-scoped reconciliation");
+    }
+
+    #[tokio::test]
+    async fn install_cannot_start_while_uninstall_is_retiring_runtime() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            "cursor".into(),
+            ProviderConfig {
+                kind: "cursor-sdk".into(),
+                ..Default::default()
+            },
+        );
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        ));
+        let entered = Arc::new(tokio::sync::Semaphore::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        engine.backends.write().unwrap().insert(
+            "cursor".into(),
+            Arc::new(BlockingShutdownBackend {
+                entered: entered.clone(),
+                release: release.clone(),
+            }),
+        );
+        let uninstalling = {
+            let engine = engine.clone();
+            tokio::spawn(async move { engine.uninstall_cli("cursor-sdk-bridge").await })
+        };
+        entered.acquire().await.unwrap().forget();
+
+        let install = engine.start_cli_install("cursor-sdk-bridge");
+
+        assert!(
+            matches!(install, Err(EngineError::Conflict(message)) if message.contains("uninstall"))
+        );
+        assert!(
+            !engine
+                .cli_installs
+                .lock()
+                .unwrap()
+                .contains_key("cursor-sdk-bridge")
+        );
+        release.add_permits(1);
+        uninstalling.await.unwrap().unwrap();
+        assert!(engine.cli_runtime_operations.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelled_backend_teardown_retains_registry_ownership() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            "cursor".into(),
+            ProviderConfig {
+                kind: "cursor-sdk".into(),
+                ..Default::default()
+            },
+        );
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        ));
+        let entered = Arc::new(tokio::sync::Semaphore::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let blocking: Arc<dyn AgentBackend> = Arc::new(BlockingShutdownBackend {
+            entered: entered.clone(),
+            release: release.clone(),
+        });
+        engine
+            .backends
+            .write()
+            .unwrap()
+            .insert("cursor".into(), blocking.clone());
+
+        let transitioning = {
+            let engine = engine.clone();
+            tokio::spawn(async move {
+                engine
+                    .retire_config_backends_for_runtime(
+                        trouve_agents::install::CliId::CursorSdkBridge,
+                    )
+                    .await
+            })
+        };
+        entered.acquire().await.unwrap().forget();
+
+        assert!(engine.backend_for("cursor/test-model").is_none());
+        assert!(
+            engine.retiring_backends.lock().unwrap()["cursor"]
+                .iter()
+                .any(|backend| Arc::ptr_eq(backend, &blocking))
+        );
+
+        transitioning.abort();
+        let _ = transitioning.await;
+        release.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let retired = engine
+                    .retiring_backends
+                    .lock()
+                    .unwrap()
+                    .get("cursor")
+                    .is_some_and(|entries| {
+                        entries
+                            .iter()
+                            .any(|backend| Arc::ptr_eq(backend, &blocking))
+                    });
+                if !retired {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached retirement did not finish after cancellation");
+
+        let replacement = engine.backends.read().unwrap()["cursor"].clone();
+        assert!(!Arc::ptr_eq(&replacement, &blocking));
+    }
+
+    #[tokio::test]
+    async fn dropped_runtime_retirement_republishes_the_configured_backend() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            "cursor".into(),
+            ProviderConfig {
+                kind: "cursor-sdk".into(),
+                ..Default::default()
+            },
+        );
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        ));
+        let previous = engine.backends.read().unwrap()["cursor"].clone();
+
+        let retirement = engine
+            .retire_config_backends_for_runtime(trouve_agents::install::CliId::CursorSdkBridge)
+            .await
+            .unwrap();
+        assert!(
+            engine.backend_for("cursor/composer-2").is_none(),
+            "retirement left the closing backend selectable"
+        );
+
+        // This is the cancellation window after detached teardown has handed
+        // ownership back to the runtime operation but before explicit publish.
+        drop(retirement);
+
+        let replacement = engine.backends.read().unwrap()["cursor"].clone();
+        assert!(!Arc::ptr_eq(&replacement, &previous));
+        assert!(engine.backend_for("cursor/composer-2").is_some());
+    }
+
+    #[tokio::test]
+    async fn backend_retirement_timeout_releases_global_transition_and_retains_cleanup() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            "cursor".into(),
+            ProviderConfig {
+                kind: "cursor-sdk".into(),
+                ..Default::default()
+            },
+        );
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        ));
+        let entered = Arc::new(tokio::sync::Semaphore::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let blocking: Arc<dyn AgentBackend> = Arc::new(BlockingShutdownBackend {
+            entered: entered.clone(),
+            release: release.clone(),
+        });
+        engine
+            .backends
+            .write()
+            .unwrap()
+            .insert("cursor".into(), blocking.clone());
+
+        let result = engine
+            .retire_config_backends_matching_ids_with_timeout(
+                &HashSet::from(["cursor".to_string()]),
+                Duration::from_millis(25),
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(entered.available_permits(), 1);
+        assert!(
+            engine.retiring_backends.lock().unwrap()["cursor"]
+                .iter()
+                .any(|backend| Arc::ptr_eq(backend, &blocking))
+        );
+        assert!(engine.backend_for("cursor/test-model").is_some());
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            engine.refresh_api_provider_registry(),
+        )
+        .await
+        .expect("timed-out retirement retained the provider transition lock");
+
+        release.add_permits(1);
+        let retirement = engine
+            .retire_config_backends_matching_ids_with_timeout(
+                &HashSet::from(["cursor".to_string()]),
+                Duration::from_secs(1),
+            )
+            .await
+            .expect("a later transition could not retry retained cleanup");
+        retirement.publish().await.unwrap();
+        assert!(engine.retiring_backends.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn retirement_releases_each_backend_before_the_shared_deadline() {
+        let data = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &Config::default(),
+        ));
+        let slow_entered = Arc::new(tokio::sync::Semaphore::new(0));
+        let slow_release = Arc::new(tokio::sync::Semaphore::new(0));
+        let slow: Arc<dyn AgentBackend> = Arc::new(BlockingShutdownBackend {
+            entered: slow_entered.clone(),
+            release: slow_release.clone(),
+        });
+        let fast_entered = Arc::new(tokio::sync::Semaphore::new(0));
+        let fast: Arc<dyn AgentBackend> = Arc::new(BlockingShutdownBackend {
+            entered: fast_entered.clone(),
+            release: Arc::new(tokio::sync::Semaphore::new(1)),
+        });
+        engine
+            .retiring_backends
+            .lock()
+            .unwrap()
+            .insert("slow".into(), vec![slow.clone()]);
+        engine
+            .retiring_backends
+            .lock()
+            .unwrap()
+            .insert("fast".into(), vec![fast.clone()]);
+        let retirement = {
+            let engine = engine.clone();
+            let slow = slow.clone();
+            let fast = fast.clone();
+            tokio::spawn(async move {
+                shutdown_retiring_backend_batch(
+                    &engine,
+                    vec![("slow".into(), slow), ("fast".into(), fast)],
+                    tokio::time::Instant::now() + Duration::from_secs(1),
+                )
+                .await
+            })
+        };
+        slow_entered.acquire().await.unwrap().forget();
+        fast_entered.acquire().await.unwrap().forget();
+
+        tokio::time::timeout(Duration::from_millis(250), async {
+            loop {
+                if !engine
+                    .retiring_backends
+                    .lock()
+                    .unwrap()
+                    .contains_key("fast")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("successful retirement remained buffered behind the slow backend");
+        assert!(
+            engine
+                .retiring_backends
+                .lock()
+                .unwrap()
+                .contains_key("slow")
+        );
+        assert_eq!(Arc::strong_count(&fast), 1);
+        assert!(!retirement.is_finished());
+
+        slow_release.add_permits(1);
+        assert!(retirement.await.unwrap().is_empty());
+        assert!(engine.retiring_backends.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_backend_retirement_retries_without_another_user_transition() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            "cursor".into(),
+            ProviderConfig {
+                kind: "cursor-sdk".into(),
+                ..Default::default()
+            },
+        );
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        ));
+        let transient = Arc::new(TransientShutdownBackend {
+            shutdowns: std::sync::atomic::AtomicUsize::new(0),
+        });
+        engine
+            .backends
+            .write()
+            .unwrap()
+            .insert("cursor".into(), transient.clone());
+
+        assert!(
+            engine
+                .retire_config_backends_matching_ids(&HashSet::from(["cursor".to_string()]))
+                .await
+                .is_err()
+        );
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if engine.retiring_backends.lock().unwrap().is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("retained backend did not receive an autonomous retry");
+        assert_eq!(
+            transient
+                .shutdowns
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn retirement_retry_skips_a_locked_provider_and_cleans_up_others() {
+        let data = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &Config::default(),
+        ));
+        let locked: Arc<dyn AgentBackend> = Arc::new(FailingShutdownBackend {
+            shutdowns: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let ready = Arc::new(TransientShutdownBackend {
+            // This backend succeeds on its next attempt.
+            shutdowns: std::sync::atomic::AtomicUsize::new(1),
+        });
+        let ready_backend: Arc<dyn AgentBackend> = ready.clone();
+        engine.retiring_backends.lock().unwrap().extend([
+            ("locked".into(), vec![locked]),
+            ("ready".into(), vec![ready_backend]),
+        ]);
+        let locked_transition = engine.provider_transition_lock("locked").lock_owned().await;
+
+        engine.ensure_retiring_backend_retry();
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if !engine
+                    .retiring_backends
+                    .lock()
+                    .unwrap()
+                    .contains_key("ready")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("an unrelated provider lock blocked retained backend cleanup");
+        assert!(
+            engine
+                .retiring_backends
+                .lock()
+                .unwrap()
+                .contains_key("locked")
+        );
+        assert_eq!(ready.shutdowns.load(std::sync::atomic::Ordering::SeqCst), 2);
+        drop(locked_transition);
+    }
+
+    #[test]
+    fn retirement_retry_batch_excludes_ids_without_transition_locks() {
+        let data = tempfile::tempdir().unwrap();
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &Config::default(),
+        );
+        let locked: Arc<dyn AgentBackend> = Arc::new(FailingShutdownBackend {
+            shutdowns: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let added_later: Arc<dyn AgentBackend> = Arc::new(FailingShutdownBackend {
+            shutdowns: std::sync::atomic::AtomicUsize::new(0),
+        });
+        engine.retiring_backends.lock().unwrap().extend([
+            ("locked".into(), vec![locked.clone()]),
+            ("added-later".into(), vec![added_later.clone()]),
+        ]);
+
+        let batch = engine.retiring_backend_batch(&HashSet::from(["locked".into()]));
+
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].0, "locked");
+        assert!(Arc::ptr_eq(&batch[0].1, &locked));
+        assert!(!Arc::ptr_eq(&batch[0].1, &added_later));
+    }
+
+    #[tokio::test]
+    async fn repeated_failed_retirement_does_not_detach_another_generation() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            "cursor".into(),
+            ProviderConfig {
+                kind: "cursor-sdk".into(),
+                ..Default::default()
+            },
+        );
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        ));
+        let failing: Arc<dyn AgentBackend> = Arc::new(FailingShutdownBackend {
+            shutdowns: std::sync::atomic::AtomicUsize::new(0),
+        });
+        engine
+            .backends
+            .write()
+            .unwrap()
+            .insert("cursor".into(), failing);
+        let targets = HashSet::from(["cursor".to_string()]);
+
+        assert!(
+            engine
+                .retire_config_backends_matching_ids(&targets)
+                .await
+                .is_err()
+        );
+        let active_after_first = engine.backends.read().unwrap()["cursor"].clone();
+        assert!(
+            engine
+                .retire_config_backends_matching_ids(&targets)
+                .await
+                .is_err()
+        );
+
+        assert!(Arc::ptr_eq(
+            &active_after_first,
+            &engine.backends.read().unwrap()["cursor"]
+        ));
+        assert_eq!(engine.retiring_backends.lock().unwrap()["cursor"].len(), 1);
+    }
+
+    #[tokio::test]
+    async fn retained_cleanup_retires_the_active_generation_before_publication() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            "cursor".into(),
+            ProviderConfig {
+                kind: "cursor-sdk".into(),
+                ..Default::default()
+            },
+        );
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        ));
+        let retained = Arc::new(TransientShutdownBackend {
+            shutdowns: std::sync::atomic::AtomicUsize::new(1),
+        });
+        let active = Arc::new(TransientShutdownBackend {
+            shutdowns: std::sync::atomic::AtomicUsize::new(1),
+        });
+        let retained_backend: Arc<dyn AgentBackend> = retained.clone();
+        let active_backend: Arc<dyn AgentBackend> = active.clone();
+        engine
+            .retiring_backends
+            .lock()
+            .unwrap()
+            .insert("cursor".into(), vec![retained_backend]);
+        engine
+            .backends
+            .write()
+            .unwrap()
+            .insert("cursor".into(), active_backend);
+
+        let retirement = engine
+            .retire_config_backends_matching_ids_with_timeout(
+                &HashSet::from(["cursor".to_string()]),
+                Duration::from_secs(1),
+            )
+            .await
+            .expect("retained and active generations did not retire");
+
+        assert_eq!(
+            retained.shutdowns.load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+        assert_eq!(
+            active.shutdowns.load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+        assert!(engine.retiring_backends.lock().unwrap().is_empty());
+        assert!(!engine.backends.read().unwrap().contains_key("cursor"));
+        retirement.publish().await.unwrap();
+        assert!(engine.backends.read().unwrap().contains_key("cursor"));
+    }
+
+    #[tokio::test]
+    async fn runtime_teardown_only_stops_matching_config_backends() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        for (id, kind) in [
+            ("cursor", "cursor-sdk"),
+            ("claude", "claude-cli"),
+            ("codex", "codex-app-server"),
+        ] {
+            config.providers.insert(
+                id.into(),
+                ProviderConfig {
+                    kind: kind.into(),
+                    ..Default::default()
+                },
+            );
+        }
+        config.providers.insert(
+            "cursor-custom".into(),
+            ProviderConfig {
+                kind: "cursor-sdk".into(),
+                command: Some("/opt/custom/cursor-sdk-bridge".into()),
+                ..Default::default()
+            },
+        );
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        ));
+        let cursor = Arc::new(FailingShutdownBackend {
+            shutdowns: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let claude = Arc::new(FailingShutdownBackend {
+            shutdowns: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let codex = Arc::new(FailingShutdownBackend {
+            shutdowns: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let cursor_custom = Arc::new(FailingShutdownBackend {
+            shutdowns: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let cursor_backend: Arc<dyn AgentBackend> = cursor.clone();
+        let claude_backend: Arc<dyn AgentBackend> = claude.clone();
+        let codex_backend: Arc<dyn AgentBackend> = codex.clone();
+        let cursor_custom_backend: Arc<dyn AgentBackend> = cursor_custom.clone();
+        {
+            let mut backends = engine.backends.write().unwrap();
+            backends.insert("cursor".into(), cursor_backend.clone());
+            backends.insert("claude".into(), claude_backend.clone());
+            backends.insert("codex".into(), codex_backend.clone());
+            backends.insert("cursor-custom".into(), cursor_custom_backend.clone());
+        }
+
+        let result = engine
+            .retire_config_backends_for_runtime(trouve_agents::install::CliId::CursorSdkBridge)
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            cursor.shutdowns.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            claude.shutdowns.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(codex.shutdowns.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            cursor_custom
+                .shutdowns
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        let backends = engine.backends.read().unwrap();
+        assert!(!Arc::ptr_eq(&cursor_backend, &backends["cursor"]));
+        assert!(Arc::ptr_eq(&claude_backend, &backends["claude"]));
+        assert!(Arc::ptr_eq(&codex_backend, &backends["codex"]));
+        assert!(Arc::ptr_eq(
+            &cursor_custom_backend,
+            &backends["cursor-custom"]
+        ));
+        drop(backends);
+        assert!(
+            engine.retiring_backends.lock().unwrap()["cursor"]
+                .iter()
+                .any(|backend| Arc::ptr_eq(backend, &cursor_backend))
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_backend_teardown_rebuilds_successes_and_retains_failures() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        for id in ["cursor-success", "cursor-failure"] {
+            config.providers.insert(
+                id.into(),
+                ProviderConfig {
+                    kind: "cursor-sdk".into(),
+                    ..Default::default()
+                },
+            );
+        }
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        ));
+        let success_entered = Arc::new(tokio::sync::Semaphore::new(0));
+        let success: Arc<dyn AgentBackend> = Arc::new(BlockingShutdownBackend {
+            entered: success_entered.clone(),
+            release: Arc::new(tokio::sync::Semaphore::new(1)),
+        });
+        let failure_count = Arc::new(FailingShutdownBackend {
+            shutdowns: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let failure: Arc<dyn AgentBackend> = failure_count.clone();
+        {
+            let mut backends = engine.backends.write().unwrap();
+            backends.insert("cursor-success".into(), success.clone());
+            backends.insert("cursor-failure".into(), failure.clone());
+        }
+
+        let result = engine
+            .retire_config_backends_for_runtime(trouve_agents::install::CliId::CursorSdkBridge)
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(success_entered.available_permits(), 1);
+        assert_eq!(
+            failure_count
+                .shutdowns
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        let retiring = engine.retiring_backends.lock().unwrap();
+        assert!(retiring.get("cursor-success").is_none_or(|entries| {
+            entries
+                .iter()
+                .all(|backend| !Arc::ptr_eq(backend, &success))
+        }));
+        assert!(
+            retiring["cursor-failure"]
+                .iter()
+                .any(|backend| Arc::ptr_eq(backend, &failure))
+        );
+        drop(retiring);
+        let backends = engine.backends.read().unwrap();
+        assert!(!Arc::ptr_eq(&backends["cursor-success"], &success));
+        assert!(!Arc::ptr_eq(&backends["cursor-failure"], &failure));
+    }
+
+    #[tokio::test]
+    async fn unrelated_api_upsert_preserves_every_vendor_backend_instance() {
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        for (id, kind) in [
+            ("cursor", "cursor-sdk"),
+            ("claude", "claude-cli"),
+            ("codex", "codex-app-server"),
+        ] {
+            config.providers.insert(
+                id.into(),
+                ProviderConfig {
+                    kind: kind.into(),
+                    ..Default::default()
+                },
+            );
+        }
+        config.providers.insert(
+            "custom".into(),
+            ProviderConfig {
+                kind: "openai-compat".into(),
+                base_url: Some("https://old.example.test/v1".into()),
+                api_key: Some("test-key".into()),
+                ..Default::default()
+            },
+        );
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        ));
+        let mut tracked = Vec::new();
+        for id in ["cursor", "claude", "codex"] {
+            let concrete = Arc::new(FailingShutdownBackend {
+                shutdowns: std::sync::atomic::AtomicUsize::new(0),
+            });
+            let backend: Arc<dyn AgentBackend> = concrete.clone();
+            engine
+                .backends
+                .write()
+                .unwrap()
+                .insert(id.into(), backend.clone());
+            tracked.push((id, concrete, backend));
+        }
+
+        engine
+            .upsert_provider(
+                "custom",
+                &UpsertProviderRequest {
+                    kind: "openai-compat".into(),
+                    base_url: Some("https://new.example.test/v1".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let backends = engine.backends.read().unwrap();
+        for (id, concrete, backend) in tracked {
+            assert_eq!(
+                concrete.shutdowns.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "unrelated upsert shut down {id}"
+            );
+            assert!(Arc::ptr_eq(&backends[id], &backend));
+        }
+    }
+
+    #[tokio::test]
+    async fn committed_runtime_reload_failure_is_an_install_warning() {
+        let data = tempfile::tempdir().unwrap();
+        let runtime_root = data.path().join("cli/codex");
+        let runtime_bin = runtime_root
+            .join(".generations/runtime-test/bin")
+            .join("codex");
+        std::fs::create_dir_all(runtime_bin.parent().unwrap()).unwrap();
+        std::fs::write(&runtime_bin, "codex fixture").unwrap();
+        let installed = trouve_agents::install::InstalledCli {
+            version: "1.2.3".into(),
+            bin: runtime_bin.to_string_lossy().into_owned(),
+        };
+        std::fs::write(
+            runtime_root.join("installed.json"),
+            serde_json::to_string(&installed).unwrap(),
+        )
+        .unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            "codex".into(),
+            ProviderConfig {
+                kind: "codex-app-server".into(),
+                ..Default::default()
+            },
+        );
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        ));
+        engine.backends.write().unwrap().insert(
+            "codex".into(),
+            Arc::new(FailingShutdownBackend {
+                shutdowns: std::sync::atomic::AtomicUsize::new(0),
+            }),
+        );
+        engine.test_cli_install_result.lock().unwrap().replace((
+            installed.version.clone(),
+            trouve_agents::install::ActivationOutcome::Durable(installed),
+        ));
+
+        engine.start_cli_install("codex").unwrap();
+        let status = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let status = engine.cli_install_status("codex");
+                if status.status != "pending" {
+                    break status;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("managed install completed");
+        assert_eq!(status.status, "success");
+        assert_eq!(status.version.as_deref(), Some("1.2.3"));
+        assert!(status.error.is_none());
+        let warning = status.warning.expect("reload warning");
+        assert!(warning.contains("is active"), "{warning}");
+        assert!(warning.contains("provider registry"), "{warning}");
+        assert_eq!(
+            trouve_agents::install::installed(data.path(), trouve_agents::install::CliId::Codex,)
+                .expect("committed runtime remains installed")
+                .version,
+            "1.2.3"
+        );
+    }
+
+    #[tokio::test]
+    async fn uninstall_drops_the_registry_runtime_lease_before_removal() {
+        let data = tempfile::tempdir().unwrap();
+        let runtime_root = data.path().join("cli").join("cursor-sdk-bridge");
+        let generation = runtime_root.join(".generations").join("runtime-test");
+        let bin = generation.join("bin").join("cursor-sdk-bridge");
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::write(&bin, "bridge").unwrap();
+        std::fs::write(
+            runtime_root.join("installed.json"),
+            serde_json::to_string(&trouve_agents::install::InstalledCli {
+                version: "test".into(),
+                bin: bin.to_string_lossy().into_owned(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut config = Config::default();
+        config.providers.insert(
+            "cursor".into(),
+            ProviderConfig {
+                kind: "cursor-sdk".into(),
+                api_key: Some("test-key".into()),
+                ..Default::default()
+            },
+        );
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        ));
+
+        let blocked = trouve_agents::install::uninstall(
+            data.path(),
+            trouve_agents::install::CliId::CursorSdkBridge,
+        )
+        .unwrap_err();
+        assert_eq!(blocked.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(bin.is_file());
+
+        let delayed_turn_backend = engine.backends.read().unwrap()["cursor"].clone();
+        let blocked = engine.uninstall_cli("cursor-sdk-bridge").await.unwrap_err();
+        assert!(matches!(blocked, EngineError::Conflict(_)));
+        assert!(bin.is_file());
+        assert_eq!(Arc::strong_count(&delayed_turn_backend), 1);
+
+        drop(delayed_turn_backend);
+        engine.uninstall_cli("cursor-sdk-bridge").await.unwrap();
+        assert!(!runtime_root.exists());
+    }
+
+    #[tokio::test]
+    async fn teardown_failure_preserves_uncommitted_provider_state_and_ownership() {
+        const ID: &str = "reload-consistency";
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            ID.into(),
+            ProviderConfig {
+                kind: "openai-compat".into(),
+                base_url: Some("https://old.example.test/v1".into()),
+                api_key: Some("test-key".into()),
+                ..Default::default()
+            },
+        );
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        ));
+
+        let failing = Arc::new(FailingShutdownBackend {
+            shutdowns: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let failing_backend: Arc<dyn AgentBackend> = failing.clone();
+        engine
+            .backends
+            .write()
+            .unwrap()
+            .insert(ID.into(), failing_backend.clone());
+        let upsert = engine
+            .upsert_provider(
+                ID,
+                &UpsertProviderRequest {
+                    kind: "openai-compat".into(),
+                    base_url: Some("https://new.example.test/v1".into()),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(upsert.is_err());
+        assert_eq!(
+            failing.shutdowns.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            engine.config.lock().unwrap().providers[ID]
+                .base_url
+                .as_deref(),
+            Some("https://old.example.test/v1")
+        );
+        assert!(engine.providers.read().unwrap().contains_key(ID));
+        assert!(
+            engine
+                .backends
+                .read()
+                .unwrap()
+                .get(ID)
+                .is_none_or(|backend| !Arc::ptr_eq(backend, &failing_backend))
+        );
+        assert!(
+            engine.retiring_backends.lock().unwrap()[ID]
+                .iter()
+                .any(|backend| Arc::ptr_eq(backend, &failing_backend))
+        );
+        let delete = engine.delete_provider(ID).await;
+        assert!(delete.is_err());
+        assert_eq!(
+            failing.shutdowns.load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+        assert!(engine.config.lock().unwrap().providers.contains_key(ID));
+        assert!(engine.providers.read().unwrap().contains_key(ID));
+        assert!(
+            engine
+                .backends
+                .read()
+                .unwrap()
+                .get(ID)
+                .is_none_or(|backend| !Arc::ptr_eq(backend, &failing_backend))
+        );
+        assert!(
+            engine.retiring_backends.lock().unwrap()[ID]
+                .iter()
+                .any(|backend| Arc::ptr_eq(backend, &failing_backend))
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn provider_delete_keeps_blocking_secret_io_off_the_runtime_worker() {
+        const ID: &str = "slow-delete";
+
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            ID.into(),
+            ProviderConfig {
+                kind: "openai-compat".into(),
+                ..Default::default()
+            },
+        );
+        let secret_store = Arc::new(BlockingProviderSecretStore::new(ID));
+        let mut engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        );
+        engine.secrets = secret_store.clone();
+        let engine = Arc::new(engine);
+
+        let (delete_started_tx, delete_started_rx) = tokio::sync::oneshot::channel();
+        let releaser = {
+            let secret_store = secret_store.clone();
+            std::thread::spawn(move || {
+                secret_store.delete_started.wait();
+                let _ = delete_started_tx.send(());
+                std::thread::sleep(Duration::from_secs(1));
+                secret_store.allow_delete.wait();
+            })
+        };
+        let deleting = {
+            let engine = engine.clone();
+            tokio::spawn(async move { engine.delete_provider(ID).await })
+        };
+
+        let started = std::time::Instant::now();
+        delete_started_rx.await.unwrap();
+        assert!(!engine.config.lock().unwrap().providers.contains_key(ID));
+        assert!(
+            !engine.providers.read().unwrap().contains_key(ID),
+            "deleted API provider remained callable during secret cleanup"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "blocking secret deletion stalled the current-thread runtime"
+        );
+        assert!(!deleting.is_finished());
+        let unrelated_exclusive_transition_progressed = match tokio::time::timeout(
+            Duration::from_millis(250),
+            engine.provider_reload.clone().write_owned(),
+        )
+        .await
+        {
+            Ok(guard) => {
+                drop(guard);
+                true
+            }
+            Err(_) => false,
+        };
+
+        deleting.await.unwrap().unwrap();
+        releaser.join().unwrap();
+        assert!(
+            unrelated_exclusive_transition_progressed,
+            "secret deletion retained the global provider reload barrier"
+        );
+        assert!(!engine.config.lock().unwrap().providers.contains_key(ID));
+    }
+
+    #[tokio::test]
+    async fn provider_delete_preserves_a_same_id_injected_provider_during_secret_cleanup() {
+        const ID: &str = "injected-delete";
+        let data = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.providers.insert(
+            ID.into(),
+            ProviderConfig {
+                kind: "openai-compat".into(),
+                ..Default::default()
+            },
+        );
+        let secret_store = Arc::new(BlockingProviderSecretStore::new(ID));
+        let injected: Arc<dyn Provider> = Arc::new(CatalogTestProvider::new(Arc::new(
+            std::sync::atomic::AtomicUsize::new(0),
+        )));
+        let mut engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &config,
+        );
+        engine.secrets = secret_store.clone();
+        let engine = Arc::new(engine.with_provider(ID, injected.clone()));
+        let (delete_started_tx, delete_started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let releaser = {
+            let secret_store = secret_store.clone();
+            std::thread::spawn(move || {
+                secret_store.delete_started.wait();
+                let _ = delete_started_tx.send(());
+                release_rx.recv().unwrap();
+                secret_store.allow_delete.wait();
+            })
+        };
+        let deleting = {
+            let engine = engine.clone();
+            tokio::spawn(async move { engine.delete_provider(ID).await })
+        };
+
+        delete_started_rx.await.unwrap();
+        assert!(!engine.config.lock().unwrap().providers.contains_key(ID));
+        assert!(Arc::ptr_eq(
+            &engine.providers.read().unwrap()[ID],
+            &injected
+        ));
+
+        release_tx.send(()).unwrap();
+        deleting.await.unwrap().unwrap();
+        releaser.join().unwrap();
+        assert!(Arc::ptr_eq(
+            &engine.providers.read().unwrap()[ID],
+            &injected
+        ));
     }
 
     #[test]
@@ -27024,7 +34508,7 @@ default_permission_mode = "ask"
                 ..Default::default()
             },
         );
-        let secret_store = Arc::new(BlockingProviderSecretStore::new());
+        let secret_store = Arc::new(BlockingProviderSecretStore::new(ID));
         secret_store
             .values
             .lock()
@@ -27040,7 +34524,13 @@ default_permission_mode = "ask"
 
         let deleting = {
             let engine = engine.clone();
-            std::thread::spawn(move || engine.delete_provider(ID))
+            std::thread::spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(engine.delete_provider(ID))
+            })
         };
         secret_store.delete_started.wait();
 
@@ -27050,15 +34540,19 @@ default_permission_mode = "ask"
             let engine = engine.clone();
             std::thread::spawn(move || {
                 started_tx.send(()).unwrap();
-                let result = engine.upsert_provider(
-                    ID,
-                    &UpsertProviderRequest {
-                        kind: "openai-compat".into(),
-                        base_url: Some("https://new.example.test/v1".into()),
-                        api_key: Some("new".into()),
-                        ..Default::default()
-                    },
-                );
+                let result = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(engine.upsert_provider(
+                        ID,
+                        &UpsertProviderRequest {
+                            kind: "openai-compat".into(),
+                            base_url: Some("https://new.example.test/v1".into()),
+                            api_key: Some("new".into()),
+                            ..Default::default()
+                        },
+                    ));
                 done_tx.send(result).unwrap();
             })
         };

@@ -34,23 +34,24 @@ use trouve_protocol::{
     CodeReviewTask, CompleteLoginRequest, ConfigureGithubAppRequest, CreatePrRequest,
     CreateSessionRequest, CreateThreadRequest, DirEntry,
     ERROR_CODE_GITHUB_REAUTHENTICATION_REQUIRED, ERROR_CODE_SESSION_DIFF_TOO_LARGE,
-    EVENT_CURSOR_HEADER, ErrorBody, FileContent, ForkCheckpointResponse,
-    GenerateSessionTitleRequest, GeneratedSessionTitle, GitWorktreeSettings, GithubAppStatus,
-    GithubIntegration, GithubPrList, KnownProvider, LocalSearchResult, LocalStatus, LoginStarted,
-    LoginStatus, McpLogs, McpServerInfo, MergePrRequest, ModelInfo, OpenTerminalRequest,
-    PROTOCOL_VERSION, PersonaInfo, PrActionRequest, PrDetail, PrDetailSection, PrFileDiff, PrInfo,
-    ProviderInfo, ProvidersResponse, QueuedPrompt, RefreshGithubPrsQuery, RegisterWorkspaceRequest,
-    ReorderQueueRequest, RequestCodeReviewRequest, ResolveApprovalRequest, ResolveQuestionRequest,
-    ReviewerProfile, RoutedModelInfo, Scope, SendMessageRequest, ServerInfo, ServerProjection,
-    Session, SessionDiff, SessionDiffFileSummary, SessionDiffSummary, SessionFileDiff,
-    SessionSummariesSnapshot, SetCodeReviewSettingsRequest, SetDefaultModelRequest,
-    SetDefaultPermissionModeRequest, SetGitWorktreeSettingsRequest, SetGlobalDefaultsRequest,
-    SetLocalEnabledRequest, SetMcpServerEnabledRequest, SetProviderOrderRequest, SteerAccepted,
-    SteerTurnRequest, SubscriptionHealth, TerminalInfo, TerminalInputRequest, TerminalReplayStart,
-    TerminalResizeRequest, Thread, ThreadStatus, ThreadToolDetails, ThreadViewQuery,
-    ThreadViewSnapshot, TurnAccepted, UpdateCodeReviewRepositoryRequest, UpdateQueuedPromptRequest,
-    UpdateSessionRequest, UpdateThreadRequest, UpsertAutomationRequest, UpsertMcpServerRequest,
-    UpsertPersonaRequest, UpsertProviderRequest, UsageSummary, Workspace,
+    EVENT_CURSOR_HEADER, ErrorBody, FileContent, ForkCheckpointResponse, GenerateTitleRequest,
+    GeneratedTitle, GithubAppStatus, GithubIntegration, GithubPrList, KnownProvider,
+    LocalSearchResult, LocalStatus, LoginStarted, LoginStatus, McpLogs, McpServerInfo,
+    MergePrRequest, ModelInfo, OpenTerminalRequest, PROTOCOL_VERSION, PersonaInfo, PrActionRequest,
+    PrDetail, PrDetailSection, PrFileDiff, PrInfo, ProviderInfo, ProvidersResponse, QueuedPrompt,
+    RefreshGithubPrsQuery, RegisterWorkspaceRequest, ReorderQueueRequest, RequestCodeReviewRequest,
+    ResolveApprovalRequest, ResolveQuestionRequest, ReviewerProfile, RoutedModelInfo, Scope,
+    SendMessageRequest, ServerInfo, ServerProjection, Session, SessionDiff, SessionDiffFileSummary,
+    SessionDiffSummary, SessionFileDiff, SessionNamingSettings, SessionSummariesSnapshot,
+    SetAutomationEnabledRequest, SetCodeReviewSettingsRequest, SetDefaultModelRequest,
+    SetDefaultPermissionModeRequest, SetGlobalDefaultsRequest, SetLocalEnabledRequest,
+    SetMcpServerEnabledRequest, SetProviderOrderRequest, SetSessionNamingSettingsRequest,
+    SteerAccepted, SteerTurnRequest, SubscriptionHealth, TerminalInfo, TerminalInputRequest,
+    TerminalReplayStart, TerminalResizeRequest, Thread, ThreadStatus, ThreadToolDetails,
+    ThreadViewQuery, ThreadViewSnapshot, TurnAccepted, UpdateCodeReviewRepositoryRequest,
+    UpdateQueuedPromptRequest, UpdateSessionRequest, UpdateThreadRequest, UpsertAutomationRequest,
+    UpsertMcpServerRequest, UpsertPersonaRequest, UpsertProviderRequest, UsageSummary,
+    WorkspaceListItem,
 };
 use utoipa::OpenApi;
 
@@ -111,7 +112,9 @@ impl IntoResponse for ApiError {
         workspace_branches,
         server_projection,
         refresh_github_prs,
-        generate_session_title,
+        generate_title,
+        generate_session_title_from_transcript,
+        generate_thread_title_from_transcript,
         create_session,
         list_sessions,
         session_summaries,
@@ -176,10 +179,8 @@ impl IntoResponse for ApiError {
         set_default_permission_mode,
         get_code_review_settings,
         set_code_review_settings,
-        get_git_worktree_settings,
-        set_git_worktree_settings,
-        install_title_model,
-        cancel_title_model_install,
+        get_session_naming_settings,
+        set_session_naming_settings,
         thread_usage,
         session_usage,
         session_mcp_servers,
@@ -216,6 +217,7 @@ impl IntoResponse for ApiError {
         automation_templates,
         create_automation,
         update_automation,
+        set_automation_enabled,
         delete_automation,
         run_automation,
         code_review_dashboard,
@@ -236,7 +238,7 @@ impl IntoResponse for ApiError {
     components(schemas(
         ServerInfo,
         RegisterWorkspaceRequest,
-        Workspace,
+        WorkspaceListItem,
         BranchList,
         CreateSessionRequest,
         Session,
@@ -296,12 +298,10 @@ impl IntoResponse for ApiError {
         CodeReviewSettings,
         SetCodeReviewSettingsRequest,
         SetProviderOrderRequest,
-        trouve_protocol::TitleModelLoadBehavior,
-        trouve_protocol::TitleModelStatus,
-        GitWorktreeSettings,
-        SetGitWorktreeSettingsRequest,
-        GenerateSessionTitleRequest,
-        GeneratedSessionTitle,
+        SessionNamingSettings,
+        SetSessionNamingSettingsRequest,
+        GenerateTitleRequest,
+        GeneratedTitle,
         UsageSummary,
         SessionDiff,
         SessionDiffFileSummary,
@@ -354,6 +354,7 @@ impl IntoResponse for ApiError {
         trouve_protocol::AutomationSchedule,
         trouve_protocol::AutomationTemplate,
         UpsertAutomationRequest,
+        SetAutomationEnabledRequest,
         CodeReviewDashboard,
         ReviewerProfile,
         trouve_protocol::ReviewerOverride,
@@ -389,6 +390,7 @@ impl IntoResponse for ApiError {
         trouve_protocol::CodeReviewPersonaModelStats,
         trouve_protocol::CodeReviewRepositoryStats,
         trouve_protocol::CodeReviewChurnStats,
+        trouve_protocol::CodeReviewCollapseBacklog,
         trouve_protocol::CodeReviewStats,
         trouve_protocol::CodeReviewMode,
         GithubAppStatus,
@@ -403,6 +405,7 @@ impl IntoResponse for ApiError {
         trouve_protocol::ApprovalDecision,
         trouve_protocol::RestoreDirection,
         trouve_protocol::PermissionMode,
+        trouve_protocol::ModelOptionValue,
         trouve_protocol::AgentPersona,
         PersonaInfo,
         UpsertPersonaRequest,
@@ -554,7 +557,7 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
         .route("/v1/workspaces/{id}/branches", get(workspace_branches))
         .route("/v1/server-projection", get(server_projection))
         .route("/v1/github/prs/refresh", post(refresh_github_prs))
-        .route("/v1/session-title", post(generate_session_title))
+        .route("/v1/title", post(generate_title))
         .route("/v1/sessions", post(create_session).get(list_sessions))
         .route("/v1/session-summaries", get(session_summaries))
         .route(
@@ -562,6 +565,10 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
             get(get_session)
                 .patch(update_session)
                 .delete(delete_session),
+        )
+        .route(
+            "/v1/sessions/{id}/title-suggestion",
+            post(generate_session_title_from_transcript),
         )
         .route("/v1/sessions/{id}/undo", post(undo_session))
         .route("/v1/sessions/{id}/redo", post(redo_session))
@@ -660,6 +667,10 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
             "/v1/automations/{id}",
             axum::routing::put(update_automation).delete(delete_automation),
         )
+        .route(
+            "/v1/automations/{id}/enabled",
+            axum::routing::put(set_automation_enabled),
+        )
         .route("/v1/automations/{id}/run", post(run_automation))
         .route("/v1/code-review", get(code_review_dashboard))
         .route("/v1/code-review/jobs", get(list_code_review_jobs))
@@ -733,16 +744,16 @@ pub fn build_router(engine: Arc<Engine>) -> Router {
             axum::routing::put(set_default_permission_mode),
         )
         .route(
-            "/v1/config/git-worktrees",
-            get(get_git_worktree_settings).put(set_git_worktree_settings),
-        )
-        .route(
-            "/v1/config/git-worktrees/title-model/install",
-            post(install_title_model).delete(cancel_title_model_install),
+            "/v1/config/session-naming",
+            get(get_session_naming_settings).put(set_session_naming_settings),
         )
         .route("/v1/threads", post(create_thread).get(list_threads))
         .route("/v1/thread-statuses", get(list_thread_statuses))
         .route("/v1/threads/{id}", get(get_thread).patch(update_thread))
+        .route(
+            "/v1/threads/{id}/title-suggestion",
+            post(generate_thread_title_from_transcript),
+        )
         .route("/v1/threads/{id}/subagents", get(list_thread_subagents))
         .route("/v1/threads/{id}/view", get(get_thread_view))
         .route(
@@ -969,8 +980,10 @@ pub async fn serve_listener(
     security: ServerSecurity,
 ) -> anyhow::Result<()> {
     engine.reconcile_checkpoint_refs().await;
+    engine.reconcile_session_branch_renames().await;
     engine.retry_artifact_cleanup_jobs().await;
     engine.retry_persona_deletions().await;
+    engine.sweep_stale_title_images().await;
     engine.start_artifact_cleanup_worker();
     // Backends dialing back in (MCP tool bridge) need our reachable URL;
     // build_secured_router injects their separate ephemeral bridge token.
@@ -980,8 +993,8 @@ pub async fn serve_listener(
     // configured probe).
     engine.init_connectivity().await;
     engine.start_session_pr_verification_worker();
-    engine.warm_title_model();
     engine.start_connectivity_monitor();
+    engine.start_background_turn_listener();
     engine.start_automation_scheduler();
     engine.start_code_review_service();
     let router = build_secured_router(engine, security);
@@ -1221,19 +1234,34 @@ async fn openapi() -> Json<serde_json::Value> {
 }
 
 #[utoipa::path(post, path = "/v1/workspaces", request_body = RegisterWorkspaceRequest,
-    responses((status = 200, body = Workspace), (status = 400, body = ErrorBody)))]
+    responses((status = 200, body = WorkspaceListItem), (status = 400, body = ErrorBody)))]
 async fn register_workspace(
     State(engine): State<Arc<Engine>>,
     Json(req): Json<RegisterWorkspaceRequest>,
-) -> Result<Json<Workspace>, ApiError> {
-    Ok(Json(engine.register_workspace(&req.path, req.name)?))
+) -> Result<Json<WorkspaceListItem>, ApiError> {
+    let workspace =
+        tokio::task::spawn_blocking(move || engine.register_workspace(&req.path, req.name))
+            .await
+            .map_err(|error| {
+                ApiError(EngineError::Internal(anyhow::anyhow!(
+                    "workspace registration worker failed: {error}"
+                )))
+            })??;
+    Ok(Json(workspace))
 }
 
-#[utoipa::path(get, path = "/v1/workspaces", responses((status = 200, body = [Workspace])))]
+#[utoipa::path(get, path = "/v1/workspaces", responses((status = 200, body = [WorkspaceListItem])))]
 async fn list_workspaces(
     State(engine): State<Arc<Engine>>,
-) -> Result<Json<Vec<Workspace>>, ApiError> {
-    Ok(Json(engine.list_workspaces()?))
+) -> Result<Json<Vec<WorkspaceListItem>>, ApiError> {
+    let workspaces = tokio::task::spawn_blocking(move || engine.list_workspaces())
+        .await
+        .map_err(|error| {
+            ApiError(EngineError::Internal(anyhow::anyhow!(
+                "workspace list worker failed: {error}"
+            )))
+        })??;
+    Ok(Json(workspaces))
 }
 
 #[utoipa::path(delete, path = "/v1/workspaces/{id}", params(("id" = String, Path,)),
@@ -1282,13 +1310,49 @@ async fn refresh_github_prs(
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
-#[utoipa::path(post, path = "/v1/session-title", request_body = GenerateSessionTitleRequest,
-    responses((status = 200, body = GeneratedSessionTitle)))]
-async fn generate_session_title(
+#[utoipa::path(post, path = "/v1/title", request_body = GenerateTitleRequest,
+    responses((status = 200, body = GeneratedTitle), (status = 400, body = ErrorBody)))]
+async fn generate_title(
     State(engine): State<Arc<Engine>>,
-    Json(req): Json<GenerateSessionTitleRequest>,
-) -> Json<GeneratedSessionTitle> {
-    Json(engine.generate_session_title(&req.prompt).await)
+    Json(req): Json<GenerateTitleRequest>,
+) -> Result<Json<GeneratedTitle>, ApiError> {
+    Ok(Json(
+        engine
+            .generate_title(&req.session_id, &req.prompt, &req.attachments)
+            .await?,
+    ))
+}
+
+#[utoipa::path(post, path = "/v1/sessions/{id}/title-suggestion",
+    params(("id" = String, Path, description = "Session whose conversation supplies the naming context")),
+    responses(
+        (status = 200, body = GeneratedTitle),
+        (status = 400, body = ErrorBody),
+        (status = 404, body = ErrorBody)
+    ))]
+async fn generate_session_title_from_transcript(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Result<Json<GeneratedTitle>, ApiError> {
+    Ok(Json(
+        engine.generate_session_title_from_transcript(&id).await?,
+    ))
+}
+
+#[utoipa::path(post, path = "/v1/threads/{id}/title-suggestion",
+    params(("id" = String, Path, description = "Thread whose conversation supplies the naming context")),
+    responses(
+        (status = 200, body = GeneratedTitle),
+        (status = 400, body = ErrorBody),
+        (status = 404, body = ErrorBody)
+    ))]
+async fn generate_thread_title_from_transcript(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Result<Json<GeneratedTitle>, ApiError> {
+    Ok(Json(
+        engine.generate_thread_title_from_transcript(&id).await?,
+    ))
 }
 
 #[utoipa::path(post, path = "/v1/sessions", request_body = CreateSessionRequest,
@@ -1348,7 +1412,9 @@ async fn update_session(
     Path(id): Path<String>,
     Json(req): Json<UpdateSessionRequest>,
 ) -> Result<Json<Session>, ApiError> {
-    Ok(Json(engine.update_session(&id, &req)?))
+    Ok(Json(
+        engine.update_session_and_rename_branch(&id, &req).await?,
+    ))
 }
 
 #[utoipa::path(delete, path = "/v1/sessions/{id}", params(("id" = String, Path,)),
@@ -1816,7 +1882,7 @@ async fn upsert_provider(
     Path(id): Path<String>,
     Json(req): Json<UpsertProviderRequest>,
 ) -> Result<Json<ProviderInfo>, ApiError> {
-    Ok(Json(engine.upsert_provider(&id, &req)?))
+    Ok(Json(engine.upsert_provider(&id, &req).await?))
 }
 
 #[utoipa::path(post, path = "/v1/providers/{id}/login", params(("id" = String, Path,)),
@@ -1875,7 +1941,7 @@ async fn cli_install_status(
     Json(engine.cli_install_status(&id))
 }
 
-/// Cancel an in-flight install; the CLI returns to its previous state.
+/// Cancel an in-flight install; the agent runtime returns to its previous state.
 #[utoipa::path(delete, path = "/v1/clis/{id}/install", params(("id" = String, Path,)),
     responses((status = 204), (status = 404, body = ErrorBody)))]
 async fn cancel_cli_install(
@@ -1886,7 +1952,7 @@ async fn cancel_cli_install(
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
-/// Remove the managed install of a CLI (a system install found on PATH is
+/// Remove a trouve-managed agent runtime (a system install found on PATH is
 /// untouched and will be used again if present).
 #[utoipa::path(delete, path = "/v1/clis/{id}", params(("id" = String, Path,)),
     responses((status = 204), (status = 404, body = ErrorBody),
@@ -1984,7 +2050,7 @@ async fn create_automation(
     State(engine): State<Arc<Engine>>,
     Json(req): Json<UpsertAutomationRequest>,
 ) -> Result<Json<Automation>, ApiError> {
-    Ok(Json(engine.create_automation(req)?))
+    Ok(Json(engine.create_automation(req).await?))
 }
 
 #[utoipa::path(put, path = "/v1/automations/{id}", params(("id" = String, Path,)),
@@ -1996,7 +2062,18 @@ async fn update_automation(
     Path(id): Path<String>,
     Json(req): Json<UpsertAutomationRequest>,
 ) -> Result<Json<Automation>, ApiError> {
-    Ok(Json(engine.update_automation(&id, req)?))
+    Ok(Json(engine.update_automation(&id, req).await?))
+}
+
+#[utoipa::path(put, path = "/v1/automations/{id}/enabled", params(("id" = String, Path,)),
+    request_body = SetAutomationEnabledRequest,
+    responses((status = 200, body = Automation), (status = 404, body = ErrorBody)))]
+async fn set_automation_enabled(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+    Json(req): Json<SetAutomationEnabledRequest>,
+) -> Result<Json<Automation>, ApiError> {
+    Ok(Json(engine.set_automation_enabled(&id, req.enabled).await?))
 }
 
 #[utoipa::path(delete, path = "/v1/automations/{id}", params(("id" = String, Path,)),
@@ -2005,7 +2082,7 @@ async fn delete_automation(
     State(engine): State<Arc<Engine>>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    engine.delete_automation(&id)?;
+    engine.delete_automation(&id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2056,7 +2133,7 @@ async fn delete_provider(
     State(engine): State<Arc<Engine>>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    engine.delete_provider(&id)?;
+    engine.delete_provider(&id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2134,49 +2211,29 @@ async fn set_provider_order(
     Ok(StatusCode::NO_CONTENT)
 }
 
-#[utoipa::path(get, path = "/v1/config/git-worktrees",
-    responses((status = 200, body = GitWorktreeSettings,
+#[utoipa::path(get, path = "/v1/config/session-naming",
+    responses((status = 200, body = SessionNamingSettings,
         headers(("x-trouve-event-cursor" = u64, description = "Server event cursor for this snapshot")))))]
-async fn get_git_worktree_settings(
+async fn get_session_naming_settings(
     State(engine): State<Arc<Engine>>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let (cursor, settings) = engine.git_worktree_settings_snapshot()?;
+    let (cursor, settings) = engine.session_naming_settings_snapshot()?;
     Ok(([(EVENT_CURSOR_HEADER, cursor.to_string())], Json(settings)))
 }
 
-#[utoipa::path(put, path = "/v1/config/git-worktrees",
-    request_body = SetGitWorktreeSettingsRequest,
-    responses((status = 200, body = GitWorktreeSettings,
+#[utoipa::path(put, path = "/v1/config/session-naming",
+    request_body = SetSessionNamingSettingsRequest,
+    responses((status = 200, body = SessionNamingSettings,
         headers(("x-trouve-event-cursor" = u64, description = "Server event cursor for this snapshot")))))]
-async fn set_git_worktree_settings(
+async fn set_session_naming_settings(
     State(engine): State<Arc<Engine>>,
-    Json(req): Json<SetGitWorktreeSettingsRequest>,
+    Json(req): Json<SetSessionNamingSettingsRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     engine
-        .set_git_worktree_settings(
-            req.title_model_load_behavior,
-            req.title_model_resource_policy,
-            req.derive_branch_name_from_session_title,
-        )
+        .set_session_naming_settings(req.model, req.derive_branch_name_from_session_title)
         .await?;
-    let (cursor, settings) = engine.git_worktree_settings_snapshot()?;
+    let (cursor, settings) = engine.session_naming_settings_snapshot()?;
     Ok(([(EVENT_CURSOR_HEADER, cursor.to_string())], Json(settings)))
-}
-
-#[utoipa::path(post, path = "/v1/config/git-worktrees/title-model/install",
-    responses((status = 202), (status = 409, body = ErrorBody)))]
-async fn install_title_model(State(engine): State<Arc<Engine>>) -> Result<StatusCode, ApiError> {
-    engine.install_title_model()?;
-    Ok(StatusCode::ACCEPTED)
-}
-
-#[utoipa::path(delete, path = "/v1/config/git-worktrees/title-model/install",
-    responses((status = 204), (status = 404, body = ErrorBody), (status = 409, body = ErrorBody)))]
-async fn cancel_title_model_install(
-    State(engine): State<Arc<Engine>>,
-) -> Result<StatusCode, ApiError> {
-    engine.cancel_title_model_install()?;
-    Ok(StatusCode::NO_CONTENT)
 }
 
 #[utoipa::path(get, path = "/v1/threads/{id}/usage", params(("id" = String, Path,)),

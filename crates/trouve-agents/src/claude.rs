@@ -37,7 +37,8 @@ use trouve_protocol::{ModelInfo, Usage};
 use crate::process_env::{ProcessTreeChild, spawn_process_tree};
 use crate::{
     AgentBackend, BackendError, BackendEvent, BackendEventStream, BackendLogin, BackendPermission,
-    BackendStatus, BackendTurn, async_stream, binary_on_path, format_reset, spawn_claude_login,
+    BackendStatus, BackendSteer, BackendTurn, TurnAttachment, async_stream, binary_on_path,
+    format_reset, spawn_claude_login,
 };
 
 /// Most live processes kept at once; the least recently used is evicted.
@@ -46,11 +47,56 @@ const POOL_CAP: usize = 3;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 /// How often the reaper scans the pool.
 const REAP_INTERVAL: Duration = Duration::from_secs(60);
+/// Steering accepted before the lazy stream sends its initial prompt. The
+/// engine normally polls that stream immediately, but a continuously-ready
+/// steering producer must not grow process memory without bound.
+const PENDING_STEER_CAP: usize = 8;
+
+fn claude_steer_message(prompt: String, attachments: Vec<TurnAttachment>) -> Value {
+    let mut content = Vec::with_capacity(1 + attachments.len());
+    if !prompt.is_empty() {
+        content.push(json!({ "type": "text", "text": prompt }));
+    }
+    for attachment in attachments {
+        content.push(json!({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": attachment.mime,
+                "data": attachment.base64(),
+            }
+        }));
+    }
+    json!({
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": content,
+        }
+    })
+}
+
+fn enqueue_pending_claude_steer(
+    pending: &mut Vec<Value>,
+    session: &str,
+    build_message: impl FnOnce() -> Value,
+) -> Result<(), BackendError> {
+    if pending.len() >= PENDING_STEER_CAP {
+        return Err(BackendError::Protocol(format!(
+            "claude steer: session {session} pending steering queue is full"
+        )));
+    }
+    pending.push(build_message());
+    Ok(())
+}
 
 pub struct ClaudeBackend {
     id: String,
     command: String,
     pool: Arc<Pool>,
+    /// Signals one thread id per vendor-autonomous turn the router observes.
+    background_turns: mpsc::Sender<String>,
+    background_turns_rx: std::sync::Mutex<Option<mpsc::Receiver<String>>>,
     /// Serialized one-shot usage process. A failed cleanup remains here so a
     /// later poll cannot spawn over an unproven prior process tree.
     usage_process: Mutex<Option<ProcessTreeChild>>,
@@ -61,10 +107,13 @@ pub struct ClaudeBackend {
 
 impl ClaudeBackend {
     pub fn new(id: impl Into<String>, command: Option<String>) -> Self {
+        let (background_turns, background_turns_rx) = mpsc::channel(64);
         Self {
             id: id.into(),
             command: command.unwrap_or_else(|| "claude".into()),
             pool: Arc::new(Pool::default()),
+            background_turns,
+            background_turns_rx: std::sync::Mutex::new(Some(background_turns_rx)),
             usage_process: Mutex::new(None),
             #[cfg(test)]
             injected_usage_cleanup_failure: std::sync::atomic::AtomicBool::new(false),
@@ -134,8 +183,9 @@ impl Pool {
         let mut procs = self.procs.lock().await;
         let mut dead = Vec::new();
         for (id, p) in procs.iter() {
-            if Arc::strong_count(p) != 1 || p.lines.try_lock().is_err() {
-                continue; // turn in flight
+            if Arc::strong_count(p) != 1 || p.router.is_busy() || p.router.has_pending_background()
+            {
+                continue; // turn in flight or buffered awaiting attach
             }
             if p.last_used.lock().unwrap().elapsed() > IDLE_TIMEOUT {
                 dead.push(id.clone());
@@ -168,7 +218,10 @@ impl Pool {
             let lru = procs
                 .iter()
                 .filter(|(_, p)| {
-                    p.is_reusable() && Arc::strong_count(p) == 1 && p.lines.try_lock().is_ok()
+                    p.is_reusable()
+                        && Arc::strong_count(p) == 1
+                        && !p.router.is_busy()
+                        && !p.router.has_pending_background()
                 })
                 .min_by_key(|(_, p)| *p.last_used.lock().unwrap())
                 .map(|(id, _)| id.clone());
@@ -197,15 +250,429 @@ impl Pool {
     }
 }
 
+/// Bytes of vendor-autonomous ("background") turn output buffered while no
+/// attach consumer is connected. Overflow drops the oldest lines (logged);
+/// the vendor transcript remains authoritative on disk.
+const BACKGROUND_BUFFER_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// Outcome of registering a turn consumer with the stdout router.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RouterRegistration {
+    /// The consumer will receive lines (live or drained from the buffer).
+    Streaming,
+    /// An attach consumer claimed a vendor-autonomous turn that is still
+    /// running, so Claude can accept steering for it.
+    StreamingLive,
+    /// Attach-only registration found no background turn to attach to.
+    NothingPending,
+}
+
+#[derive(Default)]
+struct RouterState {
+    /// Consumer for the trouve turn currently entitled to stdout lines.
+    turn: Option<mpsc::Sender<String>>,
+    /// The registered consumer is an attach turn: it must receive exactly
+    /// one buffered/live background turn, ending at its `result` line.
+    turn_is_attach: bool,
+    /// A non-attach consumer registered but its prompt has not been written
+    /// to the vendor yet, so no arriving line can belong to it.
+    prompt_pending: bool,
+    /// The process is inside a vendor-autonomous turn whose `result` has not
+    /// arrived yet.
+    background_in_flight: bool,
+    /// The stdout pump has read a result belonging to the registered turn,
+    /// but the router has not attributed that line yet. Steering must close
+    /// at receipt rather than after this channel handoff.
+    terminal_pending: bool,
+    /// A steering record passed its final liveness check and owns the writer
+    /// boundary until the complete newline-terminated record is flushed.
+    steer_write_reserved: bool,
+    /// Complete, in-order lines of vendor-autonomous turns awaiting an
+    /// attach consumer. May span multiple turns; `result` lines delimit.
+    background: std::collections::VecDeque<String>,
+    background_bytes: usize,
+    dropped_background_lines: u64,
+}
+
+/// Owns a process's stdout for its whole life and routes each line to the
+/// correct consumer. This guarantees two properties the old
+/// turn-locks-the-receiver design could not: Claude Code never blocks on an
+/// unread stdout pipe between trouve turns, and events from a
+/// vendor-autonomous turn (e.g. a Monitor wake-up inside Claude Code) can
+/// never leak into the next trouve-initiated turn — attribution only
+/// switches at `result` boundaries.
+struct StdoutRouter {
+    state: std::sync::Mutex<RouterState>,
+    /// Serializes steering writes with terminal-result attribution. A steer
+    /// that wins this boundary belongs to the active turn; one that loses it
+    /// observes the cleared router consumer and fails closed.
+    turn_boundary: Mutex<()>,
+    /// Wakes the router loop when a consumer registers.
+    notify: tokio::sync::Notify,
+    /// Announces a pending vendor-autonomous turn to the engine. Invoked
+    /// whenever a turn begins with no consumer, and re-invoked whenever a
+    /// buffered turn loses or outlives its attach consumer, so every
+    /// buffered turn is eventually announced even if an earlier signal or
+    /// attach was lost.
+    signal: Box<dyn Fn() + Send + Sync>,
+}
+
+/// Owns an eager router registration until its returned stream is dropped.
+/// Its weak sender preserves exact-channel cleanup without keeping the
+/// receiver open after the router releases its sender at a turn boundary.
+struct RouterRegistrationGuard {
+    router: Arc<StdoutRouter>,
+    sender: mpsc::WeakSender<String>,
+}
+
+struct SteerWriteReservation {
+    router: Arc<StdoutRouter>,
+}
+
+impl Drop for SteerWriteReservation {
+    fn drop(&mut self) {
+        self.router.state.lock().unwrap().steer_write_reserved = false;
+    }
+}
+
+impl Drop for RouterRegistrationGuard {
+    fn drop(&mut self) {
+        if let Some(sender) = self.sender.upgrade() {
+            self.router.consumer_lost(&sender, None);
+        }
+    }
+}
+
+impl StdoutRouter {
+    fn new(signal: impl Fn() + Send + Sync + 'static) -> Self {
+        Self {
+            state: std::sync::Mutex::new(RouterState::default()),
+            turn_boundary: Mutex::new(()),
+            notify: tokio::sync::Notify::new(),
+            signal: Box::new(signal),
+        }
+    }
+
+    /// True while stdout lines are attributed to any in-flight turn.
+    fn is_busy(&self) -> bool {
+        let state = self.state.lock().unwrap();
+        state.turn.is_some() || state.background_in_flight
+    }
+
+    /// True while completed autonomous turns sit buffered awaiting an attach
+    /// consumer. Pool reaping and cap eviction must treat such processes as
+    /// live: recycling one discards its buffered turns before the engine's
+    /// attach can drain them.
+    fn has_pending_background(&self) -> bool {
+        !self.state.lock().unwrap().background.is_empty()
+    }
+
+    /// Atomically turn the final liveness check into ownership of one whole
+    /// stdin record. Terminal receipt can still close future admission while
+    /// this reservation writes; the router attribution boundary keeps the
+    /// already-admitted record attached to the preceding turn.
+    fn reserve_steer_write(self: &Arc<Self>, attach_turn: bool) -> Option<SteerWriteReservation> {
+        let mut state = self.state.lock().unwrap();
+        let accepted = state.turn.is_some()
+            && state.turn_is_attach == attach_turn
+            && (!attach_turn || state.background_in_flight)
+            && !state.terminal_pending
+            && !state.steer_write_reserved;
+        if !accepted {
+            return None;
+        }
+        state.steer_write_reserved = true;
+        Some(SteerWriteReservation {
+            router: Arc::clone(self),
+        })
+    }
+
+    /// Close steering admission as soon as stdout yields a terminal record,
+    /// before that record can wait in the pump-to-router channel.
+    fn line_received(&self, line: &str) {
+        if !line_is_result(line) {
+            return;
+        }
+        let mut state = self.state.lock().unwrap();
+        state.terminal_pending = state.turn.is_some()
+            && if state.turn_is_attach {
+                state.background_in_flight
+            } else {
+                !state.prompt_pending && !state.background_in_flight
+            };
+    }
+
+    /// The registered non-attach turn's prompt reached the vendor; lines
+    /// arriving from now on may belong to it.
+    fn prompt_delivered(&self) {
+        self.state.lock().unwrap().prompt_pending = false;
+    }
+
+    /// Install the consumer for a trouve-initiated turn. A non-attach turn
+    /// starts receiving lines only after its prompt is delivered and any
+    /// in-flight background turn reaches its `result`; an attach turn
+    /// receives exactly one background turn (buffered and/or live) and
+    /// reports `NothingPending` when there is none.
+    fn register(
+        &self,
+        sender: mpsc::Sender<String>,
+        attach: bool,
+    ) -> Result<RouterRegistration, BackendError> {
+        let mut state = self.state.lock().unwrap();
+        if state.turn.as_ref().is_some_and(|turn| turn.is_closed()) {
+            // A cancelled turn's consumer can linger until its next send
+            // fails; replace it eagerly so registration never deadlocks. A
+            // dead attach consumer may leave its turn buffered: re-announce.
+            let was_attach = state.turn_is_attach;
+            state.turn = None;
+            state.turn_is_attach = false;
+            if was_attach && (!state.background.is_empty() || state.background_in_flight) {
+                (self.signal)();
+            }
+        }
+        if state.turn.is_some() {
+            return Err(BackendError::Protocol(
+                "claude: a turn is already consuming this process".into(),
+            ));
+        }
+        if attach && state.background.is_empty() && !state.background_in_flight {
+            return Ok(RouterRegistration::NothingPending);
+        }
+        if state.dropped_background_lines > 0 {
+            tracing::warn!(
+                dropped = state.dropped_background_lines,
+                "claude: background turn output was dropped before a consumer attached"
+            );
+            state.dropped_background_lines = 0;
+        }
+        let streaming_live = attach && state.background_in_flight;
+        state.turn = Some(sender);
+        state.turn_is_attach = attach;
+        state.prompt_pending = !attach;
+        drop(state);
+        self.notify.notify_one();
+        Ok(if streaming_live {
+            RouterRegistration::StreamingLive
+        } else {
+            RouterRegistration::Streaming
+        })
+    }
+
+    /// Register an eagerly claimed consumer whose ownership is released even
+    /// when the lazy event stream is dropped before its first poll.
+    fn register_owned(
+        self: &Arc<Self>,
+        sender: mpsc::Sender<String>,
+        attach: bool,
+    ) -> Result<(RouterRegistration, Option<RouterRegistrationGuard>), BackendError> {
+        let weak_sender = sender.downgrade();
+        let registration = self.register(sender, attach)?;
+        let guard = matches!(
+            registration,
+            RouterRegistration::Streaming | RouterRegistration::StreamingLive
+        )
+        .then(|| RouterRegistrationGuard {
+            router: self.clone(),
+            sender: weak_sender,
+        });
+        Ok((registration, guard))
+    }
+
+    fn buffer_background(state: &mut RouterState, line: String) {
+        state.background_bytes += line.len();
+        state.background.push_back(line);
+        while state.background_bytes > BACKGROUND_BUFFER_MAX_BYTES {
+            let Some(dropped) = state.background.pop_front() else {
+                break;
+            };
+            state.background_bytes -= dropped.len();
+            state.dropped_background_lines += 1;
+        }
+    }
+
+    /// Uninstall a failed consumer; when it was an attach consumer, put the
+    /// undelivered line back and re-announce the still-pending turn.
+    fn consumer_lost(&self, sender: &mpsc::Sender<String>, undelivered: Option<String>) {
+        let mut state = self.state.lock().unwrap();
+        let current = state
+            .turn
+            .as_ref()
+            .is_some_and(|turn| turn.same_channel(sender));
+        if !current {
+            return;
+        }
+        let was_attach = state.turn_is_attach;
+        state.turn = None;
+        state.turn_is_attach = false;
+        if was_attach {
+            if let Some(line) = undelivered {
+                state.background_bytes += line.len();
+                state.background.push_front(line);
+            }
+            if !state.background.is_empty() || state.background_in_flight {
+                (self.signal)();
+            }
+        }
+    }
+
+    /// Run the routing loop until the stdout pump closes.
+    async fn run(self: Arc<Self>, mut lines: mpsc::Receiver<String>) {
+        loop {
+            // Drain buffered background lines to an attach consumer first;
+            // this must not require fresh stdout activity.
+            loop {
+                let (sender, line, last_of_turn) = {
+                    let mut state = self.state.lock().unwrap();
+                    let Some(sender) = state.turn.clone() else {
+                        break;
+                    };
+                    if !state.turn_is_attach {
+                        break;
+                    }
+                    let Some(line) = state.background.pop_front() else {
+                        break;
+                    };
+                    state.background_bytes -= line.len();
+                    let last = line_is_result(&line);
+                    if last {
+                        state.turn = None;
+                        state.turn_is_attach = false;
+                        if !state.background.is_empty() {
+                            // Another complete buffered turn awaits its own
+                            // attach consumer; its original signal may have
+                            // been consumed by this one.
+                            (self.signal)();
+                        }
+                    }
+                    (sender, line, last)
+                };
+                if sender.send(line.clone()).await.is_err() {
+                    if last_of_turn {
+                        // Consumer death and turn completion coincided; the
+                        // turn is consumed either way.
+                        break;
+                    }
+                    self.consumer_lost(&sender, Some(line));
+                    break;
+                }
+                if last_of_turn {
+                    break;
+                }
+            }
+
+            let line = tokio::select! {
+                line = lines.recv() => match line {
+                    Some(line) => line,
+                    None => break,
+                },
+                _ = self.notify.notified() => continue,
+            };
+            let is_result = line_is_result(&line);
+            let _turn_boundary = if is_result {
+                Some(self.turn_boundary.lock().await)
+            } else {
+                None
+            };
+            // Decide the destination under the lock, send outside it.
+            let (destination, attach_completed) = {
+                let mut state = self.state.lock().unwrap();
+                if is_result {
+                    state.terminal_pending = false;
+                }
+                let turn = state.turn.clone();
+                let is_attach = state.turn_is_attach;
+                let prompt_pending = state.prompt_pending;
+                let in_flight = state.background_in_flight;
+                match (turn, in_flight) {
+                    // An attach consumer takes the in-flight background
+                    // turn's lines directly and ends at its boundary.
+                    (Some(sender), true) if is_attach => {
+                        if is_result {
+                            state.background_in_flight = false;
+                            state.turn = None;
+                            state.turn_is_attach = false;
+                        }
+                        (Some(sender), is_result)
+                    }
+                    // A background turn in flight always owns the line, even
+                    // when a non-attach turn is already registered: that
+                    // turn's prompt is queued vendor-side and its events
+                    // begin only after this boundary.
+                    (_, true) => {
+                        if is_result {
+                            state.background_in_flight = false;
+                        }
+                        Self::buffer_background(&mut state, line.clone());
+                        (None, false)
+                    }
+                    (Some(sender), false) if is_attach => {
+                        // Live continuation of a partially buffered turn.
+                        if is_result {
+                            state.turn = None;
+                            state.turn_is_attach = false;
+                        }
+                        (Some(sender), is_result)
+                    }
+                    (Some(sender), false) if !prompt_pending => {
+                        if is_result {
+                            state.turn = None;
+                        }
+                        (Some(sender), false)
+                    }
+                    // Either no consumer, or a non-attach consumer whose
+                    // prompt has not reached the vendor: this line starts a
+                    // new vendor-autonomous turn.
+                    (_, false) => {
+                        state.background_in_flight = !is_result;
+                        Self::buffer_background(&mut state, line.clone());
+                        (self.signal)();
+                        (None, false)
+                    }
+                }
+            };
+            if let Some(sender) = destination {
+                if sender.send(line.clone()).await.is_err() {
+                    self.consumer_lost(&sender, Some(line));
+                } else if attach_completed {
+                    let state = self.state.lock().unwrap();
+                    if !state.background.is_empty() {
+                        (self.signal)();
+                    }
+                }
+            }
+        }
+        let mut state = self.state.lock().unwrap();
+        state.turn = None;
+        state.turn_is_attach = false;
+        state.background_in_flight = false;
+    }
+}
+
+fn line_is_result(line: &str) -> bool {
+    serde_json::from_str::<Value>(line)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("type")
+                .and_then(Value::as_str)
+                .map(|kind| kind == "result")
+        })
+        .unwrap_or(false)
+}
+
 /// One persistent `claude` process serving one trouve thread.
 struct ClaudeProc {
-    stdin: Mutex<ChildStdin>,
-    /// Stdout lines; locked by the active turn for its whole duration.
-    lines: Mutex<mpsc::Receiver<String>>,
+    input: Mutex<ClaudeInputState>,
+    /// Routes stdout lines to the active consumer; owns the receiver for
+    /// the process's whole life.
+    router: Arc<StdoutRouter>,
     child: Mutex<ProcessTreeChild>,
     /// False as soon as any path decides this transport must be recycled.
     /// The pool retains a false entry until full-tree cleanup is acknowledged.
     reusable: std::sync::atomic::AtomicBool,
+    /// Explicit turn readiness. This is set before `run_turn` returns its
+    /// lazy stream, so steering can be accepted at the advertised boundary.
+    active_turn: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     injected_terminate_failure: std::sync::atomic::AtomicBool,
     /// Claude reads user MCP credentials from this owner-only file. Keeping
@@ -221,7 +688,49 @@ struct ClaudeProc {
     stderr_tail: Arc<std::sync::Mutex<String>>,
 }
 
+struct ClaudeInputState {
+    stdin: ChildStdin,
+    prompt_sent: bool,
+    attach_turn: bool,
+    pending_steers: Vec<Value>,
+}
+
+struct ClaudeTurnGuard {
+    proc_: Arc<ClaudeProc>,
+}
+
+impl Drop for ClaudeTurnGuard {
+    fn drop(&mut self) {
+        self.proc_
+            .active_turn
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
 impl ClaudeProc {
+    async fn begin_turn(
+        self: &Arc<Self>,
+        prompt_already_sent: bool,
+    ) -> Result<ClaudeTurnGuard, BackendError> {
+        let mut input = self.input.lock().await;
+        self.active_turn
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .map_err(|_| {
+                BackendError::Protocol("claude process already has an active turn".into())
+            })?;
+        input.prompt_sent = prompt_already_sent;
+        input.attach_turn = prompt_already_sent;
+        input.pending_steers.clear();
+        Ok(ClaudeTurnGuard {
+            proc_: self.clone(),
+        })
+    }
+
     fn quarantine(&self) {
         self.reusable
             .store(false, std::sync::atomic::Ordering::Release);
@@ -351,14 +860,7 @@ impl AgentBackend for ClaudeBackend {
     }
 
     fn shared_model_identity(&self, model: &str) -> Option<String> {
-        self.catalog
-            .model(
-                "anthropic",
-                &self.id,
-                model,
-                trouve_providers::models_dev::OptionsDialect::ClaudeCli,
-            )
-            .map(|_| model.to_string())
+        self.catalog.shared_model_identity("anthropic", model)
     }
 
     fn models(&self) -> Vec<ModelInfo> {
@@ -392,6 +894,83 @@ impl AgentBackend for ClaudeBackend {
         true
     }
 
+    fn supports_steering(&self) -> bool {
+        true
+    }
+
+    async fn steer_turn(&self, steer: BackendSteer) -> Result<(), BackendError> {
+        let proc_ = {
+            let procs = self.pool.procs.lock().await;
+            procs
+                .values()
+                .find(|proc_| {
+                    proc_.is_reusable()
+                        && proc_.session.lock().unwrap().as_deref() == Some(&steer.session)
+                })
+                .cloned()
+        }
+        .ok_or_else(|| {
+            BackendError::Protocol(format!(
+                "claude steer: no live process owns session {}",
+                steer.session
+            ))
+        })?;
+        let mut input = tokio::select! {
+            biased;
+            _ = steer.cancel.cancelled() => return Err(BackendError::Cancelled),
+            input = proc_.input.lock() => input,
+        };
+        if !proc_.active_turn.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(BackendError::Protocol(format!(
+                "claude steer: session {} has no active turn",
+                steer.session
+            )));
+        }
+        if !input.prompt_sent {
+            enqueue_pending_claude_steer(&mut input.pending_steers, &steer.session, || {
+                claude_steer_message(steer.prompt, steer.attachments)
+            })?;
+            return Ok(());
+        }
+        // The active-turn path has no bounded pending queue. Encode only
+        // after validating process admission, but before reserving the
+        // non-cancellable wire write so terminal receipt can still win while
+        // a large attachment is being encoded.
+        let message = claude_steer_message(steer.prompt, steer.attachments);
+        let _turn_boundary = tokio::select! {
+            biased;
+            _ = steer.cancel.cancelled() => return Err(BackendError::Cancelled),
+            boundary = proc_.router.turn_boundary.lock() => boundary,
+        };
+        let _write_reservation = proc_
+            .router
+            .reserve_steer_write(input.attach_turn)
+            .ok_or_else(|| {
+                BackendError::Protocol(format!(
+                    "claude steer: session {} has no active turn",
+                    steer.session
+                ))
+            })?;
+        if !proc_.active_turn.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(BackendError::Protocol(format!(
+                "claude steer: session {} has no active turn",
+                steer.session
+            )));
+        }
+        // Serialize and write one complete record after the atomic reservation.
+        // Once this write starts, finish it even if request cancellation or a
+        // terminal stdout record arrives; a partial JSON line would corrupt
+        // the persistent stream-json transport for every later turn.
+        let mut record = message.to_string().into_bytes();
+        record.push(b'\n');
+        input
+            .stdin
+            .write_all(&record)
+            .await
+            .map_err(BackendError::Io)?;
+        input.stdin.flush().await.map_err(BackendError::Io)
+    }
+
     async fn start_login(&self) -> Result<BackendLogin, BackendError> {
         spawn_claude_login(&self.command).await
     }
@@ -410,9 +989,63 @@ impl AgentBackend for ClaudeBackend {
         })
     }
 
+    fn take_background_turn_signals(&self) -> Option<mpsc::Receiver<String>> {
+        self.background_turns_rx.lock().unwrap().take()
+    }
+
+    async fn abandon_background_turns(&self, thread_id: &str) {
+        let proc_ = self.pool.procs.lock().await.get(thread_id).cloned();
+        if let Some(proc_) = proc_ {
+            // The thread is gone, so this process can never serve another
+            // turn and its output can never be attached. Terminating it
+            // (rather than clearing router state at one instant) also covers
+            // an autonomous turn still streaming, which would otherwise
+            // refill the buffer and re-pin the pool slot with no later
+            // signal guaranteed to repeat the cleanup.
+            if let Err(error) = self.pool.terminate_and_remove(thread_id, &proc_).await {
+                tracing::warn!(
+                    %thread_id,
+                    "claude: terminating the pooled process for a deleted thread failed: {error}"
+                );
+                // Free the slot regardless: terminate_and_remove already
+                // quarantined the process before failing, and the thread can
+                // never use it again. Dropping the pool's reference releases
+                // the pending-background pin, and the child is spawned with
+                // kill_on_drop, so it is reaped when the last reference
+                // goes.
+                let mut procs = self.pool.procs.lock().await;
+                if procs
+                    .get(thread_id)
+                    .is_some_and(|current| Arc::ptr_eq(current, &proc_))
+                {
+                    procs.remove(thread_id);
+                }
+            }
+        }
+    }
+
     async fn run_turn(&self, turn: BackendTurn) -> Result<BackendEventStream, BackendError> {
         self.start_reaper();
         let cancel = turn.cancel.clone();
+        if turn.attach_background {
+            let existing = self
+                .pool
+                .procs
+                .lock()
+                .await
+                .get(&turn.thread_id)
+                .cloned()
+                .filter(|proc_| proc_.is_reusable());
+            let Some(_) = existing else {
+                // The process (and any background output) is gone; report an
+                // empty completed turn instead of spawning a fresh CLI.
+                return Ok(Box::pin(futures::stream::once(async {
+                    Ok(BackendEvent::Completed {
+                        usage: Usage::default(),
+                    })
+                })));
+            };
+        }
         // Process acquisition may have to clean a stale tree. Do not cancel
         // that future midway through its acknowledgement: it keeps the pool
         // key quarantined and checks cancellation before spawning.
@@ -423,42 +1056,64 @@ impl AgentBackend for ClaudeBackend {
             pool.terminate_and_remove(&thread_id, &proc_).await?;
             return Err(BackendError::Cancelled);
         }
-        let prompt = turn.prompt.clone();
-        // Anthropic-style base64 image blocks, alongside the text block.
-        let mut content = vec![json!({ "type": "text", "text": prompt })];
-        for att in &turn.attachments {
-            content.push(json!({
-                "type": "image",
-                "source": {
-                    "type": "base64",
-                    "media_type": att.mime,
-                    "data": att.base64(),
+        let attach = turn.attach_background;
+        // Claim an attach target before advertising native steering. The
+        // router distinguishes a genuinely live vendor turn from a completed
+        // turn whose output is merely buffered; writing to Claude's stdin in
+        // the latter case would start unrelated background work.
+        let (mut lines, registration_guard, active_turn) = if attach {
+            let (turn_tx, lines) = mpsc::channel::<String>(1024);
+            let (registration, registration_guard) = proc_.router.register_owned(turn_tx, true)?;
+            match registration {
+                RouterRegistration::StreamingLive => (
+                    lines,
+                    registration_guard,
+                    Some(proc_.begin_turn(true).await?),
+                ),
+                RouterRegistration::Streaming => (lines, registration_guard, None),
+                RouterRegistration::NothingPending => {
+                    return Ok(Box::pin(futures::stream::once(async {
+                        Ok(BackendEvent::Completed {
+                            usage: Usage::default(),
+                        })
+                    })));
                 }
-            }));
-        }
+            }
+        } else {
+            let active_turn = proc_.begin_turn(false).await?;
+            let (turn_tx, lines) = mpsc::channel::<String>(1024);
+            let (registration, registration_guard) = proc_.router.register_owned(turn_tx, false)?;
+            match registration {
+                RouterRegistration::Streaming => {}
+                RouterRegistration::StreamingLive => unreachable!(
+                    "non-attach Claude registration cannot claim a live background turn"
+                ),
+                RouterRegistration::NothingPending => {
+                    unreachable!("non-attach Claude registration always creates a consumer")
+                }
+            }
+            (lines, registration_guard, Some(active_turn))
+        };
+        proc_.touch();
 
-        let stream = async_stream(move |tx| async move {
-            // Exclusive claim on the process for this turn.
-            let mut lines = tokio::select! {
-                biased;
-                _ = cancel.cancelled() => {
-                    if let Err(error) = pool.terminate_and_remove(&thread_id, &proc_).await {
-                        let _ = tx.send(Err(error)).await;
+        // Deliver the prompt before handing back the stream: the caller's
+        // startup pacing treats a returned stream as "the vendor has the
+        // turn", and a fresh CLI reads stdin only once it has initialized,
+        // so a deferred write would let the turn slip past that pacing.
+        if !attach {
+            let prompt = turn.prompt.clone();
+            // Anthropic-style base64 image blocks, alongside the text block.
+            let mut content = vec![json!({ "type": "text", "text": prompt })];
+            for att in &turn.attachments {
+                content.push(json!({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": att.mime,
+                        "data": att.base64(),
                     }
-                    return;
-                }
-                _ = tx.closed() => {
-                    if let Err(error) = pool.terminate_and_remove(&thread_id, &proc_).await {
-                        tracing::warn!(
-                            "claude: stream-drop cleanup was not acknowledged: {error}"
-                        );
-                    }
-                    return;
-                }
-                lines = proc_.lines.lock() => lines,
-            };
-            proc_.touch();
-
+                }));
+            }
             let msg = json!({
                 "type": "user",
                 "message": {
@@ -469,32 +1124,40 @@ impl AgentBackend for ClaudeBackend {
             let sent = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => {
-                    if let Err(error) = pool.terminate_and_remove(&thread_id, &proc_).await {
-                        let _ = tx.send(Err(error)).await;
-                    }
-                    return;
-                }
-                _ = tx.closed() => {
-                    if let Err(error) = pool.terminate_and_remove(&thread_id, &proc_).await {
-                        tracing::warn!(
-                            "claude: stream-drop cleanup was not acknowledged: {error}"
-                        );
-                    }
-                    return;
+                    pool.terminate_and_remove(&thread_id, &proc_).await?;
+                    return Err(BackendError::Cancelled);
                 }
                 sent = async {
-                    let mut stdin = proc_.stdin.lock().await;
-                    stdin.write_all(msg.to_string().as_bytes()).await?;
-                    stdin.write_all(b"\n").await?;
-                    stdin.flush().await
+                    let mut input = proc_.input.lock().await;
+                    input.stdin.write_all(msg.to_string().as_bytes()).await?;
+                    input.stdin.write_all(b"\n").await?;
+                    for steer in std::mem::take(&mut input.pending_steers) {
+                        input.stdin.write_all(steer.to_string().as_bytes()).await?;
+                        input.stdin.write_all(b"\n").await?;
+                    }
+                    input.stdin.flush().await?;
+                    input.prompt_sent = true;
+                    Ok::<(), std::io::Error>(())
                 } => sent,
             };
             if let Err(e) = sent {
-                // Likely the process died between turns; keep reading — the
-                // no-result exit path below reports it (with stderr) and
-                // drops it from the pool so the next turn respawns.
+                // Likely the process died between turns; keep reading —
+                // the stream's no-result exit path reports it (with stderr)
+                // and drops it from the pool so the next turn respawns.
+                // Delivery is still marked: a write error cannot
+                // distinguish "the vendor never saw the prompt" from
+                // "the vendor consumed the prompt and closed stdin
+                // before our flush" (EPIPE after full consumption), and
+                // withholding delivery in the second case strands the
+                // legitimate response as background output.
                 tracing::debug!("claude stdin write failed: {e}");
             }
+            proc_.router.prompt_delivered();
+        }
+
+        let stream = async_stream(move |tx| async move {
+            let _active_turn = active_turn;
+            let _registration_guard = registration_guard;
 
             let mut completed = false;
             loop {
@@ -960,16 +1623,31 @@ impl ClaudeBackend {
         let stdout = child.take_stdout().expect("stdout piped");
         let stderr = child.take_stderr().expect("stderr piped");
 
-        // Stdout pump: lines flow into the channel the active turn drains.
+        let thread_id = turn.thread_id.clone();
+        let signal = self.background_turns.clone();
+        let router = Arc::new(StdoutRouter::new(move || {
+            if signal.try_send(thread_id.clone()).is_err() {
+                tracing::debug!(
+                    thread_id = %thread_id,
+                    "claude: dropping background-turn signal (retried on attach boundaries)"
+                );
+            }
+        }));
+        // Stdout pump: lines flow into the channel the router owns for the
+        // process's whole life, so the pipe is always being read. Terminal
+        // admission closes before the line enters this bounded channel.
         let (line_tx, line_rx) = mpsc::channel::<String>(256);
+        let pump_router = Arc::clone(&router);
         tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
+                pump_router.line_received(&line);
                 if line_tx.send(line).await.is_err() {
                     break;
                 }
             }
         });
+        tokio::spawn(Arc::clone(&router).run(line_rx));
 
         // Stderr pump: keep a bounded tail for error reporting.
         let stderr_tail = Arc::new(std::sync::Mutex::new(String::new()));
@@ -988,10 +1666,16 @@ impl ClaudeBackend {
         });
 
         Ok(ClaudeProc {
-            stdin: Mutex::new(stdin),
-            lines: Mutex::new(line_rx),
+            input: Mutex::new(ClaudeInputState {
+                stdin,
+                prompt_sent: false,
+                attach_turn: false,
+                pending_steers: Vec::new(),
+            }),
+            router,
             child: Mutex::new(child),
             reusable: std::sync::atomic::AtomicBool::new(true),
+            active_turn: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             injected_terminate_failure: std::sync::atomic::AtomicBool::new(false),
             _mcp_config: mcp_config_file,
@@ -1131,31 +1815,45 @@ fn parse_usage_health(provider_id: &str, payload: &Value) -> trouve_protocol::Su
     let rate_limits = &payload["rate_limits"];
 
     let mut windows: Vec<trouve_protocol::SubscriptionWindow> = Vec::new();
+    let percent = |bucket: &Value| {
+        ["utilization", "used_percentage", "percent"]
+            .into_iter()
+            .find_map(|key| bucket[key].as_f64())
+    };
+    let reset = |bucket: &Value| {
+        bucket
+            .get("resets_at")
+            .or_else(|| bucket.get("resetsAt"))
+            .and_then(parse_reset_at)
+    };
     let push = |windows: &mut Vec<trouve_protocol::SubscriptionWindow>,
                 label: String,
-                used: &Value,
-                resets: &Value| {
-        let Some(pct) = used.as_f64() else { return };
+                pct: f64,
+                resets: Option<i64>| {
         windows.push(trouve_protocol::SubscriptionWindow {
             label,
             used_percent: (pct.round() as i64).clamp(0, 100),
-            resets: parse_reset_at(resets).map(format_reset).unwrap_or_default(),
+            resets: resets.map(format_reset).unwrap_or_default(),
         });
     };
 
-    for (key, label) in [
-        ("five_hour", "5h window"),
-        ("seven_day", "Weekly (all models)"),
-        ("seven_day_sonnet", "Weekly (Sonnet)"),
-        ("seven_day_opus", "Weekly (Opus)"),
+    // Claude has used both descriptive and compact keys for these buckets,
+    // and the status-line form calls the percentage `used_percentage`.
+    // Accept all of those spellings because `get_usage` is experimental and
+    // has changed independently of the CLI versioned output formats.
+    for (keys, label) in [
+        (&["five_hour", "5h"][..], "5h window"),
+        (&["seven_day", "7d"][..], "Weekly (all models)"),
+        (&["seven_day_sonnet", "7d_sonnet"][..], "Weekly (Sonnet)"),
+        (&["seven_day_opus", "7d_opus"][..], "Weekly (Opus)"),
     ] {
-        let bucket = &rate_limits[key];
-        push(
-            &mut windows,
-            label.to_string(),
-            &bucket["utilization"],
-            &bucket["resets_at"],
-        );
+        let Some((bucket, pct)) = keys
+            .iter()
+            .find_map(|key| percent(&rate_limits[*key]).map(|pct| (&rate_limits[*key], pct)))
+        else {
+            continue;
+        };
+        push(&mut windows, label.to_string(), pct, reset(bucket));
     }
 
     // Newer payloads carry the buckets in a self-describing `limits` array
@@ -1174,7 +1872,8 @@ fn parse_usage_health(provider_id: &str, payload: &Value) -> trouve_protocol::Su
         if windows.iter().any(|w| w.label.eq_ignore_ascii_case(&label)) {
             continue;
         }
-        push(&mut windows, label, &entry["percent"], &entry["resets_at"]);
+        let Some(pct) = percent(entry) else { continue };
+        push(&mut windows, label, pct, reset(entry));
     }
 
     // Pay-per-use overage riding on top of the subscription, when enabled.
@@ -1199,7 +1898,15 @@ fn parse_usage_health(provider_id: &str, payload: &Value) -> trouve_protocol::Su
         .unwrap_or_default();
 
     if windows.is_empty() {
-        let note = if payload["rate_limits_available"].as_bool() == Some(true) {
+        let available = payload["rate_limits_available"].as_bool() == Some(true);
+        let note = if available && rate_limits.is_null() {
+            // The CLI's own `GET /api/oauth/usage` failed (in practice the
+            // endpoint answering 429 under load); a print-mode process has
+            // no header-derived fallback, so it reports `null` here.
+            "Anthropic's usage endpoint is temporarily rate-limiting requests; \
+             usage will refresh once it recovers"
+                .to_string()
+        } else if available {
             "the Claude CLI reported no usage windows".to_string()
         } else {
             "the Claude CLI reported no usage data — subscription usage needs a \
@@ -1243,6 +1950,322 @@ fn parse_reset_at(v: &Value) -> Option<i64> {
 mod tests {
     use super::*;
 
+    async fn recv_line(rx: &mut mpsc::Receiver<String>) -> Option<String> {
+        tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .ok()
+            .flatten()
+    }
+
+    async fn wait_for(mut condition: impl FnMut() -> bool) {
+        for _ in 0..500 {
+            if condition() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("condition not reached in time");
+    }
+
+    const BG_LINE: &str =
+        r#"{"type":"assistant","message":{"content":[{"type":"text","text":"background"}]}}"#;
+    const BG_RESULT: &str = r#"{"type":"result","subtype":"success"}"#;
+    const USER_LINE: &str =
+        r#"{"type":"assistant","message":{"content":[{"type":"text","text":"user"}]}}"#;
+
+    #[test]
+    fn full_pending_steer_queue_rejects_before_building_attachment_message() {
+        let mut pending = vec![Value::Null; PENDING_STEER_CAP];
+        let built = std::cell::Cell::new(false);
+        let error = enqueue_pending_claude_steer(&mut pending, "session", || {
+            built.set(true);
+            Value::Null
+        })
+        .unwrap_err();
+
+        assert!(!built.get(), "queue rejection must precede base64 encoding");
+        assert!(error.to_string().contains("pending steering queue is full"));
+    }
+
+    #[tokio::test]
+    async fn router_buffers_background_turns_and_signals_once_per_turn() {
+        let signals = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let observed = signals.clone();
+        let router = Arc::new(StdoutRouter::new(move || {
+            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }));
+        let (line_tx, line_rx) = mpsc::channel(16);
+        let _task = tokio::spawn(Arc::clone(&router).run(line_rx));
+
+        // A background turn with no consumer buffers and signals exactly once.
+        line_tx.send(BG_LINE.to_string()).await.unwrap();
+        line_tx.send(BG_RESULT.to_string()).await.unwrap();
+        wait_for(|| signals.load(std::sync::atomic::Ordering::SeqCst) == 1).await;
+        wait_for(|| !router.is_busy()).await;
+
+        // A later non-attach turn receives only its own lines, never the
+        // buffered background output.
+        let (turn_tx, mut turn_rx) = mpsc::channel(16);
+        assert_eq!(
+            router.register(turn_tx, false).unwrap(),
+            RouterRegistration::Streaming
+        );
+        router.prompt_delivered();
+        line_tx.send(USER_LINE.to_string()).await.unwrap();
+        line_tx.send(BG_RESULT.to_string()).await.unwrap();
+        assert_eq!(recv_line(&mut turn_rx).await.as_deref(), Some(USER_LINE));
+        assert_eq!(recv_line(&mut turn_rx).await.as_deref(), Some(BG_RESULT));
+        assert!(
+            recv_line(&mut turn_rx).await.is_none(),
+            "turn stream ends at result"
+        );
+
+        // The attach turn drains exactly the buffered background turn.
+        let (attach_tx, mut attach_rx) = mpsc::channel(16);
+        assert_eq!(
+            router.register(attach_tx, true).unwrap(),
+            RouterRegistration::Streaming
+        );
+        assert_eq!(recv_line(&mut attach_rx).await.as_deref(), Some(BG_LINE));
+        assert_eq!(recv_line(&mut attach_rx).await.as_deref(), Some(BG_RESULT));
+        assert!(recv_line(&mut attach_rx).await.is_none());
+
+        // Nothing left to attach to.
+        let (empty_tx, _empty_rx) = mpsc::channel(16);
+        assert_eq!(
+            router.register(empty_tx, true).unwrap(),
+            RouterRegistration::NothingPending
+        );
+        assert_eq!(signals.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn background_turn_in_flight_never_leaks_into_a_registered_turn() {
+        let router = Arc::new(StdoutRouter::new(|| {}));
+        let (line_tx, line_rx) = mpsc::channel(16);
+        let _task = tokio::spawn(Arc::clone(&router).run(line_rx));
+
+        // Background turn starts; a trouve turn registers mid-flight (its
+        // prompt is queued vendor-side). This is the regression that used to
+        // swallow the user turn: the buffered background `result` terminated
+        // the user turn's stream before its own events arrived.
+        line_tx.send(BG_LINE.to_string()).await.unwrap();
+        wait_for(|| router.is_busy()).await;
+        let (turn_tx, mut turn_rx) = mpsc::channel(16);
+        assert_eq!(
+            router.register(turn_tx, false).unwrap(),
+            RouterRegistration::Streaming
+        );
+        router.prompt_delivered();
+        line_tx.send(BG_LINE.to_string()).await.unwrap();
+        line_tx.send(BG_RESULT.to_string()).await.unwrap();
+        line_tx.send(USER_LINE.to_string()).await.unwrap();
+        line_tx.send(BG_RESULT.to_string()).await.unwrap();
+
+        // The user turn sees only the lines after the background boundary.
+        assert_eq!(recv_line(&mut turn_rx).await.as_deref(), Some(USER_LINE));
+        assert_eq!(recv_line(&mut turn_rx).await.as_deref(), Some(BG_RESULT));
+
+        // The background turn's lines await an attach consumer.
+        let (attach_tx, mut attach_rx) = mpsc::channel(16);
+        assert_eq!(
+            router.register(attach_tx, true).unwrap(),
+            RouterRegistration::Streaming
+        );
+        assert_eq!(recv_line(&mut attach_rx).await.as_deref(), Some(BG_LINE));
+        assert_eq!(recv_line(&mut attach_rx).await.as_deref(), Some(BG_LINE));
+        assert_eq!(recv_line(&mut attach_rx).await.as_deref(), Some(BG_RESULT));
+    }
+
+    #[tokio::test]
+    async fn attach_registration_streams_a_live_background_turn_to_its_end() {
+        let router = Arc::new(StdoutRouter::new(|| {}));
+        let (line_tx, line_rx) = mpsc::channel(16);
+        let _task = tokio::spawn(Arc::clone(&router).run(line_rx));
+
+        line_tx.send(BG_LINE.to_string()).await.unwrap();
+        wait_for(|| router.is_busy()).await;
+        let (attach_tx, mut attach_rx) = mpsc::channel(16);
+        let (registration, _guard) = router.register_owned(attach_tx, true).unwrap();
+        assert_eq!(registration, RouterRegistration::StreamingLive);
+        // Buffered prefix, then live continuation, ending at the result.
+        assert_eq!(recv_line(&mut attach_rx).await.as_deref(), Some(BG_LINE));
+        line_tx.send(USER_LINE.to_string()).await.unwrap();
+        line_tx.send(BG_RESULT.to_string()).await.unwrap();
+        assert_eq!(recv_line(&mut attach_rx).await.as_deref(), Some(USER_LINE));
+        assert_eq!(recv_line(&mut attach_rx).await.as_deref(), Some(BG_RESULT));
+        assert!(recv_line(&mut attach_rx).await.is_none());
+        wait_for(|| !router.is_busy()).await;
+    }
+
+    #[tokio::test]
+    async fn terminal_receipt_closes_steering_before_router_attribution() {
+        let router = Arc::new(StdoutRouter::new(|| {}));
+        let (turn_tx, _turn_rx) = mpsc::channel(16);
+        assert_eq!(
+            router.register(turn_tx, false).unwrap(),
+            RouterRegistration::Streaming
+        );
+        router.prompt_delivered();
+
+        let _turn_boundary = router.turn_boundary.lock().await;
+        let reservation = Arc::clone(&router)
+            .reserve_steer_write(false)
+            .expect("the live turn should reserve one complete steering record");
+        router.line_received(BG_RESULT);
+
+        drop(reservation);
+        assert!(
+            Arc::clone(&router).reserve_steer_write(false).is_none(),
+            "stdout receipt must close steering without waiting for a writer boundary"
+        );
+        assert!(
+            router.is_busy(),
+            "terminal receipt must not bypass normal router attribution"
+        );
+    }
+
+    #[tokio::test]
+    async fn lines_before_prompt_delivery_are_background_not_turn_output() {
+        let signals = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let observed = signals.clone();
+        let router = Arc::new(StdoutRouter::new(move || {
+            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }));
+        let (line_tx, line_rx) = mpsc::channel(16);
+        let _task = tokio::spawn(Arc::clone(&router).run(line_rx));
+
+        // An autonomous turn starting between registration and the prompt
+        // write must not be mistaken for the registered turn's response.
+        let (turn_tx, mut turn_rx) = mpsc::channel(16);
+        assert_eq!(
+            router.register(turn_tx, false).unwrap(),
+            RouterRegistration::Streaming
+        );
+        line_tx.send(BG_LINE.to_string()).await.unwrap();
+        line_tx.send(BG_RESULT.to_string()).await.unwrap();
+        wait_for(|| signals.load(std::sync::atomic::Ordering::SeqCst) == 1).await;
+
+        router.prompt_delivered();
+        line_tx.send(USER_LINE.to_string()).await.unwrap();
+        line_tx.send(BG_RESULT.to_string()).await.unwrap();
+        assert_eq!(recv_line(&mut turn_rx).await.as_deref(), Some(USER_LINE));
+        assert_eq!(recv_line(&mut turn_rx).await.as_deref(), Some(BG_RESULT));
+
+        // The pre-delivery autonomous turn is intact for an attach consumer.
+        let (attach_tx, mut attach_rx) = mpsc::channel(16);
+        assert_eq!(
+            router.register(attach_tx, true).unwrap(),
+            RouterRegistration::Streaming
+        );
+        assert_eq!(recv_line(&mut attach_rx).await.as_deref(), Some(BG_LINE));
+        assert_eq!(recv_line(&mut attach_rx).await.as_deref(), Some(BG_RESULT));
+    }
+
+    #[tokio::test]
+    async fn dead_attach_consumer_reinserts_its_line_and_reannounces() {
+        let signals = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let observed = signals.clone();
+        let router = Arc::new(StdoutRouter::new(move || {
+            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }));
+        let (line_tx, line_rx) = mpsc::channel(16);
+        let _task = tokio::spawn(Arc::clone(&router).run(line_rx));
+
+        line_tx.send(BG_LINE.to_string()).await.unwrap();
+        line_tx.send(BG_RESULT.to_string()).await.unwrap();
+        wait_for(|| signals.load(std::sync::atomic::Ordering::SeqCst) == 1).await;
+
+        // The attach consumer dies before draining anything.
+        let (attach_tx, attach_rx) = mpsc::channel::<String>(16);
+        drop(attach_rx);
+        assert_eq!(
+            router.register(attach_tx, true).unwrap(),
+            RouterRegistration::Streaming
+        );
+        // The failed drain reinserts the line and re-announces the turn.
+        wait_for(|| signals.load(std::sync::atomic::Ordering::SeqCst) == 2).await;
+        let (retry_tx, mut retry_rx) = mpsc::channel(16);
+        let (registration, _retry_guard) = router.register_owned(retry_tx, true).unwrap();
+        assert_eq!(registration, RouterRegistration::Streaming);
+        assert_eq!(recv_line(&mut retry_rx).await.as_deref(), Some(BG_LINE));
+        assert_eq!(recv_line(&mut retry_rx).await.as_deref(), Some(BG_RESULT));
+        assert!(recv_line(&mut retry_rx).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn owned_attach_registration_clears_when_dropped_before_polling() {
+        let signals = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let observed = signals.clone();
+        let router = Arc::new(StdoutRouter::new(move || {
+            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }));
+        let (line_tx, line_rx) = mpsc::channel(16);
+        let _task = tokio::spawn(Arc::clone(&router).run(line_rx));
+
+        line_tx.send(BG_LINE.to_string()).await.unwrap();
+        line_tx.send(BG_RESULT.to_string()).await.unwrap();
+        wait_for(|| signals.load(std::sync::atomic::Ordering::SeqCst) == 1).await;
+
+        let (attach_tx, _attach_rx) = mpsc::channel::<String>(16);
+        let (registration, guard) = router.register_owned(attach_tx, true).unwrap();
+        assert_eq!(registration, RouterRegistration::Streaming);
+        assert!(router.is_busy(), "the eager registration owns the router");
+        drop(guard);
+        assert!(
+            !router.is_busy(),
+            "dropping an unpolled registration must release the router"
+        );
+        assert!(router.has_pending_background());
+        assert_eq!(signals.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        let (retry_tx, mut retry_rx) = mpsc::channel(16);
+        assert_eq!(
+            router.register(retry_tx, true).unwrap(),
+            RouterRegistration::Streaming
+        );
+        assert_eq!(recv_line(&mut retry_rx).await.as_deref(), Some(BG_LINE));
+        assert_eq!(recv_line(&mut retry_rx).await.as_deref(), Some(BG_RESULT));
+    }
+
+    #[tokio::test]
+    async fn buffered_backlog_reannounces_after_each_attach_turn() {
+        let signals = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let observed = signals.clone();
+        let router = Arc::new(StdoutRouter::new(move || {
+            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }));
+        let (line_tx, line_rx) = mpsc::channel(16);
+        let _task = tokio::spawn(Arc::clone(&router).run(line_rx));
+
+        // Two complete autonomous turns buffer while no listener attaches;
+        // even if one of their signals had been lost, draining the first
+        // turn must re-announce the second.
+        for _ in 0..2 {
+            line_tx.send(BG_LINE.to_string()).await.unwrap();
+            line_tx.send(BG_RESULT.to_string()).await.unwrap();
+        }
+        wait_for(|| signals.load(std::sync::atomic::Ordering::SeqCst) == 2).await;
+
+        let (attach_tx, mut attach_rx) = mpsc::channel(16);
+        assert_eq!(
+            router.register(attach_tx, true).unwrap(),
+            RouterRegistration::Streaming
+        );
+        assert_eq!(recv_line(&mut attach_rx).await.as_deref(), Some(BG_LINE));
+        assert_eq!(recv_line(&mut attach_rx).await.as_deref(), Some(BG_RESULT));
+        assert!(recv_line(&mut attach_rx).await.is_none());
+        // Draining turn one re-announced turn two.
+        wait_for(|| signals.load(std::sync::atomic::Ordering::SeqCst) == 3).await;
+        let (second_tx, mut second_rx) = mpsc::channel(16);
+        assert_eq!(
+            router.register(second_tx, true).unwrap(),
+            RouterRegistration::Streaming
+        );
+        assert_eq!(recv_line(&mut second_rx).await.as_deref(), Some(BG_LINE));
+        assert_eq!(recv_line(&mut second_rx).await.as_deref(), Some(BG_RESULT));
+    }
+
     #[test]
     fn parses_authoritative_claude_auth_status() {
         assert!(auth_status_is_logged_in(br#"{"loggedIn":true}"#));
@@ -1264,6 +2287,7 @@ mod tests {
             instructions: None,
             permission: BackendPermission::ReadOnly,
             tool_free: false,
+            attach_background: false,
             mcp_bridge: None,
             mcp_servers: Vec::new(),
         }
@@ -1309,6 +2333,7 @@ mod tests {
             instructions: None,
             permission: BackendPermission::ReadOnly,
             tool_free: true,
+            attach_background: false,
             mcp_bridge: None,
             mcp_servers: Vec::new(),
         }
@@ -1702,6 +2727,41 @@ cat >/dev/null
     }
 
     #[test]
+    fn parses_compact_usage_buckets_and_status_line_fields() {
+        let soon = chrono::Utc::now().timestamp() + 3600;
+        let payload = json!({
+            "subscription_type": "max",
+            "rate_limits_available": true,
+            "rate_limits": {
+                "5h": { "used_percentage": 28.0, "resetsAt": soon },
+                "7d": { "used_percentage": 67.0, "resets_at": soon + 86_400 },
+                "7d_opus": { "percent": 12.0, "resets_at": soon },
+            },
+        });
+        let health = parse_usage_health("claude-code", &payload);
+        assert_eq!(health.status, "ok");
+        let windows: Vec<(&str, i64)> = health
+            .windows
+            .iter()
+            .map(|window| (window.label.as_str(), window.used_percent))
+            .collect();
+        assert_eq!(
+            windows,
+            vec![
+                ("5h window", 28),
+                ("Weekly (all models)", 67),
+                ("Weekly (Opus)", 12),
+            ]
+        );
+        assert!(
+            health
+                .windows
+                .iter()
+                .all(|window| !window.resets.is_empty())
+        );
+    }
+
+    #[test]
     fn parses_limits_array_and_dedupes_flat_buckets() {
         // Transitional payloads can carry both shapes for the same bucket;
         // the scoped Opus week exists only in the array.
@@ -1769,6 +2829,36 @@ cat >/dev/null
         assert_eq!(health.status, "unavailable");
         assert!(health.note.contains("claude.ai login"));
         assert!(health.windows.is_empty());
+    }
+
+    #[test]
+    fn null_rate_limits_with_subscription_means_endpoint_throttled() {
+        // Logged in on a plan, but the CLI's usage fetch failed (the
+        // endpoint answers 429 under load): `rate_limits_available` stays
+        // true while `rate_limits` comes back null.
+        let payload = json!({
+            "subscription_type": "max",
+            "rate_limits_available": true,
+            "rate_limits": null,
+            "behaviors": { "day": { "request_count": 5 } },
+        });
+        let health = parse_usage_health("claude-code", &payload);
+        assert_eq!(health.status, "unavailable");
+        assert_eq!(health.plan, "max");
+        assert!(health.note.contains("rate-limiting"), "{}", health.note);
+        assert!(health.windows.is_empty());
+    }
+
+    #[test]
+    fn empty_rate_limits_object_reports_no_windows() {
+        let payload = json!({
+            "subscription_type": "pro",
+            "rate_limits_available": true,
+            "rate_limits": {},
+        });
+        let health = parse_usage_health("claude-code", &payload);
+        assert_eq!(health.status, "unavailable");
+        assert!(health.note.contains("no usage windows"), "{}", health.note);
     }
 
     #[test]

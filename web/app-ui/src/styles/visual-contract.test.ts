@@ -187,23 +187,50 @@ describe("Trouve visual contract", () => {
     }
   });
 
-  it("keeps the established desktop navigation hierarchy and density", () => {
+  it("keeps a compact, labeled desktop navigation hierarchy", () => {
     expect(shell).not.toContain('class="brand-row"');
     expect(shell).not.toContain(">Inbox</button>");
-    const pullRequests = shell.indexOf("<strong>Pull Requests</strong>");
-    const automations = shell.indexOf("<strong>Automations</strong>");
-    const settings = shell.indexOf("<strong>Settings</strong>");
-    const workspaces = shell.indexOf("<strong>Workspaces</strong>");
+    const pullRequests = shell.indexOf('aria-label="Pull Requests"');
+    const automations = shell.indexOf('aria-label="Automations"');
+    const settings = shell.indexOf('aria-label="Settings"');
+    const workspaces = shell.indexOf("<h2>Workspaces</h2>");
     expect(pullRequests).toBeGreaterThan(-1);
     expect(pullRequests).toBeLessThan(automations);
     expect(automations).toBeLessThan(settings);
     expect(settings).toBeLessThan(workspaces);
+    expect(shell).toContain('class="repository-group-heading"');
+    expect(shell).toContain('? html`<h3 id=${`workspace-${index}`}>');
+    expect(shell).toContain(': html`<h4 id=${`workspace-${index}`}>');
     expect(shell).toContain('class="workspace-row"');
     expect(shell).toContain("data-controls-visible=${");
     expect(shell).toContain('class="workspace-toggle"');
     expect(shell).toContain('class="workspace-new-session"');
     expect(shell).toContain("#toggleWorkspace");
+    expect(shell).toContain("?hidden=\${collapsed}");
+    expect(app).toContain("trouve-session-list[hidden] { display: none; }");
+    expect(shell).toContain('data-tooltip="Pull Requests"');
+    expect(app).toMatch(/\.primary-links \{[^}]*display:\s*flex/s);
     expect(app).toMatch(/\.primary-links button \{[^}]*height:\s*34px/s);
+    expect(app).toContain(".navigation-icon-button:focus-visible::after");
+    expect(shell).toContain('<div class="workspace-scroll">');
+    expect(app).toMatch(/\.navigation-panel \{[^}]*display:\s*flex/s);
+    expect(app).toMatch(/\.navigation-panel \{[^}]*overflow:\s*hidden/s);
+    expect(app).toMatch(/\.workspace-scroll \{[^}]*overflow:\s*auto/s);
+    // The scroller spans the panel's inline padding so the scrollbar lands in the gutter, not over the rows.
+    expect(app).toMatch(/\.workspace-scroll \{[^}]*margin-inline:\s*-10px[^}]*padding-inline:\s*10px/s);
+    expect(app).toMatch(/\.navigation-panel \.workspace-row \{[^}]*position:\s*sticky/s);
+    expect(app).toMatch(/\.navigation-panel \.workspace-row \{[^}]*inset-block-start:\s*0/s);
+    expect(app).toMatch(/\.navigation-panel > trouve-session-usage-panel \{[^}]*flex:\s*none/s);
+    expect(app).not.toMatch(/\.navigation-panel > trouve-session-usage-panel \{[^}]*position:\s*sticky/s);
+    expect(app).toMatch(/\.session-usage-box \{[^}]*height:\s*196px/s);
+    expect(app).toMatch(/\.session-usage-box\.collapsed \{[^}]*height:\s*auto/s);
+    expect(app).toMatch(/\.session-usage-body \{[^}]*overflow-y:\s*auto/s);
+    expect(app).toMatch(
+      /\.session-usage-heading > small \{[^}]*overflow-wrap:\s*anywhere/s,
+    );
+    expect(app).toMatch(
+      /\.session-usage-model-heading > span \{[^}]*overflow-wrap:\s*anywhere/s,
+    );
     expect(app).toMatch(/\.workspace-row \{[^}]*height:\s*34px/s);
     expect(app).toMatch(/\.workspace-toggle > span \{[^}]*inset-inline-start:\s*3px/s);
     expect(app).toMatch(/\.session-row-wrap \{[^}]*height:\s*34px/s);
@@ -372,10 +399,11 @@ describe("Trouve visual contract", () => {
     expect(shell).toContain('id="new-session-screen"');
     expect(shell).toContain('class="thread-panel new-session-screen"');
     expect(shell).not.toContain('id="new-session-dialog"');
-    expect(shell).toContain("Pick where to work, what to branch from, and how the agent should run.");
+    expect(shell).toContain("What do you want to do today?");
     expect(shell).toContain("Use latest remote branch");
     expect(app).toMatch(/\.new-session-screen \{[^}]*grid-column:\s*3[^}]*grid-row:\s*1/s);
     expect(app).toMatch(/\.new-session-screen form \{[^}]*align-content:\s*center[^}]*padding:\s*40px/s);
+    expect(app).toMatch(/\.new-session-screen \.dialog-option-grid \{[^}]*display:\s*flex[^}]*overflow-x:\s*auto/s);
     expect(app).toMatch(/\.new-session-screen\[hidden\] \{[^}]*display:\s*none\s*!important/s);
   });
 
@@ -825,35 +853,21 @@ describe("Trouve visual contract", () => {
     expect(providerSettings).not.toContain("${health.status}</span>");
   });
 
-  it("keeps the session-naming choices and reactive explanations", () => {
-    for (const label of [
-      "Adaptive (Recommended)",
-      "Keep Ready",
-      "Load When Needed",
-      "Rules Only",
-      "GPU, CPU, & RAM",
-      "GPU Only",
-      "CPU & RAM Only",
-    ]) {
-      expect(managementSettings).toContain(`label: "${label}"`);
-    }
-    for (const description of [
-      "Keeps the naming model ready when this computer has comfortable memory headroom; otherwise loads it only when needed.",
-      "Loads the naming model at startup and keeps it in memory for the fastest new-session creation.",
-      "Loads the naming model when a session is created, then releases it after a short idle period.",
-      "Uses fast built-in heuristics and never loads the optional naming model.",
-      "Uses GPU, CPU, and RAM when no local coding model is active; otherwise uses CPU and RAM only.",
-      "Lets llama.cpp use available GPU memory and spill remaining work to CPU and system RAM.",
-      "Requires every model layer to fit on a detected GPU; naming falls back to rules when it cannot.",
-      "Keeps session naming entirely off the GPU and uses CPU plus system RAM.",
-    ]) {
-      expect(managementSettings).toContain(`"${description}"`);
-    }
-    expect(managementSettings).toContain("this.#draftLoadBehavior = behaviorSelect.value");
-    expect(managementSettings).toContain("this.#draftResourcePolicy = resourceSelect.value");
-    expect(managementSettings).toContain("const behavior = this.#draftLoadBehavior ??");
-    expect(managementSettings).toContain("const resources = this.#draftResourcePolicy ??");
-    expect(managementSettings).toContain("form.requestSubmit()");
-    expect(managementSettings).toContain("current?.title_model_resource_policy ?? \"adaptive\"");
+  it("keeps configured asynchronous session naming explicit", () => {
+    expect(managementSettings).toContain("<h2>Session naming</h2>");
+    expect(managementSettings).toContain("the selected model names them in the background");
+    expect(managementSettings).toContain("lowest available reasoning level");
+    expect(managementSettings).toContain('name="model"');
+    expect(managementSettings).toContain("modelSelectorLabel(model)");
+    expect(managementSettings).toContain('" · Text only"');
+    expect(managementSettings).toContain("cannot inspect attached screenshots");
+    expect(managementSettings).toContain("Use session names in branch names");
+    expect(managementSettings).toContain("The compact branch is renamed after background naming completes.");
+    expect(managementSettings).toContain("Add a provider to choose a naming model.");
+    expect(managementSettings).toContain(">Add provider</button>");
+    expect(managementSettings).toContain('section: "providers"');
+    expect(managementSettings).toContain("setSessionNamingSettingsSnapshot");
+    expect(managementSettings).not.toContain("title_model_resource_policy");
+    expect(managementSettings).not.toContain("Built-in naming rules");
   });
 });

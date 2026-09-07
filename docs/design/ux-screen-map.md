@@ -51,7 +51,7 @@ signal and the sort key of every session list.
 - **S4 Diff review** — session branch vs base; per-file list; unified or
   split (desktop only).
 - **S5 Settings** — `/settings/<section>` shell with Appearance, Workspaces,
-  Providers, Vendor CLIs, Local models, Modes, Git & worktrees, MCP,
+  Providers, Agent runtimes, Local models, Modes, Git & worktrees, MCP,
   Integrations, Notifications, Capabilities, and About. Appearance retains the
   existing design-token themes and visual preview; capability-dependent
   sections report unavailable operations instead of implying support.

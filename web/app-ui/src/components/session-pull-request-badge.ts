@@ -46,9 +46,8 @@ const pullRequestStatus = (pr: ProtocolPrInfo): PullRequestBadgeStatus => {
   };
 };
 
-/** Account snapshots are also the established sidebar source. Match a
- * session by the server-enriched workspace id and exact head branch, then keep
- * open PRs first and newest PRs first within each terminal-state group. */
+/** Account snapshots are also the established sidebar source. Matching
+ * session-branch PRs are presented open-first and newest-first. */
 export const pullRequestsForSession = (
   session: SessionPullRequestIdentity,
   lists: readonly ProtocolGithubPrList[],

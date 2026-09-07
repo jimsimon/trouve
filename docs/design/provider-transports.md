@@ -31,7 +31,7 @@ public model catalog.
 | --- | --- | --- |
 | Codex subscription | Codex app-server, CLI installation/login, subscription billing | Live app-server ids over OpenAI models.dev metadata |
 | Claude Code subscription | Claude CLI installation/login and command-line option mapping | Anthropic models.dev metadata |
-| Cursor subscription/API key | ACP transport, CLI auth, context/fast controls | Live ACP availability; public vendor models are canonicalized from models.dev, Cursor-only models use the ACP adapter |
+| Cursor subscription/API key | Agent SDK Bridge lifecycle, API-key auth, context/fast controls, and host-owned custom-tool callbacks | Static Cursor SDK availability; public vendor models are canonicalized from models.dev, while Cursor-only models use adapter metadata |
 | Custom/local OpenAI-compatible endpoints | Endpoint/auth plus native Ollama or LM Studio probes where recognized | Explicit live adapter because arbitrary and user-installed ids have no catalog record |
 
 ## Intentionally not exposed
@@ -44,3 +44,6 @@ public model catalog.
 These records remain in the bundled catalog so adding a reviewed adapter does
 not require changing the snapshot format. They become visible only after the
 missing transport and authentication flow is implemented.
+
+Vendor transport replacements follow the shared
+[agent backend conformance and qualification contract](agent-backend-conformance.md).

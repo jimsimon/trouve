@@ -1,0 +1,3 @@
+# Large refreshed data snapshots are summarized (not reviewed line by line)
+# by the code reviewer and collapsed in GitHub's diff view.
+crates/trouve-providers/data/models-dev-snapshot.json linguist-generated=true

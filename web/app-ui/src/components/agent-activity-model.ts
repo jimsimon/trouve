@@ -148,7 +148,7 @@ export const runningAgentActivity = (
     );
   }
   if (activeState?.kind === "waiting-for-capacity") {
-    return activity("Waiting for model capacity…");
+    return activity("Waiting for provider admission…");
   }
   if (
     input.thinking
