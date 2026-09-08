@@ -1524,10 +1524,10 @@ impl Engine {
             }
             let retrying = route_index > 0;
             attempted_candidates += 1;
-            // Assign order only after this route owns provider capacity. The
-            // global hybrid clock prevents concurrent admissions from tying
-            // even when the wall clock has microsecond resolution.
-            let attempt_order = self.turn_scheduler.next_attempt_order();
+            let attempt_order = route_admission
+                .as_ref()
+                .context("model route attempt was not admitted")?
+                .attempt_order;
             *active_attempt.lock().unwrap() = Some(RoutedAttemptSnapshot {
                 provider_id: route.provider_id.clone(),
                 provider_model: route.provider_model.clone(),
@@ -4427,6 +4427,24 @@ mod tests {
         assert_eq!(scheduler.cooldown_remaining("provider/model"), None);
     }
 
+    #[tokio::test]
+    async fn older_pinned_admission_cannot_clear_a_newer_routed_cooldown() {
+        let scheduler = TurnScheduler::new();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let pinned = scheduler.admit("provider/model", &cancel).await.unwrap();
+        let routed = scheduler.admit("provider/model", &cancel).await.unwrap();
+        assert!(pinned.attempt_order < routed.attempt_order);
+
+        scheduler.record_ordered_outcome(
+            "provider/model",
+            Some("HTTP 429 Too Many Requests"),
+            routed.attempt_order,
+        );
+        scheduler.record_ordered_outcome("provider/model", None, pinned.attempt_order);
+
+        assert!(scheduler.cooldown_remaining("provider/model").is_some());
+    }
+
     #[test]
     fn stale_provider_outcome_cannot_restore_invalidated_route_health() {
         let data = tempfile::tempdir().unwrap();
@@ -4590,9 +4608,12 @@ mod tests {
             ..Default::default()
         };
         let engine = Arc::new(Engine::new(store.clone(), data.path().into(), &config));
-        engine
-            .turn_scheduler
-            .record_outcome("provider/model", Some("HTTP 429 Too Many Requests"));
+        let attempt_order = engine.turn_scheduler.next_attempt_order();
+        engine.turn_scheduler.record_ordered_outcome(
+            "provider/model",
+            Some("HTTP 429 Too Many Requests"),
+            attempt_order,
+        );
         assert!(
             engine
                 .turn_scheduler
@@ -4645,9 +4666,12 @@ mod tests {
             Engine::new(store.clone(), data.path().into(), &config)
                 .with_config_file(Some(config_path.clone())),
         );
-        engine
-            .turn_scheduler
-            .record_outcome("provider/model", Some("HTTP 429 Too Many Requests"));
+        let attempt_order = engine.turn_scheduler.next_attempt_order();
+        engine.turn_scheduler.record_ordered_outcome(
+            "provider/model",
+            Some("HTTP 429 Too Many Requests"),
+            attempt_order,
+        );
         rusqlite::Connection::open(&database)
             .unwrap()
             .execute_batch(
@@ -4864,9 +4888,12 @@ mod tests {
         );
         assert!(engine.backends.read().unwrap().contains_key("provider"));
         let scheduler_backoff = engine.turn_scheduler.provider("provider/model").backoff;
-        engine
-            .turn_scheduler
-            .record_outcome("provider/model", Some("HTTP 429 Too Many Requests"));
+        let attempt_order = engine.turn_scheduler.next_attempt_order();
+        engine.turn_scheduler.record_ordered_outcome(
+            "provider/model",
+            Some("HTTP 429 Too Many Requests"),
+            attempt_order,
+        );
 
         let result = engine
             .upsert_provider(

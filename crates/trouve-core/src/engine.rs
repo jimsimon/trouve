@@ -1337,7 +1337,7 @@ struct ProviderTurnCapacity {
 struct ProviderBackoff {
     until: Option<tokio::time::Instant>,
     delay: std::time::Duration,
-    /// Last routed attempt whose outcome was applied. Automatic routes can
+    /// Last admitted attempt whose outcome was applied. Provider turns can
     /// finish out of admission order, so stale completions must not undo a
     /// newer route's cooldown.
     last_outcome_order: Option<i64>,
@@ -1358,10 +1358,11 @@ struct TurnScheduler {
 }
 
 struct TurnAdmission {
-    /// Admission currently carries cooldown-wait telemetry only: provider
-    /// turns are deliberately uncapped. Keep it scoped to one route attempt
-    /// so any future provider-capacity lease has the correct handoff lifetime.
+    /// Provider turns are deliberately uncapped. Keep each admission scoped
+    /// to one route attempt so its outcome order and any future capacity lease
+    /// have the correct handoff lifetime.
     provider_wait_ms: u64,
+    attempt_order: i64,
 }
 
 impl TurnScheduler {
@@ -1500,12 +1501,11 @@ impl TurnScheduler {
         }
         Ok(TurnAdmission {
             provider_wait_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+            // Allocate only after cooldown admission. Every concrete and
+            // automatic completion carries this order so an older turn can
+            // never overwrite a newer route outcome.
+            attempt_order: self.next_attempt_order(),
         })
-    }
-
-    fn record_outcome(&self, model: &str, error: Option<&str>) {
-        let attempt_order = self.next_attempt_order();
-        self.record_ordered_outcome(model, error, attempt_order);
     }
 
     fn record_ordered_outcome(&self, model: &str, error: Option<&str>, attempt_order: i64) {
@@ -14667,6 +14667,7 @@ impl Engine {
                 .expect("an active queue prompt must have a cancellation token");
             let prompt_persisted = AtomicBool::new(shell_persisted);
             let routed_attempt = Mutex::new(None);
+            let concrete_attempt_order = Mutex::new(None);
             let automatic = routing::automatic_model_name(&thread.model).is_some();
             let turn_future = async {
                 if automatic {
@@ -14680,8 +14681,15 @@ impl Engine {
                     )
                     .await
                 } else {
-                    self.run_turn(&thread, turn, &prompt, cancel.clone(), &prompt_persisted)
-                        .await
+                    self.run_turn(
+                        &thread,
+                        turn,
+                        &prompt,
+                        cancel.clone(),
+                        &prompt_persisted,
+                        &concrete_attempt_order,
+                    )
+                    .await
                 }
             };
             let result = std::panic::AssertUnwindSafe(turn_future)
@@ -14721,6 +14729,14 @@ impl Engine {
                                 Ok(())
                             },
                         )?;
+                    } else if !cancel.is_cancelled()
+                        && let Some(attempt_order) = concrete_attempt_order.lock().unwrap().take()
+                    {
+                        self.turn_scheduler.record_ordered_outcome(
+                            &thread.model,
+                            Some("internal error"),
+                            attempt_order,
+                        );
                     }
                     self.store
                         .append_event(
@@ -14746,8 +14762,13 @@ impl Engine {
             let cancelled = cancel.is_cancelled();
             if !cancelled && !automatic {
                 let outcome_error = result.as_ref().err().map(ToString::to_string);
-                self.turn_scheduler
-                    .record_outcome(&thread.model, outcome_error.as_deref());
+                if let Some(attempt_order) = concrete_attempt_order.lock().unwrap().take() {
+                    self.turn_scheduler.record_ordered_outcome(
+                        &thread.model,
+                        outcome_error.as_deref(),
+                        attempt_order,
+                    );
+                }
             }
             // Cancellation wins a race with startup/stream errors only after
             // run_turn has returned, which is the adapter/tool acknowledgement
@@ -15014,6 +15035,7 @@ impl Engine {
         prompt: &trouve_protocol::QueuedPrompt,
         cancel: tokio_util::sync::CancellationToken,
         prompt_persisted: &AtomicBool,
+        active_attempt_order: &Mutex<Option<i64>>,
     ) -> Result<()> {
         let content = prompt.content.clone();
         let attachments = prompt.attachments.clone();
@@ -15104,6 +15126,7 @@ impl Engine {
             guard = session_lifecycle.read() => guard,
         };
         let admission = self.turn_scheduler.admit(&thread.model, &cancel).await?;
+        *active_attempt_order.lock().unwrap() = Some(admission.attempt_order);
 
         // External agent backend? The vendor harness owns the loop; we
         // stream its events and bridge approvals. The shared lifecycle lease
@@ -22612,7 +22635,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn provider_cooldown_wait_observes_extensions() {
         let scheduler = Arc::new(TurnScheduler::new());
-        scheduler.record_outcome("provider/model", Some("429 rate limit"));
+        let first_order = scheduler.next_attempt_order();
+        scheduler.record_ordered_outcome("provider/model", Some("429 rate limit"), first_order);
         let cancel = tokio_util::sync::CancellationToken::new();
         let waiter = {
             let scheduler = Arc::clone(&scheduler);
@@ -22621,7 +22645,8 @@ mod tests {
 
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_millis(500)).await;
-        scheduler.record_outcome("provider/model", Some("429 rate limit"));
+        let second_order = scheduler.next_attempt_order();
+        scheduler.record_ordered_outcome("provider/model", Some("429 rate limit"), second_order);
         tokio::time::advance(Duration::from_millis(500)).await;
         tokio::task::yield_now().await;
         assert!(!waiter.is_finished());
