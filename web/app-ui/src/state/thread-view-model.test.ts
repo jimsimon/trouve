@@ -177,7 +177,7 @@ describe("ThreadViewModel", () => {
     }).toEqual(fixture.expected);
   });
 
-  it("keeps steering as a top-level causal boundary between thought output", () => {
+  it("records steering without splitting the open thought output", () => {
     const vm = new ThreadViewModel();
     vm.apply(envelope(1, {
       type: "turn.started",
@@ -215,7 +215,7 @@ describe("ThreadViewModel", () => {
       {
         kind: "thinking",
         turn: 3,
-        content: "Following the original direction.",
+        content: "Following the original direction. Continue with the revised direction.",
         complete: true,
       },
       {
@@ -224,13 +224,8 @@ describe("ThreadViewModel", () => {
         content: "Prioritize the narrow layout.",
         attachments: [],
       },
-      {
-        kind: "thinking",
-        turn: 3,
-        content: " Continue with the revised direction.",
-        complete: true,
-      },
     ]);
+    expect(vm.items).toHaveLength(3);
   });
 
   it("projects a linked subagent as a top-level parent-turn boundary", () => {
