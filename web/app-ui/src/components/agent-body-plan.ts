@@ -93,6 +93,14 @@ export const activityRunItems = (
 export const hasNativeCompactionMarker = (items: readonly AgentChatItem[]): boolean =>
   items.some((item) => item.kind === "compaction");
 
+/** Rendered-row budget per virtual row. Each item in a span costs one row
+ * because expanded groups mount one card per item. */
+export const TURN_SEGMENT_TARGET_ITEMS = 40;
+
+/** Longest consecutive activity run kept as one collapsible group. Bounded by
+ * the segment budget so no single span can exceed one virtual row. */
+export const MAX_ACTIVITY_RUN_ITEMS = TURN_SEGMENT_TARGET_ITEMS;
+
 /** Segment a turn's agent items into render spans using the same grouping
  * rules as the transcript renderer. Pure over items, collapse preferences,
  * and the turn's response item (see `turnResponseItemId`); disclosure state
@@ -224,7 +232,17 @@ export const planAgentBody = (
       index += 1;
       continue;
     }
-    spans.push({ kind: "activity", activity: "run", start, end: index });
+    // An expanded group mounts one card per item, so an unbounded run would
+    // put a whole tool stream into a single virtual row. Chunk from the
+    // start so existing groups keep their identity while a turn streams.
+    for (let chunk = start; chunk < index; chunk += MAX_ACTIVITY_RUN_ITEMS) {
+      spans.push({
+        kind: "activity",
+        activity: "run",
+        start: chunk,
+        end: Math.min(index, chunk + MAX_ACTIVITY_RUN_ITEMS),
+      });
+    }
   }
   return spans;
 };
@@ -241,10 +259,6 @@ export interface TurnSegment {
   readonly first: boolean;
   readonly last: boolean;
 }
-
-/** Rendered-row budget per virtual row. Each item in a span costs one row
- * because expanded groups mount one card per item. */
-export const TURN_SEGMENT_TARGET_ITEMS = 40;
 
 const cutAllowedBetween = (before: AgentBodySpan, after: AgentBodySpan): boolean =>
   before.kind !== "compaction"

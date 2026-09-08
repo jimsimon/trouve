@@ -6,7 +6,9 @@ import {
 } from "../services/chat-preferences.js";
 import {
   activityRunItems,
+  MAX_ACTIVITY_RUN_ITEMS,
   planAgentBody,
+  TURN_SEGMENT_TARGET_ITEMS,
   segmentTurnSpans,
   turnSegmentId,
   turnSegmentUnitId,
@@ -116,6 +118,31 @@ describe("planAgentBody", () => {
       { kind: "tool", ids: ["t1"] },
       { kind: "tool", ids: ["t2"] },
     ]);
+  });
+
+  it("chunks an oversized tool run so no span exceeds one virtual row", () => {
+    const items: AgentChatItem[] = [];
+    for (let index = 0; index < MAX_ACTIVITY_RUN_ITEMS * 3 + 5; index += 1) {
+      items.push(tool(`t${index}`));
+    }
+    const spans = planAgentBody(items, collapse);
+    expect(spans.length).toBe(4);
+    expect(spans.every((span) => span.kind === "activity" && span.activity === "run")).toBe(true);
+    expect(spans.map((span) => span.end - span.start)).toEqual([
+      MAX_ACTIVITY_RUN_ITEMS,
+      MAX_ACTIVITY_RUN_ITEMS,
+      MAX_ACTIVITY_RUN_ITEMS,
+      5,
+    ]);
+    expect(spans[0]?.start).toBe(0);
+    expect(spans.at(-1)?.end).toBe(items.length);
+    // Chunks start at fixed offsets, so a group keeps its identity (first
+    // item id) as more tools stream into the same run.
+    const shorter = planAgentBody(items.slice(0, MAX_ACTIVITY_RUN_ITEMS + 1), collapse);
+    expect(shorter.map((span) => span.start)).toEqual([0, MAX_ACTIVITY_RUN_ITEMS]);
+    const segments = segmentTurnSpans(spans, items.length);
+    expect(segments.every((segment) =>
+      segment.itemEnd - segment.itemStart <= TURN_SEGMENT_TARGET_ITEMS)).toBe(true);
   });
 
   it("returns run items in order", () => {

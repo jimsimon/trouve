@@ -5780,7 +5780,9 @@ test("keeps a nested thought anchored when history extends the same agent turn",
   } });
   await page.goto("/");
   await replayHistory(page);
-  await expect(page.getByText("Stable thought 30", { exact: true })).toBeVisible();
+  // The 60-item turn spans several virtual rows; only its tail is mounted
+  // while the reader follows the live end.
+  await expect(page.getByText("Stable thought 89", { exact: true })).toBeVisible();
   await expect.poll(() => oldestRequests).toBeGreaterThanOrEqual(1);
 
   const viewport = page.locator(".chat-stream");
