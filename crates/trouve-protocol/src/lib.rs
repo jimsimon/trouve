@@ -371,7 +371,10 @@ pub use requests::*;
 // (`thread_collapse`), the collapse backlog reports failing/abandoned entries
 // with the latest error, and GitHub App status reports
 // `contents_write_configured` (additive).
-pub const PROTOCOL_VERSION: &str = "9.2";
+// 9.3: code-review repositories, reviewer overrides, and job snapshots carry
+// validated per-role `model_options` maps (for example `fast`) alongside the
+// legacy thinking-level shorthands (additive).
+pub const PROTOCOL_VERSION: &str = "9.3";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";
 pub const ERROR_CODE_GITHUB_REAUTHENTICATION_REQUIRED: &str = "github_reauthentication_required";

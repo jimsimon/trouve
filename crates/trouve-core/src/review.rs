@@ -3404,10 +3404,13 @@ impl Engine {
             retry_of: predecessor.map(|job| job.id.clone()),
             model: repository.model,
             coordinator_thinking_level: repository.coordinator_thinking_level,
+            coordinator_model_options: repository.coordinator_model_options,
             router_model: repository.router_model,
             router_thinking_level: repository.router_thinking_level,
+            router_model_options: repository.router_model_options,
             analyst_model: repository.analyst_model,
             analyst_thinking_level: repository.analyst_thinking_level,
+            analyst_model_options: repository.analyst_model_options,
             prompt: repository.prompt,
             reviewers,
             routing_mode: repository.routing_mode,
@@ -3551,16 +3554,24 @@ impl Engine {
             repository.semantic_routing,
             &repository.router_model,
             &repository.router_thinking_level,
+            &repository.router_model_options,
             &repository.analyst_model,
             &repository.analyst_thinking_level,
+            &repository.analyst_model_options,
             included_reviewer_ids,
             excluded_reviewer_ids,
         ))
         .map_err(|error| EngineError::Internal(error.into()))?;
+        let coordinator_config = serde_json::to_string(&(
+            &repository.model,
+            &repository.coordinator_thinking_level,
+            &repository.coordinator_model_options,
+        ))
+        .map_err(|error| EngineError::Internal(error.into()))?;
         Ok(hex::encode(Sha256::digest(
             format!(
-                "{:?}\0{:?}\0{}\0{routing_config}\0{reviewer_config}",
-                repository.model, repository.coordinator_thinking_level, repository.prompt
+                "{coordinator_config}\0{}\0{routing_config}\0{reviewer_config}",
+                repository.prompt
             )
             .as_bytes(),
         )))
@@ -3608,6 +3619,7 @@ impl Engine {
                 .map(str::trim)
                 .filter(|level| !level.is_empty())
                 .map(str::to_string);
+            let model_options = scalar_model_options(&reviewer_override.model_options);
             let prompt = reviewer_override.prompt.trim();
             if prompt.len() > 16_000 {
                 return Err(EngineError::BadRequest(format!(
@@ -3623,6 +3635,7 @@ impl Engine {
             }
             if model.is_none()
                 && thinking_level.is_none()
+                && model_options.is_empty()
                 && reviewer_override.prompt_mode == ReviewerPromptMode::Inherit
             {
                 continue;
@@ -3631,6 +3644,7 @@ impl Engine {
                 reviewer_id: reviewer_override.reviewer_id.clone(),
                 model,
                 thinking_level,
+                model_options,
                 prompt_mode: reviewer_override.prompt_mode,
                 prompt: if reviewer_override.prompt_mode == ReviewerPromptMode::Inherit {
                     String::new()
@@ -3683,6 +3697,40 @@ impl Engine {
             "{role} thinking level {level:?} is not supported by model \
              {selected_model:?}; {detail}"
         )))
+    }
+
+    /// Validate a role's non-thinking model options against its effective
+    /// model's advertised schema. Thinking is configured through the
+    /// role's dedicated thinking level, so thinking keys are rejected here
+    /// instead of silently competing with that field.
+    async fn validate_code_review_model_options(
+        &self,
+        role: &str,
+        options: &serde_json::Map<String, serde_json::Value>,
+        model: Option<&str>,
+    ) -> Result<serde_json::Map<String, serde_json::Value>, EngineError> {
+        let options = scalar_model_options(options);
+        if options.is_empty() {
+            return Ok(options);
+        }
+        if crate::engine::has_thinking_option(&options) {
+            return Err(EngineError::BadRequest(format!(
+                "{role} model options cannot set thinking; use the {role} thinking level"
+            )));
+        }
+        let selected_model = model.ok_or_else(|| {
+            EngineError::BadRequest(format!("{role} model options require a configured model"))
+        })?;
+        let model_info = self.resolve_model_info(selected_model).await?;
+        crate::engine::validate_model_options(&options, &model_info).map_err(
+            |error| match error {
+                EngineError::BadRequest(message) => {
+                    EngineError::BadRequest(format!("{role} {message}"))
+                }
+                other => other,
+            },
+        )?;
+        Ok(options)
     }
 
     fn code_review_snapshots_changed(
@@ -3812,6 +3860,56 @@ impl Engine {
             .list_code_review_repositories()?
             .into_iter()
             .find(|repository| repository.repository == request.repository);
+        // Omitted option maps preserve the stored ones, but they are still
+        // re-validated against the (possibly changed) effective model.
+        let coordinator_model_options = request
+            .coordinator_model_options
+            .clone()
+            .or_else(|| {
+                existing
+                    .as_ref()
+                    .map(|repository| repository.coordinator_model_options.clone())
+            })
+            .unwrap_or_default();
+        let coordinator_model_options = self
+            .validate_code_review_model_options(
+                "coordinator",
+                &coordinator_model_options,
+                model.as_deref(),
+            )
+            .await?;
+        let router_model_options = request
+            .router_model_options
+            .clone()
+            .or_else(|| {
+                existing
+                    .as_ref()
+                    .map(|repository| repository.router_model_options.clone())
+            })
+            .unwrap_or_default();
+        let router_model_options = self
+            .validate_code_review_model_options(
+                "router",
+                &router_model_options,
+                router_model.as_deref().or(model.as_deref()),
+            )
+            .await?;
+        let analyst_model_options = request
+            .analyst_model_options
+            .clone()
+            .or_else(|| {
+                existing
+                    .as_ref()
+                    .map(|repository| repository.analyst_model_options.clone())
+            })
+            .unwrap_or_default();
+        let analyst_model_options = self
+            .validate_code_review_model_options(
+                "analyst",
+                &analyst_model_options,
+                analyst_model.as_deref().or(model.as_deref()),
+            )
+            .await?;
         let reviewer_ids = request
             .reviewer_ids
             .clone()
@@ -3937,14 +4035,22 @@ impl Engine {
                         reviewer_override.reviewer_id
                     ))
                 })?;
+            let role = format!("reviewer {:?}", reviewer_override.reviewer_id);
+            let effective_model = reviewer_override
+                .model
+                .as_deref()
+                .or(reviewer.model.as_deref())
+                .or(model.as_deref());
             self.validate_code_review_thinking_level(
-                &format!("reviewer {:?}", reviewer_override.reviewer_id),
+                &role,
                 reviewer_override.thinking_level.as_deref(),
-                reviewer_override
-                    .model
-                    .as_deref()
-                    .or(reviewer.model.as_deref())
-                    .or(model.as_deref()),
+                effective_model,
+            )
+            .await?;
+            self.validate_code_review_model_options(
+                &role,
+                &reviewer_override.model_options,
+                effective_model,
             )
             .await?;
         }
@@ -3976,10 +4082,13 @@ impl Engine {
             mode: request.mode,
             model,
             coordinator_thinking_level,
+            coordinator_model_options: Some(coordinator_model_options),
             router_model,
             router_thinking_level,
+            router_model_options: Some(router_model_options),
             analyst_model,
             analyst_thinking_level,
+            analyst_model_options: Some(analyst_model_options),
             prompt: request.prompt.clone(),
             reviewer_ids: Some(reviewer_ids),
             routing_mode: Some(routing_mode),
@@ -4449,6 +4558,9 @@ impl Engine {
                         router_thinking_level: repository.router_thinking_level.clone(),
                         analyst_model: repository.analyst_model.clone(),
                         analyst_thinking_level: repository.analyst_thinking_level.clone(),
+                        coordinator_model_options: repository.coordinator_model_options.clone(),
+                        router_model_options: repository.router_model_options.clone(),
+                        analyst_model_options: repository.analyst_model_options.clone(),
                         prompt: repository.prompt.clone(),
                         reviewers: reviewers.clone(),
                         routing_mode: repository.routing_mode,
@@ -5967,7 +6079,10 @@ impl Engine {
             title: Some(session.title.clone()),
             mode: Some("review".into()),
             model: Some(coordinator_model),
-            model_options: thinking_model_options(job.coordinator_thinking_level.as_deref()),
+            model_options: role_model_options(
+                &job.coordinator_model_options,
+                job.coordinator_thinking_level.as_deref(),
+            ),
             permission_mode: Some(PermissionMode::Yolo),
         })?;
         if !self
@@ -7662,7 +7777,10 @@ impl Engine {
             title: None,
             mode: Some("review".into()),
             model: Some(model.clone()),
-            model_options: thinking_model_options(job.analyst_thinking_level.as_deref()),
+            model_options: role_model_options(
+                &job.analyst_model_options,
+                job.analyst_thinking_level.as_deref(),
+            ),
             permission_mode: Some(PermissionMode::Yolo),
         }) {
             Ok(thread) => thread,
@@ -7850,7 +7968,10 @@ impl Engine {
                         title: None,
                         mode: Some("review".into()),
                         model: Some(routing_model),
-                        model_options: thinking_model_options(job.router_thinking_level.as_deref()),
+                        model_options: role_model_options(
+                            &job.router_model_options,
+                            job.router_thinking_level.as_deref(),
+                        ),
                         permission_mode: Some(PermissionMode::Yolo),
                     }) {
                         Ok(thread) => thread,
@@ -10947,6 +11068,9 @@ impl Engine {
                     router_thinking_level: repository.router_thinking_level.clone(),
                     analyst_model: repository.analyst_model.clone(),
                     analyst_thinking_level: repository.analyst_thinking_level.clone(),
+                    coordinator_model_options: repository.coordinator_model_options.clone(),
+                    router_model_options: repository.router_model_options.clone(),
+                    analyst_model_options: repository.analyst_model_options.clone(),
                     prompt: repository.prompt.clone(),
                     reviewers: reviewers.clone(),
                     routing_mode: repository.routing_mode,
@@ -14819,6 +14943,9 @@ fn apply_reviewer_overrides(
             if let Some(thinking_level) = &reviewer_override.thinking_level {
                 reviewer.default_thinking_level = Some(thinking_level.clone());
             }
+            if !reviewer_override.model_options.is_empty() {
+                reviewer.model_options = reviewer_override.model_options.clone();
+            }
             match reviewer_override.prompt_mode {
                 ReviewerPromptMode::Inherit => {}
                 ReviewerPromptMode::Append => {
@@ -14876,21 +15003,49 @@ fn analyst_model(job: &trouve_protocol::CodeReviewJob) -> Result<String> {
         .unwrap_or_else(|| review_model(job))
 }
 
+/// Keep only the scalar entries the wire contract can represent, mirroring
+/// the storage read boundary for model options.
+fn scalar_model_options(
+    options: &serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Map<String, serde_json::Value> {
+    options
+        .iter()
+        .filter(|(_, value)| value.is_string() || value.is_number() || value.is_boolean())
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
+/// Thread options for one review role: the role's stored non-thinking
+/// options plus the legacy thinking-level shorthand, unless those options
+/// already carry a thinking selection.
+fn role_model_options(
+    options: &serde_json::Map<String, serde_json::Value>,
+    thinking_level: Option<&str>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut options = scalar_model_options(options);
+    if let Some(level) = thinking_level
+        && !crate::engine::has_thinking_option(&options)
+    {
+        options.insert(
+            "thinking_level".into(),
+            serde_json::Value::String(level.to_owned()),
+        );
+    }
+    options
+}
+
+#[cfg(test)]
 fn thinking_model_options(level: Option<&str>) -> serde_json::Map<String, serde_json::Value> {
-    level
-        .map(|level| {
-            serde_json::Map::from_iter([(
-                "thinking_level".into(),
-                serde_json::Value::String(level.to_owned()),
-            )])
-        })
-        .unwrap_or_default()
+    role_model_options(&serde_json::Map::new(), level)
 }
 
 fn reviewer_model_options(
     reviewer: &ReviewerProfile,
 ) -> serde_json::Map<String, serde_json::Value> {
-    thinking_model_options(reviewer.default_thinking_level.as_deref())
+    role_model_options(
+        &reviewer.model_options,
+        reviewer.default_thinking_level.as_deref(),
+    )
 }
 
 fn ensure_review_current(superseded: &CancellationToken) -> Result<()> {
@@ -18907,6 +19062,9 @@ fn carried_anchor_continuation_request(
         router_thinking_level: job.router_thinking_level.clone(),
         analyst_model: job.analyst_model.clone(),
         analyst_thinking_level: job.analyst_thinking_level.clone(),
+        coordinator_model_options: job.coordinator_model_options.clone(),
+        router_model_options: job.router_model_options.clone(),
+        analyst_model_options: job.analyst_model_options.clone(),
         prompt: record.prompt.clone(),
         reviewers: record.reviewers.clone(),
         routing_mode: job.routing_mode,
@@ -19969,6 +20127,11 @@ mod tests {
                                 "type": "string",
                                 "enum": ["low", "high"],
                                 "default": "low"
+                            },
+                            "fast": {
+                                "type": "boolean",
+                                "default": false,
+                                "description": "Run faster with increased credit usage"
                             }
                         }
                     }),
@@ -20055,6 +20218,9 @@ mod tests {
             router_thinking_level: None,
             analyst_model: None,
             analyst_thinking_level: None,
+            coordinator_model_options: Default::default(),
+            router_model_options: Default::default(),
+            analyst_model_options: Default::default(),
             prompt: "Review it".into(),
             reviewers: crate::reviewers::built_in_reviewers()
                 .into_iter()
@@ -30405,6 +30571,7 @@ rename to src/new.rs
             prompt: "Check trust boundaries.".into(),
             model: Some("openai/base".into()),
             default_thinking_level: Some("high".into()),
+            model_options: Default::default(),
             built_in: true,
         };
         let appended = apply_reviewer_overrides(
@@ -30413,6 +30580,7 @@ rename to src/new.rs
                 reviewer_id: "security".into(),
                 model: Some("anthropic/reviewer".into()),
                 thinking_level: Some("medium".into()),
+                model_options: Default::default(),
                 prompt_mode: ReviewerPromptMode::Append,
                 prompt: "Focus on tenant isolation.".into(),
             }],
@@ -30431,6 +30599,7 @@ rename to src/new.rs
                 reviewer_id: "security".into(),
                 model: None,
                 thinking_level: None,
+                model_options: Default::default(),
                 prompt_mode: ReviewerPromptMode::Replace,
                 prompt: "Review only authorization changes.".into(),
             }],
@@ -32052,6 +32221,9 @@ rename to src/new.rs
             router_thinking_level: Some("low".into()),
             analyst_model: None,
             analyst_thinking_level: None,
+            coordinator_model_options: Default::default(),
+            router_model_options: Default::default(),
+            analyst_model_options: Default::default(),
             prompt: "Review it".into(),
             reviewer_ids: crate::reviewers::default_reviewer_ids(),
             routing_mode: CodeReviewRoutingMode::Additive,
@@ -32093,6 +32265,9 @@ rename to src/new.rs
             router_thinking_level: None,
             analyst_model: None,
             analyst_thinking_level: None,
+            coordinator_model_options: Default::default(),
+            router_model_options: Default::default(),
+            analyst_model_options: Default::default(),
             prompt: String::new(),
             reviewer_ids: crate::reviewers::default_reviewer_ids(),
             routing_mode: CodeReviewRoutingMode::Automatic,
@@ -32160,6 +32335,9 @@ rename to src/new.rs
                 router_thinking_level: Some("low".into()),
                 analyst_model: None,
                 analyst_thinking_level: None,
+                coordinator_model_options: None,
+                router_model_options: None,
+                analyst_model_options: None,
                 prompt: String::new(),
                 reviewer_ids: None,
                 routing_mode: None,
@@ -32200,6 +32378,9 @@ rename to src/new.rs
                 router_thinking_level: None,
                 analyst_model: None,
                 analyst_thinking_level: None,
+                coordinator_model_options: None,
+                router_model_options: None,
+                analyst_model_options: None,
                 prompt: String::new(),
                 reviewer_ids: None,
                 routing_mode: Some(CodeReviewRoutingMode::Automatic),
@@ -32231,6 +32412,9 @@ rename to src/new.rs
             router_thinking_level: Some("unsupported".into()),
             analyst_model: None,
             analyst_thinking_level: None,
+            coordinator_model_options: None,
+            router_model_options: None,
+            analyst_model_options: None,
             prompt: String::new(),
             reviewer_ids: None,
             routing_mode: None,
@@ -32287,6 +32471,9 @@ rename to src/new.rs
                 router_thinking_level: level.map(str::to_owned),
                 analyst_model: None,
                 analyst_thinking_level: None,
+                coordinator_model_options: None,
+                router_model_options: None,
+                analyst_model_options: None,
                 prompt: String::new(),
                 reviewer_ids: Some(crate::reviewers::default_reviewer_ids()),
                 routing_mode: Some(CodeReviewRoutingMode::Additive),
@@ -32361,6 +32548,7 @@ rename to src/new.rs
             reviewer_id: "security".into(),
             model: Some("provider/router".into()),
             thinking_level: Some(" low ".into()),
+            model_options: Default::default(),
             prompt_mode: ReviewerPromptMode::Inherit,
             prompt: String::new(),
         }]);
@@ -32397,6 +32585,180 @@ rename to src/new.rs
     }
 
     #[tokio::test]
+    async fn repository_model_options_are_validated_persisted_and_dispatched() {
+        let data = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open_in_memory().unwrap();
+        store
+            .upsert_discovered_code_review_repository(7, "acme/widgets", false)
+            .unwrap();
+        let engine = Engine::new(
+            store,
+            data.path().to_path_buf(),
+            &crate::config::Config::default(),
+        )
+        .with_provider(
+            "provider",
+            Arc::new(RouterThinkingProvider { stall: false }),
+        );
+        let fast = || serde_json::Map::from_iter([("fast".to_string(), serde_json::json!(true))]);
+        let request = || UpdateCodeReviewRepositoryRequest {
+            installation_id: 7,
+            repository: "acme/widgets".into(),
+            mode: CodeReviewMode::Automatic,
+            model: Some("provider/router".into()),
+            coordinator_thinking_level: Some("high".into()),
+            router_model: None,
+            router_thinking_level: None,
+            analyst_model: None,
+            analyst_thinking_level: None,
+            coordinator_model_options: Some(fast()),
+            router_model_options: None,
+            analyst_model_options: None,
+            prompt: String::new(),
+            reviewer_ids: Some(crate::reviewers::default_reviewer_ids()),
+            routing_mode: Some(CodeReviewRoutingMode::Additive),
+            semantic_routing: Some(true),
+            included_reviewer_ids: Some(Vec::new()),
+            excluded_reviewer_ids: Some(Vec::new()),
+            reviewer_overrides: Some(vec![ReviewerOverride {
+                reviewer_id: "security".into(),
+                model: None,
+                thinking_level: None,
+                model_options: fast(),
+                prompt_mode: ReviewerPromptMode::Inherit,
+                prompt: String::new(),
+            }]),
+        };
+
+        let saved = engine
+            .update_code_review_repository(&request())
+            .await
+            .unwrap();
+        assert_eq!(saved.coordinator_model_options, fast());
+        assert!(saved.router_model_options.is_empty());
+        assert_eq!(saved.reviewer_overrides.len(), 1);
+        assert_eq!(saved.reviewer_overrides[0].model_options, fast());
+        let reviewers = engine.reviewers_for_repository_policy(&saved).unwrap();
+        let security = reviewers
+            .iter()
+            .find(|reviewer| reviewer.id == "security")
+            .unwrap();
+        assert_eq!(security.model_options, fast());
+        let with_fast = Engine::code_review_config_hash(&saved, &reviewers).unwrap();
+
+        // Omitting the maps preserves them; sending an empty map clears them.
+        let mut omitted = request();
+        omitted.coordinator_model_options = None;
+        omitted.reviewer_overrides = None;
+        let saved = engine
+            .update_code_review_repository(&omitted)
+            .await
+            .unwrap();
+        assert_eq!(saved.coordinator_model_options, fast());
+        assert_eq!(saved.reviewer_overrides[0].model_options, fast());
+        let mut cleared = request();
+        cleared.coordinator_model_options = Some(serde_json::Map::new());
+        cleared.reviewer_overrides = Some(Vec::new());
+        let saved = engine
+            .update_code_review_repository(&cleared)
+            .await
+            .unwrap();
+        assert!(saved.coordinator_model_options.is_empty());
+        assert!(saved.reviewer_overrides.is_empty());
+        let reviewers = engine.reviewers_for_repository_policy(&saved).unwrap();
+        assert_ne!(
+            Engine::code_review_config_hash(&saved, &reviewers).unwrap(),
+            with_fast
+        );
+
+        // Options are validated against the role's effective model.
+        let mut unknown = request();
+        unknown.coordinator_model_options = Some(serde_json::Map::from_iter([(
+            "turbo".to_string(),
+            serde_json::json!(true),
+        )]));
+        let error = engine
+            .update_code_review_repository(&unknown)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("coordinator model option turbo is not advertised"),
+            "{error}"
+        );
+        let mut wrong_type = request();
+        wrong_type.router_model_options = Some(serde_json::Map::from_iter([(
+            "fast".to_string(),
+            serde_json::json!("yes"),
+        )]));
+        assert!(
+            engine
+                .update_code_review_repository(&wrong_type)
+                .await
+                .is_err()
+        );
+        let mut unsupported_model = request();
+        unsupported_model.analyst_model = Some("provider/plain".into());
+        unsupported_model.analyst_model_options = Some(fast());
+        let error = engine
+            .update_code_review_repository(&unsupported_model)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("analyst model option fast"),
+            "{error}"
+        );
+        let mut thinking_in_options = request();
+        thinking_in_options.coordinator_model_options = Some(serde_json::Map::from_iter([(
+            "reasoning_effort".to_string(),
+            serde_json::json!("high"),
+        )]));
+        let error = engine
+            .update_code_review_repository(&thinking_in_options)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("cannot set thinking"), "{error}");
+
+        // Snapshotted jobs dispatch the stored options merged with the
+        // legacy thinking shorthand.
+        let saved = engine
+            .update_code_review_repository(&request())
+            .await
+            .unwrap();
+        let reviewers = engine.reviewers_for_repository_policy(&saved).unwrap();
+        let mut new_job = test_review_job_request("acme/widgets#42:fast-options");
+        new_job.coordinator_thinking_level = saved.coordinator_thinking_level.clone();
+        new_job.coordinator_model_options = saved.coordinator_model_options.clone();
+        new_job.reviewers = reviewers;
+        let job = engine
+            .store
+            .enqueue_code_review_job(&new_job)
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.coordinator_model_options, fast());
+        let options = role_model_options(
+            &job.coordinator_model_options,
+            job.coordinator_thinking_level.as_deref(),
+        );
+        assert_eq!(options.get("fast"), Some(&serde_json::json!(true)));
+        assert_eq!(
+            options.get("thinking_level"),
+            Some(&serde_json::json!("high"))
+        );
+        let record = engine.store.code_review_job(&job.id).unwrap().unwrap();
+        let security = record
+            .reviewers
+            .iter()
+            .find(|reviewer| reviewer.id == "security")
+            .unwrap();
+        assert_eq!(
+            reviewer_model_options(security).get("fast"),
+            Some(&serde_json::json!(true))
+        );
+    }
+
+    #[tokio::test]
     async fn repository_routing_policy_validation_rejects_invalid_selections() {
         let data = tempfile::tempdir().unwrap();
         let store = crate::store::Store::open_in_memory().unwrap();
@@ -32418,6 +32780,9 @@ rename to src/new.rs
             router_thinking_level: None,
             analyst_model: None,
             analyst_thinking_level: None,
+            coordinator_model_options: None,
+            router_model_options: None,
+            analyst_model_options: None,
             prompt: String::new(),
             reviewer_ids: Some(crate::reviewers::default_reviewer_ids()),
             routing_mode: Some(CodeReviewRoutingMode::Manual),
@@ -32574,6 +32939,9 @@ rename to src/new.rs
                 router_thinking_level: None,
                 analyst_model: None,
                 analyst_thinking_level: None,
+                coordinator_model_options: None,
+                router_model_options: None,
+                analyst_model_options: None,
                 prompt: String::new(),
                 reviewer_ids: None,
                 routing_mode: None,
@@ -32671,6 +33039,9 @@ rename to src/new.rs
             router_thinking_level: None,
             analyst_model: None,
             analyst_thinking_level: None,
+            coordinator_model_options: Default::default(),
+            router_model_options: Default::default(),
+            analyst_model_options: Default::default(),
             prompt: String::new(),
             reviewer_ids: Vec::new(),
             routing_mode: CodeReviewRoutingMode::Additive,
@@ -32947,6 +33318,9 @@ rename to src/new.rs
                 router_thinking_level: None,
                 analyst_model: None,
                 analyst_thinking_level: None,
+                coordinator_model_options: None,
+                router_model_options: None,
+                analyst_model_options: None,
                 prompt: String::new(),
                 reviewer_ids: None,
                 routing_mode: None,
@@ -33925,6 +34299,7 @@ rename to src/new.rs
             prompt: "Review domain rules.".into(),
             model: None,
             default_thinking_level: None,
+            model_options: Default::default(),
             built_in: false,
         }];
         let batches = vec![ReviewBatch {
@@ -34076,6 +34451,7 @@ rename to src/new.rs
             prompt: String::new(),
             model: Some("provider/small".into()),
             default_thinking_level: None,
+            model_options: Default::default(),
             built_in: true,
         };
 

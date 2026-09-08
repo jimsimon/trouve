@@ -2233,6 +2233,10 @@ export interface components {
              *     inherits `model`.
              */
             analyst_model?: string | null;
+            /** @description Model options snapshotted for the implementation analyst. */
+            analyst_model_options?: {
+                [key: string]: components["schemas"]["ModelOptionValue"];
+            };
             /** @description Thinking level snapshotted for the implementation analyst. */
             analyst_thinking_level?: string | null;
             base_ref: string;
@@ -2247,6 +2251,10 @@ export interface components {
             completed_at?: string | null;
             /** Format: int64 */
             coordinator_elapsed_ms?: number;
+            /** @description Model options snapshotted for the final coordinator/editor. */
+            coordinator_model_options?: {
+                [key: string]: components["schemas"]["ModelOptionValue"];
+            };
             /** @description Thinking level snapshotted for the final coordinator/editor. */
             coordinator_thinking_level?: string | null;
             /** Format: date-time */
@@ -2322,6 +2330,10 @@ export interface components {
              *     `model`; legacy jobs may omit both and are rejected before dispatch.
              */
             router_model?: string | null;
+            /** @description Model options snapshotted for semantic persona triage. */
+            router_model_options?: {
+                [key: string]: components["schemas"]["ModelOptionValue"];
+            };
             /** @description Thinking level snapshotted for semantic persona triage. */
             router_thinking_level?: string | null;
             routing_mode?: components["schemas"]["CodeReviewRoutingMode"];
@@ -2466,11 +2478,23 @@ export interface components {
              *     analyst. Absent inherits `model`.
              */
             analyst_model?: string | null;
+            /** @description Validated non-thinking model options for the analyst's effective model. */
+            analyst_model_options?: {
+                [key: string]: components["schemas"]["ModelOptionValue"];
+            };
             /**
              * @description Preferred thinking level or fixed token budget for the implementation
              *     analyst. Absent inherits the review mode's default.
              */
             analyst_thinking_level?: string | null;
+            /**
+             * @description Validated non-thinking model options for the coordinator's effective
+             *     model (for example `fast`). Thinking stays on
+             *     `coordinator_thinking_level`; thinking keys here are rejected.
+             */
+            coordinator_model_options?: {
+                [key: string]: components["schemas"]["ModelOptionValue"];
+            };
             /**
              * @description Preferred thinking level or fixed token budget for the final
              *     coordinator/editor. Absent inherits the review mode's default.
@@ -2504,6 +2528,10 @@ export interface components {
              *     inherits `model`.
              */
             router_model?: string | null;
+            /** @description Validated non-thinking model options for the router's effective model. */
+            router_model_options?: {
+                [key: string]: components["schemas"]["ModelOptionValue"];
+            };
             /**
              * @description Preferred thinking level or fixed token budget for semantic persona
              *     triage. Absent inherits the review mode's default.
@@ -4351,6 +4379,15 @@ export interface components {
              *     turn may inherit the repository/default model.
              */
             model?: string | null;
+            /**
+             * @description Non-thinking model options for the reviewer's effective model (for
+             *     example `fast`), validated against that model's advertised schema.
+             *     Thinking is configured through `thinking_level`; thinking keys here
+             *     are rejected.
+             */
+            model_options?: {
+                [key: string]: components["schemas"]["ModelOptionValue"];
+            };
             prompt?: string;
             prompt_mode?: components["schemas"]["ReviewerPromptMode"];
             reviewer_id: string;
@@ -4373,6 +4410,14 @@ export interface components {
             default_thinking_level?: string | null;
             id: string;
             model?: string | null;
+            /**
+             * @description Validated non-thinking model options for this reviewer's effective
+             *     model (for example `fast`). Populated from a repository override;
+             *     thinking stays on `default_thinking_level`.
+             */
+            model_options?: {
+                [key: string]: components["schemas"]["ModelOptionValue"];
+            };
             name: string;
             prompt: string;
         };
@@ -5035,7 +5080,22 @@ export interface components {
         TurnPhase: "processing" | "connecting_tools";
         UpdateCodeReviewRepositoryRequest: {
             analyst_model?: string | null;
+            /**
+             * @description Non-thinking model options for the analyst's effective model. Omitted
+             *     by older clients to preserve the current options.
+             */
+            analyst_model_options?: {
+                [key: string]: components["schemas"]["ModelOptionValue"];
+            } | null;
             analyst_thinking_level?: string | null;
+            /**
+             * @description Non-thinking model options for the coordinator's effective model.
+             *     Omitted by older clients to preserve the current options; an empty
+             *     map clears them.
+             */
+            coordinator_model_options?: {
+                [key: string]: components["schemas"]["ModelOptionValue"];
+            } | null;
             coordinator_thinking_level?: string | null;
             /** @description Omitted by older clients to preserve existing forced exclusions. */
             excluded_reviewer_ids?: string[] | null;
@@ -5052,6 +5112,13 @@ export interface components {
             /** @description Omitted by older clients to preserve existing reviewer overrides. */
             reviewer_overrides?: components["schemas"]["ReviewerOverride"][] | null;
             router_model?: string | null;
+            /**
+             * @description Non-thinking model options for the router's effective model. Omitted
+             *     by older clients to preserve the current options.
+             */
+            router_model_options?: {
+                [key: string]: components["schemas"]["ModelOptionValue"];
+            } | null;
             router_thinking_level?: string | null;
             routing_mode?: null | components["schemas"]["CodeReviewRoutingMode"];
             /**

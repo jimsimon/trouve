@@ -6,6 +6,20 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Model-specific options for code reviews**: the review dashboard's
+  repository settings now show schema-driven controls (for example Codex
+  "fast" mode) for the coordinator, semantic router, change analyst, and
+  per-persona overrides whenever the effective model advertises them, matching
+  the desktop prompt UI. Options are validated against the selected model,
+  dropped when a model that does not support them is chosen, snapshotted onto
+  each review job, and shown in the job details.
+- **Client/server compatibility**: protocol compatibility advances to 9.3 for
+  the additive per-role `model_options` maps on code-review repositories,
+  reviewer overrides, and job snapshots. Upgrade the desktop or PWA client,
+  review dashboard, and `trouve-server` together.
+
 ### Fixed
 
 - **A turn's final text is labelled Response even when a tool call followed
