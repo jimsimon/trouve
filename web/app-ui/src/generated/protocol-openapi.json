@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "9.2"
+    "version": "9.3"
   },
   "paths": {
     "/v1/approvals": {
@@ -6076,6 +6076,16 @@
             ],
             "description": "Model snapshotted for the per-round implementation analyst. Absent\ninherits `model`."
           },
+          "analyst_model_options": {
+            "type": "object",
+            "description": "Model options snapshotted for the implementation analyst.",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/ModelOptionValue"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
           "analyst_thinking_level": {
             "type": [
               "string",
@@ -6119,6 +6129,16 @@
             "type": "integer",
             "format": "int64",
             "minimum": 0
+          },
+          "coordinator_model_options": {
+            "type": "object",
+            "description": "Model options snapshotted for the final coordinator/editor.",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/ModelOptionValue"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
           },
           "coordinator_thinking_level": {
             "type": [
@@ -6265,6 +6285,16 @@
               "null"
             ],
             "description": "Model snapshotted for semantic persona triage. Absent inherits\n`model`; legacy jobs may omit both and are rejected before dispatch."
+          },
+          "router_model_options": {
+            "type": "object",
+            "description": "Model options snapshotted for semantic persona triage.",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/ModelOptionValue"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
           },
           "router_thinking_level": {
             "type": [
@@ -6648,12 +6678,32 @@
             ],
             "description": "Provider-qualified model used by the per-round implementation\nanalyst. Absent inherits `model`."
           },
+          "analyst_model_options": {
+            "type": "object",
+            "description": "Validated non-thinking model options for the analyst's effective model.",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/ModelOptionValue"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
           "analyst_thinking_level": {
             "type": [
               "string",
               "null"
             ],
             "description": "Preferred thinking level or fixed token budget for the implementation\nanalyst. Absent inherits the review mode's default."
+          },
+          "coordinator_model_options": {
+            "type": "object",
+            "description": "Validated non-thinking model options for the coordinator's effective\nmodel (for example `fast`). Thinking stays on\n`coordinator_thinking_level`; thinking keys here are rejected.",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/ModelOptionValue"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
           },
           "coordinator_thinking_level": {
             "type": [
@@ -6721,6 +6771,16 @@
               "null"
             ],
             "description": "Provider-qualified model used by semantic persona triage. Absent\ninherits `model`."
+          },
+          "router_model_options": {
+            "type": "object",
+            "description": "Validated non-thinking model options for the router's effective model.",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/ModelOptionValue"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
           },
           "router_thinking_level": {
             "type": [
@@ -12215,6 +12275,16 @@
             ],
             "description": "Provider-qualified model. Absent means inherit the profile, which in\nturn may inherit the repository/default model."
           },
+          "model_options": {
+            "type": "object",
+            "description": "Non-thinking model options for the reviewer's effective model (for\nexample `fast`), validated against that model's advertised schema.\nThinking is configured through `thinking_level`; thinking keys here\nare rejected.",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/ModelOptionValue"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
           "prompt": {
             "type": "string"
           },
@@ -12260,6 +12330,16 @@
               "string",
               "null"
             ]
+          },
+          "model_options": {
+            "type": "object",
+            "description": "Validated non-thinking model options for this reviewer's effective\nmodel (for example `fast`). Populated from a repository override;\nthinking stays on `default_thinking_level`.",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/ModelOptionValue"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
           },
           "name": {
             "type": "string"
@@ -13996,11 +14076,37 @@
               "null"
             ]
           },
+          "analyst_model_options": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "Non-thinking model options for the analyst's effective model. Omitted\nby older clients to preserve the current options.",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/ModelOptionValue"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
           "analyst_thinking_level": {
             "type": [
               "string",
               "null"
             ]
+          },
+          "coordinator_model_options": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "Non-thinking model options for the coordinator's effective model.\nOmitted by older clients to preserve the current options; an empty\nmap clears them.",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/ModelOptionValue"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
           },
           "coordinator_thinking_level": {
             "type": [
@@ -14073,6 +14179,19 @@
               "string",
               "null"
             ]
+          },
+          "router_model_options": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "Non-thinking model options for the router's effective model. Omitted\nby older clients to preserve the current options.",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/ModelOptionValue"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
           },
           "router_thinking_level": {
             "type": [
