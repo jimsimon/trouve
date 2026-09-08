@@ -47,7 +47,7 @@ use trouve_protocol::{
 };
 use trouve_providers::{InferencePriority, Message, Provider, ProviderEvent, ToolSpec};
 
-use crate::config::{Config, ProviderConfig};
+use crate::config::{Config, ProviderConfig, StagedConfigWrite};
 use crate::permissions::{
     ApprovalHub, ApprovalResolution, Gate, QuestionHub, QuestionResolution, allow_key, gate,
 };
@@ -2993,10 +2993,11 @@ impl BackendRetirement {
     }
 
     /// Invalidate cooldowns learned under the previous provider definition
-    /// before the replacement configuration becomes durable. A failure leaves
-    /// the old definition active and lets this retirement's drop path restore
-    /// any detached backend and tentative credentials.
-    fn prepare_route_state<T>(&mut self, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+    /// before the replacement configuration becomes durable. The candidate's
+    /// slow write and flush have already completed; only its atomic promotion
+    /// occurs while route outcomes are fenced, outside any SQLite transaction.
+    /// A failed promotion restores the exact previous cooldown snapshot.
+    fn prepare_route_state(&mut self, staged_config: Option<StagedConfigWrite>) -> Result<()> {
         let engine = self
             .engine
             .upgrade()
@@ -3016,15 +3017,24 @@ impl BackendRetirement {
                     .map(|generation| (id, generation))
             })
             .collect::<Result<Vec<_>>>()?;
-        let output = engine
-            .store
-            .clear_route_health_transactionally(&target_ids, operation)?;
+        let previous_health = engine.store.take_route_health(&target_ids)?;
+        if let Some(staged_config) = staged_config
+            && let Err(publish_error) = staged_config.publish()
+        {
+            return match engine.store.restore_route_health(&previous_health) {
+                Ok(()) => Err(publish_error),
+                Err(restore_error) => Err(anyhow!(
+                    "publishing provider configuration failed: {publish_error:#}; \
+                     restoring previous route health also failed: {restore_error:#}"
+                )),
+            };
+        }
         for (id, generation) in next_generations {
             generations.insert(id.clone(), generation);
             engine.turn_scheduler.reset_provider_outcomes(id);
         }
         self.route_state_prepared = true;
-        Ok(output)
+        Ok(())
     }
 
     /// Publish replacements from the caller's now-current configuration and
@@ -5221,14 +5231,16 @@ impl Engine {
                     entry.query_params = req.query_params.clone();
                 }
             }
-            retirement.prepare_route_state(|| {
-                if let Some(path) = &self.config_file {
-                    next.save_to(path).with_context(|| {
+            let staged_config = self
+                .config_file
+                .as_ref()
+                .map(|path| {
+                    next.stage_to(path).with_context(|| {
                         format!("persisting provider configuration to {}", path.display())
-                    })?;
-                }
-                Ok(())
-            })?;
+                    })
+                })
+                .transpose()?;
+            retirement.prepare_route_state(staged_config)?;
             *config = next;
         }
         // Keep the registry transition serialized until the new durable

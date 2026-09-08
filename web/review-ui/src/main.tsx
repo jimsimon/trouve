@@ -491,13 +491,13 @@ function App() {
     return () => window.removeEventListener("hashchange", onHash);
   }, [loadDashboard]);
 
-  const needsConfiguration =
+  const isConfigurationRoute =
     route.section === "repositories" ||
     route.section === "reviewers" ||
     route.section === "settings";
   useEffect(() => {
-    if (needsConfiguration) void loadConfiguration();
-  }, [needsConfiguration, loadConfiguration]);
+    if (isConfigurationRoute) void loadConfiguration();
+  }, [isConfigurationRoute, loadConfiguration]);
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -515,28 +515,28 @@ function App() {
   }, [dashboardError, loadDashboard]);
 
   useEffect(() => {
-    if (!needsConfiguration || !configurationError) return;
+    if (!isConfigurationRoute || !configurationError) return;
     const timer = window.setInterval(() => {
       if (document.visibilityState === "visible") void loadConfiguration();
     }, AUTOMATIC_RETRY_MS);
     return () => window.clearInterval(timer);
-  }, [configurationError, loadConfiguration, needsConfiguration]);
+  }, [configurationError, isConfigurationRoute, loadConfiguration]);
 
   useEffect(() => {
-    if (!modelCatalog.error) return;
+    if (!isConfigurationRoute || !modelCatalog.error) return;
     const timer = window.setInterval(() => {
       if (document.visibilityState === "visible") void loadModelRoutes();
     }, AUTOMATIC_RETRY_MS);
     return () => window.clearInterval(timer);
-  }, [loadModelRoutes, modelCatalog.error]);
+  }, [isConfigurationRoute, loadModelRoutes, modelCatalog.error]);
 
   useEffect(() => {
-    if (!staticModelError) return;
+    if (!isConfigurationRoute || !staticModelError) return;
     const timer = window.setInterval(() => {
       if (document.visibilityState === "visible") void loadStaticModels();
     }, AUTOMATIC_RETRY_MS);
     return () => window.clearInterval(timer);
-  }, [loadStaticModels, staticModelError]);
+  }, [isConfigurationRoute, loadStaticModels, staticModelError]);
 
   useEffect(() => {
     if (serverEventAfter === null) return;
@@ -556,7 +556,7 @@ function App() {
     };
   }, [serverEventAfter, loadDashboard]);
 
-  const error = dashboardError || (needsConfiguration ? configurationError : "");
+  const error = dashboardError || (isConfigurationRoute ? configurationError : "");
   const content = dashboard ? (
     <>
       {route.section === "overview" && <Overview dashboard={dashboard} />}

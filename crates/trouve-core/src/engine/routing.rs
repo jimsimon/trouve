@@ -4614,7 +4614,7 @@ mod tests {
         let database = data.path().join("trouve.sqlite3");
         let config_path = data.path().join("config.toml");
         let store = Store::open(&database).unwrap();
-        store
+        let previous_health = store
             .record_route_failure("provider", "model", 1, 60, 60)
             .unwrap();
         let config = Config {
@@ -4673,11 +4673,12 @@ mod tests {
                 .as_deref(),
             Some("https://old.example.test/v1")
         );
-        assert!(
+        assert_eq!(
             store
                 .route_health()
                 .unwrap()
-                .contains_key(&("provider".into(), "model".into()))
+                .get(&("provider".into(), "model".into())),
+            Some(&previous_health)
         );
         assert!(
             engine
@@ -4707,7 +4708,7 @@ mod tests {
     async fn failed_provider_update_preserves_existing_route_health() {
         let data = tempfile::tempdir().unwrap();
         let store = Store::open_in_memory().unwrap();
-        store
+        let previous_health = store
             .record_route_failure("provider", "model", 1, 60, 60)
             .unwrap();
         let config = Config {
@@ -4739,11 +4740,12 @@ mod tests {
             .await;
 
         assert!(result.is_err());
-        assert!(
+        assert_eq!(
             store
                 .route_health()
                 .unwrap()
-                .contains_key(&("provider".into(), "model".into()))
+                .get(&("provider".into(), "model".into())),
+            Some(&previous_health)
         );
         assert_eq!(
             engine.config.lock().unwrap().providers["provider"]
@@ -4757,7 +4759,7 @@ mod tests {
     async fn provider_config_persistence_failure_preserves_definition_and_route_health() {
         let data = tempfile::tempdir().unwrap();
         let store = Store::open_in_memory().unwrap();
-        store
+        let previous_health = store
             .record_route_failure("provider", "model", 1, 60, 60)
             .unwrap();
         let config = Config {
@@ -4798,11 +4800,12 @@ mod tests {
                 .as_deref(),
             Some("https://old.example.test/v1")
         );
-        assert!(
+        assert_eq!(
             store
                 .route_health()
                 .unwrap()
-                .contains_key(&("provider".into(), "model".into()))
+                .get(&("provider".into(), "model".into())),
+            Some(&previous_health)
         );
 
         assert!(engine.delete_provider("provider").await.is_err());
@@ -4814,11 +4817,12 @@ mod tests {
                 .providers
                 .contains_key("provider")
         );
-        assert!(
+        assert_eq!(
             store
                 .route_health()
                 .unwrap()
-                .contains_key(&("provider".into(), "model".into()))
+                .get(&("provider".into(), "model".into())),
+            Some(&previous_health)
         );
     }
 

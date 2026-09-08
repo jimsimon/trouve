@@ -17377,25 +17377,79 @@ impl Store {
         Ok(())
     }
 
-    /// Clear selected providers' learned health in the same SQLite
-    /// transaction as a fallible caller-supplied persistence step. If that
-    /// step fails, dropping the transaction restores the previous cooldowns.
-    pub(crate) fn clear_route_health_transactionally<T>(
-        &self,
-        provider_ids: &[String],
-        operation: impl FnOnce() -> Result<T>,
-    ) -> Result<T> {
+    /// Snapshot and clear selected providers' learned health in one short
+    /// transaction. Callers retain the provider-generation fence until their
+    /// corresponding configuration publication succeeds or this snapshot is
+    /// restored.
+    pub(crate) fn take_route_health(&self, provider_ids: &[String]) -> Result<Vec<RouteHealthRow>> {
         let conn = self.conn.lock().unwrap();
         let tx = write_transaction(&conn)?;
+        let mut previous = Vec::new();
         for provider_id in provider_ids {
+            {
+                let mut stmt = tx.prepare(
+                    "SELECT provider_id, provider_model, consecutive_failures,
+                            retry_after, last_success_at, last_failure_at,
+                            last_outcome_started_at
+                     FROM route_health
+                     WHERE provider_id = ?1
+                     ORDER BY provider_model",
+                )?;
+                let rows = stmt.query_map(params![provider_id], |row| {
+                    Ok(RouteHealthRow {
+                        provider_id: row.get(0)?,
+                        provider_model: row.get(1)?,
+                        consecutive_failures: row.get::<_, i64>(2)?.max(0) as u32,
+                        retry_after: row.get(3)?,
+                        last_success_at: row.get(4)?,
+                        last_failure_at: row.get(5)?,
+                        last_outcome_order: row.get(6)?,
+                    })
+                })?;
+                for row in rows {
+                    previous.push(row?);
+                }
+            }
             tx.execute(
                 "DELETE FROM route_health WHERE provider_id = ?1",
                 params![provider_id],
             )?;
         }
-        let output = operation()?;
         tx.commit()?;
-        Ok(output)
+        Ok(previous)
+    }
+
+    /// Restore an exact route-health snapshot after a later configuration
+    /// publication step fails. The caller's generation fence prevents new
+    /// outcomes for these routes from interleaving with the compensation.
+    pub(crate) fn restore_route_health(&self, rows: &[RouteHealthRow]) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let tx = write_transaction(&conn)?;
+        for row in rows {
+            tx.execute(
+                "INSERT INTO route_health
+                     (provider_id, provider_model, consecutive_failures, retry_after,
+                      last_success_at, last_failure_at, last_outcome_started_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(provider_id, provider_model) DO UPDATE SET
+                     consecutive_failures = excluded.consecutive_failures,
+                     retry_after = excluded.retry_after,
+                     last_success_at = excluded.last_success_at,
+                     last_failure_at = excluded.last_failure_at,
+                     last_outcome_started_at = excluded.last_outcome_started_at",
+                params![
+                    row.provider_id,
+                    row.provider_model,
+                    i64::from(row.consecutive_failures),
+                    row.retry_after,
+                    row.last_success_at,
+                    row.last_failure_at,
+                    row.last_outcome_order,
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     // --- usage accounting -------------------------------------------------------

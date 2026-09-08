@@ -1,6 +1,7 @@
 //! Server configuration: data locations and provider credentials.
 
-use std::path::PathBuf;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -191,6 +192,28 @@ fn default_kind() -> String {
     "openai-compat".into()
 }
 
+/// A fully written configuration candidate awaiting its atomic promotion.
+/// Dropping it before `publish` removes the temporary file without changing
+/// the live configuration.
+pub(crate) struct StagedConfigWrite {
+    temporary: tempfile::NamedTempFile,
+    destination: PathBuf,
+}
+
+impl StagedConfigWrite {
+    pub(crate) fn publish(self) -> Result<()> {
+        let Self {
+            temporary,
+            destination,
+        } = self;
+        temporary
+            .persist(&destination)
+            .map(|_| ())
+            .map_err(|error| error.error)
+            .with_context(|| format!("writing {}", destination.display()))
+    }
+}
+
 impl Config {
     pub fn load() -> Self {
         Self::load_from(&config_path())
@@ -241,7 +264,7 @@ impl Config {
         self.save_to(&config_path())
     }
 
-    pub fn save_to(&self, path: &std::path::Path) -> Result<()> {
+    fn serialized_for(&self, path: &Path) -> Result<String> {
         if self.load_failed {
             anyhow::bail!(
                 "refusing to overwrite {}: it failed to parse at startup (a backup is at \
@@ -249,13 +272,59 @@ impl Config {
                 path.display()
             );
         }
+        toml::to_string_pretty(self).context("serializing config")
+    }
+
+    pub fn save_to(&self, path: &Path) -> Result<()> {
+        let text = self.serialized_for(path)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
-        let text = toml::to_string_pretty(self).context("serializing config")?;
         std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))?;
         Ok(())
+    }
+
+    /// Serialize and flush a same-directory replacement without changing the
+    /// live file. The caller can perform `publish` after releasing unrelated
+    /// persistence locks; a dropped candidate is cleaned up automatically.
+    pub(crate) fn stage_to(&self, path: &Path) -> Result<StagedConfigWrite> {
+        let text = self.serialized_for(path)?;
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+        let mut temporary = tempfile::NamedTempFile::new_in(parent)
+            .with_context(|| format!("creating temporary config in {}", parent.display()))?;
+        let existing_permissions = match std::fs::metadata(path) {
+            Ok(metadata) if metadata.is_file() => Some(metadata.permissions()),
+            Ok(_) => None,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("reading metadata for {}", path.display()));
+            }
+        };
+        temporary
+            .as_file_mut()
+            .write_all(text.as_bytes())
+            .with_context(|| format!("writing staged config for {}", path.display()))?;
+        if let Some(permissions) = existing_permissions {
+            temporary
+                .as_file()
+                .set_permissions(permissions)
+                .with_context(|| format!("preserving permissions for {}", path.display()))?;
+        }
+        temporary
+            .as_file_mut()
+            .sync_all()
+            .with_context(|| format!("flushing staged config for {}", path.display()))?;
+        Ok(StagedConfigWrite {
+            temporary,
+            destination: path.to_path_buf(),
+        })
     }
 }
 
@@ -324,5 +393,32 @@ mod tests {
         let config = Config::load_from(&path);
 
         assert_eq!(config.provider_order, ["first", "second", "third"]);
+    }
+
+    #[test]
+    fn staged_config_is_invisible_until_published() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        let original = Config {
+            default_model: Some("provider/old".into()),
+            ..Default::default()
+        };
+        original.save_to(&path).unwrap();
+        let replacement = Config {
+            default_model: Some("provider/new".into()),
+            ..Default::default()
+        };
+
+        let staged = replacement.stage_to(&path).unwrap();
+        assert_eq!(
+            Config::load_from(&path).default_model.as_deref(),
+            Some("provider/old")
+        );
+
+        staged.publish().unwrap();
+        assert_eq!(
+            Config::load_from(&path).default_model.as_deref(),
+            Some("provider/new")
+        );
     }
 }
