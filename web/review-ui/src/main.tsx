@@ -2524,6 +2524,9 @@ function RepositoryEditor({
     model: Model | undefined,
   ): ModelOptions | undefined => {
     if (!configured || !Object.keys(configured).length) return undefined;
+    // Like compatibleThinking, keep the stored options when the effective
+    // model is not in the loaded catalog; the server re-validates on save.
+    if (!model) return configured;
     const sanitized = sanitizeModelOptions(model, configured);
     return Object.keys(sanitized).length ? sanitized : undefined;
   };

@@ -50,10 +50,13 @@ const entryLimit = mode === "desktop" ? 856_000 : 850_000;
 // schemas bring them to 3,302,298 B and 3,287,443 B. Local naming admission
 // status, bounded pending jobs, context-menu copy actions, and provider model-
 // catalog invalidation plus the race-safe client timeout envelope bring the
-// combined graphs to approximately 3,304,156 B and 3,289,301 B; preserve less
-// than 2 kB of headroom for each. Entry, worker, and largest-chunk budgets below
-// still prevent one bundle from hiding in the aggregate.
-const totalJavaScriptLimit = mode === "desktop" ? 3_306_000 : 3_291_000;
+// combined graphs to approximately 3,304,156 B and 3,289,301 B. The protocol
+// 9.3 per-role code-review `model_options` schemas on repositories, reviewer
+// overrides, and job snapshots bring them to 3,314,468 B and 3,299,613 B;
+// preserve less than 2 kB of headroom for each. Entry, worker, and
+// largest-chunk budgets below still prevent one bundle from hiding in the
+// aggregate.
+const totalJavaScriptLimit = mode === "desktop" ? 3_316_000 : 3_301_000;
 // Version-check, transcript-search, compact navigation, and the sticky
 // multi-mode usage panel with thread/session model rows plus workspace
 // organization styling bring the clean artifact to 190,958 B. The pinned
