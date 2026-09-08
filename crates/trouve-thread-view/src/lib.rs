@@ -219,8 +219,10 @@ impl ThreadProjection {
                 content,
                 attachments,
             } => {
-                self.finish_progress(*turn);
-                self.finish_thinking();
+                // Steering is accepted while the vendor's current sampling is
+                // still streaming; the model only reads it at its next request.
+                // Leave any open thinking/progress block growing so the steer
+                // does not split a reasoning block mid-sentence.
                 self.push(ThreadViewItem::Steered {
                     turn: *turn,
                     content: content.clone(),
@@ -1606,7 +1608,7 @@ mod tests {
     }
 
     #[test]
-    fn steering_is_a_causal_boundary_between_thinking_items() {
+    fn steering_does_not_split_an_open_thinking_item() {
         let mut projection = ThreadProjection::default();
         for (cursor, event) in [
             Event::TurnStarted {
@@ -1653,20 +1655,14 @@ mod tests {
                 ThreadViewItem::TurnStatus { .. },
                 ThreadViewItem::User { content: prompt, .. },
                 ThreadViewItem::Thinking {
-                    content: before,
+                    content: thinking,
                     complete: true,
                     ..
                 },
                 ThreadViewItem::Steered { content: steering, .. },
-                ThreadViewItem::Thinking {
-                    content: after,
-                    complete: true,
-                    ..
-                },
             ] if prompt == "Start here."
-                && before == "Before steering."
+                && thinking == "Before steering.After steering."
                 && steering == "Prioritize the regression."
-                && after == "After steering."
         ));
         assert!(!projection.snapshot.thinking);
     }

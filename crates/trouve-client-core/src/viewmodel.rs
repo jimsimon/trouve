@@ -847,8 +847,11 @@ impl ThreadViewModel {
                 content,
                 attachments,
             } => {
-                self.finish_progress();
-                self.finish_thinking();
+                // Steering is accepted by the vendor while its current sampling
+                // is still streaming; the model only reads it at its next
+                // request. Leave any open thinking/progress block growing so
+                // the steer is recorded in the rail without splitting a
+                // reasoning block mid-sentence.
                 self.items.push(ChatItem::Steered {
                     turn: *turn,
                     content: content.clone(),
@@ -2187,7 +2190,7 @@ mod tests {
     }
 
     #[test]
-    fn steering_preserves_capability_and_splits_active_thinking() {
+    fn steering_preserves_capability_without_splitting_active_thinking() {
         let mut vm = ThreadViewModel::new();
         vm.apply(&env(Event::TurnStarted {
             turn: 4,
@@ -2218,17 +2221,17 @@ mod tests {
 
         assert_eq!(vm.turn_steerable.get(&4), Some(&true));
         assert!(!vm.thinking);
+        // The steer lands in the rail when it is accepted, but the reasoning
+        // block that was streaming keeps growing instead of being cut in two.
         assert!(matches!(
             vm.items.as_slice(),
             [
                 ChatItem::TurnStatus { .. },
-                ChatItem::Thinking { content: before, complete: true, .. },
+                ChatItem::Thinking { content: thinking, complete: true, .. },
                 ChatItem::Steered { turn: 4, content, attachments },
-                ChatItem::Thinking { content: after, complete: true, .. },
-            ] if before == "Original direction."
+            ] if thinking == "Original direction. Continue with the revised direction."
                 && content == "Check the smaller-screen layout too."
                 && attachments.is_empty()
-                && after == " Continue with the revised direction."
         ));
     }
 
