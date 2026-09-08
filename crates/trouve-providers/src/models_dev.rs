@@ -1327,6 +1327,15 @@ mod tests {
             .find(|model| model.id == "cursor/claude-opus-5")
             .unwrap();
         assert!(opus.supports_images);
+        assert_eq!(opus.context_window, 1_000_000);
+        assert_eq!(
+            catalog
+                .model_record("cursor", "claude-opus-5")
+                .unwrap()
+                .limit
+                .output,
+            Some(128_000)
+        );
         assert_eq!(
             opus.options_schema.pointer("/properties/effort/default"),
             Some(&json!("high"))
