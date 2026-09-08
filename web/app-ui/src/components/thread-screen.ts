@@ -2741,7 +2741,6 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       ? runningAgentActivity(activityInput)
       : {
           label: activityOverride,
-          detail: "",
           announcementLabel: activityOverride,
         };
     let nestedActivityUnitId: string | undefined;
@@ -2800,7 +2799,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         id: "ephemeral:activity",
         kind: "activity",
         presentation: activityPresentation,
-        estimatedHeight: activityPresentation.detail === "" ? 32 : 48,
+        estimatedHeight: 32,
       });
     }
     if (virtualItems.length > 0) {
