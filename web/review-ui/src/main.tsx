@@ -438,15 +438,12 @@ function App() {
       .then((models) => {
         setStaticModelError("");
         setModelCatalog((current) =>
-          current.loaded ? current : { ...current, models, loaded: true, error: "" },
+          current.loaded ? current : { ...current, models, loaded: true },
         );
       })
       .catch((cause) => {
         const error = cause instanceof Error ? cause.message : String(cause);
         setStaticModelError(error);
-        setModelCatalog((current) =>
-          current.loaded ? current : { ...current, error },
-        );
       });
     staticModelLoadRef.current = request;
     void request.finally(() => {
@@ -526,20 +523,20 @@ function App() {
   }, [configurationError, loadConfiguration, needsConfiguration]);
 
   useEffect(() => {
-    if (!needsConfiguration || !modelCatalog.error) return;
+    if (!modelCatalog.error) return;
     const timer = window.setInterval(() => {
       if (document.visibilityState === "visible") void loadModelRoutes();
     }, AUTOMATIC_RETRY_MS);
     return () => window.clearInterval(timer);
-  }, [loadModelRoutes, modelCatalog.error, needsConfiguration]);
+  }, [loadModelRoutes, modelCatalog.error]);
 
   useEffect(() => {
-    if (!needsConfiguration || !staticModelError) return;
+    if (!staticModelError) return;
     const timer = window.setInterval(() => {
       if (document.visibilityState === "visible") void loadStaticModels();
     }, AUTOMATIC_RETRY_MS);
     return () => window.clearInterval(timer);
-  }, [loadStaticModels, needsConfiguration, staticModelError]);
+  }, [loadStaticModels, staticModelError]);
 
   useEffect(() => {
     if (serverEventAfter === null) return;

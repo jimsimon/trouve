@@ -2967,6 +2967,7 @@ struct BackendRetirement {
     engine: Weak<Engine>,
     target_ids: HashSet<String>,
     rollback_on_drop: bool,
+    route_state_prepared: bool,
     secret_transaction: Option<ProviderSecretTransaction>,
     reload: Option<ProviderReloadGuard>,
     _target_transitions: Vec<tokio::sync::OwnedMutexGuard<()>>,
@@ -2984,10 +2985,46 @@ impl BackendRetirement {
             engine: Arc::downgrade(engine),
             target_ids,
             rollback_on_drop: false,
+            route_state_prepared: false,
             secret_transaction,
             reload: Some(reload),
             _target_transitions: target_transitions,
         }
+    }
+
+    /// Invalidate cooldowns learned under the previous provider definition
+    /// before the replacement configuration becomes durable. A failure leaves
+    /// the old definition active and lets this retirement's drop path restore
+    /// any detached backend and tentative credentials.
+    fn prepare_route_state<T>(&mut self, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+        let engine = self
+            .engine
+            .upgrade()
+            .context("engine dropped while preparing provider route state")?;
+        let mut target_ids = self.target_ids.iter().cloned().collect::<Vec<_>>();
+        target_ids.sort_unstable();
+        let mut generations = engine.provider_generations.lock().unwrap();
+        let next_generations = target_ids
+            .iter()
+            .map(|id| {
+                generations
+                    .get(id)
+                    .copied()
+                    .unwrap_or(0)
+                    .checked_add(1)
+                    .with_context(|| format!("provider generation exhausted for {id}"))
+                    .map(|generation| (id, generation))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let output = engine
+            .store
+            .clear_route_health_transactionally(&target_ids, operation)?;
+        for (id, generation) in next_generations {
+            generations.insert(id.clone(), generation);
+            engine.turn_scheduler.reset_provider_outcomes(id);
+        }
+        self.route_state_prepared = true;
+        Ok(output)
     }
 
     /// Publish replacements from the caller's now-current configuration and
@@ -3003,7 +3040,11 @@ impl BackendRetirement {
             }
             retirement.rollback_on_drop = false;
             if let Some(engine) = retirement.engine.upgrade() {
-                engine.replace_provider_registries_for_ids(&retirement.target_ids);
+                if retirement.route_state_prepared {
+                    engine.rebuild_provider_registries_for_ids(&retirement.target_ids);
+                } else {
+                    engine.replace_provider_registries_for_ids(&retirement.target_ids);
+                }
             }
         })
         .await
@@ -5120,7 +5161,7 @@ impl Engine {
         // The retirement owns cleanup and registry rollback independently of
         // this request future, so cancellation cannot expose a closing backend
         // or lose the previous process tree.
-        let retirement = self
+        let mut retirement = self
             .retire_config_backends_matching_ids_locked(
                 &target_ids,
                 BACKEND_RETIREMENT_TIMEOUT,
@@ -5180,11 +5221,14 @@ impl Engine {
                     entry.query_params = req.query_params.clone();
                 }
             }
-            if let Some(path) = &self.config_file {
-                next.save_to(path).with_context(|| {
-                    format!("persisting provider configuration to {}", path.display())
-                })?;
-            }
+            retirement.prepare_route_state(|| {
+                if let Some(path) = &self.config_file {
+                    next.save_to(path).with_context(|| {
+                        format!("persisting provider configuration to {}", path.display())
+                    })?;
+                }
+                Ok(())
+            })?;
             *config = next;
         }
         // Keep the registry transition serialized until the new durable
@@ -8244,6 +8288,12 @@ impl Engine {
                 );
             }
         }
+        self.rebuild_provider_registries_for_ids(target_ids);
+    }
+
+    /// Rebuild provider instances after their old route state has already
+    /// been invalidated authoritatively by the serialized update path.
+    fn rebuild_provider_registries_for_ids(&self, target_ids: &HashSet<String>) {
         let config = self.config.lock().unwrap().clone();
         let mut provider_replacements = build_providers_for_ids(
             &config,

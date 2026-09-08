@@ -17377,6 +17377,27 @@ impl Store {
         Ok(())
     }
 
+    /// Clear selected providers' learned health in the same SQLite
+    /// transaction as a fallible caller-supplied persistence step. If that
+    /// step fails, dropping the transaction restores the previous cooldowns.
+    pub(crate) fn clear_route_health_transactionally<T>(
+        &self,
+        provider_ids: &[String],
+        operation: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let conn = self.conn.lock().unwrap();
+        let tx = write_transaction(&conn)?;
+        for provider_id in provider_ids {
+            tx.execute(
+                "DELETE FROM route_health WHERE provider_id = ?1",
+                params![provider_id],
+            )?;
+        }
+        let output = operation()?;
+        tx.commit()?;
+        Ok(output)
+    }
+
     // --- usage accounting -------------------------------------------------------
 
     /// Record a turn's usage under the model selected when the turn started.

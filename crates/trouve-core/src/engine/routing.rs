@@ -4608,6 +4608,85 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn route_health_clear_failure_rejects_provider_update_without_publication() {
+        let data = tempfile::tempdir().unwrap();
+        let database = data.path().join("trouve.sqlite3");
+        let config_path = data.path().join("config.toml");
+        let store = Store::open(&database).unwrap();
+        store
+            .record_route_failure("provider", "model", 1, 60, 60)
+            .unwrap();
+        let config = Config {
+            providers: BTreeMap::from([(
+                "provider".into(),
+                crate::config::ProviderConfig {
+                    kind: "openai-compat".into(),
+                    base_url: Some("https://old.example.test/v1".into()),
+                    ..Default::default()
+                },
+            )]),
+            local_enabled: Some(false),
+            ..Default::default()
+        };
+        config.save_to(&config_path).unwrap();
+        let engine = Arc::new(
+            Engine::new(store.clone(), data.path().into(), &config)
+                .with_config_file(Some(config_path.clone())),
+        );
+        engine
+            .turn_scheduler
+            .record_outcome("provider/model", Some("HTTP 429 Too Many Requests"));
+        rusqlite::Connection::open(&database)
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER reject_route_health_clear
+                 BEFORE DELETE ON route_health
+                 WHEN OLD.provider_id = 'provider'
+                 BEGIN
+                   SELECT RAISE(ABORT, 'injected route-health clear failure');
+                 END;",
+            )
+            .unwrap();
+
+        let result = engine
+            .upsert_provider(
+                "provider",
+                &UpsertProviderRequest {
+                    kind: "openai-compat".into(),
+                    base_url: Some("https://new.example.test/v1".into()),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            engine.config.lock().unwrap().providers["provider"]
+                .base_url
+                .as_deref(),
+            Some("https://old.example.test/v1")
+        );
+        assert_eq!(
+            Config::load_from(&config_path).providers["provider"]
+                .base_url
+                .as_deref(),
+            Some("https://old.example.test/v1")
+        );
+        assert!(
+            store
+                .route_health()
+                .unwrap()
+                .contains_key(&("provider".into(), "model".into()))
+        );
+        assert!(
+            engine
+                .turn_scheduler
+                .cooldown_remaining("provider/model")
+                .is_some()
+        );
+    }
+
     struct RejectingSecretStore;
 
     impl trouve_providers::secrets::SecretStore for RejectingSecretStore {
