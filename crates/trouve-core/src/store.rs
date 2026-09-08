@@ -21448,6 +21448,48 @@ mod tests {
     }
 
     #[test]
+    fn migrations_create_route_health_for_pre_routing_database() {
+        let temporary = tempfile::tempdir().unwrap();
+        let database = temporary.path().join("trouve.db");
+        let legacy = Connection::open(&database).unwrap();
+        legacy
+            .execute_batch(
+                "CREATE TABLE legacy_marker (
+                   id INTEGER PRIMARY KEY
+                 );
+                 INSERT INTO legacy_marker (id) VALUES (1);",
+            )
+            .unwrap();
+        let route_health_tables: i64 = legacy
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'route_health'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(route_health_tables, 0);
+        drop(legacy);
+
+        // Schema migration is shape-based rather than ledger-based. For this
+        // feature, table absence is the relevant state of every database from
+        // before automatic routing; unrelated legacy tables cannot affect it.
+        for _ in 0..2 {
+            let store = Store::open(&database).unwrap();
+            let conn = store.conn.lock().unwrap();
+            let ordering_columns: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('route_health')
+                     WHERE name IN ('last_failure_at', 'last_outcome_started_at')",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(ordering_columns, 2);
+        }
+    }
+
+    #[test]
     fn older_route_success_cannot_erase_a_newer_failure() {
         let store = Store::open_in_memory().unwrap();
         let attempt_order = chrono::Utc::now().timestamp_micros();
