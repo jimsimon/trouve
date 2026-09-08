@@ -4545,6 +4545,47 @@ mod tests {
     }
 
     #[test]
+    fn provider_order_snapshot_and_update_share_injected_provider_membership() {
+        let data = tempfile::tempdir().unwrap();
+        let config = Config {
+            providers: BTreeMap::from([(
+                "configured".into(),
+                crate::config::ProviderConfig::default(),
+            )]),
+            local_enabled: Some(false),
+            ..Default::default()
+        };
+        let engine = Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().into(),
+            &config,
+        )
+        .with_provider("injected", Arc::new(CatalogTestProvider));
+        let listed = engine.list_providers();
+        assert_eq!(
+            listed
+                .providers
+                .iter()
+                .map(|provider| provider.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["configured", "injected"]
+        );
+        assert_eq!(listed.provider_order, vec!["configured", "injected"]);
+
+        engine
+            .set_provider_order(
+                &["injected".into(), "configured".into()],
+                Some(&listed.provider_order),
+            )
+            .unwrap();
+
+        assert_eq!(
+            engine.list_providers().provider_order,
+            vec!["injected", "configured"]
+        );
+    }
+
+    #[test]
     fn provider_order_is_published_for_other_clients_and_cold_start() {
         let data = tempfile::tempdir().unwrap();
         let store = Store::open_in_memory().unwrap();

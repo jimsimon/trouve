@@ -4129,6 +4129,46 @@ fn build_backends_for_ids(
     backends
 }
 
+struct ProviderOrderProjection {
+    known: HashSet<String>,
+    resolved: Vec<String>,
+}
+
+fn resolve_provider_order(explicit: &[String], known: &HashSet<String>) -> Vec<String> {
+    let mut resolved = explicit
+        .iter()
+        .filter(|id| known.contains(id.as_str()))
+        .fold(Vec::new(), |mut order, id| {
+            if !order.contains(id) {
+                order.push(id.clone());
+            }
+            order
+        });
+    let mut remaining = known.iter().cloned().collect::<Vec<_>>();
+    remaining.sort();
+    for id in remaining {
+        if !resolved.contains(&id) {
+            resolved.push(id);
+        }
+    }
+    resolved
+}
+
+/// Build the membership and resolved order used by both the provider listing
+/// and its compare-and-swap update. Keeping this projection shared prevents a
+/// programmatically injected route from being visible to only one side.
+fn provider_order_projection(
+    config: &Config,
+    provider_ids: impl IntoIterator<Item = String>,
+    backend_ids: impl IntoIterator<Item = String>,
+) -> ProviderOrderProjection {
+    let mut known: HashSet<String> = config.providers.keys().cloned().collect();
+    known.extend(provider_ids);
+    known.extend(backend_ids);
+    let resolved = resolve_provider_order(&config.provider_order, &known);
+    ProviderOrderProjection { known, resolved }
+}
+
 impl Engine {
     pub(crate) async fn acquire_planned_turn_setup(
         &self,
@@ -4977,9 +5017,12 @@ impl Engine {
                 });
             }
         }
+        let provider_ids = registry.keys().cloned().collect::<Vec<_>>();
+        drop(registry);
         // Programmatically injected backends are routable even without a
         // config-file row. Expose them to the same preference editor.
-        for (id, backend) in self.backends.read().unwrap().iter() {
+        let backends = self.backends.read().unwrap();
+        for (id, backend) in backends.iter() {
             if !config.providers.contains_key(id) && !infos.iter().any(|info| info.id == *id) {
                 let status = backend.status();
                 infos.push(ProviderInfo {
@@ -4994,19 +5037,10 @@ impl Engine {
                 });
             }
         }
+        let backend_ids = backends.keys().cloned().collect::<Vec<_>>();
+        drop(backends);
         infos.sort_by(|a, b| a.id.cmp(&b.id));
-        let configured_ids: HashSet<&str> = infos.iter().map(|info| info.id.as_str()).collect();
-        let mut provider_order = Vec::with_capacity(infos.len());
-        for id in &config.provider_order {
-            if configured_ids.contains(id.as_str()) && !provider_order.contains(id) {
-                provider_order.push(id.clone());
-            }
-        }
-        for info in &infos {
-            if !provider_order.contains(&info.id) {
-                provider_order.push(info.id.clone());
-            }
-        }
+        let provider_order = provider_order_projection(&config, provider_ids, backend_ids).resolved;
         let defaults = self.global_defaults.read().unwrap().clone();
         ProvidersResponse {
             providers: infos,
@@ -5375,26 +5409,23 @@ impl Engine {
         expected_provider_ids: Option<&[String]>,
     ) -> Result<(), EngineError> {
         let mut config = self.config.lock().unwrap();
-        let mut known: HashSet<String> = self.providers.read().unwrap().keys().cloned().collect();
-        known.extend(self.backends.read().unwrap().keys().cloned());
-        known.extend(config.providers.keys().cloned());
-        let mut current = config
-            .provider_order
-            .iter()
-            .filter(|id| known.contains(id.as_str()))
-            .fold(Vec::new(), |mut order, id| {
-                if !order.contains(id) {
-                    order.push(id.clone());
-                }
-                order
-            });
-        let mut remaining = known.iter().cloned().collect::<Vec<_>>();
-        remaining.sort();
-        for id in &remaining {
-            if !current.contains(id) {
-                current.push(id.clone());
-            }
-        }
+        let native_provider_ids = self
+            .providers
+            .read()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        let backend_ids = self
+            .backends
+            .read()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        let projection = provider_order_projection(&config, native_provider_ids, backend_ids);
+        let known = projection.known;
+        let current = projection.resolved;
         if expected_provider_ids.is_some_and(|expected| expected != current) {
             return Err(EngineError::Conflict(
                 "provider order changed while this edit was in progress; reload and try again"
@@ -5416,12 +5447,7 @@ impl Engine {
         }
         let mut next = config.clone();
         next.provider_order = provider_ids.to_vec();
-        let mut effective_provider_order = provider_ids.to_vec();
-        for id in remaining {
-            if !effective_provider_order.contains(&id) {
-                effective_provider_order.push(id);
-            }
-        }
+        let effective_provider_order = resolve_provider_order(provider_ids, &known);
         if let Some(path) = &self.config_file {
             let staged_config = next
                 .stage_to(path)
