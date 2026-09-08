@@ -108,6 +108,12 @@ describe("chat presentation", () => {
       expect(turnResponseItemId([text("a1"), tool("t1"), progress("p1")], completed)).toBe("p1");
     });
 
+    it("keeps streaming progress as progress until the turn completes", () => {
+      expect(turnResponseItemId([progress("p1")], running)).toBeUndefined();
+      expect(turnResponseItemId([progress("p1")], undefined)).toBeUndefined();
+      expect(turnResponseItemId([progress("p1")], completed)).toBe("p1");
+    });
+
     it("does not promote text in failed or cancelled turns", () => {
       const items = [text("a1"), tool("t1")];
       expect(turnResponseItemId(items, { kind: "failed", error: "boom" })).toBeUndefined();

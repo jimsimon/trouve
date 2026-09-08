@@ -71,8 +71,9 @@ export const assistantCopyText = (markdown: string): string => {
  * text block is the response even when the agent issued a final tool call
  * afterwards and never wrote again; otherwise the answer the user actually
  * received would be filed as interim progress. Harness "progress" text
- * qualifies on the same terms: adapters tag mid-turn commentary as progress,
- * and when a completed turn ends on that commentary it is the answer. */
+ * qualifies only once the turn has completed: adapters tag mid-turn
+ * commentary as progress, so while the turn runs it stays a progress card,
+ * but when a completed turn ends on that commentary it is the answer. */
 export const turnResponseItemId = (
   items: readonly ThreadChatItem[],
   turnState: TurnState | undefined,
@@ -88,8 +89,9 @@ export const turnResponseItemId = (
   if (responseIndex < 0) return undefined;
   const response = items[responseIndex];
   const trailing = items.slice(responseIndex + 1);
-  if (trailing.length === 0) return response?.id;
+  if (trailing.length === 0 && response?.kind === "assistant") return response.id;
   if (turnState?.kind !== "completed") return undefined;
+  if (trailing.length === 0) return response?.id;
   const onlyActivityFollows = trailing.every((item) =>
     item.kind === "tool"
     || item.kind === "thinking"
