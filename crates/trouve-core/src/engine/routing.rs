@@ -4461,6 +4461,7 @@ mod tests {
     #[test]
     fn provider_order_is_not_published_when_config_persistence_fails() {
         let data = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
         let config = Config {
             providers: BTreeMap::from([
                 ("first".into(), crate::config::ProviderConfig::default()),
@@ -4470,13 +4471,10 @@ mod tests {
             local_enabled: Some(false),
             ..Default::default()
         };
-        let engine = Engine::new(
-            Store::open_in_memory().unwrap(),
-            data.path().into(),
-            &config,
-        )
-        // Saving TOML to a directory is guaranteed to fail.
-        .with_config_file(Some(data.path().to_path_buf()));
+        let engine = Engine::new(store.clone(), data.path().into(), &config)
+            // A directory cannot be atomically replaced with serialized TOML.
+            .with_config_file(Some(data.path().to_path_buf()));
+        let before = store.latest_event_cursor(&Scope::Server).unwrap();
 
         assert!(
             engine
@@ -4486,6 +4484,12 @@ mod tests {
         assert_eq!(
             engine.config.lock().unwrap().provider_order,
             vec!["first", "second"]
+        );
+        assert!(
+            store
+                .events_after(&Scope::Server, before)
+                .unwrap()
+                .is_empty()
         );
     }
 
@@ -4526,6 +4530,7 @@ mod tests {
     fn provider_order_is_published_for_other_clients_and_cold_start() {
         let data = tempfile::tempdir().unwrap();
         let store = Store::open_in_memory().unwrap();
+        let config_path = data.path().join("config.toml");
         let config = Config {
             providers: BTreeMap::from([
                 ("first".into(), crate::config::ProviderConfig::default()),
@@ -4535,7 +4540,9 @@ mod tests {
             local_enabled: Some(false),
             ..Default::default()
         };
-        let engine = Engine::new(store.clone(), data.path().into(), &config);
+        config.save_to(&config_path).unwrap();
+        let engine = Engine::new(store.clone(), data.path().into(), &config)
+            .with_config_file(Some(config_path.clone()));
         let before = store.latest_event_cursor(&Scope::Server).unwrap();
 
         engine
@@ -4555,6 +4562,10 @@ mod tests {
             projection
                 .provider_order
                 .starts_with(&["second".into(), "first".into()])
+        );
+        assert_eq!(
+            Config::load_from(&config_path).provider_order,
+            vec!["second", "first"]
         );
     }
 

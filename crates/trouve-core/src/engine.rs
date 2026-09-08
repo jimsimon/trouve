@@ -5423,7 +5423,11 @@ impl Engine {
             }
         }
         if let Some(path) = &self.config_file {
-            next.save_to(path)
+            let staged_config = next
+                .stage_to(path)
+                .with_context(|| format!("staging provider order update for {}", path.display()))?;
+            staged_config
+                .publish()
                 .with_context(|| format!("persisting provider order to {}", path.display()))?;
         }
         *config = next;
