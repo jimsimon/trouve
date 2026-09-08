@@ -258,6 +258,10 @@ const latestNumericMapKey = (map: ReadonlyMap<number, unknown>): number | undefi
  * process state across the protocol boundary. */
 export class ThreadViewModel {
   readonly items: ThreadChatItem[] = [];
+  /** Bumped whenever `items` (or any item in place) may have changed. `items`
+   * is mutated in place, so consumers memoising derived transcript layout key
+   * on this instead of array identity. */
+  itemsRevision = 0;
   readonly pendingApprovals: string[] = [];
   readonly pendingQuestions: string[] = [];
   readonly turnModels = new Map<number, string>();
@@ -300,6 +304,7 @@ export class ThreadViewModel {
 
   /** Replace replay-built state with the server's current folded tail. */
   replaceSnapshot(cursor: number, snapshot: ProtocolThreadViewSnapshot): void {
+    this.itemsRevision += 1;
     this.#admittedBeforeStart.clear();
     const itemOffset = snapshot.item_offset ?? 0;
     this.items.splice(
@@ -420,6 +425,7 @@ export class ThreadViewModel {
     }
     const olderItems = snapshot.items.map((item, index) =>
       this.#snapshotItem(item, itemOffset + index));
+    this.itemsRevision += 1;
     this.items.splice(0, 0, ...olderItems);
     this.itemOffset = itemOffset;
     this.totalItems = Math.max(
@@ -594,6 +600,13 @@ export class ThreadViewModel {
   }
 
   apply(envelope: ProtocolEventEnvelope): boolean {
+    // Events mutate items in place through many branches; treat every
+    // envelope as a potential transcript change rather than auditing each.
+    this.itemsRevision += 1;
+    return this.#applyEnvelope(envelope);
+  }
+
+  #applyEnvelope(envelope: ProtocolEventEnvelope): boolean {
     this.cursor = envelope.cursor;
     switch (envelope.type) {
       case "turn.admitted":
@@ -1091,6 +1104,7 @@ export class ThreadViewModel {
   replaceToolDetails(details: ProtocolThreadToolDetails): boolean {
     const tool = this.findTool(details.call_id);
     if (tool === undefined) return false;
+    this.itemsRevision += 1;
     tool.args = details.args;
     tool.result = details.result;
     tool.detailsDeferred = false;
@@ -1102,6 +1116,7 @@ export class ThreadViewModel {
     const retained = Math.max(1, Math.floor(maxItems));
     if (this.items.length <= retained) return;
     const removed = this.items.length - retained;
+    this.itemsRevision += 1;
     this.items.splice(0, removed);
     this.itemOffset += removed;
     this.hasOlder = this.itemOffset > 0;
