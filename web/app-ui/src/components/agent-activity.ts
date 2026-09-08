@@ -48,17 +48,12 @@ export class TrouveAgentActivity extends LitElement {
       ? this.presentation
       : liveAgentActivity(this.input) ?? this.presentation;
     if (activity === undefined) return nothing;
-    const accessibleLabel = activity.detail === ""
-      ? activity.announcementLabel
-      : `${activity.announcementLabel}. ${activity.detail}`;
     const visual = this.variant === "transient"
       ? html`<div class="turn-transient-activity-copy" aria-hidden="true">
           <header class="turn-node-header"><strong>${activity.label}</strong></header>
-          ${activity.detail === "" ? nothing : html`<small>${activity.detail}</small>`}
         </div>`
       : html`<span class="agent-activity-copy" aria-hidden="true">
           <strong>${activity.label}</strong>
-          ${activity.detail === "" ? nothing : html`<small>${activity.detail}</small>`}
         </span>`;
     return html`
       ${visual}
@@ -67,7 +62,7 @@ export class TrouveAgentActivity extends LitElement {
         role="status"
         aria-live="polite"
         aria-atomic="true"
-      >${accessibleLabel}</span>
+      >${activity.announcementLabel}</span>
     `;
   }
 

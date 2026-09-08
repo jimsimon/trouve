@@ -71,17 +71,14 @@ describe("agent activity presentation", () => {
 
     expect(presentation({ ...input, nowMs: startedMs + 1_000 })).toEqual({
       label: "Starting gpt-5.6-sol…",
-      detail: "Preparing the model request.",
       announcementLabel: "Starting gpt-5.6-sol…",
     });
     expect(presentation({ ...input, nowMs: startedMs + 42_000 })).toEqual({
       label: "Waiting for first response from gpt-5.6-sol · 42s",
-      detail: "The turn is running, but no model output has arrived yet.",
       announcementLabel: "Waiting for first response from gpt-5.6-sol…",
     });
     expect(presentation({ ...input, nowMs: startedMs + 188_000 })).toEqual({
       label: "Still waiting for gpt-5.6-sol · 3m 8s",
-      detail: "No model output has arrived yet. You can keep waiting or cancel and retry.",
       announcementLabel: "Still waiting for gpt-5.6-sol…",
     });
   });
@@ -95,7 +92,6 @@ describe("agent activity presentation", () => {
       nowMs: Date.parse(startedAt) + 42_000,
     })).toEqual({
       label: "Waiting for first response from gpt-5.6-sol · 42s",
-      detail: "The turn is running, but no model output has arrived yet.",
       announcementLabel: "Waiting for first response from gpt-5.6-sol…",
     });
   });
@@ -105,7 +101,6 @@ describe("agent activity presentation", () => {
     const model = new Map([[3, "openai/o3"]]);
     expect(presentation({ items: [marker], compacting: true })).toEqual({
       label: "Compacting context…",
-      detail: "Preparing a shorter conversation history before contacting the model.",
       announcementLabel: "Compacting context…",
     });
     expect(presentation({
@@ -119,33 +114,28 @@ describe("agent activity presentation", () => {
       }],
     })).toEqual({
       label: "Waiting for your answer…",
-      detail: "The agent will continue after you answer or skip its questions.",
       announcementLabel: "Waiting for your answer…",
     });
     expect(presentation({
       items: [marker, tool("shell", {}, "awaiting-approval")],
     })).toEqual({
       label: "Waiting for approval…",
-      detail: "The agent will continue after the pending tool request is resolved.",
       announcementLabel: "Waiting for approval…",
     });
     expect(presentation({
       items: [status(3, { kind: "waiting-for-capacity" })],
     })).toEqual({
       label: "Waiting for provider admission…",
-      detail: "",
       announcementLabel: "Waiting for provider admission…",
     });
     expect(presentation({ items: [marker], thinking: true, turnModels: model })).toEqual({
       label: "Thinking…",
-      detail: "o3 is streaming its reasoning.",
       announcementLabel: "Thinking…",
     });
     expect(presentation({
       items: [marker, tool("read_file", {}, "running")],
     })).toEqual({
       label: "Reading files…",
-      detail: "",
       announcementLabel: "Reading files…",
     });
   });
@@ -158,7 +148,6 @@ describe("agent activity presentation", () => {
     ];
     expect(presentation({ items })).toEqual({
       label: "Starting model…",
-      detail: "Preparing the model request.",
       announcementLabel: "Starting model…",
     });
     items.push({
@@ -170,7 +159,6 @@ describe("agent activity presentation", () => {
     });
     expect(presentation({ items, turnModels: new Map([[4, "codex/gpt-5"]]) })).toEqual({
       label: "Waiting for gpt-5…",
-      detail: "The model is between visible response or tool events.",
       announcementLabel: "Waiting for gpt-5…",
     });
     items.push(tool("read_file", {}, "ok"));
@@ -184,7 +172,6 @@ describe("agent activity presentation", () => {
     });
     expect(presentation({ items, turnModels: new Map([[4, "codex/gpt-5"]]) })).toEqual({
       label: "Agent is working…",
-      detail: "The agent is processing tool activity.",
       announcementLabel: "Agent is working…",
     });
   });
