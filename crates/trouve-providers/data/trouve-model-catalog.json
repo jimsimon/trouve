@@ -186,6 +186,7 @@
       },
       "claude-opus-5": {
         "id": "claude-opus-5",
+        "base_model": "anthropic/claude-opus-5",
         "name": "Claude Opus 5",
         "tool_call": true,
         "temperature": false,
