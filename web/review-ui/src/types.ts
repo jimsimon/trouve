@@ -16,6 +16,10 @@ export type ReviewStatus =
   | "cancelled"
   | "stale";
 export type StatsRange = "hour" | "day" | "week" | "month" | "year" | "all";
+export type ModelOptionValue = string | number | boolean;
+/** Non-thinking model options (for example `fast`); thinking keeps its
+ * dedicated `*_thinking_level` field. */
+export type ModelOptions = Record<string, ModelOptionValue>;
 
 export interface GithubAppStatus {
   configured: boolean;
@@ -37,6 +41,7 @@ export interface ReviewerOverride {
   reviewer_id: string;
   model?: string;
   thinking_level?: string;
+  model_options?: ModelOptions;
   prompt_mode: "inherit" | "append" | "replace";
   prompt: string;
 }
@@ -61,6 +66,9 @@ export interface Repository {
   router_thinking_level?: string;
   analyst_model?: string;
   analyst_thinking_level?: string;
+  coordinator_model_options?: ModelOptions;
+  router_model_options?: ModelOptions;
+  analyst_model_options?: ModelOptions;
   prompt: string;
   reviewer_ids: string[];
   routing_mode: RoutingMode;
@@ -98,6 +106,9 @@ export interface ReviewJob {
   router_thinking_level?: string;
   analyst_model?: string;
   analyst_thinking_level?: string;
+  coordinator_model_options?: ModelOptions;
+  router_model_options?: ModelOptions;
+  analyst_model_options?: ModelOptions;
   reviewer_ids: string[];
   routing_mode: RoutingMode;
   semantic_routing: boolean;

@@ -1715,6 +1715,12 @@ pub struct ReviewerProfile {
     /// inherits the review mode's default, then the global default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_thinking_level: Option<String>,
+    /// Validated non-thinking model options for this reviewer's effective
+    /// model (for example `fast`). Populated from a repository override;
+    /// thinking stays on `default_thinking_level`.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    #[schema(value_type = std::collections::BTreeMap<String, ModelOptionValue>)]
+    pub model_options: serde_json::Map<String, serde_json::Value>,
     #[serde(default)]
     pub built_in: bool,
 }
@@ -1759,6 +1765,13 @@ pub struct ReviewerOverride {
     /// the reviewer profile, which in turn inherits the review mode default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_level: Option<String>,
+    /// Non-thinking model options for the reviewer's effective model (for
+    /// example `fast`), validated against that model's advertised schema.
+    /// Thinking is configured through `thinking_level`; thinking keys here
+    /// are rejected.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    #[schema(value_type = std::collections::BTreeMap<String, ModelOptionValue>)]
+    pub model_options: serde_json::Map<String, serde_json::Value>,
     #[serde(default)]
     pub prompt_mode: ReviewerPromptMode,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -1784,22 +1797,38 @@ pub struct CodeReviewRepository {
     /// coordinator/editor. Absent inherits the review mode's default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coordinator_thinking_level: Option<String>,
+    /// Validated non-thinking model options for the coordinator's effective
+    /// model (for example `fast`). Thinking stays on
+    /// `coordinator_thinking_level`; thinking keys here are rejected.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    #[schema(value_type = std::collections::BTreeMap<String, ModelOptionValue>)]
+    pub coordinator_model_options: serde_json::Map<String, serde_json::Value>,
     /// Automatic model selector or provider-qualified pin used by semantic
-    /// persona triage. Absent inherits `model`.
+    /// persona triage. Absent
+    /// inherits `model`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub router_model: Option<String>,
     /// Preferred thinking level or fixed token budget for semantic persona
     /// triage. Absent inherits the review mode's default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub router_thinking_level: Option<String>,
+    /// Validated non-thinking model options for the router's effective model.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    #[schema(value_type = std::collections::BTreeMap<String, ModelOptionValue>)]
+    pub router_model_options: serde_json::Map<String, serde_json::Value>,
     /// Automatic model selector or provider-qualified pin used by the
-    /// per-round implementation analyst. Absent inherits `model`.
+    /// per-round implementation
+    /// analyst. Absent inherits `model`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub analyst_model: Option<String>,
     /// Preferred thinking level or fixed token budget for the implementation
     /// analyst. Absent inherits the review mode's default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub analyst_thinking_level: Option<String>,
+    /// Validated non-thinking model options for the analyst's effective model.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    #[schema(value_type = std::collections::BTreeMap<String, ModelOptionValue>)]
+    pub analyst_model_options: serde_json::Map<String, serde_json::Value>,
     /// Extra repository-specific review instructions.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub prompt: String,
@@ -1835,14 +1864,30 @@ pub struct UpdateCodeReviewRepositoryRequest {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coordinator_thinking_level: Option<String>,
+    /// Non-thinking model options for the coordinator's effective model.
+    /// Omitted by older clients to preserve the current options; an empty
+    /// map clears them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<std::collections::BTreeMap<String, ModelOptionValue>>)]
+    pub coordinator_model_options: Option<serde_json::Map<String, serde_json::Value>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub router_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub router_thinking_level: Option<String>,
+    /// Non-thinking model options for the router's effective model. Omitted
+    /// by older clients to preserve the current options.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<std::collections::BTreeMap<String, ModelOptionValue>>)]
+    pub router_model_options: Option<serde_json::Map<String, serde_json::Value>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub analyst_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub analyst_thinking_level: Option<String>,
+    /// Non-thinking model options for the analyst's effective model. Omitted
+    /// by older clients to preserve the current options.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<std::collections::BTreeMap<String, ModelOptionValue>>)]
+    pub analyst_model_options: Option<serde_json::Map<String, serde_json::Value>>,
     #[serde(default)]
     pub prompt: String,
     /// Omitted by older clients to preserve the current/default selection.
@@ -2407,6 +2452,10 @@ pub struct CodeReviewJob {
     /// Thinking level snapshotted for the final coordinator/editor.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coordinator_thinking_level: Option<String>,
+    /// Model options snapshotted for the final coordinator/editor.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    #[schema(value_type = std::collections::BTreeMap<String, ModelOptionValue>)]
+    pub coordinator_model_options: serde_json::Map<String, serde_json::Value>,
     /// Model snapshotted for semantic persona triage. Absent inherits
     /// `model`; legacy jobs may omit both and are rejected before dispatch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2414,6 +2463,10 @@ pub struct CodeReviewJob {
     /// Thinking level snapshotted for semantic persona triage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub router_thinking_level: Option<String>,
+    /// Model options snapshotted for semantic persona triage.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    #[schema(value_type = std::collections::BTreeMap<String, ModelOptionValue>)]
+    pub router_model_options: serde_json::Map<String, serde_json::Value>,
     /// Model snapshotted for the per-round implementation analyst. Absent
     /// inherits `model`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2421,6 +2474,10 @@ pub struct CodeReviewJob {
     /// Thinking level snapshotted for the implementation analyst.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub analyst_thinking_level: Option<String>,
+    /// Model options snapshotted for the implementation analyst.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    #[schema(value_type = std::collections::BTreeMap<String, ModelOptionValue>)]
+    pub analyst_model_options: serde_json::Map<String, serde_json::Value>,
     /// Reviewer profiles are snapshotted internally; their stable ids are
     /// exposed here for history and diagnostics. Additive/Automatic jobs
     /// snapshot the candidate catalog; routing decisions record which

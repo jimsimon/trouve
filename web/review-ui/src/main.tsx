@@ -50,11 +50,16 @@ import {
 } from "./cli";
 import type { CliInfo, CliInstallStatus } from "./cli";
 import {
+  changeModelOption,
   defaultThinkingSelection,
   modelCatalogStatusMessage,
   modelForSelection,
   modelSelectionValue,
   supplementalModelSelection,
+  modelOptionControls,
+  modelOptionSummaries,
+  modelOptionTextValue,
+  sanitizeModelOptions,
   thinkingLevelLabel,
   thinkingOptions,
   thinkingSelectionIsValid,
@@ -108,6 +113,7 @@ import type {
   ReviewerOverride,
   ReviewerProfile,
   StatsRange,
+  ModelOptions,
 } from "./types";
 
 Chart.register(...registerables);
@@ -1702,6 +1708,7 @@ function JobDetailPane({
           <dt>Router thinking</dt>
           <dd>{job.router_thinking_level || "Review persona default"}</dd>
         </div>
+        <ModelOptionFacts label="Router" options={job.router_model_options} />
         <div>
           <dt>Change analyst model</dt>
           <dd>{job.analyst_model || job.model || "Missing configuration"}</dd>
@@ -1710,6 +1717,8 @@ function JobDetailPane({
           <dt>Change analyst thinking</dt>
           <dd>{job.analyst_thinking_level || "Review persona default"}</dd>
         </div>
+        <ModelOptionFacts label="Change analyst" options={job.analyst_model_options} />
+        <ModelOptionFacts label="Coordinator" options={job.coordinator_model_options} />
         <div>
           <dt>Pending</dt>
           <dd>{duration(job.pending_elapsed_ms)}</dd>
@@ -2394,6 +2403,135 @@ function ThinkingSetting({
   );
 }
 
+/** Snapshotted non-thinking model options on a job, one fact per option. */
+function ModelOptionFacts({
+  label,
+  options,
+}: {
+  label: string;
+  options: ModelOptions | undefined;
+}) {
+  return (
+    <>
+      {modelOptionSummaries(options).map((summary) => (
+        <div key={summary.key}>
+          <dt>
+            {label} {summary.label.toLowerCase()}
+          </dt>
+          <dd>{summary.value}</dd>
+        </div>
+      ))}
+    </>
+  );
+}
+
+/** Schema-driven controls for a role's non-thinking model options (for
+ * example Codex "fast" mode). Renders nothing when the effective model does
+ * not advertise any. Thinking keeps its dedicated ThinkingSetting. */
+function ModelOptionsSetting({
+  model,
+  options,
+  onChange,
+  disabled = false,
+  scope,
+}: {
+  model: Model | undefined;
+  options: ModelOptions | undefined;
+  onChange: (options: ModelOptions) => void;
+  disabled?: boolean;
+  /** Short suffix for control labels, e.g. "Coordinator". */
+  scope?: string;
+}) {
+  const controls = modelOptionControls(model, options);
+  if (!controls.length) return null;
+  const labelFor = (label: string): string => (scope ? `${scope} ${label.toLowerCase()}` : label);
+  return (
+    <>
+      {controls.map((control) => {
+        const description = control.description || undefined;
+        if (control.kind === "boolean") {
+          const value = control.selected === undefined ? "" : String(control.selected);
+          const defaultLabel = control.defaultValue === undefined
+            ? "Model default"
+            : `Model default · ${control.defaultValue ? "On" : "Off"}`;
+          return (
+            <label key={control.key} class={disabled ? "field-disabled" : undefined}>
+              {labelFor(control.label)}
+              <select
+                value={value}
+                disabled={disabled}
+                onChange={(event) => {
+                  const selected = event.currentTarget.value;
+                  onChange(changeModelOption(
+                    options,
+                    control.key,
+                    selected === "" ? undefined : selected === "true",
+                  ));
+                }}
+              >
+                <option value="">{defaultLabel}</option>
+                <option value="true">On</option>
+                <option value="false">Off</option>
+              </select>
+              {description && <small>{description}</small>}
+            </label>
+          );
+        }
+        if (control.kind === "choice") {
+          const defaultChoice = control.choices[control.defaultIndex];
+          return (
+            <label key={control.key} class={disabled ? "field-disabled" : undefined}>
+              {labelFor(control.label)}
+              <select
+                value={control.selectedIndex >= 0 ? String(control.selectedIndex) : ""}
+                disabled={disabled}
+                onChange={(event) => {
+                  const index = event.currentTarget.value;
+                  onChange(changeModelOption(
+                    options,
+                    control.key,
+                    index === "" ? undefined : control.choices[Number(index)]?.value,
+                  ));
+                }}
+              >
+                <option value="">
+                  {defaultChoice ? `Model default · ${defaultChoice.label}` : "Model default"}
+                </option>
+                {control.choices.map((choice, index) => (
+                  <option value={String(index)} key={String(choice.value)}>
+                    {choice.label}
+                  </option>
+                ))}
+              </select>
+              {description && <small>{description}</small>}
+            </label>
+          );
+        }
+        return (
+          <label key={control.key} class={disabled ? "field-disabled" : undefined}>
+            {labelFor(control.label)}
+            <input
+              type={control.scalarType === "string" ? "text" : "number"}
+              min={control.minimum}
+              max={control.maximum}
+              step={control.scalarType === "integer" ? 1 : "any"}
+              value={control.text}
+              placeholder={control.hint}
+              disabled={disabled}
+              onChange={(event) => {
+                const parsed = modelOptionTextValue(control, event.currentTarget.value);
+                if (parsed === null) return;
+                onChange(changeModelOption(options, control.key, parsed));
+              }}
+            />
+            {description && <small>{description}</small>}
+          </label>
+        );
+      })}
+    </>
+  );
+}
+
 function RepositoryEditor({
   repository,
   reviewers,
@@ -2463,6 +2601,7 @@ function RepositoryEditor({
       if (
         updated.model ||
         updated.thinking_level ||
+        Object.keys(updated.model_options ?? {}).length > 0 ||
         updated.prompt_mode !== "inherit" ||
         updated.prompt
       ) {
@@ -2475,9 +2614,7 @@ function RepositoryEditor({
   const coordinatorThinking = thinkingOptions(effectiveCoordinatorModel);
   const effectiveRouterModel = modelForSelection(models, draft.router_model || draft.model);
   const routerThinking = thinkingOptions(effectiveRouterModel);
-  const effectiveAnalystModel = models.find(
-    (model) => model.id === (draft.analyst_model || draft.model),
-  );
+  const effectiveAnalystModel = modelForSelection(models, draft.analyst_model || draft.model);
   const analystThinking = thinkingOptions(effectiveAnalystModel);
   const compatibleThinking = (
     configured: string | undefined,
@@ -2485,6 +2622,17 @@ function RepositoryEditor({
   ): string | undefined => {
     if (!configured || !model) return configured;
     return thinkingSelectionIsValid(model, configured) ? configured : undefined;
+  };
+  const compatibleOptions = (
+    configured: ModelOptions | undefined,
+    model: Model | undefined,
+  ): ModelOptions | undefined => {
+    if (!configured || !Object.keys(configured).length) return undefined;
+    // Like compatibleThinking, keep the stored options when the effective
+    // model is not in the loaded catalog; the server re-validates on save.
+    if (!model) return configured;
+    const sanitized = sanitizeModelOptions(model, configured);
+    return Object.keys(sanitized).length ? sanitized : undefined;
   };
   const reviewerPolicyInvalid =
     draft.mode !== "off" &&
@@ -2572,8 +2720,9 @@ function RepositoryEditor({
                   models,
                   draft.router_model || model,
                 );
-                const selectedAnalystModel = models.find(
-                  (candidate) => candidate.id === (draft.analyst_model || model),
+                const selectedAnalystModel = modelForSelection(
+                  models,
+                  draft.analyst_model || model,
                 );
                 setDraft({
                   ...draft,
@@ -2590,6 +2739,18 @@ function RepositoryEditor({
                     draft.analyst_thinking_level,
                     selectedAnalystModel,
                   ),
+                  coordinator_model_options: compatibleOptions(
+                    draft.coordinator_model_options,
+                    selectedCoordinatorModel,
+                  ),
+                  router_model_options: compatibleOptions(
+                    draft.router_model_options,
+                    selectedRouterModel,
+                  ),
+                  analyst_model_options: compatibleOptions(
+                    draft.analyst_model_options,
+                    selectedAnalystModel,
+                  ),
                   reviewer_overrides: (draft.reviewer_overrides ?? []).map((override) => {
                     const profile = reviewers.find(
                       (reviewer) => reviewer.id === override.reviewer_id,
@@ -2602,6 +2763,10 @@ function RepositoryEditor({
                       ...override,
                       thinking_level: compatibleThinking(
                         override.thinking_level,
+                        selectedReviewerModel,
+                      ),
+                      model_options: compatibleOptions(
+                        override.model_options,
                         selectedReviewerModel,
                       ),
                     };
@@ -2639,6 +2804,14 @@ function RepositoryEditor({
               configured in Review persona settings.
             </small>
           </label>
+          <ModelOptionsSetting
+            model={effectiveCoordinatorModel}
+            options={draft.coordinator_model_options}
+            scope="Coordinator"
+            onChange={(options) =>
+              setDraft({ ...draft, coordinator_model_options: options })
+            }
+          />
           <label class={semanticRouterConfigEnabled ? undefined : "field-disabled"}>
             Semantic router model
             <select
@@ -2655,6 +2828,10 @@ function RepositoryEditor({
                   router_model: routerModel,
                   router_thinking_level: compatibleThinking(
                     draft.router_thinking_level,
+                    selectedRouterModel,
+                  ),
+                  router_model_options: compatibleOptions(
+                    draft.router_model_options,
                     selectedRouterModel,
                   ),
                 });
@@ -2690,14 +2867,23 @@ function RepositoryEditor({
               {!semanticRouterConfigEnabled && ` ${semanticRouterRequirement}`}
             </small>
           </label>
+          <ModelOptionsSetting
+            model={effectiveRouterModel}
+            options={draft.router_model_options}
+            scope="Semantic router"
+            disabled={!semanticRouterConfigEnabled}
+            onChange={(options) => setDraft({ ...draft, router_model_options: options })}
+          />
           <label>
             Change analyst model
             <select
-              value={draft.analyst_model ?? ""}
+              value={modelSelectionValue(models, draft.analyst_model)}
+              disabled={!modelsLoaded}
               onChange={(event) => {
                 const analystModel = event.currentTarget.value || undefined;
-                const selectedAnalystModel = models.find(
-                  (candidate) => candidate.id === (analystModel || draft.model),
+                const selectedAnalystModel = modelForSelection(
+                  models,
+                  analystModel || draft.model,
                 );
                 setDraft({
                   ...draft,
@@ -2706,15 +2892,15 @@ function RepositoryEditor({
                     draft.analyst_thinking_level,
                     selectedAnalystModel,
                   ),
+                  analyst_model_options: compatibleOptions(
+                    draft.analyst_model_options,
+                    selectedAnalystModel,
+                  ),
                 });
               }}
             >
               <option value="">Inherit coordinator/fallback model</option>
-              {models.map((model) => (
-                <option value={model.id} key={model.id}>
-                  {model.display_name} · {model.id}
-                </option>
-              ))}
+              <ModelOptions models={models} selection={draft.analyst_model} />
             </select>
             <small>
               Once per review round, reads the full pull-request branch diff and derives what the
@@ -2744,6 +2930,12 @@ function RepositoryEditor({
               Review mode setting.
             </small>
           </label>
+          <ModelOptionsSetting
+            model={effectiveAnalystModel}
+            options={draft.analyst_model_options}
+            scope="Change analyst"
+            onChange={(options) => setDraft({ ...draft, analyst_model_options: options })}
+          />
         </div>
         <label>
           Repository instructions
@@ -2836,9 +3028,8 @@ function RepositoryEditor({
                 (item) => item.reviewer_id === reviewer.id,
               );
               const effectiveModelId = override?.model || reviewer.model || draft.model;
-              const reviewerThinking = thinkingOptions(
-                modelForSelection(models, effectiveModelId),
-              );
+              const effectiveReviewerModel = modelForSelection(models, effectiveModelId);
+              const reviewerThinking = thinkingOptions(effectiveReviewerModel);
               return (
                 <div class="persona-execution" key={reviewer.id}>
                   <header>
@@ -2860,6 +3051,10 @@ function RepositoryEditor({
                           model,
                           thinking_level: compatibleThinking(
                             override?.thinking_level,
+                            selectedModel,
+                          ),
+                          model_options: compatibleOptions(
+                            override?.model_options,
                             selectedModel,
                           ),
                         });
@@ -2895,6 +3090,15 @@ function RepositoryEditor({
                       Overrides this persona's reasoning setting for this repository only.
                     </small>
                   </label>
+                  <ModelOptionsSetting
+                    model={effectiveReviewerModel}
+                    options={override?.model_options}
+                    onChange={(options) =>
+                      updateReviewerOverride(reviewer.id, {
+                        model_options: Object.keys(options).length ? options : undefined,
+                      })
+                    }
+                  />
                 </div>
               );
             })}

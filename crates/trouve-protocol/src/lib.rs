@@ -371,12 +371,15 @@ pub use requests::*;
 // (`thread_collapse`), the collapse backlog reports failing/abandoned entries
 // with the latest error, and GitHub App status reports
 // `contents_write_configured` (additive).
-// 9.3: model catalogs expose provider-neutral `auto/<model>` entries alongside
+// 9.3: code-review repositories, reviewer overrides, and job snapshots carry
+// validated per-role `model_options` maps (for example `fast`) alongside the
+// legacy thinking-level shorthands (additive).
+// 9.4: model catalogs expose provider-neutral `auto/<model>` entries alongside
 // concrete provider pins, provider preference writes are versioned, sticky
 // route selection is durable, and turns emit their selected route (additive).
-// 9.4: provider-order changes emit a durable full-replacement event and the
+// 9.5: provider-order changes emit a durable full-replacement event and the
 // cold-start server projection includes the current order (additive).
-pub const PROTOCOL_VERSION: &str = "9.4";
+pub const PROTOCOL_VERSION: &str = "9.5";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";
 pub const ERROR_CODE_GITHUB_REAUTHENTICATION_REQUIRED: &str = "github_reauthentication_required";

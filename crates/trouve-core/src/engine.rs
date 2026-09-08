@@ -1705,7 +1705,7 @@ pub(crate) fn validate_model_selection(model: &str) -> Result<(), EngineError> {
     Ok(())
 }
 
-fn has_thinking_option(options: &serde_json::Map<String, serde_json::Value>) -> bool {
+pub(crate) fn has_thinking_option(options: &serde_json::Map<String, serde_json::Value>) -> bool {
     THINKING_OPTION_KEYS
         .iter()
         .any(|key| options.contains_key(*key))
@@ -2009,7 +2009,7 @@ fn valid_choice_values(property: &serde_json::Value) -> Option<Vec<&serde_json::
     Some(values)
 }
 
-fn validate_model_options(
+pub(crate) fn validate_model_options(
     options: &serde_json::Map<String, serde_json::Value>,
     model: &trouve_protocol::ModelInfo,
 ) -> Result<(), EngineError> {
@@ -22905,6 +22905,7 @@ mod tests {
                 prompt: "Review".into(),
                 model: None,
                 default_thinking_level: None,
+                model_options: Default::default(),
                 built_in: false,
             })
             .unwrap();
@@ -23001,6 +23002,9 @@ mod tests {
                 router_thinking_level: None,
                 analyst_model: None,
                 analyst_thinking_level: None,
+                coordinator_model_options: None,
+                router_model_options: None,
+                analyst_model_options: None,
                 prompt: "preserve this".into(),
                 reviewer_ids: Some(vec!["custom".into()]),
                 routing_mode: Some(trouve_protocol::CodeReviewRoutingMode::Manual),
@@ -23016,6 +23020,7 @@ mod tests {
                     reviewer_id: "custom".into(),
                     model: None,
                     thinking_level: None,
+                    model_options: Default::default(),
                     prompt_mode: trouve_protocol::ReviewerPromptMode::Append,
                     prompt: "custom prompt".into(),
                 }]),
@@ -23047,6 +23052,7 @@ mod tests {
             prompt: "Inspect legacy behavior.".into(),
             model: None,
             default_thinking_level: None,
+            model_options: Default::default(),
             built_in: false,
         };
         engine
@@ -23153,6 +23159,9 @@ mod tests {
                 router_thinking_level: None,
                 analyst_model: None,
                 analyst_thinking_level: None,
+                coordinator_model_options: None,
+                router_model_options: None,
+                analyst_model_options: None,
                 prompt: String::new(),
                 reviewer_ids: Some(vec!["custom".into()]),
                 routing_mode: Some(trouve_protocol::CodeReviewRoutingMode::Manual),

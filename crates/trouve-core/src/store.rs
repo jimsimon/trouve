@@ -327,6 +327,9 @@ CREATE TABLE IF NOT EXISTS code_review_repositories (
   included_reviewer_ids TEXT NOT NULL DEFAULT '[]',
   excluded_reviewer_ids TEXT NOT NULL DEFAULT '[]',
   reviewer_overrides TEXT NOT NULL DEFAULT '[]',
+  coordinator_model_options TEXT NOT NULL DEFAULT '{}',
+  router_model_options TEXT NOT NULL DEFAULT '{}',
+  analyst_model_options TEXT NOT NULL DEFAULT '{}',
   updated_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS code_review_identities (
@@ -415,7 +418,10 @@ CREATE TABLE IF NOT EXISTS code_review_jobs (
   blocking_review_cleanup_next_attempt_at TEXT,
   blocking_review_cleanup_claim_token TEXT,
   blocking_review_cleanup_claim_until TEXT,
-  carried_anchor_targets_legacy INTEGER NOT NULL DEFAULT 0
+  carried_anchor_targets_legacy INTEGER NOT NULL DEFAULT 0,
+  coordinator_model_options TEXT NOT NULL DEFAULT '{}',
+  router_model_options TEXT NOT NULL DEFAULT '{}',
+  analyst_model_options TEXT NOT NULL DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS code_review_jobs_status ON code_review_jobs (status, created_at);
 CREATE INDEX IF NOT EXISTS code_review_jobs_repository_history
@@ -1069,6 +1075,20 @@ const MIGRATIONS: &[&str] = &[
     // of only from server logs.
     "ALTER TABLE code_review_findings
        ADD COLUMN collapse_error TEXT NOT NULL DEFAULT ''",
+    // Validated per-role model options (for example `fast`) stored as JSON
+    // objects next to the legacy thinking-level shorthands.
+    "ALTER TABLE code_review_repositories
+       ADD COLUMN coordinator_model_options TEXT NOT NULL DEFAULT '{}'",
+    "ALTER TABLE code_review_repositories
+       ADD COLUMN router_model_options TEXT NOT NULL DEFAULT '{}'",
+    "ALTER TABLE code_review_repositories
+       ADD COLUMN analyst_model_options TEXT NOT NULL DEFAULT '{}'",
+    "ALTER TABLE code_review_jobs
+       ADD COLUMN coordinator_model_options TEXT NOT NULL DEFAULT '{}'",
+    "ALTER TABLE code_review_jobs
+       ADD COLUMN router_model_options TEXT NOT NULL DEFAULT '{}'",
+    "ALTER TABLE code_review_jobs
+       ADD COLUMN analyst_model_options TEXT NOT NULL DEFAULT '{}'",
 ];
 
 /// Severity/confidence half of the blocking tier for one findings row: high
@@ -3796,6 +3816,9 @@ fn row_to_code_review_repository(
         coordinator_thinking_level: r.get(14)?,
         analyst_model: r.get(15)?,
         analyst_thinking_level: r.get(16)?,
+        coordinator_model_options: parse_model_options(&r.get::<_, String>(17)?),
+        router_model_options: parse_model_options(&r.get::<_, String>(18)?),
+        analyst_model_options: parse_model_options(&r.get::<_, String>(19)?),
     })
 }
 
@@ -3820,10 +3843,13 @@ pub struct NewCodeReviewJob {
     pub retry_of: Option<String>,
     pub model: Option<String>,
     pub coordinator_thinking_level: Option<String>,
+    pub coordinator_model_options: serde_json::Map<String, serde_json::Value>,
     pub router_model: Option<String>,
     pub router_thinking_level: Option<String>,
+    pub router_model_options: serde_json::Map<String, serde_json::Value>,
     pub analyst_model: Option<String>,
     pub analyst_thinking_level: Option<String>,
+    pub analyst_model_options: serde_json::Map<String, serde_json::Value>,
     pub prompt: String,
     pub reviewers: Vec<trouve_protocol::ReviewerProfile>,
     pub routing_mode: trouve_protocol::CodeReviewRoutingMode,
@@ -4013,10 +4039,13 @@ fn row_to_code_review_job(r: &rusqlite::Row<'_>) -> rusqlite::Result<CodeReviewJ
             retried_by: r.get(25)?,
             model: r.get(11)?,
             coordinator_thinking_level: r.get(49)?,
+            coordinator_model_options: parse_model_options(&r.get::<_, String>(66)?),
             router_model: r.get(47)?,
             router_thinking_level: r.get(48)?,
+            router_model_options: parse_model_options(&r.get::<_, String>(67)?),
             analyst_model: r.get(58)?,
             analyst_thinking_level: r.get(59)?,
+            analyst_model_options: parse_model_options(&r.get::<_, String>(68)?),
             reviewer_ids: reviewers
                 .iter()
                 .map(|reviewer| reviewer.id.clone())
@@ -4141,7 +4170,8 @@ const CODE_REVIEW_JOB_COLUMNS: &str = "id, installation_id, repository, pull_num
         AND attempt.pull_number = code_review_jobs.pull_number \
         AND attempt.head_sha = code_review_jobs.head_sha \
         AND attempt.trigger = 'legacy-full-coverage') \
-       AS legacy_coverage_attempts";
+       AS legacy_coverage_attempts, \
+     coordinator_model_options, router_model_options, analyst_model_options";
 
 /// Shared ownership predicate for accepting review results and claiming their
 /// publication. Keeping both transitions on one predicate prevents stale
@@ -9420,6 +9450,7 @@ impl Store {
                 prompt: row.get(2)?,
                 model: row.get(3)?,
                 default_thinking_level: row.get(4)?,
+                model_options: Default::default(),
                 built_in,
             })
         })?;
@@ -9623,7 +9654,9 @@ impl Store {
                     identity_ids, routing_mode, semantic_routing,
                     included_reviewer_ids, excluded_reviewer_ids, reviewer_overrides,
                     router_model, router_thinking_level, coordinator_thinking_level,
-                    analyst_model, analyst_thinking_level
+                    analyst_model, analyst_thinking_level,
+                    coordinator_model_options, router_model_options,
+                    analyst_model_options
              FROM code_review_repositories ORDER BY repository",
         )?;
         let rows = stmt.query_map([], row_to_code_review_repository)?;
@@ -9658,6 +9691,21 @@ impl Store {
             .transpose()?;
         let default_reviewer_ids =
             serde_json::to_string(&crate::reviewers::default_reviewer_ids())?;
+        let coordinator_model_options = request
+            .coordinator_model_options
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+        let router_model_options = request
+            .router_model_options
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+        let analyst_model_options = request
+            .analyst_model_options
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
         self.conn.lock().unwrap().execute(
             "INSERT INTO code_review_repositories
                     (repository, installation_id, private, mode, model, prompt,
@@ -9665,11 +9713,13 @@ impl Store {
                      included_reviewer_ids, excluded_reviewer_ids,
                      reviewer_overrides, router_model, router_thinking_level,
                      coordinator_thinking_level, analyst_model,
-                     analyst_thinking_level, updated_at)
+                     analyst_thinking_level, coordinator_model_options,
+                     router_model_options, analyst_model_options, updated_at)
              VALUES (?1, ?2, 0, ?3, ?4, ?5,
                      COALESCE(?6, ?16), COALESCE(?7, 'additive'),
                      COALESCE(?8, 1), COALESCE(?9, '[]'),
-                     COALESCE(?10, '[]'), COALESCE(?11, '[]'), ?12, ?13, ?14, ?17, ?18, ?15)
+                     COALESCE(?10, '[]'), COALESCE(?11, '[]'), ?12, ?13, ?14, ?17, ?18,
+                     COALESCE(?19, '{}'), COALESCE(?20, '{}'), COALESCE(?21, '{}'), ?15)
              ON CONFLICT(repository) DO UPDATE SET
                installation_id = excluded.installation_id,
                mode = excluded.mode,
@@ -9689,6 +9739,12 @@ impl Store {
                coordinator_thinking_level = excluded.coordinator_thinking_level,
                analyst_model = excluded.analyst_model,
                analyst_thinking_level = excluded.analyst_thinking_level,
+               coordinator_model_options =
+                   COALESCE(?19, code_review_repositories.coordinator_model_options),
+               router_model_options =
+                   COALESCE(?20, code_review_repositories.router_model_options),
+               analyst_model_options =
+                   COALESCE(?21, code_review_repositories.analyst_model_options),
                updated_at = excluded.updated_at",
             params![
                 request.repository,
@@ -9709,6 +9765,9 @@ impl Store {
                 default_reviewer_ids,
                 request.analyst_model,
                 request.analyst_thinking_level,
+                coordinator_model_options,
+                router_model_options,
+                analyst_model_options,
             ],
         )?;
         Ok(())
@@ -9981,6 +10040,9 @@ impl Store {
         let reviewers = serde_json::to_string(&new_job.reviewers)?;
         let included_reviewer_ids = serde_json::to_string(&new_job.included_reviewer_ids)?;
         let excluded_reviewer_ids = serde_json::to_string(&new_job.excluded_reviewer_ids)?;
+        let coordinator_model_options = serde_json::to_string(&new_job.coordinator_model_options)?;
+        let router_model_options = serde_json::to_string(&new_job.router_model_options)?;
+        let analyst_model_options = serde_json::to_string(&new_job.analyst_model_options)?;
         let inserted = conn.execute(
             "INSERT OR IGNORE INTO code_review_jobs
                     (id, dedupe_key, installation_id, repository, pull_number, pull_title,
@@ -9991,13 +10053,14 @@ impl Store {
                      included_reviewer_ids, excluded_reviewer_ids, router_model,
                      router_thinking_level, coordinator_thinking_level,
                      review_watermark_sha, pull_body, analyst_model,
-                     analyst_thinking_level)
+                     analyst_thinking_level, coordinator_model_options,
+                     router_model_options, analyst_model_options)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'queued',
                      ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
                      (SELECT COALESCE(MAX(publication_generation), 0) + 1
                       FROM code_review_jobs
                       WHERE repository = ?4 AND pull_number = ?5 AND head_sha = ?8),
-                     ?21, ?22, ?23, ?24, ?25, ?26, ?27, '', ?28, ?29, ?30)",
+                     ?21, ?22, ?23, ?24, ?25, ?26, ?27, '', ?28, ?29, ?30, ?31, ?32, ?33)",
             params![
                 id,
                 new_job.dedupe_key,
@@ -10029,6 +10092,9 @@ impl Store {
                 new_job.pull_body,
                 new_job.analyst_model,
                 new_job.analyst_thinking_level,
+                coordinator_model_options,
+                router_model_options,
+                analyst_model_options,
             ],
         )?;
         if inserted == 0 {
@@ -15295,6 +15361,9 @@ impl Store {
         let reviewers = serde_json::to_string(&new_job.reviewers)?;
         let included_reviewer_ids = serde_json::to_string(&new_job.included_reviewer_ids)?;
         let excluded_reviewer_ids = serde_json::to_string(&new_job.excluded_reviewer_ids)?;
+        let coordinator_model_options = serde_json::to_string(&new_job.coordinator_model_options)?;
+        let router_model_options = serde_json::to_string(&new_job.router_model_options)?;
+        let analyst_model_options = serde_json::to_string(&new_job.analyst_model_options)?;
         tx.execute(
             "INSERT INTO code_review_jobs
                     (id, dedupe_key, installation_id, repository, pull_number,
@@ -15305,7 +15374,8 @@ impl Store {
                      routing_mode, semantic_routing, included_reviewer_ids,
                      excluded_reviewer_ids, router_model, router_thinking_level,
                      coordinator_thinking_level, review_watermark_sha, pull_body,
-                     analyst_model, analyst_thinking_level)
+                     analyst_model, analyst_thinking_level, coordinator_model_options,
+                     router_model_options, analyst_model_options)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'retry',
                     'queued', ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19,
                     (SELECT COALESCE(MAX(generation.publication_generation), 0) + 1
@@ -15313,7 +15383,7 @@ impl Store {
                      WHERE generation.repository = ?4
                        AND generation.pull_number = ?5
                        AND generation.head_sha = ?8),
-                    ?20, ?21, ?22, ?23, ?24, ?25, ?26, '', ?27, ?28, ?29)",
+                    ?20, ?21, ?22, ?23, ?24, ?25, ?26, '', ?27, ?28, ?29, ?30, ?31, ?32)",
             params![
                 new_id,
                 new_job.dedupe_key,
@@ -15344,6 +15414,9 @@ impl Store {
                 new_job.pull_body,
                 new_job.analyst_model,
                 new_job.analyst_thinking_level,
+                coordinator_model_options,
+                router_model_options,
+                analyst_model_options,
             ],
         )?;
         let linked = tx.execute(
@@ -17832,6 +17905,9 @@ mod tests {
             router_thinking_level: job.router_thinking_level,
             analyst_model: job.analyst_model,
             analyst_thinking_level: job.analyst_thinking_level,
+            coordinator_model_options: job.coordinator_model_options,
+            router_model_options: job.router_model_options,
+            analyst_model_options: job.analyst_model_options,
             prompt: record.prompt,
             reviewers: record.reviewers,
             routing_mode: job.routing_mode,
@@ -22672,6 +22748,108 @@ mod tests {
     }
 
     #[test]
+    fn code_review_model_options_round_trip_and_snapshot_onto_jobs() {
+        let store = Store::open_in_memory().unwrap();
+        let fast = || serde_json::Map::from_iter([("fast".to_string(), serde_json::json!(true))]);
+        let base = || trouve_protocol::UpdateCodeReviewRepositoryRequest {
+            installation_id: 7,
+            repository: "acme/widgets".into(),
+            mode: trouve_protocol::CodeReviewMode::Manual,
+            model: Some("openai/reviewer".into()),
+            coordinator_thinking_level: None,
+            router_model: None,
+            router_thinking_level: None,
+            analyst_model: None,
+            analyst_thinking_level: None,
+            coordinator_model_options: None,
+            router_model_options: None,
+            analyst_model_options: None,
+            prompt: String::new(),
+            reviewer_ids: None,
+            routing_mode: None,
+            semantic_routing: None,
+            included_reviewer_ids: None,
+            excluded_reviewer_ids: None,
+            reviewer_overrides: None,
+        };
+        let repository = |store: &Store| {
+            store
+                .list_code_review_repositories()
+                .unwrap()
+                .into_iter()
+                .find(|repository| repository.repository == "acme/widgets")
+                .unwrap()
+        };
+
+        let mut request = base();
+        request.coordinator_model_options = Some(fast());
+        request.router_model_options = Some(serde_json::Map::from_iter([
+            ("fast".to_string(), serde_json::json!(false)),
+            ("nested".to_string(), serde_json::json!({"ignored": true})),
+        ]));
+        request.analyst_model_options = Some(fast());
+        store.update_code_review_repository(&request).unwrap();
+        let saved = repository(&store);
+        assert_eq!(saved.coordinator_model_options, fast());
+        assert_eq!(
+            saved.router_model_options,
+            serde_json::Map::from_iter([("fast".to_string(), serde_json::json!(false))])
+        );
+        assert_eq!(saved.analyst_model_options, fast());
+
+        // Omitted maps preserve the stored options; empty maps clear them.
+        let mut request = base();
+        request.analyst_model_options = Some(serde_json::Map::new());
+        store.update_code_review_repository(&request).unwrap();
+        let saved = repository(&store);
+        assert_eq!(saved.coordinator_model_options, fast());
+        assert!(!saved.router_model_options.is_empty());
+        assert!(saved.analyst_model_options.is_empty());
+
+        let job = store
+            .enqueue_code_review_job(&NewCodeReviewJob {
+                dedupe_key: "acme/widgets#42:options".into(),
+                installation_id: 7,
+                repository: "acme/widgets".into(),
+                pull_number: 42,
+                pull_title: "Ship widgets".into(),
+                pull_body: String::new(),
+                pull_url: "https://github.com/acme/widgets/pull/42".into(),
+                head_sha: "2222222222222222222222222222222222222222".into(),
+                review_base_sha: "1111111111111111111111111111111111111111".into(),
+                base_ref: "main".into(),
+                head_ref: "ship".into(),
+                scope: trouve_protocol::CodeReviewJobScope::Incremental,
+                trigger: "manual".into(),
+                retry_of: None,
+                model: Some("openai/reviewer".into()),
+                coordinator_thinking_level: Some("high".into()),
+                router_model: None,
+                router_thinking_level: None,
+                analyst_model: None,
+                analyst_thinking_level: None,
+                coordinator_model_options: saved.coordinator_model_options.clone(),
+                router_model_options: saved.router_model_options.clone(),
+                analyst_model_options: saved.analyst_model_options.clone(),
+                prompt: String::new(),
+                reviewers: Vec::new(),
+                routing_mode: trouve_protocol::CodeReviewRoutingMode::Manual,
+                semantic_routing: false,
+                included_reviewer_ids: Vec::new(),
+                excluded_reviewer_ids: Vec::new(),
+                config_hash: "config".into(),
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.coordinator_model_options, fast());
+        assert_eq!(job.router_model_options, saved.router_model_options);
+        assert!(job.analyst_model_options.is_empty());
+        let loaded = store.code_review_job(&job.id).unwrap().unwrap();
+        assert_eq!(loaded.job.coordinator_model_options, fast());
+        assert_eq!(loaded.job.router_model_options, saved.router_model_options);
+    }
+
+    #[test]
     fn persona_reference_cleanup_is_durable_and_preserves_unrelated_selection() {
         let store = Store::open_in_memory().unwrap();
         let request = trouve_protocol::UpdateCodeReviewRepositoryRequest {
@@ -22684,6 +22862,9 @@ mod tests {
             router_thinking_level: None,
             analyst_model: None,
             analyst_thinking_level: None,
+            coordinator_model_options: None,
+            router_model_options: None,
+            analyst_model_options: None,
             prompt: "keep this".into(),
             reviewer_ids: Some(vec!["custom".into()]),
             routing_mode: Some(trouve_protocol::CodeReviewRoutingMode::Manual),
@@ -22694,6 +22875,7 @@ mod tests {
                 reviewer_id: "custom".into(),
                 model: None,
                 thinking_level: None,
+                model_options: Default::default(),
                 prompt_mode: trouve_protocol::ReviewerPromptMode::Append,
                 prompt: "custom prompt".into(),
             }]),
@@ -22710,6 +22892,9 @@ mod tests {
                 router_thinking_level: None,
                 analyst_model: None,
                 analyst_thinking_level: None,
+                coordinator_model_options: None,
+                router_model_options: None,
+                analyst_model_options: None,
                 prompt: "preserve empty selection".into(),
                 reviewer_ids: Some(Vec::new()),
                 routing_mode: Some(trouve_protocol::CodeReviewRoutingMode::Additive),
@@ -22730,6 +22915,9 @@ mod tests {
                 router_thinking_level: None,
                 analyst_model: None,
                 analyst_thinking_level: None,
+                coordinator_model_options: None,
+                router_model_options: None,
+                analyst_model_options: None,
                 prompt: String::new(),
                 reviewer_ids: Some(vec!["reliability".into()]),
                 routing_mode: Some(trouve_protocol::CodeReviewRoutingMode::Additive),
@@ -22815,6 +23003,9 @@ mod tests {
                 router_thinking_level: Some("low".into()),
                 analyst_model: None,
                 analyst_thinking_level: None,
+                coordinator_model_options: None,
+                router_model_options: None,
+                analyst_model_options: None,
                 prompt: "focus on concurrency".into(),
                 reviewer_ids: Some(crate::reviewers::default_reviewer_ids()),
                 routing_mode: Some(trouve_protocol::CodeReviewRoutingMode::Additive),
@@ -22825,6 +23016,7 @@ mod tests {
                     reviewer_id: "security".into(),
                     model: Some("anthropic/security".into()),
                     thinking_level: Some("medium".into()),
+                    model_options: Default::default(),
                     prompt_mode: trouve_protocol::ReviewerPromptMode::Append,
                     prompt: "Focus on tenant boundaries.".into(),
                 }]),
@@ -22893,6 +23085,9 @@ mod tests {
             router_thinking_level: configured.router_thinking_level,
             analyst_model: None,
             analyst_thinking_level: None,
+            coordinator_model_options: Default::default(),
+            router_model_options: Default::default(),
+            analyst_model_options: Default::default(),
             prompt: configured.prompt,
             reviewers,
             routing_mode: configured.routing_mode,
@@ -29113,6 +29308,9 @@ mod tests {
             router_thinking_level: None,
             analyst_model: None,
             analyst_thinking_level: None,
+            coordinator_model_options: Default::default(),
+            router_model_options: Default::default(),
+            analyst_model_options: Default::default(),
             prompt: "Review it".into(),
             reviewers: crate::reviewers::built_in_reviewers()
                 .into_iter()
@@ -29903,6 +30101,9 @@ mod tests {
                     router_thinking_level: None,
                     analyst_model: None,
                     analyst_thinking_level: None,
+                    coordinator_model_options: Default::default(),
+                    router_model_options: Default::default(),
+                    analyst_model_options: Default::default(),
                     prompt: String::new(),
                     reviewers: Vec::new(),
                     routing_mode: trouve_protocol::CodeReviewRoutingMode::Manual,
@@ -29957,6 +30158,7 @@ mod tests {
             prompt: "Check widget state transitions.".into(),
             model: Some("openai/gpt-5".into()),
             default_thinking_level: Some("high".into()),
+            model_options: Default::default(),
             built_in: false,
         };
         store.upsert_reviewer_profile(&reviewer).unwrap();
@@ -29978,6 +30180,9 @@ mod tests {
                 router_thinking_level: None,
                 analyst_model: None,
                 analyst_thinking_level: None,
+                coordinator_model_options: None,
+                router_model_options: None,
+                analyst_model_options: None,
                 prompt: String::new(),
                 reviewer_ids: Some(vec![reviewer.id.clone()]),
                 routing_mode: Some(trouve_protocol::CodeReviewRoutingMode::Additive),
@@ -29988,6 +30193,7 @@ mod tests {
                     reviewer_id: reviewer.id.clone(),
                     model: Some("anthropic/domain".into()),
                     thinking_level: Some("low".into()),
+                    model_options: Default::default(),
                     prompt_mode: trouve_protocol::ReviewerPromptMode::Replace,
                     prompt: "Use repository-specific invariants.".into(),
                 }]),
@@ -30004,6 +30210,9 @@ mod tests {
                 router_thinking_level: None,
                 analyst_model: None,
                 analyst_thinking_level: None,
+                coordinator_model_options: None,
+                router_model_options: None,
+                analyst_model_options: None,
                 prompt: String::new(),
                 reviewer_ids: Some(crate::reviewers::default_reviewer_ids()),
                 routing_mode: Some(trouve_protocol::CodeReviewRoutingMode::Additive),
@@ -30079,6 +30288,9 @@ mod tests {
                 router_thinking_level: Some("low".into()),
                 analyst_model: None,
                 analyst_thinking_level: None,
+                coordinator_model_options: Default::default(),
+                router_model_options: Default::default(),
+                analyst_model_options: Default::default(),
                 prompt: "Review it".into(),
                 reviewers,
                 routing_mode: trouve_protocol::CodeReviewRoutingMode::Manual,
@@ -30676,6 +30888,9 @@ mod tests {
                     router_thinking_level: None,
                     analyst_model: None,
                     analyst_thinking_level: None,
+                    coordinator_model_options: Default::default(),
+                    router_model_options: Default::default(),
+                    analyst_model_options: Default::default(),
                     prompt: "Review it".into(),
                     reviewers: Vec::new(),
                     routing_mode: trouve_protocol::CodeReviewRoutingMode::Manual,
@@ -31017,6 +31232,9 @@ mod tests {
                 router_thinking_level: None,
                 analyst_model: None,
                 analyst_thinking_level: None,
+                coordinator_model_options: Default::default(),
+                router_model_options: Default::default(),
+                analyst_model_options: Default::default(),
                 prompt: "Review it".into(),
                 reviewers: Vec::new(),
                 routing_mode: trouve_protocol::CodeReviewRoutingMode::Manual,
@@ -31580,6 +31798,9 @@ mod tests {
                 router_thinking_level: None,
                 analyst_model: None,
                 analyst_thinking_level: None,
+                coordinator_model_options: Default::default(),
+                router_model_options: Default::default(),
+                analyst_model_options: Default::default(),
                 prompt: "Review it".into(),
                 reviewers: vec![reviewer.clone()],
                 routing_mode: trouve_protocol::CodeReviewRoutingMode::Manual,
@@ -32143,6 +32364,9 @@ mod tests {
                 router_thinking_level: None,
                 analyst_model: None,
                 analyst_thinking_level: None,
+                coordinator_model_options: Default::default(),
+                router_model_options: Default::default(),
+                analyst_model_options: Default::default(),
                 prompt: String::new(),
                 reviewers: vec![reviewer.clone()],
                 routing_mode: trouve_protocol::CodeReviewRoutingMode::Manual,
@@ -32472,6 +32696,9 @@ mod tests {
                 router_thinking_level: None,
                 analyst_model: None,
                 analyst_thinking_level: None,
+                coordinator_model_options: Default::default(),
+                router_model_options: Default::default(),
+                analyst_model_options: Default::default(),
                 prompt: "Review it".into(),
                 reviewers: vec![reviewer.clone()],
                 routing_mode: trouve_protocol::CodeReviewRoutingMode::Manual,
@@ -32601,6 +32828,9 @@ mod tests {
                     router_thinking_level: None,
                     analyst_model: None,
                     analyst_thinking_level: None,
+                    coordinator_model_options: Default::default(),
+                    router_model_options: Default::default(),
+                    analyst_model_options: Default::default(),
                     prompt: String::new(),
                     reviewers: Vec::new(),
                     routing_mode: trouve_protocol::CodeReviewRoutingMode::Manual,
@@ -32780,6 +33010,9 @@ mod tests {
                     router_thinking_level: None,
                     analyst_model: None,
                     analyst_thinking_level: None,
+                    coordinator_model_options: Default::default(),
+                    router_model_options: Default::default(),
+                    analyst_model_options: Default::default(),
                     prompt: String::new(),
                     reviewers: Vec::new(),
                     routing_mode: trouve_protocol::CodeReviewRoutingMode::Manual,
@@ -32921,6 +33154,9 @@ mod tests {
                     router_thinking_level: None,
                     analyst_model: None,
                     analyst_thinking_level: None,
+                    coordinator_model_options: Default::default(),
+                    router_model_options: Default::default(),
+                    analyst_model_options: Default::default(),
                     prompt: String::new(),
                     reviewers: Vec::new(),
                     routing_mode: trouve_protocol::CodeReviewRoutingMode::Manual,
@@ -33094,6 +33330,9 @@ mod tests {
                     router_thinking_level: None,
                     analyst_model: None,
                     analyst_thinking_level: None,
+                    coordinator_model_options: Default::default(),
+                    router_model_options: Default::default(),
+                    analyst_model_options: Default::default(),
                     prompt: String::new(),
                     reviewers: Vec::new(),
                     routing_mode: trouve_protocol::CodeReviewRoutingMode::Manual,
