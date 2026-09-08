@@ -1111,6 +1111,20 @@ export class ThreadViewModel {
     return true;
   }
 
+  /** Reflect a local approval decision before `approval.resolved` arrives.
+   * The status change moves the tool out of its approval span, so the
+   * revision has to bump for memoised layout to pick it up. */
+  resolveApprovalOptimistically(
+    callId: string,
+    decision: "approve" | "always_approve" | "deny",
+  ): boolean {
+    const tool = this.findTool(callId);
+    if (tool?.status !== "awaiting-approval") return false;
+    this.itemsRevision += 1;
+    tool.status = decision === "deny" ? "denied" : "running";
+    return true;
+  }
+
   /** Bound inactive transcript caches without changing absolute item ids. */
   trimHistory(maxItems: number): void {
     const retained = Math.max(1, Math.floor(maxItems));

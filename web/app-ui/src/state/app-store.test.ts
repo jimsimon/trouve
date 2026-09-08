@@ -953,10 +953,14 @@ describe("AppStore", () => {
       args: { command: "cargo test" },
       requires_approval: true,
     });
+    const revision = store.threadView("th_1").itemsRevision;
 
     expect(store.resolveApprovalOptimistically("th_1", "call_approval", "approve"))
       .toBe(true);
     expect(store.threadView("th_1").findTool("call_approval")?.status).toBe("running");
+    // The transcript memoises layout on the revision, and an approval tool
+    // moves out of its own row once it starts.
+    expect(store.threadView("th_1").itemsRevision).toBeGreaterThan(revision);
     expect(store.resolveApprovalOptimistically("th_1", "call_approval", "deny"))
       .toBe(false);
   });

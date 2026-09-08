@@ -52,6 +52,16 @@ const compaction = (id: string): AgentChatItem => ({
   state: { kind: "completed", messagesCompacted: 3 },
 });
 
+const subagent = (id: string): AgentChatItem => ({
+  id,
+  kind: "subagent",
+  turn: 1,
+  threadId: "th_child",
+  sessionId: "se_child",
+  prompt: "look into it",
+  model: "claude/opus",
+});
+
 const spanIds = (items: readonly AgentChatItem[], spans: readonly AgentBodySpan[]) =>
   spans.map((span) => ({
     kind: span.kind === "activity" ? span.activity : span.kind,
@@ -95,6 +105,15 @@ describe("planAgentBody", () => {
       { kind: "run", ids: ["t3"] },
     ]);
     expect(spans[1]).toMatchObject({ kind: "compaction", legacy: false, connectAfter: true });
+  });
+
+  it("ends a tool run at a subagent node instead of absorbing it", () => {
+    const items = [tool("t1"), subagent("s1"), tool("t2")];
+    expect(spanIds(items, planAgentBody(items, collapse))).toEqual([
+      { kind: "run", ids: ["t1"] },
+      { kind: "node", ids: ["s1"] },
+      { kind: "run", ids: ["t2"] },
+    ]);
   });
 
   it("folds thinking into runs when the preference allows it", () => {

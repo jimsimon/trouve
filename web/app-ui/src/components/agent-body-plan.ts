@@ -215,6 +215,7 @@ export const planAgentBody = (
         || candidate.kind === "assistant"
         || candidate.kind === "artifacts"
         || candidate.kind === "steered"
+        || candidate.kind === "subagent"
         || candidate.kind === "questions"
         || candidate.kind === "progress"
         || (!collapse.collapseCompactionWithTools && candidate.kind === "compaction")

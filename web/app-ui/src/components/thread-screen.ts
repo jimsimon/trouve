@@ -285,6 +285,26 @@ const unitResponseItemId = (
 ): string | undefined =>
   turnResponseItemId(unit.items, unit.status?.state ?? presentation.turnStates.get(unit.turn));
 
+/** The `turn-*` class every segment of a turn card shares. A cancelled turn
+ * drops its `turn-status` item, so without a recorded state the body's live
+ * activity decides whether the card still reads as running. */
+const turnStateKind = (
+  unit: ChatRenderUnit,
+  turnState: TurnState | undefined,
+): TurnState["kind"] => {
+  if (turnState !== undefined) return turnState.kind;
+  const activityRunning = unit.items.some((item) =>
+    (item.kind === "assistant" || item.kind === "progress" || item.kind === "thinking")
+      && !item.complete
+    || item.kind === "compaction" && item.state.kind === "running"
+    || item.kind === "tool" && (
+      item.status === "running" || item.status === "awaiting-approval"
+    )
+    || item.kind === "questions" && item.answers === undefined
+  );
+  return activityRunning || unit.items.length === 0 ? "running" : "completed";
+};
+
 const sameVirtualRenderWindow = (
   left: VirtualWindow<VirtualChatItem>,
   right: VirtualWindow<VirtualChatItem>,
@@ -3077,7 +3097,11 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     checkpointRestoreDisabled: boolean,
     finalUnit: boolean,
   ) {
-    const trailingBoundary = segment.last
+    // A collapsed turn mounts only its first segment, so the checkpoint
+    // boundary after the turn has to render on whichever segment is last
+    // on screen rather than the last one planned.
+    const lastMounted = segment.last || !this.#turnCardOpen(unit);
+    const trailingBoundary = lastMounted
       ? checkpointBoundaryAfterTurn(unit.turn, presentation.turnStates)
       : undefined;
     return html`
@@ -3311,18 +3335,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       : collapsedChatPreview(assistantCopyText(unit.prompt.content))
         || `${unit.prompt.attachments.length} attachment${unit.prompt.attachments.length === 1 ? "" : "s"}`;
     const preview = promptPreview || collapsedChatPreview(joined) || `Turn ${unit.turn}`;
-    const activityRunning = unit.items.some((item) =>
-      (item.kind === "assistant" || item.kind === "progress" || item.kind === "thinking")
-        && !item.complete
-      || item.kind === "compaction" && item.state.kind === "running"
-      || item.kind === "tool" && (
-        item.status === "running" || item.status === "awaiting-approval"
-      )
-      || item.kind === "questions" && item.answers === undefined
-    );
-    const stateKind = turnState?.kind ?? (
-      activityRunning || unit.items.length === 0 ? "running" : "completed"
-    );
+    const stateKind = turnStateKind(unit, turnState);
     const modelLabel = turnLabels.get(unit.turn);
     const modelId = turnModels.get(unit.turn);
     const model = this.#availableModels().find((candidate) => candidate.id === modelId);
@@ -3402,7 +3415,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     activityInput: RunningAgentActivityInput | undefined,
   ) {
     const turnState = unit.status?.state ?? presentation.turnStates.get(unit.turn);
-    const stateKind = turnState?.kind ?? "running";
+    const stateKind = turnStateKind(unit, turnState);
     return html`
       <article
         class=${`message turn-card assistant-message agent-turn-card conversation-turn turn-${stateKind} turn-segment-continuation${
