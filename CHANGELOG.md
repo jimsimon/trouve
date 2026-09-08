@@ -6,6 +6,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **A turn's final text is labelled Response even when a tool call followed
+  it**: the chat labelled agent text "Response" only when it was the very
+  last item of the turn, so an agent that wrote its answer and then made one
+  more tool call before stopping had that answer filed as "Progress". Once a
+  turn completes, its last text block (including harness-authored progress
+  such as Codex commentary) is now rendered as the Response when only tool
+  activity follows it.
+
 ## [4.10.1] - 2026-09-06
 
 This patch keeps active chat transcripts stable, makes review retries and

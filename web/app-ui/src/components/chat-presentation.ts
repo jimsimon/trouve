@@ -63,6 +63,42 @@ export const assistantCopyText = (markdown: string): string => {
   return output.join("\n");
 };
 
+/** Identify the item that carries a turn's answer.
+ *
+ * The response is the last text the agent authored in the turn. While the
+ * turn is still running, only a trailing text block qualifies, because more
+ * answer text may follow a tool call. Once the turn has completed, the last
+ * text block is the response even when the agent issued a final tool call
+ * afterwards and never wrote again; otherwise the answer the user actually
+ * received would be filed as interim progress. Harness "progress" text
+ * qualifies on the same terms: adapters tag mid-turn commentary as progress,
+ * and when a completed turn ends on that commentary it is the answer. */
+export const turnResponseItemId = (
+  items: readonly ThreadChatItem[],
+  turnState: TurnState | undefined,
+): string | undefined => {
+  let responseIndex = -1;
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    const kind = items[index]?.kind;
+    if (kind === "assistant" || kind === "progress") {
+      responseIndex = index;
+      break;
+    }
+  }
+  if (responseIndex < 0) return undefined;
+  const response = items[responseIndex];
+  const trailing = items.slice(responseIndex + 1);
+  if (trailing.length === 0) return response?.id;
+  if (turnState?.kind !== "completed") return undefined;
+  const onlyActivityFollows = trailing.every((item) =>
+    item.kind === "tool"
+    || item.kind === "thinking"
+    || item.kind === "todo"
+    || item.kind === "compaction"
+    || item.kind === "artifacts");
+  return onlyActivityFollows ? response?.id : undefined;
+};
+
 /** Build the small amount of turn-level state needed while rendering a window. */
 export const indexChatPresentation = (
   items: readonly ThreadChatItem[],
