@@ -73,6 +73,7 @@ import {
   isImageAttachment,
   isVideoAttachment,
   protocolAttachmentPath,
+  turnResponseItemId,
   type ChatCopyResult,
   type ChatPresentationIndex,
 } from "./chat-presentation.js";
@@ -2742,7 +2743,6 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       ? runningAgentActivity(activityInput)
       : {
           label: activityOverride,
-          detail: "",
           announcementLabel: activityOverride,
         };
     let nestedActivityUnitId: string | undefined;
@@ -2801,7 +2801,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         id: "ephemeral:activity",
         kind: "activity",
         presentation: activityPresentation,
-        estimatedHeight: activityPresentation.detail === "" ? 32 : 48,
+        estimatedHeight: 32,
       });
     }
     if (virtualItems.length > 0) {
@@ -3474,12 +3474,14 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       activityRows = [];
       activityConnectedFromCompaction = false;
     };
+    const turnState = unit.status?.state ?? presentation.turnStates.get(unit.turn);
+    const responseId = turnResponseItemId(unit.items, turnState);
     const activityFollows = (start: number): boolean => {
       for (let cursor = start; cursor < unit.items.length; cursor += 1) {
         const candidate = unit.items[cursor];
         if (candidate === undefined) return false;
         if (candidate.kind === "tool" && isContextCompactionTool(candidate)) continue;
-        return candidate.kind === "progress"
+        return (candidate.kind === "progress" && candidate.id !== responseId)
           || candidate.kind === "thinking"
           || candidate.kind === "todo"
           || candidate.kind === "tool";
@@ -3528,52 +3530,31 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         }
         const content = stretch.map((part) => part.content).filter(Boolean).join("\n\n");
         if (content !== "") {
-          const response = index === unit.items.length
-            && stretch.some((part) => presentation.lastAssistantIds.has(part.id));
-          const streaming = stretch.some((part) => !part.complete);
-          const turnState = unit.status?.state ?? presentation.turnStates.get(unit.turn);
-          const tone = turnState?.kind === "failed"
-            ? "failed"
-            : turnState?.kind === "cancelled"
-              ? "cancelled"
-              : response && (streaming || turnState?.kind === "running")
-                ? "running"
-                : response
-                  ? "complete"
-                  : "update";
-          const anchor = stretch.at(-1)?.id ?? stretch[0]?.id ?? unit.id;
-          rows.push(html`<section
-            class=${`turn-rail-node turn-response-node agent-text-block ${tone}`}
-            data-chat-anchor-id=${`assistant:${anchor}`}
-            aria-label=${response ? "Response" : "Agent progress"}
-            @pointerdown=${this.#captureMarkdownContextMenuSelection}
-            @mousedown=${this.#captureMarkdownContextMenuSelection}
-            @contextmenu=${(event: MouseEvent) =>
-              this.#openMarkdownContextMenu(event, content)}
-          >
-            <span class=${`turn-rail-marker response ${tone}`} aria-hidden="true">
-              ${fontAwesomeIcon("message")}
-            </span>
-            <header class="turn-node-header">
-              <strong>${response ? "Response" : "Progress"}</strong>
-              <span class="thinking-header-spacer"></span>
-              <span class="agent-copy-action">
-                ${this.#renderCopyButton(
-                  `agent:${unit.id}:${anchor}`,
-                  assistantCopyText(content),
-                  response ? "Copy assistant response" : "Copy assistant progress",
-                )}
-              </span>
-            </header>
-            <trouve-markdown-view
-              .content=${content}
-              .streaming=${streaming}
-            ></trouve-markdown-view>
-          </section>`);
+          rows.push(this.#renderAgentTextNode(unit, {
+            content,
+            anchor: stretch.at(-1)?.id ?? stretch[0]?.id ?? unit.id,
+            response: stretch.some((part) => part.id === responseId),
+            streaming: stretch.some((part) => !part.complete),
+            turnState,
+          }));
         }
         continue;
       }
       if (item.kind === "progress") {
+        if (item.id === responseId && item.content !== "") {
+          // The turn ended on harness-authored progress with no answer text
+          // after it, so that progress is the answer the user received.
+          flushActivityRows();
+          rows.push(this.#renderAgentTextNode(unit, {
+            content: item.content,
+            anchor: item.id,
+            response: true,
+            streaming: !item.complete,
+            turnState,
+          }));
+          index += 1;
+          continue;
+        }
         activityRows.push({
           content: this.#renderVisibleProgress(item),
           expandedGroup: false,
@@ -3780,6 +3761,58 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         </div>
       </article>
     `;
+  }
+
+  /** Top-level agent text node: the turn's response, or an interim update
+   * when more answer text follows (or may still follow) it. */
+  #renderAgentTextNode(
+    unit: ChatRenderUnit,
+    node: {
+      readonly content: string;
+      readonly anchor: string;
+      readonly response: boolean;
+      readonly streaming: boolean;
+      readonly turnState: TurnState | undefined;
+    },
+  ) {
+    const { content, anchor, response, streaming, turnState } = node;
+    const tone = turnState?.kind === "failed"
+      ? "failed"
+      : turnState?.kind === "cancelled"
+        ? "cancelled"
+        : response && (streaming || turnState?.kind === "running")
+          ? "running"
+          : response
+            ? "complete"
+            : "update";
+    return html`<section
+      class=${`turn-rail-node turn-response-node agent-text-block ${tone}`}
+      data-chat-anchor-id=${`assistant:${anchor}`}
+      aria-label=${response ? "Response" : "Agent progress"}
+      @pointerdown=${this.#captureMarkdownContextMenuSelection}
+      @mousedown=${this.#captureMarkdownContextMenuSelection}
+      @contextmenu=${(event: MouseEvent) =>
+        this.#openMarkdownContextMenu(event, content)}
+    >
+      <span class=${`turn-rail-marker response ${tone}`} aria-hidden="true">
+        ${fontAwesomeIcon("message")}
+      </span>
+      <header class="turn-node-header">
+        <strong>${response ? "Response" : "Progress"}</strong>
+        <span class="thinking-header-spacer"></span>
+        <span class="agent-copy-action">
+          ${this.#renderCopyButton(
+            `agent:${unit.id}:${anchor}`,
+            assistantCopyText(content),
+            response ? "Copy assistant response" : "Copy assistant progress",
+          )}
+        </span>
+      </header>
+      <trouve-markdown-view
+        .content=${content}
+        .streaming=${streaming}
+      ></trouve-markdown-view>
+    </section>`;
   }
 
   #renderVisibleProgress(

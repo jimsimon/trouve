@@ -733,8 +733,10 @@ export class ThreadViewModel {
         });
         return true;
       case "turn.steered":
-        this.finishProgress();
-        this.finishThinking();
+        // Steering is accepted while the vendor's current sampling is still
+        // streaming; the model only reads it at its next request. Leave any
+        // open thinking/progress block growing so the steer does not split a
+        // reasoning block mid-sentence.
         this.appendItem({
           id: `steered:${envelope.turn}:${envelope.cursor}`,
           kind: "steered",
