@@ -2968,6 +2968,7 @@ struct BackendRetirement {
     target_ids: HashSet<String>,
     rollback_on_drop: bool,
     route_state_prepared: bool,
+    preserve_route_state: bool,
     secret_transaction: Option<ProviderSecretTransaction>,
     reload: Option<ProviderReloadGuard>,
     _target_transitions: Vec<tokio::sync::OwnedMutexGuard<()>>,
@@ -2986,6 +2987,7 @@ impl BackendRetirement {
             target_ids,
             rollback_on_drop: false,
             route_state_prepared: false,
+            preserve_route_state: false,
             secret_transaction,
             reload: Some(reload),
             _target_transitions: target_transitions,
@@ -3018,11 +3020,15 @@ impl BackendRetirement {
             })
             .collect::<Result<Vec<_>>>()?;
         let previous_health = engine.store.take_route_health(&target_ids)?;
+        self.preserve_route_state = false;
         if let Some(staged_config) = staged_config
             && let Err(publish_error) = staged_config.publish()
         {
             return match engine.store.restore_route_health(&previous_health) {
-                Ok(()) => Err(publish_error),
+                Ok(()) => {
+                    self.preserve_route_state = true;
+                    Err(publish_error)
+                }
                 Err(restore_error) => Err(anyhow!(
                     "publishing provider configuration failed: {publish_error:#}; \
                      restoring previous route health also failed: {restore_error:#}"
@@ -3072,12 +3078,17 @@ impl BackendRetirement {
         self.rollback_on_drop = true;
     }
 
+    fn preserve_route_state_on_rollback(&mut self) {
+        self.preserve_route_state = true;
+    }
+
     /// Restore tentative credentials before an old durable definition can be
     /// republished. Secret-store implementations may block on a keychain or
     /// filesystem, so the detached retirement task performs that I/O on the
     /// blocking pool while this owner retains the provider transition fence.
     async fn rollback(mut self) -> Result<()> {
         let rebuild = self.rollback_on_drop;
+        let preserve_route_state = self.preserve_route_state;
         if let Some(mut transaction) = self.secret_transaction.take() {
             let rollback = tokio::task::spawn_blocking(move || {
                 let result = transaction.try_rollback();
@@ -3102,7 +3113,7 @@ impl BackendRetirement {
         }
         self.rollback_on_drop = false;
         if rebuild && let Some(engine) = self.engine.upgrade() {
-            engine.replace_provider_registries_for_ids(&self.target_ids);
+            engine.restore_provider_registries_for_ids(&self.target_ids, preserve_route_state);
         }
         Ok(())
     }
@@ -3126,6 +3137,7 @@ impl BackendRetirement {
             engine: self.engine.clone(),
             target_ids: self.target_ids.clone(),
             rebuild,
+            preserve_route_state: self.preserve_route_state,
             transaction,
             _target_transitions: std::mem::take(&mut self._target_transitions),
         };
@@ -3138,6 +3150,7 @@ impl BackendRetirement {
 impl Drop for BackendRetirement {
     fn drop(&mut self) {
         let rebuild = self.rollback_on_drop;
+        let preserve_route_state = self.preserve_route_state;
         if self.secret_transaction.is_some() {
             if !self.schedule_secret_rollback_retry(rebuild) {
                 // BackendRetirement is created and dropped from async engine
@@ -3153,7 +3166,7 @@ impl Drop for BackendRetirement {
         }
         self.rollback_on_drop = false;
         if rebuild && let Some(engine) = self.engine.upgrade() {
-            engine.replace_provider_registries_for_ids(&self.target_ids);
+            engine.restore_provider_registries_for_ids(&self.target_ids, preserve_route_state);
         }
     }
 }
@@ -3162,6 +3175,7 @@ struct ProviderSecretRollbackReconciliation {
     engine: Weak<Engine>,
     target_ids: HashSet<String>,
     rebuild: bool,
+    preserve_route_state: bool,
     transaction: ProviderSecretTransaction,
     _target_transitions: Vec<tokio::sync::OwnedMutexGuard<()>>,
 }
@@ -3172,6 +3186,7 @@ impl ProviderSecretRollbackReconciliation {
             engine,
             target_ids,
             rebuild,
+            preserve_route_state,
             mut transaction,
             _target_transitions,
         } = self;
@@ -3202,7 +3217,8 @@ impl ProviderSecretRollbackReconciliation {
             match result {
                 Ok(()) => {
                     if rebuild && let Some(engine) = engine.upgrade() {
-                        engine.replace_provider_registries_for_ids(&target_ids);
+                        engine
+                            .restore_provider_registries_for_ids(&target_ids, preserve_route_state);
                     }
                     return;
                 }
@@ -3424,6 +3440,7 @@ async fn supervise_provider_secret_write(
             engine,
             target_ids,
             rebuild: false,
+            preserve_route_state: false,
             transaction,
             _target_transitions: target_transitions,
         }
@@ -5152,6 +5169,7 @@ impl Engine {
                         engine: Arc::downgrade(self),
                         target_ids,
                         rebuild: false,
+                        preserve_route_state: false,
                         transaction,
                         _target_transitions: target_transitions,
                     };
@@ -5180,6 +5198,7 @@ impl Engine {
                 Some(secret_transaction),
             )
             .await?;
+        retirement.preserve_route_state_on_rollback();
         {
             let mut config = self.config.lock().unwrap();
             let mut next = config.clone();
@@ -5287,6 +5306,7 @@ impl Engine {
         let mut retirement = self
             .retire_config_backends_matching_ids(&target_ids)
             .await?;
+        retirement.preserve_route_state_on_rollback();
         {
             let mut config = self.config.lock().unwrap();
             let mut next = config.clone();
@@ -8288,9 +8308,23 @@ impl Engine {
         }
     }
 
-    /// Rebuild only selected provider/backend ids after their previous
-    /// config-owned backends have completed asynchronous teardown. Unrelated
-    /// instances keep their vendor sessions, process pools, and receivers.
+    /// Restore the previous config-owned backends after a failed transition.
+    /// If the compensating transaction restored route health exactly, avoid
+    /// invalidating that state again while rebuilding the detached backend.
+    fn restore_provider_registries_for_ids(
+        &self,
+        target_ids: &HashSet<String>,
+        preserve_route_state: bool,
+    ) {
+        if preserve_route_state {
+            self.rebuild_provider_registries_for_ids(target_ids);
+        } else {
+            self.replace_provider_registries_for_ids(target_ids);
+        }
+    }
+
+    /// Rebuild selected provider/backend ids and invalidate route state that
+    /// may have been learned by their detached instances.
     fn replace_provider_registries_for_ids(&self, target_ids: &HashSet<String>) {
         for id in target_ids {
             if let Err(error) = self.invalidate_provider_route_state(id) {

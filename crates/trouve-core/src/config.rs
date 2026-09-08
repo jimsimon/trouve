@@ -214,6 +214,50 @@ impl StagedConfigWrite {
     }
 }
 
+fn config_write_target(path: &Path) -> Result<PathBuf> {
+    config_write_target_inner(path, 0)
+}
+
+fn config_write_target_inner(path: &Path, symlink_depth: usize) -> Result<PathBuf> {
+    if let Ok(target) = std::fs::canonicalize(path) {
+        return Ok(target);
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            if symlink_depth >= 40 {
+                anyhow::bail!("too many symlinks resolving config path {}", path.display());
+            }
+            let target = std::fs::read_link(path)
+                .with_context(|| format!("reading config symlink {}", path.display()))?;
+            let target = if target.is_absolute() {
+                target
+            } else {
+                path.parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new("."))
+                    .join(target)
+            };
+            return config_write_target_inner(&target, symlink_depth + 1);
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("reading metadata for {}", path.display()));
+        }
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    let parent = std::fs::canonicalize(parent)
+        .with_context(|| format!("resolving config directory {}", parent.display()))?;
+    let file_name = path
+        .file_name()
+        .with_context(|| format!("config path has no file name: {}", path.display()))?;
+    Ok(parent.join(file_name))
+}
+
 impl Config {
     pub fn load() -> Self {
         Self::load_from(&config_path())
@@ -290,21 +334,20 @@ impl Config {
     /// persistence locks; a dropped candidate is cleaned up automatically.
     pub(crate) fn stage_to(&self, path: &Path) -> Result<StagedConfigWrite> {
         let text = self.serialized_for(path)?;
-        let parent = path
+        let destination = config_write_target(path)?;
+        let parent = destination
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
         let mut temporary = tempfile::NamedTempFile::new_in(parent)
             .with_context(|| format!("creating temporary config in {}", parent.display()))?;
-        let existing_permissions = match std::fs::metadata(path) {
+        let existing_permissions = match std::fs::metadata(&destination) {
             Ok(metadata) if metadata.is_file() => Some(metadata.permissions()),
             Ok(_) => None,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => {
                 return Err(error)
-                    .with_context(|| format!("reading metadata for {}", path.display()));
+                    .with_context(|| format!("reading metadata for {}", destination.display()));
             }
         };
         temporary
@@ -323,7 +366,7 @@ impl Config {
             .with_context(|| format!("flushing staged config for {}", path.display()))?;
         Ok(StagedConfigWrite {
             temporary,
-            destination: path.to_path_buf(),
+            destination,
         })
     }
 }
@@ -418,6 +461,46 @@ mod tests {
         staged.publish().unwrap();
         assert_eq!(
             Config::load_from(&path).default_model.as_deref(),
+            Some("provider/new")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_config_updates_a_symlink_target_without_replacing_the_link() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("managed-config.toml");
+        let link = tmp.path().join("config.toml");
+        Config {
+            default_model: Some("provider/old".into()),
+            ..Default::default()
+        }
+        .save_to(&target)
+        .unwrap();
+        symlink("managed-config.toml", &link).unwrap();
+
+        let staged = Config {
+            default_model: Some("provider/new".into()),
+            ..Default::default()
+        }
+        .stage_to(&link)
+        .unwrap();
+        assert_eq!(
+            Config::load_from(&link).default_model.as_deref(),
+            Some("provider/old")
+        );
+
+        staged.publish().unwrap();
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            Config::load_from(&target).default_model.as_deref(),
             Some("provider/new")
         );
     }

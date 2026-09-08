@@ -4827,6 +4827,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_config_mutations_preserve_health_after_vendor_backend_rebuild() {
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let previous_health = store
+            .record_route_failure("provider", "model", 1, 60, 60)
+            .unwrap();
+        let config = Config {
+            providers: BTreeMap::from([(
+                "provider".into(),
+                crate::config::ProviderConfig {
+                    kind: "codex-app-server".into(),
+                    base_url: Some("https://old.example.test/v1".into()),
+                    ..Default::default()
+                },
+            )]),
+            local_enabled: Some(false),
+            ..Default::default()
+        };
+        // Staging next to this directory succeeds, but publishing over the
+        // directory fails after route health has been tentatively cleared.
+        let engine = Arc::new(
+            Engine::new(store.clone(), data.path().into(), &config)
+                .with_config_file(Some(data.path().to_path_buf())),
+        );
+        assert!(engine.backends.read().unwrap().contains_key("provider"));
+        let scheduler_backoff = engine.turn_scheduler.provider("provider/model").backoff;
+        engine
+            .turn_scheduler
+            .record_outcome("provider/model", Some("HTTP 429 Too Many Requests"));
+
+        let result = engine
+            .upsert_provider(
+                "provider",
+                &UpsertProviderRequest {
+                    kind: "codex-app-server".into(),
+                    base_url: Some("https://new.example.test/v1".into()),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        assert!(result.is_err());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if engine.backends.read().unwrap().contains_key("provider") {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("previous vendor backend was not rebuilt");
+        assert_eq!(
+            store
+                .route_health()
+                .unwrap()
+                .get(&("provider".into(), "model".into())),
+            Some(&previous_health)
+        );
+        assert!(Arc::ptr_eq(
+            &scheduler_backoff,
+            &engine.turn_scheduler.provider("provider/model").backoff
+        ));
+        assert_eq!(
+            engine.config.lock().unwrap().providers["provider"]
+                .base_url
+                .as_deref(),
+            Some("https://old.example.test/v1")
+        );
+
+        assert!(engine.delete_provider("provider").await.is_err());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if engine.backends.read().unwrap().contains_key("provider") {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("previous vendor backend was not rebuilt after failed deletion");
+        assert_eq!(
+            store
+                .route_health()
+                .unwrap()
+                .get(&("provider".into(), "model".into())),
+            Some(&previous_health)
+        );
+        assert!(Arc::ptr_eq(
+            &scheduler_backoff,
+            &engine.turn_scheduler.provider("provider/model").backoff
+        ));
+    }
+
+    #[tokio::test]
     async fn retained_pending_writer_keeps_new_readers_behind_the_fence() {
         let admission = Arc::new(tokio::sync::RwLock::new(()));
         let initial_reader = admission.clone().read_owned().await;

@@ -1455,9 +1455,12 @@ mod tests {
             catalog.shared_model_identity("cursor", "composer-2.5"),
             None
         );
+
+        // An owned choice becomes routable once the reviewed overlay gives it
+        // an explicit public base-model identity.
         assert_eq!(
             catalog.shared_model_identity("cursor", "claude-opus-5"),
-            None
+            Some("claude-opus-5".into())
         );
     }
 
