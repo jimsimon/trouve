@@ -20,12 +20,12 @@ pub mod review;
 pub mod reviewers;
 pub mod skills;
 pub mod store;
+pub mod subscription_health;
 pub mod terminal;
-pub mod title;
 pub mod title_model;
 pub mod tools;
 
-pub use engine::Engine;
+pub use engine::{BridgedToolImage, BridgedToolResult, Engine};
 
 /// Generate a prefixed unique id, e.g. `ws_1f3a…`.
 pub(crate) fn new_id(prefix: &str) -> String {

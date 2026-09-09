@@ -13,7 +13,25 @@ import {
   isImageAttachment,
   isVideoAttachment,
   protocolAttachmentPath,
+  turnResponseItemId,
 } from "./chat-presentation.js";
+
+const completed = { kind: "completed", usage: { input_tokens: 1, output_tokens: 1 } } as const;
+const running = { kind: "running" } as const;
+const text = (id: string, content = "text"): ThreadChatItem =>
+  ({ id, kind: "assistant", turn: 1, content, complete: true });
+const progress = (id: string): ThreadChatItem =>
+  ({ id, kind: "progress", turn: 1, content: "progress", complete: true });
+const tool = (id: string): ThreadChatItem => ({
+  id,
+  kind: "tool",
+  callId: id,
+  tool: "shell",
+  args: { command: "true" },
+  status: "ok",
+  result: undefined,
+  output: { text: "", bytes: 0, omitted: false },
+});
 
 describe("chat presentation", () => {
   it("copies the visible response while preserving Markdown for the context action", () => {
@@ -61,6 +79,62 @@ describe("chat presentation", () => {
     expect(index.turnsWithAssistant.has(3)).toBe(true);
     expect(index.turnsWithAssistant.has(4)).toBe(false);
     expect(index.turnStates.get(3)?.kind).toBe("completed");
+  });
+
+  describe("turnResponseItemId", () => {
+    it("treats trailing assistant text as the response regardless of turn state", () => {
+      const items = [tool("t1"), text("a1"), text("a2")];
+      expect(turnResponseItemId(items, running)).toBe("a2");
+      expect(turnResponseItemId(items, completed)).toBe("a2");
+      expect(turnResponseItemId(items, undefined)).toBe("a2");
+    });
+
+    it("keeps text followed by a tool call as progress while the turn is running", () => {
+      const items = [text("a1"), tool("t1")];
+      expect(turnResponseItemId(items, running)).toBeUndefined();
+      expect(turnResponseItemId(items, undefined)).toBeUndefined();
+    });
+
+    it("promotes the last text of a completed turn even when a tool call followed it", () => {
+      expect(turnResponseItemId([text("a1"), tool("t1")], completed)).toBe("a1");
+      expect(turnResponseItemId(
+        [text("a1"), tool("t1"), text("a2"), tool("t2"), tool("t3")],
+        completed,
+      )).toBe("a2");
+    });
+
+    it("promotes harness progress when a completed turn ends on it", () => {
+      expect(turnResponseItemId([progress("p1"), tool("t1")], completed)).toBe("p1");
+      expect(turnResponseItemId([text("a1"), tool("t1"), progress("p1")], completed)).toBe("p1");
+    });
+
+    it("keeps streaming progress as progress until the turn completes", () => {
+      expect(turnResponseItemId([progress("p1")], running)).toBeUndefined();
+      expect(turnResponseItemId([progress("p1")], undefined)).toBeUndefined();
+      expect(turnResponseItemId([progress("p1")], completed)).toBe("p1");
+    });
+
+    it("does not promote text in failed or cancelled turns", () => {
+      const items = [text("a1"), tool("t1")];
+      expect(turnResponseItemId(items, { kind: "failed", error: "boom" })).toBeUndefined();
+      expect(turnResponseItemId(items, { kind: "cancelled" })).toBeUndefined();
+    });
+
+    it("does not promote text that a steer or question follows", () => {
+      const steered: ThreadChatItem = {
+        id: "s1", kind: "steered", turn: 1, content: "actually…", attachments: [],
+      };
+      const questions: ThreadChatItem = {
+        id: "q1", kind: "questions", requestId: "r1", title: undefined, questions: [], answers: undefined,
+      };
+      expect(turnResponseItemId([text("a1"), steered, tool("t1")], completed)).toBeUndefined();
+      expect(turnResponseItemId([text("a1"), questions], completed)).toBeUndefined();
+    });
+
+    it("returns nothing for turns without agent text", () => {
+      expect(turnResponseItemId([tool("t1")], completed)).toBeUndefined();
+      expect(turnResponseItemId([], completed)).toBeUndefined();
+    });
   });
 
   it.each([

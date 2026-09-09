@@ -37,7 +37,7 @@ jobs:
           repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           targets: x86_64-unknown-linux-gnu
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
@@ -154,7 +154,7 @@ jobs:
           repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           targets: x86_64-unknown-linux-gnu
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
@@ -238,11 +238,22 @@ jobs:
         # The base build replaces the shared target/release binary. Running
         # the candidate's script keeps the benchmark procedure identical.
         run: benchmarks/run_ci_bench.sh bench-results/e2e/base
+      - name: Re-measure candidate for the base comparison
+        if: steps.history.outputs.needs_base == 'true'
+        # The historical screen's candidate numbers may be exactly what
+        # tripped it — one contention spike during the original measurement
+        # would otherwise poison the confirmation too, since the base is
+        # measured minutes later under different load. Rebuilding and
+        # re-measuring the candidate back to back with the base compares two
+        # fresh measurements taken under the same conditions.
+        run: |
+          cargo build --release --package trouve-search
+          benchmarks/run_ci_bench.sh bench-results/e2e/head-confirm
       - name: Confirm candidate against base revision
         if: steps.history.outputs.needs_base == 'true'
         run: |
           python3 benchmarks/compare_benchmarks.py \
-            --candidate bench-results/e2e/head/e2e.json \
+            --candidate bench-results/e2e/head-confirm/e2e.json \
             --baseline bench-results/e2e/base/e2e.json \
             --threshold 1.75 \
             --minimum-baselines 1 \

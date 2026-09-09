@@ -5,7 +5,10 @@ import type {
   ProtocolModelInfo,
   ProtocolProvidersResponse,
 } from "../services/protocol-client.js";
+import { parseProtocolJson } from "../services/protocol-json.js";
+import { changeModelOption } from "../components/model-option-controls.js";
 import {
+  applyNewSessionModelOptionChange,
   beginNewSessionSubmission,
   beginNewSessionOptionLoad,
   canSubmitNewSession,
@@ -20,9 +23,6 @@ import {
   defaultThinkingSelection,
   interruptNewSessionOptionLoad,
   failNewSessionSetup,
-  NEW_SESSION_TITLE_FALLBACK,
-  NEW_SESSION_TITLE_MAX_LENGTH,
-  NEW_THREAD_TITLE_FALLBACK,
   newSessionOptionsAreAuthoritative,
   newSessionOptionsBlockSubmission,
   navigateNewSessionSetup,
@@ -34,25 +34,23 @@ import {
   resolveNewThreadDefaults,
   openNewSessionSetup,
   openNewSessionSetupForWorkspace,
-  sessionTitleFallback,
   settleNewSessionOptionLoad,
   shouldRestoreFailedNewSessionDraft,
   snapshotNewSessionSubmission,
   thinkingOption,
   thinkingSelectionIsValid,
-  threadTitleFallback,
 } from "./new-session-model.js";
 
 const model = (
   optionsSchema: unknown,
   id = "provider/model",
-): ProtocolModelInfo => ({
+): ProtocolModelInfo => parseProtocolJson(JSON.stringify({
   id,
   display_name: "Model",
   context_window: 128_000,
   supports_tools: true,
   options_schema: optionsSchema,
-});
+})) as ProtocolModelInfo;
 
 const mode = (defaultModel?: string | null): ProtocolAgentPersona => ({
   id: "code",
@@ -181,31 +179,6 @@ describe("new session model", () => {
       restoringDraft: false,
     });
     expect(replaced.lifecycle.generation).toBeGreaterThan(failed.generation);
-  });
-
-  it("uses the bounded first prompt line and removes invisible controls from fallback titles", () => {
-    expect(sessionTitleFallback("  Build\n\t the   dashboard\r\n now  ")).toBe(
-      "Build",
-    );
-    expect(sessionTitleFallback("Review\u202ethe diff")).toBe("Review the diff");
-    expect(sessionTitleFallback("\n\n  Build   the dashboard\nignore this line")).toBe(
-      "Build the dashboard",
-    );
-  });
-
-  it("returns a nonempty fallback and bounds titles by Unicode code points", () => {
-    expect(sessionTitleFallback("\u0000\u202e\t")).toBe(NEW_SESSION_TITLE_FALLBACK);
-    const title = sessionTitleFallback(`🙂${"é".repeat(80)}`);
-    expect(Array.from(title)).toHaveLength(NEW_SESSION_TITLE_MAX_LENGTH);
-    expect(title.startsWith("🙂é")).toBe(true);
-  });
-
-  it("derives bounded thread titles from the first prompt line", () => {
-    expect(threadTitleFallback("  Review the parser edge cases\nIgnore this line"))
-      .toBe("Review the parser edge cases");
-    expect(threadTitleFallback("\u0000\u202e\t")).toBe(NEW_THREAD_TITLE_FALLBACK);
-    expect(Array.from(threadTitleFallback(`🙂${"é".repeat(80)}`)))
-      .toHaveLength(NEW_SESSION_TITLE_MAX_LENGTH);
   });
 
   it("prefers a valid thinking_level schema and reports its enum and default", () => {
@@ -584,6 +557,7 @@ describe("new session model", () => {
         thinking: "low",
         permissionMode: "ask",
       },
+      modelOptions: {},
       modes: [{ ...mode(), id: "review" }],
       providers: providers("provider/default"),
       selectableModels: [selectedModel],
@@ -626,6 +600,7 @@ describe("new session model", () => {
         thinking: "high",
         permissionMode: "yolo",
       },
+      modelOptions: {},
       modes: [mode("provider/fallback")],
       providers: providers("provider/fallback"),
       selectableModels: [model({}, "provider/fallback")],
@@ -653,6 +628,7 @@ describe("new session model", () => {
         thinking: "high",
         permissionMode: "ask",
       },
+      modelOptions: {},
       edits: { ...createNewThreadOptionEdits(), permission: true },
       modes: [mode("provider/fallback")],
       providers: providers("provider/fallback"),
@@ -669,6 +645,45 @@ describe("new session model", () => {
     })).toEqual({
       session_id: "session-1",
       title: "Fallback title",
+      permission_mode: "ask",
+    });
+  });
+
+  it("pins the model when degraded metadata retains model-specific options", () => {
+    const selectedModel = model({
+      properties: {
+        temperature: { type: "number", minimum: 0, maximum: 1 },
+      },
+    }, "provider/selected");
+    const snapshot = snapshotNewSessionSubmission({
+      selections: {
+        modeId: "code",
+        modelId: selectedModel.id,
+        thinking: "",
+        permissionMode: "ask",
+      },
+      modelOptions: changeModelOption({}, {
+        key: "temperature",
+        value: { value: 0.25, source: "0.25" },
+      }),
+      edits: createNewThreadOptionEdits(),
+      modes: [mode(selectedModel.id)],
+      providers: providers(selectedModel.id),
+      selectableModels: [selectedModel],
+      inheritedThinking: undefined,
+      inheritedPermissionMode: undefined,
+      optionsAuthoritative: false,
+    });
+
+    expect(createNewSessionThreadRequestFromSnapshot({
+      sessionId: "session-1",
+      title: "Thread",
+      snapshot,
+    })).toEqual({
+      session_id: "session-1",
+      title: "Thread",
+      model: selectedModel.id,
+      model_options: { temperature: 0.25 },
       permission_mode: "ask",
     });
   });
@@ -725,6 +740,7 @@ describe("new session model", () => {
         thinking: "",
         permissionMode: "ask",
       },
+      modelOptions: {},
       edits: createNewThreadOptionEdits(),
       modes: [mode()],
       providers: providers("provider/model"),
@@ -815,10 +831,11 @@ describe("new session model", () => {
     ).modelId).toBe("cursor/default");
   });
 
-  it("chooses an explicit base, repository default, unavailable default, then conventional trunks", () => {
+  it("chooses an explicit base, repository default, then conventional trunks", () => {
     expect(resolveNewSessionBaseRef(["feature", "master", "main"], "", "main")).toBe("main");
     expect(resolveNewSessionBaseRef(["feature", "master", "main"], "master", "main")).toBe("master");
-    expect(resolveNewSessionBaseRef(["feature", "master", "main"], "", "deadbeef")).toBe("HEAD");
+    expect(resolveNewSessionBaseRef(["feature", "master", "main"], "", "deadbeef")).toBe("main");
+    expect(resolveNewSessionBaseRef(["feature", "master"], "", "deadbeef")).toBe("master");
     expect(resolveNewSessionBaseRef(["feature", "main"])).toBe("main");
     expect(resolveNewSessionBaseRef(["feature", "master"])).toBe("master");
     expect(resolveNewSessionBaseRef(["feature"])).toBe("HEAD");
@@ -866,6 +883,88 @@ describe("new session model", () => {
     })).toEqual({
       session_id: "session-1",
       mode: "code",
+    });
+  });
+
+  it("restores inherited thinking provenance when an override returns to default", () => {
+    const reset = applyNewSessionModelOptionChange({
+      modelOptions: { effort: "low" },
+      thinking: "low",
+      inheritedThinking: undefined,
+      change: { key: "effort", value: undefined },
+      defaults: { thinking: "high", inheritedThinking: "high" },
+    });
+    expect(reset).toEqual({
+      modelOptions: {},
+      thinking: "high",
+      inheritedThinking: "high",
+      thinkingEdit: false,
+    });
+
+    const modelInfo = model({
+      properties: {
+        effort: { type: "string", enum: ["low", "high"], default: "low" },
+      },
+    });
+    expect(createNewSessionThreadRequest({
+      sessionId: "session-1",
+      thinking: reset.thinking,
+      ...(reset.inheritedThinking === undefined
+        ? {}
+        : { inheritedThinking: reset.inheritedThinking }),
+      modelOptions: reset.modelOptions,
+      modelInfo,
+    })).toEqual({ session_id: "session-1" });
+  });
+
+  it("keeps unrelated model options without pinning reset thinking across refreshes", () => {
+    const reset = applyNewSessionModelOptionChange({
+      modelOptions: changeModelOption(
+        { effort: "low" },
+        { key: "temperature", value: { value: 0.7, source: "0.7" } },
+      ),
+      thinking: "low",
+      inheritedThinking: undefined,
+      change: { key: "effort", value: undefined },
+      defaults: { thinking: "high", inheritedThinking: "high" },
+    });
+    expect(reset).toEqual({
+      modelOptions: { temperature: 0.7 },
+      thinking: "high",
+      inheritedThinking: "high",
+      thinkingEdit: false,
+    });
+
+    const modelInfo = model({
+      properties: {
+        effort: { type: "string", enum: ["low", "high"], default: "low" },
+        temperature: { type: "number", minimum: 0, maximum: 1 },
+      },
+    });
+    const refreshed = reconcileNewThreadDefaults(
+      {
+        modeId: "code",
+        modelId: modelInfo.id,
+        thinking: reset.thinking,
+        permissionMode: "ask",
+      },
+      [{ ...mode(modelInfo.id), default_thinking_level: "low" }],
+      [modelInfo],
+      providers(modelInfo.id),
+      { ...createNewThreadOptionEdits(), thinking: reset.thinkingEdit },
+    );
+    expect(refreshed).toMatchObject({ thinking: "low", inheritedThinking: "low" });
+    expect(createNewSessionThreadRequest({
+      sessionId: "session-1",
+      thinking: refreshed.thinking,
+      ...(refreshed.inheritedThinking === undefined
+        ? {}
+        : { inheritedThinking: refreshed.inheritedThinking }),
+      modelOptions: reset.modelOptions,
+      modelInfo,
+    })).toEqual({
+      session_id: "session-1",
+      model_options: { temperature: 0.7 },
     });
   });
 

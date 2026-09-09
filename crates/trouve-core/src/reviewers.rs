@@ -17,6 +17,7 @@ fn built_in(id: &str, name: &str, prompt: &str) -> ReviewerProfile {
         prompt: prompt.into(),
         model: None,
         default_thinking_level: None,
+        model_options: Default::default(),
         built_in: true,
     }
 }
@@ -112,6 +113,7 @@ pub fn persona_as_reviewer(persona: &AgentPersona, built_in: bool) -> ReviewerPr
         prompt: persona.system_prompt.clone(),
         model: persona.default_model.clone(),
         default_thinking_level: persona.default_thinking_level.clone(),
+        model_options: Default::default(),
         built_in,
     }
 }

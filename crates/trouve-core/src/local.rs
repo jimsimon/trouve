@@ -25,9 +25,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use trouve_protocol::LocalGpu;
-use trouve_providers::Provider;
+use trouve_providers::{InferencePriority, Provider};
+
+const BACKGROUND_ADMISSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 // --- curated catalog ---------------------------------------------------------
 
@@ -117,30 +120,6 @@ pub const CATALOG: &[CatalogEntry] = &[
         notes: "Only 3B active parameters — usable even on CPU with enough RAM.",
     },
 ];
-
-/// Dedicated session-title model. It is intentionally absent from the local
-/// coding-model catalog: the title sidecar has its own lifecycle and never
-/// appears in thread model pickers.
-pub const TITLE_MODEL_ID: &str = "qwen3-title-1.7b-q4-k-m";
-pub const TITLE_MODEL_CONTEXT: u64 = 2_048;
-pub const TITLE_MODEL_SHA256: &str =
-    "d2387ca2dbfee2ffabce7120d3770dadca0b293052bc2f0e138fdc940d9bc7b5";
-pub const TITLE_MODEL_LICENSE: &str = "Apache-2.0";
-pub(crate) const LEGACY_TITLE_MODEL_FILES: &[&str] =
-    &["qwen2.5-0.5b-instruct-q4_k_m.gguf", "Qwen3-0.6B-Q8_0.gguf"];
-
-pub fn title_model_entry() -> ModelEntry {
-    ModelEntry {
-        id: TITLE_MODEL_ID.into(),
-        display_name: "Session naming model".into(),
-        repo: "ggml-org/Qwen3-1.7B-GGUF".into(),
-        file: "Qwen3-1.7B-Q4_K_M.gguf".into(),
-        size_bytes: 1_282_439_264,
-        params: "1.7B".into(),
-        notes: format!("Balanced-quality dedicated session-title model ({TITLE_MODEL_LICENSE})"),
-        custom: false,
-    }
-}
 
 // --- user-added models -------------------------------------------------------
 
@@ -792,6 +771,135 @@ fn kill_pid(pid: u32) {
     }
 }
 
+#[derive(Default)]
+struct LocalInferenceScheduler {
+    state: std::sync::Mutex<LocalInferenceSchedulerState>,
+    changed: tokio::sync::Notify,
+}
+
+#[derive(Default)]
+struct LocalInferenceSchedulerState {
+    active: bool,
+    foreground_waiters: usize,
+}
+
+struct LocalInferenceLease {
+    scheduler: Arc<LocalInferenceScheduler>,
+}
+
+impl Drop for LocalInferenceLease {
+    fn drop(&mut self) {
+        self.scheduler.state.lock().unwrap().active = false;
+        self.scheduler.changed.notify_waiters();
+    }
+}
+
+struct ForegroundWaiter {
+    scheduler: Arc<LocalInferenceScheduler>,
+    registered: bool,
+}
+
+impl ForegroundWaiter {
+    fn register(scheduler: Arc<LocalInferenceScheduler>) -> Self {
+        scheduler.state.lock().unwrap().foreground_waiters += 1;
+        Self {
+            scheduler,
+            registered: true,
+        }
+    }
+
+    fn admitted(&mut self) {
+        if !self.registered {
+            return;
+        }
+        self.scheduler.state.lock().unwrap().foreground_waiters -= 1;
+        self.registered = false;
+    }
+}
+
+impl Drop for ForegroundWaiter {
+    fn drop(&mut self) {
+        if !self.registered {
+            return;
+        }
+        self.scheduler.state.lock().unwrap().foreground_waiters -= 1;
+        self.scheduler.changed.notify_waiters();
+    }
+}
+
+impl LocalInferenceScheduler {
+    async fn acquire(self: &Arc<Self>, priority: InferencePriority) -> Result<LocalInferenceLease> {
+        match priority {
+            InferencePriority::Foreground => self.acquire_foreground().await,
+            InferencePriority::Background => {
+                tokio::time::timeout(BACKGROUND_ADMISSION_TIMEOUT, self.acquire_background())
+                    .await
+                    .map_err(|_| {
+                        anyhow::anyhow!("local naming waited five minutes for inference capacity")
+                    })
+            }
+        }
+    }
+
+    async fn acquire_foreground(self: &Arc<Self>) -> Result<LocalInferenceLease> {
+        self.acquire_foreground_after_check(|| {}).await
+    }
+
+    async fn acquire_foreground_after_check(
+        self: &Arc<Self>,
+        mut after_check: impl FnMut(),
+    ) -> Result<LocalInferenceLease> {
+        let mut waiter = ForegroundWaiter::register(self.clone());
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            // Notify::notify_waiters does not retain a permit. Register this
+            // waiter before inspecting the predicate so a release in the
+            // check-to-await gap cannot be lost.
+            changed.as_mut().enable();
+            {
+                let mut state = self.state.lock().unwrap();
+                if !state.active {
+                    state.active = true;
+                    drop(state);
+                    waiter.admitted();
+                    return Ok(LocalInferenceLease {
+                        scheduler: self.clone(),
+                    });
+                }
+            }
+            after_check();
+            changed.await;
+        }
+    }
+
+    async fn acquire_background(self: &Arc<Self>) -> LocalInferenceLease {
+        self.acquire_background_after_check(|| {}).await
+    }
+
+    async fn acquire_background_after_check(
+        self: &Arc<Self>,
+        mut after_check: impl FnMut(),
+    ) -> LocalInferenceLease {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            {
+                let mut state = self.state.lock().unwrap();
+                if !state.active && state.foreground_waiters == 0 {
+                    state.active = true;
+                    return LocalInferenceLease {
+                        scheduler: self.clone(),
+                    };
+                }
+            }
+            after_check();
+            changed.await;
+        }
+    }
+}
+
 struct Running {
     model_id: String,
     port: u16,
@@ -808,38 +916,11 @@ pub enum ServerState {
     Running(String),
 }
 
-fn effective_title_resources(
-    configured: trouve_protocol::TitleModelResourcePolicy,
-    local_model_active: bool,
-) -> trouve_protocol::TitleModelResourcePolicy {
-    match configured {
-        trouve_protocol::TitleModelResourcePolicy::Adaptive if local_model_active => {
-            trouve_protocol::TitleModelResourcePolicy::CpuRamOnly
-        }
-        trouve_protocol::TitleModelResourcePolicy::Adaptive => {
-            trouve_protocol::TitleModelResourcePolicy::GpuCpuRam
-        }
-        policy => policy,
-    }
-}
-
-fn title_resource_args(
-    resources: trouve_protocol::TitleModelResourcePolicy,
-) -> &'static [&'static str] {
-    match resources {
-        trouve_protocol::TitleModelResourcePolicy::CpuRamOnly => &["-ngl", "0", "--device", "none"],
-        trouve_protocol::TitleModelResourcePolicy::GpuOnly => &["-ngl", "all", "--fit", "off"],
-        trouve_protocol::TitleModelResourcePolicy::GpuCpuRam => &[],
-        trouve_protocol::TitleModelResourcePolicy::Adaptive => {
-            unreachable!("adaptive title resources must be resolved before launch")
-        }
-    }
-}
-
 /// Owns the single llama-server sidecar. One model is loaded at a time;
 /// asking for a different model stops the old server and starts a new one.
 pub struct LlamaManager {
     inner: tokio::sync::Mutex<Option<Running>>,
+    scheduler: Arc<LocalInferenceScheduler>,
     state: std::sync::Mutex<ServerState>,
     /// Pidfile tracking spawned servers across app runs (crash recovery).
     pids: PathBuf,
@@ -847,18 +928,6 @@ pub struct LlamaManager {
     effective_contexts: std::sync::Mutex<std::collections::HashMap<String, u64>>,
     /// Hardware probe shared by local model launches.
     hardware: std::sync::OnceLock<Hardware>,
-    /// A fixed context for special-purpose sidecars; coding models use an
-    /// adaptive context derived from model metadata and available hardware.
-    context: Option<u64>,
-    /// Present only for the dedicated title sidecar.
-    title_resources: Option<std::sync::RwLock<trouve_protocol::TitleModelResourcePolicy>>,
-    /// Adaptive title placement avoids the GPU while the local coding-model
-    /// sidecar is loading or running.
-    adaptive_peer: Option<std::sync::Weak<LlamaManager>>,
-    /// The coding-model manager uses this to evict an adaptive title sidecar
-    /// from the GPU before beginning a local-model load.
-    adaptive_title:
-        std::sync::Mutex<Option<std::sync::Weak<crate::title_model::TitleModelManager>>>,
 }
 
 /// Restores an honest stopped state if a caller cancels `ensure` while the
@@ -881,57 +950,15 @@ impl LlamaManager {
     /// run that ended without cleanup (crash/SIGKILL) — leaked servers keep
     /// multi-GB VRAM allocations alive and starve the next load.
     pub fn new(data_dir: &Path) -> Self {
-        Self::configured(data_dir, "llama-server.pids", None, None, None)
-    }
-
-    /// Independent short-context sidecar used only for session title
-    /// generation.
-    pub fn title(
-        data_dir: &Path,
-        resources: trouve_protocol::TitleModelResourcePolicy,
-        local_model: std::sync::Weak<LlamaManager>,
-    ) -> Self {
-        Self::configured(
-            data_dir,
-            "title-llama-server.pids",
-            Some(TITLE_MODEL_CONTEXT),
-            Some(resources),
-            Some(local_model),
-        )
-    }
-
-    fn configured(
-        data_dir: &Path,
-        pidfile: &str,
-        context: Option<u64>,
-        title_resources: Option<trouve_protocol::TitleModelResourcePolicy>,
-        adaptive_peer: Option<std::sync::Weak<LlamaManager>>,
-    ) -> Self {
-        let pids = data_dir.join(pidfile);
+        let pids = data_dir.join("llama-server.pids");
         Self::reap_stale(&pids, data_dir);
         Self {
             inner: tokio::sync::Mutex::new(None),
+            scheduler: Arc::new(LocalInferenceScheduler::default()),
             state: std::sync::Mutex::new(ServerState::Stopped),
             pids,
             effective_contexts: std::sync::Mutex::new(std::collections::HashMap::new()),
             hardware: std::sync::OnceLock::new(),
-            context,
-            title_resources: title_resources.map(std::sync::RwLock::new),
-            adaptive_peer,
-            adaptive_title: std::sync::Mutex::new(None),
-        }
-    }
-
-    pub(crate) fn set_adaptive_title(
-        &self,
-        title_model: std::sync::Weak<crate::title_model::TitleModelManager>,
-    ) {
-        *self.adaptive_title.lock().unwrap() = Some(title_model);
-    }
-
-    pub fn set_title_resources(&self, resources: trouve_protocol::TitleModelResourcePolicy) {
-        if let Some(current) = &self.title_resources {
-            *current.write().unwrap() = resources;
         }
     }
 
@@ -1018,8 +1045,6 @@ impl LlamaManager {
         log_path: &Path,
     ) -> Result<String> {
         let mut inner = self.inner.lock().await;
-        let activating_local_model =
-            self.title_resources.is_none() && self.state() == ServerState::Stopped;
         if let Some(running) = inner.as_mut() {
             // try_wait: a crashed server should be restarted, not reused.
             if running.model_id == model_id && running.child.try_wait()?.is_none() {
@@ -1035,12 +1060,6 @@ impl LlamaManager {
             manager: self,
             armed: true,
         };
-        if activating_local_model {
-            let adaptive_title = self.adaptive_title.lock().unwrap().clone();
-            if let Some(title_model) = adaptive_title.and_then(|manager| manager.upgrade()) {
-                title_model.yield_to_local_model().await;
-            }
-        }
         match self.spawn_and_wait(bin, gguf, log_path).await {
             Ok((port, child, context_window)) => {
                 if context_window > 0 {
@@ -1058,16 +1077,7 @@ impl LlamaManager {
                 });
                 Ok(format!("http://127.0.0.1:{port}/v1"))
             }
-            Err(error) => {
-                if activating_local_model {
-                    let adaptive_title = self.adaptive_title.lock().unwrap().clone();
-                    if let Some(title_model) = adaptive_title.and_then(|manager| manager.upgrade())
-                    {
-                        title_model.local_model_stopped().await;
-                    }
-                }
-                Err(error)
-            }
+            Err(error) => Err(error),
         }
     }
 
@@ -1079,14 +1089,21 @@ impl LlamaManager {
         gguf: &Path,
         log_path: &Path,
     ) -> Result<(u16, tokio::process::Child, u64)> {
-        let requested_context = self.context.unwrap_or_else(|| {
-            let native_context = model_metadata(gguf).context_window;
-            let model_size = std::fs::metadata(gguf)
-                .map(|metadata| metadata.len())
-                .unwrap_or(0);
-            let hardware = self.hardware.get_or_init(probe_hardware);
-            launch_context(native_context, model_size, hardware)
-        });
+        let native_context = model_metadata(gguf).context_window;
+        let model_size = std::fs::metadata(gguf)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        if self.hardware.get().is_none() {
+            let hardware = tokio::task::spawn_blocking(probe_hardware)
+                .await
+                .unwrap_or_default();
+            let _ = self.hardware.set(hardware);
+        }
+        let hardware = self
+            .hardware
+            .get()
+            .expect("hardware is initialized before llama-server launch");
+        let requested_context = launch_context(native_context, model_size, hardware);
         let port = free_port()?;
         let log = std::fs::File::create(log_path)
             .with_context(|| format!("creating {}", log_path.display()))?;
@@ -1111,43 +1128,6 @@ impl LlamaManager {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::from(log))
             .kill_on_drop(true);
-        if let Some(resources) = &self.title_resources {
-            // Title generation is serialized, so a single slot keeps the
-            // shared prompt prefix hot without provisioning unused parallel
-            // slots.
-            cmd.args(["-np", "1", "--cache-prompt", "--no-ui"]);
-
-            let configured = *resources.read().unwrap();
-            let local_model_active = self
-                .adaptive_peer
-                .as_ref()
-                .and_then(std::sync::Weak::upgrade)
-                .is_some_and(|manager| manager.state() != ServerState::Stopped);
-            let effective = effective_title_resources(configured, local_model_active);
-            match effective {
-                trouve_protocol::TitleModelResourcePolicy::CpuRamOnly => {
-                    // `-ngl 0` prevents layer offload; `--device none` also
-                    // disables backend operations that can otherwise still
-                    // touch Vulkan, Metal, or another accelerator.
-                }
-                trouve_protocol::TitleModelResourcePolicy::GpuOnly => {
-                    let hardware = self.hardware.get_or_init(probe_hardware);
-                    if hardware.gpus.is_empty() {
-                        bail!("GPU-only session naming requires a detected GPU");
-                    }
-                    // Disable llama.cpp's fit adjustment so an undersized GPU
-                    // fails instead of silently spilling model layers to RAM.
-                }
-                trouve_protocol::TitleModelResourcePolicy::GpuCpuRam => {
-                    // llama.cpp's defaults auto-fit layers to currently free
-                    // VRAM and spill the remainder to CPU/system RAM.
-                }
-                trouve_protocol::TitleModelResourcePolicy::Adaptive => {
-                    unreachable!("adaptive title resources are resolved above")
-                }
-            }
-            cmd.args(title_resource_args(effective));
-        }
         // The release tarballs carry their shared libraries next to the
         // binary; rpath usually covers it, but belt and braces.
         if let Some(dir) = bin.parent() {
@@ -1386,6 +1366,9 @@ impl Provider for LocalProvider {
                     // llama.cpp's --jinja path provides native or generic
                     // OpenAI-style function calling for chat models.
                     supports_tools: true,
+                    // Managed local entries currently install only a GGUF;
+                    // multimodal models also require an mmproj companion.
+                    supports_images: false,
                     input_price_per_mtok: Some(0.0),
                     output_price_per_mtok: Some(0.0),
                     options_schema: options_schema(metadata.thinking),
@@ -1400,6 +1383,24 @@ impl Provider for LocalProvider {
         messages: &[trouve_providers::Message],
         tools: &[trouve_providers::ToolSpec],
         options: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<trouve_providers::EventStream, trouve_providers::ProviderError> {
+        self.stream_chat_with_priority(
+            model,
+            messages,
+            tools,
+            options,
+            InferencePriority::Foreground,
+        )
+        .await
+    }
+
+    async fn stream_chat_with_priority(
+        &self,
+        model: &str,
+        messages: &[trouve_providers::Message],
+        tools: &[trouve_providers::ToolSpec],
+        options: &serde_json::Map<String, serde_json::Value>,
+        priority: InferencePriority,
     ) -> Result<trouve_providers::EventStream, trouve_providers::ProviderError> {
         use trouve_providers::ProviderError;
         let entry = all_entries(self.config_dir.as_deref())
@@ -1420,6 +1421,12 @@ impl Provider for LocalProvider {
                     .into(),
             )
         })?;
+        let lease = self
+            .manager
+            .scheduler
+            .acquire(priority)
+            .await
+            .map_err(|error| ProviderError::Request(error.to_string()))?;
         let log_path = self.data_dir.join("llama-server.log");
         let base_url = self
             .manager
@@ -1435,13 +1442,143 @@ impl Provider for LocalProvider {
         // Thinking knobs travel as template kwargs, not top-level fields.
         let mut options = options.clone();
         apply_thinking_options(metadata.thinking, &mut options);
-        inner.stream_chat(model, messages, tools, &options).await
+        let stream = inner.stream_chat(model, messages, tools, &options).await?;
+        Ok(stream
+            .map(move |event| {
+                let _keep_lease_alive = &lease;
+                event
+            })
+            .boxed())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn foreground_inference_jumps_a_waiting_naming_request() {
+        let scheduler = Arc::new(LocalInferenceScheduler::default());
+        let active = scheduler
+            .acquire(InferencePriority::Foreground)
+            .await
+            .unwrap();
+
+        let (background_acquired_tx, mut background_acquired_rx) = tokio::sync::mpsc::channel(1);
+        let (release_background_tx, release_background_rx) = tokio::sync::oneshot::channel();
+        let background_scheduler = scheduler.clone();
+        let background = tokio::spawn(async move {
+            let lease = background_scheduler
+                .acquire(InferencePriority::Background)
+                .await
+                .unwrap();
+            background_acquired_tx.send(()).await.unwrap();
+            let _ = release_background_rx.await;
+            drop(lease);
+        });
+        tokio::task::yield_now().await;
+
+        let (foreground_acquired_tx, mut foreground_acquired_rx) = tokio::sync::mpsc::channel(1);
+        let (release_foreground_tx, release_foreground_rx) = tokio::sync::oneshot::channel();
+        let foreground_scheduler = scheduler.clone();
+        let foreground = tokio::spawn(async move {
+            let lease = foreground_scheduler
+                .acquire(InferencePriority::Foreground)
+                .await
+                .unwrap();
+            foreground_acquired_tx.send(()).await.unwrap();
+            let _ = release_foreground_rx.await;
+            drop(lease);
+        });
+        tokio::task::yield_now().await;
+
+        drop(active);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            foreground_acquired_rx.recv(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(background_acquired_rx.try_recv().is_err());
+
+        release_foreground_tx.send(()).unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            background_acquired_rx.recv(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        release_background_tx.send(()).unwrap();
+        foreground.await.unwrap();
+        background.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_foreground_waiter_does_not_starve_naming() {
+        let scheduler = Arc::new(LocalInferenceScheduler::default());
+        let active = scheduler
+            .acquire(InferencePriority::Foreground)
+            .await
+            .unwrap();
+        let waiting_scheduler = scheduler.clone();
+        let waiter = tokio::spawn(async move {
+            waiting_scheduler
+                .acquire(InferencePriority::Foreground)
+                .await
+        });
+        tokio::task::yield_now().await;
+        waiter.abort();
+        let _ = waiter.await;
+        assert_eq!(scheduler.state.lock().unwrap().foreground_waiters, 0);
+
+        drop(active);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            scheduler.acquire(InferencePriority::Background),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn release_between_state_check_and_wait_wakes_both_priorities() {
+        let scheduler = Arc::new(LocalInferenceScheduler::default());
+        let active = scheduler
+            .acquire(InferencePriority::Foreground)
+            .await
+            .unwrap();
+        let active = Arc::new(std::sync::Mutex::new(Some(active)));
+        let foreground = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            scheduler.acquire_foreground_after_check({
+                let active = active.clone();
+                move || drop(active.lock().unwrap().take())
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        drop(foreground);
+
+        let active = scheduler
+            .acquire(InferencePriority::Foreground)
+            .await
+            .unwrap();
+        let active = Arc::new(std::sync::Mutex::new(Some(active)));
+        let background = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            scheduler.acquire_background_after_check({
+                let active = active.clone();
+                move || drop(active.lock().unwrap().take())
+            }),
+        )
+        .await
+        .unwrap();
+        drop(background);
+    }
 
     #[test]
     fn catalog_ids_are_unique_and_sane() {
@@ -1490,31 +1627,6 @@ mod tests {
         let ceiling = launch_context(1_000_000, model_size, &hw);
         assert!(ceiling < 1_000_000);
         assert_eq!(launch_context(4_096, model_size, &hw), 4_096);
-    }
-
-    #[test]
-    fn adaptive_title_resources_avoid_an_active_local_model() {
-        use trouve_protocol::TitleModelResourcePolicy::{Adaptive, CpuRamOnly, GpuCpuRam};
-
-        assert_eq!(effective_title_resources(Adaptive, false), GpuCpuRam);
-        assert_eq!(effective_title_resources(Adaptive, true), CpuRamOnly);
-        assert_eq!(effective_title_resources(GpuCpuRam, true), GpuCpuRam);
-        assert_eq!(effective_title_resources(CpuRamOnly, false), CpuRamOnly);
-    }
-
-    #[test]
-    fn title_resource_arguments_enforce_strict_modes() {
-        use trouve_protocol::TitleModelResourcePolicy::{CpuRamOnly, GpuCpuRam, GpuOnly};
-
-        assert_eq!(
-            title_resource_args(CpuRamOnly),
-            ["-ngl", "0", "--device", "none"]
-        );
-        assert_eq!(
-            title_resource_args(GpuOnly),
-            ["-ngl", "all", "--fit", "off"]
-        );
-        assert!(title_resource_args(GpuCpuRam).is_empty());
     }
 
     #[test]
@@ -1574,10 +1686,7 @@ mod tests {
     #[test]
     fn runtime_bin_requires_an_active_managed_install() {
         let tmp = tempfile::tempdir().unwrap();
-        let stable = trouve_agents::install::managed_bin(
-            tmp.path(),
-            trouve_agents::install::CliId::LlamaServer,
-        );
+        let stable = tmp.path().join("cli/bin/llama-server");
         std::fs::create_dir_all(stable.parent().unwrap()).unwrap();
         std::fs::write(&stable, b"unregistered llama-server").unwrap();
 
@@ -1600,7 +1709,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(runtime_bin(tmp.path()), Some(binary));
+        assert_eq!(
+            runtime_bin(tmp.path()),
+            Some(std::fs::canonicalize(binary).unwrap())
+        );
     }
 
     #[test]

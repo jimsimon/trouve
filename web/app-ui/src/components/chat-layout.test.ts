@@ -76,6 +76,31 @@ describe("buildChatLayout", () => {
     });
   });
 
+  it("omits reasoning nodes whose body is empty", () => {
+    const items: ThreadChatItem[] = [
+      { id: "u4", kind: "user", turn: 4, content: "Inspect it", attachments: [] },
+      { id: "empty", kind: "thinking", turn: 4, content: "", complete: true },
+      { id: "blank", kind: "thinking", turn: 4, content: " \n\t", complete: false },
+      { id: "body", kind: "thinking", turn: 4, content: "Found it.", complete: true },
+    ];
+
+    const layout = buildChatLayout(items);
+    expect(layout.units).toHaveLength(1);
+    expect(layout.units[0]?.items).toEqual([items[3]]);
+    expect(layout.unitIdForItem.has("empty")).toBe(false);
+    expect(layout.unitIdForItem.has("blank")).toBe(false);
+    expect(layout.unitIdForItem.get("body")).toBe("turn:4");
+  });
+
+  it("does not create a transcript row for an orphaned empty reasoning node", () => {
+    const layout = buildChatLayout([
+      { id: "empty", kind: "thinking", turn: 4, content: "", complete: true },
+    ]);
+
+    expect(layout.units).toEqual([]);
+    expect(layout.unitIdForItem.size).toBe(0);
+  });
+
   it("keeps compaction between adjacent work runs in the same agent card", () => {
     const items: ThreadChatItem[] = [
       { id: "u1", kind: "user", turn: 4, content: "Continue", attachments: [] },

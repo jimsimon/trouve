@@ -36,7 +36,9 @@ describe("new thread setup component contract", () => {
     expect(component).toContain("<trouve-model-picker");
     expect(component).toContain(".value=${this.#draft.modelId}");
     expect(component).toContain("@trouve-model-picked=${this.#modelPicked}");
-    expect(component).toContain('name="thinking"');
+    expect(component).toContain("<trouve-model-options-editor");
+    expect(component).toContain(".controls=${modelOptions}");
+    expect(component).toContain("@trouve-model-option-changed=${this.#modelOptionChanged}");
     expect(component).toContain('name="permission_mode"');
     expect(component).not.toContain("Default mode");
     expect(component).not.toContain("Mode or server default");
@@ -96,5 +98,12 @@ describe("new thread setup component contract", () => {
     expect(component).toContain("var(--trouve-win-bg)");
     expect(component).toContain("var(--trouve-accent)");
     expect(component).toContain("var(--trouve-err)");
+  });
+
+  it("clears a stale submission error after a model option changes", () => {
+    const start = component.indexOf("readonly #modelOptionChanged");
+    const handler = component.slice(start, component.indexOf("readonly #permissionChanged", start));
+    expect(handler).toContain("changeModelOption(this.#draft.modelOptions, event.detail)");
+    expect(handler).toContain('this.#internalError = "";');
   });
 });

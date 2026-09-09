@@ -16,6 +16,10 @@ export type ReviewStatus =
   | "cancelled"
   | "stale";
 export type StatsRange = "hour" | "day" | "week" | "month" | "year" | "all";
+export type ModelOptionValue = string | number | boolean;
+/** Non-thinking model options (for example `fast`); thinking keeps its
+ * dedicated `*_thinking_level` field. */
+export type ModelOptions = Record<string, ModelOptionValue>;
 
 export interface GithubAppStatus {
   configured: boolean;
@@ -24,6 +28,7 @@ export interface GithubAppStatus {
   bot_login: string;
   webhook_configured: boolean;
   checks_write_configured: boolean;
+  contents_write_configured?: boolean;
   check_run_webhook_configured: boolean;
   installation_count: number;
   last_poll_at?: string;
@@ -36,6 +41,7 @@ export interface ReviewerOverride {
   reviewer_id: string;
   model?: string;
   thinking_level?: string;
+  model_options?: ModelOptions;
   prompt_mode: "inherit" | "append" | "replace";
   prompt: string;
 }
@@ -58,6 +64,11 @@ export interface Repository {
   coordinator_thinking_level?: string;
   router_model?: string;
   router_thinking_level?: string;
+  analyst_model?: string;
+  analyst_thinking_level?: string;
+  coordinator_model_options?: ModelOptions;
+  router_model_options?: ModelOptions;
+  analyst_model_options?: ModelOptions;
   prompt: string;
   reviewer_ids: string[];
   routing_mode: RoutingMode;
@@ -82,7 +93,6 @@ export interface ReviewJob {
   pull_url: string;
   head_sha: string;
   review_base_sha?: string;
-  review_watermark_sha?: string;
   base_ref: string;
   head_ref: string;
   scope: ReviewScope;
@@ -94,6 +104,11 @@ export interface ReviewJob {
   coordinator_thinking_level?: string;
   router_model?: string;
   router_thinking_level?: string;
+  analyst_model?: string;
+  analyst_thinking_level?: string;
+  coordinator_model_options?: ModelOptions;
+  router_model_options?: ModelOptions;
+  analyst_model_options?: ModelOptions;
   reviewer_ids: string[];
   routing_mode: RoutingMode;
   semantic_routing: boolean;
@@ -112,6 +127,9 @@ export interface ReviewJob {
   issue_count: number;
   fixed_issue_count: number;
   open_issue_count?: number | null;
+  advisory_open_issue_count?: number | null;
+  legacy_coverage_pending?: boolean;
+  legacy_coverage_exhausted?: boolean;
   error: string;
   created_at: string;
   started_at?: string;
@@ -127,7 +145,7 @@ export interface ReviewJob {
 export interface ReviewTask {
   id: string;
   job_id: string;
-  role: "router" | "reviewer" | "coordinator";
+  role: "router" | "analyst" | "reviewer" | "coordinator";
   reviewer_id?: string;
   reviewer_name: string;
   batch_index: number;
@@ -225,6 +243,9 @@ export interface Finding {
   title: string;
   body: string;
   prompt_for_agents: string;
+  /** `open`, `advisory`, `fixed`, or `dismissed`. Advisory findings fell below
+   * the blocking bar when recorded: they never gate, are not posted to GitHub,
+   * and only feed later rounds as a dedupe/promotion ledger. */
   status: string;
   sources: FindingSource[];
   github_comment_id?: number;
@@ -250,6 +271,14 @@ export interface Finding {
   observed_head?: string;
   resolved_head?: string;
   resolved_by_job_id?: string;
+  thread_collapse?: ThreadCollapseState | null;
+}
+
+export interface ThreadCollapseState {
+  pending: boolean;
+  attempts?: number;
+  next_attempt_at?: string;
+  last_error?: string;
 }
 
 export interface ReviewTheme {
@@ -410,6 +439,13 @@ export interface ReviewStats {
   coordinator_duration: DurationStats;
   publication_duration: DurationStats;
   issue_count: number;
+  thread_collapse_backlog?: {
+    pending: number;
+    oldest_pending_minutes?: number | null;
+    failing?: number;
+    abandoned?: number;
+    last_error?: string;
+  } | null;
   churn?: {
     recurrence_issue_count: number;
     fix_regression_issue_count: number;

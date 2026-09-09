@@ -59,6 +59,12 @@ describe("renderMarkdown", () => {
     expect(rendered).not.toContain("<tag>");
     expect(rendered).toContain("&#x3C;tag>&#x26; value");
   });
+
+  it("keeps the mermaid fence class the diagram swap relies on", async () => {
+    const rendered = await renderMarkdown("```mermaid\ngraph TD\n  a --> b\n```");
+    expect(rendered).toContain('<pre><code class="language-mermaid">');
+    expect(rendered).not.toContain("<svg");
+  });
 });
 
 describe("renderMarkdownSafely", () => {

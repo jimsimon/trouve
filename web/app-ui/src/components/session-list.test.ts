@@ -1,11 +1,28 @@
 import { readFileSync } from "node:fs";
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
+import type { AppStore, SessionListItem } from "../state/app-store.js";
 import {
   sessionIndicatorPresentation,
   type SessionIndicatorFields,
 } from "../state/session-indicator-model.js";
+import { enrichWorkspaceSessions } from "./session-list.js";
+
+const session = (id: string, workspaceId: string): SessionListItem => ({
+  id,
+  workspaceId,
+  title: id,
+  branch: "main",
+  archived: false,
+  active: false,
+  attention: "none",
+  outcome: "idle",
+  latestThreadId: undefined,
+  updatedAt: "2026-08-22T00:00:00Z",
+  state: "idle",
+  unread: false,
+});
 
 describe("session list component contract", () => {
   const read = (path: string): string =>
@@ -14,15 +31,36 @@ describe("session list component contract", () => {
   const shell = read("../app/trouve-app.ts");
   const styles = read("../styles/app.css");
 
+  it("filters by workspace before deriving metadata and pull-request state", () => {
+    const sessionMetadata = vi.fn(() => undefined);
+    const sessionPullRequests = vi.fn(() => []);
+    const store = {
+      sessionMetadata,
+      sessionPullRequests,
+    } as unknown as Pick<AppStore, "sessionMetadata" | "sessionPullRequests">;
+
+    const enriched = enrichWorkspaceSessions(
+      store,
+      [session("se_first", "ws_first"), session("se_second", "ws_second")],
+      "ws_first",
+    );
+
+    expect(enriched.map(({ id }) => id)).toEqual(["se_first"]);
+    expect(sessionMetadata).toHaveBeenCalledOnce();
+    expect(sessionMetadata).toHaveBeenCalledWith("se_first");
+    expect(sessionPullRequests).toHaveBeenCalledOnce();
+    expect(sessionPullRequests).toHaveBeenCalledWith("se_first");
+  });
+
   it("renders archived sessions as a separate accessible disclosure", () => {
-    expect(component).toContain("groupWorkspaceSessions(sessions");
+    expect(component).toContain("organizeWorkspaceSessions(organizedSessions");
     expect(component).toContain("repeat(");
     expect(component).toContain("(session) => session.id");
-    expect(component).toContain('aria-label="Active sessions"');
+    expect(component).toContain('? "Active sessions" : `${section.label} sessions`');
     expect(component).toContain('class="archived-session-toggle"');
-    expect(component).toContain("aria-expanded=${groups.archivedExpanded}");
+    expect(component).toContain("aria-expanded=${archivedExpanded}");
     expect(component).toContain("aria-controls=${this.#archivedListId}");
-    expect(component).toContain("?hidden=${!groups.archivedExpanded}");
+    expect(component).toContain("?hidden=${!archivedExpanded}");
     expect(component).toContain("Archived (${groups.archived.length})");
     expect(styles).toContain(".archived-session-list .session-copy strong");
     expect(styles).toContain("var(--trouve-text-mid)");
@@ -35,28 +73,34 @@ describe("session list component contract", () => {
     expect(component).toContain("Status: ${sessionStatusText(session)}");
   });
 
-  it("keeps navigation sessions to one line without rendering branch names", () => {
+  it("keeps compact rows while optionally rendering branch names", () => {
     expect(component).toContain('<span class="session-copy">');
-    expect(component).toContain("<strong>${session.title}</strong>");
+    expect(component).toContain("titleGenerationWaiting(session.id)");
+    expect(component).toContain('class="naming-title-shimmer session-title-shimmer"');
+    expect(component).toContain("Naming session…");
+    expect(component).toContain('"title-waiting"');
+    expect(component).toContain('role="status"');
+    expect(component).toContain("SESSION_TITLE_WAITING_STATUS");
+    expect(styles).toContain(".title-waiting::after");
     expect(component).toContain("sessionAgePresentation(session.updatedAt, now)");
     expect(component).toContain('class="session-age"');
-    expect(component).not.toContain("session.branch");
-    expect(component).not.toContain("<small>");
+    expect(component).toContain("this.showBranches");
+    expect(component).toContain('class="session-branch"');
+    expect(component).toContain("${session.branch}");
     expect(styles).toMatch(/\.session-row-wrap \{[^}]*height:\s*34px/s);
     expect(styles).toMatch(/\.session-row \{[^}]*height:\s*34px/s);
+    expect(styles).toContain(".session-row-wrap.with-branch, .session-row.with-branch { height: 46px; }");
     expect(styles).toMatch(
       /\.session-copy strong \{[^}]*overflow:\s*hidden[^}]*text-overflow:\s*ellipsis[^}]*white-space:\s*nowrap/s,
     );
   });
 
-  it("keeps ages visible while revealing row actions only on interaction", () => {
+  it("keeps ages visible and opens row actions as a context menu", () => {
     expect(component).toContain("data-actions-open=${this.#menuSessionId === session.id}");
-    expect(styles).toMatch(
-      /@media \(hover: hover\) and \(pointer: fine\) \{[^}]*\.session-menu-button \{[^}]*opacity:\s*0[^}]*pointer-events:\s*none/s,
-    );
-    expect(styles).toContain(".session-row-wrap:hover .session-menu-button");
-    expect(styles).toContain(".session-row-wrap:focus-within .session-menu-button");
-    expect(styles).toContain(".session-row-wrap:hover .session-age");
+    expect(component).toContain("@contextmenu=${(event: MouseEvent) => this.#openContextMenu(event, session.id)}");
+    expect(component).toContain('event.key !== "ContextMenu"');
+    expect(component).toContain("event.shiftKey && event.key === \"F10\"");
+    expect(component).not.toContain("session-menu-button");
     expect(styles).toMatch(
       /\.session-copy strong \{[^}]*color:\s*var\(--trouve-text-mid\)/s,
     );
@@ -107,15 +151,19 @@ describe("session list component contract", () => {
     expect(shell).toContain('route.kind === "inbox" && recoverySession !== undefined');
   });
 
-  it("keeps actions in the compact popup and rename/delete in a modal", () => {
+  it("keeps actions in the contextual popup and rename/delete in a modal", () => {
     expect(component).toContain('class="session-actions"');
     expect(component).toContain('class="session-modal"');
     expect(component).toContain('dialog.showModal()');
     expect(component).toContain('>Rename session</h2>');
+    expect(component).toContain('generateSessionTitleSuggestion(sessionId, {');
+    expect(component).toContain('signal: abort.signal');
+    expect(component).toContain('? "Generating…" : "Generate"');
+    expect(component).toContain("You can still enter one manually.");
     expect(component).toContain('>Delete session “${this.#modalTitle}”?</h2>');
     expect(component).toContain("This removes the session's worktree, branch history in trouve, and its event log. The git branch itself is kept.");
     expect(styles).toMatch(
-      /\.session-actions \{[^}]*position: absolute;[^}]*width: 150px;/u,
+      /\.session-actions \{[^}]*position: fixed;[^}]*width: 150px;/u,
     );
     expect(styles).toContain('.session-modal { width: min(380px, calc(100vw - 32px));');
   });

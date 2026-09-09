@@ -12,7 +12,14 @@ const files = readdirSync(assets).map((name) => ({
   name,
   bytes: statSync(resolve(assets, name)).size,
 }));
-const javascript = files.filter(({ name }) => name.endsWith(".js"));
+// The Mermaid diagram engine is a single on-demand chunk (named by
+// `advancedChunks` in vite.config.ts) that is only fetched when a response
+// contains a `mermaid` fence. It carries ELK's compiled layout engine, so it
+// is budgeted on its own rather than folded into the always-reachable graph.
+const diagramEngine = files.find(({ name }) =>
+  name.startsWith("diagram-engine-") && name.endsWith(".js"));
+const javascript = files.filter(({ name }) =>
+  name.endsWith(".js") && name !== diagramEngine?.name);
 const styles = files.filter(({ name }) => name.endsWith(".css"));
 const fonts = files.filter(({ name }) => name.endsWith(".woff2"));
 const index = readFileSync(resolve(root, "index.html"), "utf8");
@@ -25,18 +32,50 @@ const worker = javascript.find(({ name }) => name.startsWith("content-worker-"))
 // presentation preference, and Font Awesome icon UI; the PWA remains on the
 // original entry ceiling. Font assets have their own explicit budget below.
 const entryLimit = mode === "desktop" ? 856_000 : 850_000;
-// The locked Vite/Rolldown graph emits 3,209,266 B with the evidence-backed
-// review-history, churn-metrics, durable turn-phase, conditional-title,
-// route-scoped new-session lifecycle, outside-diff review, version-check,
-// per-thread transcript-search, detailed agent-activity, attachment-gallery,
-// external-video, PR-wide review-state, and native web-search presentation
-// additions, including lazy previews and mobile playback notices. Preserve
-// less than 2 kB of headroom; entry, worker, and largest-chunk budgets below
-// still prevent one bundle from hiding in the aggregate.
-const totalJavaScriptLimit = 3_210_000;
-// Version-check and transcript-search styling bring the clean artifact to
-// 183,291 B. Preserve less than 2 kB of headroom.
-const totalStyleLimit = 184_000;
+// The locked Vite/Rolldown graph emits 3,254,430 B with provider-admission
+// telemetry, two-tier finding-gate labels, background-turn labeling, evidence-backed
+// review-history, churn-metrics, implementation-analyst configuration,
+// durable turn-phase, conditional-title, route-scoped new-session lifecycle,
+// outside-diff review, version-check, per-thread transcript-search, detailed
+// agent-activity, attachment-gallery, external-video, managed-agent runtime
+// status, and PR-wide
+// review-state and workspace-organization additions, including lazy previews,
+// mobile playback notices, the route-scoped subscription/API/local usage
+// panel with its generated per-model usage schema and scope breakdowns, and
+// the scope-verdict causal-waypoint evidence schema and schema-driven model-
+// option editors, exact model-option number preservation (including the
+// WebKit fallback), and the dedicated background-activity event. The combined
+// graphs emit 3,280,024 B for desktop and 3,265,169 B for PWA after combining
+// the durable PR-mention event with identity-aware reasoning lifecycle schemas.
+// Durable assistant-artifact events and folded attachment items bring the
+// combined graphs to 3,287,832 B for desktop and 3,272,977 B for PWA. The
+// advisory finding status, re-anchored line evidence, and the managed-agent
+// runtime status bring the combined protocol 8.3 graphs to 3,294,114 B and
+// 3,279,260 B. The collapsible usage footer with its persisted state and
+// collapsed summary brings them to 3,296,049 B and 3,281,194 B. The
+// protocol 9.2 review-thread collapse state and Contents-permission health
+// schemas bring them to 3,302,298 B and 3,287,443 B. Local naming admission
+// status, bounded pending jobs, context-menu copy actions, and provider model-
+// catalog invalidation plus the race-safe client timeout envelope bring the
+// combined graphs to approximately 3,304,156 B and 3,289,301 B. The protocol
+// 9.3 per-role code-review `model_options` schemas on repositories, reviewer
+// overrides, and job snapshots bring them to 3,314,468 B and 3,299,613 B.
+// The inline Mermaid diagram element and its lazy-loading shim bring them to
+// 3,317,073 B and 3,302,236 B (the engine itself is budgeted separately).
+// The native web-search presentation brings them to 3,317,539 B and
+// 3,302,689 B; preserve less than 2 kB of headroom for each. Entry, worker, and
+// largest-chunk budgets below still prevent one bundle from hiding in the
+// aggregate.
+const totalJavaScriptLimit = mode === "desktop" ? 3_319_000 : 3_304_000;
+// beautiful-mermaid 1.1 with elk.bundled emits 1,524,273 B (469 kB gzipped).
+// Preserve less than 6 kB of headroom.
+const diagramEngineLimit = 1_530_000;
+// Version-check, transcript-search, compact navigation, and the sticky
+// multi-mode usage panel with thread/session model rows plus workspace
+// organization styling bring the clean artifact to 190,958 B. The pinned
+// sidebar chrome, sticky workspace headers, and collapsible usage footer
+// bring it to 193,215 B. Preserve less than 2 kB of headroom.
+const totalStyleLimit = 195_000;
 const limits = {
   entry: entryLimit,
   worker: 350_000,
@@ -44,6 +83,7 @@ const limits = {
   styles: totalStyleLimit,
   fonts: 125_000,
   largestChunk: entryLimit,
+  diagramEngine: diagramEngineLimit,
 };
 const total = (entries) => entries.reduce((bytes, entry) => bytes + entry.bytes, 0);
 const fail = (message) => {
@@ -54,6 +94,10 @@ if (entry === undefined) fail("the hashed application entry could not be identif
 if (entry.bytes > limits.entry) fail(`${entry.name} is ${entry.bytes} bytes (limit ${limits.entry})`);
 if (worker === undefined) fail("the lazy content worker is missing");
 if (worker.bytes > limits.worker) fail(`${worker.name} is ${worker.bytes} bytes (limit ${limits.worker})`);
+if (diagramEngine === undefined) fail("the lazy diagram engine chunk is missing");
+if (diagramEngine.bytes > limits.diagramEngine) {
+  fail(`${diagramEngine.name} is ${diagramEngine.bytes} bytes (limit ${limits.diagramEngine})`);
+}
 const largest = javascript.reduce((current, entry) =>
   entry.bytes > current.bytes ? entry : current, { name: "", bytes: 0 });
 if (largest.bytes > limits.largestChunk) {
@@ -72,5 +116,5 @@ if (total(fonts) > limits.fonts) {
 console.log(
   `${mode} bundle within budget: entry ${basename(entry.name)} ${entry.bytes} B, `
   + `worker ${worker.bytes} B, JS ${total(javascript)} B, CSS ${total(styles)} B, `
-  + `fonts ${total(fonts)} B`,
+  + `fonts ${total(fonts)} B, lazy diagram engine ${diagramEngine.bytes} B`,
 );

@@ -105,7 +105,7 @@ button.compact { padding: 6px 9px; font-size: 12px; }
 
 .job-list { display: flex; flex-direction: column; gap: 7px; }
 .job-row {
-  width: 100%; display: grid; grid-template-columns: 82px minmax(0, 1fr) 92px; gap: 13px;
+  width: 100%; display: grid; grid-template-columns: max-content minmax(0, 1fr) 92px; gap: 13px;
   align-items: center; padding: 12px; text-align: left; border-color: transparent;
   background: var(--surface-2); font-weight: normal;
 }
@@ -121,7 +121,7 @@ button.compact { padding: 6px 9px; font-size: 12px; }
 .status.succeeded, .status.ready, .status.success, .status.open { color: #9cf0c6; border-color: #2d7558; background: #183d31; }
 .status.failed, .status.failure, .status.credentials.required { color: #ffabb7; border-color: #883b49; background: #46212a; }
 .status.warning { color: #ffd78c; border-color: #705728; background: #3a2d17; }
-.status.cancelled, .status.stale, .status.disabled, .status.fixed { color: #afb6c4; }
+.status.cancelled, .status.stale, .status.disabled, .status.fixed, .status.dismissed, .status.advisory { color: #afb6c4; }
 .progress { position: relative; height: 18px; margin-top: 8px; border-radius: 4px; overflow: hidden; background: #0c111b; }
 .progress > span { display: block; width: 100%; height: 100%; transform-origin: left center; background: linear-gradient(90deg, #397bc5, #65b2ff); transition: transform .25s; }
 .progress small { position: absolute; inset: 2px 6px; color: white; font-size: 10px; text-shadow: 0 1px 2px #000; }
@@ -348,7 +348,7 @@ th { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spa
   .review-timeout-settings .form-grid { grid-template-columns: 1fr; }
   .persona-execution { grid-template-columns: 1fr; }
   .persona-execution header { grid-column: 1; }
-  .job-row { grid-template-columns: 72px minmax(0, 1fr); }
+  .job-row { grid-template-columns: max-content minmax(0, 1fr); }
   .job-meta { display: none; }
   .health-list { grid-template-columns: 1fr; }
   .provider-setup, .split-fields { grid-template-columns: 1fr; }

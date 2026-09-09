@@ -3,7 +3,6 @@ import { effectiveToolCall, toolDisplayName } from "./tool-presentation.js";
 
 export interface AgentActivityPresentation {
   readonly label: string;
-  readonly detail: string;
   readonly announcementLabel: string;
 }
 
@@ -26,9 +25,8 @@ const normalizedToolIdentifier = (tool: string): string =>
 
 const activity = (
   label: string,
-  detail = "",
   announcementLabel = label,
-): AgentActivityPresentation => ({ label, detail, announcementLabel });
+): AgentActivityPresentation => ({ label, announcementLabel });
 
 const runningModelName = (
   models: ReadonlyMap<number, string>,
@@ -127,34 +125,23 @@ export const runningAgentActivity = (
   const current = input.items.slice(start);
   const model = runningModelName(input.turnModels, turn);
 
-  if (input.compacting) {
-    return activity(
-      "Compacting context…",
-      "Preparing a shorter conversation history before contacting the model.",
-    );
-  }
+  if (input.compacting) return activity("Compacting context…");
   if (current.some((item) => item.kind === "questions" && item.answers === undefined)) {
-    return activity(
-      "Waiting for your answer…",
-      "The agent will continue after you answer or skip its questions.",
-    );
+    return activity("Waiting for your answer…");
   }
   if (current.some(
     (item) => item.kind === "tool" && item.status === "awaiting-approval",
   )) {
-    return activity(
-      "Waiting for approval…",
-      "The agent will continue after the pending tool request is resolved.",
-    );
+    return activity("Waiting for approval…");
   }
   if (activeState?.kind === "waiting-for-capacity") {
-    return activity("Waiting for model capacity…");
+    return activity("Waiting for provider admission…");
   }
   if (
     input.thinking
     || current.some((item) => item.kind === "thinking" && !item.complete)
   ) {
-    return activity("Thinking…", `${model} is streaming its reasoning.`);
+    return activity("Thinking…");
   }
 
   for (let index = current.length - 1; index >= 0; index -= 1) {
@@ -173,22 +160,12 @@ export const runningAgentActivity = (
     latestWork = item;
     break;
   }
-  if (latestWork?.kind === "tool") {
-    return activity(
-      "Agent is working…",
-      "The agent is processing tool activity.",
-    );
-  }
+  if (latestWork?.kind === "tool") return activity("Agent is working…");
 
   const modelHasResponded = current.some((item) =>
     !["user", "steered", "turn-status", "compaction"].includes(item.kind)
   );
-  if (modelHasResponded) {
-    return activity(
-      `Waiting for ${model}…`,
-      "The model is between visible response or tool events.",
-    );
-  }
+  if (modelHasResponded) return activity(`Waiting for ${model}…`);
 
   const startedAt = turn === undefined
     ? activeState?.startedAt
@@ -197,19 +174,15 @@ export const runningAgentActivity = (
   const elapsedMs = Number.isFinite(parsedStartedAt)
     ? Math.max(0, input.nowMs - parsedStartedAt)
     : undefined;
-  if (elapsedMs === undefined || elapsedMs < 2_000) {
-    return activity(`Starting ${model}…`, "Preparing the model request.");
-  }
+  if (elapsedMs === undefined || elapsedMs < 2_000) return activity(`Starting ${model}…`);
   if (elapsedMs < 120_000) {
     return activity(
       `Waiting for first response from ${model} · ${compactRunningElapsed(elapsedMs)}`,
-      "The turn is running, but no model output has arrived yet.",
       `Waiting for first response from ${model}…`,
     );
   }
   return activity(
     `Still waiting for ${model} · ${compactRunningElapsed(elapsedMs)}`,
-    "No model output has arrived yet. You can keep waiting or cancel and retry.",
     `Still waiting for ${model}…`,
   );
 };

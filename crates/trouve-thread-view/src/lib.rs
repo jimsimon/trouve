@@ -58,11 +58,15 @@ pub struct ThreadProjection {
     /// refresh still receives an accurate duration when it completes.
     #[serde(default)]
     tool_started_at: HashMap<String, chrono::DateTime<chrono::Utc>>,
-    /// Normally capacity follows turn.started. Retain an early capacity event
-    /// until its shell arrives so replay remains deterministic even when
-    /// importing historical streams with the opposite ordering.
+    /// Normally admission follows turn.started. Retain an early admission
+    /// marker until its shell arrives so replay remains deterministic even
+    /// when importing historical streams with the opposite ordering.
+    #[serde(default, alias = "capacity_acquired_before_start")]
+    admitted_before_start: HashSet<u64>,
+    /// Highest turn for which thinking has been observed. Unlike the open-item
+    /// indexes, this survives completion and materialization.
     #[serde(default)]
-    capacity_acquired_before_start: HashSet<u64>,
+    latest_thinking_turn: Option<u64>,
     #[serde(skip)]
     indexes: ProjectionIndexes,
 }
@@ -91,7 +95,7 @@ impl ThreadProjection {
         self.ensure_indexes();
         self.cursor = envelope.cursor;
         match &envelope.event {
-            Event::TurnCapacityAcquired { turn, .. } => {
+            Event::TurnAdmitted { turn, .. } | Event::TurnCapacityAcquired { turn, .. } => {
                 if let Some(&idx) = self.indexes.turns.get(turn) {
                     if matches!(
                         self.snapshot.items.get(idx),
@@ -106,7 +110,7 @@ impl ThreadProjection {
                         };
                     }
                 } else {
-                    self.capacity_acquired_before_start.insert(*turn);
+                    self.admitted_before_start.insert(*turn);
                 }
             }
             Event::TurnStarted {
@@ -129,7 +133,7 @@ impl ThreadProjection {
                     .turn_steerable
                     .insert(*turn, *supports_steering);
                 self.snapshot.turn_started_at.insert(*turn, envelope.ts);
-                let state = if self.capacity_acquired_before_start.remove(turn) {
+                let state = if self.admitted_before_start.remove(turn) {
                     ThreadTurnState::Running
                 } else {
                     ThreadTurnState::WaitingForCapacity
@@ -193,11 +197,21 @@ impl ThreadProjection {
                 turn,
                 content,
                 attachments,
+                background,
             } => {
                 self.push(ThreadViewItem::User {
                     turn: *turn,
                     content: content.clone(),
                     attachments: attachments.clone(),
+                    background: *background,
+                });
+            }
+            Event::TurnBackgroundActivity { turn } => {
+                self.push(ThreadViewItem::User {
+                    turn: *turn,
+                    content: String::new(),
+                    attachments: Vec::new(),
+                    background: true,
                 });
             }
             Event::TurnSteered {
@@ -205,8 +219,10 @@ impl ThreadProjection {
                 content,
                 attachments,
             } => {
-                self.finish_progress(*turn);
-                self.finish_thinking();
+                // Steering is accepted while the vendor's current sampling is
+                // still streaming; the model only reads it at its next request.
+                // Leave any open thinking/progress block growing so the steer
+                // does not split a reasoning block mid-sentence.
                 self.push(ThreadViewItem::Steered {
                     turn: *turn,
                     content: content.clone(),
@@ -253,27 +269,52 @@ impl ThreadProjection {
             Event::AssistantProgressCompleted { turn } => {
                 self.finish_progress(*turn);
             }
-            Event::AssistantThinking { turn, text } => {
-                self.fail_open_compaction(*turn);
-                self.finish_progress(*turn);
-                self.snapshot.thinking = true;
-                if let Some(&idx) = self.indexes.open_thinking.get(turn) {
-                    if let ThreadViewItem::Thinking { content, .. } = &mut self.snapshot.items[idx]
-                    {
-                        content.push_str(text);
-                    }
+            Event::AssistantThinking { turn, id, text } => {
+                let active_turn = self.active_thinking_turn();
+                if self
+                    .latest_thinking_turn
+                    .is_some_and(|latest| *turn < latest)
+                {
+                    self.append_stale_thinking(*turn, id.as_deref(), text);
                 } else {
-                    let idx = self.push(ThreadViewItem::Thinking {
-                        turn: *turn,
-                        content: text.clone(),
-                        complete: false,
-                    });
-                    self.indexes.open_thinking.insert(*turn, idx);
-                    self.indexes.latest_thinking = Some(idx);
+                    self.latest_thinking_turn = Some(
+                        self.latest_thinking_turn
+                            .map_or(*turn, |latest| latest.max(*turn)),
+                    );
+                    self.fail_open_compaction(*turn);
+                    self.finish_progress(*turn);
+                    if self.snapshot.thinking
+                        && (self.snapshot.active_thinking_id.as_ref() != id.as_ref()
+                            || active_turn != Some(*turn))
+                    {
+                        self.finish_thinking();
+                    }
+                    self.snapshot.thinking = true;
+                    self.snapshot.active_thinking_id = id.clone();
+                    if let Some(&idx) = self.indexes.open_thinking.get(turn) {
+                        if let ThreadViewItem::Thinking { content, .. } =
+                            &mut self.snapshot.items[idx]
+                        {
+                            content.push_str(text);
+                        }
+                    } else {
+                        let idx = self.push(ThreadViewItem::Thinking {
+                            turn: *turn,
+                            id: id.clone(),
+                            content: text.clone(),
+                            complete: false,
+                        });
+                        self.indexes.open_thinking.insert(*turn, idx);
+                        self.indexes.latest_thinking = Some(idx);
+                    }
                 }
             }
-            Event::AssistantThinkingCompleted { .. } => {
-                self.finish_thinking();
+            Event::AssistantThinkingCompleted { turn, id } => {
+                if self.snapshot.active_thinking_id.as_ref() == id.as_ref()
+                    && self.active_thinking_turn() == Some(*turn)
+                {
+                    self.finish_thinking();
+                }
             }
             Event::AssistantDelta { turn, text } => {
                 self.fail_open_compaction(*turn);
@@ -311,6 +352,20 @@ impl ThreadProjection {
                     });
                 }
             }
+            Event::AssistantArtifacts {
+                turn,
+                call_id,
+                attachments,
+            } => {
+                self.fail_open_compaction(*turn);
+                self.finish_progress(*turn);
+                self.finish_thinking();
+                self.push(ThreadViewItem::Artifacts {
+                    turn: *turn,
+                    call_id: call_id.clone(),
+                    attachments: attachments.clone(),
+                });
+            }
             Event::ToolRequested {
                 turn,
                 call_id,
@@ -321,7 +376,9 @@ impl ThreadProjection {
             } => {
                 self.fail_open_compaction(*turn);
                 self.finish_progress(*turn);
-                self.finish_thinking();
+                if self.snapshot.active_thinking_id.is_none() {
+                    self.finish_thinking();
+                }
                 let idx = self.push(ThreadViewItem::ToolCall {
                     call_id: call_id.clone(),
                     tool: tool.clone(),
@@ -602,8 +659,45 @@ impl ThreadProjection {
         self.snapshot.items.get_mut(idx)
     }
 
+    fn active_thinking_turn(&self) -> Option<u64> {
+        let idx = self.indexes.latest_thinking?;
+        match self.snapshot.items.get(idx) {
+            Some(ThreadViewItem::Thinking {
+                turn,
+                complete: false,
+                ..
+            }) => Some(*turn),
+            _ => None,
+        }
+    }
+
+    // Preserve delayed older-turn text without making that lifecycle active
+    // again. A first-seen stale block is complete by construction.
+    fn append_stale_thinking(&mut self, turn: u64, id: Option<&str>, text: &str) {
+        if let Some(idx) = self.snapshot.items.iter().rposition(|item| {
+            matches!(
+                item,
+                ThreadViewItem::Thinking { turn: item_turn, id: item_id, .. }
+                    if *item_turn == turn
+                        && id.is_none_or(|id| item_id.as_deref() == Some(id))
+            )
+        }) {
+            if let ThreadViewItem::Thinking { content, .. } = &mut self.snapshot.items[idx] {
+                content.push_str(text);
+            }
+        } else {
+            self.push(ThreadViewItem::Thinking {
+                turn,
+                id: id.map(str::to_owned),
+                content: text.into(),
+                complete: true,
+            });
+        }
+    }
+
     fn finish_thinking(&mut self) {
         self.snapshot.thinking = false;
+        self.snapshot.active_thinking_id = None;
         if let Some(idx) = self.indexes.latest_thinking.take()
             && let Some(ThreadViewItem::Thinking { turn, complete, .. }) =
                 self.snapshot.items.get_mut(idx)
@@ -633,7 +727,7 @@ impl ThreadProjection {
     }
 
     fn finish_turn(&mut self, turn: u64, ended: chrono::DateTime<chrono::Utc>) {
-        self.capacity_acquired_before_start.remove(&turn);
+        self.admitted_before_start.remove(&turn);
         self.snapshot.turn_running = false;
         self.snapshot.turn_phase = None;
         self.fail_open_compaction(turn);
@@ -704,10 +798,14 @@ impl ThreadProjection {
                     }
                 }
                 ThreadViewItem::Thinking { turn, complete, .. } => {
+                    self.latest_thinking_turn = Some(
+                        self.latest_thinking_turn
+                            .map_or(*turn, |latest| latest.max(*turn)),
+                    );
                     if !complete {
                         self.indexes.open_thinking.insert(*turn, idx);
+                        self.indexes.latest_thinking = Some(idx);
                     }
-                    self.indexes.latest_thinking = Some(idx);
                 }
                 ThreadViewItem::Compaction {
                     turn,
@@ -729,6 +827,7 @@ impl ThreadProjection {
                 | ThreadViewItem::Steered { .. }
                 | ThreadViewItem::Subagent { .. }
                 | ThreadViewItem::Assistant { .. }
+                | ThreadViewItem::Artifacts { .. }
                 | ThreadViewItem::TodoUpdate { .. }
                 | ThreadViewItem::Compaction { .. } => {}
             }
@@ -805,7 +904,7 @@ mod tests {
     }
 
     #[test]
-    fn turn_transitions_from_waiting_to_running_when_capacity_arrives() {
+    fn turn_transitions_from_waiting_to_running_when_provider_admission_arrives() {
         let mut projection = ThreadProjection::default();
         projection.apply(&envelope(
             1,
@@ -829,10 +928,9 @@ mod tests {
         projection.apply(&envelope(
             2,
             20,
-            Event::TurnCapacityAcquired {
+            Event::TurnAdmitted {
                 turn: 7,
-                wait_ms: 20,
-                background: false,
+                provider_wait_ms: 20,
             },
         ));
         assert!(matches!(
@@ -845,7 +943,69 @@ mod tests {
     }
 
     #[test]
-    fn capacity_before_start_replays_as_running() {
+    fn background_activity_has_a_distinct_event_and_legacy_messages_still_replay() {
+        let mut projection = ThreadProjection::default();
+        projection.apply(&envelope(1, 0, Event::TurnBackgroundActivity { turn: 3 }));
+        assert!(matches!(
+            projection.snapshot.items.last(),
+            Some(ThreadViewItem::User {
+                turn: 3,
+                content,
+                background: true,
+                ..
+            }) if content.is_empty()
+        ));
+        projection.apply(&envelope(
+            2,
+            1,
+            Event::UserMessage {
+                turn: 4,
+                content: "[background agent activity]".into(),
+                attachments: Vec::new(),
+                background: true,
+            },
+        ));
+        assert!(matches!(
+            projection.snapshot.items.last(),
+            Some(ThreadViewItem::User {
+                turn: 4,
+                background: true,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn assistant_artifacts_fold_into_a_durable_transcript_item() {
+        let mut projection = ThreadProjection::default();
+        projection.apply(&envelope(
+            1,
+            0,
+            Event::AssistantArtifacts {
+                turn: 5,
+                call_id: Some("call_screenshot".into()),
+                attachments: vec![trouve_protocol::Attachment {
+                    id: "attachment_1".into(),
+                    name: "tool-image-1.png".into(),
+                    mime: "image/png".into(),
+                    size_bytes: 5,
+                }],
+            },
+        ));
+
+        assert!(matches!(
+            projection.snapshot.items.last(),
+            Some(ThreadViewItem::Artifacts {
+                turn: 5,
+                call_id: Some(call_id),
+                attachments,
+            }) if call_id == "call_screenshot"
+                && attachments[0].name == "tool-image-1.png"
+        ));
+    }
+
+    #[test]
+    fn legacy_capacity_before_start_replays_as_running() {
         let mut projection = ThreadProjection::default();
         projection.apply(&envelope(
             1,
@@ -856,6 +1016,45 @@ mod tests {
                 background: false,
             },
         ));
+        projection.apply(&envelope(
+            2,
+            1,
+            Event::TurnStarted {
+                turn: 9,
+                mode: "code".into(),
+                model: "m".into(),
+                thinking_level: None,
+                supports_steering: false,
+            },
+        ));
+        assert!(matches!(
+            projection.snapshot.items.last(),
+            Some(ThreadViewItem::TurnStatus {
+                turn: 9,
+                state: ThreadTurnState::Running,
+            })
+        ));
+    }
+
+    #[test]
+    fn legacy_cached_admission_key_replays_as_running() {
+        let mut projection = ThreadProjection::default();
+        projection.apply(&envelope(
+            1,
+            0,
+            Event::TurnCapacityAcquired {
+                turn: 9,
+                wait_ms: 0,
+                background: false,
+            },
+        ));
+        let mut cached = serde_json::to_value(projection).unwrap();
+        let cached = cached.as_object_mut().unwrap();
+        let admission = cached.remove("admitted_before_start").unwrap();
+        cached.insert("capacity_acquired_before_start".into(), admission);
+        let mut projection: ThreadProjection =
+            serde_json::from_value(cached.clone().into()).unwrap();
+
         projection.apply(&envelope(
             2,
             1,
@@ -1197,6 +1396,7 @@ mod tests {
             0,
             Event::AssistantThinking {
                 turn: 7,
+                id: None,
                 text: "Delegating the review.".into(),
             },
         ));
@@ -1218,6 +1418,7 @@ mod tests {
             vec![
                 ThreadViewItem::Thinking {
                     turn: 7,
+                    id: None,
                     content: "Delegating the review.".into(),
                     complete: true,
                 },
@@ -1258,10 +1459,9 @@ mod tests {
         projection.apply(&envelope(
             2,
             10,
-            Event::TurnCapacityAcquired {
+            Event::TurnAdmitted {
                 turn: 7,
-                wait_ms: 10,
-                background: false,
+                provider_wait_ms: 10,
             },
         ));
         projection.apply(&envelope(
@@ -1408,7 +1608,7 @@ mod tests {
     }
 
     #[test]
-    fn steering_is_a_causal_boundary_between_thinking_items() {
+    fn steering_does_not_split_an_open_thinking_item() {
         let mut projection = ThreadProjection::default();
         for (cursor, event) in [
             Event::TurnStarted {
@@ -1422,9 +1622,11 @@ mod tests {
                 turn: 7,
                 content: "Start here.".into(),
                 attachments: Vec::new(),
+                background: false,
             },
             Event::AssistantThinking {
                 turn: 7,
+                id: None,
                 text: "Before steering.".into(),
             },
             Event::TurnSteered {
@@ -1434,9 +1636,10 @@ mod tests {
             },
             Event::AssistantThinking {
                 turn: 7,
+                id: None,
                 text: "After steering.".into(),
             },
-            Event::AssistantThinkingCompleted { turn: 7 },
+            Event::AssistantThinkingCompleted { turn: 7, id: None },
         ]
         .into_iter()
         .enumerate()
@@ -1452,20 +1655,14 @@ mod tests {
                 ThreadViewItem::TurnStatus { .. },
                 ThreadViewItem::User { content: prompt, .. },
                 ThreadViewItem::Thinking {
-                    content: before,
+                    content: thinking,
                     complete: true,
                     ..
                 },
                 ThreadViewItem::Steered { content: steering, .. },
-                ThreadViewItem::Thinking {
-                    content: after,
-                    complete: true,
-                    ..
-                },
             ] if prompt == "Start here."
-                && before == "Before steering."
+                && thinking == "Before steering.After steering."
                 && steering == "Prioritize the regression."
-                && after == "After steering."
         ));
         assert!(!projection.snapshot.thinking);
     }
@@ -1521,6 +1718,7 @@ mod tests {
                 turn: 1,
                 content: "keep this prompt".into(),
                 attachments: Vec::new(),
+                background: false,
             },
             Event::AssistantMessage {
                 turn: 1,
@@ -1562,6 +1760,7 @@ mod tests {
                 turn: 1,
                 content: "first".into(),
                 attachments: Vec::new(),
+                background: false,
             },
             Event::TurnCompleted {
                 turn: 1,
@@ -1577,6 +1776,7 @@ mod tests {
             },
             Event::AssistantThinking {
                 turn: 2,
+                id: None,
                 text: "still ".into(),
             },
         ]
@@ -1604,6 +1804,7 @@ mod tests {
             6,
             Event::AssistantThinking {
                 turn: 2,
+                id: None,
                 text: "running".into(),
             },
         ));
@@ -1639,9 +1840,10 @@ mod tests {
             Event::AssistantProgressCompleted { turn: 4 },
             Event::AssistantThinking {
                 turn: 4,
+                id: None,
                 text: "The provider emits a separate reasoning stream.".into(),
             },
-            Event::AssistantThinkingCompleted { turn: 4 },
+            Event::AssistantThinkingCompleted { turn: 4, id: None },
         ]
         .into_iter()
         .enumerate()
@@ -1765,13 +1967,14 @@ mod tests {
     }
 
     #[test]
-    fn explicit_thinking_completion_closes_without_followup_output() {
+    fn thinking_lifecycle_matches_identity_and_turn() {
         let mut projection = ThreadProjection::default();
         projection.apply(&envelope(
             1,
             0,
             Event::AssistantThinking {
                 turn: 4,
+                id: Some("reasoning".into()),
                 text: "Waiting for the next event.".into(),
             },
         ));
@@ -1784,24 +1987,238 @@ mod tests {
         projection.apply(&envelope(
             2,
             25,
-            Event::AssistantThinkingCompleted { turn: 4 },
+            Event::AssistantThinkingCompleted {
+                turn: 5,
+                id: Some("reasoning".into()),
+            },
+        ));
+        assert!(projection.snapshot.thinking);
+
+        projection.apply(&envelope(
+            3,
+            50,
+            Event::AssistantThinkingCompleted { turn: 4, id: None },
+        ));
+        assert!(projection.snapshot.thinking);
+
+        projection.apply(&envelope(
+            4,
+            75,
+            Event::AssistantThinking {
+                turn: 4,
+                id: Some("reasoning".into()),
+                text: " Still waiting.".into(),
+            },
+        ));
+        projection.apply(&envelope(
+            5,
+            100,
+            Event::AssistantThinking {
+                turn: 5,
+                id: Some("reasoning".into()),
+                text: "Next turn.".into(),
+            },
+        ));
+        assert!(matches!(
+            projection.snapshot.items.as_slice(),
+            [
+                ThreadViewItem::Thinking { content: first, complete: true, .. },
+                ThreadViewItem::Thinking { content: second, complete: false, .. },
+            ] if first == "Waiting for the next event. Still waiting."
+                && second == "Next turn."
+        ));
+
+        projection.apply(&envelope(
+            6,
+            125,
+            Event::AssistantThinking {
+                turn: 4,
+                id: Some("reasoning".into()),
+                text: " Late.".into(),
+            },
+        ));
+        assert!(matches!(
+            projection.snapshot.items.as_slice(),
+            [
+                ThreadViewItem::Thinking { content: first, complete: true, .. },
+                ThreadViewItem::Thinking { content: second, complete: false, .. },
+            ] if first == "Waiting for the next event. Still waiting. Late."
+                && second == "Next turn."
+        ));
+
+        projection.apply(&envelope(
+            7,
+            150,
+            Event::AssistantThinkingCompleted {
+                turn: 4,
+                id: Some("reasoning".into()),
+            },
+        ));
+        assert!(projection.snapshot.thinking);
+
+        projection.apply(&envelope(
+            8,
+            175,
+            Event::AssistantThinkingCompleted {
+                turn: 5,
+                id: Some("reasoning".into()),
+            },
         ));
 
         assert!(!projection.snapshot.thinking);
         assert!(matches!(
             projection.snapshot.items.last(),
-            Some(ThreadViewItem::Thinking { complete: true, .. })
+            Some(ThreadViewItem::Thinking { content, complete: true, .. })
+                if content == "Next turn."
         ));
     }
 
     #[test]
-    fn tool_request_is_a_causal_boundary_between_thinking_items() {
+    fn first_stale_thinking_delta_is_preserved_without_replacing_the_active_turn() {
+        let mut projection = ThreadProjection::default();
+        projection.apply(&envelope(
+            1,
+            0,
+            Event::AssistantThinking {
+                turn: 2,
+                id: Some("reasoning".into()),
+                text: "Current.".into(),
+            },
+        ));
+        projection.apply(&envelope(
+            2,
+            25,
+            Event::AssistantThinking {
+                turn: 1,
+                id: Some("reasoning".into()),
+                text: "Late.".into(),
+            },
+        ));
+
+        assert_eq!(projection.active_thinking_turn(), Some(2));
+        assert!(matches!(
+            projection.snapshot.items.as_slice(),
+            [
+                ThreadViewItem::Thinking { turn: 2, content: current, complete: false, .. },
+                ThreadViewItem::Thinking { turn: 1, content: late, complete: true, .. },
+            ] if current == "Current." && late == "Late."
+        ));
+
+        let mut projection: ThreadProjection =
+            serde_json::from_str(&serde_json::to_string(&projection).unwrap()).unwrap();
+
+        projection.apply(&envelope(
+            3,
+            50,
+            Event::AssistantThinkingCompleted {
+                turn: 2,
+                id: Some("reasoning".into()),
+            },
+        ));
+        assert!(!projection.snapshot.thinking);
+        assert!(matches!(
+            projection.snapshot.items.first(),
+            Some(ThreadViewItem::Thinking { complete: true, .. })
+        ));
+
+        projection.apply(&envelope(
+            4,
+            75,
+            Event::AssistantThinking {
+                turn: 1,
+                id: Some("reasoning".into()),
+                text: " Later.".into(),
+            },
+        ));
+        assert!(!projection.snapshot.thinking);
+        assert!(matches!(
+            projection.snapshot.items.as_slice(),
+            [
+                ThreadViewItem::Thinking { turn: 2, content: current, complete: true, .. },
+                ThreadViewItem::Thinking { turn: 1, content: late, complete: true, .. },
+            ] if current == "Current." && late == "Late. Later."
+        ));
+    }
+
+    #[test]
+    fn stale_thinking_delta_matches_provider_identity_within_the_older_turn() {
+        let mut projection = ThreadProjection::default();
+        let mut cursor = 0;
+        for (id, text) in [("reasoning-a", "First."), ("reasoning-b", "Second.")] {
+            cursor += 1;
+            projection.apply(&envelope(
+                cursor,
+                cursor as i64,
+                Event::AssistantThinking {
+                    turn: 1,
+                    id: Some(id.into()),
+                    text: text.into(),
+                },
+            ));
+            cursor += 1;
+            projection.apply(&envelope(
+                cursor,
+                cursor as i64,
+                Event::AssistantThinkingCompleted {
+                    turn: 1,
+                    id: Some(id.into()),
+                },
+            ));
+        }
+        cursor += 1;
+        projection.apply(&envelope(
+            cursor,
+            cursor as i64,
+            Event::AssistantThinking {
+                turn: 2,
+                id: Some("current".into()),
+                text: "Current.".into(),
+            },
+        ));
+        cursor += 1;
+        projection.apply(&envelope(
+            cursor,
+            cursor as i64,
+            Event::AssistantThinkingCompleted {
+                turn: 2,
+                id: Some("current".into()),
+            },
+        ));
+        cursor += 1;
+        projection.apply(&envelope(
+            cursor,
+            cursor as i64,
+            Event::AssistantThinking {
+                turn: 1,
+                id: Some("reasoning-a".into()),
+                text: " Again.".into(),
+            },
+        ));
+
+        assert!(!projection.snapshot.thinking);
+        assert!(matches!(
+            projection.snapshot.items.as_slice(),
+            [
+                ThreadViewItem::Thinking { id: Some(first_id), content: first, complete: true, .. },
+                ThreadViewItem::Thinking { id: Some(second_id), content: second, complete: true, .. },
+                ThreadViewItem::Thinking { content: current, complete: true, .. },
+            ] if first_id == "reasoning-a"
+                && first == "First. Again."
+                && second_id == "reasoning-b"
+                && second == "Second."
+                && current == "Current."
+        ));
+    }
+
+    #[test]
+    fn tool_requests_do_not_split_an_open_thinking_item() {
         let mut projection = ThreadProjection::default();
         projection.apply(&envelope(
             1,
             0,
             Event::AssistantThinking {
                 turn: 4,
+                id: Some("reasoning-a".into()),
                 text: "The final overlap pass is still".into(),
             },
         ));
@@ -1821,37 +2238,100 @@ mod tests {
             20,
             Event::AssistantThinking {
                 turn: 4,
+                id: Some("reasoning-a".into()),
                 text: " running.".into(),
             },
         ));
         projection.apply(&envelope(
             4,
             30,
-            Event::AssistantThinkingCompleted { turn: 4 },
+            Event::ToolRequested {
+                turn: 4,
+                call_id: "read".into(),
+                tool: "read_file".into(),
+                args: serde_json::json!({ "path": "src/lib.rs" }),
+                requires_approval: false,
+            },
+        ));
+        projection.apply(&envelope(
+            5,
+            40,
+            Event::AssistantThinkingCompleted {
+                turn: 4,
+                id: Some("reasoning-a".into()),
+            },
+        ));
+        projection.apply(&envelope(
+            6,
+            50,
+            Event::AssistantThinking {
+                turn: 4,
+                id: Some("reasoning-b".into()),
+                text: "A separate reasoning block.".into(),
+            },
         ));
 
-        let thoughts = projection
-            .snapshot
-            .items
-            .iter()
-            .filter(|item| matches!(item, ThreadViewItem::Thinking { .. }))
-            .collect::<Vec<_>>();
-        assert_eq!(thoughts.len(), 2);
         assert!(matches!(
-            thoughts[0],
-            ThreadViewItem::Thinking {
-                content,
-                complete: true,
-                ..
-            } if content == "The final overlap pass is still"
+            projection.snapshot.items.as_slice(),
+            [
+                ThreadViewItem::Thinking { content, complete: true, .. },
+                ThreadViewItem::ToolCall { call_id: first, .. },
+                ThreadViewItem::ToolCall { call_id: second, .. },
+                ThreadViewItem::Thinking { content: separate, complete: false, .. },
+            ] if content == "The final overlap pass is still running."
+                && first == "search"
+                && second == "read"
+                && separate == "A separate reasoning block."
         ));
+        assert!(projection.snapshot.thinking);
+    }
+
+    #[test]
+    fn legacy_tool_requests_split_unidentified_thinking_items() {
+        let mut projection = ThreadProjection::default();
+        for (cursor, event) in [
+            Event::AssistantThinking {
+                turn: 4,
+                id: None,
+                text: "Before the tool.".into(),
+            },
+            Event::ToolRequested {
+                turn: 4,
+                call_id: "read".into(),
+                tool: "read_file".into(),
+                args: serde_json::json!({ "path": "src/lib.rs" }),
+                requires_approval: false,
+            },
+            Event::AssistantThinking {
+                turn: 4,
+                id: None,
+                text: "After the tool.".into(),
+            },
+            Event::AssistantThinkingCompleted { turn: 4, id: None },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            projection.apply(&envelope(cursor as u64 + 1, cursor as i64, event));
+        }
+
         assert!(matches!(
-            thoughts[1],
-            ThreadViewItem::Thinking {
-                content,
-                complete: true,
-                ..
-            } if content == " running."
+            projection.snapshot.items.as_slice(),
+            [
+                ThreadViewItem::Thinking {
+                    content: before,
+                    complete: true,
+                    ..
+                },
+                ThreadViewItem::ToolCall { call_id, .. },
+                ThreadViewItem::Thinking {
+                    content: after,
+                    complete: true,
+                    ..
+                },
+            ] if before == "Before the tool."
+                && call_id == "read"
+                && after == "After the tool."
         ));
         assert!(!projection.snapshot.thinking);
     }
@@ -1865,6 +2345,7 @@ mod tests {
             10,
             Event::AssistantThinking {
                 turn: 3,
+                id: None,
                 text: "continuing".into(),
             },
         ));

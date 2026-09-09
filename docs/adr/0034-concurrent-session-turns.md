@@ -1,6 +1,6 @@
 # ADR 0034: Concurrent turns in a shared session worktree
 
-Status: Accepted (2026-08)
+Status: Partially superseded by 0042 (2026-08)
 
 Supersedes the whole-turn session-lock portion of ADR 0030.
 

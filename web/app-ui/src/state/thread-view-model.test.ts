@@ -17,6 +17,28 @@ const envelope = (
   ({ cursor, scope: { thread: "th_1" }, ts, ...event }) as ProtocolEventEnvelope;
 
 describe("ThreadViewModel", () => {
+  it("projects assistant-produced attachments from live events", () => {
+    const vm = new ThreadViewModel();
+    vm.apply(envelope(1, {
+      type: "assistant.artifacts",
+      turn: 4,
+      call_id: "call_screenshot",
+      attachments: [{
+        id: "attachment_1",
+        name: "tool-image-1.png",
+        mime: "image/png",
+        size_bytes: 5,
+      }],
+    }));
+
+    expect(vm.items).toMatchObject([{
+      kind: "artifacts",
+      turn: 4,
+      callId: "call_screenshot",
+      attachments: [{ name: "tool-image-1.png", mime: "image/png" }],
+    }]);
+  });
+
   it("updates a running turn phase without adding transcript items", () => {
     const vm = new ThreadViewModel();
     vm.apply(envelope(1, {
@@ -43,7 +65,7 @@ describe("ThreadViewModel", () => {
     expect(vm.turnPhase).toBeUndefined();
   });
 
-  it("distinguishes scheduler waiting from an actively running provider turn", () => {
+  it("distinguishes provider waiting from an actively running turn", () => {
     const vm = new ThreadViewModel();
     vm.apply(envelope(1, {
       type: "turn.started",
@@ -60,10 +82,9 @@ describe("ThreadViewModel", () => {
     });
 
     vm.apply(envelope(2, {
-      type: "turn.capacity_acquired",
+      type: "turn.admitted",
       turn: 4,
-      wait_ms: 125,
-      background: false,
+      provider_wait_ms: 125,
     }));
     expect(vm.items.at(-1)).toMatchObject({
       kind: "turn-status",
@@ -72,7 +93,7 @@ describe("ThreadViewModel", () => {
     });
   });
 
-  it("replays an early capacity event without regressing the visible state", () => {
+  it("replays a legacy early capacity event without regressing visible state", () => {
     const vm = new ThreadViewModel();
     vm.apply(envelope(1, {
       type: "turn.capacity_acquired",
@@ -156,7 +177,7 @@ describe("ThreadViewModel", () => {
     }).toEqual(fixture.expected);
   });
 
-  it("keeps steering as a top-level causal boundary between thought output", () => {
+  it("records steering without splitting the open thought output", () => {
     const vm = new ThreadViewModel();
     vm.apply(envelope(1, {
       type: "turn.started",
@@ -194,7 +215,7 @@ describe("ThreadViewModel", () => {
       {
         kind: "thinking",
         turn: 3,
-        content: "Following the original direction.",
+        content: "Following the original direction. Continue with the revised direction.",
         complete: true,
       },
       {
@@ -203,13 +224,8 @@ describe("ThreadViewModel", () => {
         content: "Prioritize the narrow layout.",
         attachments: [],
       },
-      {
-        kind: "thinking",
-        turn: 3,
-        content: " Continue with the revised direction.",
-        complete: true,
-      },
     ]);
+    expect(vm.items).toHaveLength(3);
   });
 
   it("projects a linked subagent as a top-level parent-turn boundary", () => {
@@ -464,9 +480,14 @@ describe("ThreadViewModel", () => {
     })]);
   });
 
-  it("closes thinking at tool and steering causal boundaries", () => {
+  it("grows reasoning in place across tools and starts a new block after completion", () => {
     const view = new ThreadViewModel();
-    view.apply(envelope(1, { type: "assistant.thinking", turn: 2, text: "before tool" }));
+    view.apply(envelope(1, {
+      type: "assistant.thinking",
+      turn: 2,
+      id: "reasoning-a",
+      text: "before ",
+    }));
     view.apply(envelope(2, {
       type: "tool.requested",
       turn: 2,
@@ -475,16 +496,165 @@ describe("ThreadViewModel", () => {
       args: {},
       requires_approval: false,
     }));
-    view.apply(envelope(3, { type: "assistant.thinking", turn: 2, text: "after tool" }));
-    view.apply(envelope(4, {
-      type: "turn.steered",
+    view.apply(envelope(3, {
+      type: "assistant.thinking",
       turn: 2,
-      content: "new direction",
-      attachments: [],
+      id: "reasoning-a",
+      text: "and after",
     }));
-    view.apply(envelope(5, { type: "assistant.thinking", turn: 2, text: "after steer" }));
-    expect(view.items.map((item) => item.kind)).toEqual([
-      "thinking", "tool", "thinking", "steered", "thinking",
+    view.apply(envelope(4, {
+      type: "tool.requested",
+      turn: 2,
+      call_id: "search",
+      tool: "search",
+      args: {},
+      requires_approval: false,
+    }));
+    view.apply(envelope(5, {
+      type: "assistant.thinking_completed",
+      turn: 2,
+      id: "reasoning-a",
+    }));
+    view.apply(envelope(6, {
+      type: "assistant.thinking",
+      turn: 2,
+      id: "reasoning-b",
+      text: "separate",
+    }));
+    expect(view.items).toEqual([
+      expect.objectContaining({ kind: "thinking", content: "before and after", complete: true }),
+      expect.objectContaining({ kind: "tool", callId: "read" }),
+      expect.objectContaining({ kind: "tool", callId: "search" }),
+      expect.objectContaining({ kind: "thinking", content: "separate", complete: false }),
+    ]);
+  });
+
+  it("matches reasoning completions by identity and turn", () => {
+    const view = new ThreadViewModel();
+    view.apply(envelope(1, {
+      type: "assistant.thinking",
+      turn: 2,
+      id: "reasoning-a",
+      text: "before ",
+    }));
+    view.apply(envelope(2, {
+      type: "assistant.thinking_completed",
+      turn: 3,
+      id: "reasoning-a",
+    }));
+    view.apply(envelope(3, {
+      type: "assistant.thinking_completed",
+      turn: 2,
+    }));
+    view.apply(envelope(4, {
+      type: "assistant.thinking",
+      turn: 2,
+      id: "reasoning-a",
+      text: "and after",
+    }));
+    view.apply(envelope(5, {
+      type: "assistant.thinking",
+      turn: 3,
+      id: "reasoning-a",
+      text: "next turn",
+    }));
+    view.apply(envelope(6, {
+      type: "assistant.thinking",
+      turn: 2,
+      id: "reasoning-a",
+      text: " late",
+    }));
+    view.apply(envelope(7, {
+      type: "assistant.thinking_completed",
+      turn: 2,
+      id: "reasoning-a",
+    }));
+
+    expect(view.thinking).toBe(true);
+    expect(view.items).toEqual([
+      expect.objectContaining({
+        kind: "thinking",
+        content: "before and after late",
+        complete: true,
+      }),
+      expect.objectContaining({
+        kind: "thinking",
+        content: "next turn",
+        complete: false,
+      }),
+    ]);
+
+    view.apply(envelope(8, {
+      type: "assistant.thinking_completed",
+      turn: 3,
+      id: "reasoning-a",
+    }));
+    expect(view.thinking).toBe(false);
+    expect(view.items.at(-1)).toEqual(expect.objectContaining({
+      kind: "thinking",
+      content: "next turn",
+      complete: true,
+    }));
+  });
+
+  it("preserves a first stale reasoning delta without replacing the active turn", () => {
+    const view = new ThreadViewModel();
+    view.apply(envelope(1, {
+      type: "assistant.thinking",
+      turn: 3,
+      id: "reasoning-a",
+      text: "current",
+    }));
+    view.apply(envelope(2, {
+      type: "assistant.thinking",
+      turn: 2,
+      id: "reasoning-a",
+      text: "late",
+    }));
+
+    expect(view.thinking).toBe(true);
+    expect(view.items).toEqual([
+      expect.objectContaining({
+        kind: "thinking",
+        turn: 3,
+        content: "current",
+        complete: false,
+      }),
+      expect.objectContaining({
+        kind: "thinking",
+        turn: 2,
+        content: "late",
+        complete: true,
+      }),
+    ]);
+
+    view.apply(envelope(3, {
+      type: "assistant.thinking_completed",
+      turn: 3,
+      id: "reasoning-a",
+    }));
+    expect(view.thinking).toBe(false);
+    expect(view.items[0]).toEqual(expect.objectContaining({ complete: true }));
+  });
+
+  it("keeps legacy unidentified reasoning split across tool requests", () => {
+    const view = new ThreadViewModel();
+    view.apply(envelope(1, { type: "assistant.thinking", turn: 2, text: "before" }));
+    view.apply(envelope(2, {
+      type: "tool.requested",
+      turn: 2,
+      call_id: "read",
+      tool: "read_file",
+      args: {},
+      requires_approval: false,
+    }));
+    view.apply(envelope(3, { type: "assistant.thinking", turn: 2, text: "after" }));
+    view.apply(envelope(4, { type: "assistant.thinking_completed", turn: 2 }));
+
+    expect(view.items).toEqual([
+      expect.objectContaining({ kind: "thinking", content: "before", complete: true }),
+      expect.objectContaining({ kind: "tool", callId: "read" }),
+      expect.objectContaining({ kind: "thinking", content: "after", complete: true }),
     ]);
   });
 
@@ -736,6 +906,22 @@ describe("ThreadViewModel", () => {
     expect(vm.turnDurationMs.get(1)).toBe(7_000);
   });
 
+  it("folds server-dispatched background activity without inventing user input", () => {
+    const vm = new ThreadViewModel();
+    expect(vm.apply(envelope(1, {
+      type: "turn.background_activity",
+      turn: 3,
+    }))).toBe(true);
+    expect(vm.items).toMatchObject([{
+      id: "background:3",
+      kind: "user",
+      turn: 3,
+      content: "",
+      attachments: [],
+      background: true,
+    }]);
+  });
+
   it("closes the live thinking phase on its explicit provider boundary", () => {
     const vm = new ThreadViewModel();
     expect(vm.apply(envelope(1, {
@@ -755,11 +941,88 @@ describe("ThreadViewModel", () => {
     ]);
   });
 
-  it("uses an interleaved tool request as a thought boundary", () => {
+  it("keeps a delayed older-turn thought inactive after newer thinking completes", () => {
     const vm = new ThreadViewModel();
     vm.apply(envelope(1, {
       type: "assistant.thinking",
       turn: 2,
+      id: "reasoning",
+      text: "Current.",
+    }));
+    vm.apply(envelope(2, {
+      type: "assistant.thinking",
+      turn: 1,
+      id: "reasoning",
+      text: "Late.",
+    }));
+    vm.apply(envelope(3, {
+      type: "assistant.thinking_completed",
+      turn: 2,
+      id: "reasoning",
+    }));
+
+    expect(vm.apply(envelope(4, {
+      type: "assistant.thinking",
+      turn: 1,
+      id: "reasoning",
+      text: " Later.",
+    }))).toBe(true);
+    expect(vm.thinking).toBe(false);
+    expect(vm.items).toMatchObject([
+      { kind: "thinking", turn: 2, content: "Current.", complete: true },
+      { kind: "thinking", turn: 1, content: "Late. Later.", complete: true },
+    ]);
+  });
+
+  it("matches delayed older-turn thoughts by provider identity", () => {
+    const vm = new ThreadViewModel();
+    let cursor = 0;
+    for (const [id, text] of [["reasoning-a", "First."], ["reasoning-b", "Second."]]) {
+      vm.apply(envelope(++cursor, {
+        type: "assistant.thinking",
+        turn: 1,
+        id,
+        text,
+      }));
+      vm.apply(envelope(++cursor, {
+        type: "assistant.thinking_completed",
+        turn: 1,
+        id,
+      }));
+    }
+    vm.apply(envelope(++cursor, {
+      type: "assistant.thinking",
+      turn: 2,
+      id: "current",
+      text: "Current.",
+    }));
+    vm.apply(envelope(++cursor, {
+      type: "assistant.thinking_completed",
+      turn: 2,
+      id: "current",
+    }));
+
+    vm.apply(envelope(++cursor, {
+      type: "assistant.thinking",
+      turn: 1,
+      id: "reasoning-a",
+      text: " Again.",
+    }));
+
+    expect(vm.thinking).toBe(false);
+    expect(vm.items).toMatchObject([
+      { kind: "thinking", reasoningId: "reasoning-a", content: "First. Again." },
+      { kind: "thinking", reasoningId: "reasoning-b", content: "Second." },
+      { kind: "thinking", reasoningId: "current", content: "Current." },
+    ]);
+  });
+
+  it("keeps an interleaved tool request beneath the growing thought", () => {
+    const vm = new ThreadViewModel();
+    vm.apply(envelope(1, {
+      type: "assistant.thinking",
+      turn: 2,
+      id: "reasoning-a",
       text: "The final overlap pass is still",
     }));
     vm.apply(envelope(2, {
@@ -773,22 +1036,19 @@ describe("ThreadViewModel", () => {
     vm.apply(envelope(3, {
       type: "assistant.thinking",
       turn: 2,
+      id: "reasoning-a",
       text: " running.",
     }));
     vm.apply(envelope(4, {
       type: "assistant.thinking_completed",
       turn: 2,
+      id: "reasoning-a",
     }));
 
     expect(vm.items.filter((item) => item.kind === "thinking")).toMatchObject([
       {
         kind: "thinking",
-        content: "The final overlap pass is still",
-        complete: true,
-      },
-      {
-        kind: "thinking",
-        content: " running.",
+        content: "The final overlap pass is still running.",
         complete: true,
       },
     ]);
@@ -804,10 +1064,9 @@ describe("ThreadViewModel", () => {
       model: "codex/gpt-5.6-sol",
     }));
     vm.apply(envelope(2, {
-      type: "turn.capacity_acquired",
+      type: "turn.admitted",
       turn: 1,
-      wait_ms: 0,
-      background: false,
+      provider_wait_ms: 0,
     }));
     vm.apply(envelope(3, {
       type: "turn.usage_updated",
@@ -889,10 +1148,9 @@ describe("ThreadViewModel", () => {
       model: "codex/gpt-5.6-sol",
     }));
     vm.apply(envelope(7, {
-      type: "turn.capacity_acquired",
+      type: "turn.admitted",
       turn: 2,
-      wait_ms: 0,
-      background: false,
+      provider_wait_ms: 0,
     }));
     expect(vm.lastUsage).toMatchObject({
       input_tokens: 12_000,
@@ -963,10 +1221,9 @@ describe("ThreadViewModel", () => {
       model: "codex/gpt-5.6-sol",
     }));
     vm.apply(envelope(11, {
-      type: "turn.capacity_acquired",
+      type: "turn.admitted",
       turn: 3,
-      wait_ms: 0,
-      background: false,
+      provider_wait_ms: 0,
     }));
     vm.apply(envelope(12, {
       type: "turn.usage_updated",
@@ -1069,10 +1326,9 @@ describe("ThreadViewModel", () => {
       model: "codex/gpt-5.6-sol",
     }));
     vm.apply(envelope(2, {
-      type: "turn.capacity_acquired",
+      type: "turn.admitted",
       turn: 3,
-      wait_ms: 0,
-      background: true,
+      provider_wait_ms: 0,
     }));
     vm.apply(envelope(3, {
       type: "turn.usage_updated",

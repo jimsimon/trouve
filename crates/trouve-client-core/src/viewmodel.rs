@@ -144,6 +144,10 @@ pub enum ChatItem {
         /// Files uploaded with the prompt (metadata only; bytes are served
         /// at `GET /v1/attachments/{id}`).
         attachments: Vec<trouve_protocol::Attachment>,
+        /// Background-activity display row. New events use
+        /// `turn.background_activity`; true on user rows remains possible when
+        /// replaying protocol 7.19–7.26 logs and folded snapshots.
+        background: bool,
     },
     /// Additional user guidance appended to an already-running turn.
     Steered {
@@ -166,6 +170,11 @@ pub enum ChatItem {
         content: String,
         complete: bool,
     },
+    Artifacts {
+        turn: u64,
+        call_id: Option<String>,
+        attachments: Vec<trouve_protocol::Attachment>,
+    },
     /// User-facing progress authored by the agent harness.
     Progress {
         turn: u64,
@@ -175,6 +184,7 @@ pub enum ChatItem {
     /// Model reasoning ("thinking") text; closed when other output arrives.
     Thinking {
         turn: u64,
+        id: Option<String>,
         content: String,
         complete: bool,
     },
@@ -261,7 +271,7 @@ pub struct ThreadViewModel {
     /// Handles imported/replayed streams where capacity precedes the durable
     /// turn shell. Ordinary live streams transition the visible row directly.
     #[doc(hidden)]
-    pub capacity_acquired_before_start: HashSet<u64>,
+    pub admitted_before_start: HashSet<u64>,
     /// Call ids currently waiting for approval (newest last).
     pub pending_approvals: Vec<String>,
     /// Question request ids currently waiting for answers (newest last).
@@ -282,6 +292,12 @@ pub struct ThreadViewModel {
     /// True while the model is streaming thinking and nothing has followed
     /// it yet (the "Thinking…" activity label takes priority over tools).
     pub thinking: bool,
+    /// Provider-owned identity for the active thinking item. Legacy replay
+    /// leaves this absent so tool requests retain their historical boundary.
+    active_thinking_id: Option<String>,
+    /// Highest turn for which thinking has been observed. This keeps delayed
+    /// older deltas historical even after the newer lifecycle has closed.
+    latest_thinking_turn: Option<u64>,
     /// Current transient startup activity for the running turn.
     pub turn_phase: Option<TurnPhase>,
     /// The model that ran each turn ("cursor/claude-fable-5"), from
@@ -312,12 +328,24 @@ impl From<ThreadViewSnapshot> for ThreadViewModel {
         let running_usage = snapshot.active_usage;
         let completed_usage = snapshot.last_usage;
         let last_usage = running_usage.clone().or_else(|| completed_usage.clone());
+        let items = snapshot
+            .items
+            .into_iter()
+            .map(ChatItem::from)
+            .collect::<Vec<_>>();
+        let latest_thinking_turn = items
+            .iter()
+            .filter_map(|item| match item {
+                ChatItem::Thinking { turn, .. } => Some(*turn),
+                _ => None,
+            })
+            .max();
         Self {
-            items: snapshot.items.into_iter().map(ChatItem::from).collect(),
+            items,
             cursor: 0,
             tool_outputs: HashMap::new(),
             tool_started_at: HashMap::new(),
-            capacity_acquired_before_start: HashSet::new(),
+            admitted_before_start: HashSet::new(),
             pending_approvals: snapshot.pending_approvals,
             pending_questions: snapshot.pending_questions,
             last_usage,
@@ -326,6 +354,8 @@ impl From<ThreadViewSnapshot> for ThreadViewModel {
             compacting: snapshot.compacting,
             turn_running: snapshot.turn_running,
             thinking: snapshot.thinking,
+            active_thinking_id: snapshot.active_thinking_id,
+            latest_thinking_turn,
             turn_phase: snapshot.turn_phase,
             turn_models: snapshot.turn_models.into_iter().collect(),
             turn_thinking_levels: snapshot.turn_thinking_levels.into_iter().collect(),
@@ -346,10 +376,12 @@ impl From<ThreadViewItem> for ChatItem {
                 turn,
                 content,
                 attachments,
+                background,
             } => Self::User {
                 turn,
                 content,
                 attachments,
+                background,
             },
             ThreadViewItem::Steered {
                 turn,
@@ -384,6 +416,15 @@ impl From<ThreadViewItem> for ChatItem {
                 content,
                 complete,
             },
+            ThreadViewItem::Artifacts {
+                turn,
+                call_id,
+                attachments,
+            } => Self::Artifacts {
+                turn,
+                call_id,
+                attachments,
+            },
             ThreadViewItem::Progress {
                 turn,
                 content,
@@ -395,10 +436,12 @@ impl From<ThreadViewItem> for ChatItem {
             },
             ThreadViewItem::Thinking {
                 turn,
+                id,
                 content,
                 complete,
             } => Self::Thinking {
                 turn,
+                id,
                 content,
                 complete,
             },
@@ -489,10 +532,48 @@ impl ThreadViewModel {
             .find(|i| matches!(i, ChatItem::ToolCall { call_id: c, .. } if c == call_id))
     }
 
-    /// Close the trailing open thinking block (any non-thinking output ends
-    /// it; a later thinking delta starts a fresh block).
+    /// Return the turn that owns the currently open thinking block.
+    fn active_thinking_turn(&self) -> Option<u64> {
+        self.items.iter().rev().find_map(|item| match item {
+            ChatItem::Thinking {
+                turn,
+                complete: false,
+                ..
+            } => Some(*turn),
+            _ => None,
+        })
+    }
+
+    /// Preserve a delayed older-turn delta without replacing the newer active
+    /// lifecycle. A first-seen stale block is complete by construction.
+    fn append_stale_thinking(&mut self, turn: u64, id: Option<&str>, text: &str) -> usize {
+        if let Some(idx) = self.items.iter().rposition(|item| {
+            matches!(
+                item,
+                ChatItem::Thinking { turn: item_turn, id: item_id, .. }
+                    if *item_turn == turn
+                        && id.is_none_or(|id| item_id.as_deref() == Some(id))
+            )
+        }) {
+            if let ChatItem::Thinking { content, .. } = &mut self.items[idx] {
+                content.push_str(text);
+            }
+            idx
+        } else {
+            self.items.push(ChatItem::Thinking {
+                turn,
+                id: id.map(str::to_owned),
+                content: text.into(),
+                complete: true,
+            });
+            self.items.len() - 1
+        }
+    }
+
+    /// Close the currently open thinking block.
     fn finish_thinking(&mut self) -> Option<usize> {
         self.thinking = false;
+        self.active_thinking_id = None;
         let idx = self.items.iter().rposition(|item| {
             matches!(
                 item,
@@ -595,31 +676,34 @@ impl ThreadViewModel {
         })
     }
 
+    fn apply_turn_admission(&mut self, turn: u64) -> Option<usize> {
+        if let Some(idx) = self.items.iter().rposition(|item| {
+            matches!(
+                item,
+                ChatItem::TurnStatus {
+                    turn: candidate,
+                    state: TurnState::WaitingForCapacity,
+                } if *candidate == turn
+            )
+        }) {
+            self.items[idx] = ChatItem::TurnStatus {
+                turn,
+                state: TurnState::Running,
+            };
+            Some(idx)
+        } else {
+            self.admitted_before_start.insert(turn);
+            None
+        }
+    }
+
     /// Apply one event. Returns the index of the item that changed (for
     /// minimal UI updates), or `None` when nothing visible changed.
     pub fn apply(&mut self, envelope: &EventEnvelope) -> Option<usize> {
         self.cursor = envelope.cursor;
         match &envelope.event {
-            Event::TurnCapacityAcquired { turn, .. } => {
-                if let Some(idx) = self.items.iter().rposition(|item| {
-                    matches!(
-                        item,
-                        ChatItem::TurnStatus {
-                            turn: candidate,
-                            state: TurnState::WaitingForCapacity,
-                        } if candidate == turn
-                    )
-                }) {
-                    self.items[idx] = ChatItem::TurnStatus {
-                        turn: *turn,
-                        state: TurnState::Running,
-                    };
-                    Some(idx)
-                } else {
-                    self.capacity_acquired_before_start.insert(*turn);
-                    None
-                }
-            }
+            Event::TurnAdmitted { turn, .. } => self.apply_turn_admission(*turn),
+            Event::TurnCapacityAcquired { turn, .. } => self.apply_turn_admission(*turn),
             Event::TurnStarted {
                 turn,
                 model,
@@ -637,7 +721,7 @@ impl ThreadViewModel {
                 }
                 self.turn_steerable.insert(*turn, *supports_steering);
                 self.turn_started_at.insert(*turn, envelope.ts);
-                let state = if self.capacity_acquired_before_start.remove(turn) {
+                let state = if self.admitted_before_start.remove(turn) {
                     TurnState::Running
                 } else {
                     TurnState::WaitingForCapacity
@@ -739,11 +823,22 @@ impl ThreadViewModel {
                 turn,
                 content,
                 attachments,
+                background,
             } => {
                 self.items.push(ChatItem::User {
                     turn: *turn,
                     content: content.clone(),
                     attachments: attachments.clone(),
+                    background: *background,
+                });
+                Some(self.items.len() - 1)
+            }
+            Event::TurnBackgroundActivity { turn } => {
+                self.items.push(ChatItem::User {
+                    turn: *turn,
+                    content: String::new(),
+                    attachments: Vec::new(),
+                    background: true,
                 });
                 Some(self.items.len() - 1)
             }
@@ -752,8 +847,11 @@ impl ThreadViewModel {
                 content,
                 attachments,
             } => {
-                self.finish_progress();
-                self.finish_thinking();
+                // Steering is accepted by the vendor while its current sampling
+                // is still streaming; the model only reads it at its next
+                // request. Leave any open thinking/progress block growing so
+                // the steer is recorded in the rail without splitting a
+                // reasoning block mid-sentence.
                 self.items.push(ChatItem::Steered {
                     turn: *turn,
                     content: content.clone(),
@@ -802,10 +900,28 @@ impl ThreadViewModel {
                 }
             }
             Event::AssistantProgressCompleted { .. } => self.finish_progress(),
-            Event::AssistantThinking { turn, text } => {
+            Event::AssistantThinking { turn, id, text } => {
+                let active_turn = self.active_thinking_turn();
+                if self
+                    .latest_thinking_turn
+                    .is_some_and(|latest| *turn < latest)
+                {
+                    return Some(self.append_stale_thinking(*turn, id.as_deref(), text));
+                }
+                self.latest_thinking_turn = Some(
+                    self.latest_thinking_turn
+                        .map_or(*turn, |latest| latest.max(*turn)),
+                );
                 self.fail_open_compaction(*turn);
                 self.finish_progress();
+                if self.thinking
+                    && (self.active_thinking_id.as_ref() != id.as_ref()
+                        || active_turn != Some(*turn))
+                {
+                    self.finish_thinking();
+                }
                 self.thinking = true;
+                self.active_thinking_id = id.clone();
                 // Grow the trailing open thinking item, or start one.
                 if let Some(idx) = self.items.iter().rposition(|i| {
                     matches!(i, ChatItem::Thinking { turn: t, complete: false, .. } if t == turn)
@@ -817,13 +933,22 @@ impl ThreadViewModel {
                 } else {
                     self.items.push(ChatItem::Thinking {
                         turn: *turn,
+                        id: id.clone(),
                         content: text.clone(),
                         complete: false,
                     });
                     Some(self.items.len() - 1)
                 }
             }
-            Event::AssistantThinkingCompleted { .. } => self.finish_thinking(),
+            Event::AssistantThinkingCompleted { turn, id } => {
+                if self.active_thinking_id.as_ref() == id.as_ref()
+                    && self.active_thinking_turn() == Some(*turn)
+                {
+                    self.finish_thinking()
+                } else {
+                    None
+                }
+            }
             Event::AssistantDelta { turn, text } => {
                 self.fail_open_compaction(*turn);
                 self.finish_progress();
@@ -867,6 +992,21 @@ impl ThreadViewModel {
                     Some(self.items.len() - 1)
                 }
             }
+            Event::AssistantArtifacts {
+                turn,
+                call_id,
+                attachments,
+            } => {
+                self.fail_open_compaction(*turn);
+                self.finish_progress();
+                self.finish_thinking();
+                self.items.push(ChatItem::Artifacts {
+                    turn: *turn,
+                    call_id: call_id.clone(),
+                    attachments: attachments.clone(),
+                });
+                Some(self.items.len() - 1)
+            }
             Event::ToolRequested {
                 turn,
                 call_id,
@@ -877,7 +1017,9 @@ impl ThreadViewModel {
             } => {
                 self.fail_open_compaction(*turn);
                 self.finish_progress();
-                self.finish_thinking();
+                if self.active_thinking_id.is_none() {
+                    self.finish_thinking();
+                }
                 // Call ids are expected to be unique, but resetting here makes
                 // a reused id deterministic instead of inheriting stale output.
                 self.tool_outputs.remove(call_id);
@@ -1065,7 +1207,7 @@ impl ThreadViewModel {
                 usage,
                 checkpoint_id,
             } => {
-                self.capacity_acquired_before_start.remove(turn);
+                self.admitted_before_start.remove(turn);
                 self.turn_running = false;
                 let usage = usage_with_live_context(usage.clone(), self.running_usage.as_ref());
                 self.running_usage = None;
@@ -1099,7 +1241,7 @@ impl ThreadViewModel {
                 idx.or(aborted_tool)
             }
             Event::TurnFailed { turn, error } => {
-                self.capacity_acquired_before_start.remove(turn);
+                self.admitted_before_start.remove(turn);
                 self.turn_running = false;
                 self.running_usage = None;
                 self.last_usage.clone_from(&self.completed_usage);
@@ -1130,7 +1272,7 @@ impl ThreadViewModel {
                 idx.or(aborted_tool)
             }
             Event::TurnCancelled { turn } => {
-                self.capacity_acquired_before_start.remove(turn);
+                self.admitted_before_start.remove(turn);
                 self.turn_running = false;
                 self.running_usage = None;
                 self.last_usage.clone_from(&self.completed_usage);
@@ -1184,6 +1326,7 @@ mod tests {
                 ChatItem::Steered { .. } => "steered",
                 ChatItem::Subagent { .. } => "subagent",
                 ChatItem::Assistant { .. } => "assistant",
+                ChatItem::Artifacts { .. } => "artifacts",
                 ChatItem::Progress { .. } => "progress",
                 ChatItem::Thinking { .. } => "thinking",
                 ChatItem::Compaction { .. } => "compaction",
@@ -1304,7 +1447,7 @@ mod tests {
     }
 
     #[test]
-    fn turn_waits_until_capacity_is_acquired() {
+    fn turn_waits_until_provider_admission() {
         let mut vm = ThreadViewModel::new();
         vm.apply(&env(Event::TurnStarted {
             turn: 1,
@@ -1321,16 +1464,44 @@ mod tests {
             })
         ));
 
-        vm.apply(&env(Event::TurnCapacityAcquired {
+        vm.apply(&env(Event::TurnAdmitted {
             turn: 1,
-            wait_ms: 42,
-            background: false,
+            provider_wait_ms: 42,
         }));
         assert!(matches!(
             vm.items.last(),
             Some(ChatItem::TurnStatus {
                 turn: 1,
                 state: TurnState::Running,
+            })
+        ));
+    }
+
+    #[test]
+    fn background_activity_has_a_distinct_event_and_legacy_messages_still_replay() {
+        let mut vm = ThreadViewModel::new();
+        vm.apply(&env(Event::TurnBackgroundActivity { turn: 3 }));
+        assert!(matches!(
+            vm.items.last(),
+            Some(ChatItem::User {
+                turn: 3,
+                content,
+                background: true,
+                ..
+            }) if content.is_empty()
+        ));
+        vm.apply(&env(Event::UserMessage {
+            turn: 4,
+            content: "[background agent activity]".into(),
+            attachments: Vec::new(),
+            background: true,
+        }));
+        assert!(matches!(
+            vm.items.last(),
+            Some(ChatItem::User {
+                turn: 4,
+                background: true,
+                ..
             })
         ));
     }
@@ -1363,7 +1534,7 @@ mod tests {
     }
 
     #[test]
-    fn capacity_before_turn_start_replays_as_running() {
+    fn legacy_capacity_before_turn_start_replays_as_running() {
         let mut vm = ThreadViewModel::new();
         vm.apply(&env(Event::TurnCapacityAcquired {
             turn: 3,
@@ -1507,6 +1678,7 @@ mod tests {
                 turn: 1,
                 content: "do it".into(),
                 attachments: vec![],
+                background: false,
             },
             Event::AssistantDelta {
                 turn: 1,
@@ -1978,10 +2150,12 @@ mod tests {
         }));
         vm.apply(&env(Event::AssistantThinking {
             turn: 1,
+            id: None,
             text: "Let me ".into(),
         }));
         vm.apply(&env(Event::AssistantThinking {
             turn: 1,
+            id: None,
             text: "look.".into(),
         }));
         assert!(vm.thinking);
@@ -2004,6 +2178,7 @@ mod tests {
         // A later thinking delta starts a fresh block.
         vm.apply(&env(Event::AssistantThinking {
             turn: 1,
+            id: None,
             text: "More thought.".into(),
         }));
         let thinking_blocks = vm
@@ -2015,7 +2190,7 @@ mod tests {
     }
 
     #[test]
-    fn steering_preserves_capability_and_splits_active_thinking() {
+    fn steering_preserves_capability_without_splitting_active_thinking() {
         let mut vm = ThreadViewModel::new();
         vm.apply(&env(Event::TurnStarted {
             turn: 4,
@@ -2026,6 +2201,7 @@ mod tests {
         }));
         vm.apply(&env(Event::AssistantThinking {
             turn: 4,
+            id: None,
             text: "Original direction.".into(),
         }));
         vm.apply(&env(Event::TurnSteered {
@@ -2035,49 +2211,205 @@ mod tests {
         }));
         vm.apply(&env(Event::AssistantThinking {
             turn: 4,
+            id: None,
             text: " Continue with the revised direction.".into(),
         }));
-        vm.apply(&env(Event::AssistantThinkingCompleted { turn: 4 }));
+        vm.apply(&env(Event::AssistantThinkingCompleted {
+            turn: 4,
+            id: None,
+        }));
 
         assert_eq!(vm.turn_steerable.get(&4), Some(&true));
         assert!(!vm.thinking);
+        // The steer lands in the rail when it is accepted, but the reasoning
+        // block that was streaming keeps growing instead of being cut in two.
         assert!(matches!(
             vm.items.as_slice(),
             [
                 ChatItem::TurnStatus { .. },
-                ChatItem::Thinking { content: before, complete: true, .. },
+                ChatItem::Thinking { content: thinking, complete: true, .. },
                 ChatItem::Steered { turn: 4, content, attachments },
-                ChatItem::Thinking { content: after, complete: true, .. },
-            ] if before == "Original direction."
+            ] if thinking == "Original direction. Continue with the revised direction."
                 && content == "Check the smaller-screen layout too."
                 && attachments.is_empty()
-                && after == " Continue with the revised direction."
         ));
     }
 
     #[test]
-    fn explicit_thinking_completion_clears_the_live_phase() {
+    fn thinking_lifecycle_matches_identity_and_turn() {
         let mut vm = ThreadViewModel::new();
         vm.apply(&env(Event::AssistantThinking {
             turn: 1,
+            id: Some("reasoning".into()),
             text: "Waiting.".into(),
         }));
         assert!(vm.thinking);
 
-        let changed = vm.apply(&env(Event::AssistantThinkingCompleted { turn: 1 }));
+        let changed = vm.apply(&env(Event::AssistantThinkingCompleted {
+            turn: 2,
+            id: Some("reasoning".into()),
+        }));
+        assert_eq!(changed, None);
+        assert!(vm.thinking);
+
+        let changed = vm.apply(&env(Event::AssistantThinkingCompleted {
+            turn: 1,
+            id: None,
+        }));
+        assert_eq!(changed, None);
+        assert!(vm.thinking);
+
+        vm.apply(&env(Event::AssistantThinking {
+            turn: 1,
+            id: Some("reasoning".into()),
+            text: " Still waiting.".into(),
+        }));
+        vm.apply(&env(Event::AssistantThinking {
+            turn: 2,
+            id: Some("reasoning".into()),
+            text: "Next turn.".into(),
+        }));
+        assert!(matches!(
+            vm.items.as_slice(),
+            [
+                ChatItem::Thinking { content: first, complete: true, .. },
+                ChatItem::Thinking { content: second, complete: false, .. },
+            ] if first == "Waiting. Still waiting." && second == "Next turn."
+        ));
+
+        let changed = vm.apply(&env(Event::AssistantThinking {
+            turn: 1,
+            id: Some("reasoning".into()),
+            text: " Late.".into(),
+        }));
         assert_eq!(changed, Some(0));
+        assert!(matches!(
+            vm.items.as_slice(),
+            [
+                ChatItem::Thinking { content: first, complete: true, .. },
+                ChatItem::Thinking { content: second, complete: false, .. },
+            ] if first == "Waiting. Still waiting. Late." && second == "Next turn."
+        ));
+
+        let changed = vm.apply(&env(Event::AssistantThinkingCompleted {
+            turn: 1,
+            id: Some("reasoning".into()),
+        }));
+        assert_eq!(changed, None);
+        assert!(vm.thinking);
+
+        let changed = vm.apply(&env(Event::AssistantThinkingCompleted {
+            turn: 2,
+            id: Some("reasoning".into()),
+        }));
+        assert_eq!(changed, Some(1));
         assert!(!vm.thinking);
         assert!(matches!(
-            vm.items.first(),
-            Some(ChatItem::Thinking { complete: true, .. })
+            vm.items.last(),
+            Some(ChatItem::Thinking { content, complete: true, .. })
+                if content == "Next turn."
         ));
     }
 
     #[test]
-    fn tool_request_splits_active_thinking_at_the_causal_boundary() {
+    fn first_stale_thinking_delta_is_preserved_without_replacing_the_active_turn() {
+        let mut vm = ThreadViewModel::new();
+        vm.apply(&env(Event::AssistantThinking {
+            turn: 2,
+            id: Some("reasoning".into()),
+            text: "Current.".into(),
+        }));
+
+        let changed = vm.apply(&env(Event::AssistantThinking {
+            turn: 1,
+            id: Some("reasoning".into()),
+            text: "Late.".into(),
+        }));
+        assert_eq!(changed, Some(1));
+        assert_eq!(vm.active_thinking_turn(), Some(2));
+        assert!(matches!(
+            vm.items.as_slice(),
+            [
+                ChatItem::Thinking { turn: 2, content: current, complete: false, .. },
+                ChatItem::Thinking { turn: 1, content: late, complete: true, .. },
+            ] if current == "Current." && late == "Late."
+        ));
+
+        let changed = vm.apply(&env(Event::AssistantThinkingCompleted {
+            turn: 2,
+            id: Some("reasoning".into()),
+        }));
+        assert_eq!(changed, Some(0));
+        assert!(!vm.thinking);
+
+        let changed = vm.apply(&env(Event::AssistantThinking {
+            turn: 1,
+            id: Some("reasoning".into()),
+            text: " Later.".into(),
+        }));
+        assert_eq!(changed, Some(1));
+        assert!(!vm.thinking);
+        assert!(matches!(
+            vm.items.as_slice(),
+            [
+                ChatItem::Thinking { turn: 2, content: current, complete: true, .. },
+                ChatItem::Thinking { turn: 1, content: late, complete: true, .. },
+            ] if current == "Current." && late == "Late. Later."
+        ));
+    }
+
+    #[test]
+    fn stale_thinking_delta_matches_provider_identity_within_the_older_turn() {
+        let mut vm = ThreadViewModel::new();
+        for (id, text) in [("reasoning-a", "First."), ("reasoning-b", "Second.")] {
+            vm.apply(&env(Event::AssistantThinking {
+                turn: 1,
+                id: Some(id.into()),
+                text: text.into(),
+            }));
+            vm.apply(&env(Event::AssistantThinkingCompleted {
+                turn: 1,
+                id: Some(id.into()),
+            }));
+        }
+        vm.apply(&env(Event::AssistantThinking {
+            turn: 2,
+            id: Some("current".into()),
+            text: "Current.".into(),
+        }));
+        vm.apply(&env(Event::AssistantThinkingCompleted {
+            turn: 2,
+            id: Some("current".into()),
+        }));
+
+        let changed = vm.apply(&env(Event::AssistantThinking {
+            turn: 1,
+            id: Some("reasoning-a".into()),
+            text: " Again.".into(),
+        }));
+
+        assert_eq!(changed, Some(0));
+        assert!(!vm.thinking);
+        assert!(matches!(
+            vm.items.as_slice(),
+            [
+                ChatItem::Thinking { id: Some(first_id), content: first, complete: true, .. },
+                ChatItem::Thinking { id: Some(second_id), content: second, complete: true, .. },
+                ChatItem::Thinking { content: current, complete: true, .. },
+            ] if first_id == "reasoning-a"
+                && first == "First. Again."
+                && second_id == "reasoning-b"
+                && second == "Second."
+                && current == "Current."
+        ));
+    }
+
+    #[test]
+    fn tool_requests_do_not_split_an_open_thinking_item() {
         let mut vm = ThreadViewModel::new();
         vm.apply(&env(Event::AssistantThinking {
             turn: 1,
+            id: Some("reasoning-a".into()),
             text: "The final overlap pass is still".into(),
         }));
         vm.apply(&env(Event::ToolRequested {
@@ -2089,31 +2421,83 @@ mod tests {
         }));
         vm.apply(&env(Event::AssistantThinking {
             turn: 1,
+            id: Some("reasoning-a".into()),
             text: " running.".into(),
         }));
-        vm.apply(&env(Event::AssistantThinkingCompleted { turn: 1 }));
+        vm.apply(&env(Event::ToolRequested {
+            turn: 1,
+            call_id: "read".into(),
+            tool: "read_file".into(),
+            args: serde_json::json!({ "path": "src/lib.rs" }),
+            requires_approval: false,
+        }));
+        vm.apply(&env(Event::AssistantThinkingCompleted {
+            turn: 1,
+            id: Some("reasoning-a".into()),
+        }));
+        vm.apply(&env(Event::AssistantThinking {
+            turn: 1,
+            id: Some("reasoning-b".into()),
+            text: "A separate reasoning block.".into(),
+        }));
 
-        let thoughts = vm
-            .items
-            .iter()
-            .filter(|item| matches!(item, ChatItem::Thinking { .. }))
-            .collect::<Vec<_>>();
-        assert_eq!(thoughts.len(), 2);
         assert!(matches!(
-            thoughts[0],
-            ChatItem::Thinking {
-                content,
-                complete: true,
-                ..
-            } if content == "The final overlap pass is still"
+            vm.items.as_slice(),
+            [
+                ChatItem::Thinking { content, complete: true, .. },
+                ChatItem::ToolCall { call_id: first, .. },
+                ChatItem::ToolCall { call_id: second, .. },
+                ChatItem::Thinking { content: separate, complete: false, .. },
+            ] if content == "The final overlap pass is still running."
+                && first == "search"
+                && second == "read"
+                && separate == "A separate reasoning block."
         ));
+        assert!(vm.thinking);
+    }
+
+    #[test]
+    fn legacy_tool_requests_split_unidentified_thinking_items() {
+        let mut vm = ThreadViewModel::new();
+        vm.apply(&env(Event::AssistantThinking {
+            turn: 1,
+            id: None,
+            text: "Before the tool.".into(),
+        }));
+        vm.apply(&env(Event::ToolRequested {
+            turn: 1,
+            call_id: "read".into(),
+            tool: "read_file".into(),
+            args: serde_json::json!({ "path": "src/lib.rs" }),
+            requires_approval: false,
+        }));
+        vm.apply(&env(Event::AssistantThinking {
+            turn: 1,
+            id: None,
+            text: "After the tool.".into(),
+        }));
+        vm.apply(&env(Event::AssistantThinkingCompleted {
+            turn: 1,
+            id: None,
+        }));
+
         assert!(matches!(
-            thoughts[1],
-            ChatItem::Thinking {
-                content,
-                complete: true,
-                ..
-            } if content == " running."
+            vm.items.as_slice(),
+            [
+                ChatItem::Thinking {
+                    content: before,
+                    complete: true,
+                    ..
+                },
+                ChatItem::ToolCall { call_id, .. },
+                ChatItem::Thinking {
+                    content: after,
+                    complete: true,
+                    ..
+                },
+            ] if before == "Before the tool."
+                && call_id == "read"
+                && after == "After the tool."
         ));
         assert!(!vm.thinking);
     }
@@ -2199,6 +2583,7 @@ mod tests {
                 turn: 1,
                 content: "hi".into(),
                 attachments: vec![],
+                background: false,
             },
             Event::AssistantDelta {
                 turn: 1,
@@ -2239,9 +2624,11 @@ mod tests {
                 turn: 1,
                 content: "go".into(),
                 attachments: vec![],
+                background: false,
             },
             Event::AssistantThinking {
                 turn: 1,
+                id: None,
                 text: "hmm".into(),
             },
             Event::AssistantDelta {
@@ -2263,6 +2650,27 @@ mod tests {
                 status: ToolStatus::Ok,
                 result: serde_json::json!({"content": "a"}),
                 execution_duration_ms: None,
+            },
+            Event::AssistantThinking {
+                turn: 1,
+                id: Some("reasoning-a".into()),
+                text: "before ".into(),
+            },
+            Event::ToolRequested {
+                turn: 1,
+                call_id: "call_2".into(),
+                tool: "search".into(),
+                args: serde_json::json!({"query": "reasoning"}),
+                requires_approval: false,
+            },
+            Event::AssistantThinking {
+                turn: 1,
+                id: Some("reasoning-a".into()),
+                text: "after".into(),
+            },
+            Event::AssistantThinkingCompleted {
+                turn: 1,
+                id: Some("reasoning-a".into()),
             },
             Event::AssistantMessage {
                 turn: 1,

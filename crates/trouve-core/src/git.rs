@@ -350,7 +350,8 @@ fn run_git_bounded_with_status(
     operation: &GitOperation<'_>,
 ) -> Result<BoundedGitCommandOutput> {
     operation.check()?;
-    let execution_deadline = operation.deadline - PROCESS_TREE_CLEANUP_RESERVE;
+    let cleanup_reserve = PROCESS_TREE_CLEANUP_RESERVE.min(operation.timeout / 3);
+    let execution_deadline = operation.deadline - cleanup_reserve;
     if Instant::now() >= execution_deadline {
         bail!(
             "{} timed out after {}s",
@@ -2217,6 +2218,71 @@ pub fn common_directory(repo: &Path) -> Result<PathBuf> {
         .with_context(|| format!("canonicalizing git common directory {}", common.display()))
 }
 
+/// Resolve the local inputs used to identify a workspace repository under one
+/// shared deadline. Workspace listing is latency-sensitive and must not wait
+/// indefinitely on Git configuration or filesystem probes.
+pub fn workspace_repository_sources(
+    repo: &Path,
+    remote: &str,
+    timeout: Duration,
+    remote_is_usable: impl FnOnce(&str) -> bool,
+) -> (Option<String>, Option<PathBuf>) {
+    let operation = GitOperation::with_timeout(None, timeout, "workspace repository identity");
+    let remote_url = run_git_bounded(
+        repo,
+        None,
+        &["remote", "get-url", remote],
+        None,
+        64 * 1024,
+        &operation,
+    )
+    .ok()
+    .filter(|output| !output.truncated)
+    .map(|output| String::from_utf8_lossy(&output.bytes).trim().to_string())
+    .filter(|url| !url.is_empty());
+    let common_directory = if remote_url.as_deref().is_some_and(remote_is_usable) {
+        None
+    } else {
+        run_git_bounded(
+            repo,
+            None,
+            &["rev-parse", "--git-common-dir"],
+            None,
+            64 * 1024,
+            &operation,
+        )
+        .ok()
+        .filter(|output| !output.truncated)
+        .map(|output| {
+            let common = PathBuf::from(String::from_utf8_lossy(&output.bytes).trim().to_string());
+            // Keep all filesystem traversal inside the bounded Git child. The
+            // workspace root is canonical at registration, so joining Git's
+            // relative result is stable without an unbounded canonicalize call.
+            let common = if common.is_absolute() {
+                common
+            } else {
+                repo.join(common)
+            };
+            normalize_path_lexically(&common)
+        })
+    };
+    (remote_url, common_directory)
+}
+
+fn normalize_path_lexically(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            component => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
+}
+
 /// Remove an unpersisted immutable checkpoint anchor only while it still names
 /// the commit produced by that attempt. The old-OID argument is the ownership
 /// proof: a concurrent replacement makes this fail closed.
@@ -2518,6 +2584,115 @@ pub struct SessionReviewDiffFile {
     /// file. Deleted files intentionally leave this absent so their diffs stay
     /// visible.
     pub generated_header: Option<String>,
+    /// The `linguist-generated` gitattribute for the file, resolved from the
+    /// trusted base revision's attribute files rather than the reviewed
+    /// snapshot, so a change under review cannot mark its own files generated
+    /// to suppress line-by-line review. `Some(true)` when set or `true`,
+    /// `Some(false)` when unset or `false`, `None` when unspecified. Deleted
+    /// files and lookup failures leave this absent so their diffs stay visible.
+    pub linguist_generated: Option<bool>,
+}
+
+/// Resolve the `linguist-generated` attribute for `paths` against the
+/// attribute files of `source` (a trusted tree-ish, plus repository-local and
+/// global attribute files). Returns only paths with an explicit value; a
+/// failed lookup yields an empty map so every diff stays reviewable, and a
+/// truncated one keeps the records that arrived whole.
+fn review_linguist_generated_attributes(
+    worktree: &Path,
+    source: &str,
+    paths: &[&str],
+    operation: &GitOperation<'_>,
+) -> Result<HashMap<String, bool>> {
+    // `git check-attr -z` emits path<NUL>attribute<NUL>value<NUL> per path.
+    // Values are `set`, `unset`, `unspecified`, or an arbitrary string from
+    // the attribute file; allow a generous string before the bound trips.
+    const RECORD_OVERHEAD: usize = "linguist-generated".len() + 128 + 3;
+    let mut attributes = HashMap::new();
+    if paths.is_empty() {
+        return Ok(attributes);
+    }
+    let mut input = Vec::new();
+    for path in paths {
+        input.extend_from_slice(path.as_bytes());
+        input.push(0);
+    }
+    let max_stdout = paths
+        .iter()
+        .fold(0_usize, |total, path| {
+            total.saturating_add(path.len().saturating_add(RECORD_OVERHEAD))
+        })
+        .saturating_add(1);
+    let source = format!("--source={source}");
+    let output = match run_git_bounded_with_status(
+        worktree,
+        None,
+        &["check-attr", &source, "-z", "--stdin", "linguist-generated"],
+        Some(GitCommandInput::Bytes(input)),
+        max_stdout,
+        operation,
+    ) {
+        Ok(output) if output.status.success() => output.stdout,
+        Ok(_) => {
+            operation.check_cancelled()?;
+            return Ok(attributes);
+        }
+        Err(error) => {
+            // Attribute lookup is optional after patches are loaded; only
+            // explicit caller cancellation aborts the completed operation.
+            operation.check_cancelled()?;
+            tracing::debug!(%error, "review linguist-generated attribute lookup failed");
+            return Ok(attributes);
+        }
+    };
+    if output.truncated {
+        tracing::debug!("review linguist-generated attribute output was truncated");
+    }
+    let known = paths.iter().copied().collect::<HashSet<&str>>();
+    parse_review_attribute_output(&output.bytes, &known, &mut attributes);
+    Ok(attributes)
+}
+
+/// Parse `git check-attr -z` records into `attributes`. Only records whose
+/// value was terminated by NUL count, so a truncated tail can never pass a
+/// clipped string such as `settings` off as `set`.
+fn parse_review_attribute_output(
+    bytes: &[u8],
+    known: &HashSet<&str>,
+    attributes: &mut HashMap<String, bool>,
+) {
+    let mut fields = bytes.split(|byte| *byte == 0).collect::<Vec<_>>();
+    // The remainder after the final NUL is either empty or an unterminated
+    // record; either way it is not a complete field.
+    fields.pop();
+    for [path, _attribute, value] in fields.as_chunks::<3>().0 {
+        let Ok(path) = std::str::from_utf8(path) else {
+            continue;
+        };
+        if !known.contains(path) {
+            continue;
+        }
+        let generated = match *value {
+            b"set" | b"true" => true,
+            b"unset" | b"false" => false,
+            _ => continue,
+        };
+        attributes.insert(path.to_owned(), generated);
+    }
+}
+
+/// Whether one rename-aware review patch removes its path from the snapshot.
+/// A type change renders as a deletion segment followed by an addition, so
+/// only a patch whose every segment is a deletion counts.
+fn review_patch_deletes_path(diff: &str) -> bool {
+    !diff.is_empty()
+        && diff.split("\ndiff --git ").all(|segment| {
+            segment
+                .lines()
+                .skip(1)
+                .take(3)
+                .any(|line| line.starts_with("deleted file mode "))
+        })
 }
 
 fn parse_review_marker_output(
@@ -2899,8 +3074,6 @@ fn review_blob_headers(
 pub fn session_diff_patches_cancellable<F>(
     worktree: &Path,
     base_ref: &str,
-    max_files: usize,
-    max_changed_lines: u64,
     max_total_bytes: usize,
     cancel: &tokio_util::sync::CancellationToken,
     capture_header: F,
@@ -2911,40 +3084,119 @@ where
     ensure_safe_ref(base_ref)?;
     let operation = GitOperation::new(Some(cancel));
     with_session_snapshot_index(worktree, &operation, |index| {
-        let summary = session_diff_summary_with_index(worktree, base_ref, index, &operation)?;
-        let changed_lines = summary.iter().try_fold(0_u64, |total, file| {
-            total
-                .checked_add(file.additions)
-                .and_then(|total| total.checked_add(file.deletions))
-                .context("session review diff line count overflow")
-        })?;
-        if summary.len() > max_files || changed_lines > max_changed_lines {
+        // Use one rename-aware patch for review orchestration. Per-path
+        // `--no-renames` patches cannot distinguish deletion from a surviving
+        // file move. Review batching enforces the model-derived prompt budget;
+        // only byte bounds apply while collecting the repository diff.
+        let manifest = run_git_bounded(
+            worktree,
+            Some(index),
+            &[
+                "--glob-pathspecs",
+                "diff",
+                "--cached",
+                "--submodule=short",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--find-renames",
+                "--name-status",
+                "-z",
+                "--end-of-options",
+                base_ref,
+                "--",
+                ".",
+                ":(exclude,top).trouve/attachments/**",
+            ],
+            None,
+            max_total_bytes,
+            &operation,
+        )?;
+        if manifest.truncated {
             return Err(session_diff_too_large(format!(
-                "review diff is too large ({} files, {changed_lines} changed lines; limit is \
-                 {max_files} files or {max_changed_lines} changed lines)",
-                summary.len()
+                "review diff path manifest is too large (more than {max_total_bytes} bytes)"
             )));
         }
-
-        let mut total_bytes = 0_usize;
-        let mut patches = Vec::with_capacity(summary.len());
-        for file in summary {
-            operation.check()?;
-            let diff =
-                bounded_session_diff_path(worktree, base_ref, &file.path, index, &operation)?;
-            total_bytes = total_bytes
-                .checked_add(diff.len())
-                .context("review diff byte count overflow")?;
-            if total_bytes > max_total_bytes {
-                return Err(session_diff_too_large(format!(
-                    "review diff is too large (more than {max_total_bytes} bytes)"
-                )));
+        let mut fields = manifest.bytes.split(|byte| *byte == 0);
+        let mut paths = Vec::new();
+        while let Some(status) = fields.next().filter(|field| !field.is_empty()) {
+            let status = std::str::from_utf8(status)
+                .context("git diff --name-status returned a non-UTF-8 status")?;
+            let source_or_path = fields
+                .next()
+                .context("git diff --name-status omitted a path")?;
+            let path = if status.starts_with('R') || status.starts_with('C') {
+                fields
+                    .next()
+                    .context("git diff --name-status omitted a destination path")?
+            } else {
+                source_or_path
+            };
+            let path = String::from_utf8(path.to_vec())
+                .context("git diff --name-status returned a non-UTF-8 path")?;
+            // Git renders a type change as adjacent deletion/addition patch
+            // segments even though name-status reports one `T` record.
+            if status == "T" {
+                paths.push(path.clone());
             }
-            patches.push(SessionReviewDiffFile {
-                path: file.path,
-                diff,
-                generated_header: None,
-            });
+            paths.push(path);
+        }
+        let output = run_git_bounded(
+            worktree,
+            Some(index),
+            &[
+                "--glob-pathspecs",
+                "diff",
+                "--cached",
+                "--submodule=short",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--find-renames",
+                "--end-of-options",
+                base_ref,
+                "--",
+                ".",
+                ":(exclude,top).trouve/attachments/**",
+            ],
+            None,
+            max_total_bytes,
+            &operation,
+        )?;
+        if output.truncated {
+            return Err(session_diff_too_large(format!(
+                "review diff is too large (more than {max_total_bytes} bytes)"
+            )));
+        }
+        let diff = String::from_utf8_lossy(&output.bytes).into_owned();
+        if paths.is_empty() != diff.is_empty() {
+            bail!("review diff path manifest did not match patch content");
+        }
+        let mut starts = if diff.is_empty() { Vec::new() } else { vec![0] };
+        starts.extend(
+            diff.match_indices("\ndiff --git ")
+                .map(|(offset, _)| offset + 1),
+        );
+        if starts.len() != paths.len() {
+            bail!(
+                "review diff returned {} file segments for {} changed paths",
+                starts.len(),
+                paths.len()
+            );
+        }
+        starts.push(diff.len());
+        let mut patches = Vec::<SessionReviewDiffFile>::new();
+        for (path, range) in paths.into_iter().zip(starts.windows(2)) {
+            if let Some(previous) = patches.last_mut()
+                && previous.path == path
+            {
+                previous.diff.push_str(&diff[range[0]..range[1]]);
+            } else {
+                patches.push(SessionReviewDiffFile {
+                    path,
+                    diff: diff[range[0]..range[1]].to_owned(),
+                    generated_header: None,
+                    linguist_generated: None,
+                });
+            }
         }
         let current = patches
             .iter()
@@ -2952,8 +3204,21 @@ where
             .map(|file| file.path.as_str())
             .collect::<Vec<_>>();
         let mut headers = review_blob_headers(worktree, &current, index, &operation)?;
+        // Attributes cover every surviving path, not only the header-eligible
+        // ones: an explicit `linguist-generated` value must be able to override
+        // the heuristics either way. They come from the base revision, never
+        // the reviewed snapshot, so the change under review cannot exempt its
+        // own files from line-by-line review by editing `.gitattributes`.
+        let surviving = patches
+            .iter()
+            .filter(|file| !review_patch_deletes_path(&file.diff))
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>();
+        let mut attributes =
+            review_linguist_generated_attributes(worktree, base_ref, &surviving, &operation)?;
         for file in &mut patches {
             file.generated_header = headers.remove(&file.path);
+            file.linguist_generated = attributes.remove(&file.path);
         }
         Ok(patches)
     })
@@ -3156,8 +3421,6 @@ pub fn diff_files_between(
     repo: &Path,
     base_ref: &str,
     head_ref: &str,
-    max_files: usize,
-    max_changed_lines: u64,
     max_metadata_bytes: usize,
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<Vec<String>> {
@@ -3186,42 +3449,22 @@ pub fn diff_files_between(
         bail!("review diff metadata exceeds the {max_metadata_bytes}-byte limit");
     }
     let mut paths = Vec::new();
-    let mut changed_lines = 0_u64;
     for entry in output
         .bytes
         .split(|byte| *byte == 0)
         .filter(|entry| !entry.is_empty())
     {
         let mut fields = entry.splitn(3, |byte| *byte == b'\t');
-        let additions = fields
+        fields
             .next()
             .context("review diff metadata omitted additions")?;
-        let deletions = fields
+        fields
             .next()
             .context("review diff metadata omitted deletions")?;
         let path = fields
             .next()
             .context("review diff metadata omitted its path")?;
-        let additions = std::str::from_utf8(additions)
-            .context("review diff additions are not UTF-8")?
-            .parse::<u64>();
-        let deletions = std::str::from_utf8(deletions)
-            .context("review diff deletions are not UTF-8")?
-            .parse::<u64>();
-        if let (Ok(additions), Ok(deletions)) = (additions, deletions) {
-            changed_lines = changed_lines
-                .checked_add(additions)
-                .and_then(|total| total.checked_add(deletions))
-                .context("review diff changed-line count overflow")?;
-        }
         paths.push(String::from_utf8(path.to_vec()).context("review diff path is not UTF-8")?);
-        if paths.len() > max_files || changed_lines > max_changed_lines {
-            bail!(
-                "review diff is too large ({} files, {changed_lines} changed lines; limit is \
-                 {max_files} files or {max_changed_lines} changed lines)",
-                paths.len()
-            );
-        }
     }
     Ok(paths)
 }
@@ -3307,6 +3550,84 @@ pub fn diff_between(
         bail!("review diff exceeds the {max_bytes}-byte limit");
     }
     Ok(String::from_utf8_lossy(&output.bytes).into_owned())
+}
+
+/// One line of an immutable object at `revision:path`, or None when the
+/// object does not exist at that revision, exceeds `max_bytes`, or has no
+/// such line. See [`review_object_text`] for the read guarantees.
+pub fn review_object_line(
+    repo: &Path,
+    revision: &str,
+    path: &str,
+    line: u64,
+    max_bytes: usize,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<Option<String>> {
+    let Some(text) = review_object_text(repo, revision, path, max_bytes, cancel)? else {
+        return Ok(None);
+    };
+    let Some(index) = usize::try_from(line)
+        .ok()
+        .and_then(|line| line.checked_sub(1))
+    else {
+        return Ok(None);
+    };
+    Ok(text.lines().nth(index).map(str::to_owned))
+}
+
+/// The full text of an immutable object at `revision:path`, or None when the
+/// object does not exist at that revision, exceeds `max_bytes`, or is not
+/// valid UTF-8. Replacement-ref indirection is disabled so the read is pinned
+/// to the exact reviewed object even in a repository carrying hostile
+/// `refs/replace` entries, and the object's size is checked before any
+/// content is buffered.
+pub fn review_object_text(
+    repo: &Path,
+    revision: &str,
+    path: &str,
+    max_bytes: usize,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<Option<String>> {
+    ensure_safe_ref(revision)?;
+    let spec = format!("{revision}:{path}");
+    let operation =
+        GitOperation::with_timeout(Some(cancel), REVIEW_GIT_TIMEOUT, "review anchor object");
+    let size = run_git_bounded_with_status(
+        repo,
+        None,
+        &["--no-replace-objects", "cat-file", "-s", &spec],
+        None,
+        64,
+        &operation,
+    )?;
+    if !size.status.success() {
+        // The path has no object at the reviewed revision.
+        return Ok(None);
+    }
+    let Ok(size) = String::from_utf8_lossy(&size.stdout.bytes)
+        .trim()
+        .parse::<u64>()
+    else {
+        return Ok(None);
+    };
+    if size > max_bytes as u64 {
+        return Ok(None);
+    }
+    let output = run_git_bounded_with_status(
+        repo,
+        None,
+        &["--no-replace-objects", "show", &spec],
+        None,
+        max_bytes,
+        &operation,
+    )?;
+    if !output.status.success() || output.stdout.truncated {
+        return Ok(None);
+    }
+    // Strict decoding: lossy replacement would let a quote containing
+    // U+FFFD "match" bytes that are absent from the immutable object. A
+    // non-UTF-8 blob is simply not verifiable.
+    Ok(String::from_utf8(output.stdout.bytes).ok())
 }
 
 /// URL of the named remote (usually "origin"), if configured.
@@ -3408,6 +3729,25 @@ pub fn push_branch(worktree: &Path, remote: &str, branch: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn rename_session_branch(worktree: &Path, old_branch: &str, new_branch: &str) -> Result<()> {
+    ensure_safe_ref(old_branch)?;
+    ensure_safe_ref(new_branch)?;
+    let (current_branch, _) = checked_out_branch_head(worktree)?;
+    if current_branch == new_branch {
+        anyhow::ensure!(
+            !local_branch_exists(worktree, old_branch)?,
+            "worktree is on {new_branch}, but old session branch {old_branch} still exists"
+        );
+        return Ok(());
+    }
+    anyhow::ensure!(
+        current_branch == old_branch,
+        "worktree is on branch {current_branch}, expected {old_branch}"
+    );
+    git(worktree, &["branch", "-m", old_branch, new_branch])?;
+    Ok(())
+}
+
 /// Where session worktrees live: `<data_dir>/worktrees/<session_id>`.
 pub fn worktree_dir(data_dir: &Path, session_id: &str) -> PathBuf {
     data_dir.join("worktrees").join(session_id)
@@ -3440,6 +3780,98 @@ mod tests {
     }
 
     #[test]
+    fn rename_session_branch_renames_the_checked_out_local_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo(tmp.path());
+        run(tmp.path(), &["switch", "-c", "trouve/session-id"]);
+
+        rename_session_branch(
+            tmp.path(),
+            "trouve/session-id",
+            "trouve/describe-authentication-failure",
+        )
+        .unwrap();
+        // Recovery may replay an intent after Git succeeded but before the
+        // corresponding store transaction committed.
+        rename_session_branch(
+            tmp.path(),
+            "trouve/session-id",
+            "trouve/describe-authentication-failure",
+        )
+        .unwrap();
+
+        assert_eq!(
+            run(tmp.path(), &["branch", "--show-current"]),
+            "trouve/describe-authentication-failure"
+        );
+        run(tmp.path(), &["branch", "trouve/session-id"]);
+        assert!(
+            rename_session_branch(
+                tmp.path(),
+                "trouve/session-id",
+                "trouve/describe-authentication-failure",
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_repository_sources_bound_stalled_git_configuration() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo(tmp.path());
+        let stalled_include = tmp.path().join("stalled-config");
+        let mut mkfifo = Command::new("mkfifo");
+        mkfifo.arg(&stalled_include);
+        assert!(trouve_process::status(&mut mkfifo).unwrap().success());
+        let mut config = OpenOptions::new()
+            .append(true)
+            .open(tmp.path().join(".git/config"))
+            .unwrap();
+        writeln!(config, "[include]\n\tpath = {}", stalled_include.display()).unwrap();
+        drop(config);
+
+        let started = Instant::now();
+        let sources =
+            workspace_repository_sources(tmp.path(), "origin", Duration::from_millis(300), |_| {
+                true
+            });
+
+        assert_eq!(sources, (None, None));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn workspace_repository_sources_skip_local_fallback_for_a_usable_remote() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo(tmp.path());
+        run(
+            tmp.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://example.test/acme/widgets.git",
+            ],
+        );
+
+        let (remote_url, common_directory) =
+            workspace_repository_sources(tmp.path(), "origin", Duration::from_secs(1), |url| {
+                url.starts_with("https://")
+            });
+
+        assert_eq!(
+            remote_url.as_deref(),
+            Some("https://example.test/acme/widgets.git")
+        );
+        assert_eq!(common_directory, None);
+
+        let (_, common_directory) =
+            workspace_repository_sources(tmp.path(), "origin", Duration::from_secs(1), |_| false);
+        assert!(common_directory.is_some());
+    }
+
+    #[test]
     fn default_branch_uses_origin_head_instead_of_checked_out_branch() {
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path();
@@ -3469,6 +3901,15 @@ mod tests {
         init_repo(tmp.path());
 
         assert_eq!(default_branch(tmp.path()), None);
+    }
+
+    #[test]
+    fn lexical_path_normalization_collapses_relative_common_directory_segments() {
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(
+            normalize_path_lexically(&root.path().join("nested/../.git")),
+            root.path().join(".git")
+        );
     }
 
     #[test]
@@ -3586,6 +4027,133 @@ mod tests {
         assert_eq!(
             std::fs::read(attachments.join("new.bin")).unwrap(),
             b"materialized new"
+        );
+    }
+
+    #[test]
+    fn review_object_line_reads_the_exact_reviewed_object() {
+        let repo = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(repo.path())
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.test")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.test")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?}: {output:?}");
+            String::from_utf8(output.stdout).unwrap()
+        };
+        run(&["init", "--quiet"]);
+        std::fs::create_dir_all(repo.path().join("src")).unwrap();
+        std::fs::write(
+            repo.path().join("src/config.rs"),
+            "line one
+let retries = 5;
+line three
+",
+        )
+        .unwrap();
+        run(&["add", "."]);
+        run(&["commit", "--quiet", "-m", "reviewed"]);
+        let reviewed = run(&["rev-parse", "HEAD"]).trim().to_owned();
+
+        // A second commit with different content plus a replace ref that
+        // redirects the reviewed commit to it, and a mutated worktree: the
+        // read must still return the reviewed object's line.
+        std::fs::write(
+            repo.path().join("src/config.rs"),
+            "line one
+let retries = 99;
+line three
+",
+        )
+        .unwrap();
+        run(&["commit", "--quiet", "-am", "hostile"]);
+        let hostile = run(&["rev-parse", "HEAD"]).trim().to_owned();
+        run(&["replace", &reviewed, &hostile]);
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        assert_eq!(
+            review_object_line(
+                repo.path(),
+                &reviewed,
+                "src/config.rs",
+                2,
+                64 * 1024,
+                &cancel
+            )
+            .unwrap()
+            .as_deref(),
+            Some("let retries = 5;"),
+        );
+        // Missing paths, out-of-range lines, and objects over the byte cap
+        // degrade to None instead of erroring or buffering.
+        assert_eq!(
+            review_object_line(
+                repo.path(),
+                &reviewed,
+                "src/missing.rs",
+                1,
+                64 * 1024,
+                &cancel
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            review_object_line(
+                repo.path(),
+                &reviewed,
+                "src/config.rs",
+                99,
+                64 * 1024,
+                &cancel
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            review_object_line(repo.path(), &reviewed, "src/config.rs", 2, 8, &cancel).unwrap(),
+            None
+        );
+        // The whole-object read shares the pinning and the byte cap.
+        assert_eq!(
+            review_object_text(repo.path(), &reviewed, "src/config.rs", 64 * 1024, &cancel)
+                .unwrap()
+                .as_deref(),
+            Some("line one\nlet retries = 5;\nline three\n"),
+        );
+        assert_eq!(
+            review_object_text(repo.path(), &reviewed, "src/config.rs", 8, &cancel).unwrap(),
+            None
+        );
+
+        // A non-UTF-8 blob is unverifiable rather than lossily decoded: a
+        // quote containing U+FFFD must never "match" bytes the immutable
+        // object does not contain.
+        std::fs::write(
+            repo.path().join("src/binary.bin"),
+            [0xff, 0xfe, b'\n', 0x80],
+        )
+        .unwrap();
+        run(&["add", "."]);
+        run(&["commit", "--quiet", "-m", "binary"]);
+        let with_binary = run(&["rev-parse", "HEAD"]).trim().to_owned();
+        assert_eq!(
+            review_object_line(
+                repo.path(),
+                &with_binary,
+                "src/binary.bin",
+                1,
+                64 * 1024,
+                &cancel
+            )
+            .unwrap(),
+            None
         );
     }
 
@@ -4178,8 +4746,6 @@ mod tests {
         let files = session_diff_patches_cancellable(
             tmp.path(),
             &base,
-            10,
-            1_000,
             1024 * 1024,
             &tokio_util::sync::CancellationToken::new(),
             |_| true,
@@ -4205,6 +4771,131 @@ mod tests {
         );
         assert!(deleted.generated_header.is_none());
         assert!(deleted.diff.contains("Generated by"));
+    }
+
+    #[test]
+    fn review_diff_resolves_linguist_generated_attributes_from_the_base_revision() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo(tmp.path());
+        let data = tmp.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        for name in [
+            "snapshot.json",
+            "opted-out.json",
+            "plain.json",
+            "deleted.json",
+            "source.rs",
+        ] {
+            std::fs::write(data.join(name), "{\"old\":true}\n").unwrap();
+        }
+        std::fs::write(
+            tmp.path().join(".gitattributes"),
+            "data/snapshot.json linguist-generated=true\n\
+             data/deleted.json linguist-generated\n\
+             data/opted-out.json -linguist-generated\n",
+        )
+        .unwrap();
+        run(tmp.path(), &["add", "."]);
+        run(tmp.path(), &["commit", "-m", "add data"]);
+        let base = run(tmp.path(), &["rev-parse", "HEAD"]);
+
+        // The reviewed change rewrites the attributes file to exempt a source
+        // file and to opt the snapshot back in; neither edit may take effect
+        // until it has landed in a trusted revision.
+        std::fs::write(
+            tmp.path().join(".gitattributes"),
+            "data/source.rs linguist-generated=true\n\
+             data/snapshot.json -linguist-generated\n\
+             data/opted-out.json -linguist-generated\n",
+        )
+        .unwrap();
+        for name in ["snapshot.json", "opted-out.json", "plain.json", "source.rs"] {
+            std::fs::write(data.join(name), "{\"new\":true}\n").unwrap();
+        }
+        std::fs::remove_file(data.join("deleted.json")).unwrap();
+
+        let files = session_diff_patches_cancellable(
+            tmp.path(),
+            &base,
+            1024 * 1024,
+            &tokio_util::sync::CancellationToken::new(),
+            |_| true,
+        )
+        .unwrap();
+        let attribute = |path: &str| {
+            files
+                .iter()
+                .find(|file| file.path == path)
+                .unwrap_or_else(|| panic!("{path} missing from review diff"))
+                .linguist_generated
+        };
+
+        assert_eq!(attribute("data/snapshot.json"), Some(true));
+        assert_eq!(attribute("data/opted-out.json"), Some(false));
+        assert_eq!(attribute("data/plain.json"), None);
+        assert_eq!(attribute("data/source.rs"), None);
+        assert_eq!(attribute(".gitattributes"), None);
+        // Deletions keep their diff visible regardless of attributes.
+        assert_eq!(attribute("data/deleted.json"), None);
+    }
+
+    #[test]
+    fn review_attribute_parsing_ignores_unterminated_records_and_unknown_paths() {
+        let known = HashSet::from(["a.json", "b.json", "c.json"]);
+        let mut attributes = HashMap::new();
+        parse_review_attribute_output(
+            b"a.json\0linguist-generated\0true\0\
+              other.json\0linguist-generated\0set\0\
+              b.json\0linguist-generated\0custom-string\0\
+              c.json\0linguist-generated\0set",
+            &known,
+            &mut attributes,
+        );
+
+        assert_eq!(attributes, HashMap::from([("a.json".to_string(), true)]));
+    }
+
+    #[test]
+    fn review_patch_deletion_detection_requires_every_segment_to_delete() {
+        assert!(review_patch_deletes_path(
+            "diff --git a/x b/x\ndeleted file mode 100644\nindex 1..0\n--- a/x\n+++ /dev/null\n"
+        ));
+        assert!(!review_patch_deletes_path(
+            "diff --git a/x b/x\nindex 1..2 100644\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-deleted file mode 100644\n+kept\n"
+        ));
+        // A type change renders as deletion + addition of the same path.
+        assert!(!review_patch_deletes_path(
+            "diff --git a/x b/x\ndeleted file mode 120000\n--- a/x\n+++ /dev/null\n\
+             diff --git a/x b/x\nnew file mode 100644\n--- /dev/null\n+++ b/x\n"
+        ));
+        assert!(!review_patch_deletes_path(""));
+    }
+
+    #[test]
+    fn review_diff_preserves_rename_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo(tmp.path());
+        let old_path = tmp.path().join("old.rs");
+        let new_path = tmp.path().join("new.rs");
+        std::fs::write(&old_path, "fn still_broken() {}\n").unwrap();
+        run(tmp.path(), &["add", "old.rs"]);
+        run(tmp.path(), &["commit", "-m", "add source"]);
+        let base = run(tmp.path(), &["rev-parse", "HEAD"]);
+        std::fs::rename(old_path, new_path).unwrap();
+
+        let files = session_diff_patches_cancellable(
+            tmp.path(),
+            &base,
+            1024 * 1024,
+            &tokio_util::sync::CancellationToken::new(),
+            |_| false,
+        )
+        .unwrap();
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "new.rs");
+        assert!(files[0].diff.contains("rename from old.rs"));
+        assert!(files[0].diff.contains("rename to new.rs"));
     }
 
     #[test]
@@ -4357,8 +5048,6 @@ mod tests {
         let files = session_diff_patches_cancellable(
             tmp.path(),
             &base,
-            10,
-            1_000,
             1024 * 1024,
             &tokio_util::sync::CancellationToken::new(),
             |_| true,
@@ -4390,8 +5079,6 @@ mod tests {
         let files = session_diff_patches_cancellable(
             tmp.path(),
             &base,
-            10,
-            1_000,
             1024 * 1024,
             &tokio_util::sync::CancellationToken::new(),
             |_| true,
@@ -4421,8 +5108,6 @@ mod tests {
         let files = session_diff_patches_cancellable(
             tmp.path(),
             &base,
-            10,
-            1_000,
             1024 * 1024,
             &tokio_util::sync::CancellationToken::new(),
             |_| true,
@@ -4548,8 +5233,6 @@ mod tests {
             tmp.path(),
             &base,
             &head,
-            10,
-            100,
             64 * 1024,
             &tokio_util::sync::CancellationToken::new(),
         )
@@ -4685,7 +5368,7 @@ mod tests {
     }
 
     #[test]
-    fn session_diff_rejects_changes_too_large_for_the_ui() {
+    fn aggregate_session_diff_rejects_large_line_count_but_review_accepts_it() {
         let tmp = tempfile::tempdir().unwrap();
         init_repo(tmp.path());
         let base = run(tmp.path(), &["rev-parse", "HEAD"]);
@@ -4695,13 +5378,22 @@ mod tests {
         let error = session_diff(tmp.path(), &base).unwrap_err();
         assert!(error.downcast_ref::<SessionDiffTooLarge>().is_some());
         assert!(error.to_string().contains("too large to render"));
+        let review_diff = session_diff_patches_cancellable(
+            tmp.path(),
+            &base,
+            MAX_SESSION_DIFF_BYTES,
+            &tokio_util::sync::CancellationToken::new(),
+            |_| true,
+        )
+        .unwrap();
+        assert_eq!(review_diff.len(), 1);
         let summary = session_diff_summary(tmp.path(), &base).unwrap();
         assert_eq!(summary.len(), 1);
         assert_eq!(summary[0].additions, MAX_SESSION_DIFF_CHANGED_LINES + 1);
     }
 
     #[test]
-    fn session_diff_rejects_too_many_changed_files() {
+    fn aggregate_session_diff_rejects_many_files_but_review_accepts_them() {
         let tmp = tempfile::tempdir().unwrap();
         init_repo(tmp.path());
         for index in 0..=MAX_SESSION_DIFF_FILES {
@@ -4717,6 +5409,15 @@ mod tests {
         let error = session_diff(tmp.path(), &base).unwrap_err();
         assert!(error.downcast_ref::<SessionDiffTooLarge>().is_some());
         assert!(error.to_string().contains("too large to render"));
+        let review_diff = session_diff_patches_cancellable(
+            tmp.path(),
+            &base,
+            MAX_SESSION_DIFF_BYTES,
+            &tokio_util::sync::CancellationToken::new(),
+            |_| true,
+        )
+        .unwrap();
+        assert_eq!(review_diff.len(), MAX_SESSION_DIFF_FILES + 1);
         let summary = session_diff_summary(tmp.path(), &base).unwrap();
         assert_eq!(summary.len(), MAX_SESSION_DIFF_FILES + 1);
     }
@@ -4762,8 +5463,6 @@ mod tests {
                 tmp.path(),
                 &common,
                 &feature,
-                10,
-                100,
                 64 * 1024,
                 &tokio_util::sync::CancellationToken::new(),
             )
@@ -4845,7 +5544,7 @@ mod tests {
     }
 
     #[test]
-    fn immutable_review_diff_enforces_limits_and_literal_paths() {
+    fn immutable_review_diff_enforces_byte_limits_and_literal_paths() {
         let tmp = tempfile::tempdir().unwrap();
         init_repo(tmp.path());
         let base = run(tmp.path(), &["rev-parse", "HEAD"]);
@@ -4856,12 +5555,13 @@ mod tests {
         let head = run(tmp.path(), &["rev-parse", "HEAD"]);
         let cancel = tokio_util::sync::CancellationToken::new();
 
-        let file_error =
-            diff_files_between(tmp.path(), &base, &head, 1, 100, 64 * 1024, &cancel).unwrap_err();
-        assert!(file_error.to_string().contains("limit is 1 files"));
-        let line_error =
-            diff_files_between(tmp.path(), &base, &head, 10, 1, 64 * 1024, &cancel).unwrap_err();
-        assert!(line_error.to_string().contains("1 changed lines"));
+        let metadata_error = diff_files_between(tmp.path(), &base, &head, 8, &cancel).unwrap_err();
+        let metadata_message = metadata_error.to_string();
+        assert!(
+            metadata_message.contains("review diff metadata exceeds the 8-byte limit")
+                || metadata_message.contains("output exceeded its 8-byte bound"),
+            "{metadata_message}"
+        );
 
         let diff =
             diff_path_between(tmp.path(), &base, &head, ":(glob)**", 64 * 1024, &cancel).unwrap();

@@ -300,7 +300,7 @@ xterm input/resize are examples.
 | 14 | Providers and onboarding | Provider presets and custom endpoints, secret entry, reset/validation, health and models, API-key and OAuth/device/callback login, polling, cancellation, failure/expiry, delete, and vendor CLI install/update/cancel/uninstall lifecycle. | [provider settings](../../web/app-ui/src/components/provider-settings.ts), [CLI settings](../../web/app-ui/src/components/cli-settings.ts) | Live provider matrices, secret redaction audit, OAuth interruption/expiry, onboarding screenshots, keyboard/mobile/AT evidence. |
 | 15 | Personas and models | Data-driven personas, per-persona provider/model/thinking/permission defaults, inheritance, availability/health cues, model options, search, reset, and refresh. | [persona settings](../../web/app-ui/src/components/persona-settings-panel.ts), [model picker](../../web/app-ui/src/components/model-picker.ts), [model option controls](../../web/app-ui/src/components/model-option-controls.ts) | Unsupported-combination fixtures, live catalog churn, visual density, keyboard combobox and mobile evidence. |
 | 16 | Local models | Enabled/status/hardware state, llama.cpp runtime install/update/cancel/uninstall, server start/stop/restart controls, installed model management, download progress/cancel/delete, catalog search, GPU/CPU/too-large fit filters, and manual model addition. | [local model settings](../../web/app-ui/src/components/local-model-settings.ts) | Live runtime/download/disk/concurrency failures, remote-host wording on devices, progress screenshots, memory and AT evidence. |
-| 17 | Session naming | Short or title-derived branch naming plus title-model status, resource/install progress, cancellation, warnings, and protocol-backed configuration. No web client bypasses the protocol or session-owned worktree boundary. | [management settings panels](../../web/app-ui/src/components/management-settings-panels.ts), [settings screen](../../web/app-ui/src/components/settings-screen.ts) | Naming failure fixtures exposed by the server, visual hierarchy, accessibility, and live worktree soak. |
+| 17 | Session naming | Configured asynchronous session/thread naming with image attachments, placeholder-safe compare-and-set updates, and optional post-title branch renaming. No web client bypasses the protocol or session-owned worktree boundary. | [management settings panels](../../web/app-ui/src/components/management-settings-panels.ts), [settings screen](../../web/app-ui/src/components/settings-screen.ts) | Naming failure fixtures exposed by the server, visual hierarchy, accessibility, and live worktree soak. |
 | 18 | MCP | User/workspace scoped server CRUD, command/args/environment editing, enable/disable, effective per-session scopes, health refresh/reconnect, logs, copying, masking, validation, and responsive long-output behavior. | [management settings panels](../../web/app-ui/src/components/management-settings-panels.ts), [session MCP panel](../../web/app-ui/src/components/session-mcp-panel.ts) | Live reconnect/restart/secret audit, large-log memory/disposal, mobile long lines, screenshots and AT evidence. |
 | 19 | Integrations | GitHub.com and enterprise host add/remove, configuration status, login/device/callback flows, polling/cancel, disconnect, health/errors, validated navigation, and integration deep links from PR surfaces. | [management settings panels](../../web/app-ui/src/components/management-settings-panels.ts), [session PR panel](../../web/app-ui/src/components/session-pr-panel.ts) | Live multi-host OAuth and re-auth, PWA redirect origins, cancellation/expiry, security and visual/AT evidence. |
 | 20 | About and licensing | Frontend/server/protocol/deployment/connectivity/version data, packaged dependency notices, conditional Slint attribution while shipped, and desktop/PWA capability/revision information. | [settings screen](../../web/app-ui/src/components/settings-screen.ts), [generated host schema](../../web/app-ui/src/generated/host.ts) | Packaged offline artifact inspection, final inventories, platform/version screenshots, link and compliance review. |
@@ -1003,29 +1003,30 @@ remains open.
 
 **Current functional preview coverage**
 
-- The Sessions & Chat settings panel exposes the default short-branch policy,
-  the opt-in title-derived branch policy, the session-title model resource
-  policy, install/cancel actions, and related load/status presentation.
-- Settings operations use the protocol client rather than direct filesystem,
-  git, or worktree access.
+- The Sessions & Chat settings panel selects any configured provider/model
+  combination from the shared model catalog and exposes the opt-in
+  title-derived branch policy.
+- Sessions and threads are created immediately with explicit placeholders,
+  then compare-and-set renamed in the background from the first prompt and
+  its image attachments.
+- Settings, naming, and the optional post-title local branch rename all cross
+  the protocol and the server's tool boundary.
 
 **Primary Lit evidence**
 
 - [management settings panels](../../web/app-ui/src/components/management-settings-panels.ts)
-- [settings screen](../../web/app-ui/src/components/settings-screen.ts)
+- [thread screen](../../web/app-ui/src/components/thread-screen.ts)
 - [protocol client](../../web/app-ui/src/services/protocol-client.ts)
 
 **Missing parity and qualification work**
 
-- Complete title-model resource failure, recovery, and concurrent transition
-  fixtures without conflating naming policy with general Git configuration.
+- Complete failure, timeout, provider-offline, concurrent user-rename, and
+  branch-rename fixtures across direct, subscription, and CLI providers.
 - Preserve form density, field ordering, warning hierarchy, and status colors
   in every theme.
-- Ensure every naming effect stays a protocol operation against session-owned
-  worktrees; neither desktop bridge nor PWA may expose direct git/filesystem
-  escape hatches.
-- Test keyboard/forms, screen readers, validation, concurrent setting changes,
-  restart persistence, desktop/PWA wording, and long generated titles.
+- Test keyboard/forms, screen readers, validation, restart persistence,
+  desktop/PWA wording, multimodal model capability failures, and long
+  generated titles.
 
 **Qualification state:** Unqualified.
 

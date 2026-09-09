@@ -5,6 +5,11 @@ const JOB_STATUS_CLASSES = new Set([
   "succeeded",
   "failed",
   "stale",
+  // Finding ledger statuses share the pill renderer.
+  "open",
+  "advisory",
+  "fixed",
+  "dismissed",
 ]);
 
 /** Return a canonical browser URL only for non-executable HTTP(S) links. */

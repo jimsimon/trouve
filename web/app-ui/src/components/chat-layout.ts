@@ -7,7 +7,7 @@ import {
 
 export type AgentChatItem = Extract<
   ThreadChatItem,
-  { readonly kind: "assistant" | "steered" | "subagent" | "progress" | "thinking" | "compaction" | "todo" | "tool" | "questions" }
+  { readonly kind: "assistant" | "artifacts" | "steered" | "subagent" | "progress" | "thinking" | "compaction" | "todo" | "tool" | "questions" }
 >;
 
 export type AgentActivityItem = Extract<
@@ -45,6 +45,7 @@ export interface ChatLayout {
 
 const isAgentItem = (item: ThreadChatItem): item is AgentChatItem =>
   item.kind === "assistant"
+  || item.kind === "artifacts"
   || item.kind === "steered"
   || item.kind === "subagent"
   || item.kind === "progress"
@@ -131,6 +132,10 @@ export const buildChatLayout = (items: readonly ThreadChatItem[]): ChatLayout =>
       continue;
     }
     if (isAgentItem(item)) {
+      // A provider can announce and complete a reasoning block without ever
+      // exposing displayable text. Keep that lifecycle state out of the
+      // transcript instead of rendering an empty Reasoning node.
+      if (item.kind === "thinking" && item.content.trim() === "") continue;
       const explicitTurn =
         item.kind === "assistant"
         || item.kind === "steered"

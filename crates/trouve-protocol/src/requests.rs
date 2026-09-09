@@ -5,6 +5,20 @@ use utoipa::ToSchema;
 
 use crate::{ApprovalDecision, CallId, SessionId, ThreadId, WorkspaceId};
 
+/// A scalar value accepted by a model's advertised options schema.
+///
+/// Protocol request/response structs retain `serde_json::Value` internally so
+/// arbitrary-precision JSON number tokens survive deserialization. Their
+/// OpenAPI fields use this type to advertise the narrower wire contract that
+/// the engine already enforces.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(untagged)]
+pub enum ModelOptionValue {
+    String(String),
+    Number(f64),
+    Boolean(bool),
+}
+
 /// How tool calls are gated in a thread. See ADR 0004.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -107,96 +121,36 @@ pub struct ServerInfo {
     pub online: bool,
 }
 
-// --- session naming settings --------------------------------------------
+// --- session and thread naming ------------------------------------------
 
-/// When the dedicated session-title model should occupy memory.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum TitleModelLoadBehavior {
-    /// Keep the model ready when the server detects comfortable memory
-    /// headroom; otherwise load it for each naming request.
-    #[default]
-    Auto,
-    /// Load at server startup and keep the model resident.
-    Always,
-    /// Load for naming requests and release it after an idle period.
-    OnDemand,
-    /// Never load the model; use the built-in naming heuristics.
-    Off,
-}
-
-/// Compute resources the dedicated session-title model may use.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum TitleModelResourcePolicy {
-    /// Choose GPU acceleration when it will not contend with a running local
-    /// coding model; otherwise use CPU and system RAM.
-    Adaptive,
-    /// Allow llama.cpp to place the model across GPU, CPU, and system RAM.
-    GpuCpuRam,
-    /// Require all model layers to fit on a detected GPU.
-    GpuOnly,
-    /// Keep all model computation off the GPU. This preserves the behavior
-    /// used before resource selection was exposed.
-    #[default]
-    CpuRamOnly,
-}
-
-/// Runtime status for the managed session-title model.
+/// Global asynchronous naming settings shown under Settings → Sessions & Chat.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct TitleModelStatus {
-    /// `not_installed`, `installing`, `stopped`, `loading`, `ready`, or
-    /// `error`.
-    pub state: String,
-    /// Human-readable context for the settings screen.
-    #[serde(default)]
-    pub detail: String,
-    pub runtime_installed: bool,
-    pub model_downloaded: bool,
-    /// Empty, `runtime`, or `model`.
-    #[serde(default)]
-    pub install_stage: String,
-    #[serde(default)]
-    pub install_bytes: u64,
-    #[serde(default)]
-    pub install_total: u64,
-}
-
-/// Global session-naming settings shown under Settings → Sessions & Chat.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct GitWorktreeSettings {
-    /// Whether new session branches include a slug derived from the session
-    /// title. False uses the compact `trouve/<short-id>` form.
-    #[serde(default)]
+pub struct SessionNamingSettings {
+    /// Provider-qualified configured model used for session and thread names.
+    pub model: String,
+    /// Rename the compact worktree branch after the session receives its name.
     pub derive_branch_name_from_session_title: bool,
-    pub title_model_load_behavior: TitleModelLoadBehavior,
-    #[serde(default)]
-    pub title_model_resource_policy: TitleModelResourcePolicy,
-    pub title_model: TitleModelStatus,
 }
 
 /// Update the Session Naming section under Settings → Sessions & Chat.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct SetGitWorktreeSettingsRequest {
-    /// Omitted by older clients to preserve the current branch-naming mode.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub derive_branch_name_from_session_title: Option<bool>,
-    pub title_model_load_behavior: TitleModelLoadBehavior,
-    #[serde(default)]
-    pub title_model_resource_policy: TitleModelResourcePolicy,
+pub struct SetSessionNamingSettingsRequest {
+    pub model: String,
+    pub derive_branch_name_from_session_title: bool,
 }
 
-/// Ask the server to derive a concise title for a new session.
+/// Ask the configured naming model to derive a concise navigation title.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct GenerateSessionTitleRequest {
+pub struct GenerateTitleRequest {
+    pub session_id: SessionId,
     pub prompt: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<AttachmentUpload>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct GeneratedSessionTitle {
+pub struct GeneratedTitle {
     pub title: String,
-    /// `model` or `heuristic`.
-    pub source: String,
 }
 
 // --- workspaces ----------------------------------------------------------
@@ -214,6 +168,20 @@ pub struct Workspace {
     pub id: WorkspaceId,
     pub name: String,
     pub path: String,
+}
+
+/// Workspace presentation returned by the list and registration endpoints.
+/// Separate checkouts and linked worktrees share repository_key when they
+/// resolve to the same configured remote or local Git common directory.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct WorkspaceListItem {
+    pub id: WorkspaceId,
+    pub name: String,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_name: Option<String>,
 }
 
 // --- sessions ------------------------------------------------------------
@@ -249,8 +217,9 @@ pub struct Session {
     pub id: SessionId,
     pub workspace_id: WorkspaceId,
     pub title: String,
-    /// Branch dedicated to this session. New sessions default to
-    /// `trouve/<short-id>`; users may opt into `trouve/<slug>-<short-id>`.
+    /// Branch dedicated to this session. New sessions start as
+    /// `trouve/<short-id>` and may be renamed to `trouve/<slug>-<short-id>`
+    /// after asynchronous naming.
     pub branch: String,
     /// Absolute path of the session worktree.
     pub worktree_path: String,
@@ -303,6 +272,7 @@ pub struct CreateThreadRequest {
     pub model: Option<String>,
     /// Model-specific options validated against the model's options schema.
     #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    #[schema(value_type = std::collections::BTreeMap<String, ModelOptionValue>)]
     pub model_options: serde_json::Map<String, serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub permission_mode: Option<PermissionMode>,
@@ -356,6 +326,7 @@ pub struct Thread {
     /// Current values for the model's options (thinking level, etc.);
     /// clients render controls from the model's `options_schema`.
     #[serde(default)]
+    #[schema(value_type = std::collections::BTreeMap<String, ModelOptionValue>)]
     pub model_options: serde_json::Map<String, serde_json::Value>,
     pub permission_mode: PermissionMode,
     pub created_at: chrono::DateTime<chrono::Utc>,
@@ -378,6 +349,11 @@ pub enum ThreadViewItem {
         turn: u64,
         content: String,
         attachments: Vec<Attachment>,
+        /// Background-activity display row. New snapshots derive this from
+        /// `turn.background_activity`; true on user rows remains possible when
+        /// replaying protocol 7.19–7.26 logs.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        background: bool,
     },
     Steered {
         turn: u64,
@@ -401,6 +377,13 @@ pub enum ThreadViewItem {
         content: String,
         complete: bool,
     },
+    /// Durable media/files produced by the assistant or one of its tools.
+    Artifacts {
+        turn: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_id: Option<CallId>,
+        attachments: Vec<Attachment>,
+    },
     /// User-facing progress authored by the agent harness rather than model
     /// reasoning or final answer text.
     Progress {
@@ -410,6 +393,10 @@ pub enum ThreadViewItem {
     },
     Thinking {
         turn: u64,
+        /// Provider-owned reasoning-item identity. Absent for legacy,
+        /// boundary-inferred reasoning streams.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
         content: String,
         complete: bool,
     },
@@ -549,6 +536,10 @@ pub struct ThreadViewSnapshot {
     pub turn_running: bool,
     #[serde(default)]
     pub thinking: bool,
+    /// Provider-owned identity for the active thinking item. Absent for
+    /// snapshots reconstructed from legacy, boundary-inferred events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_thinking_id: Option<String>,
     /// Current transient activity for the running turn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_phase: Option<crate::TurnPhase>,
@@ -588,16 +579,23 @@ pub struct ThreadViewQuery {
     pub turn_aligned: Option<bool>,
 }
 
-/// Partial thread update between turns (mode/model switching). Rejected with
-/// a conflict while a turn is running. Omitted fields are unchanged.
+/// Partial thread title/settings update. Title-only updates remain available
+/// during a turn; model, mode, option, and permission changes are rejected
+/// until the turn is idle. Omitted fields are unchanged.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct UpdateThreadRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Apply the generated title only while the persisted title still has this value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     /// Replaces the thread's model options when present.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<std::collections::BTreeMap<String, ModelOptionValue>>)]
     pub model_options: Option<serde_json::Map<String, serde_json::Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub permission_mode: Option<PermissionMode>,
@@ -646,7 +644,7 @@ pub struct AttachmentUpload {
     pub data: String,
 }
 
-/// A stored prompt attachment. Bytes are served at
+/// A stored transcript attachment. Bytes are served at
 /// `GET /v1/attachments/{id}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct Attachment {
@@ -683,6 +681,10 @@ pub struct QueuedPrompt {
     pub thread_id: ThreadId,
     pub position: u64,
     pub content: String,
+    /// Server-dispatched attach prompt for vendor-autonomous agent
+    /// activity. Trusted dispatch metadata: never inferred from `content`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub background: bool,
     /// Attachments uploaded with the prompt (already stored server-side).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<Attachment>,
@@ -952,9 +954,10 @@ pub struct GithubPrHostProjection {
     pub pull_requests: GithubPrList,
 }
 
-/// Pull requests already associated with one session using durable branch or
-/// `session.pr_opened` evidence. This is a local projection of the persisted
-/// account snapshots and never performs a GitHub request.
+/// Pull requests associated with one session by its branch or verified
+/// creation. This is a local projection of the persisted account snapshots
+/// and never performs a GitHub request. Matching session-branch PRs precede
+/// cross-branch PRs with durable creation evidence.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SessionPrProjection {
     pub session_id: SessionId,
@@ -968,7 +971,7 @@ pub struct SessionPrProjection {
 pub struct ServerProjection {
     pub github_pull_requests: Vec<GithubPrHostProjection>,
     pub session_pull_requests: Vec<SessionPrProjection>,
-    pub git_worktree_settings: GitWorktreeSettings,
+    pub session_naming_settings: SessionNamingSettings,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -1658,6 +1661,12 @@ pub struct GithubAppStatus {
     /// deployments still create and update Check Runs when this is true.
     #[serde(default)]
     pub checks_write_configured: bool,
+    /// Whether the installation token reports `contents: write`. GitHub
+    /// rejects the `resolveReviewThread`/`unresolveReviewThread` mutations
+    /// for installation tokens without it, so fixed findings' threads stay
+    /// open on GitHub until this is granted.
+    #[serde(default)]
+    pub contents_write_configured: bool,
     /// Whether `check_run` delivery is selected in the GitHub App. This is
     /// optional unless interactive Re-run actions are desired.
     #[serde(default)]
@@ -1700,6 +1709,12 @@ pub struct ReviewerProfile {
     /// inherits the review mode's default, then the global default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_thinking_level: Option<String>,
+    /// Validated non-thinking model options for this reviewer's effective
+    /// model (for example `fast`). Populated from a repository override;
+    /// thinking stays on `default_thinking_level`.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    #[schema(value_type = std::collections::BTreeMap<String, ModelOptionValue>)]
+    pub model_options: serde_json::Map<String, serde_json::Value>,
     #[serde(default)]
     pub built_in: bool,
 }
@@ -1743,6 +1758,13 @@ pub struct ReviewerOverride {
     /// the reviewer profile, which in turn inherits the review mode default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_level: Option<String>,
+    /// Non-thinking model options for the reviewer's effective model (for
+    /// example `fast`), validated against that model's advertised schema.
+    /// Thinking is configured through `thinking_level`; thinking keys here
+    /// are rejected.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    #[schema(value_type = std::collections::BTreeMap<String, ModelOptionValue>)]
+    pub model_options: serde_json::Map<String, serde_json::Value>,
     #[serde(default)]
     pub prompt_mode: ReviewerPromptMode,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -1767,6 +1789,12 @@ pub struct CodeReviewRepository {
     /// coordinator/editor. Absent inherits the review mode's default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coordinator_thinking_level: Option<String>,
+    /// Validated non-thinking model options for the coordinator's effective
+    /// model (for example `fast`). Thinking stays on
+    /// `coordinator_thinking_level`; thinking keys here are rejected.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    #[schema(value_type = std::collections::BTreeMap<String, ModelOptionValue>)]
+    pub coordinator_model_options: serde_json::Map<String, serde_json::Value>,
     /// Provider-qualified model used by semantic persona triage. Absent
     /// inherits `model`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1775,6 +1803,22 @@ pub struct CodeReviewRepository {
     /// triage. Absent inherits the review mode's default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub router_thinking_level: Option<String>,
+    /// Validated non-thinking model options for the router's effective model.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    #[schema(value_type = std::collections::BTreeMap<String, ModelOptionValue>)]
+    pub router_model_options: serde_json::Map<String, serde_json::Value>,
+    /// Provider-qualified model used by the per-round implementation
+    /// analyst. Absent inherits `model`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analyst_model: Option<String>,
+    /// Preferred thinking level or fixed token budget for the implementation
+    /// analyst. Absent inherits the review mode's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analyst_thinking_level: Option<String>,
+    /// Validated non-thinking model options for the analyst's effective model.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    #[schema(value_type = std::collections::BTreeMap<String, ModelOptionValue>)]
+    pub analyst_model_options: serde_json::Map<String, serde_json::Value>,
     /// Extra repository-specific review instructions.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub prompt: String,
@@ -1810,10 +1854,30 @@ pub struct UpdateCodeReviewRepositoryRequest {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coordinator_thinking_level: Option<String>,
+    /// Non-thinking model options for the coordinator's effective model.
+    /// Omitted by older clients to preserve the current options; an empty
+    /// map clears them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<std::collections::BTreeMap<String, ModelOptionValue>>)]
+    pub coordinator_model_options: Option<serde_json::Map<String, serde_json::Value>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub router_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub router_thinking_level: Option<String>,
+    /// Non-thinking model options for the router's effective model. Omitted
+    /// by older clients to preserve the current options.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<std::collections::BTreeMap<String, ModelOptionValue>>)]
+    pub router_model_options: Option<serde_json::Map<String, serde_json::Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analyst_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analyst_thinking_level: Option<String>,
+    /// Non-thinking model options for the analyst's effective model. Omitted
+    /// by older clients to preserve the current options.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<std::collections::BTreeMap<String, ModelOptionValue>>)]
+    pub analyst_model_options: Option<serde_json::Map<String, serde_json::Value>>,
     #[serde(default)]
     pub prompt: String,
     /// Omitted by older clients to preserve the current/default selection.
@@ -1837,13 +1901,17 @@ pub struct UpdateCodeReviewRepositoryRequest {
     pub reviewer_overrides: Option<Vec<ReviewerOverride>>,
 }
 
-/// Whether a job reviews only changes since the last successfully published
-/// head, or the entire pull-request branch against its GitHub base.
+/// Historical review scope. All newly created jobs use `Full`; `Incremental`
+/// remains readable for durable rows created before protocol 8.0.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CodeReviewJobScope {
+    /// Legacy-only scope used by jobs created before full-branch review became
+    /// mandatory.
     #[default]
     Incremental,
+    /// Complete pull-request branch from its merge base through the exact
+    /// reviewed head.
     Full,
 }
 
@@ -1859,6 +1927,9 @@ pub struct CodeReviewProgress {
 #[serde(rename_all = "snake_case")]
 pub enum CodeReviewTaskRole {
     Router,
+    /// Per-round implementation analysis over the full-branch diff, derived
+    /// fresh each round and consumed only by the coordinator.
+    Analyst,
     Reviewer,
     Coordinator,
 }
@@ -2092,6 +2163,25 @@ pub struct CodeReviewUnadjudicatedCandidate {
     pub body: String,
 }
 
+/// One step of the causal chain from changed code to a finding's anchor,
+/// quoted by the coordinator and mechanically verified against the reviewed
+/// revision. A finding anchored outside the diff can only block the review
+/// when its waypoints verify and at least one lies on a changed line.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct CodeReviewCausalWaypoint {
+    pub path: String,
+    pub line: u64,
+    /// Verbatim source line at `path:line`, from the head revision.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub quote: String,
+    /// The line the coordinator originally claimed when the server
+    /// re-anchored `line` to where `quote` actually appears in the head
+    /// revision. Absent when the claim was correct or no re-anchoring was
+    /// possible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_claimed: Option<u64>,
+}
+
 /// Concrete evidence that makes a confirmed finding independently verifiable.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct CodeReviewFindingEvidence {
@@ -2105,6 +2195,46 @@ pub struct CodeReviewFindingEvidence {
     pub introduction: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub regression_test: String,
+    /// Verbatim source line at the finding's anchor, quoted by the
+    /// coordinator while verifying the finding. Mechanically matched against
+    /// the reviewed revision; empty when the anchor was never verified.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub anchor_quote: String,
+    /// Server-derived verdict for `anchor_quote`: `matched`, `mismatched`,
+    /// or `unchecked`. Model-provided values are overwritten.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub anchor_match: String,
+    /// The line the coordinator originally claimed for the finding when the
+    /// server re-anchored it to where `anchor_quote` actually appears in the
+    /// head revision. Absent when the claim was correct or no re-anchoring
+    /// was possible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_line_claimed: Option<u64>,
+    /// The coordinator's grade of how much of `execution_path` it verified
+    /// against the repository: `verified`, `partial`, or `unverified`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub execution_path_verification: String,
+    /// The refuting guard, caller, or test the coordinator searched for to
+    /// disprove the finding, and what it found. Empty when no refutation was
+    /// attempted.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub counterexample_search: String,
+    /// Coordinator's causation claim for the finding: `introduced` when this
+    /// change caused the issue, `pre_existing` when the issue predates it and
+    /// is surfaced for awareness only. Empty on legacy records.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub change_causation: String,
+    /// The causal chain from changed code to the finding's anchor, required
+    /// to verify an `introduced` claim whose anchor is outside the diff.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub causal_waypoints: Vec<CodeReviewCausalWaypoint>,
+    /// Server-derived scope verdict: `verified` when the causation claim is
+    /// mechanically corroborated (anchor on a changed line, or verified
+    /// waypoints reaching one), `unverified` otherwise. Only scope-verified
+    /// findings block the review. Model-provided values are overwritten;
+    /// empty legacy records block as before.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub change_scope: String,
 }
 
 /// How a finding relates to earlier review rounds on the pull request.
@@ -2207,7 +2337,11 @@ pub struct CodeReviewFinding {
     pub body: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub prompt_for_agents: String,
-    /// `open`, `fixed`, or `dismissed`.
+    /// `open`, `advisory`, `fixed`, or `dismissed`. Advisory findings fell
+    /// below the blocking bar when they were recorded: they never gate the
+    /// review, are not published to GitHub, and are only surfaced to later
+    /// review rounds so the coordinator can recognise duplicates or promote
+    /// them once verified evidence lifts them over the bar.
     pub status: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sources: Vec<CodeReviewFindingSource>,
@@ -2236,10 +2370,32 @@ pub struct CodeReviewFinding {
     /// Review job that demonstrated the fix, for exact fix-diff reconstruction.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub resolved_by_job_id: String,
+    /// State of the auto-resolve worker for this finding's GitHub review
+    /// thread. Present while a collapse is still owed or after one failed,
+    /// so a thread that stays open on GitHub can be explained.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_collapse: Option<CodeReviewThreadCollapse>,
 }
 
 fn default_code_review_confidence() -> String {
     "medium".into()
+}
+
+/// Auto-resolve progress for one finding's GitHub review thread.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct CodeReviewThreadCollapse {
+    /// The worker still owes a collapse attempt. False with a `last_error`
+    /// means the collapse was abandoned after repeated terminal failures.
+    pub pending: bool,
+    /// Failed attempts so far.
+    #[serde(default)]
+    pub attempts: u64,
+    /// Earliest time of the next attempt while one is pending.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_attempt_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Error from the most recent failed attempt.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub last_error: String,
 }
 
 /// A durable execution of one model review against one immutable PR head.
@@ -2252,19 +2408,26 @@ pub struct CodeReviewJob {
     pub pull_title: String,
     pub pull_url: String,
     pub head_sha: String,
-    /// Commit used as the left side of this review's diff. For incremental
-    /// jobs this is normally the last successfully published head.
+    /// Actual pull-request merge base used as the left side of this review's
+    /// diff. Omitted while a queued or early-running job is still preparing
+    /// its repository. Legacy jobs may expose an incremental watermark here.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub review_base_sha: String,
-    /// Immutable commit from the last successfully published review. This is
-    /// the incremental watermark even when history rewriting makes the
-    /// effective `review_base_sha` fall back to the pull request merge base.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub review_watermark_sha: String,
     pub base_ref: String,
     pub head_ref: String,
+    /// Historical scope retained for diagnostics. New jobs are always full.
     #[serde(default)]
     pub scope: CodeReviewJobScope,
+    /// A successfully published pre-8.0 partial review is waiting for the
+    /// bounded automatic full-branch compatibility review. This is a derived
+    /// migration state, not a scope option for newly created jobs.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub legacy_coverage_pending: bool,
+    /// A clean pre-8.0 partial review still lacks full-branch coverage after
+    /// both bounded automatic compatibility attempts ended. A manual whole-
+    /// review retry is required to establish coverage.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub legacy_coverage_exhausted: bool,
     /// `automatic`, `manual`, or `retry`.
     pub trigger: String,
     /// `queued`, `running`, `succeeded`, `failed`, `cancelled`, or `stale`.
@@ -2278,6 +2441,10 @@ pub struct CodeReviewJob {
     /// Thinking level snapshotted for the final coordinator/editor.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coordinator_thinking_level: Option<String>,
+    /// Model options snapshotted for the final coordinator/editor.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    #[schema(value_type = std::collections::BTreeMap<String, ModelOptionValue>)]
+    pub coordinator_model_options: serde_json::Map<String, serde_json::Value>,
     /// Model snapshotted for semantic persona triage. Absent inherits
     /// `model`; legacy jobs may omit both and are rejected before dispatch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2285,6 +2452,21 @@ pub struct CodeReviewJob {
     /// Thinking level snapshotted for semantic persona triage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub router_thinking_level: Option<String>,
+    /// Model options snapshotted for semantic persona triage.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    #[schema(value_type = std::collections::BTreeMap<String, ModelOptionValue>)]
+    pub router_model_options: serde_json::Map<String, serde_json::Value>,
+    /// Model snapshotted for the per-round implementation analyst. Absent
+    /// inherits `model`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analyst_model: Option<String>,
+    /// Thinking level snapshotted for the implementation analyst.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analyst_thinking_level: Option<String>,
+    /// Model options snapshotted for the implementation analyst.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    #[schema(value_type = std::collections::BTreeMap<String, ModelOptionValue>)]
+    pub analyst_model_options: serde_json::Map<String, serde_json::Value>,
     /// Reviewer profiles are snapshotted internally; their stable ids are
     /// exposed here for history and diagnostics. Additive/Automatic jobs
     /// snapshot the candidate catalog; routing decisions record which
@@ -2325,12 +2507,20 @@ pub struct CodeReviewJob {
     pub issue_count: u64,
     #[serde(default)]
     pub fixed_issue_count: u64,
-    /// Total confirmed findings that remained open across the pull request
-    /// after this review was published. Absent while publication is pending
-    /// and for legacy jobs that predate this snapshot. Consumers must treat
-    /// absence on a succeeded job as unknown, never as a clean review.
+    /// Blocking confirmed findings (high severity, or medium severity with
+    /// at least medium confidence) that remained open across the pull
+    /// request after this review was published. Only these gate the check
+    /// run. Absent while publication is pending and for legacy jobs that
+    /// predate this snapshot. Consumers must treat absence on a succeeded
+    /// job as unknown, never as a clean review.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub open_issue_count: Option<u64>,
+    /// Advisory findings (low severity, or medium severity with low
+    /// confidence) still open across the pull request: durable engineering
+    /// debt recorded in trouve, never posted to GitHub and never
+    /// merge-blocking.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advisory_open_issue_count: Option<u64>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub error: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
@@ -2387,16 +2577,12 @@ pub struct CodeReviewJobList {
     pub jobs: Vec<CodeReviewJob>,
 }
 
-/// Manual review request. Full scope always compares the current head with
-/// the pull request's GitHub base; incremental scope uses the saved watermark
-/// when it remains valid.
+/// Manual full-branch review request.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct RequestCodeReviewRequest {
     pub installation_id: u64,
     pub repository: String,
     pub pull_number: u64,
-    #[serde(default)]
-    pub scope: CodeReviewJobScope,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -2518,6 +2704,27 @@ pub struct CodeReviewChurnStats {
     pub max_rounds_to_clean: u64,
 }
 
+/// Auto-resolve worker backlog for finding threads.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct CodeReviewCollapseBacklog {
+    /// Findings marked for thread resolution that the worker has not
+    /// completed yet.
+    pub pending: u64,
+    /// Age of the oldest pending entry, from when its finding was resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_pending_minutes: Option<u64>,
+    /// Pending entries whose most recent attempt failed.
+    #[serde(default)]
+    pub failing: u64,
+    /// Entries the worker gave up on after repeated terminal failures; their
+    /// threads stay open on GitHub until resolved by hand.
+    #[serde(default)]
+    pub abandoned: u64,
+    /// Error from the most recently failed attempt across the backlog.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub last_error: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CodeReviewStats {
     pub range: CodeReviewStatsRange,
@@ -2542,6 +2749,11 @@ pub struct CodeReviewStats {
     pub issue_count: u64,
     #[serde(default)]
     pub churn: CodeReviewChurnStats,
+    /// Fixed or dismissed findings whose GitHub threads still await the
+    /// auto-resolve worker. A growing or aging backlog means resolved
+    /// findings look unresolved on GitHub and thread-driven flows lag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_collapse_backlog: Option<CodeReviewCollapseBacklog>,
     #[serde(default)]
     pub buckets: Vec<CodeReviewStatsBucket>,
     #[serde(default)]
@@ -2821,18 +3033,19 @@ pub struct LoginStatus {
     pub error: Option<String>,
 }
 
-// --- vendor CLIs ------------------------------------------------------------
+// --- managed agent runtimes (legacy /v1/clis API name) ----------------------
 
-/// A vendor CLI trouve can download and manage (cursor-agent, claude,
-/// codex), with its current install state.
+/// A vendor agent runtime trouve can download and manage (Cursor Agent SDK
+/// Bridge, Claude Code CLI, Codex CLI), with its current install state.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CliInfo {
-    /// Stable id, also the binary name: "cursor-agent", "claude", "codex".
+    /// Stable artifact id, also the managed binary name:
+    /// "cursor-sdk-bridge", "claude", or "codex".
     pub id: String,
     pub display_name: String,
-    /// Provider kinds served by this CLI (e.g. ["cursor-cli"]).
+    /// Provider kinds served by this runtime (e.g. ["cursor-sdk"]).
     pub kinds: Vec<String>,
-    /// Version of the binary trouve would run, when one was resolved.
+    /// Version of the runtime binary trouve would run, when one was resolved.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub installed_version: Option<String>,
     /// Where that binary comes from: "managed" (trouve-installed),
@@ -3019,6 +3232,12 @@ pub struct Automation {
     /// advertised option key when the turn starts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_level: Option<String>,
+    /// Model-specific values selected from the model's `options_schema`.
+    /// `thinking_level` remains as a compatibility shorthand; values in this
+    /// object take precedence when both select the same model capability.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    #[schema(value_type = std::collections::BTreeMap<String, ModelOptionValue>)]
+    pub model_options: serde_json::Map<String, serde_json::Value>,
     /// Permission policy applied only to sessions created by this automation.
     /// Defaults to Ask; Yolo is an explicit unattended-execution opt-in.
     #[serde(default)]
@@ -3055,11 +3274,22 @@ pub struct UpsertAutomationRequest {
     /// clients preserves normal model/mode/global inheritance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_level: Option<String>,
+    /// Model-specific values selected from the model's `options_schema`.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    #[schema(value_type = std::collections::BTreeMap<String, ModelOptionValue>)]
+    pub model_options: serde_json::Map<String, serde_json::Value>,
     /// Permission policy for each fresh automation session. Omitted by older
     /// clients means Ask.
     #[serde(default)]
     pub permission_mode: PermissionMode,
     pub schedule: AutomationSchedule,
+    pub enabled: bool,
+}
+
+/// Change only whether an automation is scheduled to run. This narrow
+/// mutation avoids replacing a concurrently edited automation definition.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SetAutomationEnabledRequest {
     pub enabled: bool,
 }
 
@@ -3085,6 +3315,11 @@ pub struct CliInstallStatus {
     /// Version being (or just) installed, when known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    /// A non-fatal activation warning. When present with `status = "success"`,
+    /// the runtime is active but its crash durability could not be confirmed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+    /// The terminal error when `status = "failed"`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     /// Bytes downloaded so far (pending only).
@@ -3106,6 +3341,10 @@ pub struct ModelInfo {
     pub display_name: String,
     pub context_window: u64,
     pub supports_tools: bool,
+    /// Whether the model accepts image inputs. False for unknown/custom
+    /// endpoints so clients do not imply that attachments will be inspected.
+    #[serde(default)]
+    pub supports_images: bool,
     /// USD per million input tokens (None = unknown; cost reporting skips it).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_price_per_mtok: Option<f64>,
@@ -3119,12 +3358,24 @@ pub struct ModelInfo {
 
 /// Aggregated usage for a thread or session.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct ModelUsageSummary {
+    pub model: String,
+    pub turns: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub cost_usd: f64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct UsageSummary {
     pub turns: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cached_input_tokens: u64,
     pub cost_usd: f64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<ModelUsageSummary>,
 }
 
 // --- errors --------------------------------------------------------------
@@ -3150,28 +3401,14 @@ mod tests {
     }
 
     #[test]
-    fn title_resources_default_to_the_historical_cpu_mode() {
-        let request: SetGitWorktreeSettingsRequest = serde_json::from_value(serde_json::json!({
-            "title_model_load_behavior": "auto"
+    fn session_naming_settings_round_trip() {
+        let request: SetSessionNamingSettingsRequest = serde_json::from_value(serde_json::json!({
+            "model": "openai/gpt-5-mini",
+            "derive_branch_name_from_session_title": true
         }))
         .unwrap();
-
-        assert_eq!(
-            request.title_model_resource_policy,
-            TitleModelResourcePolicy::CpuRamOnly
-        );
-        assert_eq!(request.derive_branch_name_from_session_title, None);
-
-        let historical: GitWorktreeSettings = serde_json::from_value(serde_json::json!({
-            "title_model_load_behavior": "auto",
-            "title_model": {
-                "state": "not_installed",
-                "runtime_installed": false,
-                "model_downloaded": false
-            }
-        }))
-        .unwrap();
-        assert!(!historical.derive_branch_name_from_session_title);
+        assert_eq!(request.model, "openai/gpt-5-mini");
+        assert!(request.derive_branch_name_from_session_title);
     }
 
     #[test]

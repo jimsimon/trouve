@@ -1,7 +1,11 @@
 import type { CodeReviewSettings } from "./types";
 
 export const TIMEOUT_MINUTES_INPUT_MIN = String(1 / 60);
-export const TIMEOUT_MINUTES_INPUT_STEP = TIMEOUT_MINUTES_INPUT_MIN;
+// A decimal approximation of 1/60 does not form a reliable HTML number-input
+// step grid: browsers can reject ordinary whole-minute values such as 15.
+// The request builder below remains the source of truth and accepts only
+// values that convert to a whole number of seconds.
+export const TIMEOUT_MINUTES_INPUT_STEP = "any";
 export const MAX_PARALLEL_REVIEWS = 32;
 
 export function timeoutMinutes(seconds: number): string {

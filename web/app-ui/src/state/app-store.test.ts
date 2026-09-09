@@ -488,6 +488,44 @@ describe("AppStore", () => {
     });
   });
 
+  it("advances session usage revision when a background thread completes", () => {
+    const store = new AppStore();
+    store.replaceThreadsForSession("se_1", [thread("th_1"), thread("th_2")]);
+    store.replaceThreadStatusesForSession("se_1", [
+      threadStatus("th_1", { active: true, outcome: "running", latest_cursor: 2 }),
+      threadStatus("th_2", { active: true, outcome: "running", latest_cursor: 3 }),
+    ]);
+    expect(store.sessionUsageRevision("se_1")).toBe(0);
+
+    store.applyServerEvent({
+      cursor: 9,
+      scope: "server",
+      ts: "2026-08-01T12:08:00Z",
+      type: "thread.status_updated",
+      status: threadStatus("th_2", {
+        outcome: "succeeded",
+        latest_cursor: 8,
+        completed_at: "2026-08-01T12:08:00Z",
+      }),
+    });
+    expect(store.sessionUsageRevision("se_1")).toBe(1);
+
+    store.applyServerEvent({
+      cursor: 10,
+      scope: "server",
+      ts: "2026-08-01T12:08:01Z",
+      type: "thread.status_updated",
+      status: threadStatus("th_2", {
+        attention: "question",
+        outcome: "succeeded",
+        latest_cursor: 9,
+        completed_at: "2026-08-01T12:08:00Z",
+      }),
+    });
+    expect(store.sessionUsageRevision("se_1")).toBe(1);
+    expect(store.sessionUsageRevision("se_other")).toBe(0);
+  });
+
   it("folds durable account PR snapshots independently per GitHub host", () => {
     const store = new AppStore();
     const event = (
@@ -566,10 +604,41 @@ describe("AppStore", () => {
     });
 
     expect(store.sessionPullRequests("se_1")).toEqual([
+      expect.objectContaining({ number: 8, state: "merged" }),
       expect.objectContaining({ number: 9, title: "Fresh linked PR" }),
       expect.objectContaining({ number: 7 }),
-      expect.objectContaining({ number: 8, state: "merged" }),
     ]);
+  });
+
+  it("ignores chat-mentioned PRs while keeping the session branch", () => {
+    const store = new AppStore();
+    store.replaceSessionMetadata([metadata]);
+    store.replaceSessionSummaries([summary]);
+    store.applyServerEvent({
+      cursor: 11,
+      scope: "server",
+      ts: "2026-08-01T12:11:00Z",
+      type: "session.pr_mentioned",
+      session_id: "se_1",
+      number: 20,
+      url: "https://github.com/trouve-ai/trouve/pull/20",
+    });
+    store.applyServerEvent({
+      cursor: 12,
+      scope: "server",
+      ts: "2026-08-01T12:12:00Z",
+      type: "github.pull_requests_updated",
+      pull_requests: {
+        host: "github.com",
+        viewer: "octocat",
+        prs: [
+          pullRequest(20, { head: "mentioned-only" }),
+          pullRequest(8, { state: "merged" }),
+        ],
+      },
+    });
+
+    expect(store.sessionPullRequests("se_1").map(({ number }) => number)).toEqual([8]);
   });
 
   it("hydrates all session PR associations from the cold-start server projection", () => {
@@ -591,15 +660,9 @@ describe("AppStore", () => {
         },
       }],
       session_pull_requests: [{ session_id: "se_1", prs: [linked] }],
-      git_worktree_settings: {
+      session_naming_settings: {
+        model: "provider/model",
         derive_branch_name_from_session_title: false,
-        title_model_load_behavior: "auto",
-        title_model_resource_policy: "adaptive",
-        title_model: {
-          state: "ready",
-          runtime_installed: true,
-          model_downloaded: true,
-        },
       },
     };
 
@@ -610,7 +673,7 @@ describe("AppStore", () => {
     expect(readSignal(store.githubPullRequests)).toEqual([
       expect.objectContaining({ cursor: 20, refreshedAt: "2026-08-01T12:20:00Z" }),
     ]);
-    expect(readSignal(store.gitWorktreeSettings)).toMatchObject({ cursor: 21 });
+    expect(readSignal(store.sessionNamingSettings)).toMatchObject({ cursor: 21 });
     expect(store.replaceServerProjection(19, {
       ...projection,
       github_pull_requests: [],
@@ -697,6 +760,21 @@ describe("AppStore", () => {
     store.threadView("th_third");
     expect(store.threadView("th_first")).toBe(first);
     expect(store.threadView("th_second")).not.toBe(second);
+  });
+
+  it("does not evict the actively streamed thread projection", () => {
+    const store = new AppStore({ maxThreadViews: 2 });
+    const active = store.threadView("th_active");
+    store.retainThreadView("th_active");
+
+    store.threadView("th_background_1");
+    store.threadView("th_background_2");
+
+    expect(store.threadView("th_active")).toBe(active);
+    store.retainThreadView(undefined);
+    store.threadView("th_background_3");
+    store.threadView("th_background_4");
+    expect(store.threadView("th_active")).not.toBe(active);
   });
 
   it("atomically replaces replay state with a folded tail and prepends older pages", () => {
@@ -883,41 +961,35 @@ describe("AppStore", () => {
       .toBe(false);
   });
 
-  it("orders title-model settings snapshots against delayed SSE replay", () => {
+  it("orders session-naming settings snapshots against delayed SSE replay", () => {
     const store = new AppStore();
-    const settings = (state: string) => ({
+    const settings = (model: string) => ({
+      model,
       derive_branch_name_from_session_title: false,
-      title_model_load_behavior: "auto" as const,
-      title_model_resource_policy: "adaptive" as const,
-      title_model: {
-        state,
-        runtime_installed: false,
-        model_downloaded: false,
-      },
     });
-    expect(store.replaceGitWorktreeSettings(8, settings("installing"))).toBe(true);
+    expect(store.replaceSessionNamingSettings(8, settings("installing"))).toBe(true);
     expect(store.applyServerEvent({
       cursor: 7,
       scope: "server",
       ts: "2026-08-01T12:04:00Z",
-      type: "settings.git_worktrees_updated",
+      type: "settings.session_naming_updated",
       settings: settings("stale"),
     })).toBe(false);
-    expect(readSignal(store.gitWorktreeSettings)).toMatchObject({
+    expect(readSignal(store.sessionNamingSettings)).toMatchObject({
       cursor: 8,
-      settings: { title_model: { state: "installing" } },
+      settings: { model: "installing" },
     });
 
     store.applyServerEvent({
       cursor: 9,
       scope: "server",
       ts: "2026-08-01T12:04:01Z",
-      type: "settings.git_worktrees_updated",
+      type: "settings.session_naming_updated",
       settings: settings("ready"),
     });
-    expect(readSignal(store.gitWorktreeSettings)).toMatchObject({
+    expect(readSignal(store.sessionNamingSettings)).toMatchObject({
       cursor: 9,
-      settings: { title_model: { state: "ready" } },
+      settings: { model: "ready" },
     });
   });
 
@@ -950,6 +1022,44 @@ describe("AppStore", () => {
       session_id: "se_2",
     })).toBe(true);
     expect(readSignal(store.automationRevision)).toBe(1);
+  });
+
+  it("tracks transient title generation and clears it when a rename arrives", () => {
+    const store = new AppStore();
+    store.upsertSessionMetadata({ ...metadata, title: "New Session" });
+    store.upsertThread({ ...thread("th_1"), title: "New Thread" });
+
+    store.beginTitleGeneration("se_1", "New Session");
+    store.beginTitleGeneration("th_1", "New Thread");
+    expect(store.titleGenerationWaiting("se_1")).toBe(false);
+    expect(store.titleGenerationWaiting("th_1")).toBe(false);
+
+    store.markTitleGenerationWaiting("se_1", "New Session");
+    store.markTitleGenerationWaiting("th_1", "New Thread");
+    expect(store.titleGenerationWaiting("se_1")).toBe(true);
+    expect(store.titleGenerationWaiting("th_1")).toBe(true);
+
+    store.upsertSessionMetadata({ ...metadata, title: "Improve Session Naming" });
+    store.upsertThread({ ...thread("th_1"), title: "Refine Shimmer State" });
+    store.markTitleGenerationWaiting("se_1", "New Session");
+    store.markTitleGenerationWaiting("th_1", "New Thread");
+    expect(store.titleGenerationWaiting("se_1")).toBeUndefined();
+    expect(store.titleGenerationWaiting("th_1")).toBeUndefined();
+  });
+
+  it("ends title generation without changing durable fallback titles", () => {
+    const store = new AppStore();
+    store.upsertSessionMetadata({ ...metadata, title: "New Session" });
+    store.upsertThread({ ...thread("th_1"), title: "New Thread" });
+    store.beginTitleGeneration("se_1", "New Session");
+    store.beginTitleGeneration("th_1", "New Thread");
+
+    store.endTitleGeneration("se_1");
+    store.endTitleGeneration("th_1");
+    expect(store.titleGenerationWaiting("se_1")).toBeUndefined();
+    expect(store.titleGenerationWaiting("th_1")).toBeUndefined();
+    expect(store.sessionMetadata("se_1")?.title).toBe("New Session");
+    expect(store.thread("th_1")?.title).toBe("New Thread");
   });
 
   it("retains the live todo replacement across late metadata and LRU recreation", () => {

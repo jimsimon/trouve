@@ -16,7 +16,7 @@ Create a `.env` beside `docker-compose.review.yml` with the deployment
 settings:
 
 ```dotenv
-TROUVE_VERSION=4.1.0
+TROUVE_VERSION=4.10.1
 TROUVE_REVIEW_PORT=7433
 TROUVE_CODE_REVIEW_POLL_INTERVAL_SECONDS=60
 TROUVE_CODE_REVIEW_TIMEOUT_SECONDS=900
@@ -74,7 +74,19 @@ Use these common settings:
 - **Enable Device Flow**: disabled.
 - Setup URL: blank (or the dashboard URL as an optional convenience).
 - **Redirect on update**: disabled.
-- Repository permission **Contents**: Read-only.
+- Repository permission **Checks**: Read and write, so trouve can publish a
+  Check Run per review.
+- Repository permission **Contents**: Read and write. Reading is enough to
+  fetch the branch, but GitHub rejects the `resolveReviewThread` and
+  `unresolveReviewThread` GraphQL mutations for installation tokens without
+  Contents write access (`FORBIDDEN: Resource not accessible by integration`),
+  so with Read-only the bot cannot collapse the threads of fixed findings.
+  The dashboard reports **Contents permission** and each affected finding's
+  last collapse error until the permission is granted and the installation
+  has accepted the update.
+- Repository permission **Issues**: Read-only. GitHub requires this permission
+  to deliver `issue_comment` events, including commands written in the pull
+  request conversation.
 - Repository permission **Pull requests**: Read and write.
 - All organization and account permissions: No access.
 - Installation scope: **Only on this account** when every reviewed repository
@@ -104,10 +116,16 @@ HTTPS endpoint:
 - Webhook URL: `https://YOUR_HOST/github/webhooks`.
 - Webhook secret: generate a strong random value and enter the same value in
   the trouve dashboard.
-- Subscribe to the **Pull request** event only. GitHub may not show this event
-  until the Pull requests repository permission is selected.
+- Subscribe to the **Pull request** and **Issue comment** events. GitHub may
+  not show them until the corresponding Pull requests and Issues repository
+  permissions are selected.
 
-Polling remains enabled as a fallback for missed webhook deliveries.
+Issue comment delivery is the immediate path for `@trouve-ai review`, `resolve`,
+and `unresolve`. Polling remains enabled as a fallback for newly discovered
+threadless `resolve` and `unresolve` commands missed by webhook delivery; it
+does not recover missed `@trouve-ai review` commands. Comments already seen
+before command polling was introduced are treated as inspected and are not
+backfilled.
 
 After creating it:
 
@@ -203,18 +221,27 @@ selected failed persona, then starts a fresh whole-job replacement so
 successful tasks from an older settings snapshot are not mixed with current
 settings. Every reviewer selected by the current policy runs again.
 
+`@trouve-ai review full` remains accepted as a compatibility alias for
+`@trouve-ai review`; both commands request the same full-branch review. New
+Check Runs expose only the ordinary retry action, which keeps the original
+job's exact base and head revision. Existing pre-8.0 Check Runs may still send
+the retired `full_review` action; that compatibility action instead requests a
+whole review of the pull request's current head.
+
 Each job fetches the exact base and head commits into a managed repository and
-creates an isolated trouve session at that head. The complete diff is enumerated
-by changed path and divided into bounded per-file batches. Manual sends every
-selected reviewer every batch. Additive and Automatic record a decision for
-every persona/batch candidate and dispatch only the selected combinations in
-the built-in read-only review mode, including files beyond the model-facing
-aggregate diff limit. Reviewer profiles, review/router models, router thinking
-level, routing mode, inclusion controls, and every typed routing reason are
-snapshotted durably with the job after repository overrides are applied.
-The dashboard exposes both the router task output and the complete
-selected/skipped decision matrix, which is also published on the job's
-persisted event stream.
+creates an isolated trouve session at that head. Every review covers the full
+branch diff from the Git merge base of the current base ref through the exact
+head; a previously reviewed head is not used as a diff watermark. The complete
+diff is enumerated by changed path and divided into bounded per-file batches.
+Manual sends every selected reviewer every batch. Additive and Automatic
+record a decision for every persona/batch candidate and dispatch only the
+selected combinations in the built-in read-only review mode, including files
+beyond the model-facing aggregate diff limit. Reviewer profiles, review/router
+models, router thinking level, routing mode, inclusion controls, and every
+typed routing reason are snapshotted durably with the job after repository
+overrides are applied. The dashboard exposes both the router task output and
+the complete selected/skipped decision matrix, which is also published on the
+job's persisted event stream.
 
 If semantic triage is disabled or its model response fails validation,
 Additive continues with its baseline and enabled core personas. Automatic
@@ -226,9 +253,43 @@ repository settings.
 
 Candidate findings are first checked against actual commentable diff lines. A
 separate final editor pass then verifies them against the repository, removes
-false positives and findings not introduced by the revision, merges semantic
-duplicates, corrects line metadata, and produces the published summary. The
-result is checked against diff lines again before it is sent to GitHub.
+false positives, classifies whether the revision caused each issue, merges
+semantic duplicates, corrects line metadata, and produces the review summary.
+The result is checked against diff lines again before it is sent to GitHub.
+Credible findings that are not mechanically tied to the revision remain in
+trouve's durable history and dashboard for later triage, but are excluded from
+GitHub comments, actionable counts, summaries, and remediation prompts.
+
+Blocking findings whose best anchor is outside the pull-request diff appear in
+the lifecycle comment under **Findings without inline threads**. A maintainer
+can resolve one as won't-fix with its displayed `@trouve-ai resolve` command.
+Resolved entries move into a collapsed **Resolved as won't-fix** disclosure,
+where struck-through issue text, an explicit disposition, and an `unresolve`
+command distinguish that decision from a code fix. Findings fixed in code
+leave the list automatically on the next review round, and the bot resolves
+their inline GitHub threads with an explanatory reply. Thread resolution
+retries with backoff; a thread that stays open shows its last failure on the
+finding in the dashboard and the stats page counts failing and abandoned
+entries, the usual cause being a missing **Contents: Read and write**
+permission.
+
+Later reviews receive bounded pull-request history: unresolved and dismissed
+findings, root-cause themes and recurrence evidence, prior candidate
+rejections, current external threads, and carried finding anchors. This
+structured history helps the review converge without suppressing reconsideration
+of code whose behavior changed. Reviewer output and a clean verdict from an
+older head are not reused as coverage of a future head. A round with open
+blocking findings is published as a review that requests changes; a clean
+round is published as an approval, which supersedes the earlier request on
+GitHub without a dismissal. GitHub forbids approving the app's own pull
+request, so a clean round there falls back to a comment review and dismisses
+the stale request explicitly. A successful published round with no open
+blocking findings also makes the Check Run succeed immediately; there is no
+separate full-coverage confirmation round for current jobs. A
+clean pre-8.0 partial result remains visibly pending while reconciliation makes
+an initial full-branch compatibility attempt and at most one automatic retry.
+If both attempts end without publication, the dashboards mark the state as
+exhausted and offer a whole-review retry; a published full review clears it.
 
 Each job snapshots the effective review configuration when it is queued. Later
 settings changes apply to newly queued jobs without changing or cancelling
@@ -244,26 +305,41 @@ server and consumes no GitHub requests.
 
 ### Model-provider concurrency
 
-Review jobs may prepare up to 24 reviewer tasks concurrently, and two jobs may
-run at once, but the shared turn scheduler applies stricter gates before any
-model request starts. By default, at most 26 turns run globally, at most 24 of
-them may be background turns, at most 18 turns use the same provider, and at
-most 16 of those may be background turns. Consequently one provider receives
-no more than 16 concurrent review requests, background work across all
-providers is capped at 24, and two global plus two per-provider slots remain
-available for interactive work.
+Each review job plans every router and reviewer batch task at once. Durable task
+and thread setup uses a short-lived scheduler lane shared across review jobs;
+its permit is released before model dispatch, so setup bursts are bounded
+without capping active reviewer turns. The engine does not impose a global or
+per-provider turn cap; sessions run until their configured model provider
+applies its own capacity or rate limit. Provider throttle responses still
+activate shared exponential cooldown so concurrent turns do not become an
+immediate retry storm.
 
-These are concurrency limits, not requests-per-minute guarantees; provider
-plans and model-specific quotas vary. Deployments that observe throttling
-should lower `TROUVE_PROVIDER_TURN_CONCURRENCY` and
-`TROUVE_PROVIDER_BACKGROUND_TURN_CONCURRENCY`. The corresponding global
-overrides are `TROUVE_TURN_CONCURRENCY` and
-`TROUVE_BACKGROUND_TURN_CONCURRENCY`; review orchestration can be narrowed
-further with `TROUVE_CODE_REVIEW_JOB_CONCURRENCY` and
-`TROUVE_CODE_REVIEW_TASK_CONCURRENCY`. All limits must be positive and require
-a server restart. Review-job concurrency has a hard maximum of 32; larger
-persisted, API, or `TROUVE_CODE_REVIEW_JOB_CONCURRENCY` values are reduced to
-32 with a server warning.
+Agent backends that multiplex every thread through one vendor process (Codex's
+app-server) admit thread starts roughly serially, so a large review's burst of
+starts would otherwise queue inside the vendor until the tail exceeded the
+backend's fixed response timeout. The engine therefore paces vendor turn
+startup per backend: at most four turns are starting on the same backend at
+once, and each permit is released as soon as the vendor accepts the turn. Any
+number of reviewer turns may then run concurrently. Should a Codex thread start
+still go unanswered, only that reviewer fails; the shared app-server keeps
+serving its other turns.
+
+A task's provider-capacity wait covers both the throttle cooldown and the
+startup slot, and is reported once the turn is actually admitted. Reviewer,
+repair, and analyst timeouts charge model time only: the time a turn spent
+queued for admission extends its deadline, and a timeout error names the
+excluded wait so a run that outlived its nominal budget on the wall clock
+explains itself.
+
+The retired `TROUVE_TURN_CONCURRENCY`, `TROUVE_BACKGROUND_TURN_CONCURRENCY`,
+`TROUVE_PROVIDER_TURN_CONCURRENCY`, and
+`TROUVE_PROVIDER_BACKGROUND_TURN_CONCURRENCY` settings are ignored with a
+startup warning.
+
+The review service bounds top-level work with
+`TROUVE_CODE_REVIEW_JOB_CONCURRENCY`. The limit must be positive and requires a
+server restart. Review-job concurrency has a hard maximum of 32; larger
+persisted, API, or environment values are reduced to 32 with a server warning.
 
 ## Backup and upgrades
 

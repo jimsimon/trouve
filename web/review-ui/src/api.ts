@@ -12,7 +12,6 @@ import type {
   ProvidersResponse,
   Repository,
   ReviewJob,
-  ReviewScope,
   ReviewStats,
   ReviewTask,
   ReviewerProfile,
@@ -112,17 +111,13 @@ export const retryFinalEditor = (id: string): Promise<ReviewJob> =>
     method: "POST",
     body: "{}",
   });
-export const requestReview = (
-  job: ReviewJob,
-  scope: ReviewScope,
-): Promise<ReviewJob> =>
+export const requestReview = (job: ReviewJob): Promise<ReviewJob> =>
   api("/code-review/requests", {
     method: "POST",
     body: JSON.stringify({
       installation_id: job.installation_id,
       repository: job.repository,
       pull_number: job.pull_number,
-      scope,
     }),
   });
 export const saveRepository = (repository: Repository): Promise<Repository> =>
@@ -136,6 +131,12 @@ export const saveRepository = (repository: Repository): Promise<Repository> =>
       coordinator_thinking_level: repository.coordinator_thinking_level || null,
       router_model: repository.router_model || null,
       router_thinking_level: repository.router_thinking_level || null,
+      analyst_model: repository.analyst_model || null,
+      analyst_thinking_level: repository.analyst_thinking_level || null,
+      // Always sent as maps: an empty map clears stale options server-side.
+      coordinator_model_options: repository.coordinator_model_options ?? {},
+      router_model_options: repository.router_model_options ?? {},
+      analyst_model_options: repository.analyst_model_options ?? {},
       prompt: repository.prompt,
       reviewer_ids: repository.reviewer_ids,
       routing_mode: repository.routing_mode,
@@ -231,7 +232,7 @@ export const saveProvider = (
     body: JSON.stringify({
       kind,
       base_url: baseUrl || null,
-      api_key: apiKey || null,
+      ...(apiKey === undefined ? {} : { api_key: apiKey || null }),
     }),
   });
 export const getClis = async (): Promise<CliInfo[]> =>

@@ -7399,13 +7399,16 @@ dependencies = [
 
 [[package]]
 name = "trouve-agents"
-version = "4.1.0"
+version = "4.10.1"
 dependencies = [
  "async-trait",
+ "axum",
  "base64 0.22.1",
+ "bytes",
  "chrono",
  "dirs",
  "flate2",
+ "fs4",
  "futures",
  "libc",
  "portable-pty",
@@ -7422,12 +7425,13 @@ dependencies = [
  "trouve-process",
  "trouve-protocol",
  "trouve-providers",
+ "uuid",
  "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "trouve-app"
-version = "4.1.0"
+version = "4.10.1"
 dependencies = [
  "anyhow",
  "arboard",
@@ -7456,7 +7460,7 @@ dependencies = [
 
 [[package]]
 name = "trouve-client-core"
-version = "4.1.0"
+version = "4.10.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -7472,7 +7476,7 @@ dependencies = [
 
 [[package]]
 name = "trouve-core"
-version = "4.1.0"
+version = "4.10.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7518,7 +7522,7 @@ dependencies = [
 
 [[package]]
 name = "trouve-desktop-host"
-version = "4.1.0"
+version = "4.10.1"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -7539,11 +7543,11 @@ dependencies = [
 
 [[package]]
 name = "trouve-process"
-version = "4.1.0"
+version = "4.10.1"
 
 [[package]]
 name = "trouve-protocol"
-version = "4.1.0"
+version = "4.10.1"
 dependencies = [
  "chrono",
  "serde",
@@ -7553,7 +7557,7 @@ dependencies = [
 
 [[package]]
 name = "trouve-providers"
-version = "4.1.0"
+version = "4.10.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7581,7 +7585,7 @@ dependencies = [
 
 [[package]]
 name = "trouve-search"
-version = "4.1.0"
+version = "4.10.1"
 dependencies = [
  "ahash",
  "anyhow",
@@ -7674,7 +7678,7 @@ dependencies = [
 
 [[package]]
 name = "trouve-server"
-version = "4.1.0"
+version = "4.10.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7701,7 +7705,7 @@ dependencies = [
 
 [[package]]
 name = "trouve-thread-view"
-version = "4.1.0"
+version = "4.10.1"
 dependencies = [
  "chrono",
  "serde",

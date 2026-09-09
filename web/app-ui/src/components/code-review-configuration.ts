@@ -320,6 +320,7 @@ export class TrouveCodeReviewConfiguration extends withSignalTracking(LitElement
           <div><dt>Bot</dt><dd>${app.bot_login || app.slug || "Not reported"}</dd></div>
           <div><dt>Installations</dt><dd>${app.installation_count ?? 0}</dd></div>
           <div><dt>Checks permission</dt><dd>${app.checks_write_configured ? "Ready" : "Not confirmed"}</dd></div>
+          <div><dt>Contents permission</dt><dd>${app.contents_write_configured ? "Ready" : "Not confirmed"}</dd></div>
           <div><dt>Webhook</dt><dd>${app.webhook_configured ? "Configured" : "Polling only"}</dd></div>
           <div><dt>Re-run actions</dt><dd>${app.check_run_webhook_configured ? "Ready" : "Not confirmed"}</dd></div>
           <div><dt>Last poll</dt><dd>${formatTimestamp(app.last_poll_at)}</dd></div>
@@ -399,13 +400,8 @@ export class TrouveCodeReviewConfiguration extends withSignalTracking(LitElement
             </label>
           </div>
 
-          <label>
-            Repository instructions
-            <textarea .value=${draft.prompt} ?disabled=${this.#busy !== ""} @input=${(event: Event) => this.#patchRepositoryDraft(key, { prompt: (event.currentTarget as HTMLTextAreaElement).value })} placeholder="Extra constraints or context for reviews in this repository"></textarea>
-          </label>
-
           <fieldset>
-            <legend>Persona routing</legend>
+            <legend>Semantic Persona Selection</legend>
             <div class="form-grid three">
               <label>
                 Selection mode
@@ -423,12 +419,26 @@ export class TrouveCodeReviewConfiguration extends withSignalTracking(LitElement
                 Router thinking
                 <input autocomplete="off" spellcheck="false" placeholder="Inherit, level, or token budget" .value=${draft.routerThinkingLevel} ?disabled=${this.#busy !== ""} @input=${(event: Event) => this.#patchRepositoryDraft(key, { routerThinkingLevel: (event.currentTarget as HTMLInputElement).value })} />
               </label>
+              <label>
+                Change analyst model
+                <input list="code-review-models" autocomplete="off" spellcheck="false" placeholder="Inherit review model" .value=${draft.analystModel} ?disabled=${this.#busy !== ""} @input=${(event: Event) => this.#patchRepositoryDraft(key, { analystModel: (event.currentTarget as HTMLInputElement).value })} />
+                <small>Derives what the PR builds from the full branch diff each round; the final editor uses it as whole-PR context.</small>
+              </label>
+              <label>
+                Change analyst thinking
+                <input autocomplete="off" spellcheck="false" placeholder="Inherit, level, or token budget" .value=${draft.analystThinkingLevel} ?disabled=${this.#busy !== ""} @input=${(event: Event) => this.#patchRepositoryDraft(key, { analystThinkingLevel: (event.currentTarget as HTMLInputElement).value })} />
+              </label>
             </div>
             <label class="check-row">
               <input type="checkbox" .checked=${draft.semanticRouting} ?disabled=${this.#busy !== "" || draft.routingMode === "manual"} @change=${(event: Event) => this.#patchRepositoryDraft(key, { semanticRouting: (event.currentTarget as HTMLInputElement).checked })} />
-              Allow one read-only semantic routing pass per diff batch
+              Enabled
             </label>
           </fieldset>
+
+          <label>
+            Repository instructions
+            <textarea .value=${draft.prompt} ?disabled=${this.#busy !== ""} @input=${(event: Event) => this.#patchRepositoryDraft(key, { prompt: (event.currentTarget as HTMLTextAreaElement).value })} placeholder="Extra constraints or context for reviews in this repository"></textarea>
+          </label>
 
           ${draft.routingMode === "manual"
             ? this.#renderReviewerSelection(key, "reviewerIds", "Personas run for every requested review", "Select at least one persona while reviews are enabled.", draft.reviewerIds)

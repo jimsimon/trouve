@@ -185,6 +185,12 @@ const searchableItemContent = (item: ThreadChatItem): unknown => {
           attachment.size_bytes,
         ]),
       ];
+    case "artifacts":
+      return item.attachments.map((attachment) => [
+        attachment.name,
+        attachment.mime,
+        attachment.size_bytes,
+      ]);
     case "assistant":
     case "progress":
     case "thinking":
@@ -246,6 +252,8 @@ const searchableItemRevision = (item: ThreadChatItem): readonly unknown[] => {
     case "user":
     case "steered":
       return [item.content, item.attachments];
+    case "artifacts":
+      return [item.attachments];
     case "assistant":
     case "progress":
     case "thinking":

@@ -519,7 +519,7 @@ export class TrouveProviderSettings extends LitElement {
 
         <section class="subscription-health" aria-labelledby="subscription-health-title">
           <h3 id="subscription-health-title">Subscription health</h3>
-          <p>How much of each subscription's metered allowance is used. Codex and Claude Code report through their CLIs; Kimi Code uses the subscription key saved above. Cursor's usage comes from an undocumented dashboard endpoint, so it may break or be restricted at any time.</p>
+          <p>How much of each subscription's metered allowance is used. Codex and Claude Code report through their CLIs; Kimi Code uses the subscription key saved above. Cursor uses the saved SDK API key to query an undocumented dashboard endpoint directly, so that health check may break or be restricted at any time.</p>
           <div class="card-list">
             ${this.#health.length === 0
               ? html`<div class="empty">No subscription providers configured.</div>`
@@ -771,6 +771,16 @@ export class TrouveProviderSettings extends LitElement {
     `;
   }
 
+  /** Provider changes alter which models can run; the cached catalog must not
+   * keep serving the roster from before the save. */
+  async #reloadAfterChange(): Promise<void> {
+    const services = this.#services.value;
+    if (services !== undefined) {
+      void services.modelCatalog.refresh("force").catch(() => undefined);
+    }
+    await this.#load();
+  }
+
   async #load(forceHealth = true): Promise<void> {
     const services = this.#services.value;
     if (services === undefined) return;
@@ -857,7 +867,7 @@ export class TrouveProviderSettings extends LitElement {
       clearWriteOnlyControls(form);
       await save;
       this.#setNotice(`${preset.display_name} is configured.`, false);
-      await this.#load();
+      await this.#reloadAfterChange();
     } catch {
       this.#setNotice("Provider could not be saved. Check the server configuration and try again.", true);
     } finally {
@@ -894,7 +904,7 @@ export class TrouveProviderSettings extends LitElement {
       clearWriteOnlyControls(form);
       await save;
       this.#setNotice(`${submission.id} is configured.`, false);
-      await this.#load();
+      await this.#reloadAfterChange();
     } catch {
       this.#setNotice("Provider could not be saved. Check the server configuration and try again.", true);
     } finally {
@@ -913,7 +923,7 @@ export class TrouveProviderSettings extends LitElement {
       await services.protocol.deleteProvider(providerId);
       this.#confirmDelete = "";
       this.#setNotice(`${providerId} was removed.`, false);
-      await this.#load();
+      await this.#reloadAfterChange();
     } catch {
       this.#setNotice("Provider could not be removed. Try again.", true);
     } finally {
@@ -1017,7 +1027,7 @@ export class TrouveProviderSettings extends LitElement {
       success ? `${this.#login.displayName} is connected.` : "Sign-in failed. Start the authorization flow again.",
       !success,
     );
-    if (success) void this.#load();
+    if (success) void this.#reloadAfterChange();
     this.requestUpdate();
   }
 

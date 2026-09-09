@@ -47,7 +47,10 @@ button:disabled, textarea:disabled, input:disabled, select:disabled { cursor: no
   background: var(--trouve-win-bg);
 }
 .navigation-panel, .thread-panel, .inspection-panel { min-width: 0; min-height: 0; }
-.navigation-panel { padding: 10px; background: var(--trouve-sidebar-bg); border-right: 1px solid var(--trouve-border); overflow: auto; }
+.navigation-panel { display: flex; flex-direction: column; padding: 10px; background: var(--trouve-sidebar-bg); border-right: 1px solid var(--trouve-border); overflow: hidden; }
+.navigation-panel > .primary-links, .navigation-panel > .workspace-list-heading { flex: none; }
+/* Span the panel's inline padding so the scrollbar sits at the panel edge, inside the gutter, rather than against the rows. */
+.workspace-scroll { flex: 1; min-width: 0; min-height: 0; margin-inline: -10px; padding-inline: 10px; overflow: auto; overscroll-behavior: contain; }
 .thread-panel { display: grid; grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr) auto; overflow: hidden; background: var(--trouve-panel-bg); }
 trouve-thread-screen.thread-panel { grid-template-rows: auto minmax(0, 1fr) auto auto; }
 .inspection-panel { display: flex; flex-direction: column; background: var(--trouve-panel-bg); border-left: 1px solid var(--trouve-border); overflow: hidden; }
@@ -73,27 +76,38 @@ trouve-thread-screen.thread-panel { grid-template-rows: auto minmax(0, 1fr) auto
   background: var(--trouve-accent);
 }
 .panel-splitter:focus-visible { outline: 2px solid var(--trouve-accent); outline-offset: -2px; }
-.primary-links { display: grid; gap: 8px; }
-.primary-links::after { content: ""; height: 1px; margin: 4px 6px; background: var(--trouve-border); }
-.primary-links button { height: 34px; display: grid; grid-template-columns: 20px minmax(0, 1fr); align-items: center; gap: 8px; border: 0; border-radius: var(--trouve-radius); padding: 0 10px; color: var(--trouve-text-hi); background: var(--trouve-raised-bg); text-align: start; }
+.primary-links { display: flex; align-items: center; gap: 6px; margin-bottom: 4px; }
+.primary-links::after { content: none; }
+.primary-links button { position: relative; width: 34px; height: 34px; display: inline-flex; align-items: center; justify-content: center; flex: none; border: 0; border-radius: var(--trouve-radius); padding: 0; color: var(--trouve-text-hi); background: var(--trouve-raised-bg); }
 .primary-links button:hover { color: var(--trouve-text-hi); background: var(--trouve-hover-bg); }
 .primary-links button[aria-current="page"] { color: var(--trouve-text-hi); background: var(--trouve-accent-bg); }
 .primary-links button > span { width: 20px; color: var(--trouve-text-mid); font-size: 14px; text-align: center; }
 .primary-links button > .settings-link-icon { font-size: 18px; }
 .primary-links button strong { min-width: 0; overflow: hidden; font-size: 13px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
+.navigation-icon-button::after { content: attr(data-tooltip); position: absolute; z-index: 30; inset-block-start: calc(100% + 6px); inset-inline-start: 50%; width: max-content; max-width: 180px; transform: translateX(-50%); border: 1px solid var(--trouve-border); border-radius: var(--trouve-radius-sm); padding: 4px 7px; color: var(--trouve-text-hi); background: var(--trouve-popup-bg); box-shadow: 0 5px 14px var(--trouve-scrim); font-size: 11px; font-weight: 500; opacity: 0; pointer-events: none; transition: opacity 100ms ease; }
+.navigation-icon-button:hover::after, .navigation-icon-button:focus-visible::after { opacity: 1; }
 .workspace-list-heading { height: 34px; display: flex; align-items: center; gap: 8px; }
-.workspace-list-heading > strong { min-width: 0; flex: 1; color: var(--trouve-text-hi); font-size: 15px; }
-.workspace-list-heading wa-button { flex: none; }
-.command-palette-compact { width: 26px; height: 26px; flex: none; border: 0; border-radius: 5px; padding: 0; color: var(--trouve-text-dim); background: transparent; font-size: 14px; }
-.command-palette-compact:hover { color: var(--trouve-text-hi); background: var(--trouve-hover-bg); }
-.workspace-group { margin-top: 8px; }
+.workspace-list-heading > h2 { min-width: 0; flex: 1; margin: 0; color: var(--trouve-text-hi); font-size: 15px; }
+.command-palette-compact, .workspace-open-button { width: 26px; height: 26px; flex: none; border: 0; border-radius: 5px; padding: 0; color: var(--trouve-text-dim); background: transparent; font-size: 14px; }
+.command-palette-compact:hover, .workspace-open-button:hover { color: var(--trouve-text-hi); background: var(--trouve-hover-bg); }
+.workspace-list-options-wrap { position: relative; flex: none; }
+.workspace-list-options-button { width: 26px; height: 26px; border: 0; border-radius: 5px; padding: 0; color: var(--trouve-text-dim); background: transparent; font-size: 16px; }
+.workspace-list-options-button:hover, .workspace-list-options-button[aria-expanded="true"] { color: var(--trouve-text-hi); background: var(--trouve-hover-bg); }
+.workspace-list-options-menu { position: absolute; z-index: 20; inset-block-start: 30px; inset-inline-end: 0; width: 220px; display: grid; gap: 7px; border: 1px solid var(--trouve-border); border-radius: var(--trouve-radius); padding: 8px; color: var(--trouve-text); background: var(--trouve-popup-bg); box-shadow: 0 9px 25px var(--trouve-scrim); }
+.workspace-list-options-menu label { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 8px; color: var(--trouve-text-mid); font-size: 11px; }
+.workspace-list-options-menu select { min-width: 110px; height: 28px; border: 1px solid var(--trouve-border); border-radius: var(--trouve-radius-sm); padding: 2px 5px; color: var(--trouve-text); background: var(--trouve-control-bg); font: inherit; }
+.workspace-list-options-menu .workspace-list-show-option { grid-template-columns: auto minmax(0, 1fr); }
+.repository-group-heading { margin: 12px 6px 0; color: var(--trouve-text-dim); font-size: 11px; font-weight: 700; letter-spacing: .02em; text-transform: uppercase; }
+.workspace-group { padding-top: 8px; }
 .navigation-panel .workspace-group { position: relative; }
 .workspace-drop-placeholder { height: 34px; margin-top: 8px; border: 1px dashed var(--trouve-accent); border-radius: var(--trouve-radius); background: var(--trouve-accent-veil); }
 .workspace-row { height: 34px; display: flex; align-items: center; gap: 2px; padding: 0 4px 0 0; border-radius: var(--trouve-radius); background: var(--trouve-raised-bg); }
+.navigation-panel .workspace-row { position: sticky; z-index: 3; inset-block-start: 0; box-shadow: 0 -8px 0 var(--trouve-sidebar-bg); }
+.navigation-panel .workspace-row[data-controls-visible="true"] { z-index: 5; }
 .workspace-toggle { height: 34px; min-width: 0; display: grid; grid-template-columns: 26px minmax(0, 1fr); align-items: center; flex: 1; border: 0; border-radius: var(--trouve-radius); padding: 0; color: inherit; background: transparent; text-align: start; }
 .workspace-toggle:hover { background: var(--trouve-hover-bg); }
 .workspace-toggle > span { position: relative; inset-inline-start: 3px; width: 26px; color: var(--trouve-text-dim); font-size: 12px; text-align: center; }
-.workspace-group h2 { min-width: 0; margin: 0; overflow: hidden; color: var(--trouve-text); font-size: 13px; font-weight: 700; letter-spacing: 0; text-overflow: ellipsis; text-transform: none; white-space: nowrap; }
+.workspace-group h3, .workspace-group h4 { min-width: 0; margin: 0; overflow: hidden; color: var(--trouve-text); font-size: 13px; font-weight: 700; letter-spacing: 0; text-overflow: ellipsis; text-transform: none; white-space: nowrap; }
 .navigation-panel .workspace-order-controls { display: flex; align-items: center; flex: none; }
 .navigation-panel .workspace-order-controls button { width: 21px; height: 26px; border: 0; border-radius: 4px; padding: 0; color: var(--trouve-text-dim); background: transparent; font-size: 11px; }
 .navigation-panel .workspace-order-controls button:hover { color: var(--trouve-text-hi); background: var(--trouve-hover-bg); }
@@ -103,11 +117,17 @@ trouve-thread-screen.thread-panel { grid-template-rows: auto minmax(0, 1fr) auto
 .workspace-actions-wrap { position: relative; display: block; flex: none; }
 .workspace-actions-button { width: 26px; height: 26px; border: 0; border-radius: 5px; padding: 0; color: var(--trouve-text-dim); background: transparent; font-size: 16px; }
 .workspace-actions-button:hover, .workspace-actions-button[aria-expanded="true"] { color: var(--trouve-text-hi); background: var(--trouve-hover-bg); }
-.workspace-actions-menu { position: absolute; z-index: 12; inset-block-start: 30px; inset-inline-end: -30px; width: 180px; display: grid; gap: 1px; border: 1px solid var(--trouve-border); border-radius: var(--trouve-radius); padding: 4px; color: var(--trouve-text); background: var(--trouve-popup-bg); box-shadow: 0 9px 25px var(--trouve-scrim); }
+.workspace-actions-menu { position: absolute; z-index: 12; inset-block-start: 30px; inset-inline-end: -30px; width: 220px; max-height: min(70vh, 520px); display: grid; gap: 1px; overflow-y: auto; border: 1px solid var(--trouve-border); border-radius: var(--trouve-radius); padding: 4px; color: var(--trouve-text); background: var(--trouve-popup-bg); box-shadow: 0 9px 25px var(--trouve-scrim); }
 .workspace-actions-menu > strong { height: 24px; display: flex; align-items: center; padding: 0 8px; color: var(--trouve-text-dim); font-size: 11px; font-weight: 400; }
 .workspace-actions-menu > button { width: 100%; min-height: 30px; display: flex; align-items: center; gap: 8px; border: 0; border-radius: 4px; padding: 4px 8px; color: var(--trouve-text); background: transparent; font-size: 12px; text-align: start; }
 .workspace-actions-menu > button:hover { background: var(--trouve-accent-bg); }
 .workspace-actions-menu > button > span:first-child { min-width: 0; flex: 1; }
+.workspace-actions-menu-section { display: grid; gap: 1px; border-top: 1px solid var(--trouve-rule); padding-top: 3px; }
+.workspace-actions-menu-section > strong { height: 22px; display: flex; align-items: center; padding: 0 8px; color: var(--trouve-text-dim); font-size: 10px; font-weight: 600; }
+.workspace-actions-menu-section > button { width: 100%; min-height: 27px; display: flex; align-items: center; gap: 8px; border: 0; border-radius: 4px; padding: 3px 8px; color: var(--trouve-text); background: transparent; font-size: 11px; text-align: start; }
+.workspace-actions-menu-section > button:hover { background: var(--trouve-accent-bg); }
+.workspace-actions-menu-section > button > span:first-child { min-width: 0; flex: 1; }
+.workspace-actions-menu .danger { color: var(--trouve-err); }
 .workspace-new-session { width: 26px; height: 26px; flex: none; border: 0; border-radius: 5px; padding: 0; color: var(--trouve-text-dim); background: transparent; font-size: 15px; }
 .workspace-new-session:hover { color: var(--trouve-text-hi); background: var(--trouve-hover-bg); }
 @media (hover: hover) and (pointer: fine) {
@@ -120,36 +140,93 @@ trouve-thread-screen.thread-panel { grid-template-rows: auto minmax(0, 1fr) auto
   .session-age { opacity: 0; }
 }
 trouve-session-list { display: block; }
+trouve-session-list[hidden] { display: none; }
 .session-list { list-style: none; margin: 0; padding: 0; }
 .context-placeholder { margin: 8px 0; color: var(--trouve-text-dim); font-size: 11px; }
+.navigation-panel > trouve-session-usage-panel { flex: none; z-index: 4; display: block; margin-top: 8px; background: var(--trouve-sidebar-bg); }
+.session-usage-box { min-width: 0; height: 196px; display: grid; grid-template-rows: auto minmax(0, 1fr); gap: 8px; border: 1px solid var(--trouve-border); border-radius: var(--trouve-radius); padding: 10px; background: var(--trouve-surface); box-shadow: 0 -3px 12px var(--trouve-scrim); }
+.session-usage-box.collapsed { height: auto; grid-template-rows: auto; padding: 4px 4px 4px 10px; }
+.session-usage-heading { min-width: 0; display: flex; align-items: center; gap: 8px; border-bottom: 1px solid var(--trouve-border); }
+.session-usage-box.collapsed .session-usage-heading { border-bottom: 0; }
+.session-usage-heading > strong { flex: 1; color: var(--trouve-text-hi); font-size: 13px; }
+.session-usage-heading > small { min-width: 0; max-width: 45%; overflow-wrap: anywhere; color: var(--trouve-text-dim); font-size: 9px; text-align: end; }
+.session-usage-summary { min-width: 0; flex: 1; display: flex; align-items: center; gap: 6px; min-height: 26px; color: var(--trouve-text-mid); font-size: 11px; }
+.session-usage-summary > strong { flex: none; color: var(--trouve-text-hi); font-size: 11px; }
+.session-usage-summary > span { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.session-usage-summary > span.tone-warning { color: var(--trouve-warn); }
+.session-usage-summary > span.tone-error { color: var(--trouve-err); }
+.session-usage-collapse { width: 26px; height: 26px; flex: none; border: 0; border-radius: 5px; padding: 0; color: var(--trouve-text-dim); background: transparent; font-size: 12px; }
+.session-usage-collapse:hover { color: var(--trouve-text-hi); background: var(--trouve-hover-bg); }
+.session-usage-collapse:focus-visible { outline: 1px solid var(--trouve-accent); outline-offset: -2px; }
+.session-usage-tabs { min-width: 0; flex: 1; display: flex; align-self: stretch; gap: 2px; }
+.session-usage-tabs button { min-width: 0; min-height: 28px; border: 0; border-bottom: 2px solid transparent; padding: 0 5px; color: var(--trouve-text-dim); background: transparent; font-size: 10px; }
+.session-usage-tabs button:hover { color: var(--trouve-text-hi); background: var(--trouve-hover-bg); }
+.session-usage-tabs button[aria-selected="true"] { border-bottom-color: var(--trouve-accent); color: var(--trouve-text-hi); }
+.session-usage-tabs button:focus-visible { outline: 1px solid var(--trouve-accent); outline-offset: -2px; }
+.session-usage-body { min-width: 0; min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
+.session-usage-tab-panel { min-width: 0; }
+.session-usage-placeholder { margin: 0; color: var(--trouve-text-dim); font-size: 11px; line-height: 1.45; }
+.session-usage-content { min-width: 0; display: grid; gap: 8px; }
+.session-usage-content > p { margin: 0; color: var(--trouve-text-dim); font-size: 10px; line-height: 1.4; }
+.session-usage-meta { min-width: 0; display: flex; align-items: center; gap: 8px; color: var(--trouve-text-mid); font-size: 11px; }
+.session-usage-meta > span { min-width: 0; flex: 1; overflow-wrap: anywhere; font-weight: 600; }
+.session-usage-meta > small { flex: none; color: var(--trouve-text-dim); font-size: 10px; }
+.session-usage-lines { display: grid; gap: 8px; }
+.session-usage-line { min-width: 0; display: grid; gap: 3px; }
+.session-usage-line-copy { min-width: 0; display: flex; align-items: center; gap: 8px; color: var(--trouve-text-mid); font-size: 10px; }
+.session-usage-line-copy > span { min-width: 0; flex: 1; overflow-wrap: anywhere; }
+.session-usage-line-copy > small { flex: none; color: var(--trouve-text-mid); font-size: 9px; text-align: end; }
+.session-usage-meter { height: 6px; overflow: hidden; border-radius: 3px; background: var(--trouve-control-bg); }
+.session-usage-meter > span { display: block; min-width: 0; height: 100%; border-radius: 3px; background: var(--trouve-ok); }
+.session-usage-meter > span.nonzero { min-width: 6px; }
+.session-usage-meter > span.tone-warning { background: var(--trouve-warn); }
+.session-usage-meter > span.tone-error { background: var(--trouve-err); }
+.session-usage-stats { display: grid; gap: 4px; margin: 0; }
+.session-usage-stats > div { min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: baseline; gap: 8px; }
+.session-usage-stats dt { min-width: 0; overflow: hidden; color: var(--trouve-text-dim); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.session-usage-stats dd { margin: 0; color: var(--trouve-text-mid); font-size: 10px; font-variant-numeric: tabular-nums; text-align: end; }
+.session-usage-scope { min-width: 0; display: grid; gap: 6px; }
+.session-usage-scope-heading { min-width: 0; display: flex; align-items: baseline; gap: 8px; }
+.session-usage-scope-heading > strong { min-width: 0; flex: 1; color: var(--trouve-text-mid); font-size: 11px; }
+.session-usage-scope-heading > small { flex: none; color: var(--trouve-text-dim); font-size: 9px; }
+.session-usage-breakdown { min-width: 0; display: grid; gap: 6px; }
+.session-usage-model-row { min-width: 0; display: grid; gap: 4px; border-radius: var(--trouve-radius); padding: 6px; background: var(--trouve-control-bg); }
+.session-usage-model-row.total { border-top: 1px solid var(--trouve-border-strong); border-radius: 0; padding: 6px 0 0; background: transparent; }
+.session-usage-model-heading { min-width: 0; display: flex; align-items: baseline; gap: 6px; }
+.session-usage-model-heading > span { min-width: 0; flex: 1; overflow-wrap: anywhere; color: var(--trouve-text-mid); font-size: 10px; font-weight: 600; }
+.session-usage-model-heading > small { flex: none; color: var(--trouve-text-dim); font-size: 9px; }
+.session-usage-model-stats { min-width: 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 2px 8px; margin: 0; }
+.session-usage-model-stats > div { min-width: 0; display: flex; align-items: baseline; gap: 4px; }
+.session-usage-model-stats dt { min-width: 0; flex: 1; color: var(--trouve-text-dim); font-size: 9px; }
+.session-usage-model-stats dd { margin: 0; color: var(--trouve-text-mid); font-size: 9px; font-variant-numeric: tabular-nums; text-align: end; }
 .session-list-empty { margin-inline: 26px 8px; }
 .archived-session-group { margin-top: 2px; }
+.session-section-toggle { width: 100%; min-height: 27px; display: grid; grid-template-columns: 26px minmax(0, 1fr); align-items: center; border: 0; border-radius: var(--trouve-radius); padding: 0; color: var(--trouve-text-dim); background: transparent; font-size: 10px; font-weight: 600; text-align: start; }
+.session-section-toggle:hover { color: var(--trouve-text-mid); background: var(--trouve-hover-bg); }
+.session-section-toggle > .trouve-icon { width: 26px; color: var(--trouve-text-faint); font-size: 9px; }
 .archived-session-toggle { width: 100%; min-height: 28px; display: grid; grid-template-columns: 26px minmax(0, 1fr); align-items: center; border: 0; border-radius: var(--trouve-radius); padding: 0; color: var(--trouve-text-dim); background: transparent; font-size: 11px; text-align: start; }
 .archived-session-toggle:hover { color: var(--trouve-text-mid); background: var(--trouve-hover-bg); }
 .archived-session-chevron { width: 26px; color: var(--trouve-text-faint); font-size: 10px; text-align: center; }
 .archived-session-list .session-copy strong { color: var(--trouve-text-mid); }
 .session-entry { position: relative; }
 .session-row-wrap { height: 34px; display: grid; grid-template-columns: minmax(0, 1fr) 34px; align-items: center; border-radius: var(--trouve-radius); }
+.session-row-wrap.with-branch, .session-row.with-branch { height: 46px; }
 .session-row-wrap:hover { background: var(--trouve-hover-bg); }
 .session-row-wrap.selected { background: var(--trouve-accent-bg); }
 .session-row { width: 100%; height: 34px; grid-column: 1 / -1; grid-row: 1; display: grid; grid-template-columns: 26px minmax(0,1fr) 26px 34px; align-items: center; padding: 0; border: 0; border-radius: var(--trouve-radius); background: transparent; text-align: left; }
 .session-row:hover, .session-row.selected { background: transparent; }
 .session-copy { min-width: 0; overflow: hidden; }
 .session-copy strong { display: block; overflow: hidden; color: var(--trouve-text-mid); font-size: 13px; font-weight: 400; line-height: 1.3; text-overflow: ellipsis; white-space: nowrap; transition: color 100ms ease; }
+.session-branch { display: block; overflow: hidden; color: var(--trouve-text-faint); font-size: 10px; font-weight: 400; line-height: 1.2; text-overflow: ellipsis; white-space: nowrap; }
+.session-row.without-status { grid-template-columns: 0 minmax(0,1fr) 34px; }
+.session-row.without-status .session-age { grid-column: 3; }
+.session-indicator-hidden { visibility: hidden; }
 .session-row-wrap:hover .session-copy strong, .session-row-wrap:focus-within .session-copy strong, .session-row-wrap.selected .session-copy strong, .session-row.selected .session-copy strong { color: var(--trouve-text-hi); }
 .session-age { grid-column: 4; min-width: 0; padding-inline-end: 7px; overflow: hidden; color: var(--trouve-text-faint); font-size: 11px; font-variant-numeric: tabular-nums; text-align: end; text-overflow: clip; white-space: nowrap; transition: opacity 100ms ease; }
-.session-menu-button { z-index: 1; width: 30px; min-height: 30px; grid-column: 2; grid-row: 1; overflow: hidden; border: 0; border-radius: var(--trouve-radius-sm); padding: 0; color: var(--trouve-text-disabled); background: transparent; font-size: 9px; letter-spacing: -1px; }
-.session-menu-button:hover, .session-menu-button[aria-expanded="true"] { color: var(--trouve-text-hi); background: var(--trouve-hover-bg); }
-@media (hover: hover) and (pointer: fine) {
-  .session-menu-button { opacity: 0; pointer-events: none; transition: opacity 100ms ease; }
-  .session-age { opacity: 1; }
-  .session-row-wrap:hover .session-menu-button, .session-row-wrap:focus-within .session-menu-button, .session-row-wrap[data-actions-open="true"] .session-menu-button { opacity: 1; pointer-events: auto; }
-  .session-row-wrap:hover .session-age, .session-row-wrap:focus-within .session-age, .session-row-wrap[data-actions-open="true"] .session-age { opacity: 0; }
-}
 .session-entry { position: relative; }
-.session-actions { position: absolute; z-index: 8; top: 32px; right: 4px; width: 150px; display: grid; gap: 0; padding: 4px; border: 1px solid var(--trouve-border); border-radius: var(--trouve-radius); background: var(--trouve-popup-bg); color: var(--trouve-text); box-shadow: 0 8px 22px var(--trouve-scrim); font-size: 12px; }
+.session-actions { position: fixed; z-index: 40; width: 150px; display: grid; gap: 0; padding: 4px; border: 1px solid var(--trouve-border); border-radius: var(--trouve-radius); background: var(--trouve-popup-bg); color: var(--trouve-text); box-shadow: 0 8px 22px var(--trouve-scrim); font-size: 12px; }
 .session-actions button { width: 100%; min-height: 30px; border: 0; border-radius: var(--trouve-radius-sm); padding: 4px 8px; color: var(--trouve-text); background: transparent; text-align: left; }
-.session-actions button:hover { background: var(--trouve-accent-bg); }
+.session-actions button:hover, .session-actions button:focus-visible { background: var(--trouve-accent-bg); }
 .session-actions .danger { color: var(--trouve-err); }
 .session-actions .danger:hover { background: var(--trouve-err-hover); }
 .session-modal { width: min(380px, calc(100vw - 32px)); max-width: none; border: 1px solid var(--trouve-border); border-radius: 8px; padding: 0; color: var(--trouve-text); background: var(--trouve-raised-bg); font: var(--trouve-font-size)/1.35 var(--trouve-font-sans); }
@@ -216,7 +293,23 @@ trouve-session-list { display: block; }
 .thread-tab-item > .thread-tab-main { width: 100%; height: 100%; flex: none; padding-inline-end: 25px; }
 .thread-tab-item > .thread-tab-close { position: absolute; z-index: 2; inset-block: 4px; inset-inline-end: 4px; width: 22px; height: 22px; min-width: 22px; display: grid; place-items: center; flex: none; border-radius: var(--trouve-radius-sm); padding: 0; color: var(--trouve-text-dim); background: transparent; cursor: pointer; font-size: 10px; }
 .thread-tab-item > .thread-tab-close:hover, .thread-tab-item > .thread-tab-close:focus-visible { color: var(--trouve-text-hi); background: var(--trouve-hover-strong); }
+.thread-tab-context-menu { position: fixed; z-index: 40; width: 150px; display: grid; padding: 4px; border: 1px solid var(--trouve-border); border-radius: var(--trouve-radius); color: var(--trouve-text); background: var(--trouve-popup-bg); box-shadow: 0 8px 22px var(--trouve-scrim); font-size: 12px; }
+.thread-tab-context-menu button { width: 100%; min-height: 30px; border: 0; border-radius: var(--trouve-radius-sm); padding: 4px 8px; color: var(--trouve-text); background: transparent; text-align: left; }
+.thread-tab-context-menu button:hover, .thread-tab-context-menu button:focus-visible { background: var(--trouve-accent-bg); }
 .thread-tab-label { min-width: 0; display: inline-flex; flex: 1; align-items: center; gap: 5px; overflow: hidden; }
+.naming-title-shimmer {
+  display: inline-block;
+  height: .8em;
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--trouve-hover-bg) 20%, var(--trouve-hover-strong) 45%, var(--trouve-hover-bg) 70%);
+  background-size: 250% 100%;
+  animation: naming-title-shimmer 1.4s ease-in-out infinite;
+}
+.session-title-shimmer { width: min(9rem, 70%); }
+.thread-title-shimmer { width: 6.5rem; max-width: 100%; }
+@keyframes naming-title-shimmer { to { background-position: -250% 0; } }
+.title-waiting::after { display: inline-block; width: 6px; height: 6px; margin-inline-start: 5px; border-radius: 999px; background: var(--trouve-accent); box-shadow: 0 0 0 2px var(--trouve-accent-dim); animation: naming-title-pending 1.4s ease-in-out infinite; content: ""; }
+@keyframes naming-title-pending { 50% { opacity: .35; } }
 .session-indicator.thread-tab-indicator { width: 14px; height: 18px; flex: 0 0 14px; margin: 0; border-radius: 3px; }
 .session-indicator.thread-tab-indicator.approval, .session-indicator.thread-tab-indicator.question, .session-indicator.thread-tab-indicator.both { font-size: 10px; }
 .session-indicator.thread-tab-indicator.error { font-size: 12px; }
@@ -407,7 +500,6 @@ trouve-session-list { display: block; }
 .turn-transient-activity .turn-node-header strong { color: var(--trouve-text-dim); font-size: 11px; font-weight: 500; }
 .turn-transient-activity-copy { min-width: 0; display: grid; gap: 0; padding-block: 1px 4px; }
 .turn-transient-activity-copy > .turn-node-header { min-height: 22px; padding-block-end: 0; }
-.turn-transient-activity-copy > small { min-width: 0; padding-inline: 8px; color: var(--trouve-text-faint); font-size: 10px; overflow-wrap: anywhere; }
 .turn-prompt-node .turn-node-header strong { color: var(--trouve-accent-tint); }
 .turn-steered-node .turn-node-header strong { color: var(--trouve-accent-tint); }
 .turn-response-node.complete .turn-node-header strong { color: var(--trouve-ok); }
@@ -610,7 +702,6 @@ trouve-session-list { display: block; }
 trouve-agent-activity { display: contents; }
 .agent-activity-copy { min-width: 0; display: grid; gap: 1px; }
 .agent-activity-copy strong { color: var(--trouve-text-dim); font-size: 12px; font-weight: 500; }
-.agent-activity-copy small { color: var(--trouve-text-faint); font-size: 10px; overflow-wrap: anywhere; }
 .activity-dots { width: 22px; display: inline-flex; align-items: center; justify-content: space-between; }
 .activity-dots i { width: 4px; height: 4px; border-radius: 50%; background: currentcolor; animation: trouve-activity-dot 1.2s ease-in-out infinite; }
 .activity-dots i:nth-child(2) { animation-delay: 120ms; }
@@ -620,13 +711,14 @@ trouve-agent-activity { display: contents; }
   30% { opacity: 1; translate: 0 -2px; }
 }
 [data-reduce-motion] .activity-dots i { animation: none; opacity: .7; translate: none; }
+[data-reduce-motion] .naming-title-shimmer, [data-reduce-motion] .title-waiting::after { animation: none; }
 [data-reduce-motion] .session-indicator.busy::before { animation: none; opacity: 1; }
 [data-reduce-motion] .tool-inline-status.running { color: var(--trouve-text-dim); }
 [data-reduce-motion] .trouve-icon-spin { animation: none; }
 [data-reduce-motion] .context-compaction-spinner, [data-reduce-motion] .composer-context-usage.compacting .context-dial-value { animation: none; }
 [data-reduce-motion] .context-compaction-marker.running::after { animation: none; opacity: .5; }
 @media (prefers-reduced-motion: reduce) {
-  .context-compaction-marker.running::after, .context-compaction-spinner, .composer-context-usage.compacting .context-dial-value, .trouve-icon-spin { animation: none; }
+  .context-compaction-marker.running::after, .context-compaction-spinner, .composer-context-usage.compacting .context-dial-value, .naming-title-shimmer, .title-waiting::after, .trouve-icon-spin { animation: none; }
 }
 .attachment-list { min-width: 0; max-width: 100%; display: flex; flex-wrap: wrap; gap: 5px; margin: 8px 0 0; padding: 0; list-style: none; }
 .attachment-list li { min-width: 170px; max-width: min(100%, 310px); display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 7px; overflow: hidden; padding: 5px 7px; border: 1px solid var(--trouve-border); border-radius: var(--trouve-radius-sm); color: var(--trouve-text-dim); background: var(--trouve-surface); font-size: 10px; }
@@ -900,7 +992,7 @@ trouve-session-info-panel:not(:defined)::before, trouve-inspection-workspace:not
 .settings-section { display: grid; align-content: start; gap: 12px; }
 .settings-section h1 { margin: 0; color: var(--trouve-text-hi); font-size: 16px; line-height: 1.35; }
 .settings-section p { margin: 0; }
-.settings-section > trouve-git-worktree-settings { display: block; width: 100%; }
+.settings-section > trouve-session-naming-settings { display: block; width: 100%; }
 .settings-subsection { display: grid; align-content: start; gap: 12px; }
 .settings-subsection h2 { margin: 0; color: var(--trouve-text-hi); font-size: 16px; line-height: 1.35; }
 .settings-note, .settings-field p, .settings-tagline, .legal-copy { color: var(--trouve-text-soft); font-size: var(--trouve-settings-info-font-size, 11px); }
@@ -1006,26 +1098,30 @@ trouve-session-info-panel:not(:defined)::before, trouve-inspection-workspace:not
 .new-session-screen label,
 .new-session-screen .dialog-field { min-width: 0; display: grid; gap: 6px; color: var(--trouve-text-mid); font-size: 12px; font-weight: 700; }
 .new-session-screen select,
-.new-session-screen textarea { width: 100%; min-height: 30px; border: 1px solid var(--trouve-border-strong); border-radius: var(--trouve-radius-sm); padding: 4px 8px; color: var(--trouve-text); background: var(--trouve-control-bg); font-weight: 400; }
-.new-session-screen textarea { height: 34px; min-height: 34px; max-height: 162px; resize: none; overflow-y: hidden; line-height: 1.45; }
+.new-session-screen textarea { width: 100%; min-height: 30px; border: 1px solid var(--trouve-border); border-radius: var(--trouve-radius); padding: 4px 8px; color: var(--trouve-text); background: var(--trouve-control-bg); font-weight: 400; }
+.new-session-screen textarea { height: 34px; min-height: 34px; max-height: 162px; resize: none; overflow-y: hidden; padding: 7px 8px; background: var(--trouve-surface); line-height: 18px; outline: none; }
+.new-session-screen textarea:focus-visible { border-color: var(--trouve-selection); }
+.new-session-screen textarea::placeholder { color: var(--trouve-text-faint); }
+.new-session-branch-warning { order: 5; }
+.new-session-screen .dialog-checkbox { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 6px; font-weight: 400; }
+.new-session-screen .dialog-checkbox input { width: auto; min-height: auto; margin: 0; }
+.new-session-screen .dialog-option-grid { order: 4; min-width: 0; display: flex; align-items: end; gap: 8px; overflow-x: auto; overflow-y: hidden; padding-bottom: 1px; }
+.new-session-screen .dialog-option-grid > label,
+.new-session-screen .dialog-option-grid > .dialog-field { width: 130px; flex: none; gap: 2px; font-weight: 400; }
 .new-session-workspace { order: 1; }
 .new-session-branch { order: 2; }
-.new-session-branch-warning { order: 3; }
-.new-session-screen .dialog-checkbox { order: 4; display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 8px; font-weight: 400; }
-.new-session-screen .dialog-checkbox input { width: auto; min-height: auto; margin: 0; }
-.new-session-screen .dialog-option-grid { order: 5; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px 12px; }
-.new-session-mode { grid-column: 1; grid-row: 1; }
-.new-session-model { grid-column: 2; grid-row: 1; }
-.new-session-thinking { grid-column: 1; grid-row: 2; }
-.new-session-permission { grid-column: 2; grid-row: 2; }
-.new-session-screen .dialog-option-grid.no-thinking .new-session-permission { grid-column: 1 / -1; }
+.new-session-mode { order: 3; }
+.new-session-model { order: 4; width: 210px !important; }
+.new-session-model-options { order: 5; flex: none; }
+.new-session-permission { order: 6; width: 108px !important; }
+.new-session-fetch { order: 7; width: 104px !important; min-height: 30px; }
 .new-session-options-warning { order: 6; }
 .new-session-options-status { order: 6; margin: 0; color: var(--trouve-text-dim); }
 .new-session-yolo-warning { order: 6; display: grid; gap: 4px; border: 1px solid var(--trouve-err); border-radius: var(--trouve-radius); padding: 10px; color: var(--trouve-err-soft); background: var(--trouve-err-bg); font-size: 11px; }
 .new-session-yolo-warning strong { color: var(--trouve-err); font-size: 12px; }
-.new-session-prompt { order: 7; }
-.new-session-screen .pending-attachments { order: 8; margin: 0; padding: 0; }
-.new-session-screen .new-session-attachment { order: 9; min-height: 30px; justify-self: start; padding: 3px 7px; font-weight: 400; }
+.new-session-prompt { order: 1; }
+.new-session-screen .pending-attachments { order: 2; margin: 0; padding: 0; }
+.new-session-screen .new-session-attachment { order: 3; min-height: 30px; justify-self: start; padding: 3px 7px; font-weight: 400; }
 .new-session-screen .new-session-attachment input { width: 1px; height: 1px; min-height: 1px; padding: 0; }
 .new-session-error { order: 10; }
 .new-session-screen footer { order: 11; display: flex; align-items: center; justify-content: flex-start; gap: 8px; }
@@ -1112,9 +1208,12 @@ trouve-command-palette { display: contents; }
   html, body { min-width: 280px; }
   .app-shell { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) auto; }
   .panel-splitter { display: none; }
-  .navigation-panel, .thread-panel, .inspection-panel { display: none; grid-column: 1; grid-row: 1; border-inline: 0; }
+  .navigation-panel, .thread-panel, .inspection-panel { display: none; border-inline: 0; }
+  .app-shell > .navigation-panel,
+  .app-shell > .thread-panel:not(.new-session-screen),
+  .app-shell > .inspection-panel { grid-column: 1; grid-row: 1; }
   .navigation-panel { padding-top: calc(10px + env(safe-area-inset-top)); padding-inline: max(10px, env(safe-area-inset-left)) max(10px, env(safe-area-inset-right)); }
-  .mobile-pane-navigation .navigation-panel { display: block; }
+  .mobile-pane-navigation .navigation-panel { display: flex; }
   .mobile-pane-navigation .navigation-panel { overscroll-behavior-y: contain; }
   .new-session-screen { grid-column: 1; grid-row: 1; }
   .new-session-screen form { align-content: start; padding: max(24px, env(safe-area-inset-top)) 16px max(24px, env(safe-area-inset-bottom)); }
@@ -1218,7 +1317,6 @@ trouve-command-palette { display: contents; }
   .terminal-tabs button { min-height: 42px; }
   .card-actions button, .screen-empty button { min-height: 42px; }
   .archived-session-toggle { min-height: 42px; }
-  .session-menu-button { min-height: 40px; }
   .session-actions button { min-height: 38px; }
   .status-bar { min-height: 52px; display: flex; padding: 3px max(6px, env(safe-area-inset-right)) max(3px, env(safe-area-inset-bottom)) max(6px, env(safe-area-inset-left)); }
   .status-copy, .status-bar > .online-dot, .status-bar > .status-spacer, .theme-picker { display: none; }

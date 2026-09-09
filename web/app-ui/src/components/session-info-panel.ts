@@ -618,7 +618,7 @@ export class TrouveSessionInfoPanel extends withSignalTracking(LitElement) {
           <div>
             <h3 id="session-info-pr-title">Pull requests</h3>
             <p>${pullRequests.length === 0
-              ? "Associated with this session's branch."
+              ? "Associated with this session's branch or chat."
               : plural(pullRequests.length, "pull request")}</p>
           </div>
           <button type="button" @click=${this.#openPullRequests}>
@@ -626,7 +626,7 @@ export class TrouveSessionInfoPanel extends withSignalTracking(LitElement) {
           </button>
         </header>
         ${pullRequests.length === 0
-          ? html`<p class="session-info-empty">No pull requests are associated with this branch.</p>`
+          ? html`<p class="session-info-empty">No pull requests are associated with this session.</p>`
           : html`<ul class="session-info-pr-list">
               ${pullRequests.map((pullRequest) => this.#renderPullRequest(pullRequest))}
             </ul>`}

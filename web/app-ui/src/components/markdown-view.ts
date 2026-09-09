@@ -10,6 +10,7 @@ import { CONTENT_WORKER_MAX_SOURCE_UNITS } from "../workers/content-worker-proto
 import {
   parseChatFileTarget,
 } from "./chat-file-link.js";
+import "./mermaid-diagram.js";
 import { stableMarkdownPrefixLength } from "./streaming-markdown.js";
 
 export const renderMarkdown = async (source: string): Promise<string> =>
@@ -133,6 +134,21 @@ export class TrouveMarkdownView extends LitElement {
     this.#rendered = "";
     this.#renderFailure = true;
     this.requestUpdate();
+  }
+
+  /** The sanitizer emits `mermaid` fences as ordinary code blocks (the
+   * renderer runs off-thread without a DOM). Promote them to diagram elements
+   * once the HTML is in place; Lit re-inserts the fragment only when the
+   * rendered string changes, so the swap survives unrelated updates. */
+  protected override updated(): void {
+    const blocks = this.renderRoot.querySelectorAll<HTMLElement>("pre > code.language-mermaid");
+    for (const code of blocks) {
+      const pre = code.parentElement;
+      if (pre === null) continue;
+      const diagram = document.createElement("trouve-mermaid-diagram");
+      diagram.source = code.textContent ?? "";
+      pre.replaceWith(diagram);
+    }
   }
 
   readonly #activateLink = (event: MouseEvent): void => {

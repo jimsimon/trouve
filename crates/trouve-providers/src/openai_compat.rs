@@ -283,6 +283,18 @@ impl OpenAiCompatProvider {
             match m {
                 Message::System(s) => wire.push(json!({"role": "system", "content": s})),
                 Message::User(s) => wire.push(json!({"role": "user", "content": s})),
+                Message::UserWithImages { content, images } => {
+                    let mut parts = vec![json!({"type": "text", "text": content})];
+                    parts.extend(images.iter().map(|image| {
+                        json!({
+                            "type": "image_url",
+                            "image_url": {
+                                "url": format!("data:{};base64,{}", image.mime, image.data),
+                            }
+                        })
+                    }));
+                    wire.push(json!({"role": "user", "content": parts}));
+                }
                 Message::Assistant {
                     content,
                     tool_calls,
@@ -383,6 +395,7 @@ fn parse_gateway_models(provider_id: &str, body: &Value) -> Vec<trouve_protocol:
                     .unwrap_or_else(|| name.to_string()),
                 context_window: window,
                 supports_tools,
+                supports_images: false,
                 input_price_per_mtok: price("prompt"),
                 output_price_per_mtok: price("completion"),
                 options_schema: serde_json::json!({}),
@@ -429,6 +442,9 @@ fn apply_ollama_metadata(model: &mut trouve_protocol::ModelInfo, body: &Value) {
         model.supports_tools = capabilities
             .iter()
             .any(|capability| capability.as_str() == Some("tools"));
+        model.supports_images = capabilities
+            .iter()
+            .any(|capability| capability.as_str() == Some("vision"));
     }
 }
 
@@ -604,6 +620,7 @@ fn async_stream(
         let mut buf = crate::sse::LineBuffer::default();
         let mut partials: Vec<PartialToolCall> = Vec::new();
         let mut usage = Usage::default();
+        let mut thinking_active = false;
         while let Some(chunk) = bytes.next().await {
             let chunk = match chunk {
                 Ok(c) => c,
@@ -621,6 +638,13 @@ fn async_stream(
                 };
                 let data = data.trim();
                 if data == "[DONE]" {
+                    if thinking_active {
+                        let _ = tx
+                            .send(Ok(ProviderEvent::ThinkingCompleted {
+                                id: "reasoning".into(),
+                            }))
+                            .await;
+                    }
                     for p in partials.drain(..) {
                         let arguments: Value =
                             serde_json::from_str(&p.arguments).unwrap_or(Value::Null);
@@ -661,6 +685,14 @@ fn async_stream(
                 if let Some(text) = delta.get("content").and_then(Value::as_str)
                     && !text.is_empty()
                 {
+                    if thinking_active {
+                        let _ = tx
+                            .send(Ok(ProviderEvent::ThinkingCompleted {
+                                id: "reasoning".into(),
+                            }))
+                            .await;
+                        thinking_active = false;
+                    }
                     let _ = tx
                         .send(Ok(ProviderEvent::TextDelta(text.to_string())))
                         .await;
@@ -669,8 +701,19 @@ fn async_stream(
                 if let Some(text) = delta.get("reasoning_content").and_then(Value::as_str)
                     && !text.is_empty()
                 {
+                    if !thinking_active {
+                        let _ = tx
+                            .send(Ok(ProviderEvent::ThinkingStarted {
+                                id: "reasoning".into(),
+                            }))
+                            .await;
+                        thinking_active = true;
+                    }
                     let _ = tx
-                        .send(Ok(ProviderEvent::ThinkingDelta(text.to_string())))
+                        .send(Ok(ProviderEvent::ThinkingDelta {
+                            id: "reasoning".into(),
+                            text: text.to_string(),
+                        }))
                         .await;
                 }
                 if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
@@ -696,6 +739,13 @@ fn async_stream(
             }
         }
         // Stream ended without [DONE]; still flush what we have.
+        if thinking_active {
+            let _ = tx
+                .send(Ok(ProviderEvent::ThinkingCompleted {
+                    id: "reasoning".into(),
+                }))
+                .await;
+        }
         for p in partials.drain(..) {
             let arguments: Value = serde_json::from_str(&p.arguments).unwrap_or(Value::Null);
             let _ = tx
@@ -714,6 +764,45 @@ fn async_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn reasoning_lifecycle_survives_interleaved_tool_call_deltas() {
+        let payload = concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"inspect\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",",
+            "\"function\":{\"name\":\"read_file\",\"arguments\":\"{}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\" continue\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let source = futures::stream::iter([Ok::<_, reqwest::Error>(bytes::Bytes::from(payload))]);
+        let events: Vec<_> = async_stream(source).collect().await;
+
+        assert_eq!(events.len(), 6);
+        assert!(matches!(
+            &events[0],
+            Ok(ProviderEvent::ThinkingStarted { id }) if id == "reasoning"
+        ));
+        assert!(matches!(
+            &events[1],
+            Ok(ProviderEvent::ThinkingDelta { id, text })
+                if id == "reasoning" && text == "inspect"
+        ));
+        assert!(matches!(
+            &events[2],
+            Ok(ProviderEvent::ThinkingDelta { id, text })
+                if id == "reasoning" && text == " continue"
+        ));
+        assert!(matches!(
+            &events[3],
+            Ok(ProviderEvent::ThinkingCompleted { id }) if id == "reasoning"
+        ));
+        assert!(matches!(
+            &events[4],
+            Ok(ProviderEvent::ToolCall(call))
+                if call.id == "call-1" && call.name == "read_file"
+        ));
+        assert!(matches!(&events[5], Ok(ProviderEvent::Completed { .. })));
+    }
 
     #[test]
     fn custom_header_and_query_auth_replace_bearer_auth() {
@@ -756,14 +845,21 @@ mod tests {
         assert_eq!(models.len(), 1, "unknown models are dropped");
         let m = &models[0];
         assert_eq!(m.id, "kilocode/anthropic/claude-sonnet-4.5");
-        assert_eq!(m.display_name, "Anthropic: Claude Sonnet 4.5");
+        assert_eq!(m.display_name, "Claude Sonnet 4.5 (latest)");
         assert_eq!(m.context_window, 1_000_000);
         assert_eq!(m.input_price_per_mtok, Some(3.0));
         assert_eq!(m.output_price_per_mtok, Some(15.0));
+        // Kilo's record has no "medium" level, so the default falls back to
+        // the catalog's first supported value.
+        assert_eq!(
+            m.options_schema
+                .pointer("/properties/reasoning_effort/enum"),
+            Some(&json!(["none", "high"]))
+        );
         assert_eq!(
             m.options_schema
                 .pointer("/properties/reasoning_effort/default"),
-            Some(&json!("medium"))
+            Some(&json!("none"))
         );
     }
 
@@ -814,6 +910,7 @@ mod tests {
             display_name: "qwen3:8b".into(),
             context_window: 0,
             supports_tools: true,
+            supports_images: false,
             input_price_per_mtok: None,
             output_price_per_mtok: None,
             options_schema: json!({}),
@@ -830,6 +927,7 @@ mod tests {
         );
         assert_eq!(model.context_window, 262_144);
         assert!(model.supports_tools);
+        assert!(!model.supports_images);
     }
 
     #[test]
@@ -862,7 +960,7 @@ mod tests {
         assert_eq!(models.len(), 2);
         assert_eq!(models[0].id, "openai/gpt-5.6");
         assert_eq!(models[0].context_window, 1_050_000);
-        assert_eq!(models[1].input_price_per_mtok, Some(2.5));
+        assert_eq!(models[1].input_price_per_mtok, Some(2.0));
     }
 
     #[test]
@@ -890,6 +988,7 @@ mod tests {
             display_name: "Stale".into(),
             context_window: 8_192,
             supports_tools: true,
+            supports_images: false,
             input_price_per_mtok: None,
             output_price_per_mtok: None,
             options_schema: json!({}),

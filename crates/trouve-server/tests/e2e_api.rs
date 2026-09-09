@@ -2,7 +2,7 @@
 //! event streams, approval flow, checkpointing, and undo — no network, no
 //! real model.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -26,12 +26,21 @@ struct StaticThenLiveModelProvider {
     live_calls: Arc<AtomicUsize>,
 }
 
+struct SteerableNativeProvider {
+    calls: AtomicUsize,
+    model_discovery_gate: Option<Arc<tokio::sync::Semaphore>>,
+    first_stream_started: Arc<tokio::sync::Semaphore>,
+    finish_first_stream: Arc<tokio::sync::Notify>,
+    messages_seen: std::sync::Mutex<Vec<Vec<Message>>>,
+}
+
 fn catalog_model(id: &str, display_name: &str) -> trouve_protocol::ModelInfo {
     trouve_protocol::ModelInfo {
         id: id.into(),
         display_name: display_name.into(),
         context_window: 100_000,
         supports_tools: true,
+        supports_images: false,
         input_price_per_mtok: None,
         output_price_per_mtok: None,
         options_schema: serde_json::json!({}),
@@ -75,6 +84,7 @@ impl Provider for ScriptedProvider {
             display_name: "Scripted test model".into(),
             context_window: 100_000,
             supports_tools: true,
+            supports_images: true,
             input_price_per_mtok: Some(1.0),
             output_price_per_mtok: Some(2.0),
             options_schema: serde_json::json!({}),
@@ -117,6 +127,74 @@ impl Provider for ScriptedProvider {
             ],
         };
         Ok(Box::pin(futures::stream::iter(events)))
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for SteerableNativeProvider {
+    fn id(&self) -> &str {
+        "native-steering"
+    }
+
+    fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
+        vec![catalog_model(
+            "native-steering/test-model",
+            "Native steering test model",
+        )]
+    }
+
+    async fn list_models(&self) -> Vec<trouve_protocol::ModelInfo> {
+        if let Some(gate) = &self.model_discovery_gate {
+            gate.acquire().await.unwrap().forget();
+        }
+        self.models()
+    }
+
+    async fn stream_chat(
+        &self,
+        _model: &str,
+        messages: &[Message],
+        _tools: &[ToolSpec],
+        _options: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<EventStream, ProviderError> {
+        self.messages_seen.lock().unwrap().push(messages.to_vec());
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        if call == 0 {
+            self.first_stream_started.add_permits(1);
+            let finish_first_stream = self.finish_first_stream.clone();
+            return Ok(Box::pin(
+                futures::stream::iter(vec![Ok(ProviderEvent::TextDelta(
+                    "Initial direction.".into(),
+                ))])
+                .chain(futures::stream::once(async move {
+                    finish_first_stream.notified().await;
+                    Ok(ProviderEvent::TextDelta(" Boundary completion.".into()))
+                }))
+                .chain(futures::stream::iter(vec![
+                    Ok(ProviderEvent::ToolCall(ToolCallRequest {
+                        id: "boundary-question".into(),
+                        name: "ask_question".into(),
+                        arguments: serde_json::json!({
+                            "title": "Safe boundary",
+                            "questions": [{
+                                "prompt": "Continue?",
+                                "options": ["Yes", "No"],
+                            }],
+                        }),
+                    })),
+                    Ok(ProviderEvent::Completed {
+                        usage: Usage::default(),
+                    }),
+                ])),
+            ));
+        }
+
+        Ok(Box::pin(futures::stream::iter(vec![
+            Ok(ProviderEvent::TextDelta("Redirected result.".into())),
+            Ok(ProviderEvent::Completed {
+                usage: Usage::default(),
+            }),
+        ])))
     }
 }
 
@@ -401,6 +479,256 @@ async fn wait_for_event(
     tokio::time::timeout(Duration::from_secs(30), fut)
         .await
         .expect("timed out waiting for event")
+}
+
+#[tokio::test]
+async fn native_provider_turn_applies_steering_at_the_next_safe_boundary() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+
+    let provider = Arc::new(SteerableNativeProvider {
+        calls: AtomicUsize::new(0),
+        model_discovery_gate: Some(Arc::new(tokio::sync::Semaphore::new(0))),
+        first_stream_started: Arc::new(tokio::sync::Semaphore::new(0)),
+        finish_first_stream: Arc::new(tokio::sync::Notify::new()),
+        messages_seen: std::sync::Mutex::new(Vec::new()),
+    });
+    let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
+    let engine = Arc::new(
+        Engine::new(store, tmp.path().join("data"), &Config::default())
+            .with_config_dir(None)
+            .with_provider("native-steering", provider.clone())
+            .with_default_model("native-steering/test-model"),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = trouve_server::build_router(engine.clone());
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let base = format!("http://{addr}/v1");
+    let client = reqwest::Client::new();
+
+    let workspace: serde_json::Value = client
+        .post(format!("{base}/workspaces"))
+        .json(&serde_json::json!({"path": repo}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let session: serde_json::Value = client
+        .post(format!("{base}/sessions"))
+        .json(&serde_json::json!({"workspace_id": workspace["id"], "title": "Native steer"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let thread: serde_json::Value = client
+        .post(format!("{base}/threads"))
+        .json(&serde_json::json!({
+            "session_id": session["id"],
+            "permission_mode": "yolo",
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let thread_id = thread["id"].as_str().unwrap();
+    let events_url = format!("{base}/threads/{thread_id}/events");
+
+    let started = client
+        .post(format!("{base}/threads/{thread_id}/messages"))
+        .json(&serde_json::json!({"content": "Begin in the initial direction."}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(started.status(), reqwest::StatusCode::ACCEPTED);
+    assert!(
+        engine.turn_accepts_steering(thread_id, 1),
+        "turn 1 steering receiver must be installed before messages POST returns"
+    );
+    let steer_client = client.clone();
+    let steer_url = format!("{base}/threads/{thread_id}/steer");
+    let pending_steer = tokio::spawn(async move {
+        steer_client
+            .post(steer_url)
+            .json(&serde_json::json!({"content": "Change direction now."}))
+            .send()
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while engine.pending_turn_steers(thread_id, 1) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("HTTP steering request should reach the installed receiver");
+    provider
+        .model_discovery_gate
+        .as_ref()
+        .unwrap()
+        .add_permits(8);
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        provider.first_stream_started.acquire(),
+    )
+    .await
+    .expect("provider never started its first stream")
+    .unwrap()
+    .forget();
+    let before = wait_for_event(&client, &events_url, |event| {
+        event["type"] == "assistant.delta"
+    })
+    .await;
+    assert!(before.iter().any(|event| {
+        event["type"] == "turn.started" && event["turn"] == 1 && event["supports_steering"] == true
+    }));
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    provider.finish_first_stream.notify_one();
+    let steered = tokio::time::timeout(Duration::from_secs(10), pending_steer)
+        .await
+        .expect("boundary steering did not resume after the provider response")
+        .unwrap()
+        .unwrap();
+    assert_eq!(steered.status(), reqwest::StatusCode::ACCEPTED);
+    assert_eq!(
+        steered.json::<serde_json::Value>().await.unwrap()["turn"],
+        1
+    );
+
+    // Hold the tool batch open, then admit attachment-bearing steering. The
+    // request must retain its bounded queue permit until the question result
+    // is recorded and attachment materialization can use the safe mutation
+    // boundary.
+    let during_tool = wait_for_event(&client, &events_url, |event| {
+        event["type"] == "question.requested"
+    })
+    .await;
+    let question = during_tool
+        .iter()
+        .find(|event| event["type"] == "question.requested")
+        .unwrap();
+    let request_id = question["request_id"].as_str().unwrap().to_string();
+    let attachment_client = client.clone();
+    let attachment_url = format!("{base}/threads/{thread_id}/steer");
+    let pending_attachment_steer = tokio::spawn(async move {
+        attachment_client
+            .post(attachment_url)
+            .json(&serde_json::json!({
+                "content": "Use this attached guidance.",
+                "attachments": [{
+                    "name": "guidance.txt",
+                    "mime": "text/plain",
+                    "data": "YXR0YWNobWVudA==",
+                }],
+            }))
+            .send()
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while engine.pending_turn_steers(thread_id, 1) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("attachment steering was not retained during tool execution");
+    let answered = client
+        .post(format!("{base}/questions"))
+        .json(&serde_json::json!({
+            "thread_id": thread_id,
+            "request_id": request_id,
+            "answers": [{"question_id": "q1", "selected_option_ids": ["opt1"]}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(answered.status(), reqwest::StatusCode::NO_CONTENT);
+    let attachment_steered =
+        tokio::time::timeout(Duration::from_secs(10), pending_attachment_steer)
+            .await
+            .expect("attachment steering did not resume after the tool boundary")
+            .unwrap()
+            .unwrap();
+    assert_eq!(attachment_steered.status(), reqwest::StatusCode::ACCEPTED);
+
+    let events = wait_for_event(&client, &events_url, |event| {
+        event["type"] == "turn.completed"
+    })
+    .await;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["type"] == "turn.started")
+            .count(),
+        1
+    );
+    assert!(!events.iter().any(|event| event["type"] == "turn.cancelled"));
+    assert!(events.iter().any(|event| {
+        event["type"] == "turn.steered"
+            && event["turn"] == 1
+            && event["content"] == "Change direction now."
+    }));
+    assert!(events.iter().any(|event| {
+        event["type"] == "assistant.delta" && event["text"] == "Redirected result."
+    }));
+    let boundary_index = events
+        .iter()
+        .position(|event| {
+            event["type"] == "assistant.delta" && event["text"] == " Boundary completion."
+        })
+        .unwrap();
+    let steering_index = events
+        .iter()
+        .position(|event| event["type"] == "turn.steered")
+        .unwrap();
+    let tool_result_index = events
+        .iter()
+        .position(|event| event["type"] == "question.resolved")
+        .unwrap();
+    assert!(steering_index < boundary_index && boundary_index < tool_result_index);
+    let attachment_steering_index = events
+        .iter()
+        .position(|event| {
+            event["type"] == "turn.steered" && event["content"] == "Use this attached guidance."
+        })
+        .unwrap();
+    assert!(tool_result_index < attachment_steering_index);
+    assert_eq!(
+        events[attachment_steering_index]["attachments"][0]["name"],
+        "guidance.txt"
+    );
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+
+    let messages_seen = provider.messages_seen.lock().unwrap();
+    assert!(messages_seen[0].iter().any(|message| {
+        matches!(message, Message::User(content) if content == "Change direction now.")
+    }));
+    let resumed = &messages_seen[1];
+    assert!(resumed.iter().any(|message| {
+        matches!(message, Message::User(content) if content == "Change direction now.")
+    }));
+    assert!(resumed.iter().any(|message| {
+        matches!(message, Message::Assistant { content, .. } if content == "Initial direction. Boundary completion.")
+    }));
+    let tool_result = resumed
+        .iter()
+        .position(|message| {
+            matches!(message, Message::ToolResult { call_id, .. } if call_id == "boundary-question")
+        })
+        .unwrap();
+    let attachment_guidance = resumed
+        .iter()
+        .position(|message| {
+            matches!(message, Message::User(content) if content.contains("Use this attached guidance.") && content.contains("guidance.txt"))
+        })
+        .unwrap();
+    assert!(tool_result < attachment_guidance);
 }
 
 #[tokio::test]
@@ -819,6 +1147,10 @@ async fn full_turn_with_approval_checkpoint_and_undo() {
     assert_eq!(usage["turns"], 1);
     assert_eq!(usage["input_tokens"], 30);
     assert_eq!(usage["output_tokens"], 7);
+    assert_eq!(usage["models"].as_array().unwrap().len(), 1);
+    assert_eq!(usage["models"][0]["model"], "scripted/test-model");
+    assert_eq!(usage["models"][0]["turns"], 1);
+    assert_eq!(usage["models"][0]["input_tokens"], 30);
 
     // Cursor resumption: replay from mid-stream only returns later events.
     let mid = events[events.len() / 2]["cursor"].as_u64().unwrap();
@@ -922,6 +1254,8 @@ async fn full_turn_with_approval_checkpoint_and_undo() {
 
 struct IterationLimitProvider {
     calls: AtomicUsize,
+    final_stream_started: tokio::sync::Semaphore,
+    finish_final_stream: tokio::sync::Notify,
 }
 
 #[async_trait::async_trait]
@@ -939,6 +1273,8 @@ impl Provider for IterationLimitProvider {
     ) -> Result<EventStream, ProviderError> {
         let call = self.calls.fetch_add(1, Ordering::SeqCst);
         let events = if tools.is_empty() {
+            self.final_stream_started.add_permits(1);
+            self.finish_final_stream.notified().await;
             vec![
                 Ok(ProviderEvent::TextDelta(
                     "I stopped at the step limit; continue to finish.".into(),
@@ -972,6 +1308,8 @@ async fn iteration_limit_gets_a_final_tool_free_model_response() {
 
     let provider = Arc::new(IterationLimitProvider {
         calls: AtomicUsize::new(0),
+        final_stream_started: tokio::sync::Semaphore::new(0),
+        finish_final_stream: tokio::sync::Notify::new(),
     });
     let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
     let engine = Arc::new(
@@ -1022,6 +1360,27 @@ async fn iteration_limit_gets_a_final_tool_free_model_response() {
         .await
         .unwrap();
 
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        provider.final_stream_started.acquire(),
+    )
+    .await
+    .expect("iteration-limit final report never started")
+    .unwrap()
+    .forget();
+    let rejected = tokio::time::timeout(
+        Duration::from_secs(2),
+        client
+            .post(format!("{base}/threads/{thread_id}/steer"))
+            .json(&serde_json::json!({"content": "race the final report"}))
+            .send(),
+    )
+    .await
+    .expect("steering raced into the unpolled final-report receiver")
+    .unwrap();
+    assert_eq!(rejected.status(), reqwest::StatusCode::CONFLICT);
+    provider.finish_final_stream.notify_one();
+
     let events = wait_for_event(
         &client,
         &format!("{base}/threads/{thread_id}/events"),
@@ -1056,6 +1415,7 @@ impl Provider for CompactingProvider {
             display_name: "Tiny".into(),
             context_window: 1000,
             supports_tools: true,
+            supports_images: false,
             input_price_per_mtok: None,
             output_price_per_mtok: None,
             options_schema: serde_json::json!({}),
@@ -1451,17 +1811,16 @@ async fn session_and_thread_updates_and_provider_config() {
     assert_eq!(kimi_code["base_url"], "https://api.kimi.com/coding/v1");
     // Policy invariant: we never ship OAuth presets that piggyback on
     // vendors' own CLI client registrations (account-ban risk). OAuth is
-    // manual-config only; subscriptions go through vendor CLIs instead.
+    // manual-config only; subscriptions use vendor-supported CLI or API-key
+    // surfaces instead.
     assert!(
         known.iter().all(|k| k["auth"] != "oauth"),
-        "no subscription presets in the shipped catalog"
+        "no shipped provider preset uses OAuth"
     );
-    // Subscription agent backends: auth lives in the vendor CLI.
-    for (id, kind) in [
-        ("codex", "codex-app-server"),
-        ("cursor", "cursor-cli"),
-        ("claude-code", "claude-cli"),
-    ] {
+    // Subscription agent backends use the vendor-supported authentication
+    // mechanism for their transport. Cursor's SDK takes an API key while
+    // Codex and Claude retain their CLI login flows.
+    for (id, kind) in [("codex", "codex-app-server"), ("claude-code", "claude-cli")] {
         let preset = known
             .iter()
             .find(|k| k["id"] == id)
@@ -1471,16 +1830,15 @@ async fn session_and_thread_updates_and_provider_config() {
         assert_eq!(preset["category"], "subscription");
         assert!(!preset["experimental"].as_bool().unwrap_or(false));
     }
-    // Cursor also ships a key-authenticated preset (usage-based billing)
-    // alongside the subscription one; same cursor-cli backend.
-    let cursor_api = known
+    let cursor = known
         .iter()
-        .find(|k| k["id"] == "cursor-api")
-        .expect("cursor-api preset");
-    assert_eq!(cursor_api["kind"], "cursor-cli");
-    assert_eq!(cursor_api["auth"], "api-key");
-    assert_eq!(cursor_api["category"], "api");
-    assert_eq!(cursor_api["api_key_env"], "CURSOR_API_KEY");
+        .find(|k| k["id"] == "cursor")
+        .expect("cursor preset");
+    assert_eq!(cursor["kind"], "cursor-sdk");
+    assert_eq!(cursor["auth"], "api-key");
+    assert_eq!(cursor["category"], "subscription");
+    assert_eq!(cursor["api_key_env"], "CURSOR_API_KEY");
+    assert!(known.iter().all(|k| k["id"] != "cursor-api"));
     assert!(known.iter().all(|k| k["id"] != "codex-api"));
 
     // Login endpoints exist but reject providers without manual OAuth config.
@@ -1951,9 +2309,19 @@ impl trouve_agents::AgentBackend for ConcurrentBackend {
             display_name: "Concurrent".into(),
             context_window: 100_000,
             supports_tools: true,
+            supports_images: false,
             input_price_per_mtok: None,
             output_price_per_mtok: None,
-            options_schema: serde_json::json!({"type": "object", "properties": {}}),
+            options_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "reasoning_effort": {
+                        "type": "string",
+                        "enum": ["low", "medium", "high"],
+                        "default": "medium"
+                    }
+                }
+            }),
         }]
     }
 
@@ -1999,6 +2367,7 @@ impl trouve_agents::AgentBackend for HandoffBackend {
             display_name: self.name.into(),
             context_window: 100_000,
             supports_tools: true,
+            supports_images: false,
             input_price_per_mtok: None,
             output_price_per_mtok: None,
             options_schema: serde_json::json!({"type": "object", "properties": {}}),
@@ -2131,11 +2500,7 @@ async fn code_turns_in_two_threads_of_one_session_enter_the_backend_concurrently
             |event| event["type"] == "turn.completed",
         )
         .await;
-        assert!(
-            events
-                .iter()
-                .any(|event| event["type"] == "turn.capacity_acquired")
-        );
+        assert!(events.iter().any(|event| event["type"] == "turn.admitted"));
     }
 }
 
@@ -2303,6 +2668,7 @@ async fn model_swap_hands_off_history_and_keeps_vendor_sessions() {
 /// backend capability, durable event ordering, and folded thread view.
 struct SteerableBackend {
     steers: std::sync::Mutex<Vec<(String, String, Vec<String>)>>,
+    model_discovery_gate: Arc<tokio::sync::Semaphore>,
     release: tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     tool_release: tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
@@ -2311,6 +2677,7 @@ impl SteerableBackend {
     fn new() -> Self {
         Self {
             steers: std::sync::Mutex::new(Vec::new()),
+            model_discovery_gate: Arc::new(tokio::sync::Semaphore::new(0)),
             release: tokio::sync::Mutex::new(None),
             tool_release: tokio::sync::Mutex::new(None),
         }
@@ -2339,10 +2706,20 @@ impl trouve_agents::AgentBackend for SteerableBackend {
             display_name: "Steerable Agent".into(),
             context_window: 100_000,
             supports_tools: true,
+            supports_images: false,
             input_price_per_mtok: None,
             output_price_per_mtok: None,
             options_schema: serde_json::json!({"type": "object", "properties": {}}),
         }]
+    }
+
+    async fn list_models(&self) -> Vec<trouve_protocol::ModelInfo> {
+        self.model_discovery_gate
+            .acquire()
+            .await
+            .expect("backend model discovery gate remains open")
+            .forget();
+        self.models()
     }
 
     fn status(&self) -> trouve_agents::BackendStatus {
@@ -2360,6 +2737,11 @@ impl trouve_agents::AgentBackend for SteerableBackend {
         &self,
         steer: trouve_agents::BackendSteer,
     ) -> Result<(), trouve_agents::BackendError> {
+        if steer.prompt == "Reject this steering command." {
+            return Err(trouve_agents::BackendError::Protocol(
+                "deterministic steering rejection".into(),
+            ));
+        }
         self.steers.lock().unwrap().push((
             steer.session,
             steer.prompt,
@@ -2552,6 +2934,11 @@ async fn active_backend_turn_can_be_steered_and_replays_on_its_timeline() {
         .await
         .unwrap();
     assert_eq!(started.status(), reqwest::StatusCode::ACCEPTED);
+    assert!(
+        engine.turn_accepts_steering(thread_id, 1),
+        "turn 1 steering receiver must be installed before backend startup completes"
+    );
+    backend.model_discovery_gate.add_permits(8);
     let before = wait_for_event(&client, &events_url, |event| {
         event["type"] == "assistant.thinking"
     })
@@ -2815,6 +3202,49 @@ async fn active_backend_turn_can_be_steered_and_replays_on_its_timeline() {
         assert_eq!(received[3].2.len(), 1);
         assert!(Path::new(&received[3].2[0]).exists());
     }
+
+    // A command-level backend rejection must fail only that HTTP request. It
+    // is neither durable guidance nor a reason to abort the active turn.
+    let started = client
+        .post(format!("{base}/threads/{thread_id}/messages"))
+        .json(&serde_json::json!({"content": "Keep running after a rejected steer."}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(started.status(), reqwest::StatusCode::ACCEPTED);
+    wait_for_event(&client, &events_url, |event| {
+        event["type"] == "assistant.thinking" && event["turn"] == 6
+    })
+    .await;
+    let rejected = client
+        .post(format!("{base}/threads/{thread_id}/steer"))
+        .json(&serde_json::json!({"content": "Reject this steering command."}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), reqwest::StatusCode::CONFLICT);
+    let accepted = client
+        .post(format!("{base}/threads/{thread_id}/steer"))
+        .json(&serde_json::json!({"content": "Accept this steering command."}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(accepted.status(), reqwest::StatusCode::ACCEPTED);
+    let events = wait_for_event(&client, &events_url, |event| {
+        event["type"] == "turn.completed" && event["turn"] == 6
+    })
+    .await;
+    assert!(!events.iter().any(|event| {
+        event["type"] == "turn.steered" && event["content"] == "Reject this steering command."
+    }));
+    assert!(events.iter().any(|event| {
+        event["type"] == "turn.steered" && event["content"] == "Accept this steering command."
+    }));
+    {
+        let received = backend.steers.lock().unwrap();
+        assert_eq!(received.len(), 5);
+        assert_eq!(received[4].1, "Accept this steering command.");
+    }
 }
 
 /// Scripted `AgentBackend`: every turn asks for approval of one "command",
@@ -2846,6 +3276,7 @@ impl trouve_agents::AgentBackend for ScriptedBackend {
             display_name: "Fake Agent".into(),
             context_window: 100_000,
             supports_tools: true,
+            supports_images: false,
             input_price_per_mtok: None,
             output_price_per_mtok: None,
             options_schema: serde_json::json!({"type": "object", "properties": {}}),
@@ -3346,6 +3777,7 @@ impl trouve_agents::AgentBackend for CancellationAckBackend {
             display_name: "Cancellation acknowledgement".into(),
             context_window: 100_000,
             supports_tools: true,
+            supports_images: false,
             input_price_per_mtok: None,
             output_price_per_mtok: None,
             options_schema: serde_json::json!({"type": "object", "properties": {}}),
@@ -4747,6 +5179,34 @@ impl Provider for FailingAutomationProvider {
         "automation-failure"
     }
 
+    fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
+        vec![trouve_protocol::ModelInfo {
+            id: "automation-failure/test".into(),
+            display_name: "Automation failure test".into(),
+            context_window: 100_000,
+            supports_tools: true,
+            supports_images: false,
+            input_price_per_mtok: None,
+            output_price_per_mtok: None,
+            options_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "reasoning_effort": {
+                        "type": "string",
+                        "enum": ["low", "medium", "high"],
+                        "default": "medium"
+                    },
+                    "fast": {"type": "boolean"},
+                    "temperature": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 1
+                    }
+                }
+            }),
+        }]
+    }
+
     async fn stream_chat(
         &self,
         _model: &str,
@@ -4796,6 +5256,7 @@ async fn automation_records_the_turn_outcome_not_just_dispatch() {
             "workspace_id": workspace["id"],
             "permission_mode": "yolo",
             "thinking_level": "high",
+            "model_options": {"fast": true, "temperature": 0.4},
             "schedule": {"kind": "daily", "time": "09:00"},
             "enabled": false
         }))
@@ -4807,7 +5268,19 @@ async fn automation_records_the_turn_outcome_not_just_dispatch() {
         .unwrap();
     assert_eq!(automation["permission_mode"], "yolo");
     assert_eq!(automation["thinking_level"], "high");
+    assert_eq!(automation["model_options"]["fast"], true);
     let automation_id = automation["id"].as_str().unwrap();
+    let enabled: serde_json::Value = client
+        .put(format!("{base}/automations/{automation_id}/enabled"))
+        .json(&serde_json::json!({"enabled": true}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(enabled["enabled"], true);
+    assert_eq!(enabled["model_options"]["fast"], true);
     let resp = client
         .post(format!("{base}/automations/{automation_id}/run"))
         .send()
@@ -4856,19 +5329,23 @@ async fn automation_records_the_turn_outcome_not_just_dispatch() {
         .unwrap();
     assert_eq!(threads.len(), 1);
     assert_eq!(threads[0]["permission_mode"], "yolo");
-    assert_eq!(threads[0]["model_options"]["thinking_level"], "high");
+    assert_eq!(threads[0]["model_options"]["reasoning_effort"], "high");
+    assert_eq!(threads[0]["model_options"]["fast"], true);
+    assert_eq!(threads[0]["model_options"]["temperature"], 0.4);
 }
 
-/// Session naming settings persist through the protocol, and missing model
-/// assets always degrade to the deterministic heuristic instead of blocking
-/// creation.
+/// Session naming settings persist the selected configured model and branch mode.
 #[tokio::test]
-async fn session_title_settings_and_fallback() {
+async fn session_naming_settings_persist_and_publish() {
     let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
     let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
     let config_file = tmp.path().join("config.toml");
     let engine = Arc::new(
         Engine::new(store, tmp.path().join("data"), &Config::default())
+            .with_provider("static", Arc::new(StaticModelProvider { id: "static" }))
             .with_config_dir(None)
             .with_config_file(Some(config_file.clone())),
     );
@@ -4881,77 +5358,27 @@ async fn session_title_settings_and_fallback() {
     let client = reqwest::Client::new();
 
     let response = client
-        .get(format!("{base}/config/git-worktrees"))
+        .put(format!("{base}/config/session-naming"))
+        .json(&serde_json::json!({
+            "model": "static/m",
+            "derive_branch_name_from_session_title": true
+        }))
         .send()
         .await
         .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
     assert!(
         response
             .headers()
             .contains_key(trouve_protocol::EVENT_CURSOR_HEADER)
     );
     let settings: serde_json::Value = response.json().await.unwrap();
-    assert_eq!(settings["derive_branch_name_from_session_title"], false);
-    assert_eq!(settings["title_model_load_behavior"], "auto");
-    assert_eq!(settings["title_model_resource_policy"], "cpu_ram_only");
-    assert_eq!(settings["title_model"]["state"], "not_installed");
-
-    let response = client
-        .put(format!("{base}/config/git-worktrees"))
-        .json(&serde_json::json!({
-            "derive_branch_name_from_session_title": true,
-            "title_model_load_behavior": "off",
-            "title_model_resource_policy": "gpu_cpu_ram"
-        }))
-        .send()
-        .await
-        .unwrap();
-    assert!(
-        response
-            .headers()
-            .contains_key(trouve_protocol::EVENT_CURSOR_HEADER)
-    );
-    let settings: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(settings["model"], "static/m");
     assert_eq!(settings["derive_branch_name_from_session_title"], true);
-    assert_eq!(settings["title_model_load_behavior"], "off");
-    assert_eq!(settings["title_model_resource_policy"], "gpu_cpu_ram");
 
-    // Requests from clients predating the additive branch-naming option must
-    // preserve an explicit opt-in rather than resetting it to the default.
-    let settings: serde_json::Value = client
-        .put(format!("{base}/config/git-worktrees"))
-        .json(&serde_json::json!({
-            "title_model_load_behavior": "off",
-            "title_model_resource_policy": "gpu_cpu_ram"
-        }))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(settings["derive_branch_name_from_session_title"], true);
-    let response = client
-        .delete(format!("{base}/config/git-worktrees/title-model/install"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
-    assert!(
-        std::fs::read_to_string(&config_file)
-            .unwrap()
-            .contains("title_model_load_behavior = \"off\"")
-    );
-    assert!(
-        std::fs::read_to_string(&config_file)
-            .unwrap()
-            .contains("title_model_resource_policy = \"gpu_cpu_ram\"")
-    );
-    assert!(
-        std::fs::read_to_string(&config_file)
-            .unwrap()
-            .contains("derive_branch_name_from_session_title = true")
-    );
+    let persisted = std::fs::read_to_string(&config_file).unwrap();
+    assert!(persisted.contains("session_naming_model = \"static/m\""));
+    assert!(persisted.contains("derive_branch_name_from_session_title = true"));
     assert!(
         engine
             .store()
@@ -4960,14 +5387,43 @@ async fn session_title_settings_and_fallback() {
             .iter()
             .any(|envelope| matches!(
                 envelope.event,
-                trouve_protocol::Event::GitWorktreeSettingsUpdated { .. }
+                trouve_protocol::Event::SessionNamingSettingsUpdated { .. }
             ))
     );
 
-    let title: serde_json::Value = client
-        .post(format!("{base}/session-title"))
+    let workspace: serde_json::Value = client
+        .post(format!("{base}/workspaces"))
+        .json(&serde_json::json!({ "path": repo }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let session: serde_json::Value = client
+        .post(format!("{base}/sessions"))
+        .json(&serde_json::json!({ "workspace_id": workspace["id"] }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(session["title"], "New Session");
+    let compact_branch = session["branch"].as_str().unwrap();
+    assert!(compact_branch.starts_with("trouve/"));
+    assert_eq!(compact_branch.matches('-').count(), 0);
+
+    let generated: serde_json::Value = client
+        .post(format!("{base}/title"))
         .json(&serde_json::json!({
-            "prompt": "When initially naming a new session, can the app create an intelligent summarized title based on the prompt instead of just using the prompt as-is?"
+            "session_id": session["id"],
+            "prompt": "What drives this review comment?",
+            "attachments": [{
+                "name": "review.png",
+                "mime": "image/png",
+                "data": "QUJD"
+            }]
         }))
         .send()
         .await
@@ -4975,10 +5431,270 @@ async fn session_title_settings_and_fallback() {
         .json()
         .await
         .unwrap();
-    assert_eq!(title["source"], "heuristic");
+    assert_eq!(generated["title"], "Explain Retry Classification");
+
+    let renamed: serde_json::Value = client
+        .patch(format!(
+            "{base}/sessions/{}",
+            session["id"].as_str().unwrap()
+        ))
+        .json(&serde_json::json!({
+            "title": generated["title"],
+            "expected_title": "New Session"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(renamed["title"], "Explain Retry Classification");
+    assert_ne!(renamed["branch"], compact_branch);
+    assert!(
+        renamed["branch"]
+            .as_str()
+            .unwrap()
+            .contains("explain-retry-classification")
+    );
+    let mut branch_command = Command::new("git");
+    branch_command
+        .arg("-C")
+        .arg(Path::new(renamed["worktree_path"].as_str().unwrap()))
+        .args(["branch", "--show-current"]);
+    let branch_output = trouve_process::output(&mut branch_command).unwrap();
+    assert!(branch_output.status.success());
     assert_eq!(
-        title["title"],
-        "Create intelligent summarized title from prompt"
+        String::from_utf8_lossy(&branch_output.stdout).trim(),
+        renamed["branch"].as_str().unwrap()
+    );
+
+    let thread: serde_json::Value = client
+        .post(format!("{base}/threads"))
+        .json(&serde_json::json!({ "session_id": session["id"] }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(thread["title"], "New Thread");
+    let thread_id = thread["id"].as_str().unwrap();
+    engine
+        .store()
+        .append_events(
+            trouve_protocol::Scope::Thread(thread_id.into()),
+            vec![
+                trouve_protocol::Event::UserMessage {
+                    turn: 1,
+                    content: "Make rename recovery transcript-aware".into(),
+                    attachments: Vec::new(),
+                    background: false,
+                },
+                trouve_protocol::Event::AssistantMessage {
+                    turn: 1,
+                    content: "Added a Generate button".into(),
+                },
+            ],
+        )
+        .unwrap();
+    let suggested: serde_json::Value = client
+        .post(format!(
+            "{base}/sessions/{}/title-suggestion",
+            session["id"].as_str().unwrap()
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(suggested["title"], "Improve Rename Recovery");
+    let thread_suggested: serde_json::Value = client
+        .post(format!("{base}/threads/{thread_id}/title-suggestion"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(thread_suggested["title"], "Improve Rename Recovery");
+    let conflict = client
+        .patch(format!("{base}/threads/{}", thread["id"].as_str().unwrap()))
+        .json(&serde_json::json!({
+            "title": "Late Generated Name",
+            "expected_title": "Already Renamed"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(conflict.status(), reqwest::StatusCode::CONFLICT);
+}
+
+/// Vendor backend that, like Codex, only accepts images as local files.
+/// Records what the naming turn's attachment looked like on disk while the
+/// turn was running.
+struct LocalImageBackend {
+    seen: std::sync::Mutex<Vec<(PathBuf, Vec<u8>)>>,
+}
+
+#[async_trait::async_trait]
+impl trouve_agents::AgentBackend for LocalImageBackend {
+    fn id(&self) -> &str {
+        "localimage"
+    }
+
+    fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
+        vec![trouve_protocol::ModelInfo {
+            id: "localimage/m".into(),
+            display_name: "Local image".into(),
+            context_window: 100_000,
+            supports_tools: true,
+            supports_images: true,
+            input_price_per_mtok: None,
+            output_price_per_mtok: None,
+            options_schema: serde_json::json!({"type": "object", "properties": {}}),
+        }]
+    }
+
+    fn status(&self) -> trouve_agents::BackendStatus {
+        trouve_agents::BackendStatus {
+            installed: true,
+            has_credentials: true,
+        }
+    }
+
+    fn requires_local_image_paths(&self) -> bool {
+        true
+    }
+
+    async fn start_login(
+        &self,
+    ) -> Result<trouve_agents::BackendLogin, trouve_agents::BackendError> {
+        Err(trouve_agents::BackendError::Auth("not needed".into()))
+    }
+
+    async fn run_turn(
+        &self,
+        turn: trouve_agents::BackendTurn,
+    ) -> Result<trouve_agents::BackendEventStream, trouve_agents::BackendError> {
+        assert!(turn.tool_free);
+        for attachment in &turn.attachments {
+            let path = attachment.local_path.clone().ok_or_else(|| {
+                trouve_agents::BackendError::Protocol(format!(
+                    "attachment {} has no engine-staged local image path",
+                    attachment.name
+                ))
+            })?;
+            let bytes = std::fs::read(&path)
+                .map_err(|error| trouve_agents::BackendError::Protocol(error.to_string()))?;
+            self.seen.lock().unwrap().push((path, bytes));
+        }
+        let events = vec![
+            Ok(trouve_agents::BackendEvent::TextDelta(
+                "Explain Broken Model Picker".into(),
+            )),
+            Ok(trouve_agents::BackendEvent::Completed {
+                usage: Usage::default(),
+            }),
+        ];
+        Ok(Box::pin(futures::stream::iter(events)))
+    }
+}
+
+/// Screenshots on a first prompt reach a path-only naming backend as
+/// temporary staged files that vanish once the title is produced.
+#[tokio::test]
+async fn naming_stages_images_for_path_only_backends() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    init_repo(&repo);
+    let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
+    let backend = Arc::new(LocalImageBackend {
+        seen: std::sync::Mutex::new(Vec::new()),
+    });
+    let data_dir = tmp.path().join("data");
+    let engine = Arc::new(
+        Engine::new(store, data_dir.clone(), &Config::default())
+            .with_backend("localimage", backend.clone())
+            .with_config_dir(None)
+            .with_config_file(Some(tmp.path().join("config.toml"))),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = trouve_server::build_router(engine.clone());
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let base = format!("http://{addr}/v1");
+    let client = reqwest::Client::new();
+
+    let response = client
+        .put(format!("{base}/config/session-naming"))
+        .json(&serde_json::json!({
+            "model": "localimage/m",
+            "derive_branch_name_from_session_title": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let workspace: serde_json::Value = client
+        .post(format!("{base}/workspaces"))
+        .json(&serde_json::json!({ "path": repo }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let session: serde_json::Value = client
+        .post(format!("{base}/sessions"))
+        .json(&serde_json::json!({ "workspace_id": workspace["id"] }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let response = client
+        .post(format!("{base}/title"))
+        .json(&serde_json::json!({
+            "session_id": session["id"],
+            "prompt": "Explain this screenshot showing a broken model picker.",
+            "attachments": [{
+                "name": "Screenshot 2026-09-06.PNG",
+                "mime": "image/png",
+                "data": "QUJD"
+            }]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let generated: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(generated["title"], "Explain Broken Model Picker");
+
+    let seen = backend.seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1);
+    let (path, bytes) = &seen[0];
+    assert_eq!(bytes, b"ABC");
+    assert_eq!(
+        path.parent(),
+        Some(data_dir.join("title-attachments").as_path())
+    );
+    assert_eq!(path.extension().and_then(|e| e.to_str()), Some("png"));
+    assert!(
+        !path.starts_with(data_dir.join("attachments")),
+        "staged image must not enter the durable attachment store"
+    );
+    assert!(
+        !path.starts_with(session["worktree_path"].as_str().unwrap()),
+        "staged image must not enter the session worktree"
+    );
+    assert!(
+        !path.exists(),
+        "staged image is removed once the title request completes"
     );
 }
 
@@ -5784,7 +6500,7 @@ async fn spawn_thread_child_agent_end_to_end() {
     let child = threads.iter().find(|t| t["id"] == child_id).unwrap();
     assert_eq!(child["spawned"], true, "{child}");
     assert_eq!(child["mode"], "code");
-    assert_eq!(child["title"], "Subagent: Child task compute answer");
+    assert_eq!(child["title"], "New Thread");
     let subagents: Vec<serde_json::Value> = client
         .get(format!("{base}/threads/{thread_id}/subagents"))
         .send()
@@ -6095,19 +6811,58 @@ impl Provider for StaticModelProvider {
             display_name: self.id.into(),
             context_window: 100_000,
             supports_tools: true,
+            supports_images: true,
             input_price_per_mtok: None,
             output_price_per_mtok: None,
-            options_schema: serde_json::json!({"type": "object", "properties": {}}),
+            options_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "reasoning_effort": {
+                        "type": "string",
+                        "enum": ["low", "medium", "high"],
+                        "default": "medium"
+                    }
+                }
+            }),
         }]
     }
 
     async fn stream_chat(
         &self,
         _model: &str,
-        _messages: &[Message],
+        messages: &[Message],
         _tools: &[ToolSpec],
-        _options: &serde_json::Map<String, serde_json::Value>,
+        options: &serde_json::Map<String, serde_json::Value>,
     ) -> Result<EventStream, ProviderError> {
+        if self.id == "static" {
+            assert_eq!(
+                options.get("reasoning_effort"),
+                Some(&serde_json::json!("low"))
+            );
+            let title = match &messages[1] {
+                Message::UserWithImages { content, images }
+                    if content == "What drives this review comment?"
+                        && images.len() == 1
+                        && images[0].mime == "image/png"
+                        && images[0].data == "QUJD" =>
+                {
+                    "Explain Retry Classification"
+                }
+                Message::User(content)
+                    if content.contains("User: Make rename recovery transcript-aware")
+                        && content.contains("Assistant outcome: Added a Generate button") =>
+                {
+                    "Improve Rename Recovery"
+                }
+                unexpected => panic!("unexpected naming prompt: {unexpected:?}"),
+            };
+            return Ok(Box::pin(futures::stream::iter(vec![
+                Ok(ProviderEvent::TextDelta(title.into())),
+                Ok(ProviderEvent::Completed {
+                    usage: trouve_protocol::Usage::default(),
+                }),
+            ])));
+        }
         Err(ProviderError::Request("catalog-only provider".into()))
     }
 }
@@ -6213,6 +6968,7 @@ async fn code_review_dashboard_and_repository_policy_round_trip() {
                 display_name: "Claude".into(),
                 context_window: 100_000,
                 supports_tools: true,
+                supports_images: false,
                 input_price_per_mtok: None,
                 output_price_per_mtok: None,
                 options_schema: serde_json::json!({
@@ -6484,6 +7240,7 @@ async fn code_review_job_overview_loads_task_content_separately() {
             repository: "acme/widgets".into(),
             pull_number: 42,
             pull_title: "Ship widgets".into(),
+            pull_body: String::new(),
             pull_url: "https://github.com/acme/widgets/pull/42".into(),
             head_sha: "2222222222222222222222222222222222222222".into(),
             review_base_sha: "1111111111111111111111111111111111111111".into(),
@@ -6496,6 +7253,11 @@ async fn code_review_job_overview_loads_task_content_separately() {
             coordinator_thinking_level: Some("medium".into()),
             router_model: Some("provider/router".into()),
             router_thinking_level: Some("low".into()),
+            analyst_model: None,
+            analyst_thinking_level: None,
+            coordinator_model_options: Default::default(),
+            router_model_options: Default::default(),
+            analyst_model_options: Default::default(),
             prompt: "Review it".into(),
             reviewers: Vec::new(),
             routing_mode: trouve_protocol::CodeReviewRoutingMode::Manual,

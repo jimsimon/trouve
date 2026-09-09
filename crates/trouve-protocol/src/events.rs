@@ -9,6 +9,35 @@ use utoipa::ToSchema;
 
 use crate::{CallId, CheckpointId, SessionId, ThreadId, WorkspaceId};
 
+fn deserialize_optional_f64<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<serde_json::Number>::deserialize(deserializer)?
+        .map(|number| {
+            number
+                .as_f64()
+                .filter(|value| value.is_finite())
+                .ok_or_else(|| {
+                    <D::Error as serde::de::Error>::custom("number is outside the finite f64 range")
+                })
+        })
+        .transpose()
+}
+
+fn serialize_optional_f64<S>(value: &Option<f64>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match value {
+        Some(value) if value.is_finite() => serializer.serialize_some(value),
+        Some(_) => Err(<S::Error as serde::ser::Error>::custom(
+            "number is outside the finite f64 range",
+        )),
+        None => serializer.serialize_none(),
+    }
+}
+
 /// Which stream an event belongs to. Cursors are monotonic per scope.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -181,7 +210,12 @@ pub struct Usage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_input_tokens: Option<u64>,
     /// Estimated cost in USD, when list pricing for the model is known.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_optional_f64",
+        deserialize_with = "deserialize_optional_f64"
+    )]
     pub cost_usd: Option<f64>,
     /// The model's context window as reported live by the provider during
     /// the turn. Authoritative over any static catalog value.
@@ -213,14 +247,19 @@ pub enum TurnPhase {
 #[serde(tag = "type")]
 pub enum Event {
     // --- thread scope -----------------------------------------------------
-    /// Shared/provider capacity has been acquired for this turn. Interactive
-    /// turns use the foreground lane; unattended review tasks use background.
+    /// Legacy admission marker written before protocol 7.24. New
+    /// servers retain this variant only to replay existing durable event logs.
     #[serde(rename = "turn.capacity_acquired")]
     TurnCapacityAcquired {
         turn: u64,
         wait_ms: u64,
         background: bool,
     },
+    /// Provider admission is complete for this turn. `provider_wait_ms` is
+    /// time spent waiting for a shared throttling cooldown; zero means the
+    /// turn was admitted immediately.
+    #[serde(rename = "turn.admitted")]
+    TurnAdmitted { turn: u64, provider_wait_ms: u64 },
     #[serde(rename = "turn.started")]
     TurnStarted {
         turn: u64,
@@ -267,7 +306,16 @@ pub enum Event {
         /// `GET /v1/attachments/{id}`).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         attachments: Vec<crate::Attachment>,
+        /// Legacy protocol 7.19–7.26 marker retained so existing durable logs
+        /// remain replayable. New servers emit `turn.background_activity`
+        /// instead and leave this false for user-authored messages.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        background: bool,
     },
+    /// The server attached a turn to vendor-autonomous agent activity. This is
+    /// deliberately distinct from `user.message`: no user authored a prompt.
+    #[serde(rename = "turn.background_activity")]
+    TurnBackgroundActivity { turn: u64 },
     /// Additional user input accepted by the backend while `turn` was still
     /// running. This belongs on the active turn's timeline and does not start
     /// or queue another turn.
@@ -307,16 +355,36 @@ pub enum Event {
     AssistantProgressCompleted { turn: u64 },
     /// Streamed model reasoning ("thinking") text, where the provider
     /// exposes it. Display-only: never part of the provider transcript.
+    /// The id is present for identity-aware streams whose reasoning may span
+    /// interleaved tool events; legacy persisted events omit it.
     #[serde(rename = "assistant.thinking")]
-    AssistantThinking { turn: u64, text: String },
+    AssistantThinking {
+        turn: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        text: String,
+    },
     /// The provider explicitly closed the current streamed thinking item.
     /// This boundary can arrive before the next visible assistant or tool
     /// event, so clients must not infer it from subsequent output alone.
     #[serde(rename = "assistant.thinking_completed")]
-    AssistantThinkingCompleted { turn: u64 },
+    AssistantThinkingCompleted {
+        turn: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+    },
     /// Folded final assistant text for the turn.
     #[serde(rename = "assistant.message")]
     AssistantMessage { turn: u64, content: String },
+    /// Durable files produced by the assistant or one of its tools. Bytes are
+    /// served through the same attachment endpoint as user uploads.
+    #[serde(rename = "assistant.artifacts")]
+    AssistantArtifacts {
+        turn: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_id: Option<CallId>,
+        attachments: Vec<crate::Attachment>,
+    },
 
     #[serde(rename = "tool.requested")]
     ToolRequested {
@@ -479,6 +547,17 @@ pub enum Event {
     },
     #[serde(rename = "session.pr_opened")]
     SessionPrOpened { number: u64, url: String },
+    /// Legacy association emitted when a pull request browser URL appeared in
+    /// session chat. Current servers retain this variant only to replay old
+    /// event logs; mentions no longer create session PR associations.
+    #[serde(rename = "session.pr_mentioned")]
+    SessionPrMentioned {
+        session_id: SessionId,
+        number: u64,
+        /// Canonical browser URL supplied by chat. A number without repository
+        /// identity is not globally unique and does not emit this event.
+        url: String,
+    },
     #[serde(rename = "session.deleted")]
     SessionDeleted {
         session_id: SessionId,
@@ -572,13 +651,16 @@ pub enum Event {
     /// state for initial fetches.
     #[serde(rename = "server.connectivity_changed")]
     ConnectivityChanged { online: bool },
-    /// The persisted session-naming settings or the session-title model's
-    /// install/load state changed. Carries a full replacement snapshot so
-    /// replay and reconnect reconstruct the settings UI exactly.
-    #[serde(rename = "settings.git_worktrees_updated")]
-    GitWorktreeSettingsUpdated {
-        settings: crate::GitWorktreeSettings,
+    /// The configured model used for asynchronous session and thread naming changed.
+    /// Carries a full replacement snapshot for replay and reconnect.
+    #[serde(rename = "settings.session_naming_updated")]
+    SessionNamingSettingsUpdated {
+        settings: crate::SessionNamingSettings,
     },
+    /// Legacy protocol 8.1-and-earlier naming lifecycle snapshot. Retained only
+    /// so existing durable event logs remain decodable after upgrading.
+    #[serde(rename = "settings.git_worktrees_updated")]
+    LegacyGitWorktreeSettingsUpdated { settings: serde_json::Value },
     /// The persisted automated code-review execution deadlines changed.
     /// Carries a full replacement snapshot for replay and reconnect.
     #[serde(rename = "settings.code_review_updated")]
@@ -694,34 +776,59 @@ mod tests {
     }
 
     #[test]
-    fn git_worktree_settings_event_uses_namespaced_tag() {
-        let event = Event::GitWorktreeSettingsUpdated {
-            settings: crate::GitWorktreeSettings {
+    fn session_pr_mentioned_roundtrips_with_canonical_url() {
+        let event = Event::SessionPrMentioned {
+            session_id: "se_1".into(),
+            number: 350,
+            url: "https://github.com/trouve-ai/trouve/pull/350".into(),
+        };
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value["type"], "session.pr_mentioned");
+        assert_eq!(value["session_id"], "se_1");
+        assert!(matches!(
+            serde_json::from_value::<Event>(value).unwrap(),
+            Event::SessionPrMentioned {
+                session_id,
+                number: 350,
+                url,
+            } if session_id == "se_1" && url.ends_with("/pull/350")
+        ));
+    }
+
+    #[test]
+    fn session_naming_settings_event_uses_namespaced_tag() {
+        let event = Event::SessionNamingSettingsUpdated {
+            settings: crate::SessionNamingSettings {
+                model: "openai/gpt-5-mini".into(),
                 derive_branch_name_from_session_title: false,
-                title_model_load_behavior: crate::TitleModelLoadBehavior::Off,
-                title_model_resource_policy: crate::TitleModelResourcePolicy::CpuRamOnly,
-                title_model: crate::TitleModelStatus {
-                    state: "stopped".into(),
-                    detail: "Built-in naming heuristics are active.".into(),
-                    runtime_installed: false,
-                    model_downloaded: false,
-                    install_stage: String::new(),
-                    install_bytes: 0,
-                    install_total: 0,
-                },
             },
         };
         let value = serde_json::to_value(event).unwrap();
-        assert_eq!(value["type"], "settings.git_worktrees_updated");
-        assert_eq!(
-            value["settings"]["derive_branch_name_from_session_title"],
-            false
-        );
-        assert_eq!(value["settings"]["title_model_load_behavior"], "off");
-        assert_eq!(
-            value["settings"]["title_model_resource_policy"],
-            "cpu_ram_only"
-        );
+        assert_eq!(value["type"], "settings.session_naming_updated");
+        assert_eq!(value["settings"]["model"], "openai/gpt-5-mini");
+    }
+
+    #[test]
+    fn legacy_git_worktree_settings_events_remain_decodable() {
+        let event: Event = serde_json::from_value(serde_json::json!({
+            "type": "settings.git_worktrees_updated",
+            "settings": {
+                "derive_branch_name_from_session_title": false,
+                "title_model_load_behavior": "auto",
+                "title_model_resource_policy": "cpu_ram_only",
+                "title_model": {
+                    "state": "ready",
+                    "runtime_installed": true,
+                    "model_downloaded": true
+                }
+            }
+        }))
+        .unwrap();
+        assert!(matches!(
+            event,
+            Event::LegacyGitWorktreeSettingsUpdated { settings }
+                if settings["title_model"]["state"] == "ready"
+        ));
     }
 
     #[test]
@@ -757,6 +864,63 @@ mod tests {
             event,
             Event::CodeReviewSettingsUpdated { settings }
                 if settings.max_parallel_reviews == 2
+        ));
+    }
+
+    #[test]
+    fn turn_admission_has_a_distinct_replay_compatible_contract() {
+        let value = serde_json::to_value(Event::TurnAdmitted {
+            turn: 3,
+            provider_wait_ms: 125,
+        })
+        .unwrap();
+        assert_eq!(value["type"], "turn.admitted");
+        assert_eq!(value["provider_wait_ms"], 125);
+        assert!(value.get("wait_ms").is_none());
+        assert!(value.get("background").is_none());
+
+        let legacy: Event = serde_json::from_value(serde_json::json!({
+            "type": "turn.capacity_acquired",
+            "turn": 3,
+            "wait_ms": 125,
+            "background": true
+        }))
+        .unwrap();
+        assert!(matches!(
+            legacy,
+            Event::TurnCapacityAcquired {
+                turn: 3,
+                wait_ms: 125,
+                background: true,
+            }
+        ));
+    }
+
+    #[test]
+    fn background_activity_has_a_distinct_replay_compatible_contract() {
+        let value = serde_json::to_value(Event::TurnBackgroundActivity { turn: 3 }).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "type": "turn.background_activity",
+                "turn": 3,
+            })
+        );
+
+        let legacy: Event = serde_json::from_value(serde_json::json!({
+            "type": "user.message",
+            "turn": 4,
+            "content": "[background agent activity]",
+            "background": true
+        }))
+        .unwrap();
+        assert!(matches!(
+            legacy,
+            Event::UserMessage {
+                turn: 4,
+                background: true,
+                ..
+            }
         ));
     }
 
@@ -805,6 +969,46 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn usage_cost_roundtrips_through_internally_tagged_events() {
+        let event = Event::TurnUsageUpdated {
+            turn: 1,
+            usage: Usage {
+                cost_usd: Some(0.000_02),
+                ..Usage::default()
+            },
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let decoded: Event = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            decoded,
+            Event::TurnUsageUpdated { usage, .. }
+                if usage.cost_usd == Some(0.000_02)
+        ));
+
+        assert!(
+            serde_json::from_str::<Event>(
+                r#"{
+            "type":"turn.usage_updated",
+            "turn":1,
+            "usage":{"input_tokens":0,"output_tokens":0,"cost_usd":1e400}
+        }"#
+            )
+            .is_err()
+        );
+
+        for cost_usd in [f64::INFINITY, f64::NAN] {
+            let invalid = Event::TurnUsageUpdated {
+                turn: 1,
+                usage: Usage {
+                    cost_usd: Some(cost_usd),
+                    ..Usage::default()
+                },
+            };
+            assert!(serde_json::to_string(&invalid).is_err());
+        }
     }
 
     #[test]
