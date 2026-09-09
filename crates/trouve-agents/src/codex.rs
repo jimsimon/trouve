@@ -593,7 +593,19 @@ fn codex_config_override(turn: &crate::BackendTurn) -> Value {
     if let Some(bridge) = &turn.mcp_bridge {
         // Streamable-HTTP server (`url` instead of `command` selects the
         // transport in codex's mcp_servers config shape).
-        servers.insert("trouve".into(), json!({ "url": bridge.url }));
+        //
+        // Trouve's bridge tools carry no MCP annotations, so Codex's default
+        // `auto` approval mode treats every call as a write that needs the
+        // user's consent. Full-bridge turns run with `approvalPolicy: never`,
+        // under which Codex denies such calls outright ("MCP tool call
+        // requires approval, but approval policy is never") instead of
+        // raising the elicitation trouve would auto-accept. Mark the server
+        // pre-approved: trouve's own permission layer already gates every
+        // bridged mutation inside the call.
+        servers.insert(
+            "trouve".into(),
+            json!({ "url": bridge.url, "default_tools_approval_mode": "approve" }),
+        );
     }
     let mut config = json!({ "show_raw_agent_reasoning": true });
     if !servers.is_empty() {
@@ -8197,6 +8209,10 @@ cat > /dev/null
             "http://127.0.0.1:1/internal/threads/th_1/mcp?tools=0&approval=0"
         );
         assert!(servers["trouve"]["command"].is_null());
+        // Codex must not gate bridged calls behind its own approval flow:
+        // full-bridge turns use `approvalPolicy: never`, which would deny them.
+        assert_eq!(servers["trouve"]["default_tools_approval_mode"], "approve");
+        assert!(servers["jira"]["default_tools_approval_mode"].is_null());
 
         // User servers alone (no bridge) still produce an override.
         turn.mcp_bridge = None;
