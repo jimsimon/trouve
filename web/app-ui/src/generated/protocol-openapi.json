@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "9.3"
+    "version": "9.4"
   },
   "paths": {
     "/v1/approvals": {
@@ -14056,10 +14056,11 @@
       },
       "TurnPhase": {
         "type": "string",
-        "description": "Current user-visible startup activity for a running turn.",
+        "description": "Current user-visible activity for a running turn.",
         "enum": [
           "processing",
-          "connecting_tools"
+          "connecting_tools",
+          "waiting_for_subagents"
         ]
       },
       "UpdateCodeReviewRepositoryRequest": {

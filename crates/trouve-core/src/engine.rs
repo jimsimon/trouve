@@ -2474,6 +2474,12 @@ struct PendingTurnSteerer {
     receiver: tokio::sync::mpsc::Receiver<SteerTurnCommand>,
     mutation_lane_state: tokio::sync::watch::Sender<SteerMutationLaneState>,
 }
+/// State carried into a follow-up vendor pass that runs inside the same
+/// trouve turn after awaited subagents finish.
+struct BackendTurnContinuation {
+    usage: Usage,
+}
+
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SteerMutationLaneState {
@@ -14603,16 +14609,30 @@ impl Engine {
     /// trips its shared token; the dispatcher publishes `turn.cancelled`
     /// after provider/tool cleanup acknowledges that no stale work can race
     /// a replacement turn. No-op error when the thread has no running turn.
+    ///
+    /// Cancellation cascades to every running agent-spawned descendant
+    /// (`spawn_thread` / `spawn_session`): those children run their own
+    /// dispatchers with their own tokens, so without this they would keep
+    /// working — and spending tokens — after the user stopped the parent.
+    /// Provider-native collaborators need no extra handling; the vendor
+    /// turn that owns them stops with the parent.
     pub fn cancel_turn(&self, thread_id: &str) -> Result<(), EngineError> {
-        match self.turn_cancels.lock().unwrap().get(thread_id) {
-            Some(token) => {
-                token.cancel();
-                Ok(())
-            }
-            None => Err(EngineError::BadRequest(format!(
+        // Store read before the token lock: `cancel_turn` must never nest
+        // the connection lock inside `turn_cancels`.
+        let descendants = self.store.spawned_descendants(thread_id)?;
+        let cancels = self.turn_cancels.lock().unwrap();
+        let Some(token) = cancels.get(thread_id) else {
+            return Err(EngineError::BadRequest(format!(
                 "no running turn to cancel on thread {thread_id}"
-            ))),
+            )));
+        };
+        token.cancel();
+        for descendant in &descendants {
+            if let Some(token) = cancels.get(&descendant.id) {
+                token.cancel();
+            }
         }
+        Ok(())
     }
 
     /// Arm the hard tool-call boundary before an automated-review turn is
@@ -14779,6 +14799,7 @@ impl Engine {
                     admission.provider_wait_ms,
                     turn_steer_rx,
                     turn_steer_mutation_lane_state,
+                    None,
                 )
                 .await;
         }
@@ -15156,11 +15177,24 @@ impl Engine {
                 .await?;
             }
             if tool_calls.is_empty() {
-                if !had_boundary_steers {
-                    hit_iteration_limit = false;
-                    break;
+                if had_boundary_steers {
+                    continue;
                 }
-                continue;
+                // The model is done, but agents it spawned may not be. Hold
+                // the turn until they finish and hand their results back as
+                // one more model pass so the answer covers their work.
+                if let Some(digest) = self
+                    .await_spawned_descendants(thread, turn, &cancel)
+                    .await?
+                {
+                    self.store.append_message(
+                        &thread.id,
+                        &serde_json::to_value(Message::User(digest))?,
+                    )?;
+                    continue;
+                }
+                hit_iteration_limit = false;
+                break;
             }
 
             // Providers may request independent calls in one response. Poll
@@ -16920,9 +16954,14 @@ impl Engine {
         provider_wait_ms: u64,
         mut steer_rx: Option<tokio::sync::mpsc::Receiver<SteerTurnCommand>>,
         steer_mutation_lane_state: tokio::sync::watch::Sender<SteerMutationLaneState>,
+        continuation: Option<BackendTurnContinuation>,
     ) -> Result<()> {
         let startup_started = Instant::now();
         let scope = Scope::Thread(thread.id.clone());
+        // A continuation is a second vendor pass inside the same trouve turn
+        // (results of awaited subagents fed back to the model). The turn was
+        // already admitted and its queued prompt consumed on the first pass.
+        let is_continuation = continuation.is_some();
         let mut model_options = self.store.thread_model_options(&thread.id)?;
         let model_catalog_started = Instant::now();
         let model_catalog = tokio::select! {
@@ -17006,7 +17045,7 @@ impl Engine {
             &thread.id,
             &serde_json::to_value(Message::User(content.clone()))?,
         )?;
-        if !self.store.finish_queued_prompt(queued_prompt_id)? {
+        if !is_continuation && !self.store.finish_queued_prompt(queued_prompt_id)? {
             bail!("queued prompt {queued_prompt_id} vanished before turn start");
         }
 
@@ -17065,7 +17104,7 @@ impl Engine {
             thread_id: thread.id.clone(),
             worktree: PathBuf::from(&session.worktree_path),
             session: vendor_session,
-            model: model_name,
+            model: model_name.clone(),
             model_options,
             prompt,
             attachments: turn_attachments,
@@ -17104,13 +17143,15 @@ impl Engine {
                 "agent startup timing: waited for backend startup lane"
             );
         }
-        self.publish_turn_admission(
-            thread,
-            turn,
-            automated_review,
-            provider_wait_ms.saturating_add(startup_wait_ms),
-        )
-        .await?;
+        if !is_continuation {
+            self.publish_turn_admission(
+                thread,
+                turn,
+                automated_review,
+                provider_wait_ms.saturating_add(startup_wait_ms),
+            )
+            .await?;
+        }
         let startup_activity = backend.startup_activity(&backend_turn).await;
         if matches!(
             startup_activity,
@@ -17161,7 +17202,9 @@ impl Engine {
         // instead of all text merging into one leading bubble.
         let mut text = String::new();
         let mut segment = String::new();
-        let mut usage_total = Usage::default();
+        let mut usage_total = continuation
+            .map(|continuation| continuation.usage)
+            .unwrap_or_default();
         // Vendor-native todo tools are reported as ordinary tool events.
         // Remember their names until completion so their result can update
         // the same persisted snapshot as trouve's bridged/native tool.
@@ -18211,6 +18254,51 @@ impl Engine {
             let seen_after = self.store.messages(&thread.id)?.len() as u64;
             self.store
                 .mark_backend_seen(&thread.id, backend_id, seen_after)?;
+        }
+        // The vendor is done, but agents this turn spawned may not be. Hold
+        // the turn until they finish, then run one more vendor pass on the
+        // resumed session with their results so the answer covers their
+        // work. Steering targets the vendor turn that just ended, so fail
+        // any late request closed rather than leave it queued behind the
+        // wait; the continuation runs without a steer receiver.
+        close_steer_receiver(&mut steer_rx);
+        let mut no_pending = None;
+        let mut deferred = Vec::new();
+        reject_steer_commands(
+            &mut steer_rx,
+            &mut no_pending,
+            &mut deferred,
+            "turn no longer accepts steering",
+        );
+        drop(steer_rx);
+        if tools_enabled
+            && let Some(digest) = self
+                .await_spawned_descendants(thread, turn, &cancel)
+                .await?
+        {
+            return Box::pin(self.run_backend_turn(
+                session,
+                thread,
+                turn,
+                mode,
+                backend_id,
+                backend,
+                model_name,
+                digest,
+                Vec::new(),
+                cancel,
+                queued_prompt_id,
+                tools_enabled,
+                attach_background,
+                provider_wait_ms,
+                None,
+                steer_mutation_lane_state,
+                Some(BackendTurnContinuation { usage: usage_total }),
+            ))
+            .await;
+        }
+        if cancel.is_cancelled() {
+            return Ok(());
         }
 
         // Vendor turns can contain several model calls. Their final usage is
@@ -19403,6 +19491,20 @@ impl Engine {
             .map_err(|e| anyhow!(e.to_string()))?;
         self.send_message_with_tools(&child.id, prompt.to_string(), Vec::new(), true, true)
             .map_err(|e| anyhow!(e.to_string()))?;
+        // The parent may have been cancelled while this call was creating
+        // the child; `cancel_turn` on the parent ran before the child's
+        // token existed and could not cascade to it. The child's token is
+        // registered synchronously by `send_message_with_tools`, so stop it
+        // here rather than leave an orphan working for nobody.
+        if cancel.is_cancelled() {
+            if let Err(error) = self.cancel_turn(&child.id) {
+                tracing::warn!(
+                    child_thread_id = %child.id,
+                    "could not cancel child spawned by a cancelled turn: {error}"
+                );
+            }
+            bail!("spawn cancelled; child {} was stopped", child.id);
+        }
 
         let mut result = serde_json::json!({
             "thread_id": child.id,
@@ -19489,6 +19591,159 @@ impl Engine {
             out["error"] = serde_json::json!(error);
         }
         Ok(out)
+    }
+
+    /// Hold a turn open until every agent it spawned has finished, then
+    /// return a digest of their results for the model to fold into its
+    /// answer. `spawn_thread` / `spawn_session` children run as independent
+    /// dispatchers; without this gate the parent's `turn.completed` could
+    /// land while they were still working, orphaning their output (and, for
+    /// `spawn_session` children, an unmerged branch nobody reads).
+    ///
+    /// Only direct children that are still running (themselves or through an
+    /// active descendant) when the model stops are awaited and reported.
+    /// Children that already finished had their chance to be collected with
+    /// `spawn_output`; repeating them here would double-report.
+    ///
+    /// The wait is rendered as a synthetic `await_subagents` tool call so the
+    /// rail shows what the turn is blocked on, and the turn phase flips to
+    /// `waiting_for_subagents` for the activity label. Returns `None` when
+    /// nothing was running or the turn was cancelled mid-wait; callers
+    /// already treat a tripped token as the end of the turn.
+    async fn await_spawned_descendants(
+        &self,
+        thread: &Thread,
+        turn: u64,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<Option<String>> {
+        let mut awaited = Vec::new();
+        for child_id in self.store.spawned_children(&thread.id)? {
+            if self.spawn_status(&child_id)?["status"] == "running" {
+                awaited.push(child_id);
+            }
+        }
+        if awaited.is_empty() || cancel.is_cancelled() {
+            return Ok(None);
+        }
+        let scope = Scope::Thread(thread.id.clone());
+        let call_id = format!(
+            "await-subagents-{turn}-{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        self.store.append_event(
+            scope.clone(),
+            Event::ToolRequested {
+                turn,
+                call_id: call_id.clone(),
+                tool: "await_subagents".into(),
+                args: serde_json::json!({ "thread_ids": awaited }),
+                requires_approval: false,
+            },
+        )?;
+        self.store.append_event(
+            scope.clone(),
+            Event::ToolStarted {
+                call_id: call_id.clone(),
+            },
+        )?;
+        self.store.append_event(
+            scope.clone(),
+            Event::TurnPhaseChanged {
+                turn,
+                phase: TurnPhase::WaitingForSubagents,
+            },
+        )?;
+        let started = Instant::now();
+        // Wait for the whole subtree, not just the awaited children: a
+        // child whose own turn returned still counts as running while one
+        // of its descendants is active, exactly as `spawn_output` reports.
+        let cancelled = loop {
+            let descendants = self.list_thread_descendants(&thread.id)?;
+            let any_active = {
+                let active = self.active_threads.lock().unwrap();
+                descendants
+                    .iter()
+                    .any(|descendant| active.contains_key(&descendant.id))
+            };
+            if !any_active {
+                break false;
+            }
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => break true,
+                _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
+            }
+        };
+        let execution_duration_ms =
+            Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
+        if cancelled {
+            self.store.append_event(
+                scope,
+                Event::ToolCompleted {
+                    call_id,
+                    status: ToolStatus::Aborted,
+                    result: serde_json::json!({ "error": "turn cancelled while waiting for subagents" }),
+                    execution_duration_ms,
+                },
+            )?;
+            return Ok(None);
+        }
+
+        let mut results = Vec::with_capacity(awaited.len());
+        let mut digest = format!(
+            "[Harness] This turn was held open until the {} subagent(s) it spawned finished. \
+             Their results:\n",
+            awaited.len()
+        );
+        for child_id in &awaited {
+            let status = self.spawn_status(child_id)?;
+            let title = self
+                .store
+                .thread(child_id)?
+                .and_then(|child| child.title)
+                .unwrap_or_default();
+            let heading = if title.is_empty() {
+                child_id.clone()
+            } else {
+                format!("{title} ({child_id})")
+            };
+            digest.push_str(&format!(
+                "\n### {heading} — {}\n",
+                status["status"].as_str().unwrap_or("unknown")
+            ));
+            if let Some(error) = status["error"].as_str() {
+                digest.push_str(&format!("Error: {error}\n"));
+            }
+            let last_message = status["last_message"].as_str().unwrap_or("").trim();
+            digest.push_str(if last_message.is_empty() {
+                "(no final message)\n"
+            } else {
+                last_message
+            });
+            digest.push('\n');
+            results.push(status);
+        }
+        digest.push_str(
+            "\nIncorporate these results and finish your response to the user. These subagents \
+             have already completed; do not wait for or poll them again.",
+        );
+        self.store.append_event(
+            scope.clone(),
+            Event::ToolCompleted {
+                call_id,
+                status: ToolStatus::Ok,
+                result: serde_json::json!({ "subagents": results }),
+                execution_duration_ms,
+            },
+        )?;
+        self.store.append_event(
+            scope,
+            Event::TurnPhaseChanged {
+                turn,
+                phase: TurnPhase::Processing,
+            },
+        )?;
+        Ok(Some(digest))
     }
 
     /// The engine-served `search_transcript` tool: recover details that
@@ -24688,6 +24943,333 @@ mod tests {
         .expect("spawn_output did not wake promptly on cancellation")
         .unwrap_err();
         assert!(result.to_string().contains("cancelled"));
+    }
+
+    #[test]
+    fn cancel_turn_cascades_to_running_spawned_descendants() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let workspace = Workspace {
+            id: "ws_cancel_cascade".into(),
+            name: "cancel cascade".into(),
+            path: temp.path().to_string_lossy().into_owned(),
+        };
+        let session = Session {
+            id: "se_cancel_cascade".into(),
+            workspace_id: workspace.id.clone(),
+            title: "cancel cascade".into(),
+            branch: "main".into(),
+            worktree_path: workspace.path.clone(),
+            base_ref: "main".into(),
+            archived: false,
+            active: false,
+            created_at: chrono::Utc::now(),
+        };
+        let parent = Thread {
+            id: "th_cascade_parent".into(),
+            session_id: session.id.clone(),
+            parent_thread_id: None,
+            title: None,
+            mode: "code".into(),
+            model: "provider/model".into(),
+            model_options: serde_json::Map::new(),
+            permission_mode: trouve_protocol::PermissionMode::Ask,
+            created_at: chrono::Utc::now(),
+            spawned: false,
+            todos: Vec::new(),
+        };
+        let child = Thread {
+            id: "th_cascade_child".into(),
+            parent_thread_id: Some(parent.id.clone()),
+            spawned: true,
+            ..parent.clone()
+        };
+        let grandchild = Thread {
+            id: "th_cascade_grandchild".into(),
+            parent_thread_id: Some(child.id.clone()),
+            ..child.clone()
+        };
+        // A sibling of the parent that is not part of its subtree.
+        let unrelated = Thread {
+            id: "th_cascade_unrelated".into(),
+            ..parent.clone()
+        };
+        store.insert_workspace(&workspace).unwrap();
+        store.insert_session(&session).unwrap();
+        store
+            .insert_thread(&parent, &serde_json::Map::new())
+            .unwrap();
+        store
+            .insert_thread(&unrelated, &serde_json::Map::new())
+            .unwrap();
+        store
+            .insert_spawned_thread(&child, &serde_json::Map::new(), &parent.id, "thread")
+            .unwrap();
+        store
+            .insert_spawned_thread(&grandchild, &serde_json::Map::new(), &child.id, "session")
+            .unwrap();
+        let engine = Arc::new(Engine::new(
+            store,
+            temp.path().join("data"),
+            &Config::default(),
+        ));
+        let parent_cancel = engine.register_cancel(&parent.id);
+        let child_cancel = engine.register_cancel(&child.id);
+        let grandchild_cancel = engine.register_cancel(&grandchild.id);
+        let unrelated_cancel = engine.register_cancel(&unrelated.id);
+
+        engine.cancel_turn(&parent.id).unwrap();
+
+        assert!(parent_cancel.is_cancelled());
+        assert!(child_cancel.is_cancelled(), "direct child keeps running");
+        assert!(
+            grandchild_cancel.is_cancelled(),
+            "nested spawn_session descendant keeps running"
+        );
+        assert!(
+            !unrelated_cancel.is_cancelled(),
+            "cancellation leaked outside the spawned subtree"
+        );
+
+        // Cancelling a child directly stays scoped to its own subtree and
+        // still errors when the child has no running turn.
+        engine.clear_cancel(&parent.id);
+        engine.clear_cancel(&child.id);
+        engine.clear_cancel(&grandchild.id);
+        let parent_cancel = engine.register_cancel(&parent.id);
+        let grandchild_cancel = engine.register_cancel(&grandchild.id);
+        assert!(matches!(
+            engine.cancel_turn(&child.id),
+            Err(EngineError::BadRequest(_))
+        ));
+        assert!(!grandchild_cancel.is_cancelled());
+        assert!(!parent_cancel.is_cancelled());
+    }
+
+    /// Parent + spawned child fixture for the turn-completion gate tests.
+    fn await_subagents_fixture(tag: &str) -> (Arc<Engine>, tempfile::TempDir, Thread, Thread) {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let workspace = Workspace {
+            id: format!("ws_await_{tag}"),
+            name: "await subagents".into(),
+            path: temp.path().to_string_lossy().into_owned(),
+        };
+        let session = Session {
+            id: format!("se_await_{tag}"),
+            workspace_id: workspace.id.clone(),
+            title: "await subagents".into(),
+            branch: "main".into(),
+            worktree_path: workspace.path.clone(),
+            base_ref: "main".into(),
+            archived: false,
+            active: false,
+            created_at: chrono::Utc::now(),
+        };
+        let parent = Thread {
+            id: format!("th_await_{tag}_parent"),
+            session_id: session.id.clone(),
+            parent_thread_id: None,
+            title: None,
+            mode: "code".into(),
+            model: "provider/model".into(),
+            model_options: serde_json::Map::new(),
+            permission_mode: trouve_protocol::PermissionMode::Ask,
+            created_at: chrono::Utc::now(),
+            spawned: false,
+            todos: Vec::new(),
+        };
+        let child = Thread {
+            id: format!("th_await_{tag}_child"),
+            parent_thread_id: Some(parent.id.clone()),
+            title: Some("Investigate flake".into()),
+            spawned: true,
+            ..parent.clone()
+        };
+        store.insert_workspace(&workspace).unwrap();
+        store.insert_session(&session).unwrap();
+        store
+            .insert_thread(&parent, &serde_json::Map::new())
+            .unwrap();
+        store
+            .insert_spawned_thread(&child, &serde_json::Map::new(), &parent.id, "thread")
+            .unwrap();
+        let engine = Arc::new(Engine::new(
+            store,
+            temp.path().join("data"),
+            &Config::default(),
+        ));
+        (engine, temp, parent, child)
+    }
+
+    fn parent_events(engine: &Engine, parent: &Thread) -> Vec<Event> {
+        engine
+            .store
+            .events_after(&Scope::Thread(parent.id.clone()), 0)
+            .unwrap()
+            .into_iter()
+            .map(|envelope| envelope.event)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn await_spawned_descendants_is_a_no_op_without_running_children() {
+        let (engine, _temp, parent, child) = await_subagents_fixture("idle");
+        // The child already finished: it had its chance to be collected via
+        // spawn_output, so the gate must not re-report it or emit any events.
+        engine
+            .store
+            .append_event(
+                Scope::Thread(child.id.clone()),
+                Event::TurnCompleted {
+                    turn: 1,
+                    checkpoint_id: None,
+                    usage: Usage::default(),
+                },
+            )
+            .unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+
+        let digest = engine
+            .await_spawned_descendants(&parent, 1, &cancel)
+            .await
+            .unwrap();
+
+        assert!(digest.is_none());
+        assert!(parent_events(&engine, &parent).is_empty());
+    }
+
+    #[tokio::test]
+    async fn await_spawned_descendants_holds_until_the_child_finishes() {
+        let (engine, _temp, parent, child) = await_subagents_fixture("wait");
+        engine
+            .active_threads
+            .lock()
+            .unwrap()
+            .insert(child.id.clone(), parent.session_id.clone());
+        let finisher = Arc::clone(&engine);
+        let child_id = child.id.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            finisher
+                .store
+                .append_events(
+                    Scope::Thread(child_id.clone()),
+                    vec![
+                        Event::AssistantMessage {
+                            turn: 1,
+                            content: "The flake is a timezone assumption.".into(),
+                        },
+                        Event::TurnCompleted {
+                            turn: 1,
+                            checkpoint_id: None,
+                            usage: Usage::default(),
+                        },
+                    ],
+                )
+                .unwrap();
+            finisher.active_threads.lock().unwrap().remove(&child_id);
+        });
+        let cancel = tokio_util::sync::CancellationToken::new();
+
+        let digest = tokio::time::timeout(
+            Duration::from_secs(5),
+            engine.await_spawned_descendants(&parent, 3, &cancel),
+        )
+        .await
+        .expect("gate did not release after the child finished")
+        .unwrap()
+        .expect("a running child must produce a digest");
+
+        assert!(digest.contains("Investigate flake"));
+        assert!(digest.contains(&child.id));
+        assert!(digest.contains("completed"));
+        assert!(digest.contains("The flake is a timezone assumption."));
+
+        let events = parent_events(&engine, &parent);
+        let call_id = match &events[0] {
+            Event::ToolRequested {
+                turn: 3,
+                call_id,
+                tool,
+                args,
+                requires_approval: false,
+            } => {
+                assert_eq!(tool, "await_subagents");
+                assert_eq!(args["thread_ids"], serde_json::json!([child.id]));
+                call_id.clone()
+            }
+            other => panic!("expected await_subagents ToolRequested, got {other:?}"),
+        };
+        assert!(matches!(&events[1], Event::ToolStarted { call_id: started } if *started == call_id));
+        assert!(matches!(
+            events[2],
+            Event::TurnPhaseChanged {
+                turn: 3,
+                phase: TurnPhase::WaitingForSubagents
+            }
+        ));
+        match &events[3] {
+            Event::ToolCompleted {
+                call_id: completed,
+                status: ToolStatus::Ok,
+                result,
+                ..
+            } => {
+                assert_eq!(*completed, call_id);
+                assert_eq!(result["subagents"][0]["status"], "completed");
+            }
+            other => panic!("expected Ok ToolCompleted, got {other:?}"),
+        }
+        assert!(matches!(
+            events[4],
+            Event::TurnPhaseChanged {
+                turn: 3,
+                phase: TurnPhase::Processing
+            }
+        ));
+        assert_eq!(events.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn await_spawned_descendants_aborts_on_cancellation() {
+        let (engine, _temp, parent, child) = await_subagents_fixture("cancel");
+        engine
+            .active_threads
+            .lock()
+            .unwrap()
+            .insert(child.id.clone(), parent.session_id.clone());
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            trigger.cancel();
+        });
+
+        let digest = tokio::time::timeout(
+            Duration::from_secs(5),
+            engine.await_spawned_descendants(&parent, 1, &cancel),
+        )
+        .await
+        .expect("gate did not wake promptly on cancellation")
+        .unwrap();
+
+        assert!(digest.is_none());
+        let events = parent_events(&engine, &parent);
+        assert!(matches!(
+            events.last(),
+            Some(Event::ToolCompleted {
+                status: ToolStatus::Aborted,
+                ..
+            })
+        ));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            Event::TurnPhaseChanged {
+                phase: TurnPhase::Processing,
+                ..
+            }
+        )));
     }
 
     #[test]

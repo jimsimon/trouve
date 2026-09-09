@@ -5074,10 +5074,10 @@ export interface components {
             turn: number;
         };
         /**
-         * @description Current user-visible startup activity for a running turn.
+         * @description Current user-visible activity for a running turn.
          * @enum {string}
          */
-        TurnPhase: "processing" | "connecting_tools";
+        TurnPhase: "processing" | "connecting_tools" | "waiting_for_subagents";
         UpdateCodeReviewRepositoryRequest: {
             analyst_model?: string | null;
             /**
