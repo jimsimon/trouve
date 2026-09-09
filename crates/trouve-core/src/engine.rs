@@ -67,7 +67,9 @@ const MAX_ITERATIONS: usize = 32;
 /// `MAX_ITERATIONS` instead, since each fold-in consumes an iteration.
 const MAX_SUBAGENT_CONTINUATIONS: usize = 4;
 /// Per-child cap on the final message copied into the `await_subagents`
-/// digest and tool result; the full text stays on the child thread.
+/// digest and tool result; the full text stays on the child thread. Only
+/// children still running when the model stops are awaited, so the whole
+/// digest is bounded by `MAX_ACTIVE_DESCENDANTS` times this cap.
 const SUBAGENT_DIGEST_MESSAGE_BYTES: usize = 8 * 1024;
 /// Bound native provider fan-out so a malformed or over-eager response cannot
 /// monopolize the runtime. Results are still written to the provider
