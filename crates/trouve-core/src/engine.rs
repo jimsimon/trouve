@@ -69,7 +69,8 @@ const MAX_SUBAGENT_CONTINUATIONS: usize = 4;
 /// Per-child cap on the final message copied into the `await_subagents`
 /// digest and tool result; the full text stays on the child thread.
 const SUBAGENT_DIGEST_MESSAGE_BYTES: usize = 8 * 1024;
-/// Whole-digest cap on child final messages across every awaited child.
+/// Whole-digest cap on child text (final messages and quoted failure
+/// reasons) across every awaited child.
 /// Once spent, later children are reported by status only, so a wide
 /// fan-out cannot turn the fold-in prompt into a context overflow.
 const SUBAGENT_DIGEST_TOTAL_BYTES: usize = 48 * 1024;
@@ -19755,6 +19756,7 @@ impl Engine {
                 // Vendor failures can carry whole stderr dumps; the tool
                 // result keeps the full text, the prompt digest a bounded cut.
                 let error = cap_chars(error, SUBAGENT_DIGEST_ERROR_BYTES);
+                message_bytes += error.len();
                 digest.push_str(&format!("Error: {error}\n"));
             }
             // Child answers are unbounded; keep the digest (which becomes
