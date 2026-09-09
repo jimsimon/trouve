@@ -16,6 +16,18 @@ worktree for this session. You interact with the workspace exclusively through t
 tools. Tool calls may require user approval; if a call is denied, respect the decision and \
 adapt. Be precise, verify your changes, and keep the user informed of what you are doing.";
 
+/// How the chat UI displays assistant text. Vendor harnesses describe their
+/// own surface (typically a terminal), so this is appended to vendor turns
+/// as well as to the native base prompt; without it models never reach for
+/// a diagram fence unprompted.
+pub const RENDERING_GUIDANCE: &str = "\
+## Output rendering
+
+Your replies are rendered as GitHub-flavored Markdown in a chat UI with \
+syntax-highlighted code blocks. Fenced ```mermaid blocks render as diagrams \
+(flowchart/graph, sequence, state, class, ER); use one when a structure or \
+flow is clearer drawn than described, and plain prose otherwise.";
+
 fn read_if_exists(path: &Path) -> Option<String> {
     let text = std::fs::read_to_string(path).ok()?;
     let trimmed = text.trim();
@@ -32,7 +44,11 @@ pub fn system_prompt(
     config_dir: Option<&Path>,
     workspace_root: &Path,
 ) -> String {
-    let mut sections = vec![BASE_PROMPT.to_string(), mode.system_prompt.clone()];
+    let mut sections = vec![
+        BASE_PROMPT.to_string(),
+        RENDERING_GUIDANCE.to_string(),
+        mode.system_prompt.clone(),
+    ];
 
     if let Some(dir) = config_dir
         && let Some(text) = read_if_exists(&dir.join("AGENTS.md"))
@@ -88,5 +104,6 @@ mod tests {
         std::fs::create_dir_all(&empty).unwrap();
         let prompt = system_prompt(&modes[0], None, &empty);
         assert!(prompt.contains("You are trouve"));
+        assert!(prompt.contains(RENDERING_GUIDANCE));
     }
 }

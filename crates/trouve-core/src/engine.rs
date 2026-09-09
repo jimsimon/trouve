@@ -769,6 +769,18 @@ fn append_vendor_search_guidance(
     instructions.push_str(crate::tools::VENDOR_SEARCH_GUIDANCE);
 }
 
+fn append_vendor_rendering_guidance(instructions: &mut String, automated_review: bool) {
+    // Review output lands in PR comments under the review persona's own
+    // formatting rules, not in the chat surface this guidance describes.
+    if automated_review {
+        return;
+    }
+    if !instructions.is_empty() {
+        instructions.push_str("\n\n");
+    }
+    instructions.push_str(crate::context::RENDERING_GUIDANCE);
+}
+
 fn vendor_tool_uses_automated_review_budget(
     tools_enabled: bool,
     tool: &str,
@@ -17029,6 +17041,7 @@ impl Engine {
         // (MCP instructions alone are too weak a signal). Automated review
         // instead keeps its evidence-first instruction floor.
         let mut instructions = mode.system_prompt.trim().to_string();
+        append_vendor_rendering_guidance(&mut instructions, automated_review);
         append_vendor_search_guidance(&mut instructions, mcp_bridge.is_some(), automated_review);
         let full_tool_bridge = mcp_bridge
             .as_ref()
@@ -23421,6 +23434,18 @@ mod tests {
         let mut no_bridge = "ordinary persona".to_string();
         append_vendor_search_guidance(&mut no_bridge, false, false);
         assert_eq!(no_bridge, "ordinary persona");
+    }
+
+    #[test]
+    fn vendor_turns_learn_the_chat_rendering_surface() {
+        let mut ordinary = "ordinary persona".to_string();
+        append_vendor_rendering_guidance(&mut ordinary, false);
+        assert!(ordinary.starts_with("ordinary persona\n\n"));
+        assert!(ordinary.contains(crate::context::RENDERING_GUIDANCE));
+
+        let mut review = "review persona".to_string();
+        append_vendor_rendering_guidance(&mut review, true);
+        assert_eq!(review, "review persona");
     }
 
     #[test]
