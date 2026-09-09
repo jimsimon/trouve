@@ -67,10 +67,12 @@ const MAX_ITERATIONS: usize = 32;
 /// `MAX_ITERATIONS` instead, since each fold-in consumes an iteration.
 const MAX_SUBAGENT_CONTINUATIONS: usize = 4;
 /// Per-child cap on the final message copied into the `await_subagents`
-/// digest and tool result; the full text stays on the child thread. Only
-/// children still running when the model stops are awaited, so the whole
-/// digest is bounded by `MAX_ACTIVE_DESCENDANTS` times this cap.
+/// digest and tool result; the full text stays on the child thread.
 const SUBAGENT_DIGEST_MESSAGE_BYTES: usize = 8 * 1024;
+/// Whole-digest cap on child final messages across every awaited child.
+/// Once spent, later children are reported by status only, so a wide
+/// fan-out cannot turn the fold-in prompt into a context overflow.
+const SUBAGENT_DIGEST_TOTAL_BYTES: usize = 48 * 1024;
 /// Bound native provider fan-out so a malformed or over-eager response cannot
 /// monopolize the runtime. Results are still written to the provider
 /// transcript in request order.
@@ -19729,6 +19731,7 @@ impl Engine {
              Their results:\n",
             awaited.len()
         );
+        let mut message_bytes = 0usize;
         for child_id in &awaited {
             let mut status = self.spawn_status(child_id)?;
             let title = self
@@ -19749,20 +19752,37 @@ impl Engine {
                 digest.push_str(&format!("Error: {error}\n"));
             }
             // Child answers are unbounded; keep the digest (which becomes
-            // prompt context) and the persisted tool result to a fixed
-            // per-child budget and point at the child thread for the rest.
+            // prompt context) and the persisted tool result within a fixed
+            // per-child and whole-digest budget, pointing at the child
+            // thread for whatever was left out.
             let last_message = status["last_message"].as_str().unwrap_or("").trim();
+            let remaining = SUBAGENT_DIGEST_TOTAL_BYTES.saturating_sub(message_bytes);
+            // The truncation marker counts against the budget too, so a run of
+            // capped messages cannot creep past the whole-digest ceiling.
+            let budget = SUBAGENT_DIGEST_MESSAGE_BYTES
+                .min(remaining)
+                .saturating_sub(CAP_CHARS_MARKER.len());
             if last_message.is_empty() {
                 digest.push_str("(no final message)\n");
-            } else if last_message.len() > SUBAGENT_DIGEST_MESSAGE_BYTES {
-                let capped = cap_chars(last_message, SUBAGENT_DIGEST_MESSAGE_BYTES);
+            } else if budget == 0 {
                 digest.push_str(&format!(
-                    "{capped}\n(final message truncated at {SUBAGENT_DIGEST_MESSAGE_BYTES} bytes; \
-                     read thread {child_id} with search_transcript for the rest)\n"
+                    "(final message omitted: the {SUBAGENT_DIGEST_TOTAL_BYTES}-byte digest \
+                     budget is spent; read thread {child_id} with search_transcript)\n"
+                ));
+                status["last_message"] = serde_json::json!("");
+                status["last_message_truncated"] = serde_json::json!(true);
+            } else if last_message.len() > budget {
+                let capped = cap_chars(last_message, budget);
+                debug_assert!(capped.len() <= budget + CAP_CHARS_MARKER.len());
+                message_bytes += capped.len();
+                digest.push_str(&format!(
+                    "{capped}\n(final message truncated at {budget} bytes; read thread \
+                     {child_id} with search_transcript for the rest)\n"
                 ));
                 status["last_message"] = serde_json::json!(capped);
                 status["last_message_truncated"] = serde_json::json!(true);
             } else {
+                message_bytes += last_message.len();
                 digest.push_str(last_message);
                 digest.push('\n');
             }
@@ -20284,13 +20304,17 @@ fn render_history_digest(messages: &[Message], resumed: bool) -> Option<String> 
     ))
 }
 
+/// Suffix `cap_chars` appends after a cut; callers that budget bytes must
+/// account for it.
+const CAP_CHARS_MARKER: &str = "… [truncated]";
+
 /// Truncate to at most `max` bytes on a char boundary, marking the cut.
 fn cap_chars(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_string();
     }
     let end = floor_char_boundary(s, max);
-    format!("{}… [truncated]", &s[..end])
+    format!("{}{CAP_CHARS_MARKER}", &s[..end])
 }
 
 /// Largest index `<= at` that lands on a char boundary.
@@ -25341,6 +25365,117 @@ mod tests {
         let reported = &result["subagents"][0];
         assert_eq!(reported["last_message_truncated"], true);
         assert!(reported["last_message"].as_str().unwrap().len() < long_message.len());
+    }
+
+    #[tokio::test]
+    async fn await_spawned_descendants_bounds_the_whole_digest() {
+        let (engine, _temp, parent, first_child) = await_subagents_fixture("total");
+        // Enough children at the per-child cap to overrun the whole-digest
+        // budget, so the later ones must be reported by status only.
+        let child_count = SUBAGENT_DIGEST_TOTAL_BYTES / SUBAGENT_DIGEST_MESSAGE_BYTES + 2;
+        let mut children = vec![first_child.clone()];
+        for index in 1..child_count {
+            let child = Thread {
+                id: format!("{}_{index}", first_child.id),
+                ..first_child.clone()
+            };
+            engine
+                .store
+                .insert_spawned_thread(&child, &serde_json::Map::new(), &parent.id, "thread")
+                .unwrap();
+            children.push(child);
+        }
+        let long_message = format!("{}END", "x".repeat(SUBAGENT_DIGEST_MESSAGE_BYTES * 2));
+        for child in &children {
+            engine
+                .active_threads
+                .lock()
+                .unwrap()
+                .insert(child.id.clone(), parent.session_id.clone());
+            engine
+                .store
+                .append_events(
+                    Scope::Thread(child.id.clone()),
+                    vec![
+                        Event::AssistantMessage {
+                            turn: 1,
+                            content: long_message.clone(),
+                        },
+                        Event::TurnCompleted {
+                            turn: 1,
+                            checkpoint_id: None,
+                            usage: Usage::default(),
+                        },
+                    ],
+                )
+                .unwrap();
+        }
+        let releaser = Arc::clone(&engine);
+        let child_ids: Vec<String> = children.iter().map(|child| child.id.clone()).collect();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let mut active = releaser.active_threads.lock().unwrap();
+            for child_id in &child_ids {
+                active.remove(child_id);
+            }
+        });
+        let cancel = tokio_util::sync::CancellationToken::new();
+
+        let digest = tokio::time::timeout(
+            Duration::from_secs(5),
+            engine.await_spawned_descendants(&parent, 1, &cancel),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+        assert!(!digest.contains("END"));
+        assert!(digest.contains("final message truncated"));
+        assert!(digest.contains("final message omitted"));
+        assert!(digest.contains("search_transcript"));
+        for child in &children {
+            assert!(digest.contains(&child.id), "digest names {}", child.id);
+        }
+        // The prose around each result is small; the message payload itself
+        // must stay inside the whole-digest budget.
+        assert!(
+            digest.len() < SUBAGENT_DIGEST_TOTAL_BYTES + child_count * 512,
+            "digest is {} bytes",
+            digest.len()
+        );
+        let events = parent_events(&engine, &parent);
+        let result = events
+            .iter()
+            .find_map(|event| match event {
+                Event::ToolCompleted { result, .. } => Some(result.clone()),
+                _ => None,
+            })
+            .expect("await_subagents tool result");
+        let reported = result["subagents"].as_array().unwrap();
+        assert_eq!(reported.len(), child_count);
+        let message_bytes: usize = reported
+            .iter()
+            .map(|entry| entry["last_message"].as_str().unwrap().len())
+            .sum();
+        assert!(message_bytes <= SUBAGENT_DIGEST_TOTAL_BYTES);
+        assert!(
+            reported
+                .iter()
+                .all(|entry| entry["last_message_truncated"] == true)
+        );
+        let omitted = reported
+            .iter()
+            .filter(|entry| entry["last_message"].as_str().unwrap().is_empty())
+            .count();
+        assert!(
+            omitted >= 1,
+            "at least one child must be reported by status only"
+        );
+        assert!(
+            omitted < child_count,
+            "the first children must still carry a capped message"
+        );
     }
 
     #[tokio::test]

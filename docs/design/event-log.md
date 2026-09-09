@@ -167,8 +167,11 @@ Thread scope:
   child's final status), flips the phase to `waiting_for_subagents`, and once
   the subtree is idle feeds the children's results back to the model in the
   same turn so its final answer covers their work. Each child's final message
-  is capped in the digest and tool result (the full text stays on the child
-  thread), and the number of fold-in passes per turn is bounded so a model that
+  is capped in the digest and tool result, and the digest as a whole has a
+  byte budget: once it is spent, later children are reported by status only
+  with `last_message_truncated: true` and a pointer to their thread (the full
+  text always stays on the child thread, reachable via `search_transcript`).
+  The number of fold-in passes per turn is bounded so a model that
   spawns again on every pass cannot hold the turn open indefinitely. Cancelling
   the parent cancels the running descendants and aborts the wait.
 - `user.message` `{turn, content}` — user-authored input only; the legacy
