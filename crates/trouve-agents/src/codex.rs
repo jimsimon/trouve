@@ -281,10 +281,9 @@ impl AgentBackend for CodexBackend {
     /// `model/list` when the catalog's TTL says it is stale. `models()`
     /// keeps reading the catalog, so this never sits on a request path.
     async fn refresh_model_roster(&self) -> Result<bool, BackendError> {
-        if !self.catalog.roster_needs_refresh(CODEX_CATALOG_PROVIDER) {
+        if !self.catalog.begin_roster_refresh(CODEX_CATALOG_PROVIDER) {
             return Ok(false);
         }
-        self.catalog.note_roster_attempt(CODEX_CATALOG_PROVIDER);
         let server = self.server().await?;
         let live = server.request("model/list", json!({})).await?;
         let seed = self.catalog.owned_provider_models(CODEX_CATALOG_PROVIDER);

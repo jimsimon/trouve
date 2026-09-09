@@ -264,7 +264,14 @@ export class TrouveNewThreadSetup extends LitElement {
   #catalog = emptyCatalog();
   #draft: NewThreadSetupDraft = createInitialNewThreadDraft(this.#catalog);
   #optionsLoading = false;
-  #catalogAvailable = true;
+
+  /** Read at render time: the app force-refreshes the catalog (and thus
+   * `catalogModels`) whenever the server announces a catalog change, so this
+   * never goes stale. */
+  #catalogAvailable(): boolean {
+    const signal = this.#services.value?.modelCatalog.catalogAvailable;
+    return signal === undefined ? true : readSignal(signal);
+  }
   #optionsError = "";
   #attachmentLoading = false;
   #attachmentError = "";
@@ -435,7 +442,7 @@ export class TrouveNewThreadSetup extends LitElement {
               placement="down"
               placeholder=${this.#optionsLoading
                 ? "Loading models…"
-                : this.#catalogAvailable
+                : this.#catalogAvailable()
                   ? "No model available"
                   : "Downloading model catalog…"}
               empty-label=""
@@ -586,7 +593,6 @@ export class TrouveNewThreadSetup extends LitElement {
       inheritedPermissionMode: undefined,
     };
     this.#subscriptionHealth = readSignal(services.subscriptionHealth.current);
-    this.#catalogAvailable = readSignal(services.modelCatalog.catalogAvailable);
     this.requestUpdate();
 
     // Subscription health only decorates model choices. Provider probes may

@@ -47,13 +47,21 @@ pub fn rebuild_codex_roster(
         if let Some(efforts) = live_reasoning_option(entry) {
             object.insert("reasoning_options".into(), Value::Array(vec![efforts]));
         }
+        // The speed tier is live-derived: a previous roster's `fast` must not
+        // outlive the vendor withdrawing it.
+        let mut options = object
+            .get("options")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        options.remove("fast");
         if let Some(fast) = live_fast_option(entry) {
-            let options = object
-                .entry("options")
-                .or_insert_with(|| Value::Object(Map::new()));
-            if let Some(options) = options.as_object_mut() {
-                options.insert("fast".into(), fast);
-            }
+            options.insert("fast".into(), fast);
+        }
+        if options.is_empty() {
+            object.remove("options");
+        } else {
+            object.insert("options".into(), Value::Object(options));
         }
         roster.insert(slug.to_string(), patch);
     }
@@ -179,7 +187,9 @@ mod tests {
 
     #[test]
     fn keeps_seed_extras_and_overrides_efforts_from_live() {
-        let live = json!({"data": [live_entry("gpt-5.6-sol", &["low", "high", "ultra"], "low")]});
+        let mut sol = live_entry("gpt-5.6-sol", &["low", "high", "ultra"], "low");
+        sol["additionalSpeedTiers"] = json!(["fast"]);
+        let live = json!({"data": [sol]});
         let roster = rebuild_codex_roster(&live, &seed(), |_| true).unwrap();
         let sol = &roster["gpt-5.6-sol"];
         assert_eq!(sol["base_model"], "openai/gpt-5.6-sol");
@@ -250,5 +260,23 @@ mod tests {
             json!({"type": "boolean", "default": false, "description": "2x speed, increased usage"})
         );
         assert!(roster["gpt-5.3-codex-spark"].get("options").is_none());
+    }
+
+    #[test]
+    fn withdrawn_fast_tier_is_dropped_on_the_next_rebuild() {
+        let mut with_fast = live_entry("gpt-5.6-luna", &["low"], "low");
+        with_fast["additionalSpeedTiers"] = json!(["fast"]);
+        let first = rebuild_codex_roster(&json!({"data": [with_fast]}), &BTreeMap::new(), |_| true)
+            .unwrap();
+        assert!(first["gpt-5.6-luna"]["options"].get("fast").is_some());
+
+        let without_fast = live_entry("gpt-5.6-luna", &["low"], "low");
+        let second =
+            rebuild_codex_roster(&json!({"data": [without_fast]}), &first, |_| true).unwrap();
+        assert!(
+            second["gpt-5.6-luna"].get("options").is_none(),
+            "the previous roster's fast option must not survive: {:?}",
+            second["gpt-5.6-luna"]
+        );
     }
 }

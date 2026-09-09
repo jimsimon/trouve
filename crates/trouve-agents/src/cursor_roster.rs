@@ -62,12 +62,11 @@ pub fn rebuild_cursor_roster(
         object.insert("reasoning_options".into(), Value::Array(Vec::new()));
         object.insert("temperature".into(), Value::Bool(false));
 
+        // Options are rebuilt from the live parameters alone: a seed or
+        // previous roster must not keep offering a parameter Cursor withdrew,
+        // since every option is forwarded to the agent verbatim.
         let defaults = default_params(item);
-        let mut options = object
-            .get("options")
-            .and_then(Value::as_object)
-            .cloned()
-            .unwrap_or_default();
+        let mut options = Map::new();
         for parameter in item
             .get("parameters")
             .and_then(Value::as_array)
@@ -79,7 +78,9 @@ pub fn rebuild_cursor_roster(
             };
             options.insert(key, schema);
         }
-        if !options.is_empty() {
+        if options.is_empty() {
+            object.remove("options");
+        } else {
             object.insert("options".into(), Value::Object(options));
         }
         if let Some(context) = defaults.get("context").and_then(|v| parse_token_count(v)) {
@@ -326,6 +327,29 @@ mod tests {
             roster["gemini-3.1-pro"]["base_model"], "google/gemini-3.1-pro-preview",
             "seed slug remaps are kept"
         );
+    }
+
+    #[test]
+    fn withdrawn_parameters_are_dropped_on_the_next_rebuild() {
+        let first =
+            rebuild_cursor_roster(&json!({"items": [sol()]}), &BTreeMap::new(), |_, _| false)
+                .unwrap();
+        assert!(first["gpt-5.6-sol"]["options"].get("fast").is_some());
+
+        let mut reduced = sol();
+        reduced["parameters"] = json!([
+            {"id": "reasoning", "values": [{"value": "low"}, {"value": "high"}]}
+        ]);
+        let second =
+            rebuild_cursor_roster(&json!({"items": [reduced]}), &first, |_, _| false).unwrap();
+        let options = second["gpt-5.6-sol"]["options"].as_object().unwrap();
+        assert_eq!(options.keys().collect::<Vec<_>>(), ["reasoning"]);
+
+        let mut bare = sol();
+        bare["parameters"] = json!([]);
+        let third =
+            rebuild_cursor_roster(&json!({"items": [bare]}), &second, |_, _| false).unwrap();
+        assert!(third["gpt-5.6-sol"].get("options").is_none());
     }
 
     #[test]

@@ -9444,7 +9444,7 @@
           },
           {
             "type": "object",
-            "description": "The public model catalog (models.dev) became available or was lost.\nNothing is bundled, so until the first successful download only local\nand vendor-only models exist and provider setup presets are limited to\ntrouve's own integrations; clients show a \"downloading\" state instead\nof \"no models\" and refetch `/v1/models` on recovery.\n`ServerInfo.catalog_available` carries the same state for initial\nfetches.",
+            "description": "The server-side model catalog changed: the public catalog\n(models.dev) became available or was lost, or a vendor-backed roster\n(Codex, Cursor) was rebuilt in the background. Nothing is bundled, so\nuntil the first successful download only local and vendor-only models\nexist and provider setup presets are limited to trouve's own\nintegrations; clients show a \"downloading\" state instead of \"no\nmodels\" while `available` is false and refetch `/v1/models` on every\n`available: true` event. `ServerInfo.catalog_available` carries the\navailability for initial fetches.",
             "required": [
               "available",
               "type"

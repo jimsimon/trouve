@@ -460,8 +460,32 @@ impl ModelsDevCatalog {
     }
 
     /// Same TTL and retry backoff as the models.dev refresh, tracked per
-    /// overlay provider. Callers should `note_roster_attempt` before doing
-    /// the (possibly slow or failing) live lookup.
+    /// overlay provider. When a refresh is due this also records the attempt
+    /// under the same lock, so overlapping triggers admit exactly one live
+    /// lookup per retry window.
+    pub fn begin_roster_refresh(&self, provider: &str) -> bool {
+        let mut state = self.state.write().unwrap();
+        let roster = state
+            .rosters
+            .entry(canonical_provider_id(provider).to_string())
+            .or_default();
+        if roster
+            .last_attempt
+            .is_some_and(|attempt| attempt.elapsed() < RETRY_TTL)
+        {
+            return false;
+        }
+        if roster
+            .fetched_at
+            .is_some_and(|at| unix_now().saturating_sub(at) < CATALOG_TTL.as_secs())
+        {
+            return false;
+        }
+        roster.last_attempt = Some(Instant::now());
+        true
+    }
+
+    /// Whether `begin_roster_refresh` would admit a refresh (status, tests).
     pub fn roster_needs_refresh(&self, provider: &str) -> bool {
         let state = self.state.read().unwrap();
         let Some(roster) = state.rosters.get(canonical_provider_id(provider)) else {
@@ -476,15 +500,6 @@ impl ModelsDevCatalog {
         !roster
             .fetched_at
             .is_some_and(|at| unix_now().saturating_sub(at) < CATALOG_TTL.as_secs())
-    }
-
-    pub fn note_roster_attempt(&self, provider: &str) {
-        let mut state = self.state.write().unwrap();
-        state
-            .rosters
-            .entry(canonical_provider_id(provider).to_string())
-            .or_default()
-            .last_attempt = Some(Instant::now());
     }
 
     /// Replace a provider's roster in memory and on disk. An empty roster is
@@ -705,23 +720,26 @@ impl ModelsDevCatalog {
 }
 
 /// Write `bytes` to `path` via a same-directory temp file and rename so a
-/// crash never leaves a truncated cache behind.
+/// crash never leaves a truncated cache behind. Every call gets its own
+/// temp file, so concurrent writers of one destination cannot clobber each
+/// other mid-write; the last rename wins. `rename` replaces an existing
+/// destination on every supported platform (Windows uses
+/// MOVEFILE_REPLACE_EXISTING), so the last-known-good file is never absent.
 async fn write_json_atomically(path: &Path, bytes: Vec<u8>) -> Result<()> {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent)
             .await
             .with_context(|| format!("creating {}", parent.display()))?;
     }
-    let temp = path.with_extension(format!("json.tmp-{}", std::process::id()));
+    let temp = path.with_extension(format!(
+        "json.tmp-{}-{}",
+        std::process::id(),
+        SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     tokio::fs::write(&temp, bytes)
         .await
         .with_context(|| format!("writing {}", temp.display()))?;
-    #[cfg(windows)]
-    if tokio::fs::try_exists(path).await.unwrap_or(false) {
-        tokio::fs::remove_file(path)
-            .await
-            .with_context(|| format!("replacing {}", path.display()))?;
-    }
     if let Err(error) = tokio::fs::rename(&temp, path).await {
         let _ = tokio::fs::remove_file(&temp).await;
         return Err(error).with_context(|| format!("replacing {}", path.display()));
@@ -1960,7 +1978,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let catalog = ModelsDevCatalog::fixture_for_data_dir(dir.path());
         assert!(catalog.roster_needs_refresh("openai-codex"));
-        catalog.note_roster_attempt("openai-codex");
+        assert!(catalog.begin_roster_refresh("openai-codex"));
+        assert!(
+            !catalog.begin_roster_refresh("openai-codex"),
+            "overlapping triggers admit one refresh per retry window"
+        );
         assert!(
             !catalog.roster_needs_refresh("openai-codex"),
             "retry backoff suppresses immediate re-attempts"
@@ -1994,6 +2016,36 @@ mod tests {
         let reloaded = ModelsDevCatalog::fixture_for_data_dir(dir.path());
         assert_eq!(codex_ids(&reloaded), ["codex/gpt-5.6-luna"]);
         assert!(!reloaded.roster_needs_refresh("openai-codex"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_roster_writes_never_corrupt_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = std::sync::Arc::new(ModelsDevCatalog::fixture_for_data_dir(dir.path()));
+        let writes = (0..8).map(|index| {
+            let catalog = catalog.clone();
+            tokio::spawn(async move {
+                let mut models = BTreeMap::new();
+                models.insert(
+                    format!("model-{index}"),
+                    json!({"name": format!("Model {index}"), "tool_call": true}),
+                );
+                catalog.replace_roster("openai-codex", models).await
+            })
+        });
+        for write in writes {
+            write.await.unwrap().unwrap();
+        }
+        // Whichever write won, the file is complete and matches a full roster.
+        let path = dir.path().join("rosters").join("openai-codex.json");
+        let file: RosterFile = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(file.models.len(), 1);
+        assert!(
+            std::fs::read_dir(dir.path().join("rosters"))
+                .unwrap()
+                .all(|entry| entry.unwrap().file_name() == "openai-codex.json"),
+            "no temp files are left behind"
+        );
     }
 
     #[test]

@@ -1,6 +1,7 @@
 # 0055 — Downloaded model catalog and vendor-refreshed rosters
 
-Status: Accepted (2026-09). Amends ADR 0016 and ADR 0020.
+Status: Accepted (2026-09). Amends ADR 0016 and ADR 0020; scoped amendment
+to ADR 0050 (see below).
 
 ## Context
 
@@ -52,6 +53,12 @@ or pricing.
   ids and defaults are authoritative for option schemas: Cursor parameters
   become option properties under their own ids, Codex efforts and speed tiers
   become `reasoning_effort` and `fast`.
+- **Cursor's roster lookup uses its own short-lived Bridge.** ADR 0050 keeps
+  one shared warm Bridge per backend for turns; that remains. The
+  `SdkCursorService/ListModels` call needs no agent or workspace, runs at
+  most once per TTL, and must never wait on or be waited on by a turn, so it
+  starts a separate Bridge process and shuts it down when done rather than
+  entering the pool's turn admission.
 - **The trouve overlay only fills gaps.** Seed entries survive a refresh as
   per-model patches and carry only what vendors and models.dev cannot report:
   Codex-specific context limits, slug remaps to models.dev records, image

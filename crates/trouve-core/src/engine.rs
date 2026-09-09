@@ -4743,10 +4743,20 @@ impl Engine {
             })
             .cloned()
             .collect();
+        let store = self.store.clone();
         for backend in ready {
+            let store = store.clone();
             tokio::spawn(async move {
                 match backend.refresh_model_roster().await {
-                    Ok(true) => tracing::info!(backend = backend.id(), "model roster refreshed"),
+                    Ok(true) => {
+                        tracing::info!(backend = backend.id(), "model roster refreshed");
+                        // The roster was replaced after any in-flight model
+                        // listing answered; tell clients to fetch again.
+                        let _ = store.append_event(
+                            Scope::Server,
+                            Event::ModelCatalogChanged { available: true },
+                        );
+                    }
                     Ok(false) => {}
                     Err(error) => tracing::debug!(
                         backend = backend.id(),

@@ -112,8 +112,6 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const REAP_INTERVAL: Duration = Duration::from_secs(60);
 /// Trouve-owned catalog provider whose roster this backend refreshes.
 const CURSOR_CATALOG_PROVIDER: &str = "cursor";
-/// Upper bound for a roster refresh: Bridge startup plus one cloud RPC.
-const ROSTER_REFRESH_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub struct CursorBackend {
     id: String,
@@ -190,7 +188,8 @@ impl CursorBackend {
     /// Ask Cursor Cloud for the account's model list through a short-lived
     /// Bridge process. `SdkCursorService` needs no agent or workspace, so
     /// this bypasses the turn pool: it runs once per catalog TTL and must
-    /// never wait on, or be waited on by, a turn.
+    /// never wait on, or be waited on by, a turn. Startup and the RPC carry
+    /// their own deadlines, and the process is reaped on every exit path.
     async fn list_models_via_bridge(&self, api_key: &str) -> Result<Value, BackendError> {
         let state_dir = self.state_root.join("roster");
         create_private_dir(&state_dir)?;
@@ -207,23 +206,27 @@ impl CursorBackend {
             cancel: &cancel,
             events: &events,
         };
-        let result = tokio::time::timeout(ROSTER_REFRESH_TIMEOUT, async {
-            let mut bridge = BridgeProcess::start(&request, &callback, &closing).await?;
-            let models = bridge
-                .client
-                .unary(
-                    "SdkCursorService",
-                    "ListModels",
-                    json!({ "options": { "apiKey": api_key } }),
-                )
-                .await;
-            if let Err(error) = bridge.shutdown().await {
-                tracing::debug!("Cursor SDK Bridge roster process shutdown failed: {error}");
+        // `BridgeProcess::start` reaps the child itself on every failure,
+        // including its startup timeout; once it has returned, `shutdown` is
+        // the single reaping path and runs after the RPC regardless of
+        // outcome (`unary` enforces the RPC deadline).
+        let result = match BridgeProcess::start(&request, &callback, &closing).await {
+            Ok(mut bridge) => {
+                let models = bridge
+                    .client
+                    .unary(
+                        "SdkCursorService",
+                        "ListModels",
+                        json!({ "options": { "apiKey": api_key } }),
+                    )
+                    .await;
+                if let Err(error) = bridge.shutdown().await {
+                    tracing::debug!("Cursor SDK Bridge roster process shutdown failed: {error}");
+                }
+                models
             }
-            models
-        })
-        .await
-        .unwrap_or_else(|_| Err(BackendError::Protocol("Cursor ListModels timed out".into())));
+            Err(error) => Err(error),
+        };
         if let Err(error) = callback.stop().await {
             tracing::debug!("Cursor callback router shutdown failed: {error}");
         }
@@ -394,15 +397,15 @@ impl AgentBackend for CursorBackend {
     /// Rebuild the persisted `cursor` roster from `ListModels` when the
     /// catalog's TTL says it is stale. `models()` keeps reading the catalog.
     async fn refresh_model_roster(&self) -> Result<bool, BackendError> {
-        if self.legacy_cli_migration_required
-            || !self.catalog.roster_needs_refresh(CURSOR_CATALOG_PROVIDER)
-        {
+        if self.legacy_cli_migration_required {
             return Ok(false);
         }
         let Some(api_key) = self.effective_api_key() else {
             return Ok(false);
         };
-        self.catalog.note_roster_attempt(CURSOR_CATALOG_PROVIDER);
+        if !self.catalog.begin_roster_refresh(CURSOR_CATALOG_PROVIDER) {
+            return Ok(false);
+        }
         let live = self.list_models_via_bridge(&api_key).await?;
         let seed = self.catalog.owned_provider_models(CURSOR_CATALOG_PROVIDER);
         let roster =

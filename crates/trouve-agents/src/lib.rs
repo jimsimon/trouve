@@ -725,6 +725,14 @@ impl AgentBackend for RetirementAwareBackend {
     }
 
     async fn refresh_model_roster(&self) -> Result<bool, BackendError> {
+        // A roster refresh may spawn a vendor process, so it counts as
+        // activity: retirement drains it before destructive shutdown and
+        // refuses new refreshes on a backend being replaced.
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let _activity = match self.activity.enter(self.id(), cancel) {
+            Ok(guard) => guard,
+            Err(_) => return Ok(false),
+        };
         self.inner.refresh_model_roster().await
     }
 
