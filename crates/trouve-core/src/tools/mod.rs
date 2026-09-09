@@ -1765,7 +1765,7 @@ impl LocalToolExecutor {
         // Both search tools share one index cache (indexes are expensive to
         // build, cheap to re-validate, and identical across tools).
         let search_cache = search::shared_cache();
-        // The three shell tools share one background-job registry.
+        // The shell tools share one background-job registry.
         let jobs = Arc::new(shell::JobRegistry::default());
         let tools: Vec<Arc<dyn Tool>> = vec![
             Arc::new(fs::ReadFile),
@@ -1780,6 +1780,7 @@ impl LocalToolExecutor {
             Arc::new(glob::Glob),
             Arc::new(shell::Shell::new(jobs.clone())),
             Arc::new(shell::ShellOutput { jobs: jobs.clone() }),
+            Arc::new(shell::WriteStdin { jobs: jobs.clone() }),
             Arc::new(shell::ShellKill { jobs: jobs.clone() }),
             Arc::new(grep::Grep),
             Arc::new(web::WebFetch),

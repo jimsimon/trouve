@@ -32,3 +32,24 @@ permission layer.
   documented, opt-in, and visually flagged in clients.
 - Because every side effect already passes through `ToolExecutor`, adding a
   sandboxed executor later is additive, not a refactor.
+
+## Amendment (2026-09): read-only shell commands are reads
+
+The `shell` tool is classified as mutating because arbitrary shell text can
+do anything. Applied literally, that made `git log` or `rg` prompt on every
+call in `ask` mode and denied them outright in read-only personas, while the
+same reads were free through `read_file` and `grep`, and it pushed vendor
+backends toward their own unsandboxed shells for quiet reads.
+
+`crate::command_safety::shell_command_is_read_only` recognises a small fixed
+vocabulary of read-only commands (file readers and text filters, `find`
+without `-exec`/`-delete`, a `git` query subset, toolchain version probes),
+joined only by `|`, `&&`, `||`, and `;`. A recognised command is gated as a
+read: no prompt in `ask`, allowed in read-only personas, shared execution
+lane. Everything else keeps the mutating classification. The classifier fails
+closed: substitution, redirection, background jobs, escapes, expansion, flags
+that write or execute, and any path that is absolute, `~`-relative, or
+contains `..` all reject, because a read-only persona must not become a way
+to read outside the worktree without a prompt. The same classification
+applies to vendor-native shell approvals that carry the command text
+(Claude's `Bash`).
