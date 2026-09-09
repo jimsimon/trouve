@@ -1333,6 +1333,11 @@ function JobDetailPane({
         {finding.origin && finding.origin !== "new_change" ? ` · ${finding.origin.replaceAll("_", " ").toUpperCase()}` : ""}
       </small>
       <p>{finding.body}</p>
+      {finding.status === "open" && finding.carried_verdict && finding.carried_verdict.reason && (
+        <small>
+          Still open at {finding.carried_verdict.head_sha.slice(0, 12)} (review {finding.carried_verdict.job_id.slice(0, 12)}): {finding.carried_verdict.reason}
+        </small>
+      )}
       {finding.resolved_head && finding.status !== "advisory" && (
         <small>
           Fixed at {finding.resolved_head.slice(0, 12)} by review {finding.resolved_by_job_id?.slice(0, 12) || "unknown"}

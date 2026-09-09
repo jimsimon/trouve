@@ -267,11 +267,26 @@ Resolved entries move into a collapsed **Resolved as won't-fix** disclosure,
 where struck-through issue text, an explicit disposition, and an `unresolve`
 command distinguish that decision from a code fix. Findings fixed in code
 leave the list automatically on the next review round, and the bot resolves
-their inline GitHub threads with an explanatory reply. Thread resolution
+their inline GitHub threads with an explanatory reply. Findings that share a
+root cause are published under one inline comment; that shared thread is only
+resolved once every finding grouped under it is closed, so a fixed primary
+never hides a still-open sibling. Thread resolution
 retries with backoff; a thread that stays open shows its last failure on the
 finding in the dashboard and the stats page counts failing and abandoned
 entries, the usual cause being a missing **Contents: Read and write**
 permission.
+
+Blocking findings from earlier rounds that a later round leaves open are never
+silent. The final editor records a verdict for each one — `fixed`, which is
+verified like any other resolution, or `still_open` with a reason naming what
+the reviewed revision still exhibits (for example, what a partial fix left
+uncovered). The reason is published in the review body under **Still open
+from earlier rounds** together with the finding's location and a link to its
+original comment, is appended to the finding's row in the lifecycle comment's
+threadless list, names the finding in the Check Run summary, is shown on the
+finding in the dashboard, and is handed to the next round's final editor as
+`previous_round_verdict` so it can judge whether the new revision addressed
+exactly that gap.
 
 Later reviews receive bounded pull-request history: unresolved and dismissed
 findings, root-cause themes and recurrence evidence, prior candidate

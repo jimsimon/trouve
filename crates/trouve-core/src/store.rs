@@ -513,6 +513,8 @@ CREATE TABLE IF NOT EXISTS code_review_findings (
   collapse_next_attempt_at TEXT,
   collapse_error TEXT NOT NULL DEFAULT '',
   publication_resolution_job_id TEXT,
+  carried_verdict_job_id TEXT NOT NULL DEFAULT '',
+  carried_verdict_reason TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL
 );
 -- The partial index on collapse_pending lives in MIGRATIONS only: SCHEMA
@@ -1063,6 +1065,12 @@ const MIGRATIONS: &[&str] = &[
        ADD COLUMN router_model_options TEXT NOT NULL DEFAULT '{}'",
     "ALTER TABLE code_review_jobs
        ADD COLUMN analyst_model_options TEXT NOT NULL DEFAULT '{}'",
+    // The latest later round's reason for leaving a carried finding open,
+    // so the pull request can say why a fix attempt did not count.
+    "ALTER TABLE code_review_findings
+       ADD COLUMN carried_verdict_job_id TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE code_review_findings
+       ADD COLUMN carried_verdict_reason TEXT NOT NULL DEFAULT ''",
 ];
 
 /// Severity/confidence half of the blocking tier for one findings row: high
@@ -3571,6 +3579,54 @@ fn finalize_code_review_theme_publication(
 /// for below-bar severity/confidence, or an open blocking-level finding
 /// whose scope verdict this change could not be tied to) are tracked
 /// separately as durable debt.
+/// Whether the `code_review_findings` row being updated is the primary of a
+/// shared root-cause comment under which another finding, published only
+/// through that comment, is still open. Collapsing the primary's thread
+/// would hide that unresolved sibling, so the thread stays open until the
+/// last grouped finding closes.
+const OPEN_GROUPED_SIBLING_PREDICATE: &str = "EXISTS (
+       SELECT 1 FROM code_review_publication_manifest AS grouped
+       JOIN code_review_findings AS sibling ON sibling.id = grouped.finding_id
+       WHERE grouped.primary_finding_id = code_review_findings.id
+         AND grouped.finding_id != code_review_findings.id
+         AND sibling.status = 'open'
+     )";
+
+/// Arms the collapse of every closed grouped primary comment whose last open
+/// sibling just closed. The primary's own close deliberately left its thread
+/// open (see [`OPEN_GROUPED_SIBLING_PREDICATE`]); once no grouped finding
+/// remains open the shared thread can finally be resolved.
+/// `closed_sibling_predicate` selects the siblings that just closed, using
+/// the `sibling` alias and the single bound parameter.
+fn rearm_grouped_primary_collapses(
+    conn: &rusqlite::Connection,
+    closed_sibling_predicate: &str,
+    param: &str,
+) -> Result<()> {
+    conn.execute(
+        &format!(
+            "UPDATE code_review_findings
+             SET collapse_pending = 1, collapse_attempts = 0,
+                 collapse_terminal_attempts = 0, collapse_next_attempt_at = NULL,
+                 collapse_error = ''
+             WHERE status IN ('fixed', 'dismissed') AND github_comment_id IS NOT NULL
+               AND collapse_pending = 0
+               AND id IN (
+                 SELECT grouped.primary_finding_id
+                 FROM code_review_publication_manifest AS grouped
+                 JOIN code_review_findings AS sibling ON sibling.id = grouped.finding_id
+                 WHERE grouped.primary_finding_id != grouped.finding_id
+                   AND sibling.status IN ('fixed', 'dismissed')
+                   AND {closed_sibling_predicate}
+               )
+               AND NOT {open_sibling}",
+            open_sibling = OPEN_GROUPED_SIBLING_PREDICATE,
+        ),
+        params![param],
+    )?;
+    Ok(())
+}
+
 fn record_code_review_open_issue_count(tx: &rusqlite::Transaction<'_>, job_id: &str) -> Result<()> {
     tx.execute(
         &format!(
@@ -3700,6 +3756,23 @@ fn code_review_thread_collapse_from_row(
         attempts: attempts.max(0) as u64,
         next_attempt_at: next_attempt_at.filter(|_| pending),
         last_error,
+    }))
+}
+
+/// Reads the `carried_verdict_job_id`, its job's head, and
+/// `carried_verdict_reason` columns selected consecutively from `index`.
+fn code_review_carried_verdict_from_row(
+    row: &rusqlite::Row<'_>,
+    index: usize,
+) -> rusqlite::Result<Option<trouve_protocol::CodeReviewCarriedVerdict>> {
+    let job_id: String = row.get(index)?;
+    if job_id.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(trouve_protocol::CodeReviewCarriedVerdict {
+        job_id,
+        head_sha: row.get::<_, Option<String>>(index + 1)?.unwrap_or_default(),
+        reason: row.get(index + 2)?,
     }))
 }
 
@@ -12382,31 +12455,37 @@ impl Store {
         resolved_head: &str,
         resolved_by_job_id: &str,
     ) -> Result<bool> {
-        Ok(self.conn.lock().unwrap().execute(
-            "UPDATE code_review_findings
-             SET status = ?2, resolved_at = ?3,
-                 resolved_head = ?4, resolved_by_job_id = ?5,
-                 collapse_attempts = CASE
-                     WHEN github_comment_id IS NOT NULL THEN 0
-                     ELSE collapse_attempts
-                 END,
-                 collapse_terminal_attempts = CASE
-                     WHEN github_comment_id IS NOT NULL THEN 0
-                     ELSE collapse_terminal_attempts
-                 END,
-                 collapse_next_attempt_at = CASE
-                     WHEN github_comment_id IS NOT NULL THEN NULL
-                     ELSE collapse_next_attempt_at
-                 END,
-                 collapse_error = CASE
-                     WHEN github_comment_id IS NOT NULL THEN ''
-                     ELSE collapse_error
-                 END,
-                 collapse_pending = CASE
-                     WHEN github_comment_id IS NOT NULL THEN 1
-                     ELSE 0
-                 END
-             WHERE id = ?1 AND status = 'open'",
+        let conn = self.conn.lock().unwrap();
+        let tx = write_transaction(&conn)?;
+        let updated = tx.execute(
+            &format!(
+                "UPDATE code_review_findings
+                 SET status = ?2, resolved_at = ?3,
+                     resolved_head = ?4, resolved_by_job_id = ?5,
+                     carried_verdict_job_id = '', carried_verdict_reason = '',
+                     collapse_attempts = CASE
+                         WHEN github_comment_id IS NOT NULL THEN 0
+                         ELSE collapse_attempts
+                     END,
+                     collapse_terminal_attempts = CASE
+                         WHEN github_comment_id IS NOT NULL THEN 0
+                         ELSE collapse_terminal_attempts
+                     END,
+                     collapse_next_attempt_at = CASE
+                         WHEN github_comment_id IS NOT NULL THEN NULL
+                         ELSE collapse_next_attempt_at
+                     END,
+                     collapse_error = CASE
+                         WHEN github_comment_id IS NOT NULL THEN ''
+                         ELSE collapse_error
+                     END,
+                     collapse_pending = CASE
+                         WHEN github_comment_id IS NOT NULL AND NOT {open_sibling} THEN 1
+                         ELSE 0
+                     END
+                 WHERE id = ?1 AND status = 'open'",
+                open_sibling = OPEN_GROUPED_SIBLING_PREDICATE,
+            ),
             params![
                 id,
                 status,
@@ -12414,7 +12493,37 @@ impl Store {
                 resolved_head,
                 resolved_by_job_id
             ],
-        )? > 0)
+        )?;
+        if updated > 0 {
+            rearm_grouped_primary_collapses(&tx, "sibling.id = ?1", id)?;
+        }
+        tx.commit()?;
+        Ok(updated > 0)
+    }
+
+    /// Records the latest round's reason for leaving each carried finding
+    /// open. Only open rows are touched: a finding the same round resolved
+    /// keeps its resolution instead of a stale verdict.
+    pub fn record_code_review_carried_verdicts(
+        &self,
+        job_id: &str,
+        verdicts: &[(&str, &str)],
+    ) -> Result<()> {
+        if verdicts.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn.lock().unwrap();
+        let tx = write_transaction(&conn)?;
+        for (finding_id, reason) in verdicts {
+            tx.execute(
+                "UPDATE code_review_findings
+                 SET carried_verdict_job_id = ?2, carried_verdict_reason = ?3
+                 WHERE id = ?1 AND status = 'open'",
+                params![finding_id, job_id, reason],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Marks a finding's thread collapse as done, records the successfully
@@ -12662,6 +12771,7 @@ impl Store {
                         resolved_by_job_id: row.get(23)?,
                         outside_diff: row.get(24)?,
                         thread_collapse: code_review_thread_collapse_from_row(row, 25)?,
+                        carried_verdict: None,
                     },
                 ))
             })?
@@ -12694,7 +12804,10 @@ impl Store {
                         github_comment_url, github_publication_status,
                         github_thread_id, resolved_at,
                         (SELECT head_sha FROM code_review_jobs WHERE id = code_review_findings.job_id),
-                        resolved_head, resolved_by_job_id, outside_diff, collapse_pending, collapse_attempts, collapse_next_attempt_at, collapse_error
+                        resolved_head, resolved_by_job_id, outside_diff, collapse_pending, collapse_attempts, collapse_next_attempt_at, collapse_error,
+                        carried_verdict_job_id,
+                        (SELECT head_sha FROM code_review_jobs WHERE id = code_review_findings.carried_verdict_job_id),
+                        carried_verdict_reason
                  FROM code_review_findings
                  WHERE job_id = ?1{status_filter} ORDER BY path, line, id"
             ))?;
@@ -12731,6 +12844,7 @@ impl Store {
                     resolved_by_job_id: row.get(20)?,
                     outside_diff: row.get(21)?,
                     thread_collapse: code_review_thread_collapse_from_row(row, 22)?,
+                    carried_verdict: code_review_carried_verdict_from_row(row, 26)?,
                 })
             })?
             .collect::<rusqlite::Result<_>>()?
@@ -12975,7 +13089,10 @@ impl Store {
                         f.prompt_for_agents, f.status, f.github_comment_id,
                         f.github_comment_url, f.github_publication_status,
                         f.github_thread_id, f.resolved_at, j.head_sha,
-                        f.resolved_head, f.resolved_by_job_id, f.outside_diff, f.collapse_pending, f.collapse_attempts, f.collapse_next_attempt_at, f.collapse_error
+                        f.resolved_head, f.resolved_by_job_id, f.outside_diff, f.collapse_pending, f.collapse_attempts, f.collapse_next_attempt_at, f.collapse_error,
+                        f.carried_verdict_job_id,
+                        (SELECT head_sha FROM code_review_jobs WHERE id = f.carried_verdict_job_id),
+                        f.carried_verdict_reason
                  FROM code_review_findings f
                  JOIN code_review_jobs j ON j.id = f.job_id
                  WHERE j.repository = ?1 AND j.pull_number = ?2
@@ -13011,6 +13128,7 @@ impl Store {
                     resolved_by_job_id: row.get(20)?,
                     outside_diff: row.get(21)?,
                     thread_collapse: code_review_thread_collapse_from_row(row, 22)?,
+                    carried_verdict: code_review_carried_verdict_from_row(row, 26)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?
@@ -13098,7 +13216,10 @@ impl Store {
                         f.github_thread_resolved, f.github_thread_generation,
                         f.github_thread_recheck_pending, f.evidence, f.origin,
                         j.head_sha, f.resolved_head, f.resolved_by_job_id,
-                        f.outside_diff, f.collapse_pending, f.collapse_attempts, f.collapse_next_attempt_at, f.collapse_error
+                        f.outside_diff, f.collapse_pending, f.collapse_attempts, f.collapse_next_attempt_at, f.collapse_error,
+                        f.carried_verdict_job_id,
+                        (SELECT head_sha FROM code_review_jobs WHERE id = f.carried_verdict_job_id),
+                        f.carried_verdict_reason
                  FROM code_review_findings f
                  JOIN code_review_jobs j ON j.id = f.job_id
                  WHERE j.repository = ?1 AND j.pull_number = ?2
@@ -13137,6 +13258,7 @@ impl Store {
                         resolved_by_job_id: row.get(23)?,
                         outside_diff: row.get(24)?,
                         thread_collapse: code_review_thread_collapse_from_row(row, 25)?,
+                        carried_verdict: code_review_carried_verdict_from_row(row, 29)?,
                     },
                     is_resolved: row.get(16)?,
                     generation: row.get::<_, i64>(17)? as u64,
@@ -13792,7 +13914,9 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(&format!(
             "SELECT f.id, f.path, f.line, f.severity, f.confidence, f.title, f.body,
-                    f.status
+                    f.status, f.carried_verdict_job_id,
+                    (SELECT head_sha FROM code_review_jobs WHERE id = f.carried_verdict_job_id),
+                    f.carried_verdict_reason
              FROM code_review_findings f
              JOIN code_review_jobs j ON j.id = f.job_id
              WHERE j.repository = ?1 AND j.pull_number = ?2
@@ -13833,6 +13957,7 @@ impl Store {
                     resolved_by_job_id: String::new(),
                     outside_diff: true,
                     thread_collapse: None,
+                    carried_verdict: code_review_carried_verdict_from_row(row, 8)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -15754,32 +15879,36 @@ impl Store {
         )?;
         let fixed = if current_publication {
             tx.execute(
-                "UPDATE code_review_findings
-                 SET status = 'fixed', resolved_at = ?2,
-                     resolved_head = (SELECT head_sha FROM code_review_jobs WHERE id = ?1),
-                     resolved_by_job_id = ?1,
-                     publication_resolution_job_id = NULL,
-                     collapse_attempts = CASE
-                         WHEN github_comment_id IS NOT NULL THEN 0
-                         ELSE collapse_attempts
-                     END,
-                     collapse_terminal_attempts = CASE
-                         WHEN github_comment_id IS NOT NULL THEN 0
-                         ELSE collapse_terminal_attempts
-                     END,
-                     collapse_next_attempt_at = CASE
-                         WHEN github_comment_id IS NOT NULL THEN NULL
-                         ELSE collapse_next_attempt_at
-                     END,
-                     collapse_error = CASE
-                         WHEN github_comment_id IS NOT NULL THEN ''
-                         ELSE collapse_error
-                     END,
-                     collapse_pending = CASE
-                         WHEN github_comment_id IS NOT NULL THEN 1
-                         ELSE 0
-                     END
-                 WHERE publication_resolution_job_id = ?1 AND status = 'open'",
+                &format!(
+                    "UPDATE code_review_findings
+                     SET status = 'fixed', resolved_at = ?2,
+                         resolved_head = (SELECT head_sha FROM code_review_jobs WHERE id = ?1),
+                         resolved_by_job_id = ?1,
+                         publication_resolution_job_id = NULL,
+                         carried_verdict_job_id = '', carried_verdict_reason = '',
+                         collapse_attempts = CASE
+                             WHEN github_comment_id IS NOT NULL THEN 0
+                             ELSE collapse_attempts
+                         END,
+                         collapse_terminal_attempts = CASE
+                             WHEN github_comment_id IS NOT NULL THEN 0
+                             ELSE collapse_terminal_attempts
+                         END,
+                         collapse_next_attempt_at = CASE
+                             WHEN github_comment_id IS NOT NULL THEN NULL
+                             ELSE collapse_next_attempt_at
+                         END,
+                         collapse_error = CASE
+                             WHEN github_comment_id IS NOT NULL THEN ''
+                             ELSE collapse_error
+                         END,
+                         collapse_pending = CASE
+                             WHEN github_comment_id IS NOT NULL AND NOT {open_sibling} THEN 1
+                             ELSE 0
+                         END
+                     WHERE publication_resolution_job_id = ?1 AND status = 'open'",
+                    open_sibling = OPEN_GROUPED_SIBLING_PREDICATE,
+                ),
                 params![id, published_at],
             )?
         } else {
@@ -15790,6 +15919,7 @@ impl Store {
                 "UPDATE code_review_jobs SET fixed_issue_count = ?2 WHERE id = ?1",
                 params![id, fixed as i64],
             )?;
+            rearm_grouped_primary_collapses(&tx, "sibling.resolved_by_job_id = ?1", id)?;
         }
         let (repository, pull_number, head_sha): (String, i64, String) = tx.query_row(
             "SELECT repository, pull_number, head_sha FROM code_review_jobs WHERE id = ?1",
@@ -16231,37 +16361,44 @@ impl Store {
         }
         let fixed = if current_publication {
             tx.execute(
-                "UPDATE code_review_findings
-                 SET status = 'fixed', resolved_at = ?2,
-                     resolved_head = (SELECT head_sha FROM code_review_jobs WHERE id = ?1),
-                     resolved_by_job_id = ?1,
-                     publication_resolution_job_id = NULL,
-                     collapse_attempts = CASE
-                         WHEN github_comment_id IS NOT NULL THEN 0
-                         ELSE collapse_attempts
-                     END,
-                     collapse_terminal_attempts = CASE
-                         WHEN github_comment_id IS NOT NULL THEN 0
-                         ELSE collapse_terminal_attempts
-                     END,
-                     collapse_next_attempt_at = CASE
-                         WHEN github_comment_id IS NOT NULL THEN NULL
-                         ELSE collapse_next_attempt_at
-                     END,
-                     collapse_error = CASE
-                         WHEN github_comment_id IS NOT NULL THEN ''
-                         ELSE collapse_error
-                     END,
-                     collapse_pending = CASE
-                         WHEN github_comment_id IS NOT NULL THEN 1
-                         ELSE 0
-                     END
-                 WHERE publication_resolution_job_id = ?1 AND status = 'open'",
+                &format!(
+                    "UPDATE code_review_findings
+                     SET status = 'fixed', resolved_at = ?2,
+                         resolved_head = (SELECT head_sha FROM code_review_jobs WHERE id = ?1),
+                         resolved_by_job_id = ?1,
+                         publication_resolution_job_id = NULL,
+                         carried_verdict_job_id = '', carried_verdict_reason = '',
+                         collapse_attempts = CASE
+                             WHEN github_comment_id IS NOT NULL THEN 0
+                             ELSE collapse_attempts
+                         END,
+                         collapse_terminal_attempts = CASE
+                             WHEN github_comment_id IS NOT NULL THEN 0
+                             ELSE collapse_terminal_attempts
+                         END,
+                         collapse_next_attempt_at = CASE
+                             WHEN github_comment_id IS NOT NULL THEN NULL
+                             ELSE collapse_next_attempt_at
+                         END,
+                         collapse_error = CASE
+                             WHEN github_comment_id IS NOT NULL THEN ''
+                             ELSE collapse_error
+                         END,
+                         collapse_pending = CASE
+                             WHEN github_comment_id IS NOT NULL AND NOT {open_sibling} THEN 1
+                             ELSE 0
+                         END
+                     WHERE publication_resolution_job_id = ?1 AND status = 'open'",
+                    open_sibling = OPEN_GROUPED_SIBLING_PREDICATE,
+                ),
                 params![id, published_at],
             )? as u64
         } else {
             0
         };
+        if fixed > 0 {
+            rearm_grouped_primary_collapses(&tx, "sibling.resolved_by_job_id = ?1", id)?;
+        }
         let updated = tx.execute(
             "UPDATE code_review_jobs
              SET publication_accepted = 1,
@@ -26724,6 +26861,275 @@ mod tests {
                 .unwrap()
                 .len(),
             2
+        );
+    }
+
+    #[test]
+    fn grouped_primary_thread_collapses_only_after_its_siblings_close() {
+        let store = Store::open_in_memory().unwrap();
+        let finding = |path: &str| NewCodeReviewFinding {
+            path: path.into(),
+            line: 7,
+            side: "RIGHT".into(),
+            severity: "high".into(),
+            confidence: "high".into(),
+            title: "Shared symptom".into(),
+            body: "The shared state leaks.".into(),
+            prompt_for_agents: "Scope the shared state.".into(),
+            sources: Vec::new(),
+        };
+        // The publication claim is taken by the caller: round one claims it
+        // before preparing its manifest, like the publisher does.
+        let publish = |job: &trouve_protocol::CodeReviewJob, resolved: &[&str]| {
+            store
+                .record_code_review_publication(
+                    &job.id,
+                    &job.repository,
+                    job.pull_number,
+                    &job.base_ref,
+                    &job.head_sha,
+                    "https://example/review",
+                    false,
+                    resolved,
+                )
+                .unwrap();
+            store
+                .finish_code_review_job(&job.id, "succeeded", "https://example/review", "")
+                .unwrap();
+        };
+        let state = |id: &str| {
+            store
+                .code_review_findings_for_pull("acme/widgets", 42)
+                .unwrap()
+                .into_iter()
+                .find(|finding| finding.id == id)
+                .unwrap()
+        };
+
+        // Round one publishes two findings under one shared root-cause
+        // comment: the primary carries the comment, the sibling is grouped.
+        let first = enqueue_backoff_test_job(&store);
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            first.id
+        );
+        let findings = store
+            .save_code_review_result_with_themes(
+                &first.id,
+                "summary",
+                "fix the root cause",
+                2,
+                &[finding("src/primary.rs"), finding("src/grouped.rs")],
+                &[
+                    NewCodeReviewFindingDetails {
+                        theme_ids: vec!["shared-state".into()],
+                        ..Default::default()
+                    },
+                    NewCodeReviewFindingDetails {
+                        theme_ids: vec!["shared-state".into()],
+                        ..Default::default()
+                    },
+                ],
+                &[NewCodeReviewTheme {
+                    id: "shared-state".into(),
+                    root_cause: "shared state is not scoped".into(),
+                    recommendation: "scope the shared state".into(),
+                    observation_kind: trouve_protocol::CodeReviewThemeObservationKind::New,
+                    previous_finding_ids: Vec::new(),
+                }],
+                &[],
+            )
+            .unwrap();
+        let by_path = |path: &str| {
+            findings
+                .iter()
+                .find(|finding| finding.path == path)
+                .cloned()
+                .unwrap()
+        };
+        let (primary, grouped) = (by_path("src/primary.rs"), by_path("src/grouped.rs"));
+        assert!(store.claim_code_review_publication(&first.id).unwrap());
+        assert!(
+            store
+                .prepare_code_review_publication_manifest(
+                    &first.id,
+                    &[
+                        (&primary.id, &primary.id, "inline"),
+                        (&grouped.id, &primary.id, "grouped_inline"),
+                    ],
+                )
+                .unwrap()
+        );
+        publish(&first, &[]);
+        assert!(
+            store
+                .update_code_review_finding_publication(
+                    &primary.id,
+                    Some(7),
+                    "https://example/comment/7",
+                    None,
+                )
+                .unwrap()
+        );
+
+        // Round two fixes the primary only and explains why the sibling is
+        // still open: the shared thread must stay open for the sibling.
+        let mut second_request = backoff_test_job_request();
+        second_request.dedupe_key = "acme/widgets#42:fix-primary".into();
+        second_request.head_sha = "3333333333333333333333333333333333333333".into();
+        let second = store
+            .enqueue_code_review_job(&second_request)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            second.id
+        );
+        assert!(store.claim_code_review_publication(&second.id).unwrap());
+        publish(&second, &[&primary.id]);
+        store
+            .record_code_review_carried_verdicts(
+                &second.id,
+                &[
+                    (&grouped.id, "Headings are still copied uncapped."),
+                    (&primary.id, "a fixed finding keeps no verdict"),
+                ],
+            )
+            .unwrap();
+        let primary_fixed = state(&primary.id);
+        assert_eq!(primary_fixed.status, "fixed");
+        assert!(
+            primary_fixed.thread_collapse.is_none(),
+            "the shared thread stays open while a grouped sibling is open"
+        );
+        assert!(primary_fixed.carried_verdict.is_none());
+        let grouped_open = state(&grouped.id);
+        assert_eq!(grouped_open.status, "open");
+        let verdict = grouped_open.carried_verdict.unwrap();
+        assert_eq!(verdict.job_id, second.id);
+        assert_eq!(verdict.head_sha, second.head_sha);
+        assert_eq!(verdict.reason, "Headings are still copied uncapped.");
+
+        // Round three fixes the sibling: the primary's collapse is armed and
+        // the sibling's verdict is cleared with its resolution.
+        let mut third_request = backoff_test_job_request();
+        third_request.dedupe_key = "acme/widgets#42:fix-grouped".into();
+        third_request.head_sha = "4444444444444444444444444444444444444444".into();
+        let third = store
+            .enqueue_code_review_job(&third_request)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            third.id
+        );
+        assert!(store.claim_code_review_publication(&third.id).unwrap());
+        publish(&third, &[&grouped.id]);
+        let grouped_fixed = state(&grouped.id);
+        assert_eq!(grouped_fixed.status, "fixed");
+        assert!(grouped_fixed.carried_verdict.is_none());
+        assert!(
+            grouped_fixed.thread_collapse.is_none(),
+            "a grouped finding has no thread of its own"
+        );
+        let primary_armed = state(&primary.id);
+        assert_eq!(primary_armed.status, "fixed");
+        assert!(
+            primary_armed
+                .thread_collapse
+                .is_some_and(|collapse| collapse.pending),
+            "the shared thread collapses once its last grouped finding closes"
+        );
+    }
+
+    #[test]
+    fn direct_resolution_honours_grouped_siblings_too() {
+        let store = Store::open_in_memory().unwrap();
+        let job = enqueue_backoff_test_job(&store);
+        assert_eq!(
+            store.claim_code_review_job().unwrap().unwrap().job.id,
+            job.id
+        );
+        let finding = |path: &str| NewCodeReviewFinding {
+            path: path.into(),
+            line: 7,
+            side: "RIGHT".into(),
+            severity: "high".into(),
+            confidence: "high".into(),
+            title: "Shared symptom".into(),
+            body: "The shared state leaks.".into(),
+            prompt_for_agents: "Scope the shared state.".into(),
+            sources: Vec::new(),
+        };
+        let findings = store
+            .save_code_review_result_with_themes(
+                &job.id,
+                "summary",
+                "fix the root cause",
+                2,
+                &[finding("src/primary.rs"), finding("src/grouped.rs")],
+                &[Default::default(), Default::default()],
+                &[],
+                &[],
+            )
+            .unwrap();
+        let (primary, grouped) = (findings[0].clone(), findings[1].clone());
+        assert!(store.claim_code_review_publication(&job.id).unwrap());
+        assert!(
+            store
+                .prepare_code_review_publication_manifest(
+                    &job.id,
+                    &[
+                        (&primary.id, &primary.id, "inline"),
+                        (&grouped.id, &primary.id, "grouped_inline"),
+                    ],
+                )
+                .unwrap()
+        );
+        store
+            .record_code_review_publication(
+                &job.id,
+                &job.repository,
+                job.pull_number,
+                &job.base_ref,
+                &job.head_sha,
+                "https://example/review",
+                false,
+                &[],
+            )
+            .unwrap();
+        store
+            .update_code_review_finding_publication(
+                &primary.id,
+                Some(7),
+                "https://example/comment/7",
+                None,
+            )
+            .unwrap();
+        let state = |id: &str| {
+            store
+                .code_review_findings(&job.id)
+                .unwrap()
+                .into_iter()
+                .find(|finding| finding.id == id)
+                .unwrap()
+        };
+
+        assert!(
+            store
+                .resolve_code_review_finding(&primary.id, "fixed", &job.head_sha, &job.id)
+                .unwrap()
+        );
+        assert!(state(&primary.id).thread_collapse.is_none());
+        assert!(
+            store
+                .resolve_code_review_finding(&grouped.id, "dismissed", &job.head_sha, &job.id)
+                .unwrap()
+        );
+        assert!(
+            state(&primary.id)
+                .thread_collapse
+                .is_some_and(|collapse| collapse.pending)
         );
     }
 

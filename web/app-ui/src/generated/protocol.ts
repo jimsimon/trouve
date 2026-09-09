@@ -1996,6 +1996,15 @@ export interface components {
             /** @description Concise, generated one-line summary of the candidate issue. */
             title: string;
         };
+        /** @description A later review round's reason for leaving a carried finding open. */
+        CodeReviewCarriedVerdict: {
+            /** @description Immutable PR head that job reviewed. */
+            head_sha: string;
+            /** @description Review job whose coordinator judged the finding still open. */
+            job_id: string;
+            /** @description The coordinator's explanation of what still exhibits the issue. */
+            reason: string;
+        };
         /**
          * @description One step of the causal chain from changed code to a finding's anchor,
          *     quoted by the coordinator and mechanically verified against the reviewed
@@ -2097,6 +2106,7 @@ export interface components {
          */
         CodeReviewFinding: {
             body: string;
+            carried_verdict?: null | components["schemas"]["CodeReviewCarriedVerdict"];
             /**
              * @description Strength of the evidence for the issue, independently of impact.
              *     `high`, `medium`, or `low`; legacy records default to `medium`.
