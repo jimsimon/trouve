@@ -20,7 +20,10 @@
 //!   `SHA256SUMS.txt` is checked as corroborating metadata, not trusted alone
 //! - claude: `downloads.claude.ai/claude-code-releases` (`latest` + manifest
 //!   with sha256 checksums; single static binary)
-//! - codex: GitHub `openai/codex` latest release tarball (musl build on Linux)
+//! - codex: GitHub `openai/codex` latest release tarballs (musl builds on
+//!   Linux): the `codex` CLI plus its `codex-code-mode-host` sidecar, which
+//!   Codex resolves next to its own executable and which code-mode-only
+//!   models need for every tool call
 
 use std::fmt::Write as _;
 use std::path::{Component, Path, PathBuf};
@@ -45,6 +48,13 @@ static RUNTIME_INSTALL_RESOURCE: tokio::sync::Semaphore = tokio::sync::Semaphore
 const MAX_RETAINED_RUNTIME_GENERATIONS: usize = 8;
 const CANCEL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 const CURSOR_SDK_BRIDGE_REVIEWED_VERSION: &str = "1.0.28";
+/// Codex's code-mode host. Codex looks for it beside its own executable and,
+/// for models whose catalog entry is `code_mode_only`, routes every nested tool
+/// call through it, so a generation without it cannot run those models.
+const CODEX_CODE_MODE_HOST: &str = "codex-code-mode-host";
+/// Every executable a Codex release generation must carry, in the order
+/// installed. Each is a separate `<name>-<triple>.tar.gz` release asset.
+const CODEX_RELEASE_BINARIES: [&str; 2] = ["codex", CODEX_CODE_MODE_HOST];
 
 fn cursor_sdk_bridge_reviewed_checksum(version: &str, asset: &str) -> Option<&'static str> {
     if version != CURSOR_SDK_BRIDGE_REVIEWED_VERSION {
@@ -143,6 +153,28 @@ impl CliId {
             Self::LlamaServer => &["local"],
         }
     }
+
+    /// Sidecar executables the runtime expects beside its main binary. A
+    /// generation missing one is installed but not fully functional.
+    pub fn companion_executables(&self) -> &'static [&'static str] {
+        match self {
+            Self::Codex => &[CODEX_CODE_MODE_HOST],
+            Self::CursorSdkBridge | Self::Claude | Self::LlamaServer => &[],
+        }
+    }
+}
+
+/// Whether an active install carries every companion executable its runtime
+/// needs. Generations published before a sidecar became part of the release
+/// layout report `false`, and reinstalling the same version repairs them.
+pub fn install_complete(id: CliId, installed: &InstalledCli) -> bool {
+    let bin = Path::new(&installed.bin);
+    let Some(directory) = bin.parent() else {
+        return id.companion_executables().is_empty();
+    };
+    id.companion_executables()
+        .iter()
+        .all(|name| directory.join(name).is_file())
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1555,15 +1587,17 @@ async fn install_into(
         }
         CliId::Codex => {
             let triple = codex_triple()?;
-            let url = format!(
-                "https://github.com/openai/codex/releases/download/rust-v{version}/codex-{triple}.tar.gz"
-            );
-            let bytes = get_bytes(&url, progress, MAX_RUNTIME_DOWNLOAD_BYTES).await?;
-            untar_gz(bytes, dir, progress).await?;
-            let rel = PathBuf::from("codex");
-            std::fs::rename(dir.join(format!("codex-{triple}")), dir.join(&rel))?;
-            make_executable(&dir.join(&rel))?;
-            Ok(rel)
+            // Each binary is its own release asset. Unpack them into the same
+            // generation directory because Codex resolves the code-mode host
+            // relative to its own executable.
+            for name in CODEX_RELEASE_BINARIES {
+                let url = format!(
+                    "https://github.com/openai/codex/releases/download/rust-v{version}/{name}-{triple}.tar.gz"
+                );
+                let bytes = get_bytes(&url, progress, MAX_RUNTIME_DOWNLOAD_BYTES).await?;
+                stage_codex_release_binary(bytes, dir, &triple, name, progress).await?;
+            }
+            Ok(PathBuf::from(CODEX_RELEASE_BINARIES[0]))
         }
         CliId::LlamaServer => {
             let platform = llama_platform()?;
@@ -1584,6 +1618,29 @@ async fn install_into(
             Ok(rel)
         }
     }
+}
+
+/// Unpack one Codex release tarball into `dir` and publish its single binary
+/// under its plain `name`. Release archives hold the binary as
+/// `<name>-<triple>`; Codex expects the triple-less name next to `codex`.
+async fn stage_codex_release_binary(
+    bytes: Vec<u8>,
+    dir: &Path,
+    triple: &str,
+    name: &str,
+    progress: &Arc<Progress>,
+) -> Result<(), InstallError> {
+    untar_gz(bytes, dir, progress).await?;
+    let unpacked = dir.join(format!("{name}-{triple}"));
+    if !unpacked.is_file() {
+        return Err(InstallError::Download(format!(
+            "{name}-{triple}.tar.gz had no {name}-{triple}"
+        )));
+    }
+    let published = dir.join(name);
+    std::fs::rename(&unpacked, &published)?;
+    make_executable(&published)?;
+    Ok(())
 }
 
 fn checksum_for_asset(sums: &str, asset: &str) -> Option<String> {
@@ -2232,6 +2289,78 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
             matches!(err, InstallError::Download(m) if m.contains("outside")),
             "expected a containment error"
         );
+    }
+
+    #[tokio::test]
+    async fn codex_release_binaries_publish_under_their_plain_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let progress = Arc::new(Progress::default());
+        let triple = "x86_64-unknown-linux-musl";
+        for (name, contents) in [
+            ("codex", b"cli".as_slice()),
+            (CODEX_CODE_MODE_HOST, b"host".as_slice()),
+        ] {
+            let archive = gzipped_tar(&[(&format!("{name}-{triple}"), contents)]);
+            stage_codex_release_binary(archive, dir.path(), triple, name, &progress)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(std::fs::read(dir.path().join("codex")).unwrap(), b"cli");
+        assert_eq!(
+            std::fs::read(dir.path().join(CODEX_CODE_MODE_HOST)).unwrap(),
+            b"host"
+        );
+        assert!(!dir.path().join(format!("codex-{triple}")).exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for name in CODEX_RELEASE_BINARIES {
+                let mode = std::fs::metadata(dir.path().join(name))
+                    .unwrap()
+                    .permissions()
+                    .mode();
+                assert_eq!(mode & 0o111, 0o111, "{name} is not executable");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_release_archive_without_its_binary_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let progress = Arc::new(Progress::default());
+        let archive = gzipped_tar(&[("README", b"not a binary".as_slice())]);
+        let error = stage_codex_release_binary(
+            archive,
+            dir.path(),
+            "x86_64-unknown-linux-musl",
+            CODEX_CODE_MODE_HOST,
+            &progress,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&error, InstallError::Download(m) if m.contains(CODEX_CODE_MODE_HOST)),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn codex_install_is_complete_only_with_its_code_mode_host() {
+        let generation = tempfile::tempdir().unwrap();
+        let bin = generation.path().join("codex");
+        std::fs::write(&bin, "cli").unwrap();
+        let installed = InstalledCli {
+            version: "0.153.4".into(),
+            bin: bin.to_string_lossy().into_owned(),
+        };
+        assert!(!install_complete(CliId::Codex, &installed));
+
+        std::fs::write(generation.path().join(CODEX_CODE_MODE_HOST), "host").unwrap();
+        assert!(install_complete(CliId::Codex, &installed));
+
+        // Runtimes without sidecars are complete with their main binary alone.
+        assert!(install_complete(CliId::Claude, &installed));
     }
 
     #[tokio::test]

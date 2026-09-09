@@ -5526,6 +5526,12 @@ impl Engine {
                     .find_map(configured_runtime_command)
             };
             let managed = cli::installed(&self.data_dir, id);
+            // A generation published before one of the runtime's sidecars
+            // joined the release layout (Codex's code-mode host) is offered
+            // as an update: reinstalling the current version repairs it.
+            let managed_incomplete = managed
+                .as_ref()
+                .is_some_and(|info| !cli::install_complete(id, info));
             let (source, path, installed_version) = if let Some(cmd) = explicit {
                 let version = cli::binary_version(&cmd).await;
                 ("path".to_string(), Some(cmd), version)
@@ -5540,11 +5546,12 @@ impl Engine {
             };
 
             let latest_version = self.cli_latest_version(id).await;
-            let update_available = match (&installed_version, &latest_version) {
-                (Some(have), Some(latest)) => !cli_version_matches(have, latest),
-                (None, Some(_)) => true,
-                _ => false,
-            };
+            let update_available = (source == "managed" && managed_incomplete)
+                || match (&installed_version, &latest_version) {
+                    (Some(have), Some(latest)) => !cli_version_matches(have, latest),
+                    (None, Some(_)) => true,
+                    _ => false,
+                };
             clis.push(trouve_protocol::CliInfo {
                 id: id.as_str().into(),
                 display_name: id.display_name().into(),
