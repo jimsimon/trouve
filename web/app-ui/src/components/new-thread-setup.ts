@@ -264,6 +264,7 @@ export class TrouveNewThreadSetup extends LitElement {
   #catalog = emptyCatalog();
   #draft: NewThreadSetupDraft = createInitialNewThreadDraft(this.#catalog);
   #optionsLoading = false;
+  #catalogAvailable = true;
   #optionsError = "";
   #attachmentLoading = false;
   #attachmentError = "";
@@ -432,7 +433,11 @@ export class TrouveNewThreadSetup extends LitElement {
             <trouve-model-picker
               accessible-label="Model"
               placement="down"
-              placeholder=${this.#optionsLoading ? "Loading models…" : "No model available"}
+              placeholder=${this.#optionsLoading
+                ? "Loading models…"
+                : this.#catalogAvailable
+                  ? "No model available"
+                  : "Downloading model catalog…"}
               empty-label=""
               .value=${this.#draft.modelId}
               .models=${this.#catalog.models}
@@ -581,6 +586,7 @@ export class TrouveNewThreadSetup extends LitElement {
       inheritedPermissionMode: undefined,
     };
     this.#subscriptionHealth = readSignal(services.subscriptionHealth.current);
+    this.#catalogAvailable = readSignal(services.modelCatalog.catalogAvailable);
     this.requestUpdate();
 
     // Subscription health only decorates model choices. Provider probes may

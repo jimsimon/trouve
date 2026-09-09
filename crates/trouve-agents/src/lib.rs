@@ -11,8 +11,10 @@
 
 pub mod claude;
 pub mod codex;
+mod codex_roster;
 #[path = "cursor_sdk.rs"]
 pub mod cursor;
+mod cursor_roster;
 pub mod install;
 mod login;
 pub mod process_env;
@@ -479,6 +481,14 @@ pub trait AgentBackend: Send + Sync {
         self.models()
     }
 
+    /// Rebuild the backend's persisted model roster from the vendor's live
+    /// model list when it is stale. Runs in the background so `models()`
+    /// stays instant and offline-safe; returns whether the roster was
+    /// rewritten. The default has no live roster to refresh.
+    async fn refresh_model_roster(&self) -> Result<bool, BackendError> {
+        Ok(false)
+    }
+
     fn status(&self) -> BackendStatus;
 
     /// Whether the backend can guarantee that a requested tool-free turn
@@ -714,6 +724,10 @@ impl AgentBackend for RetirementAwareBackend {
         self.inner.list_models().await
     }
 
+    async fn refresh_model_roster(&self) -> Result<bool, BackendError> {
+        self.inner.refresh_model_roster().await
+    }
+
     fn status(&self) -> BackendStatus {
         self.inner.status()
     }
@@ -823,6 +837,10 @@ impl AgentBackend for RuntimeLeasedBackend {
         self.inner.list_models().await
     }
 
+    async fn refresh_model_roster(&self) -> Result<bool, BackendError> {
+        self.inner.refresh_model_roster().await
+    }
+
     fn status(&self) -> BackendStatus {
         self.inner.status()
     }
@@ -894,6 +912,16 @@ const TOOL_OUTPUT_COALESCE_WINDOW: Duration = Duration::from_millis(50);
 /// exact order and backpressure behind earlier deltas instead of being lost.
 pub(crate) struct BackendEventSender {
     buffer: Arc<BackendEventBuffer>,
+}
+
+impl BackendEventSender {
+    /// A sender with no consumer, for vendor-process interactions that emit
+    /// no turn events (roster refreshes). Its `closed()` never resolves.
+    pub(crate) fn detached() -> Self {
+        Self {
+            buffer: Arc::new(BackendEventBuffer::new()),
+        }
+    }
 }
 
 struct BufferedBackendEvent {

@@ -55,7 +55,7 @@ impl AnthropicProvider {
                 .to_string(),
             token,
             client: reqwest::Client::new(),
-            catalog: Arc::new(ModelsDevCatalog::embedded()),
+            catalog: Arc::new(ModelsDevCatalog::empty()),
             catalog_provider: None,
             oauth_bearer: false,
             vertex_bearer: false,
@@ -819,7 +819,7 @@ mod tests {
 
     #[test]
     fn catalog_provider_uses_live_ids_and_models_dev_settings() {
-        let catalog = ModelsDevCatalog::embedded();
+        let catalog = ModelsDevCatalog::fixture();
         let body = json!({
             "data": [{
                 "id": "claude-fable-5",
@@ -858,7 +858,7 @@ mod tests {
 
     #[test]
     fn model_list_does_not_invent_thinking_when_unsupported() {
-        let catalog = ModelsDevCatalog::embedded();
+        let catalog = ModelsDevCatalog::fixture();
         let body = json!({
             "data": [{
                 "id": "claude-no-thinking",
@@ -876,7 +876,7 @@ mod tests {
 
     #[test]
     fn custom_endpoint_retains_reported_effort_adapter() {
-        let catalog = ModelsDevCatalog::embedded();
+        let catalog = ModelsDevCatalog::fixture();
         let body = json!({"data": [{
             "id": "private-model",
             "display_name": "Private Model",
@@ -900,7 +900,7 @@ mod tests {
 
     #[test]
     fn model_ids_without_live_capabilities_still_use_models_dev() {
-        let catalog = ModelsDevCatalog::embedded();
+        let catalog = ModelsDevCatalog::fixture();
         let body = json!({"data": [{"id": "claude-fable-5"}]});
         let models = parse_model_list("anthropic", &body, Some("anthropic"), &catalog);
         assert_eq!(

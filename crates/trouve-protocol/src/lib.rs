@@ -387,7 +387,11 @@ pub use requests::*;
 // 9.7: threads expose the sticky `route` their automatic model last completed
 // on so clients can attribute usage before replaying the transcript
 // (additive).
-pub const PROTOCOL_VERSION: &str = "9.7";
+// 9.8: downloaded model catalog — the server no longer bundles models.dev;
+// ServerInfo.catalog_available and the server.model_catalog_changed event
+// report whether the public catalog has been downloaded, and vendor-backed
+// providers (Codex, Cursor) refresh their rosters from their CLIs (additive).
+pub const PROTOCOL_VERSION: &str = "9.8";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";
 pub const ERROR_CODE_GITHUB_REAUTHENTICATION_REQUIRED: &str = "github_reauthentication_required";

@@ -3361,6 +3361,10 @@ export interface components {
             /** @enum {string} */
             type: "server.connectivity_changed";
         } | {
+            available: boolean;
+            /** @enum {string} */
+            type: "server.model_catalog_changed";
+        } | {
             settings: components["schemas"]["SessionNamingSettings"];
             /** @enum {string} */
             type: "settings.session_naming_updated";
@@ -4568,6 +4572,12 @@ export interface components {
             content: string;
         };
         ServerInfo: {
+            /**
+             * @description Whether the public model catalog has been downloaded (see the
+             *     `server.model_catalog_changed` event). Absent on older servers, which
+             *     bundled a catalog and were never without one.
+             */
+            catalog_available?: boolean;
             name: string;
             /**
              * @description Whether the server can currently reach the internet (see the

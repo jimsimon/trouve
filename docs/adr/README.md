@@ -64,3 +64,4 @@ sequentially.
 | [0052](0052-owned-os-sandbox-for-shell-commands.md) | Trouve owns an OS sandbox for shell commands | Proposed |
 | [0053](0053-policy-ordered-cross-adapter-model-routing.md) | Policy-ordered cross-adapter model routing | Partially superseded by 0054 |
 | [0054](0054-explicit-and-sticky-model-route-selection.md) | Explicit and sticky model route selection | Accepted |
+| [0055](0055-downloaded-model-catalog-and-vendor-rosters.md) | Downloaded model catalog and vendor-refreshed rosters | Accepted (amends 0016, 0020) |

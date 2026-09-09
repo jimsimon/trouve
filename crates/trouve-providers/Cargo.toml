@@ -33,3 +33,8 @@ trouve-protocol.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 tokio.workspace = true
+
+[features]
+# Bundle the checked-in models.dev copy as `ModelsDevCatalog::fixture()` for
+# dependants' tests. Never enabled in release builds.
+catalog-fixture = []

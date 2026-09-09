@@ -117,7 +117,7 @@ impl ClaudeBackend {
             usage_process: Mutex::new(None),
             #[cfg(test)]
             injected_usage_cleanup_failure: std::sync::atomic::AtomicBool::new(false),
-            catalog: Arc::new(trouve_providers::models_dev::ModelsDevCatalog::embedded()),
+            catalog: Arc::new(trouve_providers::models_dev::ModelsDevCatalog::empty()),
         }
     }
 
@@ -2651,7 +2651,7 @@ cat >/dev/null
     #[test]
     fn adaptive_models_use_cli_effort_flag() {
         let mut cmd = tokio::process::Command::new("claude");
-        let catalog = trouve_providers::models_dev::ModelsDevCatalog::embedded();
+        let catalog = trouve_providers::models_dev::ModelsDevCatalog::fixture();
         configure_thinking(
             &mut cmd,
             &turn("claude-fable-5", "thinking_level", "xhigh"),
@@ -2667,7 +2667,9 @@ cat >/dev/null
 
     #[test]
     fn models_dev_owns_claude_code_display_metadata() {
-        let backend = ClaudeBackend::new("claude-code", None);
+        let backend = ClaudeBackend::new("claude-code", None).with_catalog(std::sync::Arc::new(
+            trouve_providers::models_dev::ModelsDevCatalog::fixture(),
+        ));
         let model = backend
             .models()
             .into_iter()
@@ -2682,7 +2684,7 @@ cat >/dev/null
     #[test]
     fn legacy_off_explicitly_disables_thinking() {
         let mut cmd = tokio::process::Command::new("claude");
-        let catalog = trouve_providers::models_dev::ModelsDevCatalog::embedded();
+        let catalog = trouve_providers::models_dev::ModelsDevCatalog::fixture();
         configure_thinking(
             &mut cmd,
             &turn("claude-haiku-4-5", "thinking_level", "off"),

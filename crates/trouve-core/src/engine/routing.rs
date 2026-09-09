@@ -681,13 +681,16 @@ impl Engine {
         let online = self.is_online();
         if online
             && self.connectivity_probe.is_some()
-            && let Ok(Err(error)) = tokio::time::timeout(
-                MODEL_ROUTE_DISCOVERY_TIMEOUT,
-                self.model_catalog.refresh_if_stale(),
-            )
-            .await
+            && tokio::time::timeout(MODEL_ROUTE_DISCOVERY_TIMEOUT, self.refresh_catalog())
+                .await
+                .is_err()
         {
-            tracing::debug!("models.dev refresh failed; using cached snapshot: {error:#}");
+            tracing::debug!("models.dev refresh timed out; using the cached catalog");
+        }
+        if online {
+            // Detached: this response still comes from the persisted rosters;
+            // a rebuild (if due) is announced and shows up on the next listing.
+            self.spawn_roster_refresh();
         }
         let automatic = selection.and_then(automatic_model_name);
         let concrete_provider = selection

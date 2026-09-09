@@ -600,4 +600,31 @@ describe("ModelCatalogController", () => {
       ["cursor/live-2"],
     ]);
   });
+  it("never caches an empty roster as fresh while the server is still downloading its catalog", async () => {
+    let now = 0;
+    let liveCalls = 0;
+    let available = false;
+    const controller = new ModelCatalogController(
+      {
+        models: async () => [],
+        refreshModels: async () => {
+          liveCalls += 1;
+          return [];
+        },
+      },
+      { now: () => now, liveTtlMs: 300_000, catalogAvailable: () => available },
+    );
+    expect(readSignal(controller.catalogAvailable)).toBe(false);
+
+    await controller.liveModels("force");
+    now += 1_000;
+    await controller.liveModels("if-stale");
+    expect(liveCalls).toBe(2);
+
+    available = true;
+    await controller.liveModels("if-stale");
+    now += 1_000;
+    await controller.liveModels("if-stale");
+    expect(liveCalls).toBe(3);
+  });
 });

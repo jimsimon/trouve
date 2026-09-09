@@ -63,7 +63,7 @@ impl OpenAiCompatProvider {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             token,
             client: reqwest::Client::new(),
-            catalog: Arc::new(ModelsDevCatalog::embedded()),
+            catalog: Arc::new(ModelsDevCatalog::empty()),
             catalog_provider: None,
             bearer_auth: true,
             headers: BTreeMap::new(),
@@ -842,7 +842,7 @@ mod tests {
                 "supported_parameters": ["max_tokens"],
             },
         ]});
-        let catalog = ModelsDevCatalog::embedded();
+        let catalog = ModelsDevCatalog::fixture();
         let models = parse_catalog_models("kilocode", &body, "kilo", &catalog);
         assert_eq!(models.len(), 1, "unknown models are dropped");
         let m = &models[0];
@@ -957,7 +957,7 @@ mod tests {
             {"id": "text-embedding-4-large"},
             {"id": "gpt-5.6-terra"}
         ]});
-        let catalog = ModelsDevCatalog::embedded();
+        let catalog = ModelsDevCatalog::fixture();
         let models = parse_catalog_models("openai", &body, "openai", &catalog);
         assert_eq!(models.len(), 2);
         assert_eq!(models[0].id, "openai/gpt-5.6");
@@ -968,7 +968,8 @@ mod tests {
     #[test]
     fn known_endpoint_has_catalog_fallback_when_models_api_is_missing() {
         let provider =
-            OpenAiCompatProvider::new("openai", "https://api.openai.com/v1", "unused-test-key");
+            OpenAiCompatProvider::new("openai", "https://api.openai.com/v1", "unused-test-key")
+                .with_catalog(Arc::new(ModelsDevCatalog::fixture()));
         let models = provider.models();
         assert!(models.iter().any(|model| model.id == "openai/gpt-5.6"));
         assert!(models.iter().all(|model| !model.id.contains("embedding")));

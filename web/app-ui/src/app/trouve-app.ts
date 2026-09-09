@@ -317,7 +317,9 @@ export class TrouveApp extends withSignalTracking(LitElement) {
   readonly #subscriptionHealth = new SubscriptionHealthController(
     this.#protocolClient,
   );
-  readonly #modelCatalog = new ModelCatalogController(this.#protocolClient);
+  readonly #modelCatalog = new ModelCatalogController(this.#protocolClient, {
+    catalogAvailable: () => readSignal(this.#store.serverInfo)?.catalog_available !== false,
+  });
   readonly #sessionNotifications = new SessionNotificationCoordinator(
     this.#notificationPreferences.current,
     this.#hostClient === undefined
@@ -771,6 +773,17 @@ export class TrouveApp extends withSignalTracking(LitElement) {
         }
       });
     }
+    if (event.type === "server.model_catalog_changed") {
+      const wasUnavailable = readSignal(this.#store.serverInfo)?.catalog_available === false;
+      if (event.available && wasUnavailable) {
+        // The first successful models.dev download (or a recovery) changes
+        // every picker at once; invalidate both snapshots immediately.
+        void this.#modelCatalog.refresh("force").catch(() => undefined);
+        this.#showConnectivityNotice("Model catalog downloaded — the full model list is available.");
+      }
+      this.requestUpdate();
+      return;
+    }
     if (event.type !== "server.connectivity_changed") return;
     const wasOffline = readSignal(this.#store.serverInfo)?.online === false;
     if (event.online && wasOffline) {
@@ -779,13 +792,18 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       // again, so invalidate both the static and live snapshots immediately.
       void this.#modelCatalog.refresh("force").catch(() => undefined);
     }
+    this.#showConnectivityNotice(
+      event.online && wasOffline ? "Back online — the full model list is available again." : "",
+    );
+    this.requestUpdate();
+  };
+
+  #showConnectivityNotice(notice: string): void {
     if (this.#connectivityNoticeTimer !== undefined) {
       clearTimeout(this.#connectivityNoticeTimer);
       this.#connectivityNoticeTimer = undefined;
     }
-    this.#connectivityNotice = event.online && wasOffline
-      ? "Back online — the full model list is available again."
-      : "";
+    this.#connectivityNotice = notice;
     if (this.#connectivityNotice !== "") {
       this.#connectivityNoticeTimer = setTimeout(() => {
         this.#connectivityNoticeTimer = undefined;
@@ -793,8 +811,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
         this.requestUpdate();
       }, 6_000);
     }
-    this.requestUpdate();
-  };
+  }
 
   #tombstoneSession(sessionId: string): void {
     const threadIds = new Set(this.#store.sessionThreadIds(sessionId));
@@ -3154,12 +3171,16 @@ export class TrouveApp extends withSignalTracking(LitElement) {
       attachmentPending: this.#newSessionAttachmentPending,
     });
     const serverOffline = readSignal(this.#store.serverInfo)?.online === false;
+    const catalogDownloading = !serverOffline
+      && readSignal(this.#store.serverInfo)?.catalog_available === false;
     const connectionLabel = this.#hostError
       ? "Host unavailable"
       : this.#protocolError
         ? "Disconnected"
       : serverOffline
         ? "Offline · local models only"
+      : catalogDownloading
+        ? "Downloading model catalog…"
       : this.#routeLoading
         ? "Loading"
         : readSignal(this.#threadIngress.state) === "error"
@@ -3792,7 +3813,9 @@ export class TrouveApp extends withSignalTracking(LitElement) {
                   placement="down"
                   placeholder=${newSessionOptionsLoading
                     ? "Loading models…"
-                    : "No model available"}
+                    : readSignal(this.#modelCatalog.catalogAvailable)
+                      ? "No model available"
+                      : "Downloading model catalog…"}
                   empty-label=""
                   .value=${this.#newSessionModelId}
                   .models=${newSessionModels}

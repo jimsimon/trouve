@@ -601,7 +601,7 @@ mod tests {
             "amazon-bedrock",
             Some("us-east-1".into()),
             None,
-            Arc::new(ModelsDevCatalog::embedded()),
+            Arc::new(ModelsDevCatalog::fixture()),
         );
         let models = provider.models();
         assert!(models.len() > 50, "only {} Bedrock models", models.len());
