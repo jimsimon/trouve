@@ -185,10 +185,7 @@ impl ProviderDispatcher {
             },
             response = &mut send => Some(response),
             _ = &mut handoff_timeout => {
-                return Err(SearchError::Failed(format!(
-                    "provider dispatch timed out after {:.1}s",
-                    self.handoff_timeout.as_secs_f64()
-                )));
+                Self::resolve_handoff_deadline(&mut acknowledged_rx, self.handoff_timeout)?
             },
         };
         *last_request = Some(Instant::now());
@@ -200,6 +197,25 @@ impl ProviderDispatcher {
             return Ok(Box::pin(async move { Ok(response) }));
         }
         Ok(send)
+    }
+
+    /// Decide the outcome of an elapsed handoff deadline. Polling `send`
+    /// earlier in the same selection cycle can hand off the request body
+    /// before the timer branch runs, so an elapsed deadline is only a
+    /// failure while the body is still unsent. Once the provider has the
+    /// body it may be allocating a session, and the caller must keep owning
+    /// the response future so that session stays recoverable.
+    fn resolve_handoff_deadline(
+        acknowledged_rx: &mut tokio::sync::oneshot::Receiver<()>,
+        handoff_timeout: Duration,
+    ) -> Result<Option<reqwest::Result<reqwest::Response>>, SearchError> {
+        if acknowledged_rx.try_recv().is_ok() {
+            return Ok(None);
+        }
+        Err(SearchError::Failed(format!(
+            "provider dispatch timed out after {:.1}s",
+            handoff_timeout.as_secs_f64()
+        )))
     }
 
     async fn dispatch(
@@ -2524,6 +2540,46 @@ mod tests {
         assert!(started.elapsed() < Duration::from_millis(200));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         drop(permits);
+    }
+
+    #[tokio::test]
+    async fn elapsed_handoff_deadline_keeps_an_already_handed_off_response() {
+        // Polling `send` earlier in the same select cycle can hand off the
+        // body before the deadline branch runs. The dispatcher must then keep
+        // the response future so any session the provider allocates stays
+        // recoverable, instead of treating the elapsed timer as a failure.
+        let (acknowledged_tx, mut acknowledged_rx) = tokio::sync::oneshot::channel();
+        let mut body = DispatchBody {
+            bytes: Some(Bytes::from_static(b"{}")),
+            acknowledged: Some(acknowledged_tx),
+        };
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(matches!(
+            Pin::new(&mut body).poll_next(&mut cx),
+            Poll::Ready(Some(Ok(_)))
+        ));
+
+        match ProviderDispatcher::resolve_handoff_deadline(
+            &mut acknowledged_rx,
+            Duration::from_millis(50),
+        ) {
+            Ok(None) => {}
+            Ok(Some(_)) => panic!("a handed-off dispatch must keep awaiting its response"),
+            Err(_) => panic!("an elapsed deadline after handoff must not fail the dispatch"),
+        }
+
+        let (_pending_tx, mut pending_rx) = tokio::sync::oneshot::channel::<()>();
+        match ProviderDispatcher::resolve_handoff_deadline(
+            &mut pending_rx,
+            Duration::from_millis(50),
+        ) {
+            Err(SearchError::Failed(message)) => {
+                assert!(message.contains("provider dispatch timed out"));
+            }
+            Err(_) => panic!("an unsent body must report the dispatch timeout"),
+            Ok(_) => panic!("an unsent body must not proceed after the deadline"),
+        }
     }
 
     #[tokio::test]
