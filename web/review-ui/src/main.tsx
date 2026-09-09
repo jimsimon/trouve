@@ -42,6 +42,7 @@ import {
   submitLoginCode,
   uninstallCli,
 } from "./api";
+import type { RepositoryModelOptionChanges } from "./api";
 import {
   cliIsInstalled,
   cliProgressLabel,
@@ -2546,17 +2547,33 @@ function RepositoryEditor({
   onSaved: () => void;
 }) {
   const [draft, setDraft] = useState(repository);
+  const [changedModelOptions, setChangedModelOptions] =
+    useState<RepositoryModelOptionChanges>({});
   const [busy, setBusy] = useState(false);
   const [message, flash] = useFlash();
   const persistedRepository = JSON.stringify(repository);
-  useEffect(() => setDraft(repository), [persistedRepository]);
+  useEffect(() => {
+    setDraft(repository);
+    setChangedModelOptions({});
+  }, [persistedRepository]);
+  const markModelOptionsChanged = (
+    ...roles: (keyof RepositoryModelOptionChanges)[]
+  ): void => {
+    setChangedModelOptions((current) => {
+      const next = { ...current };
+      for (const role of roles) next[role] = true;
+      return next;
+    });
+  };
   const persistRepository = async (
     next: Repository,
     successMessage = "Saved",
+    modelOptionChanges = changedModelOptions,
   ): Promise<void> => {
     setBusy(true);
     try {
-      await saveRepository(next);
+      await saveRepository(next, modelOptionChanges);
+      setChangedModelOptions({});
       flash(successMessage);
       onSaved();
     } catch (cause) {
@@ -2715,6 +2732,7 @@ function RepositoryEditor({
               disabled={!modelsLoaded}
               onChange={(event) => {
                 const model = event.currentTarget.value || undefined;
+                markModelOptionsChanged("coordinator", "router", "analyst");
                 const selectedCoordinatorModel = modelForSelection(models, model);
                 const selectedRouterModel = modelForSelection(
                   models,
@@ -2808,9 +2826,10 @@ function RepositoryEditor({
             model={effectiveCoordinatorModel}
             options={draft.coordinator_model_options}
             scope="Coordinator"
-            onChange={(options) =>
-              setDraft({ ...draft, coordinator_model_options: options })
-            }
+            onChange={(options) => {
+              markModelOptionsChanged("coordinator");
+              setDraft({ ...draft, coordinator_model_options: options });
+            }}
           />
           <label class={semanticRouterConfigEnabled ? undefined : "field-disabled"}>
             Semantic router model
@@ -2819,6 +2838,7 @@ function RepositoryEditor({
               disabled={!modelsLoaded || !semanticRouterConfigEnabled}
               onChange={(event) => {
                 const routerModel = event.currentTarget.value || undefined;
+                markModelOptionsChanged("router");
                 const selectedRouterModel = modelForSelection(
                   models,
                   routerModel || draft.model,
@@ -2872,7 +2892,10 @@ function RepositoryEditor({
             options={draft.router_model_options}
             scope="Semantic router"
             disabled={!semanticRouterConfigEnabled}
-            onChange={(options) => setDraft({ ...draft, router_model_options: options })}
+            onChange={(options) => {
+              markModelOptionsChanged("router");
+              setDraft({ ...draft, router_model_options: options });
+            }}
           />
           <label>
             Change analyst model
@@ -2881,6 +2904,7 @@ function RepositoryEditor({
               disabled={!modelsLoaded}
               onChange={(event) => {
                 const analystModel = event.currentTarget.value || undefined;
+                markModelOptionsChanged("analyst");
                 const selectedAnalystModel = modelForSelection(
                   models,
                   analystModel || draft.model,
@@ -2934,7 +2958,10 @@ function RepositoryEditor({
             model={effectiveAnalystModel}
             options={draft.analyst_model_options}
             scope="Change analyst"
-            onChange={(options) => setDraft({ ...draft, analyst_model_options: options })}
+            onChange={(options) => {
+              markModelOptionsChanged("analyst");
+              setDraft({ ...draft, analyst_model_options: options });
+            }}
           />
         </div>
         <label>
@@ -3123,6 +3150,7 @@ function RepositoryEditor({
                 void persistRepository(
                   { ...repository, mode: "off" },
                   "Reviews disabled",
+                  {},
                 )
               }
             >

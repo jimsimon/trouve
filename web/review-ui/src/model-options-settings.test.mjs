@@ -9,11 +9,20 @@ const api = readFileSync(new URL("./api.ts", import.meta.url), "utf8");
 test("repositories, overrides, and jobs model per-role model options", () => {
   for (const role of ["coordinator", "router", "analyst"]) {
     assert.match(types, new RegExp(`${role}_model_options\\?: ModelOptions;`, "u"));
-    // Maps are always sent so an empty map clears stale options server-side.
+    // Untouched maps are omitted, while an intentional clear serializes {}.
     assert.match(
       api,
-      new RegExp(`${role}_model_options: repository\\.${role}_model_options \\?\\? \\{\\},`, "u"),
+      new RegExp(
+        `changedModelOptions\\.${role}[\\s\\S]*${role}_model_options: repository\\.${role}_model_options \\?\\? \\{\\}`,
+        "u",
+      ),
     );
+  }
+  assert.match(api, /changedModelOptions: RepositoryModelOptionChanges = \{\}/u);
+  assert.match(source, /await saveRepository\(next, modelOptionChanges\)/u);
+  assert.match(source, /markModelOptionsChanged\("coordinator", "router", "analyst"\)/u);
+  for (const role of ["coordinator", "router", "analyst"]) {
+    assert.match(source, new RegExp(`markModelOptionsChanged\\("${role}"\\)`, "u"));
   }
   assert.match(types, /model_options\?: ModelOptions;\n  prompt_mode:/u);
 });

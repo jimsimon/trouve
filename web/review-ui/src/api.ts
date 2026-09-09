@@ -121,7 +121,16 @@ export const requestReview = (job: ReviewJob): Promise<ReviewJob> =>
       pull_number: job.pull_number,
     }),
   });
-export const saveRepository = (repository: Repository): Promise<Repository> =>
+export interface RepositoryModelOptionChanges {
+  coordinator?: boolean;
+  router?: boolean;
+  analyst?: boolean;
+}
+
+export const saveRepository = (
+  repository: Repository,
+  changedModelOptions: RepositoryModelOptionChanges = {},
+): Promise<Repository> =>
   api("/code-review/repository", {
     method: "PUT",
     body: JSON.stringify({
@@ -134,10 +143,16 @@ export const saveRepository = (repository: Repository): Promise<Repository> =>
       router_thinking_level: repository.router_thinking_level || null,
       analyst_model: repository.analyst_model || null,
       analyst_thinking_level: repository.analyst_thinking_level || null,
-      // Always sent as maps: an empty map clears stale options server-side.
-      coordinator_model_options: repository.coordinator_model_options ?? {},
-      router_model_options: repository.router_model_options ?? {},
-      analyst_model_options: repository.analyst_model_options ?? {},
+      // Omission preserves server state; an intentional clear sends {}.
+      ...(changedModelOptions.coordinator
+        ? { coordinator_model_options: repository.coordinator_model_options ?? {} }
+        : {}),
+      ...(changedModelOptions.router
+        ? { router_model_options: repository.router_model_options ?? {} }
+        : {}),
+      ...(changedModelOptions.analyst
+        ? { analyst_model_options: repository.analyst_model_options ?? {} }
+        : {}),
       prompt: repository.prompt,
       reviewer_ids: repository.reviewer_ids,
       routing_mode: repository.routing_mode,
