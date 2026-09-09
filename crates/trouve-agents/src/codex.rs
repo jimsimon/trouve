@@ -14,7 +14,11 @@
 //!   `thread/tokenUsage/updated`, `turn/completed`
 //! - server-initiated approval requests:
 //!   `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`
-//!   answered with `{ decision: "accept" | "decline" }`
+//!   answered with `{ decision: "accept" | "decline" }`, and
+//!   `mcpServer/elicitation/request` for MCP tool approvals, answered with
+//!   `{ action: "accept" | "decline" }`. Trouve's own bridge server is
+//!   pre-approved in config; user-configured servers prompt on every call so
+//!   trouve's permission gate decides for them.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::process::Stdio;
@@ -106,11 +110,32 @@ fn sandbox_settings(
     (sandbox, policy)
 }
 
-fn approval_policy(permission: BackendPermission, full_tool_bridge: bool) -> &'static str {
+/// Codex's approval policy for one turn.
+///
+/// Full-bridge turns must never see a native approval prompt: trouve's
+/// permission layer approves bridged mutations inside the MCP call, and a
+/// duplicate Codex prompt could hold a vendor request open ahead of the
+/// engine's execution lane. `never` achieved that, but Codex 0.153+ also
+/// applies it to MCP tool approvals, denying user-configured MCP servers
+/// outright ("MCP tool call requires approval, but approval policy is
+/// never"). The granular form keeps every native prompt forbidden while
+/// letting MCP approvals surface as `mcpServer/elicitation/request`, which
+/// the stream relays to trouve's gate so those servers follow the thread's
+/// permission mode (read-only denies, Ask prompts once per server, Yolo
+/// allows) exactly like trouve's own MCP client.
+fn approval_policy(permission: BackendPermission, full_tool_bridge: bool) -> Value {
     if full_tool_bridge {
-        "never"
+        json!({
+            "granular": {
+                "sandbox_approval": false,
+                "rules": false,
+                "skill_approval": false,
+                "request_permissions": false,
+                "mcp_elicitations": true,
+            }
+        })
     } else {
-        permission_settings(permission).0
+        json!(permission_settings(permission).0)
     }
 }
 
@@ -581,12 +606,20 @@ fn codex_config_override(turn: &crate::BackendTurn) -> Value {
     };
     let mut servers = serde_json::Map::new();
     for server in &turn.mcp_servers {
+        // User-configured servers follow the thread's trouve permission
+        // mode, not Codex's own policy. `prompt` makes Codex ask before every
+        // call; the stream relays that elicitation to trouve's gate, which
+        // denies in read-only modes, asks once per server per session in Ask
+        // mode, and allows in Yolo, matching trouve's native MCP client.
+        // Codex's default `auto` would instead silently approve tools that
+        // annotate themselves read-only.
         servers.insert(
             server.name.clone(),
             json!({
                 "command": server.command,
                 "args": server.args,
                 "env": env_map(&server.env),
+                "default_tools_approval_mode": "prompt",
             }),
         );
     }
@@ -594,14 +627,10 @@ fn codex_config_override(turn: &crate::BackendTurn) -> Value {
         // Streamable-HTTP server (`url` instead of `command` selects the
         // transport in codex's mcp_servers config shape).
         //
-        // Trouve's bridge tools carry no MCP annotations, so Codex's default
-        // `auto` approval mode treats every call as a write that needs the
-        // user's consent. Full-bridge turns run with `approvalPolicy: never`,
-        // under which Codex denies such calls outright ("MCP tool call
-        // requires approval, but approval policy is never") instead of
-        // raising the elicitation trouve would auto-accept. Mark the server
-        // pre-approved: trouve's own permission layer already gates every
-        // bridged mutation inside the call.
+        // Trouve's own bridge is pre-approved: its permission layer already
+        // gates every bridged mutation inside the call, so a Codex prompt
+        // would only duplicate it. (The tools also carry no MCP annotations,
+        // which Codex's default `auto` mode would treat as writes.)
         servers.insert(
             "trouve".into(),
             json!({ "url": bridge.url, "default_tools_approval_mode": "approve" }),
@@ -8150,9 +8179,20 @@ cat > /dev/null
         );
 
         let (sandbox, policy) = sandbox_settings(crate::BackendPermission::Ask, true);
+        // Full bridge: every native prompt is forbidden (equivalent to
+        // `never` for commands, patches, rules, and skills), but MCP
+        // elicitations still reach trouve's gate so user-configured servers
+        // follow the thread's permission mode instead of being denied.
+        let bridged = approval_policy(crate::BackendPermission::Ask, true);
+        assert_eq!(bridged["granular"]["sandbox_approval"], false);
+        assert_eq!(bridged["granular"]["rules"], false);
+        assert_eq!(bridged["granular"]["skill_approval"], false);
+        assert_eq!(bridged["granular"]["request_permissions"], false);
+        assert_eq!(bridged["granular"]["mcp_elicitations"], true);
         assert_eq!(
-            approval_policy(crate::BackendPermission::Ask, true),
-            "never"
+            approval_policy(crate::BackendPermission::ReadOnly, true),
+            bridged,
+            "the bridge policy does not vary by permission; trouve's gate applies it"
         );
         assert_eq!(sandbox, "read-only");
         assert_eq!(policy["type"], "readOnly");
@@ -8209,10 +8249,11 @@ cat > /dev/null
             "http://127.0.0.1:1/internal/threads/th_1/mcp?tools=0&approval=0"
         );
         assert!(servers["trouve"]["command"].is_null());
-        // Codex must not gate bridged calls behind its own approval flow:
-        // full-bridge turns use `approvalPolicy: never`, which would deny them.
+        // Trouve's bridge is pre-approved (its own permission layer gates the
+        // call); user servers prompt on every call so trouve's gate can apply
+        // the thread's permission mode to them.
         assert_eq!(servers["trouve"]["default_tools_approval_mode"], "approve");
-        assert!(servers["jira"]["default_tools_approval_mode"].is_null());
+        assert_eq!(servers["jira"]["default_tools_approval_mode"], "prompt");
 
         // User servers alone (no bridge) still produce an override.
         turn.mcp_bridge = None;
