@@ -62,6 +62,13 @@ fn dispatched_prompt_event(turn: u64, prompt: &trouve_protocol::QueuedPrompt) ->
 
 /// Safety valve: maximum provider round-trips within a single turn.
 const MAX_ITERATIONS: usize = 32;
+/// Safety valve for vendor backends: maximum extra vendor passes one turn may
+/// run to fold awaited subagent results back in. Native turns are bounded by
+/// `MAX_ITERATIONS` instead, since each fold-in consumes an iteration.
+const MAX_SUBAGENT_CONTINUATIONS: usize = 4;
+/// Per-child cap on the final message copied into the `await_subagents`
+/// digest and tool result; the full text stays on the child thread.
+const SUBAGENT_DIGEST_MESSAGE_BYTES: usize = 8 * 1024;
 /// Bound native provider fan-out so a malformed or over-eager response cannot
 /// monopolize the runtime. Results are still written to the provider
 /// transcript in request order.
@@ -2474,12 +2481,15 @@ struct PendingTurnSteerer {
     receiver: tokio::sync::mpsc::Receiver<SteerTurnCommand>,
     mutation_lane_state: tokio::sync::watch::Sender<SteerMutationLaneState>,
 }
+
 /// State carried into a follow-up vendor pass that runs inside the same
 /// trouve turn after awaited subagents finish.
 struct BackendTurnContinuation {
     usage: Usage,
+    /// Vendor passes already run after the first, checked against
+    /// `MAX_SUBAGENT_CONTINUATIONS`.
+    passes: usize,
 }
-
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SteerMutationLaneState {
@@ -14617,16 +14627,25 @@ impl Engine {
     /// Provider-native collaborators need no extra handling; the vendor
     /// turn that owns them stops with the parent.
     pub fn cancel_turn(&self, thread_id: &str) -> Result<(), EngineError> {
-        // Store read before the token lock: `cancel_turn` must never nest
+        // Trip the parent before reading its subtree. A spawn registers the
+        // child's token synchronously and then checks the parent token, so
+        // every child is covered by exactly one side of this ordering: it is
+        // either already in the snapshot below or its spawn observes the
+        // tripped parent and stops it. Reading first would leave a window
+        // where a child registered after the read slips past both. The store
+        // read stays outside the token lock: `cancel_turn` must never nest
         // the connection lock inside `turn_cancels`.
+        {
+            let cancels = self.turn_cancels.lock().unwrap();
+            let Some(token) = cancels.get(thread_id) else {
+                return Err(EngineError::BadRequest(format!(
+                    "no running turn to cancel on thread {thread_id}"
+                )));
+            };
+            token.cancel();
+        }
         let descendants = self.store.spawned_descendants(thread_id)?;
         let cancels = self.turn_cancels.lock().unwrap();
-        let Some(token) = cancels.get(thread_id) else {
-            return Err(EngineError::BadRequest(format!(
-                "no running turn to cancel on thread {thread_id}"
-            )));
-        };
-        token.cancel();
         for descendant in &descendants {
             if let Some(token) = cancels.get(&descendant.id) {
                 token.cancel();
@@ -17202,8 +17221,8 @@ impl Engine {
         // instead of all text merging into one leading bubble.
         let mut text = String::new();
         let mut segment = String::new();
-        let mut usage_total = continuation
-            .map(|continuation| continuation.usage)
+        let (mut usage_total, passes) = continuation
+            .map(|continuation| (continuation.usage, continuation.passes))
             .unwrap_or_default();
         // Vendor-native todo tools are reported as ordinary tool events.
         // Remember their names until completion so their result can update
@@ -18276,26 +18295,42 @@ impl Engine {
                 .await_spawned_descendants(thread, turn, &cancel)
                 .await?
         {
-            return Box::pin(self.run_backend_turn(
-                session,
-                thread,
+            if passes < MAX_SUBAGENT_CONTINUATIONS {
+                return Box::pin(self.run_backend_turn(
+                    session,
+                    thread,
+                    turn,
+                    mode,
+                    backend_id,
+                    backend,
+                    model_name,
+                    digest,
+                    Vec::new(),
+                    cancel,
+                    queued_prompt_id,
+                    tools_enabled,
+                    attach_background,
+                    provider_wait_ms,
+                    None,
+                    steer_mutation_lane_state,
+                    Some(BackendTurnContinuation {
+                        usage: usage_total,
+                        passes: passes + 1,
+                    }),
+                ))
+                .await;
+            }
+            // A model that spawns again on every fold-in could hold the turn
+            // open forever. The gate still waited for the last children, and
+            // their results are in the tool event and the transcript; the
+            // turn now completes without another vendor pass.
+            tracing::warn!(
+                thread_id = %thread.id,
                 turn,
-                mode,
-                backend_id,
-                backend,
-                model_name,
-                digest,
-                Vec::new(),
-                cancel,
-                queued_prompt_id,
-                tools_enabled,
-                attach_background,
-                provider_wait_ms,
-                None,
-                steer_mutation_lane_state,
-                Some(BackendTurnContinuation { usage: usage_total }),
-            ))
-            .await;
+                "subagent continuation limit ({MAX_SUBAGENT_CONTINUATIONS}) reached; completing turn"
+            );
+            self.store
+                .append_message(&thread.id, &serde_json::to_value(Message::User(digest))?)?;
         }
         if cancel.is_cancelled() {
             return Ok(());
@@ -19696,7 +19731,7 @@ impl Engine {
             awaited.len()
         );
         for child_id in &awaited {
-            let status = self.spawn_status(child_id)?;
+            let mut status = self.spawn_status(child_id)?;
             let title = self
                 .store
                 .thread(child_id)?
@@ -19714,13 +19749,24 @@ impl Engine {
             if let Some(error) = status["error"].as_str() {
                 digest.push_str(&format!("Error: {error}\n"));
             }
+            // Child answers are unbounded; keep the digest (which becomes
+            // prompt context) and the persisted tool result to a fixed
+            // per-child budget and point at the child thread for the rest.
             let last_message = status["last_message"].as_str().unwrap_or("").trim();
-            digest.push_str(if last_message.is_empty() {
-                "(no final message)\n"
+            if last_message.is_empty() {
+                digest.push_str("(no final message)\n");
+            } else if last_message.len() > SUBAGENT_DIGEST_MESSAGE_BYTES {
+                let capped = cap_chars(last_message, SUBAGENT_DIGEST_MESSAGE_BYTES);
+                digest.push_str(&format!(
+                    "{capped}\n(final message truncated at {SUBAGENT_DIGEST_MESSAGE_BYTES} bytes; \
+                     read thread {child_id} with search_transcript for the rest)\n"
+                ));
+                status["last_message"] = serde_json::json!(capped);
+                status["last_message_truncated"] = serde_json::json!(true);
             } else {
-                last_message
-            });
-            digest.push('\n');
+                digest.push_str(last_message);
+                digest.push('\n');
+            }
             results.push(status);
         }
         digest.push_str(
@@ -25229,6 +25275,68 @@ mod tests {
             }
         ));
         assert_eq!(events.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn await_spawned_descendants_caps_each_child_message() {
+        let (engine, _temp, parent, child) = await_subagents_fixture("cap");
+        // Already finished, but not yet observed as such: mark it active and
+        // release it from a task so the gate sees a running child first.
+        engine
+            .active_threads
+            .lock()
+            .unwrap()
+            .insert(child.id.clone(), parent.session_id.clone());
+        let long_message = format!("{}END", "x".repeat(SUBAGENT_DIGEST_MESSAGE_BYTES * 2));
+        engine
+            .store
+            .append_events(
+                Scope::Thread(child.id.clone()),
+                vec![
+                    Event::AssistantMessage {
+                        turn: 1,
+                        content: long_message.clone(),
+                    },
+                    Event::TurnCompleted {
+                        turn: 1,
+                        checkpoint_id: None,
+                        usage: Usage::default(),
+                    },
+                ],
+            )
+            .unwrap();
+        let releaser = Arc::clone(&engine);
+        let child_id = child.id.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            releaser.active_threads.lock().unwrap().remove(&child_id);
+        });
+        let cancel = tokio_util::sync::CancellationToken::new();
+
+        let digest = tokio::time::timeout(
+            Duration::from_secs(5),
+            engine.await_spawned_descendants(&parent, 1, &cancel),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+        assert!(!digest.contains("END"), "digest must not carry the whole message");
+        assert!(digest.contains("final message truncated"));
+        assert!(digest.contains(&child.id));
+        assert!(digest.len() < long_message.len());
+        let events = parent_events(&engine, &parent);
+        let result = events
+            .iter()
+            .find_map(|event| match event {
+                Event::ToolCompleted { result, .. } => Some(result.clone()),
+                _ => None,
+            })
+            .expect("await_subagents tool result");
+        let reported = &result["subagents"][0];
+        assert_eq!(reported["last_message_truncated"], true);
+        assert!(reported["last_message"].as_str().unwrap().len() < long_message.len());
     }
 
     #[tokio::test]

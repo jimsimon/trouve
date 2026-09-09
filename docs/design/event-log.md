@@ -166,8 +166,11 @@ Thread scope:
   tool call (`tool.requested` → `tool.started` → `tool.completed` listing each
   child's final status), flips the phase to `waiting_for_subagents`, and once
   the subtree is idle feeds the children's results back to the model in the
-  same turn so its final answer covers their work. Cancelling the parent
-  cancels the running descendants and aborts the wait.
+  same turn so its final answer covers their work. Each child's final message
+  is capped in the digest and tool result (the full text stays on the child
+  thread), and the number of fold-in passes per turn is bounded so a model that
+  spawns again on every pass cannot hold the turn open indefinitely. Cancelling
+  the parent cancels the running descendants and aborts the wait.
 - `user.message` `{turn, content}` — user-authored input only; the legacy
   `background` field is read solely when replaying protocol 7.19–7.26 logs
 - `turn.background_activity` `{turn}` — the server attached a turn to
