@@ -109,6 +109,7 @@ license review deliberately change that policy.
 | axe-core | 4.12.1 | MPL-2.0 | development |
 | bail | 2.0.2 | MIT | runtime/transitive |
 | balanced-match | 1.0.2 | MIT | development |
+| beautiful-mermaid | 1.1.3 | MIT | runtime/transitive |
 | brace-expansion | 2.1.4 | MIT | development |
 | ccount | 2.0.1 | MIT | runtime/transitive |
 | chai | 6.2.2 | MIT | development |
@@ -128,8 +129,10 @@ license review deliberately change that policy.
 | dequal | 2.0.3 | MIT | runtime/transitive |
 | detect-libc | 2.1.2 | Apache-2.0 | development |
 | devlop | 1.1.0 | MIT | runtime/transitive |
+| elkjs | 0.11.1 | EPL-2.0 | runtime/transitive |
 | enhanced-resolve | 5.24.5 | MIT | runtime/transitive |
 | entities | 6.0.1 | BSD-2-Clause | runtime/transitive |
+| entities | 7.0.1 | BSD-2-Clause | runtime/transitive |
 | es-module-lexer | 2.3.1 | MIT | development |
 | escape-string-regexp | 5.0.0 | MIT | runtime/transitive |
 | estree-walker | 3.0.3 | MIT | development |

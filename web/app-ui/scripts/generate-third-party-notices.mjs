@@ -15,6 +15,11 @@ const approvedLicenses = new Set([
   "Apache-2.0",
   "BSD-2-Clause",
   "BSD-3-Clause",
+  // Weak, file-scoped copyleft (elkjs, the Mermaid layout engine). Approved
+  // on the same basis as MPL-2.0: the library ships unmodified as a separate
+  // module and its notice is reproduced below. Patching it would require
+  // publishing the changes under EPL-2.0.
+  "EPL-2.0",
   "ISC",
   "MIT",
   "MPL-2.0",

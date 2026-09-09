@@ -152,6 +152,18 @@ export default defineConfig(({ mode }) => {
               : "assets/[name]-[hash].js",
           chunkFileNames: "assets/[name]-[hash].js",
           assetFileNames: "assets/[name]-[hash][extname]",
+          // The Mermaid diagram engine (ELK layout plus its parser) is only
+          // fetched when a response contains a `mermaid` fence. Give it a
+          // stable chunk name so the bundle budget can account for it as an
+          // on-demand download instead of part of the always-loaded graph.
+          advancedChunks: {
+            groups: [
+              {
+                name: "diagram-engine",
+                test: /node_modules[\\/](?:beautiful-mermaid|elkjs|entities)[\\/]/u,
+              },
+            ],
+          },
         },
       },
     },
