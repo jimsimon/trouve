@@ -1659,9 +1659,15 @@ async fn stage_codex_release_binary(
     untar_gz(bytes, &unpack_dir, progress).await?;
     let mut cleanup = PathCleanup::new(unpack_dir.clone());
     let unpacked = unpack_dir.join(format!("{name}-{triple}"));
-    if !unpacked.is_file() {
+    // The entry itself must be a regular file. A symlink to a sibling passes
+    // the archive containment checks, but publishing it would leave a dangling
+    // link once the unpack directory is removed.
+    if !matches!(
+        std::fs::symlink_metadata(&unpacked),
+        Ok(metadata) if metadata.file_type().is_file()
+    ) {
         return Err(InstallError::Download(format!(
-            "{name}-{triple}.tar.gz had no {name}-{triple}"
+            "{name}-{triple}.tar.gz had no regular file {name}-{triple}"
         )));
     }
     let published = dir.join(name);
@@ -2398,6 +2404,59 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
         assert_eq!(
             std::fs::read(dir.path().join(CODEX_CODE_MODE_HOST)).unwrap(),
             b"host"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_release_archive_with_a_symlinked_binary_is_rejected() {
+        let triple = "x86_64-unknown-linux-musl";
+        // A regular file plus an expected-name symlink pointing at it: the
+        // link stays inside the extraction directory, so containment checks
+        // accept it, but publishing it would dangle after cleanup.
+        let mut buf = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut buf);
+            let mut file = tar::Header::new_gnu();
+            file.set_size(4);
+            file.set_mode(0o755);
+            file.set_cksum();
+            builder
+                .append_data(&mut file, "real", b"host".as_slice())
+                .unwrap();
+            let mut link = tar::Header::new_gnu();
+            link.set_entry_type(tar::EntryType::Symlink);
+            link.set_size(0);
+            link.set_mode(0o777);
+            builder
+                .append_link(&mut link, format!("codex-{triple}"), "real")
+                .unwrap();
+            builder.finish().unwrap();
+        }
+        let mut gz = Vec::new();
+        {
+            use std::io::Write;
+            let mut enc = flate2::write::GzEncoder::new(&mut gz, flate2::Compression::default());
+            enc.write_all(&buf).unwrap();
+            enc.finish().unwrap();
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let progress = Arc::new(Progress::default());
+        let error = stage_codex_release_binary(gz, dir.path(), triple, "codex", &progress)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, InstallError::Download(m) if m.contains("regular file")),
+            "unexpected error: {error}"
+        );
+        assert!(
+            dir.path().join("codex").symlink_metadata().is_err(),
+            "a symlinked binary was published"
+        );
+        assert!(
+            !dir.path().join(".unpack-codex").exists(),
+            "the rejected unpack directory was left behind"
         );
     }
 
