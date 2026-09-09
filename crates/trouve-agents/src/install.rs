@@ -191,21 +191,40 @@ pub enum InstallError {
     Io(#[from] std::io::Error),
 }
 
-/// Shared byte-level progress for one download, readable while the
-/// transfer runs. `total` is 0 until (unless) the server reports a
-/// Content-Length. Setting `cancel` makes the transfer stop at the next
-/// chunk with [`InstallError::Cancelled`].
+/// Shared byte-level progress for one install, readable while its transfers
+/// run. `received` and `total` accumulate across every artifact the install
+/// downloads (Codex fetches two). `total` is 0 until a server reports a
+/// Content-Length, and stays 0 (indeterminate) once any artifact arrives
+/// without one, so a partial total never makes `received` overshoot it.
+/// Setting `cancel` makes the transfer stop at the next chunk with
+/// [`InstallError::Cancelled`].
 #[derive(Debug, Default)]
 pub struct Progress {
     pub received: std::sync::atomic::AtomicU64,
     pub total: std::sync::atomic::AtomicU64,
     pub cancel: std::sync::atomic::AtomicBool,
+    indeterminate: std::sync::atomic::AtomicBool,
     activation_committed: std::sync::Mutex<bool>,
 }
 
 impl Progress {
     pub fn cancelled(&self) -> bool {
         self.cancel.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Fold one artifact's announced length into the install-wide total.
+    fn add_expected_bytes(&self, len: Option<u64>) {
+        use std::sync::atomic::Ordering::Relaxed;
+        match len {
+            Some(len) if !self.indeterminate.load(Relaxed) => {
+                self.total.fetch_add(len, Relaxed);
+            }
+            Some(_) => {}
+            None => {
+                self.indeterminate.store(true, Relaxed);
+                self.total.store(0, Relaxed);
+            }
+        }
     }
 
     /// Linearize an external cancellation request against managed-runtime
@@ -480,14 +499,14 @@ async fn get_bytes(url: &str, progress: &Progress, limit: usize) -> Result<Vec<u
     use std::sync::atomic::Ordering::Relaxed;
 
     let resp = get_response(url, Some(progress)).await?;
-    if let Some(len) = resp.content_length() {
-        if len > limit as u64 {
-            return Err(InstallError::Download(format!(
-                "{url}: response exceeded {limit} bytes"
-            )));
-        }
-        progress.total.store(len, Relaxed);
+    if let Some(len) = resp.content_length()
+        && len > limit as u64
+    {
+        return Err(InstallError::Download(format!(
+            "{url}: response exceeded {limit} bytes"
+        )));
     }
+    progress.add_expected_bytes(resp.content_length());
     let mut out = Vec::new();
     let mut stream = resp.bytes_stream();
     loop {
@@ -1620,9 +1639,13 @@ async fn install_into(
     }
 }
 
-/// Unpack one Codex release tarball into `dir` and publish its single binary
+/// Unpack one Codex release tarball and publish its single binary into `dir`
 /// under its plain `name`. Release archives hold the binary as
 /// `<name>-<triple>`; Codex expects the triple-less name next to `codex`.
+///
+/// The archive is extracted into a private subdirectory and only the expected
+/// entry is moved out, so a later archive cannot overwrite a binary an earlier
+/// one already published (a host tarball carrying a stray `codex`, say).
 async fn stage_codex_release_binary(
     bytes: Vec<u8>,
     dir: &Path,
@@ -1630,8 +1653,12 @@ async fn stage_codex_release_binary(
     name: &str,
     progress: &Arc<Progress>,
 ) -> Result<(), InstallError> {
-    untar_gz(bytes, dir, progress).await?;
-    let unpacked = dir.join(format!("{name}-{triple}"));
+    let unpack_dir = dir.join(format!(".unpack-{name}"));
+    std::fs::create_dir_all(&unpack_dir)?;
+    // untar_gz removes its extraction directory when it fails.
+    untar_gz(bytes, &unpack_dir, progress).await?;
+    let mut cleanup = PathCleanup::new(unpack_dir.clone());
+    let unpacked = unpack_dir.join(format!("{name}-{triple}"));
     if !unpacked.is_file() {
         return Err(InstallError::Download(format!(
             "{name}-{triple}.tar.gz had no {name}-{triple}"
@@ -1640,6 +1667,8 @@ async fn stage_codex_release_binary(
     let published = dir.join(name);
     std::fs::rename(&unpacked, &published)?;
     make_executable(&published)?;
+    cleanup.disarm();
+    std::fs::remove_dir_all(&unpack_dir)?;
     Ok(())
 }
 
@@ -2312,6 +2341,14 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
             b"host"
         );
         assert!(!dir.path().join(format!("codex-{triple}")).exists());
+        assert!(
+            !dir.path().join(".unpack-codex").exists()
+                && !dir
+                    .path()
+                    .join(format!(".unpack-{CODEX_CODE_MODE_HOST}"))
+                    .exists(),
+            "unpack directories were left in the generation"
+        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -2323,6 +2360,60 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
                 assert_eq!(mode & 0o111, 0o111, "{name} is not executable");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn codex_release_archive_cannot_overwrite_an_earlier_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let progress = Arc::new(Progress::default());
+        let triple = "x86_64-unknown-linux-musl";
+        stage_codex_release_binary(
+            gzipped_tar(&[(&format!("codex-{triple}"), b"cli".as_slice())]),
+            dir.path(),
+            triple,
+            "codex",
+            &progress,
+        )
+        .await
+        .unwrap();
+        // A host archive carrying a stray `codex` entry must not replace the
+        // CLI published from the first archive.
+        stage_codex_release_binary(
+            gzipped_tar(&[
+                ("codex", b"impostor".as_slice()),
+                (
+                    &format!("{CODEX_CODE_MODE_HOST}-{triple}"),
+                    b"host".as_slice(),
+                ),
+            ]),
+            dir.path(),
+            triple,
+            CODEX_CODE_MODE_HOST,
+            &progress,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(std::fs::read(dir.path().join("codex")).unwrap(), b"cli");
+        assert_eq!(
+            std::fs::read(dir.path().join(CODEX_CODE_MODE_HOST)).unwrap(),
+            b"host"
+        );
+    }
+
+    #[test]
+    fn progress_totals_accumulate_across_artifacts() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let progress = Progress::default();
+        progress.add_expected_bytes(Some(10));
+        progress.add_expected_bytes(Some(5));
+        assert_eq!(progress.total.load(Relaxed), 15);
+
+        // One artifact without a length makes the whole install indeterminate.
+        progress.add_expected_bytes(None);
+        assert_eq!(progress.total.load(Relaxed), 0);
+        progress.add_expected_bytes(Some(7));
+        assert_eq!(progress.total.load(Relaxed), 0);
     }
 
     #[tokio::test]
