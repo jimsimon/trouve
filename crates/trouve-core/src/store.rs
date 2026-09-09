@@ -14030,7 +14030,7 @@ impl Store {
         let mut changed = false;
         for (finding_id, checked) in states {
             let applied = if *checked {
-                tx.execute(
+                let dismissed = tx.execute(
                     "UPDATE code_review_findings
                      SET status = 'dismissed',
                          dismiss_reason = 'maintainer checked the dismissal box',
@@ -14046,7 +14046,13 @@ impl Store {
                            AND job.review_published = 1
                        )",
                     params![finding_id, now, repository, pull_number as i64],
-                )?
+                )?;
+                // A dismissed grouped sibling may have been the last thing
+                // holding its primary's shared thread open.
+                if dismissed > 0 {
+                    rearm_grouped_primary_collapses(&tx, "sibling.id = ?1", finding_id)?;
+                }
+                dismissed
             } else {
                 let restored = tx.execute(
                     "UPDATE code_review_findings
@@ -14244,6 +14250,9 @@ impl Store {
                  WHERE id = ?1",
                 params![finding_id, dismiss_reason, now],
             )?;
+            // A dismissed grouped sibling may have been the last thing
+            // holding its primary's shared thread open.
+            rearm_grouped_primary_collapses(&tx, "sibling.id = ?1", &finding_id)?;
         } else {
             tx.execute(
                 "UPDATE code_review_findings
@@ -27066,14 +27075,29 @@ mod tests {
                 &job.id,
                 "summary",
                 "fix the root cause",
-                2,
-                &[finding("src/primary.rs"), finding("src/grouped.rs")],
-                &[Default::default(), Default::default()],
+                3,
+                &[
+                    finding("src/primary.rs"),
+                    finding("src/grouped-a.rs"),
+                    finding("src/grouped-b.rs"),
+                ],
+                &[Default::default(), Default::default(), Default::default()],
                 &[],
                 &[],
             )
             .unwrap();
-        let (primary, grouped) = (findings[0].clone(), findings[1].clone());
+        let by_path = |path: &str| {
+            findings
+                .iter()
+                .find(|finding| finding.path == path)
+                .cloned()
+                .unwrap()
+        };
+        let (primary, grouped_a, grouped_b) = (
+            by_path("src/primary.rs"),
+            by_path("src/grouped-a.rs"),
+            by_path("src/grouped-b.rs"),
+        );
         assert!(store.claim_code_review_publication(&job.id).unwrap());
         assert!(
             store
@@ -27081,7 +27105,8 @@ mod tests {
                     &job.id,
                     &[
                         (&primary.id, &primary.id, "inline"),
-                        (&grouped.id, &primary.id, "grouped_inline"),
+                        (&grouped_a.id, &primary.id, "grouped_inline"),
+                        (&grouped_b.id, &primary.id, "grouped_inline"),
                     ],
                 )
                 .unwrap()
@@ -27121,11 +27146,42 @@ mod tests {
                 .unwrap()
         );
         assert!(state(&primary.id).thread_collapse.is_none());
+
+        // Maintainer dismissals close grouped siblings too: the lifecycle
+        // checkbox closes one, and the primary stays open for the other.
+        let (changed, _) = store
+            .apply_lifecycle_dismissal_states(
+                &job.repository,
+                job.pull_number,
+                "2026-09-09T00:00:00Z",
+                &[(grouped_a.id.clone(), true)],
+            )
+            .unwrap();
+        assert!(changed);
+        assert_eq!(state(&grouped_a.id).status, "dismissed");
         assert!(
-            store
-                .resolve_code_review_finding(&grouped.id, "dismissed", &job.head_sha, &job.id)
-                .unwrap()
+            state(&primary.id).thread_collapse.is_none(),
+            "another grouped sibling is still open"
         );
+
+        // A threadless resolve command closes the last sibling and arms the
+        // shared thread's collapse.
+        let command = PendingThreadlessCommand {
+            trigger_key: String::new(),
+            repository: job.repository.clone(),
+            pull_number: job.pull_number,
+            comment_id: 100,
+            author: "jim".into(),
+            resolve: true,
+            finding_prefix: grouped_b.id.clone(),
+            reason: "because".into(),
+            created_at: String::new(),
+        };
+        let (outcome, _) = store
+            .apply_threadless_resolve_command(&command, "won't fix", None)
+            .unwrap();
+        assert!(matches!(outcome, ThreadlessCommandOutcome::Applied { .. }));
+        assert_eq!(state(&grouped_b.id).status, "dismissed");
         assert!(
             state(&primary.id)
                 .thread_collapse

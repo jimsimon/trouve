@@ -7416,13 +7416,10 @@ impl Engine {
             )?;
         // Persist why each carried finding stayed open so the check run,
         // lifecycle comment, dashboard, and the next round's coordinator
-        // can all cite it.
-        let carried_verdicts = parsed
-            .carried_findings
-            .iter()
-            .filter(|verdict| !parsed.resolved_finding_ids.contains(&verdict.finding_id))
-            .map(|verdict| (verdict.finding_id.as_str(), verdict.reason.as_str()))
-            .collect::<Vec<_>>();
+        // can all cite it. The record covers every unresolved open finding,
+        // with a fallback where the coordinator gave no verdict, so an
+        // older round's reason never survives as the latest word.
+        let carried_verdicts = carried_verdict_records(&previous_findings, &parsed);
         self.store
             .record_code_review_carried_verdicts(&job.id, &carried_verdicts)?;
         // Remote cleanup is detached from the round entirely: it starts only
@@ -14811,29 +14808,64 @@ struct CarriedOpenFinding<'a> {
     reason: &'a str,
 }
 
-/// The still-open blocking findings from earlier rounds that `output` did
-/// not resolve, paired with its `still_open` reasons. Only gating findings
-/// are included: the review body is a blocking-only surface.
-fn carried_open_findings<'a>(
+/// Reason recorded for a carried finding the coordinator left open without
+/// a verdict of its own. Every open finding is stamped with this round's
+/// head either way, so no surface can present an older round's explanation
+/// as the current one.
+const CARRIED_VERDICT_FALLBACK_REASON: &str =
+    "The final editor recorded no verdict for this finding at this revision; no fix was verified.";
+
+/// This round's verdict record for every open finding from earlier rounds
+/// that `output` did not resolve: the coordinator's `still_open` reason
+/// when it gave one, the fallback otherwise. Exhaustive by construction, so
+/// persisting it supersedes every earlier round's verdict.
+fn carried_verdict_records<'a>(
     previous_findings: &'a [trouve_protocol::CodeReviewFinding],
     output: &'a ReviewOutput,
-) -> Vec<CarriedOpenFinding<'a>> {
+) -> Vec<(&'a str, &'a str)> {
     let reason_by_id = output
         .carried_findings
         .iter()
+        .filter(|verdict| !verdict.reason.is_empty())
         .map(|verdict| (verdict.finding_id.as_str(), verdict.reason.as_str()))
         .collect::<HashMap<_, _>>();
     previous_findings
         .iter()
         .filter(|finding| {
-            finding.status == "open"
-                && !output.resolved_finding_ids.contains(&finding.id)
+            finding.status == "open" && !output.resolved_finding_ids.contains(&finding.id)
+        })
+        .map(|finding| {
+            (
+                finding.id.as_str(),
+                reason_by_id
+                    .get(finding.id.as_str())
+                    .copied()
+                    .unwrap_or(CARRIED_VERDICT_FALLBACK_REASON),
+            )
+        })
+        .collect()
+}
+
+/// The still-open blocking findings from earlier rounds that `output` did
+/// not resolve, paired with this round's reasons. Only gating findings are
+/// included: the review body is a blocking-only surface.
+fn carried_open_findings<'a>(
+    previous_findings: &'a [trouve_protocol::CodeReviewFinding],
+    output: &'a ReviewOutput,
+) -> Vec<CarriedOpenFinding<'a>> {
+    let reason_by_id = carried_verdict_records(previous_findings, output)
+        .into_iter()
+        .collect::<HashMap<_, _>>();
+    previous_findings
+        .iter()
+        .filter(|finding| {
+            reason_by_id.contains_key(finding.id.as_str())
                 && finding_is_blocking(&finding.severity, &finding.confidence)
                 && finding_gates(&finding.evidence, finding.origin)
         })
         .map(|finding| CarriedOpenFinding {
             finding,
-            reason: reason_by_id.get(finding.id.as_str()).copied().unwrap_or(""),
+            reason: reason_by_id[finding.id.as_str()],
         })
         .collect()
 }
@@ -14848,11 +14880,7 @@ fn render_carried_open_finding(job_head: &str, carried: &CarriedOpenFinding<'_>)
         .get(..8)
         .unwrap_or(&finding.observed_head);
     let head = job_head.get(..8).unwrap_or(job_head);
-    let reason = if carried.reason.trim().is_empty() {
-        "This round did not verify a fix at this revision.".to_owned()
-    } else {
-        safe_public_model_markdown(carried.reason, CARRIED_VERDICT_REASON_MAX_BYTES, "…")
-    };
+    let reason = safe_public_model_markdown(carried.reason, CARRIED_VERDICT_REASON_MAX_BYTES, "…");
     let origin = if finding.github_comment_url.is_empty() {
         "Reported under a shared root-cause comment; the trouve dashboard has its full text."
             .to_owned()
@@ -24368,7 +24396,7 @@ rename to src/new.rs
                 "Original comment: https://github.com/acme/widgets/pull/42#discussion_r7"
             )
         );
-        assert!(body.contains("This round did not verify a fix at this revision."));
+        assert!(body.contains(CARRIED_VERDICT_FALLBACK_REASON));
         assert!(!body.contains("<script>"), "model text is escaped");
         assert!(
             rendered_ids.is_empty(),
@@ -24381,6 +24409,47 @@ rename to src/new.rs
         assert_eq!(
             clean["body"].as_str().unwrap(),
             inline_review_marker(&job.id)
+        );
+    }
+
+    #[test]
+    fn every_unresolved_carried_finding_gets_this_rounds_verdict_record() {
+        let mut explained = open_history_finding("rvf_explained", "src/lib.rs", 1, "high");
+        explained.carried_verdict = Some(trouve_protocol::CodeReviewCarriedVerdict {
+            job_id: "rv_older".into(),
+            head_sha: "b".repeat(40),
+            reason: "an older round's reason".into(),
+        });
+        let mut omitted = open_history_finding("rvf_omitted", "src/lib.rs", 2, "high");
+        omitted.carried_verdict = explained.carried_verdict.clone();
+        let resolved = open_history_finding("rvf_resolved", "src/lib.rs", 3, "high");
+        let mut fixed = open_history_finding("rvf_fixed", "src/lib.rs", 4, "high");
+        fixed.status = "fixed".into();
+        let output = review_output_with_carried(
+            vec!["rvf_resolved".into()],
+            vec![
+                carried_verdict(
+                    "rvf_explained",
+                    "still_open",
+                    "Error text is still uncapped.",
+                ),
+                carried_verdict(
+                    "rvf_resolved",
+                    "still_open",
+                    "contradicted by the resolution",
+                ),
+            ],
+        );
+        let previous = [explained, omitted, resolved, fixed];
+        let records = carried_verdict_records(&previous, &output);
+        assert_eq!(
+            records,
+            [
+                ("rvf_explained", "Error text is still uncapped."),
+                ("rvf_omitted", CARRIED_VERDICT_FALLBACK_REASON),
+            ],
+            "an omitted open finding gets this round's fallback instead of keeping an \
+             older round's reason; resolved and closed findings get nothing"
         );
     }
 
