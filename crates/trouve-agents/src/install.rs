@@ -20,7 +20,10 @@
 //!   `SHA256SUMS.txt` is checked as corroborating metadata, not trusted alone
 //! - claude: `downloads.claude.ai/claude-code-releases` (`latest` + manifest
 //!   with sha256 checksums; single static binary)
-//! - codex: GitHub `openai/codex` latest release tarball (musl build on Linux)
+//! - codex: GitHub `openai/codex` latest release tarballs (musl builds on
+//!   Linux): the `codex` CLI plus its `codex-code-mode-host` sidecar, which
+//!   Codex resolves next to its own executable and which code-mode-only
+//!   models need for every tool call
 
 use std::fmt::Write as _;
 use std::path::{Component, Path, PathBuf};
@@ -45,6 +48,13 @@ static RUNTIME_INSTALL_RESOURCE: tokio::sync::Semaphore = tokio::sync::Semaphore
 const MAX_RETAINED_RUNTIME_GENERATIONS: usize = 8;
 const CANCEL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 const CURSOR_SDK_BRIDGE_REVIEWED_VERSION: &str = "1.0.28";
+/// Codex's code-mode host. Codex looks for it beside its own executable and,
+/// for models whose catalog entry is `code_mode_only`, routes every nested tool
+/// call through it, so a generation without it cannot run those models.
+const CODEX_CODE_MODE_HOST: &str = "codex-code-mode-host";
+/// Every executable a Codex release generation must carry, in the order
+/// installed. Each is a separate `<name>-<triple>.tar.gz` release asset.
+const CODEX_RELEASE_BINARIES: [&str; 2] = ["codex", CODEX_CODE_MODE_HOST];
 
 fn cursor_sdk_bridge_reviewed_checksum(version: &str, asset: &str) -> Option<&'static str> {
     if version != CURSOR_SDK_BRIDGE_REVIEWED_VERSION {
@@ -143,6 +153,28 @@ impl CliId {
             Self::LlamaServer => &["local"],
         }
     }
+
+    /// Sidecar executables the runtime expects beside its main binary. A
+    /// generation missing one is installed but not fully functional.
+    pub fn companion_executables(&self) -> &'static [&'static str] {
+        match self {
+            Self::Codex => &[CODEX_CODE_MODE_HOST],
+            Self::CursorSdkBridge | Self::Claude | Self::LlamaServer => &[],
+        }
+    }
+}
+
+/// Whether an active install carries every companion executable its runtime
+/// needs. Generations published before a sidecar became part of the release
+/// layout report `false`, and reinstalling the same version repairs them.
+pub fn install_complete(id: CliId, installed: &InstalledCli) -> bool {
+    let bin = Path::new(&installed.bin);
+    let Some(directory) = bin.parent() else {
+        return id.companion_executables().is_empty();
+    };
+    id.companion_executables()
+        .iter()
+        .all(|name| directory.join(name).is_file())
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -159,21 +191,40 @@ pub enum InstallError {
     Io(#[from] std::io::Error),
 }
 
-/// Shared byte-level progress for one download, readable while the
-/// transfer runs. `total` is 0 until (unless) the server reports a
-/// Content-Length. Setting `cancel` makes the transfer stop at the next
-/// chunk with [`InstallError::Cancelled`].
+/// Shared byte-level progress for one install, readable while its transfers
+/// run. `received` and `total` accumulate across every artifact the install
+/// downloads (Codex fetches two). `total` is 0 until a server reports a
+/// Content-Length, and stays 0 (indeterminate) once any artifact arrives
+/// without one, so a partial total never makes `received` overshoot it.
+/// Setting `cancel` makes the transfer stop at the next chunk with
+/// [`InstallError::Cancelled`].
 #[derive(Debug, Default)]
 pub struct Progress {
     pub received: std::sync::atomic::AtomicU64,
     pub total: std::sync::atomic::AtomicU64,
     pub cancel: std::sync::atomic::AtomicBool,
+    indeterminate: std::sync::atomic::AtomicBool,
     activation_committed: std::sync::Mutex<bool>,
 }
 
 impl Progress {
     pub fn cancelled(&self) -> bool {
         self.cancel.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Fold one artifact's announced length into the install-wide total.
+    fn add_expected_bytes(&self, len: Option<u64>) {
+        use std::sync::atomic::Ordering::Relaxed;
+        match len {
+            Some(len) if !self.indeterminate.load(Relaxed) => {
+                self.total.fetch_add(len, Relaxed);
+            }
+            Some(_) => {}
+            None => {
+                self.indeterminate.store(true, Relaxed);
+                self.total.store(0, Relaxed);
+            }
+        }
     }
 
     /// Linearize an external cancellation request against managed-runtime
@@ -448,14 +499,14 @@ async fn get_bytes(url: &str, progress: &Progress, limit: usize) -> Result<Vec<u
     use std::sync::atomic::Ordering::Relaxed;
 
     let resp = get_response(url, Some(progress)).await?;
-    if let Some(len) = resp.content_length() {
-        if len > limit as u64 {
-            return Err(InstallError::Download(format!(
-                "{url}: response exceeded {limit} bytes"
-            )));
-        }
-        progress.total.store(len, Relaxed);
+    if let Some(len) = resp.content_length()
+        && len > limit as u64
+    {
+        return Err(InstallError::Download(format!(
+            "{url}: response exceeded {limit} bytes"
+        )));
     }
+    progress.add_expected_bytes(resp.content_length());
     let mut out = Vec::new();
     let mut stream = resp.bytes_stream();
     loop {
@@ -1555,15 +1606,17 @@ async fn install_into(
         }
         CliId::Codex => {
             let triple = codex_triple()?;
-            let url = format!(
-                "https://github.com/openai/codex/releases/download/rust-v{version}/codex-{triple}.tar.gz"
-            );
-            let bytes = get_bytes(&url, progress, MAX_RUNTIME_DOWNLOAD_BYTES).await?;
-            untar_gz(bytes, dir, progress).await?;
-            let rel = PathBuf::from("codex");
-            std::fs::rename(dir.join(format!("codex-{triple}")), dir.join(&rel))?;
-            make_executable(&dir.join(&rel))?;
-            Ok(rel)
+            // Each binary is its own release asset. Unpack them into the same
+            // generation directory because Codex resolves the code-mode host
+            // relative to its own executable.
+            for name in CODEX_RELEASE_BINARIES {
+                let url = format!(
+                    "https://github.com/openai/codex/releases/download/rust-v{version}/{name}-{triple}.tar.gz"
+                );
+                let bytes = get_bytes(&url, progress, MAX_RUNTIME_DOWNLOAD_BYTES).await?;
+                stage_codex_release_binary(bytes, dir, &triple, name, progress).await?;
+            }
+            Ok(PathBuf::from(CODEX_RELEASE_BINARIES[0]))
         }
         CliId::LlamaServer => {
             let platform = llama_platform()?;
@@ -1584,6 +1637,45 @@ async fn install_into(
             Ok(rel)
         }
     }
+}
+
+/// Unpack one Codex release tarball and publish its single binary into `dir`
+/// under its plain `name`. Release archives hold the binary as
+/// `<name>-<triple>`; Codex expects the triple-less name next to `codex`.
+///
+/// The archive is extracted into a private subdirectory and only the expected
+/// entry is moved out, so a later archive cannot overwrite a binary an earlier
+/// one already published (a host tarball carrying a stray `codex`, say).
+async fn stage_codex_release_binary(
+    bytes: Vec<u8>,
+    dir: &Path,
+    triple: &str,
+    name: &str,
+    progress: &Arc<Progress>,
+) -> Result<(), InstallError> {
+    let unpack_dir = dir.join(format!(".unpack-{name}"));
+    std::fs::create_dir_all(&unpack_dir)?;
+    // untar_gz removes its extraction directory when it fails.
+    untar_gz(bytes, &unpack_dir, progress).await?;
+    let mut cleanup = PathCleanup::new(unpack_dir.clone());
+    let unpacked = unpack_dir.join(format!("{name}-{triple}"));
+    // The entry itself must be a regular file. A symlink to a sibling passes
+    // the archive containment checks, but publishing it would leave a dangling
+    // link once the unpack directory is removed.
+    if !matches!(
+        std::fs::symlink_metadata(&unpacked),
+        Ok(metadata) if metadata.file_type().is_file()
+    ) {
+        return Err(InstallError::Download(format!(
+            "{name}-{triple}.tar.gz had no regular file {name}-{triple}"
+        )));
+    }
+    let published = dir.join(name);
+    std::fs::rename(&unpacked, &published)?;
+    make_executable(&published)?;
+    cleanup.disarm();
+    std::fs::remove_dir_all(&unpack_dir)?;
+    Ok(())
 }
 
 fn checksum_for_asset(sums: &str, asset: &str) -> Option<String> {
@@ -2232,6 +2324,193 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb *cursor-sdk-bri
             matches!(err, InstallError::Download(m) if m.contains("outside")),
             "expected a containment error"
         );
+    }
+
+    #[tokio::test]
+    async fn codex_release_binaries_publish_under_their_plain_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let progress = Arc::new(Progress::default());
+        let triple = "x86_64-unknown-linux-musl";
+        for (name, contents) in [
+            ("codex", b"cli".as_slice()),
+            (CODEX_CODE_MODE_HOST, b"host".as_slice()),
+        ] {
+            let archive = gzipped_tar(&[(&format!("{name}-{triple}"), contents)]);
+            stage_codex_release_binary(archive, dir.path(), triple, name, &progress)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(std::fs::read(dir.path().join("codex")).unwrap(), b"cli");
+        assert_eq!(
+            std::fs::read(dir.path().join(CODEX_CODE_MODE_HOST)).unwrap(),
+            b"host"
+        );
+        assert!(!dir.path().join(format!("codex-{triple}")).exists());
+        assert!(
+            !dir.path().join(".unpack-codex").exists()
+                && !dir
+                    .path()
+                    .join(format!(".unpack-{CODEX_CODE_MODE_HOST}"))
+                    .exists(),
+            "unpack directories were left in the generation"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for name in CODEX_RELEASE_BINARIES {
+                let mode = std::fs::metadata(dir.path().join(name))
+                    .unwrap()
+                    .permissions()
+                    .mode();
+                assert_eq!(mode & 0o111, 0o111, "{name} is not executable");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_release_archive_cannot_overwrite_an_earlier_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let progress = Arc::new(Progress::default());
+        let triple = "x86_64-unknown-linux-musl";
+        stage_codex_release_binary(
+            gzipped_tar(&[(&format!("codex-{triple}"), b"cli".as_slice())]),
+            dir.path(),
+            triple,
+            "codex",
+            &progress,
+        )
+        .await
+        .unwrap();
+        // A host archive carrying a stray `codex` entry must not replace the
+        // CLI published from the first archive.
+        stage_codex_release_binary(
+            gzipped_tar(&[
+                ("codex", b"impostor".as_slice()),
+                (
+                    &format!("{CODEX_CODE_MODE_HOST}-{triple}"),
+                    b"host".as_slice(),
+                ),
+            ]),
+            dir.path(),
+            triple,
+            CODEX_CODE_MODE_HOST,
+            &progress,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(std::fs::read(dir.path().join("codex")).unwrap(), b"cli");
+        assert_eq!(
+            std::fs::read(dir.path().join(CODEX_CODE_MODE_HOST)).unwrap(),
+            b"host"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_release_archive_with_a_symlinked_binary_is_rejected() {
+        let triple = "x86_64-unknown-linux-musl";
+        // A regular file plus an expected-name symlink pointing at it: the
+        // link stays inside the extraction directory, so containment checks
+        // accept it, but publishing it would dangle after cleanup.
+        let mut buf = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut buf);
+            let mut file = tar::Header::new_gnu();
+            file.set_size(4);
+            file.set_mode(0o755);
+            file.set_cksum();
+            builder
+                .append_data(&mut file, "real", b"host".as_slice())
+                .unwrap();
+            let mut link = tar::Header::new_gnu();
+            link.set_entry_type(tar::EntryType::Symlink);
+            link.set_size(0);
+            link.set_mode(0o777);
+            builder
+                .append_link(&mut link, format!("codex-{triple}"), "real")
+                .unwrap();
+            builder.finish().unwrap();
+        }
+        let mut gz = Vec::new();
+        {
+            use std::io::Write;
+            let mut enc = flate2::write::GzEncoder::new(&mut gz, flate2::Compression::default());
+            enc.write_all(&buf).unwrap();
+            enc.finish().unwrap();
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let progress = Arc::new(Progress::default());
+        let error = stage_codex_release_binary(gz, dir.path(), triple, "codex", &progress)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, InstallError::Download(m) if m.contains("regular file")),
+            "unexpected error: {error}"
+        );
+        assert!(
+            dir.path().join("codex").symlink_metadata().is_err(),
+            "a symlinked binary was published"
+        );
+        assert!(
+            !dir.path().join(".unpack-codex").exists(),
+            "the rejected unpack directory was left behind"
+        );
+    }
+
+    #[test]
+    fn progress_totals_accumulate_across_artifacts() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let progress = Progress::default();
+        progress.add_expected_bytes(Some(10));
+        progress.add_expected_bytes(Some(5));
+        assert_eq!(progress.total.load(Relaxed), 15);
+
+        // One artifact without a length makes the whole install indeterminate.
+        progress.add_expected_bytes(None);
+        assert_eq!(progress.total.load(Relaxed), 0);
+        progress.add_expected_bytes(Some(7));
+        assert_eq!(progress.total.load(Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn codex_release_archive_without_its_binary_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let progress = Arc::new(Progress::default());
+        let archive = gzipped_tar(&[("README", b"not a binary".as_slice())]);
+        let error = stage_codex_release_binary(
+            archive,
+            dir.path(),
+            "x86_64-unknown-linux-musl",
+            CODEX_CODE_MODE_HOST,
+            &progress,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&error, InstallError::Download(m) if m.contains(CODEX_CODE_MODE_HOST)),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn codex_install_is_complete_only_with_its_code_mode_host() {
+        let generation = tempfile::tempdir().unwrap();
+        let bin = generation.path().join("codex");
+        std::fs::write(&bin, "cli").unwrap();
+        let installed = InstalledCli {
+            version: "0.153.4".into(),
+            bin: bin.to_string_lossy().into_owned(),
+        };
+        assert!(!install_complete(CliId::Codex, &installed));
+
+        std::fs::write(generation.path().join(CODEX_CODE_MODE_HOST), "host").unwrap();
+        assert!(install_complete(CliId::Codex, &installed));
+
+        // Runtimes without sidecars are complete with their main binary alone.
+        assert!(install_complete(CliId::Claude, &installed));
     }
 
     #[tokio::test]
