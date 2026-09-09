@@ -110,6 +110,13 @@ fn sandbox_settings(
     (sandbox, policy)
 }
 
+/// Every Codex approval request must reach trouve, which is the approver of
+/// record for the thread. A user's `approvals_reviewer = "auto_review"` in
+/// `~/.codex/config.toml` would otherwise route requests raised under the
+/// `on-request` or granular policies to Codex's own reviewer model, and
+/// trouve's permission gate would never see them.
+const APPROVALS_REVIEWER: &str = "user";
+
 /// Codex's approval policy for one turn.
 ///
 /// Full-bridge turns must never see a native approval prompt: trouve's
@@ -406,6 +413,7 @@ impl AgentBackend for CodexBackend {
         let mut start_params = with_thread_settings(json!({
             "cwd": turn.worktree,
             "approvalPolicy": approval_policy,
+            "approvalsReviewer": APPROVALS_REVIEWER,
             "sandbox": sandbox,
             "serviceName": "trouve",
         }));
@@ -554,6 +562,7 @@ impl AgentBackend for CodexBackend {
         let mut turn_params = json!({
             "threadId": codex_thread_id,
             "approvalPolicy": approval_policy,
+            "approvalsReviewer": APPROVALS_REVIEWER,
             "sandboxPolicy": sandbox_policy,
             "input": input,
         });
