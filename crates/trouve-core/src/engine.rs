@@ -73,6 +73,9 @@ const SUBAGENT_DIGEST_MESSAGE_BYTES: usize = 8 * 1024;
 /// Once spent, later children are reported by status only, so a wide
 /// fan-out cannot turn the fold-in prompt into a context overflow.
 const SUBAGENT_DIGEST_TOTAL_BYTES: usize = 48 * 1024;
+/// Per-child cap on a failure reason quoted in the digest; the tool result
+/// keeps the whole error.
+const SUBAGENT_DIGEST_ERROR_BYTES: usize = 1024;
 /// Bound native provider fan-out so a malformed or over-eager response cannot
 /// monopolize the runtime. Results are still written to the provider
 /// transcript in request order.
@@ -19749,6 +19752,9 @@ impl Engine {
                 status["status"].as_str().unwrap_or("unknown")
             ));
             if let Some(error) = status["error"].as_str() {
+                // Vendor failures can carry whole stderr dumps; the tool
+                // result keeps the full text, the prompt digest a bounded cut.
+                let error = cap_chars(error, SUBAGENT_DIGEST_ERROR_BYTES);
                 digest.push_str(&format!("Error: {error}\n"));
             }
             // Child answers are unbounded; keep the digest (which becomes
@@ -25476,6 +25482,60 @@ mod tests {
             omitted < child_count,
             "the first children must still carry a capped message"
         );
+    }
+
+    #[tokio::test]
+    async fn await_spawned_descendants_caps_child_errors() {
+        let (engine, _temp, parent, child) = await_subagents_fixture("err");
+        engine
+            .active_threads
+            .lock()
+            .unwrap()
+            .insert(child.id.clone(), parent.session_id.clone());
+        let long_error = format!("{}END", "e".repeat(SUBAGENT_DIGEST_ERROR_BYTES * 4));
+        engine
+            .store
+            .append_event(
+                Scope::Thread(child.id.clone()),
+                Event::TurnFailed {
+                    turn: 1,
+                    error: long_error.clone(),
+                },
+            )
+            .unwrap();
+        let releaser = Arc::clone(&engine);
+        let child_id = child.id.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            releaser.active_threads.lock().unwrap().remove(&child_id);
+        });
+        let cancel = tokio_util::sync::CancellationToken::new();
+
+        let digest = tokio::time::timeout(
+            Duration::from_secs(5),
+            engine.await_spawned_descendants(&parent, 1, &cancel),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+        assert!(digest.contains("failed"));
+        assert!(digest.contains("Error: "));
+        assert!(
+            !digest.contains("END"),
+            "digest must not quote the whole error"
+        );
+        assert!(digest.len() < long_error.len());
+        let events = parent_events(&engine, &parent);
+        let result = events
+            .iter()
+            .find_map(|event| match event {
+                Event::ToolCompleted { result, .. } => Some(result.clone()),
+                _ => None,
+            })
+            .expect("await_subagents tool result");
+        assert_eq!(result["subagents"][0]["error"], long_error);
     }
 
     #[tokio::test]
