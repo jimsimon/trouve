@@ -19661,10 +19661,7 @@ impl Engine {
             return Ok(None);
         }
         let scope = Scope::Thread(thread.id.clone());
-        let call_id = format!(
-            "await-subagents-{turn}-{}",
-            uuid::Uuid::new_v4().simple()
-        );
+        let call_id = format!("await-subagents-{turn}-{}", uuid::Uuid::new_v4().simple());
         self.store.append_event(
             scope.clone(),
             Event::ToolRequested {
@@ -25247,7 +25244,9 @@ mod tests {
             }
             other => panic!("expected await_subagents ToolRequested, got {other:?}"),
         };
-        assert!(matches!(&events[1], Event::ToolStarted { call_id: started } if *started == call_id));
+        assert!(
+            matches!(&events[1], Event::ToolStarted { call_id: started } if *started == call_id)
+        );
         assert!(matches!(
             events[2],
             Event::TurnPhaseChanged {
@@ -25322,7 +25321,10 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        assert!(!digest.contains("END"), "digest must not carry the whole message");
+        assert!(
+            !digest.contains("END"),
+            "digest must not carry the whole message"
+        );
         assert!(digest.contains("final message truncated"));
         assert!(digest.contains(&child.id));
         assert!(digest.len() < long_message.len());
