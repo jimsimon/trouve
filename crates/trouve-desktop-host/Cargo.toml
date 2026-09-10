@@ -9,7 +9,7 @@ rust-version.workspace = true
 
 [dependencies]
 axum.workspace = true
-base64 = "0.22"
+base64 = "0.23"
 fontdb.workspace = true
 fs4.workspace = true
 reqwest.workspace = true

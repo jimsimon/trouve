@@ -9,7 +9,7 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-base64 = "0.22.1"
+base64 = "0.23.0"
 chrono.workspace = true
 futures.workspace = true
 reqwest.workspace = true
