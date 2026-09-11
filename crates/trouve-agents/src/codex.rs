@@ -15,10 +15,13 @@
 //! - server-initiated approval requests:
 //!   `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`
 //!   answered with `{ decision: "accept" | "decline" }`, and
-//!   `mcpServer/elicitation/request` for MCP tool approvals, answered with
-//!   `{ action: "accept" | "decline" }`. Trouve's own bridge server is
-//!   pre-approved in config; user-configured servers prompt on every call so
-//!   trouve's permission gate decides for them.
+//!   `mcpServer/elicitation/request`, answered with
+//!   `{ action: "accept" | "decline", content }`. Codex uses it for its own
+//!   MCP tool approvals (marked `_meta.codex_approval_kind`), which go to
+//!   trouve's permission gate, and for the server's own form and URL
+//!   elicitations, which become user questions. Trouve's own bridge server
+//!   is pre-approved in config; user-configured servers prompt on every call
+//!   so trouve's permission gate decides for them.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::process::Stdio;
@@ -654,6 +657,216 @@ fn codex_config_override(turn: &crate::BackendTurn) -> Value {
 
 fn thread_mcp_config(config: &Value) -> Value {
     config.get("mcp_servers").cloned().unwrap_or(Value::Null)
+}
+
+/// Option id for the "done" choice of a URL elicitation.
+const URL_ELICITATION_DONE: &str = "done";
+
+/// What one `mcpServer/elicitation/request` is asking for.
+#[derive(Debug, PartialEq)]
+enum ElicitationKind {
+    /// Codex's own tool-call approval prompt (marked in `_meta`), or a
+    /// server confirmation with nothing to fill in: a yes/no for the gate.
+    Approval,
+    /// A server form whose fields trouve can present as questions.
+    Form {
+        title: String,
+        questions: Vec<trouve_protocol::Question>,
+    },
+    /// A server asking the user to visit a URL (typically to authorize).
+    Url {
+        title: String,
+        questions: Vec<trouve_protocol::Question>,
+    },
+    /// A form with fields trouve cannot represent; declined, never guessed.
+    Unsupported(String),
+}
+
+fn classify_elicitation(params: &Value) -> ElicitationKind {
+    let meta = &params["_meta"];
+    if meta.get("codex_approval_kind").is_some() || meta["codex_request_type"] == "approval_request"
+    {
+        return ElicitationKind::Approval;
+    }
+    let message = params["message"].as_str().unwrap_or("").to_string();
+    match params["mode"].as_str() {
+        Some("url") => {
+            let Some(url) = params["url"].as_str() else {
+                return ElicitationKind::Unsupported("URL elicitation without a url".into());
+            };
+            let server = params["serverName"].as_str().unwrap_or("the MCP server");
+            let prompt = if message.is_empty() {
+                format!("{server} asks you to open {url} and complete the steps there.")
+            } else {
+                format!("{message}\n\nOpen {url} and complete the steps there.")
+            };
+            ElicitationKind::Url {
+                title: format!("{server} needs you to visit a link"),
+                questions: vec![trouve_protocol::Question {
+                    id: "url".into(),
+                    prompt,
+                    options: vec![
+                        trouve_protocol::QuestionOption {
+                            id: URL_ELICITATION_DONE.into(),
+                            label: "Done".into(),
+                        },
+                        trouve_protocol::QuestionOption {
+                            id: "cancel".into(),
+                            label: "Cancel".into(),
+                        },
+                    ],
+                    allow_multiple: false,
+                }],
+            }
+        }
+        Some("form") | None => {
+            let schema = &params["requestedSchema"];
+            let Some(properties) = schema["properties"].as_object() else {
+                // No schema, or an empty one: a confirmation prompt.
+                return ElicitationKind::Approval;
+            };
+            if properties.is_empty() {
+                return ElicitationKind::Approval;
+            }
+            let mut questions = Vec::with_capacity(properties.len());
+            for (name, property) in properties {
+                match form_question(name, property) {
+                    Some(question) => questions.push(question),
+                    None => {
+                        return ElicitationKind::Unsupported(format!(
+                            "form field `{name}` has an unsupported schema"
+                        ));
+                    }
+                }
+            }
+            ElicitationKind::Form {
+                title: if message.is_empty() {
+                    format!(
+                        "{} needs some information",
+                        params["serverName"].as_str().unwrap_or("The MCP server")
+                    )
+                } else {
+                    message
+                },
+                questions,
+            }
+        }
+        Some(other) => ElicitationKind::Unsupported(format!("elicitation mode `{other}`")),
+    }
+}
+
+/// One MCP form field as a trouve question. Booleans and enums become
+/// options; free strings and numbers rely on the client's "Other" text entry
+/// (an empty option list). Nested objects and arrays are not representable.
+fn form_question(name: &str, property: &Value) -> Option<trouve_protocol::Question> {
+    let prompt = match (property["title"].as_str(), property["description"].as_str()) {
+        (Some(title), Some(description)) => format!("{title}: {description}"),
+        (Some(title), None) => title.to_string(),
+        (None, Some(description)) => format!("{name}: {description}"),
+        (None, None) => name.to_string(),
+    };
+    let options = if let Some(values) = property["enum"].as_array() {
+        let labels = property["enumNames"].as_array();
+        values
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                let id = match value {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                let label = labels
+                    .and_then(|labels| labels.get(index))
+                    .and_then(Value::as_str)
+                    .map_or_else(|| id.clone(), str::to_string);
+                trouve_protocol::QuestionOption { id, label }
+            })
+            .collect()
+    } else {
+        match property["type"].as_str() {
+            Some("boolean") => vec![
+                trouve_protocol::QuestionOption {
+                    id: "true".into(),
+                    label: "Yes".into(),
+                },
+                trouve_protocol::QuestionOption {
+                    id: "false".into(),
+                    label: "No".into(),
+                },
+            ],
+            Some("string") | Some("number") | Some("integer") => Vec::new(),
+            _ => return None,
+        }
+    };
+    Some(trouve_protocol::Question {
+        id: name.to_string(),
+        prompt,
+        options,
+        allow_multiple: false,
+    })
+}
+
+/// Build the form's `content` object from the user's answers, typed per the
+/// requested schema. Unanswered fields are omitted; the server applies its
+/// own `required` handling.
+fn form_elicitation_content(schema: &Value, answers: &[trouve_protocol::QuestionAnswer]) -> Value {
+    let mut content = serde_json::Map::new();
+    let properties = schema["properties"].as_object();
+    for answer in answers {
+        let property = properties.and_then(|p| p.get(&answer.question_id));
+        let kind = property
+            .and_then(|p| p["type"].as_str())
+            .unwrap_or("string");
+        let has_enum = property.is_some_and(|p| p["enum"].is_array());
+        let raw = answer
+            .selected_option_ids
+            .first()
+            .cloned()
+            .or_else(|| answer.other_text.clone());
+        let Some(raw) = raw else {
+            continue;
+        };
+        let value = if has_enum {
+            // Enum ids are the schema's own values; restore non-string ones.
+            property
+                .and_then(|p| p["enum"].as_array())
+                .and_then(|values| {
+                    values.iter().find(|v| match v {
+                        Value::String(s) => *s == raw,
+                        other => other.to_string() == raw,
+                    })
+                })
+                .cloned()
+                .unwrap_or(Value::String(raw))
+        } else {
+            match kind {
+                "boolean" => Value::Bool(raw == "true"),
+                "integer" => raw
+                    .trim()
+                    .parse::<i64>()
+                    .map_or_else(|_| Value::String(raw), Value::from),
+                "number" => raw
+                    .trim()
+                    .parse::<f64>()
+                    .ok()
+                    .and_then(serde_json::Number::from_f64)
+                    .map_or_else(|| Value::String(raw.clone()), Value::Number),
+                _ => Value::String(raw),
+            }
+        };
+        content.insert(answer.question_id.clone(), value);
+    }
+    Value::Object(content)
+}
+
+fn url_elicitation_completed(answers: &[trouve_protocol::QuestionAnswer]) -> bool {
+    answers.iter().any(|answer| {
+        answer.question_id == "url"
+            && answer
+                .selected_option_ids
+                .iter()
+                .any(|id| id == URL_ELICITATION_DONE)
+    })
 }
 
 fn loaded_thread_settings_match(
@@ -1559,6 +1772,91 @@ fn turn_stream(
                                     .respond(id, json!({ "action": "accept", "content": {} }))
                                     .await;
                                 continue;
+                            }
+                            // Codex sends every elicitation on this method:
+                            // its own tool-call approval prompts, but also
+                            // form and URL elicitations raised by the MCP
+                            // server itself. Only the former is an
+                            // accept/decline decision for trouve's gate.
+                            match classify_elicitation(&params) {
+                                ElicitationKind::Approval => {}
+                                ElicitationKind::Form { title, questions } => {
+                                    let content = if root_message {
+                                        let (answer_tx, answer_rx) = oneshot::channel();
+                                        let _ = tx
+                                            .send(Ok(BackendEvent::QuestionsNeeded {
+                                                request_id: format!(
+                                                    "codex-elicitation-{}",
+                                                    json_rpc_id(&id)
+                                                ),
+                                                title: Some(title),
+                                                questions,
+                                                responder: answer_tx,
+                                            }))
+                                            .await;
+                                        answer_rx.await.ok().flatten().map(|answers| {
+                                            form_elicitation_content(
+                                                &params["requestedSchema"],
+                                                &answers,
+                                            )
+                                        })
+                                    } else {
+                                        // Child threads have no question channel.
+                                        tracing::warn!(
+                                            "codex: declining form elicitation from {} on collaborator thread",
+                                            params["serverName"]
+                                        );
+                                        None
+                                    };
+                                    let response = match content {
+                                        Some(content) => {
+                                            json!({ "action": "accept", "content": content })
+                                        }
+                                        None => json!({ "action": "decline", "content": {} }),
+                                    };
+                                    server.respond(id, response).await;
+                                    continue;
+                                }
+                                ElicitationKind::Url { title, questions } => {
+                                    let done = if root_message {
+                                        let (answer_tx, answer_rx) = oneshot::channel();
+                                        let _ = tx
+                                            .send(Ok(BackendEvent::QuestionsNeeded {
+                                                request_id: format!(
+                                                    "codex-elicitation-{}",
+                                                    json_rpc_id(&id)
+                                                ),
+                                                title: Some(title),
+                                                questions,
+                                                responder: answer_tx,
+                                            }))
+                                            .await;
+                                        answer_rx.await.ok().flatten().is_some_and(|answers| {
+                                            url_elicitation_completed(&answers)
+                                        })
+                                    } else {
+                                        tracing::warn!(
+                                            "codex: declining URL elicitation from {} on collaborator thread",
+                                            params["serverName"]
+                                        );
+                                        false
+                                    };
+                                    let action = if done { "accept" } else { "decline" };
+                                    server
+                                        .respond(id, json!({ "action": action, "content": {} }))
+                                        .await;
+                                    continue;
+                                }
+                                ElicitationKind::Unsupported(reason) => {
+                                    tracing::warn!(
+                                        "codex: declining elicitation from {}: {reason}",
+                                        params["serverName"]
+                                    );
+                                    server
+                                        .respond(id, json!({ "action": "decline", "content": {} }))
+                                        .await;
+                                    continue;
+                                }
                             }
                             let (ok_tx, ok_rx) = oneshot::channel();
                             // JSON-RPC request ids are unique for this app-server
@@ -8269,6 +8567,135 @@ cat > /dev/null
         let config = codex_config_override(&turn);
         assert!(config["mcp_servers"]["jira"].is_object());
         assert!(config["mcp_servers"]["trouve"].is_null());
+    }
+
+    #[test]
+    fn elicitations_are_classified_by_kind() {
+        // Codex's own tool-call approval prompt: a gate decision.
+        let approval = json!({
+            "serverName": "jira",
+            "mode": "form",
+            "_meta": { "codex_approval_kind": "mcp_tool_call" },
+            "message": "Allow jira.create_issue?",
+            "requestedSchema": { "type": "object", "properties": {} }
+        });
+        assert_eq!(classify_elicitation(&approval), ElicitationKind::Approval);
+        // A server confirmation with nothing to fill in is also yes/no.
+        let confirm = json!({
+            "serverName": "jira",
+            "mode": "form",
+            "message": "Proceed?",
+            "requestedSchema": { "type": "object", "properties": {} }
+        });
+        assert_eq!(classify_elicitation(&confirm), ElicitationKind::Approval);
+        assert_eq!(
+            classify_elicitation(&json!({ "serverName": "jira" })),
+            ElicitationKind::Approval
+        );
+
+        // A real form becomes questions typed from the schema.
+        let form = json!({
+            "serverName": "jira",
+            "mode": "form",
+            "message": "Which project?",
+            "requestedSchema": {
+                "type": "object",
+                "properties": {
+                    "project": { "type": "string", "enum": ["OPS", "DEV"], "enumNames": ["Operations", "Development"] },
+                    "urgent": { "type": "boolean", "title": "Urgent" },
+                    "summary": { "type": "string", "description": "Issue summary" },
+                    "points": { "type": "integer" }
+                },
+                "required": ["project"]
+            }
+        });
+        let ElicitationKind::Form { title, questions } = classify_elicitation(&form) else {
+            panic!("expected a form");
+        };
+        assert_eq!(title, "Which project?");
+        assert_eq!(questions.len(), 4);
+        let project = questions.iter().find(|q| q.id == "project").unwrap();
+        assert_eq!(project.options[0].id, "OPS");
+        assert_eq!(project.options[0].label, "Operations");
+        let urgent = questions.iter().find(|q| q.id == "urgent").unwrap();
+        assert_eq!(urgent.prompt, "Urgent");
+        assert_eq!(urgent.options.len(), 2);
+        let summary = questions.iter().find(|q| q.id == "summary").unwrap();
+        assert!(summary.options.is_empty(), "free text relies on Other");
+        assert_eq!(summary.prompt, "summary: Issue summary");
+
+        let answers = vec![
+            trouve_protocol::QuestionAnswer {
+                question_id: "project".into(),
+                selected_option_ids: vec!["DEV".into()],
+                other_text: None,
+            },
+            trouve_protocol::QuestionAnswer {
+                question_id: "urgent".into(),
+                selected_option_ids: vec!["false".into()],
+                other_text: None,
+            },
+            trouve_protocol::QuestionAnswer {
+                question_id: "summary".into(),
+                selected_option_ids: vec![],
+                other_text: Some("Login broken".into()),
+            },
+            trouve_protocol::QuestionAnswer {
+                question_id: "points".into(),
+                selected_option_ids: vec![],
+                other_text: Some(" 3 ".into()),
+            },
+        ];
+        assert_eq!(
+            form_elicitation_content(&form["requestedSchema"], &answers),
+            json!({ "project": "DEV", "urgent": false, "summary": "Login broken", "points": 3 })
+        );
+
+        // Fields trouve cannot represent are declined, never guessed.
+        let nested = json!({
+            "serverName": "jira",
+            "mode": "form",
+            "requestedSchema": { "type": "object", "properties": { "labels": { "type": "array" } } }
+        });
+        assert!(matches!(
+            classify_elicitation(&nested),
+            ElicitationKind::Unsupported(_)
+        ));
+
+        // URL elicitations become a done/cancel question carrying the link.
+        let url = json!({
+            "serverName": "github",
+            "mode": "url",
+            "message": "Authorize trouve",
+            "url": "https://example.com/authorize"
+        });
+        let ElicitationKind::Url { title, questions } = classify_elicitation(&url) else {
+            panic!("expected a url elicitation");
+        };
+        assert_eq!(title, "github needs you to visit a link");
+        assert!(
+            questions[0]
+                .prompt
+                .contains("https://example.com/authorize")
+        );
+        assert!(url_elicitation_completed(&[
+            trouve_protocol::QuestionAnswer {
+                question_id: "url".into(),
+                selected_option_ids: vec!["done".into()],
+                other_text: None,
+            }
+        ]));
+        assert!(!url_elicitation_completed(&[
+            trouve_protocol::QuestionAnswer {
+                question_id: "url".into(),
+                selected_option_ids: vec!["cancel".into()],
+                other_text: None,
+            }
+        ]));
+        assert!(matches!(
+            classify_elicitation(&json!({ "serverName": "x", "mode": "url" })),
+            ElicitationKind::Unsupported(_)
+        ));
     }
 
     #[test]
