@@ -44,8 +44,13 @@ pub fn rebuild_codex_roster(
             continue;
         };
         object.insert("id".into(), Value::String(slug.into()));
-        if let Some(efforts) = live_reasoning_option(entry) {
-            object.insert("reasoning_options".into(), Value::Array(vec![efforts]));
+        // A present effort list is authoritative even when empty (the vendor
+        // withdrew the control); only an absent field keeps the seed's levels.
+        if entry.get("supportedReasoningEfforts").is_some() {
+            let live = live_reasoning_option(entry)
+                .map(|e| vec![e])
+                .unwrap_or_default();
+            object.insert("reasoning_options".into(), Value::Array(live));
         }
         // The speed tier is live-derived: a previous roster's `fast` must not
         // outlive the vendor withdrawing it.
@@ -260,6 +265,33 @@ mod tests {
             json!({"type": "boolean", "default": false, "description": "2x speed, increased usage"})
         );
         assert!(roster["gpt-5.3-codex-spark"].get("options").is_none());
+    }
+
+    #[test]
+    fn empty_effort_list_withdraws_reasoning_options() {
+        let first = rebuild_codex_roster(
+            &json!({"data": [live_entry("gpt-5.6-luna", &["low", "high"], "low")]}),
+            &BTreeMap::new(),
+            |_| true,
+        )
+        .unwrap();
+        assert_eq!(
+            first["gpt-5.6-luna"]["reasoning_options"][0]["values"],
+            json!(["low", "high"])
+        );
+
+        let mut withdrawn = live_entry("gpt-5.6-luna", &[], "");
+        withdrawn["supportedReasoningEfforts"] = json!([]);
+        let second = rebuild_codex_roster(&json!({"data": [withdrawn]}), &first, |_| true).unwrap();
+        assert_eq!(second["gpt-5.6-luna"]["reasoning_options"], json!([]));
+
+        let absent = json!({"model": "gpt-5.6-luna", "hidden": false});
+        let third = rebuild_codex_roster(&json!({"data": [absent]}), &first, |_| true).unwrap();
+        assert_eq!(
+            third["gpt-5.6-luna"]["reasoning_options"][0]["values"],
+            json!(["low", "high"]),
+            "an absent field keeps the seed's levels"
+        );
     }
 
     #[test]

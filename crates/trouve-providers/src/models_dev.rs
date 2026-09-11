@@ -221,6 +221,9 @@ struct CatalogState {
 pub struct ModelsDevCatalog {
     state: RwLock<CatalogState>,
     refresh_lock: tokio::sync::Mutex<()>,
+    /// Serializes roster persistence with publication so the running catalog
+    /// and the durable file always agree on which replacement won.
+    roster_write_lock: tokio::sync::Mutex<()>,
     cache_path: Option<PathBuf>,
     rosters_dir: Option<PathBuf>,
     client: reqwest::Client,
@@ -320,6 +323,7 @@ impl ModelsDevCatalog {
                 last_attempt: None,
             }),
             refresh_lock: tokio::sync::Mutex::new(()),
+            roster_write_lock: tokio::sync::Mutex::new(()),
             cache_path,
             rosters_dir,
             client,
@@ -504,6 +508,9 @@ impl ModelsDevCatalog {
 
     /// Replace a provider's roster in memory and on disk. An empty roster is
     /// rejected so a bad live response never empties the model picker.
+    /// Replacements are serialized: the file is written and the in-memory
+    /// roster published under one lock, so overlapping refreshes can never
+    /// leave disk and memory on different winners.
     pub async fn replace_roster(
         &self,
         provider: &str,
@@ -512,6 +519,7 @@ impl ModelsDevCatalog {
         if models.is_empty() {
             bail!("{provider} roster contains no models");
         }
+        let _guard = self.roster_write_lock.lock().await;
         let provider = canonical_provider_id(provider).to_string();
         let file = RosterFile {
             version: ROSTER_VERSION,
@@ -2036,10 +2044,16 @@ mod tests {
         for write in writes {
             write.await.unwrap().unwrap();
         }
-        // Whichever write won, the file is complete and matches a full roster.
+        // Whichever write won, the file is complete, matches a full roster,
+        // and is the roster the running catalog publishes.
         let path = dir.path().join("rosters").join("openai-codex.json");
         let file: RosterFile = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(file.models.len(), 1);
+        assert_eq!(
+            catalog.owned_provider_models("openai-codex"),
+            file.models,
+            "memory and disk must agree on the winning replacement"
+        );
         assert!(
             std::fs::read_dir(dir.path().join("rosters"))
                 .unwrap()

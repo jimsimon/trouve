@@ -4747,7 +4747,10 @@ impl Engine {
         for backend in ready {
             let store = store.clone();
             tokio::spawn(async move {
-                match backend.refresh_model_roster().await {
+                // Retirement of the backend cancels this token if the refresh
+                // outlives the drain deadline.
+                let cancel = tokio_util::sync::CancellationToken::new();
+                match backend.refresh_model_roster(&cancel).await {
                     Ok(true) => {
                         tracing::info!(backend = backend.id(), "model roster refreshed");
                         // The roster was replaced after any in-flight model

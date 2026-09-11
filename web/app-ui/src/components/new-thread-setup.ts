@@ -14,7 +14,7 @@ import {
   pendingAttachmentPreviewUrl,
   type PendingAttachment,
 } from "../services/attachments.js";
-import { readSignal } from "../state/reactivity.js";
+import { readSignal, withSignalTracking } from "../state/reactivity.js";
 import type { ProtocolSubscriptionHealth } from "../services/protocol-client.js";
 import { modelHealthPresentations } from "./model-health.js";
 import {
@@ -68,7 +68,7 @@ const emptyCatalog = (): NewThreadSetupCatalog => ({
   providers: undefined,
 });
 
-export class TrouveNewThreadSetup extends LitElement {
+export class TrouveNewThreadSetup extends withSignalTracking(LitElement) {
   static override properties = {
     workspaceId: { type: String, attribute: "workspace-id" },
     sessionId: { type: String, attribute: "session-id" },
@@ -265,9 +265,8 @@ export class TrouveNewThreadSetup extends LitElement {
   #draft: NewThreadSetupDraft = createInitialNewThreadDraft(this.#catalog);
   #optionsLoading = false;
 
-  /** Read at render time: the app force-refreshes the catalog (and thus
-   * `catalogModels`) whenever the server announces a catalog change, so this
-   * never goes stale. */
+  /** Read at render time; signal tracking re-renders this element when the
+   * server announces a catalog change. */
   #catalogAvailable(): boolean {
     const signal = this.#services.value?.modelCatalog.catalogAvailable;
     return signal === undefined ? true : readSignal(signal);

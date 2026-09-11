@@ -484,8 +484,14 @@ pub trait AgentBackend: Send + Sync {
     /// Rebuild the backend's persisted model roster from the vendor's live
     /// model list when it is stale. Runs in the background so `models()`
     /// stays instant and offline-safe; returns whether the roster was
-    /// rewritten. The default has no live roster to refresh.
-    async fn refresh_model_roster(&self) -> Result<bool, BackendError> {
+    /// rewritten. `cancel` is triggered when the backend is retired while the
+    /// refresh is still talking to the vendor, so implementations must stop
+    /// and clean up their vendor process promptly. The default has no live
+    /// roster to refresh.
+    async fn refresh_model_roster(
+        &self,
+        _cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<bool, BackendError> {
         Ok(false)
     }
 
@@ -724,16 +730,19 @@ impl AgentBackend for RetirementAwareBackend {
         self.inner.list_models().await
     }
 
-    async fn refresh_model_roster(&self) -> Result<bool, BackendError> {
+    async fn refresh_model_roster(
+        &self,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<bool, BackendError> {
         // A roster refresh may spawn a vendor process, so it counts as
-        // activity: retirement drains it before destructive shutdown and
-        // refuses new refreshes on a backend being replaced.
-        let cancel = tokio_util::sync::CancellationToken::new();
-        let _activity = match self.activity.enter(self.id(), cancel) {
+        // activity: retirement drains it before destructive shutdown, refuses
+        // new refreshes on a backend being replaced, and cancels a refresh
+        // that outlives the drain deadline through this token.
+        let _activity = match self.activity.enter(self.id(), cancel.clone()) {
             Ok(guard) => guard,
             Err(_) => return Ok(false),
         };
-        self.inner.refresh_model_roster().await
+        self.inner.refresh_model_roster(cancel).await
     }
 
     fn status(&self) -> BackendStatus {
@@ -845,8 +854,11 @@ impl AgentBackend for RuntimeLeasedBackend {
         self.inner.list_models().await
     }
 
-    async fn refresh_model_roster(&self) -> Result<bool, BackendError> {
-        self.inner.refresh_model_roster().await
+    async fn refresh_model_roster(
+        &self,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<bool, BackendError> {
+        self.inner.refresh_model_roster(cancel).await
     }
 
     fn status(&self) -> BackendStatus {

@@ -775,11 +775,11 @@ export class TrouveApp extends withSignalTracking(LitElement) {
     }
     if (event.type === "server.model_catalog_changed") {
       const wasUnavailable = readSignal(this.#store.serverInfo)?.catalog_available === false;
-      if (event.available) {
-        // A models.dev download or a background vendor roster rebuild
-        // changes every picker at once; invalidate both snapshots.
-        void this.#modelCatalog.refresh("force").catch(() => undefined);
-      }
+      // A models.dev download, a background vendor roster rebuild, or the
+      // catalog being lost changes every picker at once; invalidate both
+      // snapshots on every transition so pickers never offer models that
+      // `/v1/models` no longer exposes.
+      void this.#modelCatalog.refresh("force").catch(() => undefined);
       if (event.available && wasUnavailable) {
         this.#showConnectivityNotice("Model catalog downloaded — the full model list is available.");
       }

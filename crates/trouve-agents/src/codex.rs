@@ -280,12 +280,17 @@ impl AgentBackend for CodexBackend {
     /// Rebuild the persisted `openai-codex` roster from the app-server's
     /// `model/list` when the catalog's TTL says it is stale. `models()`
     /// keeps reading the catalog, so this never sits on a request path.
-    async fn refresh_model_roster(&self) -> Result<bool, BackendError> {
+    async fn refresh_model_roster(
+        &self,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<bool, BackendError> {
         if !self.catalog.begin_roster_refresh(CODEX_CATALOG_PROVIDER) {
             return Ok(false);
         }
-        let server = self.server().await?;
-        let live = server.request("model/list", json!({})).await?;
+        let server = self.server_with_cancel(Some(cancel)).await?;
+        let live = server
+            .request_with_cancel("model/list", json!({}), Some(cancel), RequestFence::None)
+            .await?;
         let seed = self.catalog.owned_provider_models(CODEX_CATALOG_PROVIDER);
         let roster = crate::codex_roster::rebuild_codex_roster(&live, &seed, |slug| {
             self.catalog.has_source_model("openai", slug)
@@ -9250,7 +9255,12 @@ for line in sys.stdin:
             "bundled seed serves until the first refresh"
         );
 
-        assert!(backend.refresh_model_roster().await.unwrap());
+        assert!(
+            backend
+                .refresh_model_roster(&tokio_util::sync::CancellationToken::new())
+                .await
+                .unwrap()
+        );
         let models = backend.models();
         let mut ids: Vec<_> = models.iter().map(|model| model.id.as_str()).collect();
         ids.sort();
@@ -9283,7 +9293,12 @@ for line in sys.stdin:
         assert!(file["models"].get("gpt-5.4-mini").is_none());
 
         // Within the TTL the refresh is a no-op that never touches the server.
-        assert!(!backend.refresh_model_roster().await.unwrap());
+        assert!(
+            !backend
+                .refresh_model_roster(&tokio_util::sync::CancellationToken::new())
+                .await
+                .unwrap()
+        );
         assert_eq!(
             std::fs::read_to_string(&calls).unwrap().lines().count(),
             1,

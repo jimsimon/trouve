@@ -190,11 +190,14 @@ impl CursorBackend {
     /// this bypasses the turn pool: it runs once per catalog TTL and must
     /// never wait on, or be waited on by, a turn. Startup and the RPC carry
     /// their own deadlines, and the process is reaped on every exit path.
-    async fn list_models_via_bridge(&self, api_key: &str) -> Result<Value, BackendError> {
+    async fn list_models_via_bridge(
+        &self,
+        api_key: &str,
+        cancel: &CancellationToken,
+    ) -> Result<Value, BackendError> {
         let state_dir = self.state_root.join("roster");
         create_private_dir(&state_dir)?;
         let callback = CallbackRouter::start(local_http_client()?).await?;
-        let cancel = CancellationToken::new();
         let closing = CancellationToken::new();
         let events = BackendEventSender::detached();
         let request = BridgeProcessRequest {
@@ -203,7 +206,7 @@ impl CursorBackend {
             state_dir: &state_dir,
             resume_agent_id: None,
             api_key,
-            cancel: &cancel,
+            cancel,
             events: &events,
         };
         // `BridgeProcess::start` reaps the child itself on every failure,
@@ -212,14 +215,15 @@ impl CursorBackend {
         // outcome (`unary` enforces the RPC deadline).
         let result = match BridgeProcess::start(&request, &callback, &closing).await {
             Ok(mut bridge) => {
-                let models = bridge
-                    .client
-                    .unary(
+                let models = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => Err(BackendError::Cancelled),
+                    models = bridge.client.unary(
                         "SdkCursorService",
                         "ListModels",
                         json!({ "options": { "apiKey": api_key } }),
-                    )
-                    .await;
+                    ) => models,
+                };
                 if let Err(error) = bridge.shutdown().await {
                     tracing::debug!("Cursor SDK Bridge roster process shutdown failed: {error}");
                 }
@@ -396,7 +400,7 @@ impl AgentBackend for CursorBackend {
 
     /// Rebuild the persisted `cursor` roster from `ListModels` when the
     /// catalog's TTL says it is stale. `models()` keeps reading the catalog.
-    async fn refresh_model_roster(&self) -> Result<bool, BackendError> {
+    async fn refresh_model_roster(&self, cancel: &CancellationToken) -> Result<bool, BackendError> {
         if self.legacy_cli_migration_required {
             return Ok(false);
         }
@@ -406,7 +410,7 @@ impl AgentBackend for CursorBackend {
         if !self.catalog.begin_roster_refresh(CURSOR_CATALOG_PROVIDER) {
             return Ok(false);
         }
-        let live = self.list_models_via_bridge(&api_key).await?;
+        let live = self.list_models_via_bridge(&api_key, cancel).await?;
         let seed = self.catalog.owned_provider_models(CURSOR_CATALOG_PROVIDER);
         let roster =
             crate::cursor_roster::rebuild_cursor_roster(&live, &seed, |provider, model| {
@@ -4440,7 +4444,12 @@ server.serve_forever()
             "bundled seed serves until the first refresh"
         );
 
-        assert!(backend.refresh_model_roster().await.unwrap());
+        assert!(
+            backend
+                .refresh_model_roster(&CancellationToken::new())
+                .await
+                .unwrap()
+        );
         let models = backend.models();
         let mut ids: Vec<_> = models.iter().map(|model| model.id.as_str()).collect();
         ids.sort();
@@ -4473,7 +4482,12 @@ server.serve_forever()
         assert!(file["models"].get("composer-2.5").is_none());
 
         // Within the TTL the refresh is a no-op that spawns nothing.
-        assert!(!backend.refresh_model_roster().await.unwrap());
+        assert!(
+            !backend
+                .refresh_model_roster(&CancellationToken::new())
+                .await
+                .unwrap()
+        );
         assert_eq!(
             std::fs::read_to_string(&calls).unwrap().lines().count(),
             1,
