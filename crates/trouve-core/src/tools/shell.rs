@@ -622,6 +622,10 @@ impl Drop for DetachedRegistry {
 struct JobHandle {
     child: Arc<tokio::sync::Mutex<ProcessTreeChild>>,
     output: Arc<Mutex<JobOutput>>,
+    /// The job's stdin pipe, until `write_stdin` closes it or the job ends.
+    /// Background jobs get a pipe so interactive processes (REPLs, prompts,
+    /// `cat`) can be driven; foreground calls keep stdin closed.
+    stdin: Arc<tokio::sync::Mutex<Option<tokio::process::ChildStdin>>>,
     /// Worktree the job was started from; other sessions cannot touch it.
     worktree: PathBuf,
     /// Returned with `shell_kill` results; never logged, as it may carry
@@ -1226,16 +1230,17 @@ async fn foreground_result(
 const SHELL_DESCRIPTION: &str = if trouve_agents::process_env::DETACHED_RELEASE_SUPPORTED {
     "Run a shell command in the workspace root. Captures stdout/stderr (truncated at 32KB \
      each); times out after 120s by default. Set run_in_background for long-running \
-     processes (dev servers, builds): it returns a job id immediately — poll it with \
-     shell_output and stop it with shell_kill. Processes the command leaves behind are \
-     stopped with it, except daemons that detach into their own session (build caches, \
-     package-manager daemons): those keep running, are reported in the result, and are \
-     stopped when the session worktree is removed."
+     processes (dev servers, builds) or interactive ones: it returns a job id immediately — \
+     poll it with shell_output, feed it with write_stdin, and stop it with shell_kill. \
+     Processes the command leaves behind are stopped with it, except daemons that detach \
+     into their own session (build caches, package-manager daemons): those keep running, \
+     are reported in the result, and are stopped when the session worktree is removed."
 } else {
     "Run a shell command in the workspace root. Captures stdout/stderr (truncated at 32KB \
      each); times out after 120s by default. Set run_in_background for long-running \
-     processes (dev servers, builds): it returns a job id immediately — poll it with \
-     shell_output and stop it with shell_kill. Processes the command leaves behind are \
+     processes (dev servers, builds) or interactive ones: it returns a job id immediately — \
+     poll it with shell_output, feed it with write_stdin, and stop it with shell_kill. \
+     Processes the command leaves behind are \
      stopped with it; a daemon that detaches into its own session (build caches, \
      package-manager daemons) cannot be released on this platform and keeps the call \
      from completing until it exits or the timeout elapses."
@@ -1517,7 +1522,7 @@ impl Shell {
             .arg("-c")
             .arg(command)
             .current_dir(&ctx.worktree)
-            .stdin(std::process::Stdio::null())
+            .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
@@ -1531,9 +1536,11 @@ impl Shell {
         let output = Arc::new(Mutex::new(JobOutput::default()));
         pump(child.take_stdout(), output.clone());
         pump(child.take_stderr(), output.clone());
+        let stdin = Arc::new(tokio::sync::Mutex::new(child.take_stdin()));
         let job = JobHandle {
             child: Arc::new(tokio::sync::Mutex::new(child)),
             output,
+            stdin,
             worktree: ctx.worktree.clone(),
             command: command.to_string(),
             _in_flight: in_flight,
@@ -1628,7 +1635,7 @@ impl Shell {
         ToolResult::ok(json!({
             "job_id": id,
             "pid": pid,
-            "note": "running in background; read output with shell_output, stop with shell_kill",
+            "note": "running in background; read output with shell_output, write to stdin with write_stdin, stop with shell_kill",
         }))
     }
 }
@@ -1755,6 +1762,95 @@ impl Tool for ShellOutput {
                 }
             }
         }
+    }
+}
+
+pub struct WriteStdin {
+    pub jobs: Arc<JobRegistry>,
+}
+
+#[async_trait::async_trait]
+impl Tool for WriteStdin {
+    fn name(&self) -> &'static str {
+        "write_stdin"
+    }
+    fn description(&self) -> &'static str {
+        "Write to the stdin of a background shell job started with run_in_background, for \
+         driving interactive processes (REPLs, prompts, programs reading stdin). Text is sent \
+         exactly as given; include a trailing newline to submit a line. Set close=true to send \
+         EOF after writing (or with empty input to send EOF alone). Read the response with \
+         shell_output."
+    }
+    fn parameters(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "job_id": {"type": "string", "description": "Id returned by shell with run_in_background"},
+                "input": {"type": "string", "description": "Text to write to the job's stdin (default: empty)"},
+                "close": {"type": "boolean", "description": "Close stdin (send EOF) after writing (default: false)"}
+            },
+            "required": ["job_id"]
+        })
+    }
+    fn mutates(&self) -> bool {
+        // The bytes are model-chosen input to a process that may itself be a
+        // shell or REPL, so a write can submit any command the job's launch
+        // approval never covered. Gate it like a mutation: read-only personas
+        // cannot drive jobs, Ask prompts, and "always approve" unlocks the
+        // one job (the allow-list key is per job id).
+        true
+    }
+
+    async fn run(&self, ctx: &ToolCtx, args: &Value) -> ToolResult {
+        use tokio::io::AsyncWriteExt as _;
+        let Some(id) = args.get("job_id").and_then(Value::as_str) else {
+            return ToolResult::error("missing required argument: job_id");
+        };
+        let input = args.get("input").and_then(Value::as_str).unwrap_or("");
+        let close = args.get("close").and_then(Value::as_bool).unwrap_or(false);
+        let job = {
+            let jobs = self.jobs.jobs.lock().unwrap();
+            let Some(job) = jobs.get(id) else {
+                return ToolResult::error(format!("unknown job: {id}"));
+            };
+            if job.handle.worktree != ctx.worktree {
+                return ToolResult::error(format!("unknown job: {id}"));
+            }
+            job.handle.clone()
+        };
+        if job.output.lock().unwrap().exit_code.is_some() {
+            return ToolResult::error(format!("job {id} has already finished"));
+        }
+        let mut stdin = job.stdin.lock().await;
+        let Some(pipe) = stdin.as_mut() else {
+            return ToolResult::error(format!("stdin of job {id} is already closed"));
+        };
+        let write = async {
+            if !input.is_empty() {
+                pipe.write_all(input.as_bytes()).await?;
+            }
+            pipe.flush().await
+        };
+        let written = tokio::select! {
+            biased;
+            _ = ctx.cancel.cancelled() => return ToolResult::error("stdin write cancelled"),
+            result = write => result,
+        };
+        if let Err(error) = written {
+            // A reader that exited or closed its end: drop our side so later
+            // calls report the closed pipe instead of retrying it.
+            *stdin = None;
+            return ToolResult::error(format!("cannot write to stdin of job {id}: {error}"));
+        }
+        if close {
+            // Dropping the handle closes the pipe, which is how EOF is sent.
+            *stdin = None;
+        }
+        ToolResult::ok(json!({
+            "job_id": id,
+            "bytes_written": input.len(),
+            "stdin_open": !close,
+        }))
     }
 }
 
@@ -2132,6 +2228,87 @@ mod tests {
         let res = output.run(&ctx, &json!({"job_id": id})).await;
         assert_eq!(res.result["running"], false);
         assert_eq!(res.result["new_output"], "");
+    }
+
+    #[tokio::test]
+    async fn write_stdin_drives_an_interactive_background_job() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ToolCtx {
+            worktree: tmp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let jobs = Arc::new(JobRegistry::default());
+        let shell = Shell::new(jobs.clone());
+        let output = ShellOutput { jobs: jobs.clone() };
+        let stdin = WriteStdin { jobs: jobs.clone() };
+
+        // `cat` echoes each line it reads and exits only on EOF.
+        let res = shell
+            .run(&ctx, &json!({"command": "cat", "run_in_background": true}))
+            .await;
+        assert_eq!(res.status, trouve_protocol::ToolStatus::Ok);
+        let id = res.result["job_id"].as_str().unwrap().to_string();
+
+        let res = stdin
+            .run(&ctx, &json!({"job_id": id, "input": "hello\n"}))
+            .await;
+        assert_eq!(
+            res.status,
+            trouve_protocol::ToolStatus::Ok,
+            "{}",
+            res.result
+        );
+        assert_eq!(res.result["bytes_written"], 6);
+        assert_eq!(res.result["stdin_open"], true);
+        let res = output
+            .run(&ctx, &json!({"job_id": id, "wait_ms": 2000}))
+            .await;
+        assert_eq!(res.result["new_output"], "hello\n");
+        assert_eq!(res.result["running"], true, "cat must wait for EOF");
+
+        // EOF ends the job; a later write reports the closed pipe.
+        let res = stdin
+            .run(
+                &ctx,
+                &json!({"job_id": id, "input": "bye\n", "close": true}),
+            )
+            .await;
+        assert_eq!(
+            res.status,
+            trouve_protocol::ToolStatus::Ok,
+            "{}",
+            res.result
+        );
+        assert_eq!(res.result["stdin_open"], false);
+        let mut seen = String::new();
+        for _ in 0..40 {
+            let res = output
+                .run(&ctx, &json!({"job_id": id, "wait_ms": 500}))
+                .await;
+            seen.push_str(res.result["new_output"].as_str().unwrap());
+            if res.result["running"] == false {
+                assert_eq!(res.result["exit_code"], 0);
+                break;
+            }
+        }
+        assert_eq!(seen, "bye\n");
+        let res = stdin.run(&ctx, &json!({"job_id": id, "input": "x"})).await;
+        assert_eq!(res.status, trouve_protocol::ToolStatus::Error);
+
+        // Jobs are scoped to their worktree.
+        let other = tempfile::tempdir().unwrap();
+        let foreign = ToolCtx {
+            worktree: other.path().to_path_buf(),
+            ..Default::default()
+        };
+        let res = shell
+            .run(&ctx, &json!({"command": "cat", "run_in_background": true}))
+            .await;
+        let id = res.result["job_id"].as_str().unwrap().to_string();
+        let res = stdin
+            .run(&foreign, &json!({"job_id": id, "input": "x"}))
+            .await;
+        assert_eq!(res.status, trouve_protocol::ToolStatus::Error);
     }
 
     #[tokio::test]

@@ -6,6 +6,7 @@
 //! ([`git`]). See `AGENTS.md` for the invariants.
 
 pub mod automations;
+pub mod command_safety;
 pub mod config;
 pub mod connectivity;
 pub mod context;
