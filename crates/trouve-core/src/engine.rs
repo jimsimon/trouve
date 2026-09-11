@@ -1134,10 +1134,15 @@ fn trouve_bridge_wrapper_call<'a>(
 /// command the classifier recognises as read-only is treated as a read: it
 /// runs without a prompt in Ask mode, is allowed in read-only personas, and
 /// takes the shared execution lane. Unknown tools stay mutating.
-fn call_mutates(known: Option<bool>, tool: &str, args: &serde_json::Value) -> bool {
+fn call_mutates(
+    known: Option<bool>,
+    tool: &str,
+    args: &serde_json::Value,
+    worktree: &Path,
+) -> bool {
     if tool == "shell"
         && let Some(command) = args.get("command").and_then(serde_json::Value::as_str)
-        && crate::command_safety::shell_command_is_read_only(command)
+        && crate::command_safety::shell_command_is_read_only(command, worktree)
     {
         return false;
     }
@@ -1146,12 +1151,18 @@ fn call_mutates(known: Option<bool>, tool: &str, args: &serde_json::Value) -> bo
 
 /// Vendor-native shell approvals (Claude's `Bash`) carry the command text, so
 /// the same read-only classification applies to them.
-fn vendor_shell_command_is_read_only(tool: &str, args: &serde_json::Value) -> bool {
+fn vendor_shell_command_is_read_only(
+    tool: &str,
+    args: &serde_json::Value,
+    worktree: &Path,
+) -> bool {
     tool.eq_ignore_ascii_case("bash")
         && args
             .get("command")
             .and_then(serde_json::Value::as_str)
-            .is_some_and(crate::command_safety::shell_command_is_read_only)
+            .is_some_and(|command| {
+                crate::command_safety::shell_command_is_read_only(command, worktree)
+            })
 }
 
 /// Claude reports first-party MCP calls under their direct MCP name. Their
@@ -18531,8 +18542,8 @@ impl Engine {
         // (it only asks for things it considers mutating), except a native
         // shell command the classifier recognises as read-only, which passes
         // exactly like the same command through trouve's shell tool.
-        let mutates =
-            self.backend_tool_mutates(tool) && !vendor_shell_command_is_read_only(tool, args);
+        let mutates = self.backend_tool_mutates(tool)
+            && !vendor_shell_command_is_read_only(tool, args, Path::new(&session.worktree_path));
         let decision = gate_tool(
             thread.permission_mode,
             effective_read_only,
@@ -18998,7 +19009,12 @@ impl Engine {
         let known = self.executor.tool_mutates(&call.name);
         let allowed_by_mode =
             mode.allowed_tools.is_empty() || mode.allowed_tools.contains(&call.name);
-        let mutates = call_mutates(known, &call.name, &call.arguments);
+        let mutates = call_mutates(
+            known,
+            &call.name,
+            &call.arguments,
+            Path::new(&session.worktree_path),
+        );
         let key = allow_key(&call.name, &call.arguments);
         let decision = if known.is_none() || !allowed_by_mode {
             Gate::Deny
@@ -22369,40 +22385,64 @@ mod tests {
 
     #[test]
     fn read_only_shell_commands_are_gated_as_reads() {
+        let worktree = tempfile::tempdir().unwrap();
+        let wt = worktree.path();
         let shell = |command: &str| serde_json::json!({ "command": command });
         // The shell tool is statically mutating; a recognised read-only
         // command is reclassified per call, an unrecognised one is not.
         assert!(!call_mutates(
             Some(true),
             "shell",
-            &shell("git log --oneline")
+            &shell("git log --oneline"),
+            wt
         ));
-        assert!(!call_mutates(Some(true), "shell", &shell("rg TODO src")));
-        assert!(call_mutates(Some(true), "shell", &shell("cargo test")));
-        assert!(call_mutates(Some(true), "shell", &shell("cat /etc/passwd")));
-        assert!(call_mutates(Some(true), "shell", &serde_json::json!({})));
+        assert!(!call_mutates(
+            Some(true),
+            "shell",
+            &shell("rg TODO src"),
+            wt
+        ));
+        assert!(call_mutates(Some(true), "shell", &shell("cargo test"), wt));
+        assert!(call_mutates(
+            Some(true),
+            "shell",
+            &shell("cat /etc/passwd"),
+            wt
+        ));
+        assert!(call_mutates(
+            Some(true),
+            "shell",
+            &serde_json::json!({}),
+            wt
+        ));
         // Other tools keep the executor's classification; unknown tools
-        // stay mutating.
+        // stay mutating. Stdin writes to a background job are mutating: the
+        // job may be an interactive shell.
         assert!(!call_mutates(
             Some(false),
             "read_file",
-            &serde_json::json!({})
+            &serde_json::json!({}),
+            wt
         ));
-        assert!(call_mutates(Some(true), "write_file", &shell("ls")));
-        assert!(call_mutates(None, "mystery", &shell("ls")));
+        assert!(call_mutates(Some(true), "write_file", &shell("ls"), wt));
+        assert!(call_mutates(Some(true), "write_stdin", &shell("ls"), wt));
+        assert!(call_mutates(None, "mystery", &shell("ls"), wt));
 
         // Claude's native Bash carries the same command text.
         assert!(vendor_shell_command_is_read_only(
             "Bash",
-            &shell("git status")
+            &shell("git status"),
+            wt
         ));
         assert!(!vendor_shell_command_is_read_only(
             "Bash",
-            &shell("rm -rf x")
+            &shell("rm -rf x"),
+            wt
         ));
         assert!(!vendor_shell_command_is_read_only(
             "Edit",
-            &shell("git status")
+            &shell("git status"),
+            wt
         ));
     }
 

@@ -47,9 +47,24 @@ without `-exec`/`-delete`, a `git` query subset, toolchain version probes),
 joined only by `|`, `&&`, `||`, and `;`. A recognised command is gated as a
 read: no prompt in `ask`, allowed in read-only personas, shared execution
 lane. Everything else keeps the mutating classification. The classifier fails
-closed: substitution, redirection, background jobs, escapes, expansion, flags
-that write or execute, and any path that is absolute, `~`-relative, or
-contains `..` all reject, because a read-only persona must not become a way
-to read outside the worktree without a prompt. The same classification
-applies to vendor-native shell approvals that carry the command text
-(Claude's `Bash`).
+closed, because a read-only persona must not become a way to read outside the
+worktree without a prompt:
+
+- Substitution, redirection, background jobs, escapes, expansion, and flags
+  that write, execute helpers (`find -exec`, `rg --pre`, `git -c`,
+  `--textconv`, `--filters`), or follow symlinks during recursion reject.
+- Operands are confined on the real filesystem, not just lexically: absolute,
+  `~`-relative, and `..` paths reject; an operand that exists is
+  canonicalized through symlinks and must stay beneath the canonical
+  worktree; a glob operand rejects if any symlink it could expand through
+  leaves the worktree; `cd` must name one existing directory inside the
+  worktree and is tracked so later operands resolve against it (bare `cd`
+  and `cd -` reject).
+- `git config` reads only with `--local`, exactly one read action, and that
+  action's positional grammar, so host-level configuration is never merged
+  into the answer and output modifiers cannot disguise a write.
+
+The same classification applies to vendor-native shell approvals that carry
+the command text (Claude's `Bash`). `write_stdin`, which feeds a background
+job, is a mutation with a per-job allow-list key: the job may be an
+interactive shell, so its launch approval does not cover later input.

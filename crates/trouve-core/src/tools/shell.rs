@@ -1793,10 +1793,12 @@ impl Tool for WriteStdin {
         })
     }
     fn mutates(&self) -> bool {
-        // Only reaches processes the (already gated) shell tool started, and
-        // the launching command was the approved action; its input is part
-        // of that interaction, like a terminal keystroke.
-        false
+        // The bytes are model-chosen input to a process that may itself be a
+        // shell or REPL, so a write can submit any command the job's launch
+        // approval never covered. Gate it like a mutation: read-only personas
+        // cannot drive jobs, Ask prompts, and "always approve" unlocks the
+        // one job (the allow-list key is per job id).
+        true
     }
 
     async fn run(&self, ctx: &ToolCtx, args: &Value) -> ToolResult {

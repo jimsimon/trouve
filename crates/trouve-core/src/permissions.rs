@@ -51,6 +51,14 @@ pub fn allow_key(tool: &str, args: &serde_json::Value) -> String {
         let first = cmd.split_whitespace().next().unwrap_or("");
         return format!("shell:{first}");
     }
+    // Stdin writes are approved per background job: an interactive shell
+    // started by one approved command must not unlock input to every job.
+    if tool == "write_stdin"
+        && let Some(job) = args.get("job_id").and_then(serde_json::Value::as_str)
+        && !job.is_empty()
+    {
+        return format!("write_stdin:{job}");
+    }
     if let Some((server, _)) = crate::mcp::split_tool_name(tool) {
         return format!("mcp:{server}");
     }
@@ -524,6 +532,13 @@ mod tests {
         assert_eq!(
             allow_key("mcp__jira__create_issue", &serde_json::json!({})),
             "mcp:jira"
+        );
+        assert_eq!(
+            allow_key(
+                "write_stdin",
+                &serde_json::json!({"job_id": "job-7", "input": "x"})
+            ),
+            "write_stdin:job-7"
         );
         assert_eq!(
             allow_key(
