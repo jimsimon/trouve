@@ -233,12 +233,16 @@ pub enum ToolStatus {
     Aborted,
 }
 
-/// Current user-visible startup activity for a running turn.
+/// Current user-visible activity for a running turn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum TurnPhase {
     Processing,
     ConnectingTools,
+    /// The model has finished its own work for now and the turn is held
+    /// open until every agent it spawned has finished, so their results can
+    /// be folded back into this turn instead of being orphaned.
+    WaitingForSubagents,
 }
 
 /// Every event type in the log. Serialized with a `type` tag using

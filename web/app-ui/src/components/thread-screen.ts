@@ -330,6 +330,18 @@ const agentTurnLabels = (
   return labels;
 };
 
+/** Activity label for a turn phase that has no explicit turn-control label. */
+const turnPhaseLabel = (phase: string | undefined): string | undefined => {
+  switch (phase) {
+    case "connecting_tools":
+      return "Connecting tools…";
+    case "waiting_for_subagents":
+      return "Waiting for subagents…";
+    default:
+      return undefined;
+  }
+};
+
 const threadTodoProgress = (
   todos: readonly { readonly status: string }[] | undefined,
 ): string => {
@@ -2155,8 +2167,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         view?.turnModels ?? new Map<number, string>(),
         view?.turnStartedAt ?? new Map<number, string>(),
         view?.turnDurationMs ?? new Map<number, number>(),
-        turnControls.activityLabel
-          ?? (view?.turnPhase === "connecting_tools" ? "Connecting tools…" : undefined),
+        turnControls.activityLabel ?? turnPhaseLabel(view?.turnPhase),
         view?.hasOlder ?? false,
       )}
 

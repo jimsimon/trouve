@@ -3632,7 +3632,7 @@ return errors === 0;
 }
 validate91.evaluated = {"props":{"content":true,"id":true,"status":true},"dynamicProps":false,"dynamicItems":false};
 
-const schema37 = {"type":"string","description":"Current user-visible startup activity for a running turn.","enum":["processing","connecting_tools"]};
+const schema37 = {"type":"string","description":"Current user-visible activity for a running turn.","enum":["processing","connecting_tools","waiting_for_subagents"]};
 
 function validate95(data, {instancePath="", parentData, parentDataProperty, rootData=data, dynamicAnchors={}}={}){
 let vErrors = null;
@@ -3648,7 +3648,7 @@ if(typeof data !== "string"){
 validate95.errors = [{instancePath,schemaPath:"#/type",keyword:"type",params:{type: "string"},message:"must be string"}];
 return false;
 }
-if(!((data === "processing") || (data === "connecting_tools"))){
+if(!(((data === "processing") || (data === "connecting_tools")) || (data === "waiting_for_subagents"))){
 validate95.errors = [{instancePath,schemaPath:"#/enum",keyword:"enum",params:{allowedValues: schema37.enum},message:"must be equal to one of the allowed values"}];
 return false;
 }

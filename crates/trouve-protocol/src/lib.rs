@@ -374,7 +374,10 @@ pub use requests::*;
 // 9.3: code-review repositories, reviewer overrides, and job snapshots carry
 // validated per-role `model_options` maps (for example `fast`) alongside the
 // legacy thinking-level shorthands (additive).
-pub const PROTOCOL_VERSION: &str = "9.3";
+// 9.4: a turn that spawned subagents stays open in the
+// `waiting_for_subagents` phase until they finish, then folds their results
+// back into the same turn before `turn.completed` (additive).
+pub const PROTOCOL_VERSION: &str = "9.4";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";
 pub const ERROR_CODE_GITHUB_REAUTHENTICATION_REQUIRED: &str = "github_reauthentication_required";

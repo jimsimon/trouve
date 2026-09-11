@@ -158,8 +158,22 @@ Thread scope:
   `turn.completed` `{turn, usage, checkpoint_id?}` / `turn.failed`
   `{turn, error}`
 - `turn.phase_changed` `{turn, phase}` — replaces the transient activity
-  label for the running turn (for example, `connecting_tools`); it does not
-  add a transcript or tool-rail item
+  label for the running turn (`connecting_tools`, `waiting_for_subagents`,
+  back to `processing`); it does not add a transcript or tool-rail item
+- A turn that spawned subagents (`spawn_thread` / `spawn_session`) does not
+  emit `turn.completed` while any of them is still running. When the model
+  stops with children active, the engine emits a synthetic `await_subagents`
+  tool call (`tool.requested` → `tool.started` → `tool.completed` listing each
+  child's final status), flips the phase to `waiting_for_subagents`, and once
+  the subtree is idle feeds the children's results back to the model in the
+  same turn so its final answer covers their work. Each child's final message
+  is capped in the digest and tool result, and the digest as a whole has a
+  byte budget: once it is spent, later children are reported by status only
+  with `last_message_truncated: true` and a pointer to their thread (the full
+  text always stays on the child thread, reachable via `search_transcript`).
+  The number of fold-in passes per turn is bounded so a model that
+  spawns again on every pass cannot hold the turn open indefinitely. Cancelling
+  the parent cancels the running descendants and aborts the wait.
 - `user.message` `{turn, content}` — user-authored input only; the legacy
   `background` field is read solely when replaying protocol 7.19–7.26 logs
 - `turn.background_activity` `{turn}` — the server attached a turn to
