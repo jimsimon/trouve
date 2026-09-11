@@ -6,8 +6,29 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [4.11.0] - 2026-09-11
+
+This release adds native web search and inline Mermaid diagrams, makes long
+conversations and subagent workflows more responsive and reliable, strengthens
+Codex and Cursor integration, and gives automated reviews clearer configuration
+and carried-finding explanations.
+
 ### Added
 
+- **Native cached web search**: agents can search the public web through a
+  built-in tool with provider-isolated caching, bounded dispatch and cleanup,
+  cancellation-safe session ownership, and the same outbound approval
+  semantics as other bridged tools.
+- **Inline Mermaid diagrams**: fenced `mermaid` blocks in assistant Markdown
+  render as themed SVG diagrams, with the layout engine loaded only when
+  needed and invalid sources falling back to ordinary code blocks. Agent
+  prompts now describe the rendered chat surface so diagrams can be used when
+  they clarify a response.
+- **Read-only shell recognition and interactive input**: a conservative shell
+  classifier allows known read-only commands without a mutation prompt while
+  confining paths to the session worktree and failing closed on ambiguous or
+  executable forms. The new `write_stdin` tool can drive approved background
+  jobs and is permissioned separately per job.
 - **Code reviews explain why a carried finding still blocks**: the final
   editor now records a verdict for every open finding from an earlier round it
   did not resolve, with a reason naming what the reviewed revision still
@@ -19,8 +40,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   it as `previous_round_verdict` so it can judge whether the new revision
   addressed exactly that gap.
 - **Client/server compatibility**: protocol compatibility advances to 9.5 for
-  the additive `carried_verdict` on code-review findings. Upgrade the desktop
-  or PWA client, review dashboard, and `trouve-server` together.
+  the additive code-review model option maps, the
+  `waiting_for_subagents` turn phase, and `carried_verdict` on code-review
+  findings. Upgrade the desktop or PWA client, review dashboard, and
+  `trouve-server` together.
 - **Model-specific options for code reviews**: the review dashboard's
   repository settings now show schema-driven controls (for example Codex
   "fast" mode) for the coordinator, semantic router, change analyst, and
@@ -28,13 +51,34 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the desktop prompt UI. Options are validated against the selected model,
   dropped when a model that does not support them is chosen, snapshotted onto
   each review job, and shown in the job details.
-- **Client/server compatibility**: protocol compatibility advances to 9.3 for
-  the additive per-role `model_options` maps on code-review repositories,
-  reviewer overrides, and job snapshots. Upgrade the desktop or PWA client,
-  review dashboard, and `trouve-server` together.
+
+### Changed
+
+- **Subagent completion is part of the parent turn**: cancelling a turn now
+  cascades to all spawned descendants. A parent waits for its subagent tree to
+  become idle, folds bounded child results back into the model, and only then
+  emits `turn.completed`, preventing orphaned work and premature answers.
+- **Long chats remain responsive**: composer-only changes no longer rebuild
+  the transcript, derived chat layout is memoized, and very long turns are
+  virtualized in bounded segments while preserving continuous cards,
+  timelines, checkpoint actions, and live history anchoring.
+- **Cursor uses one shared SDK Bridge process**: bridge lifecycle and storage
+  are coordinated globally across sessions, reducing duplicate processes and
+  avoiding shared-store transition races. Cursor Opus 5 also advertises image
+  input support.
+- **Managed Codex installs include the code-mode host**: the installer fetches,
+  validates, and atomically publishes the sidecar required by code-mode-only
+  models alongside the Codex binary; existing managed installs missing it are
+  offered an in-place repair.
 
 ### Fixed
 
+- **Codex MCP tools reach trouve's permission gate**: bridge tools are
+  pre-approved inside Codex while user MCP calls, confirmations, forms, and
+  URL elicitations are routed through trouve with lossless answer validation.
+  The handshake now opts into Codex's experimental API so granular approvals
+  are accepted, and user-level Codex approval-reviewer settings cannot bypass
+  trouve's decision point.
 - **A shared root-cause review thread no longer closes while a grouped
   finding is still open**: findings published under one inline comment share
   its thread, and fixing the primary finding used to resolve that thread even
@@ -48,6 +92,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   turn completes, its last text block (including harness-authored progress
   such as Codex commentary) is now rendered as the Response when only tool
   activity follows it.
+- **Reasoning and activity rendering is cleaner**: empty reasoning lifecycle
+  nodes are hidden, steering no longer splits an open reasoning stream, and
+  running-turn status rows avoid redundant subtitles.
 
 ## [4.10.1] - 2026-09-06
 
@@ -1426,6 +1473,7 @@ semble ([BENCHMARKS.md](BENCHMARKS.md)):
 - Incremental reindex (1 file touched): 0.86 s vs ~3 min (212x)
 - Warm query: 0.55 s vs 7.2 s (13x)
 
+[4.11.0]: https://github.com/jimsimon/trouve/compare/v4.10.1...v4.11.0
 [4.10.1]: https://github.com/jimsimon/trouve/compare/v4.10.0...v4.10.1
 [4.10.0]: https://github.com/jimsimon/trouve/compare/v4.9.0...v4.10.0
 [4.9.0]: https://github.com/jimsimon/trouve/compare/v4.8.1...v4.9.0
