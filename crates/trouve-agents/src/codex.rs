@@ -808,8 +808,14 @@ fn form_question(name: &str, property: &Value) -> Option<trouve_protocol::Questi
 
 /// Build the form's `content` object from the user's answers, typed per the
 /// requested schema. Unanswered fields are omitted; the server applies its
-/// own `required` handling.
-fn form_elicitation_content(schema: &Value, answers: &[trouve_protocol::QuestionAnswer]) -> Value {
+/// own `required` handling. Returns `None` when an answer cannot be
+/// represented as its schema type without altering it (an integer beyond
+/// 64 bits, a non-numeric string for a number), so the form is declined
+/// rather than submitted with a changed value.
+fn form_elicitation_content(
+    schema: &Value,
+    answers: &[trouve_protocol::QuestionAnswer],
+) -> Option<Value> {
     let mut content = serde_json::Map::new();
     let properties = schema["properties"].as_object();
     for answer in answers {
@@ -841,22 +847,37 @@ fn form_elicitation_content(schema: &Value, answers: &[trouve_protocol::Question
         } else {
             match kind {
                 "boolean" => Value::Bool(raw == "true"),
-                "integer" => raw
-                    .trim()
-                    .parse::<i64>()
-                    .map_or_else(|_| Value::String(raw), Value::from),
-                "number" => raw
-                    .trim()
-                    .parse::<f64>()
-                    .ok()
-                    .and_then(serde_json::Number::from_f64)
-                    .map_or_else(|| Value::String(raw.clone()), Value::Number),
+                "integer" => lossless_integer(raw.trim())?,
+                "number" => lossless_number(raw.trim())?,
                 _ => Value::String(raw),
             }
         };
         content.insert(answer.question_id.clone(), value);
     }
-    Value::Object(content)
+    Some(Value::Object(content))
+}
+
+/// A JSON integer that round-trips exactly: i64 or u64 range only.
+fn lossless_integer(text: &str) -> Option<Value> {
+    text.parse::<i64>()
+        .map(Value::from)
+        .or_else(|_| text.parse::<u64>().map(Value::from))
+        .ok()
+}
+
+/// A JSON number that round-trips exactly. Integer literals must fit in 64
+/// bits (an f64 would round `9007199254740993`); anything else must be a
+/// finite decimal, for which f64 is JSON's own representation.
+fn lossless_number(text: &str) -> Option<Value> {
+    let is_integer_literal = {
+        let digits = text.strip_prefix('-').unwrap_or(text);
+        !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+    };
+    if is_integer_literal {
+        return lossless_integer(text);
+    }
+    let parsed: f64 = text.parse().ok()?;
+    serde_json::Number::from_f64(parsed).map(Value::Number)
 }
 
 fn url_elicitation_completed(answers: &[trouve_protocol::QuestionAnswer]) -> bool {
@@ -1794,7 +1815,7 @@ fn turn_stream(
                                                 responder: answer_tx,
                                             }))
                                             .await;
-                                        answer_rx.await.ok().flatten().map(|answers| {
+                                        answer_rx.await.ok().flatten().and_then(|answers| {
                                             form_elicitation_content(
                                                 &params["requestedSchema"],
                                                 &answers,
@@ -8648,7 +8669,58 @@ cat > /dev/null
         ];
         assert_eq!(
             form_elicitation_content(&form["requestedSchema"], &answers),
-            json!({ "project": "DEV", "urgent": false, "summary": "Login broken", "points": 3 })
+            Some(
+                json!({ "project": "DEV", "urgent": false, "summary": "Login broken", "points": 3 })
+            )
+        );
+
+        // Numbers are never altered on the way through: integers beyond
+        // 64 bits and non-numeric text decline the form instead of being
+        // rounded or stringified.
+        let numeric_schema = json!({
+            "properties": {
+                "id": { "type": "integer" },
+                "amount": { "type": "number" }
+            }
+        });
+        let answer = |question: &str, text: &str| {
+            vec![trouve_protocol::QuestionAnswer {
+                question_id: question.into(),
+                selected_option_ids: vec![],
+                other_text: Some(text.into()),
+            }]
+        };
+        assert_eq!(
+            form_elicitation_content(&numeric_schema, &answer("id", "9007199254740993")),
+            Some(json!({ "id": 9007199254740993_i64 }))
+        );
+        assert_eq!(
+            form_elicitation_content(&numeric_schema, &answer("id", "18446744073709551615")),
+            Some(json!({ "id": 18446744073709551615_u64 }))
+        );
+        assert_eq!(
+            form_elicitation_content(&numeric_schema, &answer("id", "18446744073709551616")),
+            None
+        );
+        assert_eq!(
+            form_elicitation_content(&numeric_schema, &answer("id", "3.5")),
+            None
+        );
+        assert_eq!(
+            form_elicitation_content(&numeric_schema, &answer("amount", "9007199254740993")),
+            Some(json!({ "amount": 9007199254740993_i64 }))
+        );
+        assert_eq!(
+            form_elicitation_content(&numeric_schema, &answer("amount", "12.50")),
+            Some(json!({ "amount": 12.5 }))
+        );
+        assert_eq!(
+            form_elicitation_content(&numeric_schema, &answer("amount", "lots")),
+            None
+        );
+        assert_eq!(
+            form_elicitation_content(&numeric_schema, &answer("amount", "NaN")),
+            None
         );
 
         // Fields trouve cannot represent are declined, never guessed.
