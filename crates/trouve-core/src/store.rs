@@ -12503,17 +12503,49 @@ impl Store {
 
     /// Records the latest round's reason for leaving each carried finding
     /// open. Only open rows are touched: a finding the same round resolved
-    /// keeps its resolution instead of a stale verdict.
+    /// keeps its resolution instead of a stale verdict. The verdicts are
+    /// only the pull request's latest word when the job's review is the
+    /// current publication for its head: a job superseded by a newer
+    /// same-head round records nothing, so a stale round cannot overwrite
+    /// the reason the current one gave. Returns whether they were recorded.
     pub fn record_code_review_carried_verdicts(
         &self,
         job_id: &str,
         verdicts: &[(&str, &str)],
-    ) -> Result<()> {
+    ) -> Result<bool> {
         if verdicts.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
         let conn = self.conn.lock().unwrap();
         let tx = write_transaction(&conn)?;
+        let current_publication = tx.query_row(
+            "SELECT EXISTS (
+               SELECT 1 FROM code_review_jobs AS current_job
+               WHERE current_job.id = ?1
+                 AND current_job.review_published != 0
+                 AND current_job.cancel_requested = 0
+                 AND NOT EXISTS (
+                   SELECT 1 FROM code_review_jobs AS newer
+                   WHERE newer.repository = current_job.repository
+                     AND newer.pull_number = current_job.pull_number
+                     AND newer.head_sha = current_job.head_sha
+                     AND (
+                       newer.publication_generation > current_job.publication_generation
+                       OR (
+                         newer.publication_generation = current_job.publication_generation
+                         AND newer.rowid > current_job.rowid
+                       )
+                     )
+                     AND newer.status IN ('queued', 'running', 'succeeded')
+                 )
+             )",
+            params![job_id],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !current_publication {
+            tx.commit()?;
+            return Ok(false);
+        }
         for (finding_id, reason) in verdicts {
             tx.execute(
                 "UPDATE code_review_findings
@@ -12523,7 +12555,7 @@ impl Store {
             )?;
         }
         tx.commit()?;
-        Ok(())
+        Ok(true)
     }
 
     /// Marks a finding's thread collapse as done, records the successfully
@@ -27018,6 +27050,35 @@ mod tests {
         assert_eq!(verdict.job_id, second.id);
         assert_eq!(verdict.head_sha, second.head_sha);
         assert_eq!(verdict.reason, "Headings are still copied uncapped.");
+
+        // A round superseded by a newer job at the same head is no longer
+        // the pull request's latest word: its verdicts are not recorded.
+        let mut replacement_request = backoff_test_job_request();
+        replacement_request.dedupe_key = "acme/widgets#42:fix-primary-replacement".into();
+        replacement_request.head_sha = second.head_sha.clone();
+        let replacement = store
+            .enqueue_code_review_job(&replacement_request)
+            .unwrap()
+            .unwrap();
+        assert!(
+            !store
+                .record_code_review_carried_verdicts(&second.id, &[(&grouped.id, "stale")])
+                .unwrap()
+        );
+        assert_eq!(
+            state(&grouped.id).carried_verdict.unwrap().reason,
+            "Headings are still copied uncapped."
+        );
+        // Take the replacement out of the queue so round three is claimed.
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE code_review_jobs SET status = 'cancelled' WHERE id = ?1",
+                params![replacement.id],
+            )
+            .unwrap();
 
         // Round three fixes the sibling: the primary's collapse is armed and
         // the sibling's verdict is cleared with its resolution.
