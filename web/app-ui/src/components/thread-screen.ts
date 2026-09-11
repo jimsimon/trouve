@@ -42,7 +42,18 @@ import type { ComposerDraft } from "../services/composer-drafts.js";
 import {
   DEFAULT_CHAT_PREFERENCES,
   effectiveChatCollapsePreferences,
+  type ChatPreferences,
 } from "../services/chat-preferences.js";
+import {
+  activityRunItems,
+  hasNativeCompactionMarker,
+  planAgentBody,
+  segmentTurnSpans,
+  turnSegmentId,
+  turnSegmentUnitId,
+  type AgentBodySpan,
+  type TurnSegment,
+} from "./agent-body-plan.js";
 import type { ChatScrollBookmark } from "../services/resume-preferences.js";
 import { rankComposerCompletionsOffThread } from "../services/content-worker-client.js";
 import { readSignal, withSignalTracking } from "../state/reactivity.js";
@@ -88,6 +99,7 @@ import {
   isContextCompactionTool,
   type AgentActivityItem,
   type AgentChatItem,
+  type ChatLayout,
   type ChatRenderUnit,
 } from "./chat-layout.js";
 import {
@@ -201,12 +213,32 @@ import "./model-picker.js";
 import "./new-thread-setup.js";
 
 type VirtualChatItem = VirtualItem & (
-  | { readonly kind: "unit"; readonly unitIndex: number }
+  | { readonly kind: "unit"; readonly unitIndex: number; readonly segment: TurnSegment }
   | { readonly kind: "optimistic-prompt" }
   | { readonly kind: "compacting" }
   | { readonly kind: "activity"; readonly presentation: AgentActivityPresentation }
   | { readonly kind: "edge-spacer"; readonly edge: "start" }
 );
+
+interface AgentBodyPlanEntry {
+  readonly items: readonly AgentChatItem[];
+  readonly collapse: ChatPreferences;
+  readonly responseId: string | undefined;
+  readonly spans: readonly AgentBodySpan[];
+}
+
+interface ChatDerivedState {
+  readonly threadId: string;
+  readonly items: readonly ThreadChatItem[];
+  readonly itemsRevision: number;
+  readonly collapse: ChatPreferences;
+  readonly presentation: ChatPresentationIndex;
+  readonly layout: ChatLayout;
+  /** One virtual row per turn segment, in transcript order. */
+  readonly unitItems: readonly VirtualChatItem[];
+  readonly hasRunningCompaction: boolean;
+  readonly bodyPlans: Map<string, AgentBodyPlanEntry>;
+}
 
 interface OptimisticPromptSubmission {
   readonly id: string;
@@ -239,6 +271,39 @@ const CHAT_HISTORY_STATUS_DELAY_MS = 180;
 const CHAT_HISTORY_RETRY_DELAY_MS = 1_500;
 // Title generation is optional metadata and must not make thread creation
 // appear hung when the naming provider is slow or unavailable.
+
+const sameChatPreferences = (left: ChatPreferences, right: ChatPreferences): boolean =>
+  left.collapseSequentialToolCalls === right.collapseSequentialToolCalls
+  && left.collapseThinkingWithTools === right.collapseThinkingWithTools
+  && left.collapseCompactionWithTools === right.collapseCompactionWithTools
+  && left.collapseTodoUpdatesWithTools === right.collapseTodoUpdatesWithTools;
+
+/** The item drawn as a unit's answer, which shapes its body plan. */
+const unitResponseItemId = (
+  unit: ChatRenderUnit,
+  presentation: ChatPresentationIndex,
+): string | undefined =>
+  turnResponseItemId(unit.items, unit.status?.state ?? presentation.turnStates.get(unit.turn));
+
+/** The `turn-*` class every segment of a turn card shares. A cancelled turn
+ * drops its `turn-status` item, so without a recorded state the body's live
+ * activity decides whether the card still reads as running. */
+const turnStateKind = (
+  unit: ChatRenderUnit,
+  turnState: TurnState | undefined,
+): TurnState["kind"] => {
+  if (turnState !== undefined) return turnState.kind;
+  const activityRunning = unit.items.some((item) =>
+    (item.kind === "assistant" || item.kind === "progress" || item.kind === "thinking")
+      && !item.complete
+    || item.kind === "compaction" && item.state.kind === "running"
+    || item.kind === "tool" && (
+      item.status === "running" || item.status === "awaiting-approval"
+    )
+    || item.kind === "questions" && item.answers === undefined
+  );
+  return activityRunning || unit.items.length === 0 ? "running" : "completed";
+};
 
 const sameVirtualRenderWindow = (
   left: VirtualWindow<VirtualChatItem>,
@@ -494,6 +559,8 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
   #composerDraftThreadId = "";
   #composerDraftRestoreGeneration = 0;
   #composerDraftPersistTimer: ReturnType<typeof setTimeout> | undefined;
+  #renderedComposerSignature = "";
+  #chatDerivedCache: ChatDerivedState | undefined;
   #restoreComposerSelection = false;
   #composerComposing = false;
   #completionSelected = 0;
@@ -1041,6 +1108,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     this.#markdownContextMenuReturnFocus = undefined;
     this.#threadTabContextMenu = undefined;
     this.#renamingThreadId = "";
+    this.#chatDerivedCache = undefined;
     super.disconnectedCallback();
   }
 
@@ -1729,9 +1797,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     const serverOnline = readSignal(store.serverInfo)?.online;
     const models = this.#availableModels();
     const connectivityBlocked = serverOnline === false && models.length === 0;
-    const hasComposerContent = this.#composerDraft.trim() !== ""
-      || this.#pendingAttachments.length > 0
-      || this.#queueEditRetainedAttachments.length > 0;
+    const hasComposerContent = this.#composerHasContent();
     const turnControls = chatTurnControlState({
       threadAvailable: thread !== undefined,
       durableTurnRunning: view?.turnRunning ?? false,
@@ -1753,6 +1819,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     const completion = connectivityBlocked
       ? undefined
       : this.#activeComposerCompletion(view?.commands ?? []);
+    this.#renderedComposerSignature = this.#composerRenderSignature(hasComposerContent);
     const selectedModel = thread === undefined
       ? undefined
       : models.find((model) => model.id === thread.model);
@@ -2159,6 +2226,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         : html`
       ${this.#renderChat(
         view?.items ?? [],
+        view?.itemsRevision ?? 0,
         view?.turnRunning ?? false,
         turnControls.effectiveTurnRunning,
         view?.thinking ?? false,
@@ -2497,6 +2565,33 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     `;
   }
 
+  // Everything outside the textarea that a keystroke can change. The textarea
+  // itself tracks its own value, so while this signature is stable the rest of
+  // the screen (including the whole chat transcript) does not need to re-render.
+  #composerRenderSignature(hasContent: boolean): string {
+    const token = composerCompletionToken(this.#composerDraft, this.#composerCursor);
+    return [
+      hasContent,
+      this.#completionDismissed,
+      this.#composerComposing,
+      this.#completionSelected,
+      token?.kind ?? "",
+      token?.query ?? "",
+    ].join(" ");
+  }
+
+  #composerHasContent(): boolean {
+    return this.#composerDraft.trim() !== ""
+      || this.#pendingAttachments.length > 0
+      || this.#queueEditRetainedAttachments.length > 0;
+  }
+
+  #requestComposerUpdate(): void {
+    const signature = this.#composerRenderSignature(this.#composerHasContent());
+    if (signature === this.#renderedComposerSignature) return;
+    this.requestUpdate();
+  }
+
   #activeComposerCompletion(
     commands: readonly { readonly name: string; readonly description?: string }[],
   ): ActiveComposerCompletion | undefined {
@@ -2712,8 +2807,78 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     `;
   }
 
+  /** Derived transcript structure for the current items revision. A single
+   * entry is retained (the active thread only) so keystroke and scroll
+   * re-renders skip the O(items) layout pass without growing memory. */
+  #chatDerived(
+    items: readonly ThreadChatItem[],
+    itemsRevision: number,
+  ): ChatDerivedState {
+    const cached = this.#chatDerivedCache;
+    const collapse = this.#effectiveCollapsePreferences();
+    if (
+      cached !== undefined
+      && cached.threadId === this.threadId
+      && cached.items === items
+      && cached.itemsRevision === itemsRevision
+      && sameChatPreferences(cached.collapse, collapse)
+    ) {
+      return cached;
+    }
+    this.#syncQuestionWizards(items);
+    const presentation = indexChatPresentation(items);
+    const layout = buildChatLayout(items);
+    const bodyPlans = new Map<string, AgentBodyPlanEntry>();
+    const unitItems: VirtualChatItem[] = [];
+    layout.units.forEach((unit, unitIndex) => {
+      // Large turns become several virtual rows so only the visible slice of
+      // a long tool/thinking stream is mounted at once.
+      const responseId = unitResponseItemId(unit, presentation);
+      const spans = planAgentBody(unit.items, collapse, responseId);
+      bodyPlans.set(unit.id, { items: unit.items, collapse, responseId, spans });
+      for (const segment of segmentTurnSpans(spans, unit.items.length)) {
+        const itemCount = segment.itemEnd - segment.itemStart;
+        let heavyweight = false;
+        for (let index = segment.itemStart; index < segment.itemEnd; index += 1) {
+          const kind = unit.items[index]?.kind;
+          if (kind === "tool" || kind === "questions") {
+            heavyweight = true;
+            break;
+          }
+        }
+        unitItems.push({
+          id: turnSegmentId(unit.id, segment.index),
+          kind: "unit",
+          unitIndex,
+          segment,
+          estimatedHeight: segment.first
+            ? Math.max(190, Math.min(760, 110 + itemCount * 90))
+            : Math.max(90, Math.min(760, 20 + itemCount * 90)),
+          heavyweight,
+        });
+      }
+    });
+    const hasRunningCompaction = items.some(
+      (item) => item.kind === "compaction" && item.state.kind === "running",
+    );
+    const derived: ChatDerivedState = {
+      threadId: this.threadId,
+      items,
+      itemsRevision,
+      collapse,
+      presentation,
+      layout,
+      unitItems,
+      hasRunningCompaction,
+      bodyPlans,
+    };
+    this.#chatDerivedCache = derived;
+    return derived;
+  }
+
   #renderChat(
     items: readonly ThreadChatItem[],
+    itemsRevision: number,
     turnRunning: boolean,
     effectiveTurnRunning: boolean,
     thinking: boolean,
@@ -2725,9 +2890,8 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     activityOverride: string | undefined,
     hasOlder: boolean,
   ) {
-    this.#syncQuestionWizards(items);
-    const presentation = indexChatPresentation(items);
-    const layout = buildChatLayout(items);
+    const { presentation, layout, unitItems, hasRunningCompaction } =
+      this.#chatDerived(items, itemsRevision);
     const chatFindMatchIds = new Set(this.#chatFindUnitIds);
     const activeChatFindUnitId = this.#activeChatFindUnitId();
     let activeTurn: number | undefined;
@@ -2774,16 +2938,11 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         }
       }
     }
-    const virtualItems: VirtualChatItem[] = layout.units.map((unit, unitIndex) => ({
-      id: unit.id,
-      kind: "unit",
-      unitIndex,
-      estimatedHeight:
-        Math.max(190, Math.min(760, 110 + unit.items.length * 90)),
-      heavyweight: unit.items.some(
-        (item) => item.kind === "tool" || item.kind === "questions",
-      ),
-    }));
+    // A collapsed turn shows only its header, which lives in the first segment.
+    const virtualItems: VirtualChatItem[] = unitItems.filter((item) =>
+      item.kind !== "unit"
+      || item.segment.first
+      || this.#turnCardOpen(layout.units[item.unitIndex]));
     const optimistic = this.#optimisticPrompt;
     if (
       optimistic !== undefined
@@ -2796,9 +2955,6 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         estimatedHeight: Math.max(170, 120 + optimistic.attachments.length * 52),
       });
     }
-    const hasRunningCompaction = items.some(
-      (item) => item.kind === "compaction" && item.state.kind === "running",
-    );
     if (compacting && !hasRunningCompaction) {
       virtualItems.push({
         id: "ephemeral:compacting",
@@ -2837,10 +2993,10 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       if (bookmark === undefined) {
         this.#restoredScrollThreadId = this.threadId;
       } else {
-        const unitId = layout.unitIdForItem.get(bookmark.itemId) ?? bookmark.itemId;
-        if (virtualItems.some((item) => item.id === unitId)) {
+        const rowId = this.#bookmarkRowId(bookmark.itemId, layout, unitItems, virtualItems);
+        if (rowId !== undefined) {
           this.#virtualizer.restoreBookmark({
-            id: unitId,
+            id: rowId,
             offset: bookmark.offset,
           });
         } else {
@@ -2899,8 +3055,9 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
                 </div>`;
               }
               const unit = layout.units[item.unitIndex];
-              const chatFindMatch = this.#chatFindOpen && chatFindMatchIds.has(item.id);
-              const chatFindActive = chatFindMatch && item.id === activeChatFindUnitId;
+              const chatFindMatch = this.#chatFindOpen && chatFindMatchIds.has(unit?.id ?? "");
+              const chatFindActive = chatFindMatch && unit?.id === activeChatFindUnitId;
+              const nestedActivity = unit?.id === nestedActivityUnitId && item.segment.last;
               return unit === undefined
                 ? nothing
                 : html`<div
@@ -2909,15 +3066,16 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
                       : chatFindMatch ? "chat-find-match" : nothing}
                     data-virtual-id=${item.id}
                     style=${style}
-                    aria-current=${chatFindActive ? "true" : nothing}
+                    aria-current=${chatFindActive && item.segment.first ? "true" : nothing}
                   >${this.#renderUnit(
                     unit,
+                    item.segment,
                     turnLabels,
                     turnModels,
                     turnDurationMs,
                     presentation,
-                    unit.id === nestedActivityUnitId ? activityPresentation : undefined,
-                    unit.id === nestedActivityUnitId ? liveActivityInput : undefined,
+                    nestedActivity ? activityPresentation : undefined,
+                    nestedActivity ? liveActivityInput : undefined,
                     effectiveTurnRunning,
                     item.unitIndex === layout.units.length - 1,
                   )}</div>`;
@@ -2940,6 +3098,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
 
   #renderUnit(
     unit: ChatRenderUnit,
+    segment: TurnSegment,
     turnLabels: ReadonlyMap<number, string>,
     turnModels: ReadonlyMap<number, string>,
     turnDurationMs: ReadonlyMap<number, number>,
@@ -2949,9 +3108,15 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     checkpointRestoreDisabled: boolean,
     finalUnit: boolean,
   ) {
-    const trailingBoundary = checkpointBoundaryAfterTurn(unit.turn, presentation.turnStates);
+    // A collapsed turn mounts only its first segment, so the checkpoint
+    // boundary after the turn has to render on whichever segment is last
+    // on screen rather than the last one planned.
+    const lastMounted = segment.last || !this.#turnCardOpen(unit);
+    const trailingBoundary = lastMounted
+      ? checkpointBoundaryAfterTurn(unit.turn, presentation.turnStates)
+      : undefined;
     return html`
-      ${unit.divider
+      ${unit.divider && segment.first
         ? this.#renderTurnRule(
             unit.turn,
             presentation,
@@ -2960,6 +3125,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         : nothing}
       ${this.#renderTurnCard(
         unit,
+        segment,
         turnLabels,
         turnModels,
         turnDurationMs,
@@ -2971,6 +3137,44 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         ? this.#renderCheckpointRule(trailingBoundary, checkpointRestoreDisabled)
         : nothing}
     `;
+  }
+
+  #turnCardOpen(unit: ChatRenderUnit | undefined): boolean {
+    if (unit === undefined) return false;
+    if (this.#messageDisclosure.get(unit.id) ?? true) return true;
+    return unit.items.some(
+      (item) => item.kind === "compaction" && item.state.kind === "running",
+    );
+  }
+
+  /** Resolve a persisted scroll bookmark to a currently mounted row id. Older
+   * bookmarks name an item or a whole turn; newer ones name a segment whose
+   * boundaries may have shifted since the bookmark was taken. */
+  #bookmarkRowId(
+    bookmarkId: string,
+    layout: ChatLayout,
+    unitItems: readonly VirtualChatItem[],
+    virtualItems: readonly VirtualChatItem[],
+  ): string | undefined {
+    const mounted = (id: string): boolean => virtualItems.some((item) => item.id === id);
+    if (mounted(bookmarkId)) return bookmarkId;
+    const itemUnitId = layout.unitIdForItem.get(bookmarkId);
+    if (itemUnitId !== undefined) {
+      const unitIndex = layout.units.findIndex((unit) => unit.id === itemUnitId);
+      const unit = layout.units[unitIndex];
+      const itemIndex = unit?.items.findIndex((item) => item.id === bookmarkId) ?? -1;
+      if (unit !== undefined && itemIndex !== -1) {
+        const row = unitItems.find((item) =>
+          item.kind === "unit"
+          && item.unitIndex === unitIndex
+          && item.segment.itemStart <= itemIndex
+          && itemIndex < item.segment.itemEnd);
+        if (row !== undefined && mounted(row.id)) return row.id;
+      }
+      if (mounted(itemUnitId)) return itemUnitId;
+    }
+    const unitId = turnSegmentUnitId(bookmarkId);
+    return unitId !== bookmarkId && mounted(unitId) ? unitId : undefined;
   }
 
   #renderTurnRule(
@@ -3106,6 +3310,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
 
   #renderTurnCard(
     unit: ChatRenderUnit,
+    segment: TurnSegment,
     turnLabels: ReadonlyMap<number, string>,
     turnModels: ReadonlyMap<number, string>,
     turnDurationMs: ReadonlyMap<number, number>,
@@ -3114,6 +3319,15 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     activityInput: RunningAgentActivityInput | undefined,
   ) {
     this.#ensureMarkdown();
+    if (!segment.first) {
+      return this.#renderTurnCardContinuation(
+        unit,
+        segment,
+        presentation,
+        activityPresentation,
+        activityInput,
+      );
+    }
     const assistantItems = unit.items.filter(
       (item): item is Extract<AgentChatItem, { readonly kind: "assistant" }> =>
         item.kind === "assistant",
@@ -3132,18 +3346,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       : collapsedChatPreview(assistantCopyText(unit.prompt.content))
         || `${unit.prompt.attachments.length} attachment${unit.prompt.attachments.length === 1 ? "" : "s"}`;
     const preview = promptPreview || collapsedChatPreview(joined) || `Turn ${unit.turn}`;
-    const activityRunning = unit.items.some((item) =>
-      (item.kind === "assistant" || item.kind === "progress" || item.kind === "thinking")
-        && !item.complete
-      || item.kind === "compaction" && item.state.kind === "running"
-      || item.kind === "tool" && (
-        item.status === "running" || item.status === "awaiting-approval"
-      )
-      || item.kind === "questions" && item.answers === undefined
-    );
-    const stateKind = turnState?.kind ?? (
-      activityRunning || unit.items.length === 0 ? "running" : "completed"
-    );
+    const stateKind = turnStateKind(unit, turnState);
     const modelLabel = turnLabels.get(unit.turn);
     const modelId = turnModels.get(unit.turn);
     const model = this.#availableModels().find((candidate) => candidate.id === modelId);
@@ -3156,9 +3359,12 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       compactionRunning,
       modelId?.startsWith("codex/") ?? false,
     );
+    const continues = open && !segment.last;
     return html`
       <article
-        class=${`message turn-card assistant-message agent-turn-card conversation-turn turn-${stateKind}`}
+        class=${`message turn-card assistant-message agent-turn-card conversation-turn turn-${stateKind}${
+          continues ? " turn-segment-continues" : ""
+        }`}
         aria-labelledby=${`turn-heading-${unit.id}`}
       >
         <header class="message-header agent-header turn-header ${open ? "" : "collapsed"}">
@@ -3200,16 +3406,56 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
               ${this.#renderAgentBody(
                 unit,
                 presentation,
+                segment,
               )}
-              ${activityPresentation === undefined
-                ? nothing
-                : this.#renderTransientActivityNode(activityPresentation, activityInput)}
-              ${unit.status === undefined
-                ? nothing
-                : this.#renderTerminalTurnState(unit.status)}
+              ${this.#renderTurnTail(unit, segment, activityPresentation, activityInput)}
             </div>`
           : nothing}
       </article>
+    `;
+  }
+
+  /** Rows of an open turn after its first segment. They share the first
+   * segment's card frame visually (see `.turn-segment-continuation`) but are
+   * mounted and measured as independent virtual rows. */
+  #renderTurnCardContinuation(
+    unit: ChatRenderUnit,
+    segment: TurnSegment,
+    presentation: ChatPresentationIndex,
+    activityPresentation: AgentActivityPresentation | undefined,
+    activityInput: RunningAgentActivityInput | undefined,
+  ) {
+    const turnState = unit.status?.state ?? presentation.turnStates.get(unit.turn);
+    const stateKind = turnStateKind(unit, turnState);
+    return html`
+      <article
+        class=${`message turn-card assistant-message agent-turn-card conversation-turn turn-${stateKind} turn-segment-continuation${
+          segment.last ? "" : " turn-segment-continues"
+        }`}
+        aria-label=${`Turn ${unit.turn} (continued)`}
+      >
+        <div class="message-body turn-body-stream agent-body-stream turn-timeline">
+          ${this.#renderAgentBody(unit, presentation, segment)}
+          ${this.#renderTurnTail(unit, segment, activityPresentation, activityInput)}
+        </div>
+      </article>
+    `;
+  }
+
+  #renderTurnTail(
+    unit: ChatRenderUnit,
+    segment: TurnSegment,
+    activityPresentation: AgentActivityPresentation | undefined,
+    activityInput: RunningAgentActivityInput | undefined,
+  ) {
+    if (!segment.last) return nothing;
+    return html`
+      ${activityPresentation === undefined
+        ? nothing
+        : this.#renderTransientActivityNode(activityPresentation, activityInput)}
+      ${unit.status === undefined
+        ? nothing
+        : this.#renderTerminalTurnState(unit.status)}
     `;
   }
 
@@ -3445,20 +3691,49 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     `;
   }
 
-  #renderAgentBody(
-    unit: ChatRenderUnit,
-    presentation: ChatPresentationIndex,
-  ) {
+  #effectiveCollapsePreferences(): ChatPreferences {
     const chatPreferences = this.#services.value === undefined
       ? undefined
       : readSignal(this.#services.value.chatPreferences);
-    const effectiveCollapse = effectiveChatCollapsePreferences(
-      chatPreferences ?? DEFAULT_CHAT_PREFERENCES,
-    );
-    const collapseSequentialToolCalls = effectiveCollapse.collapseSequentialToolCalls;
-    const collapseThinkingWithTools = effectiveCollapse.collapseThinkingWithTools;
-    const collapseCompactionWithTools = effectiveCollapse.collapseCompactionWithTools;
-    const collapseTodoUpdatesWithTools = effectiveCollapse.collapseTodoUpdatesWithTools;
+    return effectiveChatCollapsePreferences(chatPreferences ?? DEFAULT_CHAT_PREFERENCES);
+  }
+
+  /** Body spans for one unit, computed once per transcript revision and
+   * collapse-preference set. The cache lives on the derived chat state so it
+   * is dropped together with the layout it describes. */
+  #agentBodySpans(
+    unit: ChatRenderUnit,
+    collapse: ChatPreferences,
+    presentation: ChatPresentationIndex,
+  ): readonly AgentBodySpan[] {
+    const derived = this.#chatDerivedCache;
+    const cached = derived?.bodyPlans.get(unit.id);
+    const responseId = unitResponseItemId(unit, presentation);
+    if (
+      cached !== undefined
+      && cached.items === unit.items
+      && cached.responseId === responseId
+      && sameChatPreferences(cached.collapse, collapse)
+    ) {
+      return cached.spans;
+    }
+    const spans = planAgentBody(unit.items, collapse, responseId);
+    derived?.bodyPlans.set(unit.id, { items: unit.items, collapse, responseId, spans });
+    return spans;
+  }
+
+  #renderAgentBody(
+    unit: ChatRenderUnit,
+    presentation: ChatPresentationIndex,
+    segment: TurnSegment | undefined,
+  ) {
+    const collapse = this.#chatDerivedCache?.collapse ?? this.#effectiveCollapsePreferences();
+    const collapseThinkingWithTools = collapse.collapseThinkingWithTools;
+    const collapseCompactionWithTools = collapse.collapseCompactionWithTools;
+    const collapseTodoUpdatesWithTools = collapse.collapseTodoUpdatesWithTools;
+    const spans = this.#agentBodySpans(unit, collapse, presentation);
+    const spanStart = segment?.spanStart ?? 0;
+    const spanEnd = segment?.spanEnd ?? spans.length;
     const rows: unknown[] = [];
     let activityConnectedFromCompaction = false;
     let activityRows: Array<{
@@ -3486,58 +3761,51 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     };
     const turnState = unit.status?.state ?? presentation.turnStates.get(unit.turn);
     const responseId = turnResponseItemId(unit.items, turnState);
-    const activityFollows = (start: number): boolean => {
-      for (let cursor = start; cursor < unit.items.length; cursor += 1) {
-        const candidate = unit.items[cursor];
-        if (candidate === undefined) return false;
-        if (candidate.kind === "tool" && isContextCompactionTool(candidate)) continue;
-        return (candidate.kind === "progress" && candidate.id !== responseId)
-          || candidate.kind === "thinking"
-          || candidate.kind === "todo"
-          || candidate.kind === "tool";
-      }
-      return false;
+    const pushActivity = (
+      content: unknown,
+      expandedGroup = false,
+      endsWithExpandedToolGroup = false,
+    ): void => {
+      activityRows.push({ content, expandedGroup, endsWithExpandedToolGroup });
     };
-    const hasNativeCompaction = unit.items.some((item) => item.kind === "compaction");
-    let index = 0;
-    while (index < unit.items.length) {
-      const item = unit.items[index];
-      if (item === undefined) break;
-      if (item.kind === "steered") {
-        flushActivityRows();
-        rows.push(this.#renderUserNode(item));
-        index += 1;
+    const hasNativeCompaction = hasNativeCompactionMarker(unit.items);
+    for (let spanIndex = spanStart; spanIndex < spanEnd; spanIndex += 1) {
+      const span = spans[spanIndex];
+      const item = span === undefined ? undefined : unit.items[span.start];
+      if (span === undefined || item === undefined) continue;
+      if (span.kind === "skip") {
+        if (span.flush) flushActivityRows();
         continue;
       }
-      if (item.kind === "subagent") {
+      if (span.kind === "node") {
         flushActivityRows();
-        rows.push(this.#renderSubagentNode(item));
-        index += 1;
-        continue;
-      }
-      if (item.kind === "artifacts") {
-        flushActivityRows();
-        rows.push(html`<section
-          class="turn-rail-node turn-response-node agent-artifacts"
-          data-chat-anchor-id=${`item:${item.id}`}
-          aria-label="Agent attachments"
-        >
-          <span class="turn-rail-marker response complete" aria-hidden="true">
-            ${fontAwesomeIcon("paperclip")}
-          </span>
-          <header class="turn-node-header"><strong>Attachments</strong></header>
-          ${this.#renderAttachments(item.attachments, "Agent attachments")}
-        </section>`);
-        index += 1;
-        continue;
-      }
-      if (item.kind === "assistant") {
-        flushActivityRows();
-        const stretch: Extract<AgentChatItem, { readonly kind: "assistant" }>[] = [];
-        while (index < unit.items.length && unit.items[index]?.kind === "assistant") {
-          stretch.push(unit.items[index] as Extract<AgentChatItem, { readonly kind: "assistant" }>);
-          index += 1;
+        if (item.kind === "steered") {
+          rows.push(this.#renderUserNode(item));
+        } else if (item.kind === "subagent") {
+          rows.push(this.#renderSubagentNode(item));
+        } else if (item.kind === "artifacts") {
+          rows.push(html`<section
+            class="turn-rail-node turn-response-node agent-artifacts"
+            data-chat-anchor-id=${`item:${item.id}`}
+            aria-label="Agent attachments"
+          >
+            <span class="turn-rail-marker response complete" aria-hidden="true">
+              ${fontAwesomeIcon("paperclip")}
+            </span>
+            <header class="turn-node-header"><strong>Attachments</strong></header>
+            ${this.#renderAttachments(item.attachments, "Agent attachments")}
+          </section>`);
+        } else if (item.kind === "questions") {
+          rows.push(this.#renderItem(item, presentation));
         }
+        continue;
+      }
+      if (span.kind === "assistant") {
+        flushActivityRows();
+        const stretch = unit.items.slice(span.start, span.end) as Extract<
+          AgentChatItem,
+          { readonly kind: "assistant" }
+        >[];
         const content = stretch.map((part) => part.content).filter(Boolean).join("\n\n");
         if (content !== "") {
           rows.push(this.#renderAgentTextNode(unit, {
@@ -3550,152 +3818,68 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         }
         continue;
       }
-      if (item.kind === "progress") {
-        if (item.id === responseId && item.content !== "") {
-          // The turn ended on harness-authored progress with no answer text
-          // after it, so that progress is the answer the user received.
-          flushActivityRows();
-          rows.push(this.#renderAgentTextNode(unit, {
-            content: item.content,
-            anchor: item.id,
-            response: true,
-            streaming: !item.complete,
-            turnState,
-          }));
-          index += 1;
-          continue;
-        }
-        activityRows.push({
-          content: this.#renderVisibleProgress(item),
-          expandedGroup: false,
-          endsWithExpandedToolGroup: false,
-        });
-        index += 1;
-        continue;
-      }
-      if (item.kind === "questions") {
+      if (span.kind === "progress-response") {
+        if (item.kind !== "progress") continue;
         flushActivityRows();
-        rows.push(this.#renderItem(item, presentation));
-        index += 1;
-        continue;
-      }
-      if (item.kind === "compaction" && !collapseCompactionWithTools) {
-        const connectBefore = activityRows.length > 0;
-        const connectAfter = activityFollows(index + 1);
-        flushActivityRows(connectBefore);
-        rows.push(this.#renderCompactionMarker(item.state, item.id, {
-          before: connectBefore,
-          after: connectAfter,
+        rows.push(this.#renderAgentTextNode(unit, {
+          content: item.content,
+          anchor: item.id,
+          response: true,
+          streaming: !item.complete,
+          turnState,
         }));
-        activityConnectedFromCompaction = connectAfter;
-        index += 1;
         continue;
       }
-      if (item.kind === "tool" && isContextCompactionTool(item)) {
-        if (hasNativeCompaction) {
-          if (!collapseCompactionWithTools) flushActivityRows();
-          index += 1;
-          continue;
-        }
-        if (!collapseCompactionWithTools) {
-          const connectBefore = activityRows.length > 0;
-          const connectAfter = activityFollows(index + 1);
-          flushActivityRows(connectBefore);
-          rows.push(this.#renderCompactionMarker(this.#legacyCompactionState(item), item.id, {
+      if (span.kind === "compaction") {
+        const connectBefore = activityRows.length > 0;
+        flushActivityRows(connectBefore);
+        const state = span.legacy && item.kind === "tool"
+          ? this.#legacyCompactionState(item)
+          : item.kind === "compaction"
+            ? item.state
+            : undefined;
+        if (state !== undefined) {
+          rows.push(this.#renderCompactionMarker(state, item.id, {
             before: connectBefore,
-            after: connectAfter,
+            after: span.connectAfter,
           }));
-          activityConnectedFromCompaction = connectAfter;
-          index += 1;
+        }
+        activityConnectedFromCompaction = span.connectAfter;
+        continue;
+      }
+      // Activity rows. Approval controls must remain directly reachable.
+      // Running calls can join the same collapsed activity run as soon as
+      // they are requested; the transient tail describes the current action
+      // without adding a shifting top-level tool node for each parallel call.
+      switch (span.activity) {
+        case "progress":
+          if (item.kind === "progress") pushActivity(this.#renderVisibleProgress(item));
+          continue;
+        case "thinking":
+          if (item.kind === "thinking") pushActivity(this.#renderVisibleThinking(item));
+          continue;
+        case "todo":
+          if (item.kind === "todo") pushActivity(this.#renderTodoUpdate(item));
+          continue;
+        case "todo-group": {
+          const repeatedTodos = unit.items.slice(span.start, span.end) as Extract<
+            AgentActivityItem,
+            { readonly kind: "todo" }
+          >[];
+          pushActivity(
+            this.#renderActivityGroup(unit, repeatedTodos, presentation),
+            this.#activityGroupOpen(unit, repeatedTodos),
+          );
           continue;
         }
-      }
-      if (item.kind === "thinking" && !collapseThinkingWithTools) {
-        activityRows.push({
-          content: this.#renderVisibleThinking(item),
-          expandedGroup: false,
-          endsWithExpandedToolGroup: false,
-        });
-        index += 1;
-        continue;
-      }
-      if (item.kind === "todo" && !collapseTodoUpdatesWithTools) {
-        const repeatedTodos: Extract<AgentActivityItem, { readonly kind: "todo" }>[] = [item];
-        let nextIndex = index + 1;
-        while (nextIndex < unit.items.length) {
-          const candidate = unit.items[nextIndex];
-          if (candidate?.kind !== "todo" || candidate.state !== item.state) break;
-          repeatedTodos.push(candidate);
-          nextIndex += 1;
-        }
-        if (repeatedTodos.length === 1) {
-          activityRows.push({
-            content: this.#renderTodoUpdate(item),
-            expandedGroup: false,
-            endsWithExpandedToolGroup: false,
-          });
-        } else {
-          activityRows.push({
-            content: this.#renderActivityGroup(unit, repeatedTodos, presentation),
-            expandedGroup: this.#activityGroupOpen(unit, repeatedTodos),
-            endsWithExpandedToolGroup: false,
-          });
-        }
-        index = nextIndex;
-        continue;
-      }
-      // Approval controls must remain directly reachable. Running calls can
-      // join the same collapsed activity run as soon as they are requested;
-      // the transient tail describes the current action without adding a
-      // shifting top-level tool node for each parallel call.
-      if (toolCallNeedsApproval(item)) {
-        activityRows.push({
-          content: this.#renderItem(item, presentation),
-          expandedGroup: false,
-          endsWithExpandedToolGroup: false,
-        });
-        index += 1;
-        continue;
-      }
-      if (item.kind === "tool" && !collapseSequentialToolCalls) {
-        activityRows.push({
-          content: this.#renderItem(item, presentation),
-          expandedGroup: false,
-          endsWithExpandedToolGroup: false,
-        });
-        index += 1;
-        continue;
-      }
-
-      const run: AgentActivityItem[] = [];
-      while (index < unit.items.length) {
-        const candidate = unit.items[index];
-        if (
-          candidate === undefined
-          || candidate.kind === "assistant"
-          || candidate.kind === "artifacts"
-          || candidate.kind === "steered"
-          || candidate.kind === "questions"
-          || candidate.kind === "progress"
-          || (!collapseCompactionWithTools && candidate.kind === "compaction")
-          || (!collapseCompactionWithTools
-            && candidate.kind === "tool"
-            && isContextCompactionTool(candidate))
-          || (!collapseThinkingWithTools && candidate.kind === "thinking")
-          || (!collapseTodoUpdatesWithTools && candidate.kind === "todo")
-          || (candidate.kind === "tool" && toolCallNeedsApproval(candidate))
-        ) break;
-        if (
-          hasNativeCompaction
-          && candidate.kind === "tool"
-          && isContextCompactionTool(candidate)
-        ) {
-          index += 1;
+        case "approval":
+        case "tool":
+          if (item.kind === "tool") pushActivity(this.#renderItem(item, presentation));
           continue;
-        }
-        run.push(candidate as AgentActivityItem);
-        index += 1;
+        case "run":
+          break;
       }
+      const run = activityRunItems(unit.items, span, hasNativeCompaction);
       const only = run[0];
       const groupSinglePreferenceBoundary = run.length === 1 && (
         (collapseThinkingWithTools && only?.kind === "thinking")
@@ -3713,13 +3897,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         && !groupSinglePreferenceBoundary
         && !groupSingleActiveTurnTool
       ) {
-        if (only !== undefined) {
-          activityRows.push({
-            content: this.#renderItem(only, presentation),
-            expandedGroup: false,
-            endsWithExpandedToolGroup: false,
-          });
-        }
+        if (only !== undefined) pushActivity(this.#renderItem(only, presentation));
         continue;
       }
       const expandedGroup = this.#activityGroupOpen(unit, run);
@@ -3728,15 +3906,11 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         && !isContextCompactionTool(finalGroupedItem)
         && finalGroupedItem.status !== "awaiting-approval"
         && !(this.#toolDisclosure.get(finalGroupedItem.callId) ?? false);
-      activityRows.push({
-        content: this.#renderActivityGroup(
-          unit,
-          run,
-          presentation,
-        ),
+      pushActivity(
+        this.#renderActivityGroup(unit, run, presentation),
         expandedGroup,
-        endsWithExpandedToolGroup: expandedGroup && endsWithCollapsedTool,
-      });
+        expandedGroup && endsWithCollapsedTool,
+      );
     }
     flushActivityRows();
     return rows;
@@ -7673,7 +7847,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       this.#loadMentionPathsIfNeeded();
     }
     this.#scheduleComposerDraftPersistence();
-    if (!composing) this.requestUpdate();
+    if (!composing) this.#requestComposerUpdate();
   };
 
   #applyQuickReply(prompt: string): void {
@@ -7717,7 +7891,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     this.#scheduleComposerDraftPersistence();
     if (this.#composerComposing) return;
     this.#loadMentionPathsIfNeeded();
-    this.requestUpdate();
+    this.#requestComposerUpdate();
   };
 
   readonly #composerCompositionStarted = (): void => {

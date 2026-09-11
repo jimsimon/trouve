@@ -1200,6 +1200,43 @@ test("turn separators expose exact restore and session-fork actions", async ({ p
   await expect.poll(() => restoredCheckpointIds).toEqual(["cp_turn_7"]);
 });
 
+test("a collapsed multi-segment turn keeps its trailing checkpoint actions", async ({ page }) => {
+  await installProtocolFixtures(page);
+  await page.goto("/");
+  await replayHistory(page);
+  // Sixty separately-identified thoughts split the turn across several
+  // virtual rows, so collapsing it unmounts every segment but the first.
+  const thoughts = Array.from({ length: 60 }, (_, index) => threadEvent(18 + index, {
+    type: "assistant.thinking",
+    turn: 8,
+    id: `reasoning_${index}`,
+    text: `Segmented thought ${index}`,
+  }));
+  await emitBatch(page, [
+    threadEvent(16, { type: "turn.started", turn: 8, mode: "code", model: "test/model" }),
+    threadEvent(17, { type: "user.message", turn: 8, content: "Think a lot", attachments: [] }),
+    ...thoughts,
+    threadEvent(78, {
+      type: "turn.completed",
+      turn: 8,
+      usage: { input_tokens: 2, output_tokens: 1 },
+      checkpoint_id: "cp_turn_8",
+    }),
+  ]);
+
+  const actions = page.getByRole("group", { name: "Actions after turn 8" });
+  await expect(actions.getByRole("button", {
+    name: "Restore files to the checkpoint after turn 8",
+  })).toBeVisible();
+  await expect(page.locator(".turn-segment-continuation")).not.toHaveCount(0);
+
+  await page.getByRole("button", { name: "Collapse turn 8" }).click();
+  await expect(page.locator(".turn-segment-continuation")).toHaveCount(0);
+  await expect(actions.getByRole("button", {
+    name: "Restore files to the checkpoint after turn 8",
+  })).toBeVisible();
+});
+
 test("code review repository groups reorder through rendered keyboard controls", async ({ page }) => {
   const job = (id: string, repository: string, pullNumber: number) => ({
     id,
@@ -5780,7 +5817,9 @@ test("keeps a nested thought anchored when history extends the same agent turn",
   } });
   await page.goto("/");
   await replayHistory(page);
-  await expect(page.getByText("Stable thought 30", { exact: true })).toBeVisible();
+  // The 60-item turn spans several virtual rows; only its tail is mounted
+  // while the reader follows the live end.
+  await expect(page.getByText("Stable thought 89", { exact: true })).toBeVisible();
   await expect.poll(() => oldestRequests).toBeGreaterThanOrEqual(1);
 
   const viewport = page.locator(".chat-stream");

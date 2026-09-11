@@ -65,6 +65,31 @@ describe("ThreadViewModel", () => {
     expect(vm.turnPhase).toBeUndefined();
   });
 
+  it("bumps the items revision only for events that can touch the transcript", () => {
+    const vm = new ThreadViewModel();
+    vm.apply(envelope(1, { type: "turn.started", turn: 4, mode: "code", model: "test/model" }));
+    const afterStart = vm.itemsRevision;
+
+    vm.apply(envelope(2, { type: "turn.phase_changed", turn: 4, phase: "connecting_tools" }));
+    vm.apply(envelope(3, {
+      type: "thread.commands_updated",
+      commands: [{ name: "review", description: "Review changes" }],
+    }));
+    vm.apply(envelope(4, { type: "thread.queue_updated", prompts: [] }));
+    // Thread-level state changed, but the memoised transcript layout is
+    // still valid for the unchanged items.
+    expect(vm.itemsRevision).toBe(afterStart);
+
+    vm.apply(envelope(5, {
+      type: "turn.usage_updated",
+      turn: 4,
+      usage: { input_tokens: 1, output_tokens: 1 },
+    }));
+    expect(vm.itemsRevision).toBe(afterStart + 1);
+    vm.apply(envelope(6, { type: "assistant.delta", turn: 4, text: "hi" }));
+    expect(vm.itemsRevision).toBe(afterStart + 2);
+  });
+
   it("distinguishes provider waiting from an actively running turn", () => {
     const vm = new ThreadViewModel();
     vm.apply(envelope(1, {

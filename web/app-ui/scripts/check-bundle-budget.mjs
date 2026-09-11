@@ -63,10 +63,12 @@ const entryLimit = mode === "desktop" ? 856_000 : 850_000;
 // The inline Mermaid diagram element and its lazy-loading shim bring them to
 // 3,317,073 B and 3,302,236 B (the engine itself is budgeted separately).
 // The native web-search presentation brings them to 3,317,539 B and
-// 3,302,689 B; preserve less than 2 kB of headroom for each. Entry, worker, and
+// 3,302,689 B. Segment-level turn virtualization with its pure agent-body
+// span planner and the memoized chat-derived state bring them to 3,322,799 B
+// and 3,307,948 B; preserve less than 2 kB of headroom for each. Entry, worker, and
 // largest-chunk budgets below still prevent one bundle from hiding in the
 // aggregate.
-const totalJavaScriptLimit = mode === "desktop" ? 3_319_000 : 3_304_000;
+const totalJavaScriptLimit = mode === "desktop" ? 3_324_000 : 3_309_000;
 // beautiful-mermaid 1.1 with elk.bundled emits 1,524,273 B (469 kB gzipped).
 // Preserve less than 6 kB of headroom.
 const diagramEngineLimit = 1_530_000;

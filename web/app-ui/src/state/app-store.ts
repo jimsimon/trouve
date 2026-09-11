@@ -718,9 +718,9 @@ export class AppStore {
     callId: string,
     decision: "approve" | "always_approve" | "deny",
   ): boolean {
-    const tool = this.#threadViews.get(threadId)?.findTool(callId);
-    if (tool?.status !== "awaiting-approval") return false;
-    tool.status = decision === "deny" ? "denied" : "running";
+    const resolved = this.#threadViews.get(threadId)
+      ?.resolveApprovalOptimistically(callId, decision) ?? false;
+    if (!resolved) return false;
     this.#touch();
     return true;
   }
