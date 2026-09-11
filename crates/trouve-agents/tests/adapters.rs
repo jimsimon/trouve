@@ -1804,6 +1804,10 @@ cat > /dev/null
     let thread_start = std::fs::read_to_string(format!("{stub}.thread-start")).unwrap();
     let thread_start: serde_json::Value = serde_json::from_str(&thread_start).unwrap();
     assert_eq!(thread_start["params"]["approvalPolicy"], "untrusted");
+    assert_eq!(
+        thread_start["params"]["approvalsReviewer"], "user",
+        "a user-level auto_review setting must not divert approvals from trouve"
+    );
     assert_eq!(thread_start["params"]["sandbox"], "danger-full-access");
     assert_eq!(
         thread_start["params"]["config"]["show_raw_agent_reasoning"],
@@ -1816,6 +1820,7 @@ cat > /dev/null
     let turn_start = std::fs::read_to_string(format!("{stub}.turn-start")).unwrap();
     let turn_start: serde_json::Value = serde_json::from_str(&turn_start).unwrap();
     assert_eq!(turn_start["params"]["approvalPolicy"], "untrusted");
+    assert_eq!(turn_start["params"]["approvalsReviewer"], "user");
     assert_eq!(turn_start["params"]["summary"], "auto");
     assert_eq!(
         turn_start["params"]["input"][0]["text"], "do the thing",
