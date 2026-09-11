@@ -61,3 +61,4 @@ sequentially.
 | [0049](0049-explicit-ownership-for-managed-background-work.md) | Explicit ownership for managed background work | Accepted |
 | [0050](0050-shared-cursor-sdk-bridge-process.md) | One shared Cursor SDK Bridge per backend | Accepted |
 | [0051](0051-cursor-shared-store-transition-and-quarantine.md) | Cursor shared-store transition and callback quarantine | Accepted |
+| [0052](0052-owned-os-sandbox-for-shell-commands.md) | Trouve owns an OS sandbox for shell commands | Proposed |
