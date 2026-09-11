@@ -323,6 +323,17 @@ impl AgentBackend for CodexBackend {
         }
     }
 
+    /// Terminate the cached app-server (if any) so a retired backend never
+    /// leaves a Codex process behind; turns and roster refreshes were drained
+    /// by the retirement wrapper before this runs.
+    async fn shutdown(&self) -> Result<(), BackendError> {
+        let server = self.server.lock().await.take();
+        match server {
+            Some(server) => server.terminate_transport().await,
+            None => Ok(()),
+        }
+    }
+
     async fn subscription_health(&self) -> Option<trouve_protocol::SubscriptionHealth> {
         let result = async {
             let server = self.server().await?;
@@ -9212,7 +9223,9 @@ for line in sys.stdin:
         std::fs::write(
             &stub,
             r#"#!/usr/bin/env python3
-import json, sys
+import json, os, sys
+with open(sys.argv[0] + ".pid", "w") as marker:
+    marker.write(str(os.getpid()))
 for line in sys.stdin:
     msg = json.loads(line)
     method = msg.get("method")
@@ -9304,7 +9317,22 @@ for line in sys.stdin:
             1,
             "model/list is requested once per refresh window"
         );
+
+        // Retiring the backend terminates the app-server the refresh spawned.
+        let pid = std::fs::read_to_string(format!("{}.pid", stub.display()))
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
         backend.shutdown().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while std::path::Path::new(&format!("/proc/{pid}")).exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("shutdown left the roster app-server alive");
+        assert!(backend.server.lock().await.is_none());
     }
 
     #[cfg(target_os = "linux")]

@@ -519,8 +519,13 @@ impl ModelsDevCatalog {
         if models.is_empty() {
             bail!("{provider} roster contains no models");
         }
-        let _guard = self.roster_write_lock.lock().await;
+        // The provider id names the roster file, so only ids that survive
+        // setup-id sanitizing unchanged may be persisted.
         let provider = canonical_provider_id(provider).to_string();
+        if provider.is_empty() || setup_provider_id(&provider) != provider {
+            bail!("refusing to persist a roster for provider id {provider:?}");
+        }
+        let _guard = self.roster_write_lock.lock().await;
         let file = RosterFile {
             version: ROSTER_VERSION,
             fetched_at: unix_now(),
@@ -2024,6 +2029,25 @@ mod tests {
         let reloaded = ModelsDevCatalog::fixture_for_data_dir(dir.path());
         assert_eq!(codex_ids(&reloaded), ["codex/gpt-5.6-luna"]);
         assert!(!reloaded.roster_needs_refresh("openai-codex"));
+    }
+
+    #[tokio::test]
+    async fn unsafe_provider_ids_never_become_roster_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = ModelsDevCatalog::fixture_for_data_dir(dir.path());
+        let mut models = BTreeMap::new();
+        models.insert("m".to_string(), json!({"name": "M", "tool_call": true}));
+        for provider in ["../escape", "a/b", "a\\b", "", ".."] {
+            assert!(
+                catalog
+                    .replace_roster(provider, models.clone())
+                    .await
+                    .is_err(),
+                "{provider:?} must be rejected"
+            );
+        }
+        assert!(!dir.path().join("rosters").exists());
+        assert!(!dir.path().join("escape.json").exists());
     }
 
     #[tokio::test]
