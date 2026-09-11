@@ -253,6 +253,14 @@ const latestNumericMapKey = (map: ReadonlyMap<number, unknown>): number | undefi
   return latest;
 };
 
+/** Events whose `#applyEnvelope` branch never reads or writes `items`. Every
+ * other event may mutate an item in place and must bump `itemsRevision`. */
+const TRANSCRIPT_NEUTRAL_EVENTS: ReadonlySet<ProtocolEventEnvelope["type"]> = new Set([
+  "turn.phase_changed",
+  "thread.commands_updated",
+  "thread.queue_updated",
+]);
+
 /** Replay-equivalent projection of one thread's durable event stream.
  * This mirrors trouve-client-core's ThreadViewModel without sharing Rust
  * process state across the protocol boundary. */
@@ -601,8 +609,10 @@ export class ThreadViewModel {
 
   apply(envelope: ProtocolEventEnvelope): boolean {
     // Events mutate items in place through many branches; treat every
-    // envelope as a potential transcript change rather than auditing each.
-    this.itemsRevision += 1;
+    // envelope as a potential transcript change except the few that only
+    // touch thread-level state, so a long transcript keeps its memoised
+    // layout across phase, command, and queue updates.
+    if (!TRANSCRIPT_NEUTRAL_EVENTS.has(envelope.type)) this.itemsRevision += 1;
     return this.#applyEnvelope(envelope);
   }
 

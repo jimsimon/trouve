@@ -62,6 +62,25 @@ const subagent = (id: string): AgentChatItem => ({
   model: "claude/opus",
 });
 
+const progress = (id: string, content: string, complete = true): AgentChatItem => ({
+  id,
+  kind: "progress",
+  turn: 1,
+  content,
+  complete,
+});
+
+const compactionTool = (id: string): AgentChatItem => ({
+  id,
+  kind: "tool",
+  callId: `call-${id}`,
+  tool: "context_compaction",
+  args: {},
+  status: "ok",
+  result: null,
+  output,
+});
+
 const spanIds = (items: readonly AgentChatItem[], spans: readonly AgentBodySpan[]) =>
   spans.map((span) => ({
     kind: span.kind === "activity" ? span.activity : span.kind,
@@ -114,6 +133,47 @@ describe("planAgentBody", () => {
       { kind: "node", ids: ["s1"] },
       { kind: "run", ids: ["t2"] },
     ]);
+  });
+
+  it("skips a legacy compaction tool that a native marker already represents", () => {
+    const items = [tool("t1"), compactionTool("cc"), compaction("c1"), tool("t2")];
+    const spans = planAgentBody(items, collapse);
+    expect(spanIds(items, spans)).toEqual([
+      { kind: "run", ids: ["t1"] },
+      { kind: "skip", ids: ["cc"] },
+      { kind: "compaction", ids: ["c1"] },
+      { kind: "run", ids: ["t2"] },
+    ]);
+    expect(spans[1]).toMatchObject({ kind: "skip", flush: true });
+
+    // When compaction folds into tool runs the skip no longer flushes the
+    // surrounding activity rows. (A preceding run absorbs the tool instead,
+    // and `activityRunItems` drops it there.)
+    const folded = effectiveChatCollapsePreferences({
+      ...DEFAULT_CHAT_PREFERENCES,
+      collapseSequentialToolCalls: true,
+      collapseCompactionWithTools: true,
+    });
+    const leading = [compactionTool("cc"), compaction("c1"), tool("t2")];
+    expect(planAgentBody(leading, folded)[0]).toMatchObject({ kind: "skip", flush: false });
+    expect(activityRunItems(items, { start: 0, end: 2 }, true).map((item) => item.id))
+      .toEqual(["t1"]);
+  });
+
+  it("draws a turn's response progress as answer content, not activity", () => {
+    const items = [tool("t1"), progress("p1", "Working…"), progress("p2", "All done.")];
+    expect(spanIds(items, planAgentBody(items, collapse, "p2"))).toEqual([
+      { kind: "run", ids: ["t1"] },
+      { kind: "progress", ids: ["p1"] },
+      { kind: "progress-response", ids: ["p2"] },
+    ]);
+    // Without a response id, or when the response has no text, progress
+    // stays an activity row.
+    expect(spanIds(items, planAgentBody(items, collapse)).map((span) => span.kind))
+      .toEqual(["run", "progress", "progress"]);
+    const empty = [tool("t1"), progress("p3", "")];
+    expect(spanIds(empty, planAgentBody(empty, collapse, "p3")).map((span) => span.kind))
+      .toEqual(["run", "progress"]);
   });
 
   it("folds thinking into runs when the preference allows it", () => {
