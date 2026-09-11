@@ -7438,7 +7438,7 @@ validate219.errors = [{instancePath,schemaPath:"#/required",keyword:"required",p
 return false;
 }
 else {
-if(data.name !== undefined){
+if(data.catalog_available !== undefined){
 const _errs1 = errors;
 if(typeof data.name !== "string"){
 validate219.errors = [{instancePath:instancePath+"/name",schemaPath:"#/properties/name/type",keyword:"type",params:{type: "string"},message:"must be string"}];
@@ -7450,7 +7450,7 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.online !== undefined){
+if(data.name !== undefined){
 const _errs3 = errors;
 if(typeof data.online !== "boolean"){
 validate219.errors = [{instancePath:instancePath+"/online",schemaPath:"#/properties/online/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
@@ -7462,7 +7462,7 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.protocol_version !== undefined){
+if(data.online !== undefined){
 const _errs5 = errors;
 if(typeof data.protocol_version !== "string"){
 validate219.errors = [{instancePath:instancePath+"/protocol_version",schemaPath:"#/properties/protocol_version/type",keyword:"type",params:{type: "string"},message:"must be string"}];
@@ -7474,7 +7474,7 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.version !== undefined){
+if(data.protocol_version !== undefined){
 const _errs7 = errors;
 if(typeof data.version !== "string"){
 validate219.errors = [{instancePath:instancePath+"/version",schemaPath:"#/properties/version/type",keyword:"type",params:{type: "string"},message:"must be string"}];
@@ -7484,6 +7484,19 @@ var valid0 = _errs7 === errors;
 }
 else {
 var valid0 = true;
+}
+if(valid0){
+if(data.version !== undefined){
+const _errs9 = errors;
+if(typeof data.version !== "string"){
+validate215.errors = [{instancePath:instancePath+"/version",schemaPath:"#/properties/version/type",keyword:"type",params:{type: "string"},message:"must be string"}];
+return false;
+}
+var valid0 = _errs9 === errors;
+}
+else {
+var valid0 = true;
+}
 }
 }
 }
@@ -26182,7 +26195,7 @@ const _errs495 = errors;
 if(errors === _errs495){
 if(data && typeof data == "object" && !Array.isArray(data)){
 let missing61;
-if(((data.settings === undefined) && (missing61 = "settings")) || ((data.type === undefined) && (missing61 = "type"))){
+if(((data.available === undefined) && (missing61 = "available")) || ((data.type === undefined) && (missing61 = "type"))){
 const err371 = {instancePath,schemaPath:"#/oneOf/61/required",keyword:"required",params:{missingProperty: missing61},message:"must have required property '"+missing61+"'"};
 if(vErrors === null){
 vErrors = [err371];
@@ -26193,7 +26206,7 @@ vErrors.push(err371);
 errors++;
 }
 else {
-if(data.settings !== undefined){
+if(data.available !== undefined){
 const _errs497 = errors;
 if(!(validate232(data.settings, {instancePath:instancePath+"/settings",parentData:data,parentDataProperty:"settings",rootData,dynamicAnchors}))){
 vErrors = vErrors === null ? validate232.errors : vErrors.concat(validate232.errors);
@@ -26207,7 +26220,7 @@ var valid76 = true;
 if(valid76){
 if(data.type !== undefined){
 let data207 = data.type;
-const _errs498 = errors;
+const _errs499 = errors;
 if(typeof data207 !== "string"){
 const err372 = {instancePath:instancePath+"/type",schemaPath:"#/oneOf/61/properties/type/type",keyword:"type",params:{type: "string"},message:"must be string"};
 if(vErrors === null){
@@ -26228,7 +26241,17 @@ vErrors.push(err373);
 }
 errors++;
 }
-var valid76 = _errs498 === errors;
+if(!(data207 === "server.model_catalog_changed")){
+const err374 = {instancePath:instancePath+"/type",schemaPath:"#/oneOf/61/properties/type/enum",keyword:"enum",params:{allowedValues: schema170.oneOf[61].properties.type.enum},message:"must be equal to one of the allowed values"};
+if(vErrors === null){
+vErrors = [err374];
+}
+else {
+vErrors.push(err374);
+}
+errors++;
+}
+var valid76 = _errs499 === errors;
 }
 else {
 var valid76 = true;
@@ -26237,12 +26260,12 @@ var valid76 = true;
 }
 }
 else {
-const err374 = {instancePath,schemaPath:"#/oneOf/61/type",keyword:"type",params:{type: "object"},message:"must be object"};
+const err375 = {instancePath,schemaPath:"#/oneOf/61/type",keyword:"type",params:{type: "object"},message:"must be object"};
 if(vErrors === null){
-vErrors = [err374];
+vErrors = [err375];
 }
 else {
-vErrors.push(err374);
+vErrors.push(err375);
 }
 errors++;
 }
@@ -26258,29 +26281,16 @@ valid0 = true;
 passing0 = 61;
 if(props0 !== true){
 props0 = props0 || {};
-props0.settings = true;
+props0.available = true;
 props0.type = true;
 }
 }
-const _errs500 = errors;
-if(errors === _errs500){
+const _errs501 = errors;
+if(errors === _errs501){
 if(data && typeof data == "object" && !Array.isArray(data)){
 let missing62;
 if(((data.settings === undefined) && (missing62 = "settings")) || ((data.type === undefined) && (missing62 = "type"))){
-const err375 = {instancePath,schemaPath:"#/oneOf/62/required",keyword:"required",params:{missingProperty: missing62},message:"must have required property '"+missing62+"'"};
-if(vErrors === null){
-vErrors = [err375];
-}
-else {
-vErrors.push(err375);
-}
-errors++;
-}
-else {
-if(data.type !== undefined){
-let data208 = data.type;
-if(typeof data208 !== "string"){
-const err376 = {instancePath:instancePath+"/type",schemaPath:"#/oneOf/62/properties/type/type",keyword:"type",params:{type: "string"},message:"must be string"};
+const err376 = {instancePath,schemaPath:"#/oneOf/62/required",keyword:"required",params:{missingProperty: missing62},message:"must have required property '"+missing62+"'"};
 if(vErrors === null){
 vErrors = [err376];
 }
@@ -26299,11 +26309,8 @@ vErrors.push(err377);
 }
 errors++;
 }
-}
-}
-}
-else {
-const err378 = {instancePath,schemaPath:"#/oneOf/62/type",keyword:"type",params:{type: "object"},message:"must be object"};
+if(!(data209 === "settings.session_naming_updated")){
+const err378 = {instancePath:instancePath+"/type",schemaPath:"#/oneOf/62/properties/type/enum",keyword:"enum",params:{allowedValues: schema170.oneOf[62].properties.type.enum},message:"must be equal to one of the allowed values"};
 if(vErrors === null){
 vErrors = [err378];
 }
@@ -26312,8 +26319,26 @@ vErrors.push(err378);
 }
 errors++;
 }
+var valid77 = _errs504 === errors;
 }
-var _valid0 = _errs500 === errors;
+else {
+var valid77 = true;
+}
+}
+}
+}
+else {
+const err379 = {instancePath,schemaPath:"#/oneOf/62/type",keyword:"type",params:{type: "object"},message:"must be object"};
+if(vErrors === null){
+vErrors = [err379];
+}
+else {
+vErrors.push(err379);
+}
+errors++;
+}
+}
+var _valid0 = _errs501 === errors;
 if(_valid0 && valid0){
 valid0 = false;
 passing0 = [passing0, 62];
@@ -26328,8 +26353,8 @@ props0.settings = true;
 props0.type = true;
 }
 }
-const _errs504 = errors;
-if(errors === _errs504){
+const _errs506 = errors;
+if(errors === _errs506){
 if(data && typeof data == "object" && !Array.isArray(data)){
 let missing63;
 if(((data.settings === undefined) && (missing63 = "settings")) || ((data.type === undefined) && (missing63 = "type"))){
@@ -26378,16 +26403,8 @@ vErrors.push(err381);
 }
 errors++;
 }
-var valid78 = _errs507 === errors;
-}
-else {
-var valid78 = true;
-}
-}
-}
-}
-else {
-const err382 = {instancePath,schemaPath:"#/oneOf/63/type",keyword:"type",params:{type: "object"},message:"must be object"};
+if(!(data210 === "settings.git_worktrees_updated")){
+const err382 = {instancePath:instancePath+"/type",schemaPath:"#/oneOf/63/properties/type/enum",keyword:"enum",params:{allowedValues: schema170.oneOf[63].properties.type.enum},message:"must be equal to one of the allowed values"};
 if(vErrors === null){
 vErrors = [err382];
 }
@@ -26397,7 +26414,20 @@ vErrors.push(err382);
 errors++;
 }
 }
-var _valid0 = _errs504 === errors;
+}
+}
+else {
+const err383 = {instancePath,schemaPath:"#/oneOf/63/type",keyword:"type",params:{type: "object"},message:"must be object"};
+if(vErrors === null){
+vErrors = [err383];
+}
+else {
+vErrors.push(err383);
+}
+errors++;
+}
+}
+var _valid0 = _errs506 === errors;
 if(_valid0 && valid0){
 valid0 = false;
 passing0 = [passing0, 63];
@@ -27792,6 +27822,7 @@ export const knownEventTypes = Object.freeze([
   "automation.fired",
   "code_review.updated",
   "server.connectivity_changed",
+  "server.model_catalog_changed",
   "settings.session_naming_updated",
   "settings.git_worktrees_updated",
   "settings.code_review_updated",
