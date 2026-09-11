@@ -48,12 +48,27 @@ nothing under it is visible unless listed:
 - system roots needed to run programs: `/usr`, `/bin`, `/sbin`, `/lib*`,
   `/opt`, `/etc` (minus `/etc/shadow` and friends), `/proc/self`, `/dev`
   essentials, and the macOS equivalents;
-- toolchain roots trouve already knows about (`~/.cargo`, `~/.rustup`,
-  `~/.nvm`, the Node and Python installs it resolves), plus the
-  host-registered read-only roots that `read_file` already honours;
+- curated toolchain subpaths, never whole toolchain homes, because several
+  of those homes keep credentials beside the binaries: for Cargo, `bin/`,
+  `registry/`, `git/`, and `config.toml` under the resolved Cargo home
+  (`$CARGO_HOME`, else `~/.cargo`), while `credentials.toml` and the legacy
+  `credentials` file are excluded even though they sit directly under that
+  root; for rustup, the whole home (it stores no secrets); for Node version
+  managers, the installed versions and their global packages, not
+  `~/.npmrc`; for Python, the interpreter and site-packages trees, not
+  `~/.config/pip` or `~/.pypirc`. Each tool's home is resolved through the
+  environment variable it honours before falling back to the default;
+- the host-registered read-only roots that `read_file` already honours;
 - roots the user adds in configuration for their environment.
 
-Credential stores (`~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.config/gh`,
+Two further rules apply to every root, listed or configured. First, a
+descendant exclusion list is mounted over each root as empty tmpfs or
+denied by Landlock and Seatbelt rules, so a root can never expose these
+even when it legitimately contains them: `credentials.toml`, `credentials`,
+`.npmrc`, `.pypirc`, `.netrc`, `.docker/config.json`, `.git-credentials`,
+`*.pem`, `*.key`, `id_*` key files, and any `credentials*` or `*token*`
+file the resolver finds at the top level of a root. Second, the credential
+stores themselves (`~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.config/gh`,
 `~/.codex`, `~/.claude`, the OS keychain paths) are never in the list, and a
 configured root that would expose one is rejected with a diagnostic. A
 command that needs something outside the roots fails inside the sandbox and
