@@ -832,6 +832,10 @@ fn form_elicitation_content(
         let Some(raw) = raw else {
             continue;
         };
+        // Every typed branch fails closed: an answer that is not exactly one
+        // of the schema's values (a free-text "Other" entry such as "yes"
+        // for a boolean, or a string outside an enum) declines the form
+        // rather than being coerced into something the user did not choose.
         let value = if has_enum {
             // Enum ids are the schema's own values; restore non-string ones.
             property
@@ -842,11 +846,14 @@ fn form_elicitation_content(
                         other => other.to_string() == raw,
                     })
                 })
-                .cloned()
-                .unwrap_or(Value::String(raw))
+                .cloned()?
         } else {
             match kind {
-                "boolean" => Value::Bool(raw == "true"),
+                "boolean" => match raw.as_str() {
+                    "true" => Value::Bool(true),
+                    "false" => Value::Bool(false),
+                    _ => return None,
+                },
                 "integer" => lossless_integer(raw.trim())?,
                 "number" => lossless_number(raw.trim())?,
                 _ => Value::String(raw),
@@ -8720,6 +8727,44 @@ cat > /dev/null
         );
         assert_eq!(
             form_elicitation_content(&numeric_schema, &answer("amount", "NaN")),
+            None
+        );
+
+        // Booleans and enums fail closed too: a free-text "Other" entry that
+        // is not one of the schema's values declines instead of coercing.
+        let choice_schema = json!({
+            "properties": {
+                "urgent": { "type": "boolean" },
+                "project": { "type": "string", "enum": ["OPS", "DEV"] },
+                "level": { "type": "integer", "enum": [1, 2, 3] }
+            }
+        });
+        for text in ["yes", "True", "1", ""] {
+            assert_eq!(
+                form_elicitation_content(&choice_schema, &answer("urgent", text)),
+                None,
+                "boolean {text:?} must not coerce"
+            );
+        }
+        assert_eq!(
+            form_elicitation_content(&choice_schema, &answer("urgent", "true")),
+            Some(json!({ "urgent": true }))
+        );
+        assert_eq!(
+            form_elicitation_content(&choice_schema, &answer("project", "ops")),
+            None
+        );
+        assert_eq!(
+            form_elicitation_content(&choice_schema, &answer("project", "OPS")),
+            Some(json!({ "project": "OPS" }))
+        );
+        // Non-string enum values are restored to their schema type.
+        assert_eq!(
+            form_elicitation_content(&choice_schema, &answer("level", "2")),
+            Some(json!({ "level": 2 }))
+        );
+        assert_eq!(
+            form_elicitation_content(&choice_schema, &answer("level", "4")),
             None
         );
 
