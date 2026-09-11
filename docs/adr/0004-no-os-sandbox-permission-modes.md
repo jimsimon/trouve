@@ -59,7 +59,11 @@ worktree without a prompt:
   worktree; a glob operand rejects if any symlink it could expand through
   leaves the worktree; `cd` must name one existing directory inside the
   worktree and is tracked so later operands resolve against it (bare `cd`
-  and `cd -` reject).
+  and `cd -` reject), and only where the shell is guaranteed to apply it:
+  a command containing `cd` may use only `&&` and `|`, and `cd` may not sit
+  in a pipeline or be followed by anything but `&&`.
+- A background launch (`run_in_background`) is never a read, whatever the
+  command: it retains a process in the session.
 - `git config` reads only with `--local`, exactly one read action, and that
   action's positional grammar, so host-level configuration is never merged
   into the answer and output modifiers cannot disguise a write.

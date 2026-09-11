@@ -1140,7 +1140,15 @@ fn call_mutates(
     args: &serde_json::Value,
     worktree: &Path,
 ) -> bool {
+    // A background launch is never a read, whatever the command: it leaves a
+    // process (and, with the piped stdin, one that may wait for input) in
+    // the session until job control or worktree cleanup ends it.
+    let background = args
+        .get("run_in_background")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
     if tool == "shell"
+        && !background
         && let Some(command) = args.get("command").and_then(serde_json::Value::as_str)
         && crate::command_safety::shell_command_is_read_only(command, worktree)
     {
@@ -22413,6 +22421,19 @@ mod tests {
             Some(true),
             "shell",
             &serde_json::json!({}),
+            wt
+        ));
+        // A background launch retains a process, so it is never a read.
+        assert!(call_mutates(
+            Some(true),
+            "shell",
+            &serde_json::json!({ "command": "cat", "run_in_background": true }),
+            wt
+        ));
+        assert!(!call_mutates(
+            Some(true),
+            "shell",
+            &serde_json::json!({ "command": "cat Cargo.toml", "run_in_background": false }),
             wt
         ));
         // Other tools keep the executor's classification; unknown tools

@@ -41,22 +41,23 @@ pub fn shell_command_is_read_only(command: &str, worktree: &Path) -> bool {
     let Ok(worktree) = worktree.canonicalize() else {
         return false;
     };
-    // Split on the list operators the classifier understands. A lone `&`
-    // (background job) is rejected below because it survives the split.
-    let mut segments = Vec::new();
+    // Split on the list operators the classifier understands, keeping the
+    // operator that follows each segment. A lone `&` (background job) is
+    // rejected below because it survives the split.
+    let mut segments: Vec<(&str, Option<Operator>)> = Vec::new();
     let mut rest = command;
     loop {
-        let split = ["&&", "||", "|", ";"]
+        let split = Operator::ALL
             .iter()
-            .filter_map(|op| rest.find(op).map(|at| (at, op.len())))
-            .min_by_key(|(at, len)| (*at, std::cmp::Reverse(*len)));
+            .filter_map(|op| rest.find(op.text()).map(|at| (at, *op)))
+            .min_by_key(|(at, op)| (*at, std::cmp::Reverse(op.text().len())));
         match split {
-            Some((at, len)) => {
-                segments.push(&rest[..at]);
-                rest = &rest[at + len..];
+            Some((at, op)) => {
+                segments.push((&rest[..at], Some(op)));
+                rest = &rest[at + op.text().len()..];
             }
             None => {
-                segments.push(rest);
+                segments.push((rest, None));
                 break;
             }
         }
@@ -64,11 +65,27 @@ pub fn shell_command_is_read_only(command: &str, worktree: &Path) -> bool {
     if segments.is_empty() {
         return false;
     }
-    // The directory each segment runs in. `cd` in one segment changes it for
-    // the rest of the command line, and a `cd` inside a pipeline segment only
-    // affects that subshell, which is still inside the worktree.
+    // `cd` is tracked only where the shell is guaranteed to apply it to what
+    // follows. In a pipeline `cd` runs in a subshell; after `;` a failed `cd`
+    // still lets the next command run in the old directory; with `||` an
+    // earlier success skips it. So a command containing `cd` may use only
+    // `&&` and `|`, and `cd` itself may not sit in a pipeline and must be
+    // followed by `&&` (or end the command): if it fails, nothing after it
+    // runs, and if anything before it fails, it and everything after are
+    // skipped together.
+    let has_cd = segments
+        .iter()
+        .any(|(segment, _)| tokenize(segment).is_some_and(|t| t[0] == "cd"));
+    if has_cd
+        && segments
+            .iter()
+            .any(|(_, op)| matches!(op, Some(Operator::Or) | Some(Operator::Seq)))
+    {
+        return false;
+    }
     let mut cwd = worktree.clone();
-    for segment in segments {
+    let mut previous_op: Option<Operator> = None;
+    for (segment, next_op) in segments {
         if segment.contains('&') {
             return false;
         }
@@ -82,10 +99,41 @@ pub fn shell_command_is_read_only(command: &str, worktree: &Path) -> bool {
         match segment_is_read_only(&tokens, &scope) {
             Verdict::Reject => return false,
             Verdict::Read => {}
-            Verdict::ChangeDir(dir) => cwd = dir,
+            Verdict::ChangeDir(dir) => {
+                let in_pipeline = matches!(previous_op, Some(Operator::Pipe))
+                    || matches!(next_op, Some(Operator::Pipe));
+                if in_pipeline || !matches!(next_op, Some(Operator::And) | None) {
+                    return false;
+                }
+                cwd = dir;
+            }
         }
+        previous_op = next_op;
     }
     true
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Operator {
+    And,
+    Or,
+    Pipe,
+    Seq,
+}
+
+impl Operator {
+    /// Longest operators first so `&&` and `||` win over `|` at the same
+    /// offset (the split also prefers the longer text on ties).
+    const ALL: [Operator; 4] = [Operator::And, Operator::Or, Operator::Pipe, Operator::Seq];
+
+    fn text(self) -> &'static str {
+        match self {
+            Operator::And => "&&",
+            Operator::Or => "||",
+            Operator::Pipe => "|",
+            Operator::Seq => ";",
+        }
+    }
 }
 
 fn is_forbidden_char(c: char) -> bool {
@@ -539,7 +587,7 @@ mod tests {
             "cargo --version",
             "jq '.name' package.json",
             "cd crates && ls",
-            "cd src; cat main.rs",
+            "cd src && cat main.rs",
             "git log --oneline | head -5",
             "cat Cargo.toml; cat names.txt",
             "test -f Cargo.toml && echo yes || echo no",
@@ -702,15 +750,37 @@ mod tests {
     fn cd_is_tracked_and_confined() {
         let wt = Worktree::new();
         // Bare `cd` goes to $HOME; `cd -` to an unknown directory.
-        assert!(!wt.read_only("cd; cat .ssh/id_rsa"));
-        assert!(!wt.read_only("cd -; cat secret"));
+        assert!(!wt.read_only("cd && cat .ssh/id_rsa"));
+        assert!(!wt.read_only("cd - && cat secret"));
         assert!(!wt.read_only("cd - && ls"));
         // Nonexistent or non-directory targets fail closed.
         assert!(!wt.read_only("cd nope && ls"));
         assert!(!wt.read_only("cd Cargo.toml && ls"));
         // Later operands resolve against the directory the shell is in.
         assert!(wt.read_only("cd src && cat main.rs"));
+        assert!(wt.read_only("cd src && cat main.rs | head -1"));
+        assert!(wt.read_only("cd src"));
         assert!(!wt.read_only("cd src && cat ../names.txt"));
+    }
+
+    #[test]
+    fn cd_is_rejected_where_the_shell_might_not_apply_it() {
+        let wt = Worktree::new();
+        // After `;` a failed cd still lets the next command run in the old
+        // directory; `||` can skip the cd entirely; in a pipeline cd runs in
+        // a subshell. The classifier cannot know which directory the next
+        // operand resolves against, so it refuses to guess.
+        assert!(!wt.read_only("cd src; cat main.rs"));
+        assert!(!wt.read_only("cd src; ls"));
+        assert!(!wt.read_only("ls || cd src && cat main.rs"));
+        assert!(!wt.read_only("cd src || cat main.rs"));
+        assert!(!wt.read_only("ls | cd src && cat main.rs"));
+        assert!(!wt.read_only("cd src | cat main.rs"));
+        assert!(!wt.read_only("cd src && cat main.rs; ls"));
+        // Without cd, every operator remains usable.
+        assert!(wt.read_only("ls; cat Cargo.toml"));
+        assert!(wt.read_only("test -f x || echo missing"));
+        assert!(wt.read_only("cat Cargo.toml | head -1"));
     }
 
     #[cfg(unix)]
