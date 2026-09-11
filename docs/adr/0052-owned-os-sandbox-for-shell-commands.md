@@ -34,14 +34,49 @@ Trouve's shell tool runs each command under one of three policies:
 
 | Policy | Filesystem | Network | Used for |
 | --- | --- | --- | --- |
-| `ReadOnly` | Whole filesystem read-only; a private writable temp dir | Off | Read-only-classified commands; every command in read-only personas |
-| `WorkspaceWrite` | Read everywhere; writes only inside the session worktree, its linked Git directory, and a private temp dir | Off by default | Mutating commands in `ask` and `allow-list` after approval |
+| `ReadOnly` | Only the readable roots below are visible, read-only; a private writable temp dir | Off | Read-only-classified commands; every command in read-only personas |
+| `WorkspaceWrite` | Readable roots visible; writes only to the Git-aware writable set below and a private temp dir | Off by default | Mutating commands in `ask` and `allow-list` after approval |
 | `Unrestricted` | No sandbox | On | Explicit escalation (see below); `yolo` |
 
-`WorkspaceWrite` must include the worktree's resolved external Git directory.
-ADR 0004 notes that Codex's workspace-write mode broke linked worktrees by
-protecting `.git`; trouve's worktrees are linked worktrees, so `git` must be
-able to create `index.lock` under the shared gitdir.
+#### Readable roots
+
+Neither policy exposes the whole host filesystem. The read view is an
+explicit allowlist, and the home directory is masked with an empty tmpfs so
+nothing under it is visible unless listed:
+
+- the session worktree and the repository's common Git directory;
+- system roots needed to run programs: `/usr`, `/bin`, `/sbin`, `/lib*`,
+  `/opt`, `/etc` (minus `/etc/shadow` and friends), `/proc/self`, `/dev`
+  essentials, and the macOS equivalents;
+- toolchain roots trouve already knows about (`~/.cargo`, `~/.rustup`,
+  `~/.nvm`, the Node and Python installs it resolves), plus the
+  host-registered read-only roots that `read_file` already honours;
+- roots the user adds in configuration for their environment.
+
+Credential stores (`~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.config/gh`,
+`~/.codex`, `~/.claude`, the OS keychain paths) are never in the list, and a
+configured root that would expose one is rejected with a diagnostic. A
+command that needs something outside the roots fails inside the sandbox and
+may escalate; it does not read silently. This is the property the
+classifier's path rules approximate lexically, now enforced by the kernel.
+
+#### Git-aware writable set
+
+Trouve's sessions are linked worktrees, so the per-worktree `.git` file
+points at `<common>/worktrees/<name>`, while objects, refs, and packed refs
+live in the common directory. Writes are allowed to:
+
+- the worktree itself;
+- the worktree's own administrative directory under `<common>/worktrees/`;
+- in the common directory: `objects/`, `refs/`, `logs/`, `packed-refs` and
+  its lock, `HEAD` lock files, and nothing else.
+
+`config`, `hooks/`, `info/`, and other worktrees' administrative directories
+stay read-only. That lets `git commit`, `git hash-object -w`, branch updates,
+and reflog writes succeed under `WorkspaceWrite` without escalation, while a
+command cannot change hooks or repository configuration or touch a sibling
+worktree. ADR 0004 recorded that Codex's workspace-write mode broke linked
+worktrees by protecting `.git` wholesale; this set is the corrected shape.
 
 The permission layer decides *whether* a command runs. The sandbox decides
 *what it can touch while running*. The read-only classifier stays as it is:
@@ -80,9 +115,29 @@ hint; a false negative only means the model reads the raw error.
   default, allow reads, allow writes under the worktree, gitdir, and temp
   dir, deny network unless on. `sandbox-exec` is deprecated but present
   through current macOS releases and is what every shipping harness uses.
-- **Windows**: no sandbox in this ADR. Commands run as today, the tool
-  result reports `sandbox: "none"`, and escalation is a no-op. A
+- **Windows**: no sandbox backend exists in this ADR. Windows is a
+  *platform without a backend*, decided at build time: commands run as
+  today, the tool result reports `sandbox: "none"`, the runtime settings
+  screen shows the host as unsandboxed, and escalation is a no-op. A
   restricted-token or AppContainer backend is future work.
+
+#### Backend exhaustion fails closed
+
+On a platform that has a backend, the selected policy is a security
+boundary, and running a policy-marked command without it is never an
+acceptable fallback. If a `ReadOnly` or `WorkspaceWrite` command cannot be
+contained because every backend in the resolution order failed to
+initialize (bubblewrap unavailable or refused, Landlock unsupported by the
+kernel or its ruleset rejected), the shell tool does not run the command. It
+returns a `sandbox_unavailable` error naming the backends tried and the
+reason each failed. The model may then request escalation, which goes
+through the same explicit "run outside the sandbox" approval as any other
+escalation; `yolo` auto-approves it, and the result still reports
+`sandbox: "none"` so the transcript shows what actually happened. A
+degraded host therefore surfaces as prompts and a settings diagnostic, not
+as silent uncontained execution. The distinction from Windows is
+deliberate: build-time absence is documented and visible; runtime
+degradation is an error.
 
 ### Shipping bubblewrap with trouve
 
@@ -120,11 +175,16 @@ a vendor release. It builds bubblewrap from source and ships the result.
 
 ## Consequences
 
-- Read-only-classified commands become safe against classifier mistakes and
-  cannot read outside the worktree even when they name paths the classifier
-  did not catch, because the read-only policy still applies. This is the
-  precondition for retiring Codex's built-in shell without a containment
-  regression.
+- Read-only-classified commands become safe against classifier mistakes:
+  under `ReadOnly` they can read only the explicit readable roots, so a path
+  the classifier did not catch cannot reach a credential store or another
+  checkout. The worktree, the toolchain roots, and the system roots remain
+  readable, so real reads keep working. This is the precondition for
+  retiring Codex's built-in shell without a containment regression.
+- The readable-roots allowlist will need tuning per environment. A tool that
+  lives somewhere unusual fails inside the sandbox until its root is added
+  to configuration; the `sandbox_unavailable` and denial hints exist so that
+  failure is legible rather than mysterious.
 - Mutating commands in `ask` and `allow-list` gain a real boundary: an
   approved `cargo test` can no longer write to `~/.cargo/config.toml` or
   reach the network without a second, explicitly worded approval. Some
@@ -140,10 +200,11 @@ a vendor release. It builds bubblewrap from source and ships the result.
 
 1. `trouve-bwrap` crate, vendored source, embedding, digest-verified
    extraction, and a `trouve_core::sandbox` module exposing
-   `SandboxPolicy` and a `wrap(command) -> Command` for Linux and macOS.
-   Read-only-classified commands and read-only personas run under
-   `ReadOnly`. No user-visible UX change beyond a `sandbox` field in shell
-   results.
+   `SandboxPolicy`, the readable-roots resolver, the Git-aware writable set,
+   and a `wrap(command) -> Command` for Linux and macOS that fails closed
+   when no backend initializes. Read-only-classified commands and read-only
+   personas run under `ReadOnly`. No user-visible UX change beyond a
+   `sandbox` field in shell results and the `sandbox_unavailable` error.
 2. `WorkspaceWrite` for mutating commands in `ask` and `allow-list`, denial
    hints, and the escalation approval with its own allow-list key.
 3. Release workflow: libcap in the build images, static linking for musl,
