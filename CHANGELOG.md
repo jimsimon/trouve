@@ -8,6 +8,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Code reviews explain why a carried finding still blocks**: the final
+  editor now records a verdict for every open finding from an earlier round it
+  did not resolve, with a reason naming what the reviewed revision still
+  exhibits. A round with no new findings no longer posts an empty "changes
+  requested" review: the review body lists the still-open findings with their
+  location, original comment, and that reason; the lifecycle comment's
+  threadless list and the Check Run summary name them too; the dashboard shows
+  the latest verdict on the finding; and the next round's final editor receives
+  it as `previous_round_verdict` so it can judge whether the new revision
+  addressed exactly that gap.
+- **Client/server compatibility**: protocol compatibility advances to 9.5 for
+  the additive `carried_verdict` on code-review findings. Upgrade the desktop
+  or PWA client, review dashboard, and `trouve-server` together.
 - **Model-specific options for code reviews**: the review dashboard's
   repository settings now show schema-driven controls (for example Codex
   "fast" mode) for the coordinator, semantic router, change analyst, and
@@ -22,6 +35,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A shared root-cause review thread no longer closes while a grouped
+  finding is still open**: findings published under one inline comment share
+  its thread, and fixing the primary finding used to resolve that thread even
+  when a sibling grouped under it remained open, leaving the pull request
+  blocked by a finding with no visible thread. The thread now stays open until
+  the last grouped finding closes, at which point it is resolved as before.
 - **A turn's final text is labelled Response even when a tool call followed
   it**: the chat labelled agent text "Response" only when it was the very
   last item of the turn, so an agent that wrote its answer and then made one

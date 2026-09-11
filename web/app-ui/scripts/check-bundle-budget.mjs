@@ -65,10 +65,11 @@ const entryLimit = mode === "desktop" ? 856_000 : 850_000;
 // The native web-search presentation brings them to 3,317,539 B and
 // 3,302,689 B. Segment-level turn virtualization with its pure agent-body
 // span planner and the memoized chat-derived state bring them to 3,322,799 B
-// and 3,307,948 B; preserve less than 2 kB of headroom for each. Entry, worker, and
-// largest-chunk budgets below still prevent one bundle from hiding in the
-// aggregate.
-const totalJavaScriptLimit = mode === "desktop" ? 3_324_000 : 3_309_000;
+// and 3,307,948 B. The protocol 9.5 `carried_verdict` schema on code-review
+// findings brings them to 3,325,722 B and 3,310,871 B; preserve less than
+// 2 kB of headroom for each. Entry, worker, and largest-chunk budgets below
+// still prevent one bundle from hiding in the aggregate.
+const totalJavaScriptLimit = mode === "desktop" ? 3_327_000 : 3_312_000;
 // beautiful-mermaid 1.1 with elk.bundled emits 1,524,273 B (469 kB gzipped).
 // Preserve less than 6 kB of headroom.
 const diagramEngineLimit = 1_530_000;

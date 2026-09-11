@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "9.4"
+    "version": "9.5"
   },
   "paths": {
     "/v1/approvals": {
@@ -5607,6 +5607,29 @@
           }
         }
       },
+      "CodeReviewCarriedVerdict": {
+        "type": "object",
+        "description": "A later review round's reason for leaving a carried finding open.",
+        "required": [
+          "job_id",
+          "head_sha",
+          "reason"
+        ],
+        "properties": {
+          "head_sha": {
+            "type": "string",
+            "description": "Immutable PR head that job reviewed."
+          },
+          "job_id": {
+            "type": "string",
+            "description": "Review job whose coordinator judged the finding still open."
+          },
+          "reason": {
+            "type": "string",
+            "description": "The coordinator's explanation of what still exhibits the issue."
+          }
+        }
+      },
       "CodeReviewCausalWaypoint": {
         "type": "object",
         "description": "One step of the causal chain from changed code to a finding's anchor,\nquoted by the coordinator and mechanically verified against the reviewed\nrevision. A finding anchored outside the diff can only block the review\nwhen its waypoints verify and at least one lies on a changed line.",
@@ -5826,6 +5849,17 @@
         "properties": {
           "body": {
             "type": "string"
+          },
+          "carried_verdict": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/CodeReviewCarriedVerdict",
+                "description": "The latest later round's judgment on this still-open finding: the\ncoordinator inspected the finding at that round's head and explains\nwhy the issue is not yet fixed. Absent until a later round has\ncarried the finding, and only meaningful while the finding is open."
+              }
+            ]
           },
           "confidence": {
             "type": "string",

@@ -272,6 +272,14 @@ export interface Finding {
   resolved_head?: string;
   resolved_by_job_id?: string;
   thread_collapse?: ThreadCollapseState | null;
+  /** The latest later round's reason for leaving this finding open. */
+  carried_verdict?: CarriedVerdict | null;
+}
+
+export interface CarriedVerdict {
+  job_id: string;
+  head_sha: string;
+  reason: string;
 }
 
 export interface ThreadCollapseState {

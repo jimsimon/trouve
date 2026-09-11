@@ -2375,6 +2375,23 @@ pub struct CodeReviewFinding {
     /// so a thread that stays open on GitHub can be explained.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_collapse: Option<CodeReviewThreadCollapse>,
+    /// The latest later round's judgment on this still-open finding: the
+    /// coordinator inspected the finding at that round's head and explains
+    /// why the issue is not yet fixed. Absent until a later round has
+    /// carried the finding, and only meaningful while the finding is open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub carried_verdict: Option<CodeReviewCarriedVerdict>,
+}
+
+/// A later review round's reason for leaving a carried finding open.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct CodeReviewCarriedVerdict {
+    /// Review job whose coordinator judged the finding still open.
+    pub job_id: String,
+    /// Immutable PR head that job reviewed.
+    pub head_sha: String,
+    /// The coordinator's explanation of what still exhibits the issue.
+    pub reason: String,
 }
 
 fn default_code_review_confidence() -> String {
