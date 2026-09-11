@@ -55,6 +55,20 @@ const isAgentItem = (item: ThreadChatItem): item is AgentChatItem =>
   || item.kind === "tool"
   || item.kind === "questions";
 
+/** Whether reasoning text carries anything beyond a section title. Codex
+ * summaries open every section with a bold or `#` heading line and may
+ * complete without a paragraph under it; a bare title is lifecycle noise
+ * rather than displayable reasoning. */
+export const reasoningHasBody = (content: string): boolean => {
+  const lines = content.split("\n").map((line) => line.trim()).filter((line) => line !== "");
+  if (lines.length === 0) return false;
+  if (lines.length > 1) return true;
+  const line = lines[0] ?? "";
+  if (/^#{1,6}\s+\S/u.test(line)) return false;
+  const bold = /^(\*\*|__)(.+)\1$/u.exec(line);
+  return bold === null || bold[2]?.includes(bold[1] ?? "") === true;
+};
+
 interface MutableTurnUnit {
   turn: number | undefined;
   readonly firstId: string;
@@ -133,9 +147,10 @@ export const buildChatLayout = (items: readonly ThreadChatItem[]): ChatLayout =>
     }
     if (isAgentItem(item)) {
       // A provider can announce and complete a reasoning block without ever
-      // exposing displayable text. Keep that lifecycle state out of the
-      // transcript instead of rendering an empty Reasoning node.
-      if (item.kind === "thinking" && item.content.trim() === "") continue;
+      // exposing displayable text, or with only a section title and no body.
+      // Keep that lifecycle state out of the transcript instead of rendering
+      // an empty or title-only Reasoning node.
+      if (item.kind === "thinking" && !reasoningHasBody(item.content)) continue;
       const explicitTurn =
         item.kind === "assistant"
         || item.kind === "steered"
