@@ -938,6 +938,30 @@ export const presentToolDetail = (
     };
   }
 
+  if (firstParty && normalized === "websearch" && resultRecord !== undefined && typeof resultRecord.content === "string") {
+    const content = resultRecord.content;
+    const cache = record(resultRecord.cache);
+    const cacheHit = typeof cache?.hit === "boolean" ? cache.hit : undefined;
+    const cacheAge = numberValue(cache?.age_seconds);
+    return {
+      kind: "document",
+      inputs: [
+        detailField("Query", effective.args.query),
+        detailField("Results", effective.args.max_results ?? 8),
+        detailField("Provider", resultRecord.provider),
+        detailField(
+          "Cache",
+          cacheHit === true
+            ? `Hit${cacheAge === undefined ? "" : ` (${String(cacheAge)}s old)`}`
+            : cacheHit === false ? "Miss" : undefined,
+        ),
+      ].filter((field): field is ToolDetailField => field !== undefined),
+      content,
+      language: parsedJson(content) === undefined ? "markdown" : "json",
+      truncated: booleanValue(resultRecord.truncated),
+    };
+  }
+
   if (firstParty && normalized === "gitdiff" && resultRecord !== undefined && typeof resultRecord.diff === "string") {
     const nextOffset = numberValue(resultRecord.next_offset);
     const totalBytes = numberValue(resultRecord.total_bytes);

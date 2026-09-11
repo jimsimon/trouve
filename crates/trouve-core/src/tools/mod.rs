@@ -17,6 +17,7 @@ mod search;
 mod shell;
 mod todo;
 mod web;
+mod web_search;
 
 pub use search::{
     VENDOR_SEARCH_GUIDANCE, VENDOR_TOOL_BRIDGE_GUIDANCE, gc_index_store_in_background,
@@ -1782,6 +1783,7 @@ impl LocalToolExecutor {
             Arc::new(shell::ShellKill { jobs: jobs.clone() }),
             Arc::new(grep::Grep),
             Arc::new(web::WebFetch),
+            Arc::new(web_search::WebSearch::default()),
             Arc::new(todo::TodoWrite),
             Arc::new(search::Search {
                 cache: search_cache.clone(),
@@ -4777,11 +4779,9 @@ mod tests {
         let origin = tempfile::tempdir().unwrap();
         let repository = tempfile::tempdir().unwrap();
         let git = |directory: &Path, args: &[&str]| {
-            std::process::Command::new("git")
-                .args(args)
-                .current_dir(directory)
-                .output()
-                .unwrap()
+            let mut command = std::process::Command::new("git");
+            command.args(args).current_dir(directory);
+            trouve_process::output(&mut command).unwrap()
         };
         assert!(git(origin.path(), &["init"]).status.success());
         assert!(
@@ -4863,11 +4863,9 @@ mod tests {
         let repository = root.path().join("acme/widgets");
         std::fs::create_dir_all(&repository).unwrap();
         let git = |args: &[&str]| {
-            std::process::Command::new("git")
-                .args(args)
-                .current_dir(&repository)
-                .output()
-                .unwrap()
+            let mut command = std::process::Command::new("git");
+            command.args(args).current_dir(&repository);
+            trouve_process::output(&mut command).unwrap()
         };
         assert!(git(&["init"]).status.success());
         assert!(git(&["config", "user.name", "Test"]).status.success());
@@ -4909,11 +4907,9 @@ mod tests {
     async fn review_history_cleanup_deletes_only_the_jobs_bounded_refs() {
         let dir = tempfile::tempdir().unwrap();
         let git = |args: &[&str]| {
-            std::process::Command::new("git")
-                .args(args)
-                .current_dir(dir.path())
-                .output()
-                .unwrap()
+            let mut command = std::process::Command::new("git");
+            command.args(args).current_dir(dir.path());
+            trouve_process::output(&mut command).unwrap()
         };
         assert!(git(&["init"]).status.success());
         assert!(git(&["config", "user.name", "Test"]).status.success());

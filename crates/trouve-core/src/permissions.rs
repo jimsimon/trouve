@@ -73,6 +73,21 @@ pub fn gate(
     allow_list: &HashSet<String>,
     key: &str,
 ) -> Gate {
+    gate_tool(mode, mode_read_only, tool_mutates, allow_list, key, key)
+}
+
+/// Apply permission policy using both the reported tool identity and its
+/// allow-list scope. Bridged trouve tools retain an MCP server key for
+/// session-scoped approval, but outbound web tools must still be classified
+/// by the underlying operation before generic read-only handling.
+pub fn gate_tool(
+    mode: PermissionMode,
+    mode_read_only: bool,
+    tool_mutates: bool,
+    allow_list: &HashSet<String>,
+    tool: &str,
+    key: &str,
+) -> Gate {
     // Yolo is opt-in full trust: no approval prompts. Read-only agent personas
     // still deny mutating tools.
     if mode == PermissionMode::Yolo {
@@ -82,13 +97,17 @@ pub fn gate(
             Gate::Allow
         };
     }
-    // web_fetch mutates nothing, but fetching a model-chosen URL is an
+    // Web tools mutate nothing, but sending a model-chosen URL or query is an
     // outbound side channel (prompt-injection exfiltration of anything the
-    // ungated read tools can see), so it requires approval in every
+    // ungated read tools can see), so they require approval in every
     // non-yolo mode — including read-only modes, where research is
     // legitimate but silent exfiltration is not. "Always approve" unlocks
     // the session via the allow-list.
-    if key == "web_fetch" {
+    let outbound_web_tool = matches!(tool, "web_fetch" | "web_search")
+        || crate::mcp::split_tool_name(tool).is_some_and(|(server, tool)| {
+            server == "trouve" && matches!(tool, "web_fetch" | "web_search")
+        });
+    if outbound_web_tool {
         return if allow_list.contains(key) {
             Gate::Allow
         } else {
@@ -424,7 +443,7 @@ mod tests {
             gate(PermissionMode::AllowList, false, true, &listed, "shell:rm"),
             Gate::NeedsApproval
         );
-        // Yolo runs everything (non-read-only), including MCP and web_fetch.
+        // Yolo runs everything (non-read-only), including MCP and web tools.
         assert_eq!(
             gate(PermissionMode::Yolo, false, true, &empty, "shell:rm"),
             Gate::Allow
@@ -437,12 +456,18 @@ mod tests {
             gate(PermissionMode::Yolo, false, false, &empty, "web_fetch"),
             Gate::Allow
         );
-        // Yolo skips the web_fetch prompt even in read-only modes (it
-        // mutates nothing, so the read-only deny does not apply).
         assert_eq!(
-            gate(PermissionMode::Yolo, true, false, &empty, "web_fetch"),
+            gate(PermissionMode::Yolo, false, false, &empty, "web_search"),
             Gate::Allow
         );
+        // Yolo skips web-tool prompts even in read-only modes (they mutate
+        // nothing, so the read-only deny does not apply).
+        for web_tool in ["web_fetch", "web_search"] {
+            assert_eq!(
+                gate(PermissionMode::Yolo, true, false, &empty, web_tool),
+                Gate::Allow
+            );
+        }
         // MCP servers need first-use approval in ask/allow-list …
         assert_eq!(
             gate(PermissionMode::Ask, false, true, &empty, "mcp:jira"),
@@ -471,18 +496,19 @@ mod tests {
             gate(PermissionMode::AllowList, true, true, &empty, "mcp:jira"),
             Gate::Deny
         );
-        // web_fetch needs approval in non-yolo modes (exfiltration channel),
+        // Web tools need approval in non-yolo modes (exfiltration channels),
         // read-only modes included, until allow-listed for the session.
-        assert_eq!(
-            gate(PermissionMode::Ask, true, false, &empty, "web_fetch"),
-            Gate::NeedsApproval
-        );
-        let mut web_listed = HashSet::new();
-        web_listed.insert("web_fetch".to_string());
-        assert_eq!(
-            gate(PermissionMode::Ask, true, false, &web_listed, "web_fetch"),
-            Gate::Allow
-        );
+        for web_tool in ["web_fetch", "web_search"] {
+            assert_eq!(
+                gate(PermissionMode::Ask, true, false, &empty, web_tool),
+                Gate::NeedsApproval
+            );
+            let web_listed = HashSet::from([web_tool.to_string()]);
+            assert_eq!(
+                gate(PermissionMode::Ask, true, false, &web_listed, web_tool),
+                Gate::Allow
+            );
+        }
     }
 
     #[test]
@@ -509,6 +535,25 @@ mod tests {
         assert_ne!(
             allow_key("mcpToolCall", &serde_json::json!({"serverName": "github"})),
             allow_key("mcpToolCall", &serde_json::json!({"serverName": "jira"}))
+        );
+    }
+
+    #[test]
+    fn bridged_web_tools_keep_mcp_scope_but_require_outbound_approval() {
+        let empty = HashSet::new();
+        let args = serde_json::json!({"query": "sensitive query"});
+        let tool = "mcp__trouve__web_search";
+        let key = allow_key(tool, &args);
+        assert_eq!(key, "mcp:trouve");
+        assert_eq!(
+            gate_tool(PermissionMode::Ask, true, false, &empty, tool, &key),
+            Gate::NeedsApproval
+        );
+
+        let listed = HashSet::from([key.clone()]);
+        assert_eq!(
+            gate_tool(PermissionMode::Ask, true, false, &listed, tool, &key),
+            Gate::Allow
         );
     }
 

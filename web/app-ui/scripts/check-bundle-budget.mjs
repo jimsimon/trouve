@@ -61,8 +61,9 @@ const entryLimit = mode === "desktop" ? 856_000 : 850_000;
 // 9.3 per-role code-review `model_options` schemas on repositories, reviewer
 // overrides, and job snapshots bring them to 3,314,468 B and 3,299,613 B.
 // The inline Mermaid diagram element and its lazy-loading shim bring them to
-// 3,317,073 B and 3,302,236 B (the engine itself is budgeted separately);
-// preserve less than 2 kB of headroom for each. Entry, worker, and
+// 3,317,073 B and 3,302,236 B (the engine itself is budgeted separately).
+// The native web-search presentation brings them to 3,317,539 B and
+// 3,302,689 B; preserve less than 2 kB of headroom for each. Entry, worker, and
 // largest-chunk budgets below still prevent one bundle from hiding in the
 // aggregate.
 const totalJavaScriptLimit = mode === "desktop" ? 3_319_000 : 3_304_000;
