@@ -4425,10 +4425,16 @@ impl AppServer {
     }
 
     async fn handshake(&self) -> Result<(), BackendError> {
+        // The app-server rejects experimental methods and fields unless the
+        // client opts in at `initialize`. The granular approval policy that
+        // full-bridge turns send on `thread/start` is one such field:
+        // without the opt-in Codex 0.153 fails every bridged thread with
+        // "askForApproval.granular requires experimentalApi capability".
         self.request(
             "initialize",
             json!({
                 "clientInfo": { "name": "trouve", "version": env!("CARGO_PKG_VERSION") },
+                "capabilities": { "experimentalApi": true },
             }),
         )
         .await?;
@@ -6885,6 +6891,65 @@ for line in sys.stdin:
             "a later request did not spawn a replacement app-server"
         );
         replacement.terminate_transport().await.unwrap();
+    }
+
+    /// Codex gates the granular approval policy behind the `experimentalApi`
+    /// initialize capability. The stub mirrors that check so a handshake
+    /// that drops the opt-in fails `thread/start` the way Codex 0.153 does.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn handshake_opts_into_the_experimental_api_for_granular_approvals() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let stub = temp.path().join("codex-experimental-api");
+        std::fs::write(
+            &stub,
+            r#"#!/usr/bin/env python3
+import json, sys
+experimental = False
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    mid = message.get("id")
+    if method == "initialized":
+        continue
+    if method == "initialize":
+        capabilities = message.get("params", {}).get("capabilities") or {}
+        experimental = capabilities.get("experimentalApi") is True
+        result = {}
+    elif method == "thread/start":
+        policy = message.get("params", {}).get("approvalPolicy")
+        if isinstance(policy, dict) and "granular" in policy and not experimental:
+            error = {"code": -32600, "message": "thread/start: askForApproval.granular requires experimentalApi capability"}
+            sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": mid, "error": error}) + "\n")
+            sys.stdout.flush()
+            continue
+        result = {"thread": {"id": "granular-thread"}}
+    else:
+        result = {}
+    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": mid, "result": result}) + "\n")
+    sys.stdout.flush()
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let backend = CodexBackend::new("codex", Some(stub.to_string_lossy().into_owned()));
+        let server = backend.server().await.unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let started = server
+            .start_thread_cancellable(
+                json!({
+                    "cwd": temp.path(),
+                    "approvalPolicy": approval_policy(crate::BackendPermission::Ask, true),
+                }),
+                &cancel,
+            )
+            .await
+            .unwrap();
+        assert_eq!(started["thread"]["id"], "granular-thread");
+        server.terminate_transport().await.unwrap();
     }
 
     #[cfg(target_os = "linux")]
