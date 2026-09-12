@@ -1830,9 +1830,10 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     const modelControls = modelOptionControls(selectedModel, thread?.model_options);
     const modelHealth = modelHealthPresentations(models, this.#subscriptionHealth);
     const usageModel = view?.usageModel() ?? thread?.model;
+    const usageCatalogModel = modelForSelection(models, usageModel);
     const contextUsage = composerContextUsage(
       view?.lastUsage,
-      selectedModel?.context_window,
+      usageCatalogModel?.context_window,
       view?.compacting ?? false,
       usageModel?.startsWith("codex/") ?? false,
     );

@@ -110,7 +110,10 @@ export class TrouveMermaidDiagram extends LitElement {
     const cached = readDiagram(source);
     this.#svg = cached ?? undefined;
     this.#failed = cached === null;
-    if (cached !== undefined) return;
+    if (cached !== undefined) {
+      this.requestUpdate();
+      return;
+    }
     const svg = await renderMermaid(source);
     if (generation !== this.#generation || !this.isConnected) return;
     this.#svg = svg;

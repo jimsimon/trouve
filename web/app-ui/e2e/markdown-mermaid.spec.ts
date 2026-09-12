@@ -81,3 +81,56 @@ test("a pending mermaid render finishes after the element reconnects", async ({ 
   await expect(diagram.locator("svg")).toBeVisible();
   await expect(diagram.locator("svg")).toContainText("reconnected");
 });
+
+test("a detached mermaid render restores its cached result after reconnecting", async ({ page }) => {
+  let releaseRenderer = () => {};
+  const rendererRelease = new Promise<void>((resolve) => {
+    releaseRenderer = resolve;
+  });
+  let markRendererRequested = () => {};
+  const rendererRequested = new Promise<void>((resolve) => {
+    markRendererRequested = resolve;
+  });
+  await page.route("**/*beautiful-mermaid*", async (route) => {
+    markRendererRequested();
+    await rendererRelease;
+    await route.continue();
+  });
+  await page.goto("/gallery.html");
+  await page.locator("trouve-component-gallery").waitFor();
+
+  await page.evaluate(async () => {
+    const diagram = document.createElement("trouve-mermaid-diagram");
+    diagram.id = "mermaid-detached-fixture";
+    diagram.source = "graph TD\n  detached --> cached";
+    document.body.append(diagram);
+    await diagram.updateComplete;
+    diagram.remove();
+    const scope = globalThis as typeof globalThis & { detachedMermaid?: HTMLElement };
+    scope.detachedMermaid = diagram;
+  });
+  await rendererRequested;
+  releaseRenderer();
+
+  await page.evaluate(async () => {
+    const sentinel = document.createElement("trouve-mermaid-diagram");
+    sentinel.id = "mermaid-cache-sentinel";
+    sentinel.source = "graph TD\n  detached --> cached";
+    document.body.append(sentinel);
+    await sentinel.updateComplete;
+  });
+  await expect(page.locator("#mermaid-cache-sentinel svg")).toBeVisible();
+
+  await page.evaluate(async () => {
+    document.querySelector("#mermaid-cache-sentinel")?.remove();
+    const scope = globalThis as typeof globalThis & { detachedMermaid?: HTMLElement };
+    const diagram = scope.detachedMermaid;
+    if (!(diagram instanceof HTMLElement)) throw new Error("missing detached diagram fixture");
+    document.body.append(diagram);
+    await (diagram as HTMLElement & { updateComplete: Promise<boolean> }).updateComplete;
+  });
+
+  const diagram = page.locator("#mermaid-detached-fixture");
+  await expect(diagram.locator("svg")).toBeVisible();
+  await expect(diagram.locator("svg")).toContainText("cached");
+});

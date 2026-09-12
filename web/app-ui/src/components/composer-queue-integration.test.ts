@@ -36,6 +36,16 @@ describe("thread composer and queue integration", () => {
     expect(screen).toContain("changeModelOption(thread.model_options ?? {}, change)");
   });
 
+  it("uses the model that produced cached usage after the thread model changes", () => {
+    expect(screen).toContain("const usageCatalogModel = modelForSelection(models, usageModel);");
+    expect(screen).toMatch(
+      /composerContextUsage\(\s*view\?\.lastUsage,\s*usageCatalogModel\?\.context_window,/u,
+    );
+    expect(screen).not.toMatch(
+      /composerContextUsage\(\s*view\?\.lastUsage,\s*selectedModel\?\.context_window,/u,
+    );
+  });
+
   it("keeps queue mutations disabled, recoverable, and explicit on failure", () => {
     expect(screen).toContain("queueControlState({");
     expect(screen).toContain("Editing queued prompt");
