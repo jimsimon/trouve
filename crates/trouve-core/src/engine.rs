@@ -85,14 +85,17 @@ const MAX_SUBAGENT_CONTINUATIONS: usize = 4;
 /// Per-child cap on the final message copied into the `await_subagents`
 /// digest and tool result; the full text stays on the child thread.
 const SUBAGENT_DIGEST_MESSAGE_BYTES: usize = 8 * 1024;
-/// Whole-digest cap on child text (final messages and quoted failure
-/// reasons) across every awaited child.
+/// Whole prompt-digest cap, including child metadata, final messages, and
+/// quoted failure reasons across every awaited child.
 /// Once spent, later children are reported by status only, so a wide
 /// fan-out cannot turn the fold-in prompt into a context overflow.
 const SUBAGENT_DIGEST_TOTAL_BYTES: usize = 48 * 1024;
-/// Per-child cap on a failure reason quoted in the digest; the tool result
-/// keeps the whole error.
+/// Per-child cap on a failure reason copied into the digest and tool result.
 const SUBAGENT_DIGEST_ERROR_BYTES: usize = 1024;
+/// Reserve enough fixed space per result for a capped title, thread id,
+/// status, and omission/truncation guidance before dividing the text budget.
+const SUBAGENT_DIGEST_SECTION_OVERHEAD_BYTES: usize = 512;
+const SUBAGENT_DIGEST_TITLE_BYTES: usize = 128;
 /// Bound native provider fan-out so a malformed or over-eager response cannot
 /// monopolize the runtime. Results are still written to the provider
 /// transcript in request order.
@@ -19685,10 +19688,7 @@ impl Engine {
             BackgroundControl,
         }
         let execution_lock = self.tool_execution_lock(&session.id);
-        let permit = if matches!(
-            call.name.as_str(),
-            "shell_output" | "write_stdin" | "shell_kill"
-        ) {
+        let permit = if matches!(call.name.as_str(), "shell_output" | "shell_kill") {
             Some(ExecutionPermit::BackgroundControl)
         } else if mutates || pr_creation.is_some() {
             // A confirmed or unresolved creator must hold the write lane even
@@ -20301,13 +20301,23 @@ impl Engine {
             return Ok(None);
         }
 
+        const FINAL_INSTRUCTION: &str = "\nIncorporate these results and finish your response to the user. These subagents \
+             have already completed; do not wait for or poll them again.";
         let mut results = Vec::with_capacity(awaited.len());
         let mut digest = format!(
             "[Harness] This turn was held open until the {} subagent(s) it spawned finished. \
              Their results:\n",
             awaited.len()
         );
-        let mut message_bytes = 0usize;
+        let payload_budget = SUBAGENT_DIGEST_TOTAL_BYTES
+            .saturating_sub(digest.len())
+            .saturating_sub(FINAL_INSTRUCTION.len())
+            .saturating_sub(
+                awaited
+                    .len()
+                    .saturating_mul(SUBAGENT_DIGEST_SECTION_OVERHEAD_BYTES),
+            );
+        let mut payload_bytes = 0usize;
         for child_id in &awaited {
             let mut status = self.spawn_status(child_id)?;
             let title = self
@@ -20315,6 +20325,14 @@ impl Engine {
                 .thread(child_id)?
                 .and_then(|child| child.title)
                 .unwrap_or_default();
+            let title = if title.len() > SUBAGENT_DIGEST_TITLE_BYTES {
+                cap_chars(
+                    &title,
+                    SUBAGENT_DIGEST_TITLE_BYTES.saturating_sub(CAP_CHARS_MARKER.len()),
+                )
+            } else {
+                title
+            };
             let heading = if title.is_empty() {
                 child_id.clone()
             } else {
@@ -20324,19 +20342,44 @@ impl Engine {
                 "\n### {heading} — {}\n",
                 status["status"].as_str().unwrap_or("unknown")
             ));
-            if let Some(error) = status["error"].as_str() {
-                // Vendor failures can carry whole stderr dumps; the tool
-                // result keeps the full text, the prompt digest a bounded cut.
-                let error = cap_chars(error, SUBAGENT_DIGEST_ERROR_BYTES);
-                message_bytes += error.len();
-                digest.push_str(&format!("Error: {error}\n"));
+            if let Some(error) = status["error"].as_str().map(str::to_owned) {
+                // Vendor failures can carry whole stderr dumps. Bound both
+                // persisted and prompt copies, sharing the aggregate payload
+                // budget with final messages.
+                let remaining = payload_budget.saturating_sub(payload_bytes);
+                let budget = SUBAGENT_DIGEST_ERROR_BYTES.min(remaining);
+                let truncated = error.len() > budget;
+                let error = if !truncated {
+                    error
+                } else if budget > CAP_CHARS_MARKER.len() {
+                    cap_chars(&error, budget - CAP_CHARS_MARKER.len())
+                } else {
+                    String::new()
+                };
+                payload_bytes += error.len();
+                status["error"] = serde_json::json!(error);
+                if truncated {
+                    status["error_truncated"] = serde_json::json!(true);
+                }
+                if error.is_empty() {
+                    digest.push_str(&format!(
+                        "(error omitted: the {SUBAGENT_DIGEST_TOTAL_BYTES}-byte digest budget is \
+                         spent; read thread {child_id} with search_transcript)\n"
+                    ));
+                } else {
+                    digest.push_str(&format!("Error: {error}\n"));
+                }
             }
             // Child answers are unbounded; keep the digest (which becomes
             // prompt context) and the persisted tool result within a fixed
             // per-child and whole-digest budget, pointing at the child
             // thread for whatever was left out.
-            let last_message = status["last_message"].as_str().unwrap_or("").trim();
-            let remaining = SUBAGENT_DIGEST_TOTAL_BYTES.saturating_sub(message_bytes);
+            let last_message = status["last_message"]
+                .as_str()
+                .unwrap_or("")
+                .trim()
+                .to_owned();
+            let remaining = payload_budget.saturating_sub(payload_bytes);
             // The truncation marker counts against the budget too, so a run of
             // capped messages cannot creep past the whole-digest ceiling.
             let budget = SUBAGENT_DIGEST_MESSAGE_BYTES
@@ -20352,9 +20395,9 @@ impl Engine {
                 status["last_message"] = serde_json::json!("");
                 status["last_message_truncated"] = serde_json::json!(true);
             } else if last_message.len() > budget {
-                let capped = cap_chars(last_message, budget);
+                let capped = cap_chars(&last_message, budget);
                 debug_assert!(capped.len() <= budget + CAP_CHARS_MARKER.len());
-                message_bytes += capped.len();
+                payload_bytes += capped.len();
                 digest.push_str(&format!(
                     "{capped}\n(final message truncated at {budget} bytes; read thread \
                      {child_id} with search_transcript for the rest)\n"
@@ -20362,16 +20405,23 @@ impl Engine {
                 status["last_message"] = serde_json::json!(capped);
                 status["last_message_truncated"] = serde_json::json!(true);
             } else {
-                message_bytes += last_message.len();
-                digest.push_str(last_message);
+                payload_bytes += last_message.len();
+                digest.push_str(&last_message);
                 digest.push('\n');
             }
             results.push(status);
         }
-        digest.push_str(
-            "\nIncorporate these results and finish your response to the user. These subagents \
-             have already completed; do not wait for or poll them again.",
-        );
+        // The fixed per-section reserve above preserves ordinary metadata;
+        // this final guard makes the limit unconditional even if a future id
+        // or status representation grows beyond that reserve.
+        let body_limit = SUBAGENT_DIGEST_TOTAL_BYTES.saturating_sub(FINAL_INSTRUCTION.len());
+        if digest.len() > body_limit {
+            let keep = body_limit.saturating_sub(CAP_CHARS_MARKER.len());
+            digest.truncate(floor_char_boundary(&digest, keep));
+            digest.push_str(CAP_CHARS_MARKER);
+        }
+        digest.push_str(FINAL_INSTRUCTION);
+        debug_assert!(digest.len() <= SUBAGENT_DIGEST_TOTAL_BYTES);
         self.store.append_event(
             scope.clone(),
             Event::ToolCompleted {
@@ -22905,7 +22955,9 @@ mod tests {
         let shell = |command: &str| serde_json::json!({ "command": command });
         // The shell tool is statically mutating; a recognised read-only
         // command is reclassified per call, an unrecognised one is not.
-        assert!(!call_mutates(
+        // Repository-aware Git reads can execute configured helpers and keep
+        // the shell tool's conservative mutating classification.
+        assert!(call_mutates(
             Some(true),
             "shell",
             &shell("git log --oneline"),
@@ -22957,9 +23009,14 @@ mod tests {
         assert!(call_mutates(None, "mystery", &shell("ls"), wt));
 
         // Claude's native Bash carries the same command text.
-        assert!(vendor_shell_command_is_read_only(
+        assert!(!vendor_shell_command_is_read_only(
             "Bash",
             &shell("git status"),
+            wt
+        ));
+        assert!(vendor_shell_command_is_read_only(
+            "Bash",
+            &shell("git --version"),
             wt
         ));
         assert!(!vendor_shell_command_is_read_only(
@@ -26117,6 +26174,7 @@ mod tests {
         for index in 1..child_count {
             let child = Thread {
                 id: format!("{}_{index}", first_child.id),
+                title: Some("wide metadata ".repeat(SUBAGENT_DIGEST_TITLE_BYTES)),
                 ..first_child.clone()
             };
             engine
@@ -26177,10 +26235,8 @@ mod tests {
         for child in &children {
             assert!(digest.contains(&child.id), "digest names {}", child.id);
         }
-        // The prose around each result is small; the message payload itself
-        // must stay inside the whole-digest budget.
         assert!(
-            digest.len() < SUBAGENT_DIGEST_TOTAL_BYTES + child_count * 512,
+            digest.len() <= SUBAGENT_DIGEST_TOTAL_BYTES,
             "digest is {} bytes",
             digest.len()
         );
@@ -26269,7 +26325,11 @@ mod tests {
                 _ => None,
             })
             .expect("await_subagents tool result");
-        assert_eq!(result["subagents"][0]["error"], long_error);
+        let reported = &result["subagents"][0];
+        let reported_error = reported["error"].as_str().unwrap();
+        assert!(!reported_error.contains("END"));
+        assert!(reported_error.len() <= SUBAGENT_DIGEST_ERROR_BYTES);
+        assert_eq!(reported["error_truncated"], true);
     }
 
     #[tokio::test]
@@ -33108,7 +33168,10 @@ default_permission_mode = "ask"
                         2,
                         &mode,
                         &ctx,
-                        calls(&["write_one", "write_two"]),
+                        // Driving a background process is an arbitrary write,
+                        // unlike polling or terminating it, and must retain
+                        // the same session lane as every other mutation.
+                        calls(&["write_stdin", "write_two"]),
                         &tokio_util::sync::CancellationToken::new(),
                     )
                     .await

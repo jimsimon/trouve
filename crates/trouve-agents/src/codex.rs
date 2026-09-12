@@ -821,13 +821,15 @@ fn form_elicitation_content(
     answers: &[trouve_protocol::QuestionAnswer],
 ) -> Option<Value> {
     let mut content = serde_json::Map::new();
-    let properties = schema["properties"].as_object();
+    let properties = schema["properties"].as_object()?;
+    let mut answered = HashSet::new();
     for answer in answers {
-        let property = properties.and_then(|p| p.get(&answer.question_id));
-        let kind = property
-            .and_then(|p| p["type"].as_str())
-            .unwrap_or("string");
-        let has_enum = property.is_some_and(|p| p["enum"].is_array());
+        if !answered.insert(answer.question_id.as_str()) {
+            return None;
+        }
+        let property = properties.get(&answer.question_id)?;
+        let kind = property["type"].as_str()?;
+        let has_enum = property["enum"].is_array();
         let raw = answer
             .selected_option_ids
             .first()
@@ -842,8 +844,8 @@ fn form_elicitation_content(
         // rather than being coerced into something the user did not choose.
         let value = if has_enum {
             // Enum ids are the schema's own values; restore non-string ones.
-            property
-                .and_then(|p| p["enum"].as_array())
+            property["enum"]
+                .as_array()
                 .and_then(|values| {
                     values.iter().find(|v| match v {
                         Value::String(s) => *s == raw,
@@ -877,8 +879,8 @@ fn lossless_integer(text: &str) -> Option<Value> {
 }
 
 /// A JSON number that round-trips exactly. Integer literals must fit in 64
-/// bits (an f64 would round `9007199254740993`); anything else must be a
-/// finite decimal, for which f64 is JSON's own representation.
+/// bits; decimal and exponent forms use serde_json's arbitrary-precision
+/// number parser so no f64 conversion changes their value.
 fn lossless_number(text: &str) -> Option<Value> {
     let is_integer_literal = {
         let digits = text.strip_prefix('-').unwrap_or(text);
@@ -887,8 +889,7 @@ fn lossless_number(text: &str) -> Option<Value> {
     if is_integer_literal {
         return lossless_integer(text);
     }
-    let parsed: f64 = text.parse().ok()?;
-    serde_json::Number::from_f64(parsed).map(Value::Number)
+    text.parse::<serde_json::Number>().ok().map(Value::Number)
 }
 
 fn url_elicitation_completed(answers: &[trouve_protocol::QuestionAnswer]) -> bool {
@@ -8786,9 +8787,17 @@ cat > /dev/null
             form_elicitation_content(&numeric_schema, &answer("amount", "9007199254740993")),
             Some(json!({ "amount": 9007199254740993_i64 }))
         );
+        let decimal =
+            form_elicitation_content(&numeric_schema, &answer("amount", "12.50")).unwrap();
+        assert_eq!(decimal["amount"].as_number().unwrap().to_string(), "12.50");
+        let precise = form_elicitation_content(
+            &numeric_schema,
+            &answer("amount", "0.123456789012345678901234567890"),
+        )
+        .unwrap();
         assert_eq!(
-            form_elicitation_content(&numeric_schema, &answer("amount", "12.50")),
-            Some(json!({ "amount": 12.5 }))
+            precise["amount"].as_number().unwrap().to_string(),
+            "0.123456789012345678901234567890"
         );
         assert_eq!(
             form_elicitation_content(&numeric_schema, &answer("amount", "lots")),
@@ -8836,6 +8845,17 @@ cat > /dev/null
             form_elicitation_content(&choice_schema, &answer("level", "4")),
             None
         );
+
+        // Answers are accepted only for a unique field declared by the
+        // server's schema. Unknown and duplicate ids decline the form rather
+        // than changing its shape or silently overwriting a value.
+        assert_eq!(
+            form_elicitation_content(&choice_schema, &answer("admin", "true")),
+            None
+        );
+        let mut duplicate = answer("urgent", "true");
+        duplicate.extend(answer("urgent", "false"));
+        assert_eq!(form_elicitation_content(&choice_schema, &duplicate), None);
 
         // Fields trouve cannot represent are declined, never guessed.
         let nested = json!({

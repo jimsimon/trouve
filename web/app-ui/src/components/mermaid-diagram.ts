@@ -71,6 +71,16 @@ export class TrouveMermaidDiagram extends LitElement {
     if (changed.has("source")) void this.#render(this.source);
   }
 
+  override connectedCallback(): void {
+    super.connectedCallback();
+    // A pending render is deliberately ignored after disconnect. Reattach to
+    // that shared promise (or its cache entry) when the same element returns;
+    // Lit will not call willUpdate again when `source` itself did not change.
+    if (this.hasUpdated && this.#svg === undefined && !this.#failed) {
+      void this.#render(this.source);
+    }
+  }
+
   override disconnectedCallback(): void {
     this.#generation += 1;
     super.disconnectedCallback();

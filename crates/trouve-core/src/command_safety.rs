@@ -2,7 +2,7 @@
 //!
 //! The permission layer treats the `shell` tool as mutating: arbitrary shell
 //! text can do anything. That is the right default, but it makes every
-//! `git log` or `rg` prompt in Ask mode and denies them outright in read-only
+//! `rg` or `cat` prompt in Ask mode and denies them outright in read-only
 //! personas, even though the same reads are free through `read_file` and
 //! `grep`. This module recognises a small, fixed vocabulary of read-only
 //! commands so the gate can treat those calls as reads. Everything it does
@@ -21,10 +21,10 @@
 //!   read-only persona must not become a way to read `~/.ssh` without a
 //!   prompt, whether by path, by symlink, or by changing directory.
 //! - Never execute model-chosen code. Commands and flags that run other
-//!   programs (`find -exec`, `rg --pre`, `git -c`, `git --textconv`, `xargs`)
-//!   are rejected even though the wrapper itself only reads.
-//! - Never read host state outside the checkout. `git config` is confined to
-//!   the repository's own configuration; global and system scopes reject.
+//!   programs (`find -exec`, `rg --pre`, `xargs`) are rejected even though
+//!   the wrapper itself only reads.
+//! - Repository-aware Git commands require permission because repository
+//!   configuration can execute helpers. Only version probes are pure reads.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -326,13 +326,16 @@ fn segment_is_read_only(tokens: &[String], scope: &Scope<'_>) -> Verdict {
             };
         }
         // Pure readers and text filters with no file-writing options.
-        "ls" | "cat" | "head" | "tail" | "wc" | "pwd" | "echo" | "printf" | "true" | "false"
-        | "which" | "whoami" | "id" | "uname" | "stat" | "file" | "du" | "df" | "nl" | "cut"
-        | "tr" | "realpath" | "basename" | "dirname" | "readlink" | "diff" | "cmp" | "comm"
-        | "jq" | "test" | "[" | "type" | "egrep" | "fgrep" | "column" | "fold" | "rev" | "tac"
-        | "strings" | "md5sum" | "sha1sum" | "sha256sum" | "hexdump" | "od" | "seq" | "expr" => {
-            true
-        }
+        "cat" | "head" | "tail" | "wc" | "pwd" | "echo" | "printf" | "true" | "false" | "which"
+        | "whoami" | "id" | "uname" | "stat" | "file" | "df" | "nl" | "cut" | "tr" | "realpath"
+        | "basename" | "dirname" | "readlink" | "diff" | "cmp" | "comm" | "jq" | "test" | "["
+        | "type" | "egrep" | "fgrep" | "column" | "fold" | "rev" | "tac" | "strings" | "md5sum"
+        | "sha1sum" | "sha256sum" | "hexdump" | "od" | "seq" | "expr" => true,
+        // Recursive `ls` and `du` can otherwise follow a nested symlink out
+        // of the worktree even though their explicit operand is confined.
+        "ls" | "du" => !args
+            .iter()
+            .any(|a| *a == "--dereference" || is_short_flag_with(a, 'L')),
         // `-R` follows symlinks during recursion.
         "grep" => !args
             .iter()
@@ -370,7 +373,11 @@ fn segment_is_read_only(tokens: &[String], scope: &Scope<'_>) -> Verdict {
                     | "-follow"
             )
         }),
-        "git" => git_is_read_only(&args),
+        // Repository-aware Git commands load repository configuration, which
+        // can execute helpers such as fsmonitor, diff drivers, and pagers.
+        // They therefore require the mutation/approval lane; only a version
+        // probe is safe to auto-classify as a pure read.
+        "git" => matches!(args.as_slice(), ["--version"] | ["version"]),
         // Toolchains: only a version probe, which runs nothing else.
         "cargo" | "rustc" | "rustup" | "node" | "npm" | "pnpm" | "yarn" | "python" | "python3"
         | "go" | "java" | "gcc" | "clang" | "make" => {
@@ -391,144 +398,6 @@ fn is_short_flag_with(token: &str, flag: char) -> bool {
         && token.starts_with('-')
         && !token.starts_with("--")
         && token[1..].contains(flag)
-}
-
-fn git_is_read_only(args: &[&str]) -> bool {
-    // Global options that run code or retarget the repository are rejected;
-    // a relative `-C <dir>` has already passed the operand checks.
-    let mut rest = args;
-    loop {
-        match rest {
-            [
-                "--no-pager" | "-P" | "--no-optional-locks" | "--literal-pathspecs",
-                tail @ ..,
-            ] => {
-                rest = tail;
-            }
-            ["-C", _, tail @ ..] => rest = tail,
-            [flag, ..] if flag.starts_with('-') => return matches!(*flag, "--version"),
-            _ => break,
-        }
-    }
-    let Some((subcommand, args)) = rest.split_first() else {
-        return false;
-    };
-    // Options that write files or launch configured helper programs (external
-    // diff, pagers, textconv and clean/smudge filters), valid on several of
-    // the subcommands below.
-    if args.iter().any(|a| {
-        a.starts_with("--output")
-            || a.starts_with("--open-files-in-pager")
-            || a.starts_with("--textconv")
-            || a.starts_with("--filters")
-            || a.starts_with("--config-env")
-            || matches!(*a, "--ext-diff" | "-O")
-    }) {
-        return false;
-    }
-    let positionals = || args.iter().filter(|a| !a.starts_with('-')).count();
-    match *subcommand {
-        "status" | "log" | "diff" | "show" | "rev-parse" | "ls-files" | "ls-tree" | "blame"
-        | "describe" | "shortlog" | "grep" | "cat-file" | "count-objects" | "for-each-ref"
-        | "rev-list" | "merge-base" | "name-rev" | "show-ref" | "check-ignore" | "check-attr"
-        | "diff-tree" | "diff-index" | "diff-files" | "version" | "help" => true,
-        "reflog" => !args
-            .iter()
-            .any(|a| matches!(*a, "expire" | "delete" | "exists")),
-        "stash" => matches!(args.first().copied(), Some("list") | Some("show")),
-        "worktree" => args.first().copied() == Some("list"),
-        "remote" => match args.first().copied() {
-            None => true,
-            Some("-v") | Some("--verbose") => args.len() == 1,
-            Some("show") | Some("get-url") => true,
-            Some(_) => false,
-        },
-        // `git tag <name>` and `git branch <name>` create; only listings pass.
-        "tag" => {
-            positionals() == 0
-                && !args
-                    .iter()
-                    .any(|a| matches!(*a, "-d" | "--delete" | "-a" | "-s" | "-f" | "-m" | "-F"))
-        }
-        "branch" => {
-            positionals() == 0
-                && !args.iter().any(|a| {
-                    matches!(
-                        *a,
-                        "-d" | "-D"
-                            | "--delete"
-                            | "-m"
-                            | "-M"
-                            | "--move"
-                            | "-c"
-                            | "-C"
-                            | "--copy"
-                            | "-u"
-                            | "--set-upstream-to"
-                            | "--unset-upstream"
-                            | "--edit-description"
-                            | "-f"
-                            | "--force"
-                    ) || a.starts_with("--set-upstream-to=")
-                })
-        }
-        "config" => git_config_is_read_only(args),
-        _ => false,
-    }
-}
-
-/// `git config` reads only when it is confined to the repository's own
-/// configuration and uses exactly one explicit read action with that
-/// action's positional grammar. Without `--local`, Git merges global and
-/// system files into the answer, which can disclose credential helpers and
-/// personal URLs; output modifiers such as `--show-origin` say nothing about
-/// whether the command reads or writes.
-fn git_config_is_read_only(args: &[&str]) -> bool {
-    if !args.contains(&"--local") {
-        return false;
-    }
-    if args.iter().any(|a| {
-        matches!(
-            *a,
-            "--global"
-                | "--system"
-                | "--worktree"
-                | "--file"
-                | "-f"
-                | "--blob"
-                | "--includes"
-                | "--edit"
-                | "-e"
-                | "--unset"
-                | "--unset-all"
-                | "--add"
-                | "--replace-all"
-                | "--rename-section"
-                | "--remove-section"
-                | "--set"
-                | "--get-urlmatch"
-                | "--get-color"
-                | "--get-colorbool"
-        ) || a.starts_with("--file=")
-            || a.starts_with("--blob=")
-    }) {
-        return false;
-    }
-    let actions: Vec<&str> = args
-        .iter()
-        .copied()
-        .filter(|a| matches!(*a, "--get" | "--get-all" | "--get-regexp" | "--list" | "-l"))
-        .collect();
-    let [action] = actions.as_slice() else {
-        return false;
-    };
-    let positionals = args.iter().filter(|a| !a.starts_with('-')).count();
-    match *action {
-        "--list" | "-l" => positionals == 0,
-        // `--get <key> [value-pattern]`: the second positional filters values.
-        "--get" | "--get-all" | "--get-regexp" => (1..=2).contains(&positionals),
-        _ => false,
-    }
 }
 
 #[cfg(test)]
@@ -569,26 +438,12 @@ mod tests {
             "rg 'fn main' src",
             "grep -rn TODO crates",
             "find . -name '*.rs' -type f",
-            "git status",
-            "git log --oneline -20",
-            "git diff HEAD~1 -- src",
-            "git show HEAD:Cargo.toml",
-            "git --no-pager log -5",
-            "git -C crates status",
-            "git branch -a",
-            "git branch --show-current",
-            "git tag -l",
-            "git remote -v",
-            "git stash list",
-            "git worktree list",
-            "git config --local --get user.name",
-            "git config --local --list",
-            "git config --local --get-regexp remote",
+            "git --version",
+            "git version",
             "cargo --version",
             "jq '.name' package.json",
             "cd crates && ls",
             "cd src && cat main.rs",
-            "git log --oneline | head -5",
             "cat Cargo.toml; cat names.txt",
             "test -f Cargo.toml && echo yes || echo no",
             "date",
@@ -668,15 +523,32 @@ mod tests {
             "find -L . -name x",
             "find . -follow -name x",
             "tree -l",
+            "ls -LR .",
+            "ls --recursive --dereference .",
+            "du -L .",
+            "du -aL .",
         ] {
             assert!(!wt.read_only(cmd), "expected rejected: {cmd}");
         }
     }
 
     #[test]
-    fn git_config_is_confined_to_the_repository_and_to_reads() {
+    fn repository_aware_git_commands_require_permission() {
         let wt = Worktree::new();
         for cmd in [
+            "git status",
+            "git log --oneline -20",
+            "git diff HEAD~1 -- src",
+            "git show HEAD:Cargo.toml",
+            "git --no-pager log -5",
+            "git -C crates status",
+            "git branch -a",
+            "git branch --show-current",
+            "git tag -l",
+            "git remote -v",
+            "git stash list",
+            "git worktree list",
+            "git log --oneline | head -5",
             "git config --get user.name",
             "git config --list",
             "git config --global --list",
@@ -690,15 +562,11 @@ mod tests {
             "git config --local --get",
             "git config --local --get a b c",
             "git config --local --get-urlmatch http https://x",
-        ] {
-            assert!(!wt.read_only(cmd), "expected rejected: {cmd}");
-        }
-        for cmd in [
             "git config --local --show-origin --list",
             "git config --local --get user.name",
             "git config --local --get remote.origin.url .*github.*",
         ] {
-            assert!(wt.read_only(cmd), "expected read-only: {cmd}");
+            assert!(!wt.read_only(cmd), "expected permission requirement: {cmd}");
         }
     }
 
@@ -743,7 +611,7 @@ mod tests {
         // Relative paths and option values stay inside the checkout.
         assert!(wt.read_only("cat src/main.rs"));
         assert!(wt.read_only("rg --glob='*.rs' main"));
-        assert!(wt.read_only("git log --since=2.weeks"));
+        assert!(!wt.read_only("git log --since=2.weeks"));
     }
 
     #[test]
