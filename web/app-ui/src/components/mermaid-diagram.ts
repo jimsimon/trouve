@@ -5,9 +5,7 @@ import { unsafeHTML } from "lit/directives/unsafe-html.js";
  * create distinct diagram prefixes, so retain only the most recently used
  * outcomes instead of growing for the lifetime of the page. */
 const MAX_CACHED_DIAGRAMS = 64;
-interface CachedDiagram {
-  readonly svg: string | undefined;
-}
+type CachedDiagram = string | null;
 const cachedDiagrams = new Map<string, CachedDiagram>();
 const pendingDiagrams = new Map<string, Promise<string | undefined>>();
 
@@ -21,11 +19,9 @@ const readDiagram = (source: string): CachedDiagram | undefined => {
 
 const cacheDiagram = (source: string, svg: string | undefined): void => {
   cachedDiagrams.delete(source);
-  cachedDiagrams.set(source, { svg });
-  while (cachedDiagrams.size > MAX_CACHED_DIAGRAMS) {
-    const oldest = cachedDiagrams.keys().next().value;
-    if (oldest === undefined) break;
-    cachedDiagrams.delete(oldest);
+  cachedDiagrams.set(source, svg ?? null);
+  if (cachedDiagrams.size > MAX_CACHED_DIAGRAMS) {
+    cachedDiagrams.delete(cachedDiagrams.keys().next().value!);
   }
 };
 
@@ -36,7 +32,7 @@ const loadRenderer = async () => (await import("beautiful-mermaid")).renderMerma
 
 export const renderMermaid = async (source: string): Promise<string | undefined> => {
   const cached = readDiagram(source);
-  if (cached !== undefined) return cached.svg;
+  if (cached !== undefined) return cached ?? undefined;
   const pending = pendingDiagrams.get(source);
   if (pending !== undefined) return pending;
   const request = (async () => {
@@ -82,7 +78,7 @@ export class TrouveMermaidDiagram extends LitElement {
     .diagram svg { display: block; max-width: 100%; height: auto; margin: 0 auto; }
     pre { max-width: 100%; overflow: auto; margin: 0; padding: 10px 12px; border: 1px solid var(--trouve-card-border); border-radius: var(--trouve-radius); background: var(--trouve-code-bg); color: var(--trouve-code-fg); font-family: var(--trouve-font-mono); }
     code { font-family: inherit; }
-    .visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: pre-wrap; border: 0; }
+    .visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
   `;
 
   source = "";
@@ -112,8 +108,8 @@ export class TrouveMermaidDiagram extends LitElement {
   async #render(source: string): Promise<void> {
     const generation = ++this.#generation;
     const cached = readDiagram(source);
-    this.#svg = cached?.svg;
-    this.#failed = cached !== undefined && cached.svg === undefined;
+    this.#svg = cached ?? undefined;
+    this.#failed = cached === null;
     if (cached !== undefined) return;
     const svg = await renderMermaid(source);
     if (generation !== this.#generation || !this.isConnected) return;
