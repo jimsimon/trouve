@@ -1,6 +1,12 @@
 # Preact application for the review dashboard
 
-Status: Accepted (2026-07)
+Status: Superseded by ADR 0053 (2026-09)
+
+ADR 0053 rebuilt the dashboard as the Lit `@trouve-ai/code-review` package on
+the web packages shared with the desktop app; `review-ui` is now a thin shell
+around it. The
+section structure, Chart.js charts with textual fallbacks, typed API module,
+and native-controls-over-design-system choices below carried over unchanged.
 
 ## Context
 

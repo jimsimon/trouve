@@ -1,0 +1,33 @@
+{
+  "name": "@trouve-ai/web",
+  "version": "4.11.0",
+  "private": true,
+  "description": "npm workspace for the trouve web frontends and their shared packages.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jimsimon/trouve.git",
+    "directory": "web"
+  },
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "format:check": "node scripts/check-source-format.mjs",
+    "generate:protocol": "npm run generate:protocol --workspaces --if-present",
+    "lint": "node scripts/check-source-policy.mjs && node scripts/check-review-dockerfile.mjs",
+    "test": "npm test --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.3",
+    "vite": "^8.2.0",
+    "vitest": "^4.1.10"
+  }
+}

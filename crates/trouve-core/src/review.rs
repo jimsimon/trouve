@@ -34656,8 +34656,8 @@ rename to src/new.rs
         // banner drowned in protocol-client changes).
         let batch = ReviewBatch {
             paths: vec![
-                "web/app-ui/src/services/protocol-client.ts".into(),
-                "web/review-ui/src/main.tsx".into(),
+                "web/packages/protocol/src/protocol-client.ts".into(),
+                "web/packages/code-review/src/job-detail.ts".into(),
             ],
             diff: "+        <div class=\"banner warning stacked\" role=\"alert\">\n".into(),
         };

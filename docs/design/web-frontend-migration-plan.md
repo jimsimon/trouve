@@ -117,7 +117,7 @@ then registers the selected path through the existing protocol; PWA and remote
 deployments retain the explicit manual-path fallback.
 
 The existing Slint frontend's functional surface is now ported. The executable
-[application action contract](../../web/app-ui/src/app/app-action-contract.test.ts)
+[application action contract](../../web/apps/app-ui/src/app/app-action-contract.test.ts)
 extracts all 134 `AppWindow` callbacks from `app.slint` and requires exactly
 one Lit implementation or documented browser-native consolidation for each.
 The closure pass covers completion/queue edge states, checkpoint undo/redo,
@@ -187,7 +187,7 @@ Current phase status is deliberately conservative:
 From the repository root, build and verify both frontend artifacts:
 
 ```sh
-cd web/app-ui
+cd web/apps/app-ui
 npm ci
 npm run generate:protocol
 npm run typecheck
@@ -223,7 +223,7 @@ the nested manifest with its lockfile:
 
 ```sh
 TROUVE_SERVER_URL=http://127.0.0.1:7433 \
-TROUVE_APP_UI_DIST=/absolute/path/to/trouve/web/app-ui/dist/desktop \
+TROUVE_APP_UI_DIST=/absolute/path/to/trouve/web/apps/app-ui/dist/desktop \
   cargo run \
     --manifest-path crates/trouve-servo-embed-preview/Cargo.toml \
     --locked
@@ -248,14 +248,14 @@ default database:
 
 ```sh
 TROUVE_SERVER_URL=http://127.0.0.1:7433 \
-TROUVE_APP_UI_DIST=/absolute/path/to/trouve/web/app-ui/dist/desktop \
+TROUVE_APP_UI_DIST=/absolute/path/to/trouve/web/apps/app-ui/dist/desktop \
   cargo run -p trouve-app --features web-preview --bin trouve-web-preview
 ```
 
 For development, both hosts follow ADR 0026's shared source policy. A debug or
 qualification process snapshots `TROUVE_APP_UI_DIST` at startup without
 embedding it into the Rust binary. To use HMR, run `npm run dev` from
-`web/app-ui`, omit
+`web/apps/app-ui`, omit
 `TROUVE_APP_UI_DIST`, and set
 `TROUVE_APP_UI_DEV_URL=http://127.0.0.1:5173` on the preview process. The
 desktop gateway stays the webview origin: it proxies Vite assets while keeping
@@ -488,7 +488,7 @@ Mobile rules:
 
 Once this plan is approved:
 
-- Add web/app-ui with package name @trouve-ai/app-ui.
+- Add web/apps/app-ui with package name @trouve-ai/app-ui.
 - Add crates/trouve-desktop-host.
 - Keep trouve-app as the main desktop application and binary.
 - Introduce a feature-gated web-UI preview path in trouve-app; do not create a
@@ -689,7 +689,7 @@ Choose Lit for the main application.
 
 ### Preact’s role
 
-Keep web/review-ui as Preact. Share only generated protocol DTOs, pure
+Keep web/apps/review-ui as Preact. Share only generated protocol DTOs, pure
 formatters, semantic design tokens, and reusable event-log fixtures. Do not
 copy its monolithic structure into the desktop/PWA frontend. Reconsider Preact
 only if actual sharing becomes more valuable than custom-element fit.
@@ -699,7 +699,7 @@ only if actual sharing becomes more valuable than custom-element fit.
 Proposed structure:
 
 ```text
-web/app-ui/
+web/apps/app-ui/
   src/
     app/
     services/

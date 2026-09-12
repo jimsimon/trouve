@@ -11,9 +11,9 @@
 **Archived 2026-08-07:** This audit records the source comparison that enabled
 retirement. ADR 0028 removed the audited Slint sources after their relevant
 behavior was ported. The current
-[`native-source-contract.test.ts`](../../web/app-ui/src/app/native-source-contract.test.ts)
+[`native-source-contract.test.ts`](../../web/apps/app-ui/src/app/native-source-contract.test.ts)
 keeps the remaining Rust host boundary explicit, and
-[`app-action-contract.test.ts`](../../web/app-ui/src/app/app-action-contract.test.ts)
+[`app-action-contract.test.ts`](../../web/apps/app-ui/src/app/app-action-contract.test.ts)
 preserves executable evidence for the established application actions. Paths
 in the historical matrices below are available through version control.
 
@@ -73,7 +73,7 @@ For each file, the audit checked whichever of the following apply:
 Core/server/provider Rust is outside the frontend source inventory except where
 the web port already needed an additive projection or host contract. Generated
 TypeScript and OpenAPI snapshots are treated as generated evidence, not a
-second handwritten implementation. `web/review-ui` is included as a
+second handwritten implementation. `web/apps/review-ui` is included as a
 corresponding web surface where the Rust protocol client exposes detailed code
 review operations that the Lit shell deliberately delegates to that existing
 review application.
@@ -141,7 +141,7 @@ These are not missing web features:
 
 | Retained source | Corresponding TS/JS source(s) | Disposition |
 | --- | --- | --- |
-| `crates/trouve-app/build.rs` | `web/app-ui/vite.config.ts`, `web/app-ui/scripts/verify-build-modes.mjs`, desktop `FrontendSource`/`AssetManifest` | Slint compilation maps to Vite's separate desktop/PWA builds. Hashed local assets, no desktop service worker, explicit release dist selection, and embedded asset metadata are enforced. Debug builds deliberately omit web assets so runtime dist snapshots and loopback Vite HMR do not require recompiling Rust. |
+| `crates/trouve-app/build.rs` | `web/apps/app-ui/vite.config.ts`, `web/apps/app-ui/scripts/verify-build-modes.mjs`, desktop `FrontendSource`/`AssetManifest` | Slint compilation maps to Vite's separate desktop/PWA builds. Hashed local assets, no desktop service worker, explicit release dist selection, and embedded asset metadata are enforced. Debug builds deliberately omit web assets so runtime dist snapshots and loopback Vite HMR do not require recompiling Rust. |
 | `crates/trouve-app/src/controller.rs` | `src/app/trouve-app.ts`; `src/services/protocol-ingress.ts`, `thread-ingress.ts`, `session-notifications.ts`, `subscription-health-controller.ts`; `src/state/app-store.ts`; route components/models | Full controller decomposition. Commands, navigation, title creation, projections, refresh cadence, PR grouping/actions, personas/models, settings, automation, terminal, notification, unread, close, queue, turn, scroll, and replay behaviors are represented; async generations/cursors replace mutable monolithic controller state. |
 | `crates/trouve-app/src/main.rs` | `src/main.ts`, `src/app/trouve-app.ts`, composer/chat-file/clipboard/drag models, `desktop-host-coordinator.ts` | Bootstrap and callback wiring map to custom elements and scoped contexts. Fuzzy completion, `@` token detection, file links, clipboard precedence, provider validity, drag payloads, focus tracking, close flow, and command dispatch are covered. Skia-only rendering flags are intentionally engine-specific. |
 | `crates/trouve-app/src/notify.rs` | `src/services/session-notifications.ts`, `browser-notifications.ts`, `host-client.ts` plus native host sender | Nonblocking delivery, exact durable categories, compact failure/question detail, repeated attention edges, sound/policy gating, safe body/title, session/thread activation, and window focus are preserved. |
@@ -167,7 +167,7 @@ These are not missing web features:
 
 | Retained source | Corresponding TS/JS source(s) | Disposition |
 | --- | --- | --- |
-| `crates/trouve-client-core/src/client.rs` | `src/services/protocol-client.ts`, `cursor-event-stream.ts`, `protocol-ingress.ts`, `thread-ingress.ts`; `web/review-ui/src/api.ts` for detailed review jobs | Generated-path HTTP mutations/queries, response validation, safe errors, URL encoding, cursor-bearing snapshots, bounded thread-view pages, snapshot-to-SSE cursor handoff, SSE replay/resume/reconnect, and empty responses are present. App-only review methods are consolidated behind the current review APIs; detailed job/task/stat/event operations remain in the existing review web app. |
+| `crates/trouve-client-core/src/client.rs` | `src/services/protocol-client.ts`, `cursor-event-stream.ts`, `protocol-ingress.ts`, `thread-ingress.ts`; `web/apps/review-ui/src/api.ts` for detailed review jobs | Generated-path HTTP mutations/queries, response validation, safe errors, URL encoding, cursor-bearing snapshots, bounded thread-view pages, snapshot-to-SSE cursor handoff, SSE replay/resume/reconnect, and empty responses are present. App-only review methods are consolidated behind the current review APIs; detailed job/task/stat/event operations remain in the existing review web app. |
 | `crates/trouve-client-core/src/lib.rs` | Direct ES module imports and `src/contexts/app-contexts.ts` | Rust's module re-export barrel has no behavioral web equivalent. TypeScript uses explicit modules and stable context interfaces. |
 | `crates/trouve-client-core/src/protocol_compatibility.rs` | `src/services/protocol-client.ts`, `src/services/protocol-ingress.ts` | Native preview hosts share one compatibility parser while the generated TypeScript client reads and validates the same server-info protocol version before starting ingress. |
 | `crates/trouve-client-core/src/viewmodel.rs` | `src/state/thread-view-model.ts`, `tool-output.ts`, `src/services/thread-ingress.ts` | Every folded event and protocol `ThreadViewItem` snapshot variant maps explicitly. Tool output head/tail truncation and UTF-8 safety, approvals/questions, commands, queue, todos, compaction including failure, usage, turn state, idempotency, cursor ordering, folded-page offsets, and bounded buffers are preserved. |

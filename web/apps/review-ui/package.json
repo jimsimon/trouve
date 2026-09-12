@@ -1,0 +1,30 @@
+{
+  "name": "@trouve-ai/review-ui",
+  "private": true,
+  "version": "4.11.0",
+  "type": "module",
+  "description": "Self-hosted review site: a thin shell that serves the shared @trouve-ai/code-review dashboard behind nginx.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jimsimon/trouve.git",
+    "directory": "web/apps/review-ui"
+  },
+  "scripts": {
+    "build": "npm run typecheck && vite build",
+    "dev": "vite --host 0.0.0.0",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "dependencies": {
+    "@trouve-ai/code-review": "4.11.0",
+    "@trouve-ai/ui-foundation": "4.11.0",
+    "lit": "^3.3.3"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3",
+    "vite": "^8.0.0"
+  }
+}
