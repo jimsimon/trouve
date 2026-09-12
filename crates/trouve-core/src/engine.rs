@@ -82,6 +82,10 @@ const MAX_ITERATIONS: usize = 32;
 /// run to fold awaited subagent results back in. Native turns are bounded by
 /// `MAX_ITERATIONS` instead, since each fold-in consumes an iteration.
 const MAX_SUBAGENT_CONTINUATIONS: usize = 4;
+/// A wedged child must not hold its parent's terminal response open forever.
+/// Timed-out descendants remain active and inspectable; only the parent's
+/// synthetic wait ends.
+const SUBAGENT_WAIT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// Per-child cap on the final message copied into the `await_subagents`
 /// digest and tool result; the full text stays on the child thread.
 const SUBAGENT_DIGEST_MESSAGE_BYTES: usize = 8 * 1024;
@@ -20229,8 +20233,8 @@ impl Engine {
     /// The wait is rendered as a synthetic `await_subagents` tool call so the
     /// rail shows what the turn is blocked on, and the turn phase flips to
     /// `waiting_for_subagents` for the activity label. Returns `None` when
-    /// nothing was running or the turn was cancelled mid-wait; callers
-    /// already treat a tripped token as the end of the turn.
+    /// nothing was running, the turn was cancelled, or the bounded wait timed
+    /// out; callers already treat each case as the end of the turn.
     async fn await_spawned_descendants(
         &self,
         thread: &Thread,
@@ -20272,10 +20276,17 @@ impl Engine {
             },
         )?;
         let started = Instant::now();
+        let deadline = tokio::time::Instant::now() + SUBAGENT_WAIT_TIMEOUT;
+        #[derive(Clone, Copy)]
+        enum WaitOutcome {
+            Completed,
+            Cancelled,
+            TimedOut,
+        }
         // Wait for the whole subtree, not just the awaited children: a
         // child whose own turn returned still counts as running while one
         // of its descendants is active, exactly as `spawn_output` reports.
-        let cancelled = loop {
+        let outcome = loop {
             let descendants = self.list_thread_descendants(&thread.id)?;
             let any_active = {
                 let active = self.active_threads.lock().unwrap();
@@ -20284,17 +20295,18 @@ impl Engine {
                     .any(|descendant| active.contains_key(&descendant.id))
             };
             if !any_active {
-                break false;
+                break WaitOutcome::Completed;
             }
             tokio::select! {
                 biased;
-                _ = cancel.cancelled() => break true,
+                _ = cancel.cancelled() => break WaitOutcome::Cancelled,
+                _ = tokio::time::sleep_until(deadline) => break WaitOutcome::TimedOut,
                 _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
             }
         };
         let execution_duration_ms =
             Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
-        if cancelled {
+        if matches!(outcome, WaitOutcome::Cancelled) {
             self.store.append_event(
                 scope,
                 Event::ToolCompleted {
@@ -20302,6 +20314,41 @@ impl Engine {
                     status: ToolStatus::Aborted,
                     result: serde_json::json!({ "error": "turn cancelled while waiting for subagents" }),
                     execution_duration_ms,
+                },
+            )?;
+            return Ok(None);
+        }
+        if matches!(outcome, WaitOutcome::TimedOut) {
+            let active_thread_ids = {
+                let descendants = self.list_thread_descendants(&thread.id)?;
+                let active = self.active_threads.lock().unwrap();
+                descendants
+                    .into_iter()
+                    .filter(|descendant| active.contains_key(&descendant.id))
+                    .map(|descendant| descendant.id)
+                    .collect::<Vec<_>>()
+            };
+            self.store.append_event(
+                scope.clone(),
+                Event::ToolCompleted {
+                    call_id,
+                    status: ToolStatus::Error,
+                    result: serde_json::json!({
+                        "error": format!(
+                            "timed out after {} seconds waiting for subagents; the child threads remain available for inspection",
+                            SUBAGENT_WAIT_TIMEOUT.as_secs()
+                        ),
+                        "timed_out": true,
+                        "thread_ids": active_thread_ids,
+                    }),
+                    execution_duration_ms,
+                },
+            )?;
+            self.store.append_event(
+                scope,
+                Event::TurnPhaseChanged {
+                    turn,
+                    phase: TurnPhase::Processing,
                 },
             )?;
             return Ok(None);
@@ -20433,7 +20480,7 @@ impl Engine {
             Event::ToolCompleted {
                 call_id,
                 status: ToolStatus::Ok,
-                result: serde_json::json!({ "subagents": results }),
+                result: bounded_subagent_tool_result(results),
                 execution_duration_ms,
             },
         )?;
@@ -20950,6 +20997,66 @@ fn cap_chars(s: &str, max: usize) -> String {
     }
     let end = floor_char_boundary(s, max);
     format!("{}{CAP_CHARS_MARKER}", &s[..end])
+}
+
+/// Bound the exact serialized `await_subagents` tool result. Raw text caps are
+/// insufficient because JSON escaping can expand messages and descendant
+/// failure metadata can grow independently of those messages.
+fn bounded_subagent_tool_result(results: Vec<serde_json::Value>) -> serde_json::Value {
+    const SUMMARY_ID_BYTES: usize = 256;
+    const SUMMARY_STATUS_BYTES: usize = 64;
+
+    let total_subagents = results.len();
+    let mut truncated = false;
+    let serialized_len = |subagents: &[serde_json::Value], was_truncated: bool| {
+        serde_json::to_vec(&serde_json::json!({
+            "subagents": subagents,
+            "total_subagents": total_subagents,
+            "truncated": was_truncated,
+        }))
+        .map(|bytes| bytes.len())
+        .unwrap_or(usize::MAX)
+    };
+    let mut bounded = Vec::with_capacity(results.len());
+    for status in results {
+        bounded.push(status);
+        if serialized_len(&bounded, truncated) <= SUBAGENT_DIGEST_TOTAL_BYTES {
+            continue;
+        }
+
+        let status = bounded.pop().expect("just pushed a subagent status");
+        truncated = true;
+        let summary = serde_json::json!({
+            "thread_id": cap_chars(
+                status["thread_id"].as_str().unwrap_or("unknown"),
+                SUMMARY_ID_BYTES.saturating_sub(CAP_CHARS_MARKER.len()),
+            ),
+            "status": cap_chars(
+                status["status"].as_str().unwrap_or("unknown"),
+                SUMMARY_STATUS_BYTES.saturating_sub(CAP_CHARS_MARKER.len()),
+            ),
+            "last_message": "",
+            "last_message_truncated": true,
+            "details_omitted": true,
+        });
+        bounded.push(summary);
+        if serialized_len(&bounded, true) > SUBAGENT_DIGEST_TOTAL_BYTES {
+            bounded.pop();
+            break;
+        }
+    }
+    truncated |= bounded.len() < total_subagents;
+    let result = serde_json::json!({
+        "subagents": bounded,
+        "total_subagents": total_subagents,
+        "truncated": truncated,
+    });
+    debug_assert!(
+        serde_json::to_vec(&result)
+            .map(|bytes| bytes.len() <= SUBAGENT_DIGEST_TOTAL_BYTES)
+            .unwrap_or(false)
+    );
+    result
 }
 
 /// Largest index `<= at` that lands on a char boundary.
@@ -26254,6 +26361,12 @@ mod tests {
                 _ => None,
             })
             .expect("await_subagents tool result");
+        let serialized_result = serde_json::to_vec(&result).unwrap();
+        assert!(
+            serialized_result.len() <= SUBAGENT_DIGEST_TOTAL_BYTES,
+            "tool result is {} bytes",
+            serialized_result.len()
+        );
         let reported = result["subagents"].as_array().unwrap();
         assert_eq!(reported.len(), child_count);
         let message_bytes: usize = reported
@@ -26377,6 +26490,57 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn await_spawned_descendants_times_out_without_stopping_the_child() {
+        let (engine, _temp, parent, child) = await_subagents_fixture("timeout");
+        engine
+            .active_threads
+            .lock()
+            .unwrap()
+            .insert(child.id.clone(), parent.session_id.clone());
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let waiter = {
+            let engine = Arc::clone(&engine);
+            let parent = parent.clone();
+            tokio::spawn(async move { engine.await_spawned_descendants(&parent, 2, &cancel).await })
+        };
+        tokio::task::yield_now().await;
+
+        tokio::time::advance(SUBAGENT_WAIT_TIMEOUT + Duration::from_millis(1)).await;
+        let digest = waiter.await.unwrap().unwrap();
+
+        assert!(digest.is_none());
+        assert!(
+            engine
+                .active_threads
+                .lock()
+                .unwrap()
+                .contains_key(&child.id),
+            "timing out the parent wait must not cancel or discard the child"
+        );
+        let events = parent_events(&engine, &parent);
+        match &events[3] {
+            Event::ToolCompleted {
+                status: ToolStatus::Error,
+                result,
+                ..
+            } => {
+                assert_eq!(result["timed_out"], true);
+                assert_eq!(result["thread_ids"], serde_json::json!([child.id]));
+                assert!(result["error"].as_str().unwrap().contains("1800 seconds"));
+            }
+            other => panic!("expected timed-out ToolCompleted, got {other:?}"),
+        }
+        assert!(matches!(
+            events.last(),
+            Some(Event::TurnPhaseChanged {
+                turn: 2,
+                phase: TurnPhase::Processing,
+            })
+        ));
+        assert_eq!(events.len(), 5);
     }
 
     #[test]
@@ -31410,6 +31574,41 @@ default_permission_mode = "ask"
         let capped = cap_chars(&"é".repeat(100), 21);
         assert!(capped.starts_with("éééééééééé"));
         assert!(capped.ends_with("[truncated]"));
+    }
+
+    #[test]
+    fn subagent_tool_result_bounds_escaped_payloads_and_descendant_metadata() {
+        let statuses = (0..MAX_ACTIVE_DESCENDANTS)
+            .map(|index| {
+                serde_json::json!({
+                    "thread_id": format!("th_{index}"),
+                    "status": "failed",
+                    "last_message": "\"\n".repeat(SUBAGENT_DIGEST_MESSAGE_BYTES / 2),
+                    "error": "\\\n".repeat(SUBAGENT_DIGEST_ERROR_BYTES / 2),
+                    "failed_descendants": (0..2_000)
+                        .map(|descendant| format!("th_{index}_{descendant}_{}", "x".repeat(16)))
+                        .collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+
+        let result = bounded_subagent_tool_result(statuses);
+        let serialized = serde_json::to_vec(&result).unwrap();
+
+        assert!(
+            serialized.len() <= SUBAGENT_DIGEST_TOTAL_BYTES,
+            "tool result is {} bytes",
+            serialized.len()
+        );
+        assert_eq!(result["total_subagents"], MAX_ACTIVE_DESCENDANTS);
+        assert_eq!(result["truncated"], true);
+        assert!(
+            result["subagents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|status| status["details_omitted"] == true)
+        );
     }
 
     #[test]
