@@ -7,10 +7,12 @@ import {
 } from "../contexts/app-contexts.js";
 import type {
   ProtocolLocalStatus,
+  ProtocolModelInfo,
   ProtocolSubscriptionHealth,
   ProtocolUsageSummary,
 } from "../services/protocol-client.js";
-import { withSignalTracking } from "../state/reactivity.js";
+import { modelForSelection } from "../services/model-catalog-controller.js";
+import { readSignal, withSignalTracking } from "../state/reactivity.js";
 import { fontAwesomeIcon } from "./font-awesome-icon.js";
 import {
   boundedSubscriptionUsage,
@@ -18,12 +20,16 @@ import {
 } from "./model-health.js";
 import {
   collapsedUsageSummary,
+  isAutomaticModel,
   latestCompletedTurnDuration,
   localMemoryUtilization,
   sessionUsagePanelKind,
   type SessionUsagePanelKind,
   type UsageBreakdownRow,
+  type UsageRoute,
+  type UsageRouteCandidate,
   usageBreakdownRows,
+  usagePanelRoute,
   usageThroughput,
 } from "./session-usage-model.js";
 import { nextHorizontalTabIndex, rovingTabIndex } from "./tab-navigation.js";
@@ -39,6 +45,11 @@ const USAGE_PANEL_TABS = [
 let nextSessionUsagePanelId = 0;
 
 const COLLAPSED_STORAGE_KEY = "trouve.usage-panel.v1";
+
+/** Live catalog entries carry their routes; the compatibility type omits them. */
+type UsageCatalogEntry = ProtocolModelInfo & {
+  readonly routes?: readonly UsageRouteCandidate[];
+};
 
 const loadCollapsed = (): boolean => {
   try {
@@ -77,12 +88,15 @@ export class TrouveSessionUsagePanel extends withSignalTracking(LitElement) {
     sessionId: { type: String, attribute: "session-id" },
     threadId: { type: String, attribute: "thread-id" },
     model: { type: String },
+    threadRoute: { attribute: false },
     placeholder: { type: Boolean },
   };
 
   sessionId = "";
   threadId = "";
   model = "";
+  /** The thread's durable sticky route for an automatic model, if any. */
+  threadRoute: UsageRouteCandidate | null | undefined = undefined;
   placeholder = false;
 
   readonly #services = new ContextConsumer(this, {
@@ -100,6 +114,7 @@ export class TrouveSessionUsagePanel extends withSignalTracking(LitElement) {
   #loading = false;
   #error = "";
   #health: ProtocolSubscriptionHealth | undefined;
+  #route: UsageRoute | undefined;
   #sessionSummary: ProtocolUsageSummary | undefined;
   #threadSummary: ProtocolUsageSummary | undefined;
   #localStatus: ProtocolLocalStatus | undefined;
@@ -117,10 +132,14 @@ export class TrouveSessionUsagePanel extends withSignalTracking(LitElement) {
       ? 0
       : store?.threadView(this.threadId).lastUsageCursor ?? 0;
     const sessionUsageRevision = store?.sessionUsageRevision(this.sessionId) ?? 0;
+    // Route selection precedes usage for the turn and can change on failover,
+    // so the attributed route is part of the reload key in its own right.
+    const attributed = this.#attributedRoute();
     const key = [
       this.sessionId,
       this.threadId,
       this.model,
+      attributed === undefined ? "" : `${attributed.providerId}/${attributed.providerModel}`,
       this.placeholder ? "placeholder" : "active",
       String(usageCursor),
       String(sessionUsageRevision),
@@ -189,6 +208,36 @@ export class TrouveSessionUsagePanel extends withSignalTracking(LitElement) {
         </div>
       </section>
     `;
+  }
+
+  #turnModels(): ReadonlyMap<number, string> {
+    if (this.threadId === "") return new Map();
+    return this.#store.value?.threadView(this.threadId).turnModels ?? new Map();
+  }
+
+  #resolveRoute(
+    catalog: readonly UsageCatalogEntry[],
+    subscriptions: readonly ProtocolSubscriptionHealth[],
+  ): UsageRoute | undefined {
+    if (this.model === "") return undefined;
+    return usagePanelRoute({
+      model: this.model,
+      turnModels: this.#turnModels(),
+      threadRoute: this.threadRoute,
+      candidates: modelForSelection(catalog, this.model)?.routes ?? [],
+      subscriptions,
+    });
+  }
+
+  /** The route this thread is attributed to right now. Reading the catalog
+   * and provider-usage signals here keeps the reload key reactive to a
+   * healthiest-candidate change on a thread that has not run a turn yet. */
+  #attributedRoute(): UsageRoute | undefined {
+    const services = this.#services.value;
+    return this.#resolveRoute(
+      services === undefined ? [] : readSignal(services.modelCatalog.current),
+      services === undefined ? [] : readSignal(services.subscriptionHealth.current),
+    );
   }
 
   readonly #toggleCollapsed = (): void => {
@@ -280,15 +329,26 @@ export class TrouveSessionUsagePanel extends withSignalTracking(LitElement) {
       return this.#renderLocal();
     }
     if (kind === "subscription" && this.#health !== undefined) {
-      return this.#renderSubscription(this.#health);
+      return html`${this.#renderRouteNote()}${this.#renderSubscription(this.#health)}`;
     }
     if (kind === "api" && (this.#sessionSummary !== undefined || this.#threadSummary !== undefined)) {
-      return html`<p class="session-usage-placeholder">
-        Provider usage is unavailable for this model. Thread and session totals are available in their tabs.
+      return html`${this.#renderRouteNote()}<p class="session-usage-placeholder">
+        Provider usage is unavailable for ${this.#route === undefined ? "this model" : this.#route.providerId}. Thread and session totals are available in their tabs.
       </p>`;
     }
     return html`<p class="session-usage-placeholder" role="status">
       ${this.#error || "Usage details are not available yet."}
+    </p>`;
+  }
+
+  /** Automatic models say which concrete provider the meters belong to. */
+  #renderRouteNote() {
+    const route = this.#route;
+    if (route === undefined || !isAutomaticModel(this.model)) return nothing;
+    return html`<p class="session-usage-route">
+      Routed to <strong>${route.providerId}</strong>${route.source === "candidate"
+        ? " · likely first route; no turn has run yet"
+        : ""}
     </p>`;
   }
 
@@ -431,6 +491,7 @@ export class TrouveSessionUsagePanel extends withSignalTracking(LitElement) {
     if (dataKey !== this.#dataKey) {
       this.#dataKey = dataKey;
       this.#health = undefined;
+      this.#route = undefined;
       this.#sessionSummary = undefined;
       this.#threadSummary = undefined;
       this.#localStatus = undefined;
@@ -465,13 +526,22 @@ export class TrouveSessionUsagePanel extends withSignalTracking(LitElement) {
           (result) => result.status === "rejected",
         )) throw new Error("local usage refresh failed");
       } else {
-        const providerId = this.model.split("/", 1)[0] ?? "";
-        const [healthResult, sessionResult, threadResult] = await Promise.allSettled([
+        const [healthResult, sessionResult, threadResult, catalogResult] = await Promise.allSettled([
           services.subscriptionHealth.refresh("if-stale"),
           services.protocol.sessionUsage(this.sessionId),
           services.protocol.threadUsage(this.threadId),
+          services.modelCatalog.refresh("if-stale"),
         ]);
         if (generation !== this.#generation) return;
+        this.#route = this.#resolveRoute(
+          catalogResult.status === "fulfilled"
+            ? catalogResult.value
+            : readSignal(services.modelCatalog.current),
+          healthResult.status === "fulfilled"
+            ? healthResult.value
+            : readSignal(services.subscriptionHealth.current),
+        );
+        const providerId = this.#route?.providerId;
         if (healthResult.status === "fulfilled") {
           this.#health = healthResult.value.find(
             (candidate) => candidate.provider_id === providerId,
@@ -479,6 +549,10 @@ export class TrouveSessionUsagePanel extends withSignalTracking(LitElement) {
           if (this.#health === undefined || this.#health.status === "unsupported") {
             this.#health = undefined;
           }
+        } else if (this.#health?.provider_id !== providerId) {
+          // A failover reloads under the same data key. A rejected refresh may
+          // keep the same provider's last meter, never another provider's.
+          this.#health = undefined;
         }
         if (sessionResult.status === "fulfilled") {
           this.#sessionSummary = sessionResult.value;

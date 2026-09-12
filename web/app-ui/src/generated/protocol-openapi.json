@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "9.6"
+    "version": "9.7"
   },
   "paths": {
     "/v1/approvals": {
@@ -13401,6 +13401,17 @@
           },
           "permission_mode": {
             "$ref": "#/components/schemas/PermissionMode"
+          },
+          "route": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ModelRouteInfo",
+                "description": "Concrete provider route the thread's automatic model last completed\non. Automatic selections stay sticky to this route while it is\nhealthy; it is cleared when the model changes or the route fails.\nAbsent for pinned models and before the first successful turn."
+              }
+            ]
           },
           "session_id": {
             "$ref": "#/components/schemas/String"

@@ -71,6 +71,38 @@ describe("session usage panel asynchronous lifecycle guards", () => {
     expect(source).toContain("String(sessionUsageRevision)");
   });
 
+  it("attributes automatic models to a concrete route and reloads when it changes", () => {
+    expect(source).not.toContain('this.model.split("/", 1)[0]');
+    expect(source).toContain("this.#route = this.#resolveRoute(");
+    expect(source).toContain("candidates: modelForSelection(catalog, this.model)?.routes ?? []");
+    expect(source).toContain("candidate.provider_id === providerId");
+    const keyStart = source.indexOf("const key = [");
+    const keyEnd = source.indexOf('].join("|");', keyStart);
+    expect(source.slice(keyStart, keyEnd)).toContain(
+      "`${attributed.providerId}/${attributed.providerModel}`",
+    );
+    expect(source).toContain(".threadRoute");
+    expect(source).toContain("Routed to <strong>${route.providerId}</strong>");
+  });
+
+  it("keys the reload on the live catalog and provider-usage snapshots", () => {
+    const start = source.indexOf("#attributedRoute(): UsageRoute | undefined {");
+    const end = source.indexOf("readonly #toggleCollapsed", start);
+    const attributed = source.slice(start, end);
+    expect(attributed).toContain("readSignal(services.modelCatalog.current)");
+    expect(attributed).toContain("readSignal(services.subscriptionHealth.current)");
+    expect(attributed).not.toContain("candidates: []");
+  });
+
+  it("drops another provider's meter when a route-only reload cannot refresh usage", () => {
+    const branchStart = source.indexOf("this.#route = this.#resolveRoute(");
+    const branchEnd = source.indexOf("if (sessionResult.status === \"fulfilled\")", branchStart);
+    const branch = source.slice(branchStart, branchEnd);
+    expect(branch).toContain("} else if (this.#health?.provider_id !== providerId) {");
+    expect(branch.indexOf("this.#health = undefined;", branch.indexOf("} else if")))
+      .toBeGreaterThan(0);
+  });
+
   it("keeps complete model labels visible without hover-only truncation", () => {
     expect(source).toContain("<small>${this.model}</small>");
     expect(source).toContain("<span>${row.label}</span>");

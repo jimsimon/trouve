@@ -1,13 +1,38 @@
 import { describe, expect, it } from "vitest";
 
+import type { ProtocolSubscriptionHealth } from "../services/protocol-client.js";
 import {
   collapsedUsageSummary,
   latestCompletedTurnDuration,
   localMemoryUtilization,
   sessionUsagePanelKind,
   usageBreakdownRows,
+  usagePanelRoute,
   usageThroughput,
 } from "./session-usage-model.js";
+
+const health = (
+  provider_id: string,
+  overrides: Partial<ProtocolSubscriptionHealth> = {},
+): ProtocolSubscriptionHealth => ({
+  provider_id,
+  status: "ok",
+  plan: "pro",
+  credits: "",
+  note: "",
+  windows: [{ label: "5h window", used_percent: 10, resets: "" }],
+  ...overrides,
+});
+
+const route = (overrides: Partial<Parameters<typeof usagePanelRoute>[0]> = {}) =>
+  usagePanelRoute({
+    model: "auto/claude-fable-5-1",
+    turnModels: new Map(),
+    threadRoute: undefined,
+    candidates: [],
+    subscriptions: [],
+    ...overrides,
+  });
 
 const kind = (overrides: Partial<Parameters<typeof sessionUsagePanelKind>[0]> = {}) =>
   sessionUsagePanelKind({
@@ -63,6 +88,66 @@ describe("session usage panel presentation", () => {
     expect(kind({ hasSubscriptionHealth: true })).toBe("subscription");
     expect(kind()).toBe("api");
     expect(kind({ model: "local/qwen-coder", hasSubscriptionHealth: true })).toBe("local");
+  });
+
+  it("attributes pinned models to their own provider", () => {
+    expect(route({ model: "openai/gpt-5" })).toEqual({
+      providerId: "openai",
+      providerModel: "gpt-5",
+      source: "pinned",
+    });
+    expect(route({ model: "openai/org/gpt-5" })).toMatchObject({
+      providerId: "openai",
+      providerModel: "org/gpt-5",
+    });
+    expect(route({ model: "bare-model" })).toBeUndefined();
+  });
+
+  it("attributes automatic models to the latest routed turn, skipping unrouted seeds", () => {
+    expect(route({
+      turnModels: new Map([
+        [1, "codex/gpt-5.6-sol"],
+        [2, "claude-code/claude-fable-5-1"],
+        [3, "auto/claude-fable-5-1"],
+      ]),
+      threadRoute: { provider_id: "codex", provider_model: "gpt-5.6-sol" },
+    })).toEqual({
+      providerId: "claude-code",
+      providerModel: "claude-fable-5-1",
+      source: "turn",
+    });
+  });
+
+  it("falls back to the thread's sticky route before any routed turn is known", () => {
+    expect(route({
+      turnModels: new Map([[1, "auto/claude-fable-5-1"]]),
+      threadRoute: { provider_id: "codex", provider_model: "gpt-5.6-sol" },
+      candidates: [{ provider_id: "anthropic", provider_model: "claude-fable-5-1" }],
+    })).toEqual({
+      providerId: "codex",
+      providerModel: "gpt-5.6-sol",
+      source: "thread",
+    });
+  });
+
+  it("falls back to the healthiest catalog candidate on a fresh thread", () => {
+    const candidates = [
+      { provider_id: "anthropic", provider_model: "claude-fable-5-1" },
+      { provider_id: "claude-code", provider_model: "claude-fable-5-1" },
+      { provider_id: "cursor", provider_model: "claude-fable-5-1" },
+    ];
+    expect(route({
+      candidates,
+      subscriptions: [
+        health("claude-code", { windows: [{ label: "5h", used_percent: 80, resets: "" }] }),
+        health("cursor", { windows: [{ label: "5h", used_percent: 20, resets: "" }] }),
+      ],
+    })).toEqual({ providerId: "cursor", providerModel: "claude-fable-5-1", source: "candidate" });
+    expect(route({
+      candidates,
+      subscriptions: [health("cursor", { status: "unavailable", windows: [] })],
+    })).toMatchObject({ providerId: "anthropic", source: "candidate" });
+    expect(route({ candidates: [] })).toBeUndefined();
   });
 
   it("bounds local memory utilization and derives last-turn throughput", () => {

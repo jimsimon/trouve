@@ -18022,9 +18022,12 @@ fn insert_thread_row(
 const THREAD_COLUMNS: &str = "id, session_id, mode, model, permission_mode, model_options, \
      created_at, EXISTS(SELECT 1 FROM spawned_threads st WHERE st.child_thread_id = threads.id), \
      todos, title, (SELECT st.parent_thread_id FROM spawned_threads st \
-       WHERE st.child_thread_id = threads.id LIMIT 1)";
+       WHERE st.child_thread_id = threads.id LIMIT 1), \
+     route_provider_id, route_provider_model";
 
 fn row_to_thread(r: &rusqlite::Row<'_>) -> rusqlite::Result<Thread> {
+    let route_provider_id: Option<String> = r.get(11)?;
+    let route_provider_model: Option<String> = r.get(12)?;
     Ok(Thread {
         id: r.get(0)?,
         session_id: r.get(1)?,
@@ -18040,6 +18043,14 @@ fn row_to_thread(r: &rusqlite::Row<'_>) -> rusqlite::Result<Thread> {
             .unwrap_or_else(|_| chrono::Utc::now()),
         spawned: r.get(7)?,
         todos: serde_json::from_str(&r.get::<_, String>(8)?).unwrap_or_default(),
+        route: route_provider_id
+            .zip(route_provider_model)
+            .map(
+                |(provider_id, provider_model)| trouve_protocol::ModelRouteInfo {
+                    provider_id,
+                    provider_model,
+                },
+            ),
     })
 }
 
@@ -20884,6 +20895,7 @@ mod tests {
         };
         store.insert_session(&session).unwrap();
         let thread = Thread {
+            route: None,
             id: "th_pr_intent".into(),
             session_id: session.id.clone(),
             parent_thread_id: None,
@@ -21370,6 +21382,7 @@ mod tests {
         };
         store.insert_session(&session).unwrap();
         let thread = Thread {
+            route: None,
             id: "th_chat_pr".into(),
             session_id: session.id.clone(),
             parent_thread_id: None,
@@ -21434,6 +21447,7 @@ mod tests {
         };
         store.insert_session(&session).unwrap();
         let thread = Thread {
+            route: None,
             id: "th_1".into(),
             session_id: "se_1".into(),
             parent_thread_id: None,
@@ -21469,6 +21483,7 @@ mod tests {
             )
             .unwrap();
         let child = Thread {
+            route: None,
             id: "th_child".into(),
             session_id: "se_1".into(),
             parent_thread_id: Some("th_1".into()),
@@ -21724,6 +21739,13 @@ mod tests {
             store.thread_route_affinity("th_affinity").unwrap(),
             Some(("codex".into(), "gpt-5.6-sol".into()))
         );
+        assert_eq!(
+            store.thread("th_affinity").unwrap().unwrap().route,
+            Some(trouve_protocol::ModelRouteInfo {
+                provider_id: "codex".into(),
+                provider_model: "gpt-5.6-sol".into(),
+            })
+        );
 
         store
             .update_thread(
@@ -21767,6 +21789,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(store.thread_route_affinity("th_affinity").unwrap(), None);
+        assert_eq!(store.thread("th_affinity").unwrap().unwrap().route, None);
         assert!(
             !store
                 .set_thread_route_affinity("th_affinity", "p/m", "codex", "gpt-5.6-sol")
@@ -21891,6 +21914,7 @@ mod tests {
         store
             .insert_thread(
                 &Thread {
+                    route: None,
                     id: thread_id.into(),
                     session_id: "se_q".into(),
                     parent_thread_id: None,
@@ -21913,6 +21937,7 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         seed_thread(&store, "th_seed");
         let named = Thread {
+            route: None,
             id: "th_named".into(),
             session_id: "se_q".into(),
             parent_thread_id: None,
@@ -22374,6 +22399,7 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         seed_thread(&store, "th_spawn_parent");
         let child = Thread {
+            route: None,
             id: "th_spawn_child".into(),
             session_id: "se_q".into(),
             parent_thread_id: Some("th_spawn_parent".into()),
@@ -22751,6 +22777,7 @@ mod tests {
         };
         store.insert_session(&session).unwrap();
         let thread = Thread {
+            route: None,
             id: "th_1".into(),
             session_id: "se_1".into(),
             parent_thread_id: None,

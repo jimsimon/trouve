@@ -1,5 +1,9 @@
 import type { ProtocolSubscriptionHealth } from "../services/protocol-client.js";
-import { type ModelHealthTone, modelHealthPresentation } from "./model-health.js";
+import {
+  boundedSubscriptionUsage,
+  type ModelHealthTone,
+  modelHealthPresentation,
+} from "./model-health.js";
 
 export type SessionUsagePanelKind =
   | "placeholder"
@@ -22,6 +26,104 @@ export const sessionUsagePanelKind = (input: {
   ) return "placeholder";
   if (input.model.startsWith("local/")) return "local";
   return input.hasSubscriptionHealth ? "subscription" : "api";
+};
+
+export const isAutomaticModel = (model: string): boolean => model.startsWith("auto/");
+
+export interface UsageRouteCandidate {
+  readonly provider_id: string;
+  readonly provider_model: string;
+}
+
+/** The concrete provider route whose usage the panel attributes a thread to. */
+export interface UsageRoute {
+  readonly providerId: string;
+  readonly providerModel: string;
+  /** Where the attribution came from: a pinned `provider/model` selection,
+   * the route a turn in this thread actually ran on, the thread's durable
+   * sticky route, or the healthiest catalog candidate before any turn ran. */
+  readonly source: "pinned" | "turn" | "thread" | "candidate";
+}
+
+const splitRoute = (
+  id: string,
+): { readonly providerId: string; readonly providerModel: string } | undefined => {
+  const separator = id.indexOf("/");
+  if (separator <= 0 || separator === id.length - 1) return undefined;
+  return { providerId: id.slice(0, separator), providerModel: id.slice(separator + 1) };
+};
+
+const candidateHealthRank = (
+  health: ProtocolSubscriptionHealth | undefined,
+): readonly [number, number] => {
+  if (health === undefined || health.status === "unsupported") return [1, 0];
+  if (health.status !== "ok") return [2, 0];
+  const highestUsage = health.windows.reduce(
+    (highest, window) => Math.max(highest, boundedSubscriptionUsage(window.used_percent)),
+    0,
+  );
+  return [0, highestUsage];
+};
+
+/**
+ * Resolve which provider's usage the panel should show. Pinned models name
+ * their provider directly. Automatic models are attributed to the most
+ * recent turn that was routed (a running turn's failover included), then to
+ * the thread's sticky route from the server, and before either exists to the
+ * candidate route with the healthiest subscription so a fresh thread still
+ * shows a meaningful meter.
+ */
+export const usagePanelRoute = (input: {
+  readonly model: string;
+  readonly turnModels: ReadonlyMap<number, string>;
+  readonly threadRoute: UsageRouteCandidate | null | undefined;
+  readonly candidates: readonly UsageRouteCandidate[];
+  readonly subscriptions: readonly ProtocolSubscriptionHealth[];
+}): UsageRoute | undefined => {
+  if (!isAutomaticModel(input.model)) {
+    const pinned = splitRoute(input.model);
+    return pinned === undefined ? undefined : { ...pinned, source: "pinned" };
+  }
+  let latestTurn: number | undefined;
+  let latestRoute: ReturnType<typeof splitRoute>;
+  for (const [turn, id] of input.turnModels) {
+    // turn.started seeds the automatic id; the concrete route replaces it.
+    if (isAutomaticModel(id)) continue;
+    if (latestTurn !== undefined && turn <= latestTurn) continue;
+    const route = splitRoute(id);
+    if (route === undefined) continue;
+    latestTurn = turn;
+    latestRoute = route;
+  }
+  if (latestRoute !== undefined) return { ...latestRoute, source: "turn" };
+  if (input.threadRoute) {
+    return {
+      providerId: input.threadRoute.provider_id,
+      providerModel: input.threadRoute.provider_model,
+      source: "thread",
+    };
+  }
+  const byProvider = new Map(
+    input.subscriptions.map((health) => [health.provider_id, health] as const),
+  );
+  const ranked = input.candidates
+    .map((candidate, index) => ({
+      candidate,
+      index,
+      rank: candidateHealthRank(byProvider.get(candidate.provider_id)),
+    }))
+    .sort((left, right) =>
+      left.rank[0] - right.rank[0]
+      || left.rank[1] - right.rank[1]
+      || left.index - right.index);
+  const best = ranked[0]?.candidate;
+  return best === undefined
+    ? undefined
+    : {
+        providerId: best.provider_id,
+        providerModel: best.provider_model,
+        source: "candidate",
+      };
 };
 
 export interface CollapsedUsageSummary {

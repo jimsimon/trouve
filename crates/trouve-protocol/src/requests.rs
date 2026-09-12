@@ -340,6 +340,12 @@ pub struct Thread {
     /// history of how the list changed; this field is the initial-load view.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub todos: Vec<TodoItem>,
+    /// Concrete provider route the thread's automatic model last completed
+    /// on. Automatic selections stay sticky to this route while it is
+    /// healthy; it is cleared when the model changes or the route fails.
+    /// Absent for pinned models and before the first successful turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<ModelRouteInfo>,
 }
 
 /// One folded, renderable row in a thread snapshot. Raw streaming fragments
