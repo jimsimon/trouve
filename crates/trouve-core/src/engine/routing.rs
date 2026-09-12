@@ -681,13 +681,16 @@ impl Engine {
         let online = self.is_online();
         if online
             && self.connectivity_probe.is_some()
-            && let Ok(Err(error)) = tokio::time::timeout(
-                MODEL_ROUTE_DISCOVERY_TIMEOUT,
-                self.model_catalog.refresh_if_stale(),
-            )
-            .await
+            && tokio::time::timeout(MODEL_ROUTE_DISCOVERY_TIMEOUT, self.refresh_catalog())
+                .await
+                .is_err()
         {
-            tracing::debug!("models.dev refresh failed; using cached snapshot: {error:#}");
+            tracing::debug!("models.dev refresh timed out; using the cached catalog");
+        }
+        if online {
+            // Detached: this response still comes from the persisted rosters;
+            // a rebuild (if due) is announced and shows up on the next listing.
+            self.spawn_roster_refresh();
         }
         let automatic = selection.and_then(automatic_model_name);
         let concrete_provider = selection
@@ -3926,7 +3929,7 @@ mod tests {
         };
         let mut native = TurnAccounting::default();
         native.add_native(
-            &trouve_providers::models_dev::ModelsDevCatalog::embedded(),
+            &trouve_providers::models_dev::ModelsDevCatalog::fixture(),
             &route,
             &usage,
         );
@@ -4001,6 +4004,9 @@ mod tests {
     #[tokio::test]
     async fn configured_loopback_catalog_provider_is_concrete_only() {
         let data = tempfile::tempdir().unwrap();
+        // The openai roster comes from the downloaded catalog; seed the data
+        // dir with the test copy so this offline engine has one.
+        trouve_providers::models_dev::ModelsDevCatalog::write_fixture_cache(data.path()).unwrap();
         let engine = Engine::new(
             Store::open_in_memory().unwrap(),
             data.path().into(),

@@ -14,7 +14,7 @@ import {
   pendingAttachmentPreviewUrl,
   type PendingAttachment,
 } from "../services/attachments.js";
-import { readSignal } from "../state/reactivity.js";
+import { readSignal, withSignalTracking } from "../state/reactivity.js";
 import type { ProtocolSubscriptionHealth } from "../services/protocol-client.js";
 import { modelHealthPresentations } from "./model-health.js";
 import {
@@ -68,7 +68,7 @@ const emptyCatalog = (): NewThreadSetupCatalog => ({
   providers: undefined,
 });
 
-export class TrouveNewThreadSetup extends LitElement {
+export class TrouveNewThreadSetup extends withSignalTracking(LitElement) {
   static override properties = {
     workspaceId: { type: String, attribute: "workspace-id" },
     sessionId: { type: String, attribute: "session-id" },
@@ -264,6 +264,13 @@ export class TrouveNewThreadSetup extends LitElement {
   #catalog = emptyCatalog();
   #draft: NewThreadSetupDraft = createInitialNewThreadDraft(this.#catalog);
   #optionsLoading = false;
+
+  /** Read at render time; signal tracking re-renders this element when the
+   * server announces a catalog change. */
+  #catalogAvailable(): boolean {
+    const signal = this.#services.value?.modelCatalog.catalogAvailable;
+    return signal === undefined ? true : readSignal(signal);
+  }
   #optionsError = "";
   #attachmentLoading = false;
   #attachmentError = "";
@@ -432,7 +439,11 @@ export class TrouveNewThreadSetup extends LitElement {
             <trouve-model-picker
               accessible-label="Model"
               placement="down"
-              placeholder=${this.#optionsLoading ? "Loading models…" : "No model available"}
+              placeholder=${this.#optionsLoading
+                ? "Loading models…"
+                : this.#catalogAvailable()
+                  ? "No model available"
+                  : "Downloading model catalog…"}
               empty-label=""
               .value=${this.#draft.modelId}
               .models=${this.#catalog.models}

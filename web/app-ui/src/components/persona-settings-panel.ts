@@ -475,7 +475,9 @@ export class TrouvePersonaSettings extends withSignalTracking(LitElement) {
       <div class="stack">
         <h2 tabindex="-1" data-persona-focus-fallback>Personas &amp; Models</h2>
         ${models.length === 0 && !this.#busy
-          ? html`<div class="no-models"><span>No models available — configure a provider to enable the model selectors.</span><button class="primary" type="button" @click=${() => this.#services.value?.router.navigate({ kind: "settings", section: "providers" })}>Configure providers</button></div>`
+          ? this.#services.value?.modelCatalog.catalogAvailable.get() === false
+            ? html`<div class="no-models"><span>Downloading the model catalog… model selectors enable once it arrives.</span></div>`
+            : html`<div class="no-models"><span>No models available — configure a provider to enable the model selectors.</span><button class="primary" type="button" @click=${() => this.#services.value?.router.navigate({ kind: "settings", section: "providers" })}>Configure providers</button></div>`
           : nothing}
         <form class="defaults-form" @submit=${(event: SubmitEvent) => void this.#saveDefaults(event)}>
           <p class="meta">Global default model — used by new threads whose persona has no default of its own.</p>

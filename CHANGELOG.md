@@ -8,6 +8,26 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **The model catalog is downloaded, not bundled**: `trouve-server` no longer
+  ships a models.dev snapshot. The downloaded copy under the data directory is
+  the only catalog; until the first successful download the server reports
+  `catalog_available: false`, retries every connectivity poll, offers only
+  local models and its own integrations, and the app shows "Downloading model
+  catalog…" instead of "No model available". `server.model_catalog_changed`
+  announces the download and every later catalog change.
+- **Codex and Cursor rosters follow the signed-in account**: both backends
+  rebuild their model lists in the background from the Codex app-server's
+  `model/list` and the Cursor SDK Bridge's `ListModels` (hourly, at startup,
+  on connectivity recovery, and on model-list refresh). Retired models
+  disappear, newly entitled ones appear, and per-model options (reasoning
+  efforts, Codex Fast, Cursor's `reasoning`/`context`/`fast` parameters) come
+  from the vendor, which also fixes GPT models on Cursor receiving `effort`
+  instead of `reasoning`. Model lists never wait on a vendor process; they
+  read the persisted roster under `rosters/`.
+- **Client/server compatibility**: protocol compatibility advances to 9.8 for
+  the additive `ServerInfo.catalog_available` field and the
+  `server.model_catalog_changed` event. Upgrade the desktop or PWA client and
+  `trouve-server` together.
 - **Provider-neutral model routing**: model pickers expose `auto/<model>`
   alongside hard-pinned `provider/model` choices. Automatic selections keep a
   healthy provider sticky across turns and use bounded, preference-ordered

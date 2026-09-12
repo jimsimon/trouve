@@ -1624,6 +1624,10 @@ async fn session_and_thread_updates_and_provider_config() {
     std::fs::create_dir(&repo).unwrap();
     init_repo(&repo);
 
+    // Known-provider presets come from the downloaded models.dev catalog;
+    // seed the data dir with the test copy so this offline engine has one.
+    trouve_providers::models_dev::ModelsDevCatalog::write_fixture_cache(&tmp.path().join("data"))
+        .unwrap();
     let store = Store::open(&tmp.path().join("db/trouve.db")).unwrap();
     let config_file = tmp.path().join("config.toml");
     let engine = Arc::new(

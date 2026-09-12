@@ -303,8 +303,10 @@ export class TrouveSessionNamingSettings extends withSignalTracking(LitElement) 
           <p class="meta">The compact branch is renamed after background naming completes. Existing remote branches are not renamed.</p>
           ${models.length === 0 && !this.#busy
             ? html`<div class="row" role="status">
-                <span class="meta">No models are available. Add a provider to choose a naming model.</span>
-                <button class="primary" type="button" @click=${() => this.#services.value?.router.navigate({ kind: "settings", section: "providers" })}>Add provider</button>
+                ${this.#services.value?.modelCatalog.catalogAvailable.get() === false
+                  ? html`<span class="meta">Downloading the model catalog… naming models appear once it arrives.</span>`
+                  : html`<span class="meta">No models are available. Add a provider to choose a naming model.</span>
+                    <button class="primary" type="button" @click=${() => this.#services.value?.router.navigate({ kind: "settings", section: "providers" })}>Add provider</button>`}
               </div>`
             : nothing}
           <div class="row"><button type="submit" ?disabled=${this.#busy || models.length === 0}>Save</button></div>

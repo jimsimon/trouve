@@ -53,6 +53,8 @@ const COLLABORATOR_START_GRACE: std::time::Duration = std::time::Duration::from_
 const APP_SERVER_STDERR_TAIL_BYTES: usize = 8 * 1024;
 const APP_SERVER_STDERR_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 const SENSITIVE_APP_SERVER_STDERR_ENV: &str = "TROUVE_LOG_SENSITIVE_APP_SERVER_STDERR";
+/// Trouve-owned catalog provider whose roster this backend refreshes.
+const CODEX_CATALOG_PROVIDER: &str = "openai-codex";
 
 type AppServerStderrTail = Arc<std::sync::Mutex<VecDeque<u8>>>;
 
@@ -155,7 +157,7 @@ impl CodexBackend {
             id: id.into(),
             command: command.unwrap_or_else(|| "codex".into()),
             server: Mutex::new(None),
-            catalog: Arc::new(ModelsDevCatalog::embedded()),
+            catalog: Arc::new(ModelsDevCatalog::empty()),
         }
     }
 
@@ -269,10 +271,46 @@ impl AgentBackend for CodexBackend {
         // provider inherits shared metadata from models.dev and owns the
         // OAuth roster, context limits, defaults, and reasoning levels.
         Self::without_usage_pricing(self.catalog.provider_models(
-            "openai-codex",
+            CODEX_CATALOG_PROVIDER,
             &self.id,
             OptionsDialect::CodexCli,
         ))
+    }
+
+    /// Rebuild the persisted `openai-codex` roster from the app-server's
+    /// `model/list` when the catalog's TTL says it is stale. `models()`
+    /// keeps reading the catalog, so this never sits on a request path.
+    async fn refresh_model_roster(
+        &self,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<bool, BackendError> {
+        if !self.catalog.begin_roster_refresh(CODEX_CATALOG_PROVIDER) {
+            return Ok(false);
+        }
+        let server = self.server_with_cancel(Some(cancel)).await?;
+        let live = server
+            .request_with_cancel("model/list", json!({}), Some(cancel), RequestFence::None)
+            .await?;
+        let seed = self.catalog.owned_provider_models(CODEX_CATALOG_PROVIDER);
+        let roster = crate::codex_roster::rebuild_codex_roster(&live, &seed, |slug| {
+            self.catalog.has_source_model("openai", slug)
+        })
+        .map_err(|e| BackendError::Protocol(format!("rebuilding Codex model roster: {e}")))?;
+        let added: Vec<_> = roster.keys().filter(|id| !seed.contains_key(*id)).collect();
+        let removed: Vec<_> = seed.keys().filter(|id| !roster.contains_key(*id)).collect();
+        if !added.is_empty() || !removed.is_empty() {
+            tracing::info!(
+                backend = %self.id,
+                ?added,
+                ?removed,
+                "Codex model roster changed"
+            );
+        }
+        self.catalog
+            .replace_roster(CODEX_CATALOG_PROVIDER, roster)
+            .await
+            .map_err(|e| BackendError::Protocol(format!("persisting Codex model roster: {e:#}")))?;
+        Ok(true)
     }
 
     fn status(&self) -> BackendStatus {
@@ -282,6 +320,17 @@ impl AgentBackend for CodexBackend {
         BackendStatus {
             installed: binary_on_path(&self.command),
             has_credentials: auth,
+        }
+    }
+
+    /// Terminate the cached app-server (if any) so a retired backend never
+    /// leaves a Codex process behind; turns and roster refreshes were drained
+    /// by the retirement wrapper before this runs.
+    async fn shutdown(&self) -> Result<(), BackendError> {
+        let server = self.server.lock().await.take();
+        match server {
+            Some(server) => server.terminate_transport().await,
+            None => Ok(()),
         }
     }
 
@@ -9094,9 +9143,14 @@ for line in sys.stdin:
 
     #[tokio::test]
     async fn listing_models_is_static_and_does_not_spawn_app_server() {
-        let backend = CodexBackend::new("codex", Some("definitely-not-a-command".into()));
+        let backend = CodexBackend::new("codex", Some("definitely-not-a-command".into()))
+            .with_catalog(Arc::new(ModelsDevCatalog::fixture()));
         let models = backend.list_models().await;
-        assert_eq!(models.len(), 8);
+        assert_eq!(
+            models.len(),
+            5,
+            "bundled seed until the first roster refresh"
+        );
         assert!(backend.server.lock().await.is_none());
     }
 
@@ -9110,28 +9164,31 @@ for line in sys.stdin:
 
     #[test]
     fn trouve_catalog_owns_codex_roster_metadata_and_settings() {
-        let backend = CodexBackend::new("codex", None);
+        let backend =
+            CodexBackend::new("codex", None).with_catalog(Arc::new(ModelsDevCatalog::fixture()));
         let models = backend.models();
-        assert_eq!(models.len(), 8);
+        assert_eq!(models.len(), 5);
         let sol = models
             .iter()
             .find(|model| model.id == "codex/gpt-5.6-sol")
             .unwrap();
         assert_eq!(sol.display_name, "GPT-5.6 Sol");
-        assert_eq!(sol.context_window, 500_000);
+        assert_eq!(sol.context_window, 500_000, "seed overrides the API limit");
         assert_eq!(sol.input_price_per_mtok, None);
         assert_eq!(sol.output_price_per_mtok, None);
+        // Until the roster refresh replaces them, reasoning levels come from
+        // the public record.
         assert_eq!(
             sol.options_schema
                 .pointer("/properties/reasoning_effort/enum")
                 .unwrap(),
-            &json!(["low", "medium", "high", "xhigh", "max", "ultra"])
+            &json!(["none", "low", "medium", "high", "xhigh", "max"])
         );
         assert_eq!(
             sol.options_schema
                 .pointer("/properties/reasoning_effort/default")
                 .and_then(Value::as_str),
-            Some("low")
+            Some("medium")
         );
 
         let gpt_55 = models
@@ -9139,15 +9196,11 @@ for line in sys.stdin:
             .find(|model| model.id == "codex/gpt-5.5")
             .unwrap();
         assert_eq!(gpt_55.context_window, 400_000);
-        let luna = models
+        let astra = models
             .iter()
-            .find(|model| model.id == "codex/gpt-5.6-luna")
+            .find(|model| model.id == "codex/gpt-6-astra")
             .unwrap();
-        assert_eq!(
-            luna.options_schema
-                .pointer("/properties/reasoning_effort/enum"),
-            Some(&json!(["low", "medium", "high", "xhigh", "max"]))
-        );
+        assert_eq!(astra.context_window, 1_050_000);
     }
 
     #[test]
@@ -9155,6 +9208,131 @@ for line in sys.stdin:
         assert!(thread_id_of(&json!({ "thread": { "id": "  " } }), "thread/start").is_err());
         assert!(turn_id_of(&json!({ "turn": { "id": "\n" } })).is_err());
         assert!(steered_turn_id_of(&json!({ "turnId": "\t" })).is_err());
+    }
+
+    /// The roster refresh rebuilds the persisted `openai-codex` overlay from
+    /// the app-server's `model/list`; `models()` keeps reading the catalog.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn refresh_model_roster_rewrites_the_catalog_from_model_list() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let stub = temp.path().join("codex-model-list");
+        let calls = std::path::PathBuf::from(format!("{}.calls", stub.display()));
+        std::fs::write(
+            &stub,
+            r#"#!/usr/bin/env python3
+import json, os, sys
+with open(sys.argv[0] + ".pid", "w") as marker:
+    marker.write(str(os.getpid()))
+for line in sys.stdin:
+    msg = json.loads(line)
+    method = msg.get("method")
+    mid = msg.get("id")
+    if method == "initialized":
+        continue
+    if method == "model/list":
+        with open(sys.argv[0] + ".calls", "a") as calls:
+            calls.write("model/list\n")
+        result = {"data": [
+            {"model": "gpt-5.6-sol", "displayName": "GPT-5.6 Sol", "hidden": False,
+             "inputModalities": ["text", "image"], "additionalSpeedTiers": ["fast"],
+             "supportedReasoningEfforts": [{"reasoningEffort": "low"}, {"reasoningEffort": "ultra"}],
+             "defaultReasoningEffort": "ultra"},
+            {"model": "gpt-5.6-luna", "displayName": "GPT-5.6 Luna", "hidden": False,
+             "inputModalities": ["text", "image"],
+             "supportedReasoningEfforts": [{"reasoningEffort": "medium"}],
+             "defaultReasoningEffort": "medium"},
+            {"model": "gpt-4.1", "displayName": "GPT-4.1", "hidden": True,
+             "inputModalities": ["text"], "supportedReasoningEfforts": []},
+        ]}
+    else:
+        result = {}
+    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": mid, "result": result}) + "\n")
+    sys.stdout.flush()
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let data_dir = tempfile::tempdir().unwrap();
+        let catalog = Arc::new(ModelsDevCatalog::fixture_for_data_dir(data_dir.path()));
+        let backend = CodexBackend::new("codex", Some(stub.to_string_lossy().into_owned()))
+            .with_catalog(catalog.clone());
+        assert!(
+            backend
+                .models()
+                .iter()
+                .any(|model| model.id == "codex/gpt-6-astra"),
+            "bundled seed serves until the first refresh"
+        );
+
+        assert!(
+            backend
+                .refresh_model_roster(&tokio_util::sync::CancellationToken::new())
+                .await
+                .unwrap()
+        );
+        let models = backend.models();
+        let mut ids: Vec<_> = models.iter().map(|model| model.id.as_str()).collect();
+        ids.sort();
+        assert_eq!(ids, ["codex/gpt-5.6-luna", "codex/gpt-5.6-sol"]);
+        let sol = models
+            .iter()
+            .find(|model| model.id == "codex/gpt-5.6-sol")
+            .unwrap();
+        assert_eq!(sol.context_window, 500_000, "seed limit survives");
+        assert_eq!(
+            sol.options_schema.pointer("/properties/fast/type"),
+            Some(&json!("boolean")),
+            "fast tier discovered from the live speed tiers"
+        );
+        assert_eq!(
+            sol.options_schema
+                .pointer("/properties/reasoning_effort/enum"),
+            Some(&json!(["low", "ultra"]))
+        );
+        assert_eq!(
+            sol.options_schema
+                .pointer("/properties/reasoning_effort/default"),
+            Some(&json!("ultra"))
+        );
+        assert!(sol.input_price_per_mtok.is_none(), "codex strips pricing");
+
+        let roster = data_dir.path().join("rosters").join("openai-codex.json");
+        let file: Value = serde_json::from_slice(&std::fs::read(&roster).unwrap()).unwrap();
+        assert!(file["models"]["gpt-5.6-luna"].is_object());
+        assert!(file["models"].get("gpt-5.4-mini").is_none());
+
+        // Within the TTL the refresh is a no-op that never touches the server.
+        assert!(
+            !backend
+                .refresh_model_roster(&tokio_util::sync::CancellationToken::new())
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&calls).unwrap().lines().count(),
+            1,
+            "model/list is requested once per refresh window"
+        );
+
+        // Retiring the backend terminates the app-server the refresh spawned.
+        let pid = std::fs::read_to_string(format!("{}.pid", stub.display()))
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+        backend.shutdown().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while std::path::Path::new(&format!("/proc/{pid}")).exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("shutdown left the roster app-server alive");
+        assert!(backend.server.lock().await.is_none());
     }
 
     #[cfg(target_os = "linux")]

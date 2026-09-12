@@ -7418,7 +7418,7 @@ validate215.evaluated = {"items":true,"dynamicProps":false,"dynamicItems":false}
 
 export const serverInfo = validate218;
 const schema95 = {"$id":"urn:trouve:protocol-validator:serverInfo","$ref":"urn:trouve:protocol-openapi#/components/schemas/ServerInfo"};
-const schema96 = {"type":"object","required":["name","version","protocol_version"],"properties":{"name":{"type":"string"},"online":{"type":"boolean","description":"Whether the server can currently reach the internet (see the\n`server.connectivity_changed` event). Absent on older servers, which\nnever report offline."},"protocol_version":{"type":"string"},"version":{"type":"string"}}};
+const schema96 = {"type":"object","required":["name","version","protocol_version"],"properties":{"catalog_available":{"type":"boolean","description":"Whether the public model catalog has been downloaded (see the\n`server.model_catalog_changed` event). Absent on older servers, which\nbundled a catalog and were never without one."},"name":{"type":"string"},"online":{"type":"boolean","description":"Whether the server can currently reach the internet (see the\n`server.connectivity_changed` event). Absent on older servers, which\nnever report offline."},"protocol_version":{"type":"string"},"version":{"type":"string"}}};
 
 function validate219(data, {instancePath="", parentData, parentDataProperty, rootData=data, dynamicAnchors={}}={}){
 let vErrors = null;
@@ -7438,10 +7438,10 @@ validate219.errors = [{instancePath,schemaPath:"#/required",keyword:"required",p
 return false;
 }
 else {
-if(data.name !== undefined){
+if(data.catalog_available !== undefined){
 const _errs1 = errors;
-if(typeof data.name !== "string"){
-validate219.errors = [{instancePath:instancePath+"/name",schemaPath:"#/properties/name/type",keyword:"type",params:{type: "string"},message:"must be string"}];
+if(typeof data.catalog_available !== "boolean"){
+validate219.errors = [{instancePath:instancePath+"/catalog_available",schemaPath:"#/properties/catalog_available/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
 return false;
 }
 var valid0 = _errs1 === errors;
@@ -7450,10 +7450,10 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.online !== undefined){
+if(data.name !== undefined){
 const _errs3 = errors;
-if(typeof data.online !== "boolean"){
-validate219.errors = [{instancePath:instancePath+"/online",schemaPath:"#/properties/online/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
+if(typeof data.name !== "string"){
+validate219.errors = [{instancePath:instancePath+"/name",schemaPath:"#/properties/name/type",keyword:"type",params:{type: "string"},message:"must be string"}];
 return false;
 }
 var valid0 = _errs3 === errors;
@@ -7462,10 +7462,10 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.protocol_version !== undefined){
+if(data.online !== undefined){
 const _errs5 = errors;
-if(typeof data.protocol_version !== "string"){
-validate219.errors = [{instancePath:instancePath+"/protocol_version",schemaPath:"#/properties/protocol_version/type",keyword:"type",params:{type: "string"},message:"must be string"}];
+if(typeof data.online !== "boolean"){
+validate219.errors = [{instancePath:instancePath+"/online",schemaPath:"#/properties/online/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"}];
 return false;
 }
 var valid0 = _errs5 === errors;
@@ -7474,16 +7474,29 @@ else {
 var valid0 = true;
 }
 if(valid0){
-if(data.version !== undefined){
+if(data.protocol_version !== undefined){
 const _errs7 = errors;
-if(typeof data.version !== "string"){
-validate219.errors = [{instancePath:instancePath+"/version",schemaPath:"#/properties/version/type",keyword:"type",params:{type: "string"},message:"must be string"}];
+if(typeof data.protocol_version !== "string"){
+validate219.errors = [{instancePath:instancePath+"/protocol_version",schemaPath:"#/properties/protocol_version/type",keyword:"type",params:{type: "string"},message:"must be string"}];
 return false;
 }
 var valid0 = _errs7 === errors;
 }
 else {
 var valid0 = true;
+}
+if(valid0){
+if(data.version !== undefined){
+const _errs9 = errors;
+if(typeof data.version !== "string"){
+validate219.errors = [{instancePath:instancePath+"/version",schemaPath:"#/properties/version/type",keyword:"type",params:{type: "string"},message:"must be string"}];
+return false;
+}
+var valid0 = _errs9 === errors;
+}
+else {
+var valid0 = true;
+}
 }
 }
 }
@@ -7498,7 +7511,7 @@ return false;
 validate219.errors = vErrors;
 return errors === 0;
 }
-validate219.evaluated = {"props":{"name":true,"online":true,"protocol_version":true,"version":true},"dynamicProps":false,"dynamicItems":false};
+validate219.evaluated = {"props":{"catalog_available":true,"name":true,"online":true,"protocol_version":true,"version":true},"dynamicProps":false,"dynamicItems":false};
 
 
 function validate218(data, {instancePath="", parentData, parentDataProperty, rootData=data, dynamicAnchors={}}={}){
@@ -7519,7 +7532,7 @@ errors = vErrors.length;
 validate218.errors = vErrors;
 return errors === 0;
 }
-validate218.evaluated = {"props":{"name":true,"online":true,"protocol_version":true,"version":true},"dynamicProps":false,"dynamicItems":false};
+validate218.evaluated = {"props":{"catalog_available":true,"name":true,"online":true,"protocol_version":true,"version":true},"dynamicProps":false,"dynamicItems":false};
 
 export const serverProjection = validate221;
 const schema97 = {"$id":"urn:trouve:protocol-validator:serverProjection","$ref":"urn:trouve:protocol-openapi#/components/schemas/ServerProjection"};
@@ -16662,7 +16675,7 @@ validate374.evaluated = {"props":{"error":true,"received_bytes":true,"status":tr
 export const knownEnvelope = validate377;
 const schema169 = {"$id":"urn:trouve:protocol-validator:knownEnvelope","$ref":"urn:trouve:protocol-openapi#/components/schemas/EventEnvelope"};
 const schema170 = {"allOf":[{"$ref":"#/components/schemas/Event"},{"type":"object","required":["cursor","scope","ts"],"properties":{"cursor":{"type":"integer","format":"int64","description":"Strictly increasing within a scope; used as the SSE event id for\n`Last-Event-ID` resumption. Not necessarily dense.","minimum":0},"scope":{"$ref":"#/components/schemas/Scope"},"ts":{"type":"string","format":"date-time","description":"RFC 3339 timestamp assigned at append time."}}}],"description":"The envelope every event is delivered in (and persisted as)."};
-const schema171 = {"oneOf":[{"type":"object","description":"Legacy admission marker written before protocol 7.24. New\nservers retain this variant only to replay existing durable event logs.","required":["turn","wait_ms","background","type"],"properties":{"background":{"type":"boolean"},"turn":{"type":"integer","format":"int64","minimum":0},"type":{"type":"string","enum":["turn.capacity_acquired"]},"wait_ms":{"type":"integer","format":"int64","minimum":0}}},{"type":"object","description":"Provider admission is complete for this turn. `provider_wait_ms` is\ntime spent waiting for a shared throttling cooldown; zero means the\nturn was admitted immediately.","required":["turn","provider_wait_ms","type"],"properties":{"provider_wait_ms":{"type":"integer","format":"int64","minimum":0},"turn":{"type":"integer","format":"int64","minimum":0},"type":{"type":"string","enum":["turn.admitted"]}}},{"type":"object","required":["turn","mode","model","type"],"properties":{"mode":{"type":"string"},"model":{"type":"string"},"supports_steering":{"type":"boolean","description":"Whether the backend running this exact turn accepts additional\nuser input without cancelling or starting another turn."},"thinking_level":{"type":["string","null"],"description":"Effective provider-native thinking/reasoning selection for this\nturn after inherited defaults and model schema normalization."},"turn":{"type":"integer","format":"int64","minimum":0},"type":{"type":"string","enum":["turn.started"]}}},{"type":"object","description":"The transient activity label for a running turn changed. This updates\nthe existing activity row; it is not a transcript or tool-rail item.","required":["turn","phase","type"],"properties":{"phase":{"$ref":"#/components/schemas/TurnPhase"},"turn":{"type":"integer","format":"int64","minimum":0},"type":{"type":"string","enum":["turn.phase_changed"]}}},{"type":"object","description":"Live usage from the most recently completed model request in a running\nturn. Thread snapshots add its billing counters to `active_usage` while\nreplacing only the context fields. `last_usage` remains unchanged until\n`turn.completed` supplies the turn's final aggregates.","required":["turn","usage","type"],"properties":{"turn":{"type":"integer","format":"int64","minimum":0},"type":{"type":"string","enum":["turn.usage_updated"]},"usage":{"$ref":"#/components/schemas/Usage"}}},{"type":"object","required":["turn","usage","type"],"properties":{"checkpoint_id":{"oneOf":[{"type":"null"},{"$ref":"#/components/schemas/String"}]},"turn":{"type":"integer","format":"int64","minimum":0},"type":{"type":"string","enum":["turn.completed"]},"usage":{"$ref":"#/components/schemas/Usage"}}},{"type":"object","required":["turn","error","type"],"properties":{"error":{"type":"string"},"turn":{"type":"integer","format":"int64","minimum":0},"type":{"type":"string","enum":["turn.failed"]}}},{"type":"object","description":"The turn was interrupted by the user (via the cancel endpoint). Like\n`turn.failed` it pauses the queue, but it isn't an error condition.","required":["turn","type"],"properties":{"turn":{"type":"integer","format":"int64","minimum":0},"type":{"type":"string","enum":["turn.cancelled"]}}},{"type":"object","required":["turn","content","type"],"properties":{"attachments":{"type":"array","items":{"$ref":"#/components/schemas/Attachment"},"description":"Files the user attached to the prompt (bytes at\n`GET /v1/attachments/{id}`)."},"background":{"type":"boolean","description":"Legacy protocol 7.19–7.26 marker retained so existing durable logs\nremain replayable. New servers emit `turn.background_activity`\ninstead and leave this false for user-authored messages."},"content":{"type":"string"},"turn":{"type":"integer","format":"int64","minimum":0},"type":{"type":"string","enum":["user.message"]}}},{"type":"object","description":"The server attached a turn to vendor-autonomous agent activity. This is\ndeliberately distinct from `user.message`: no user authored a prompt.","required":["turn","type"],"properties":{"turn":{"type":"integer","format":"int64","minimum":0},"type":{"type":"string","enum":["turn.background_activity"]}}},{"type":"object","description":"Additional user input accepted by the backend while `turn` was still\nrunning. This belongs on the active turn's timeline and does not start\nor queue another turn.","required":["turn","content","type"],"properties":{"attachments":{"type":"array","items":{"$ref":"#/components/schemas/Attachment"}},"content":{"type":"string"},"turn":{"type":"integer","format":"int64","minimum":0},"type":{"type":"string","enum":["turn.steered"]}}},{"type":"object","description":"A child agent became part of this parent turn. The child transcript\nremains independently addressable while this durable boundary lets\nclients render and navigate the relationship from the parent rail.","required":["turn","thread_id","session_id","prompt","model","type"],"properties":{"call_id":{"oneOf":[{"type":"null"},{"$ref":"#/components/schemas/String","description":"The trouve spawn tool call represented by this node, when one\nexists. Provider-native collaborators do not have a parent tool\ncall. Clients may suppress the redundant spawn tool presentation."}]},"model":{"type":"string"},"prompt":{"type":"string"},"session_id":{"$ref":"#/components/schemas/String"},"thread_id":{"$ref":"#/components/schemas/String"},"turn":{"type":"integer","format":"int64","minimum":0},"type":{"type":"string","enum":["subagent.spawned"]}}},{"type":"object","description":"Streamed model output. Replaying all deltas of a turn reproduces the\nfinal message exactly.","required":["turn","text","type"],"properties":{"text":{"type":"string"},"turn":{"type":"integer","format":"int64","minimum":0},"type":{"type":"string","enum":["assistant.delta"]}}},{"type":"object","description":"Streamed user-facing progress authored by the agent harness. Progress\nis distinct from both model reasoning and answer text.","required":["turn","text","type"],"properties":{"text":{"type":"string"},"turn":{"type":"integer","format":"int64","minimum":0},"type":{"type":"string","enum":["assistant.progress"]}}},{"type":"object","description":"The harness explicitly closed the current progress item.","required":["turn","type"],"properties":{"turn":{"type":"integer","format":"int64","minimum":0},"type":{"type":"string","enum":["assistant.progress_completed"]}}},{"type":"object","description":"Streamed model reasoning (\"thinking\") text, where the provider\nexposes it. Display-only: never part of the provider transcript.\nThe id is present for identity-aware streams whose reasoning may span\ninterleaved tool events; legacy persisted events omit it.","required":["turn","text","type"],"properties":{"id":{"type":["string","null"]},"text":{"type":"string"},"turn":{"type":"integer","format":"int64","minimum":0},"type":{"type":"string","enum":["assistant.thinking"]}}},{"type":"object","description":"The provider explicitly closed the current streamed thinking item.\nThis boundary can arrive before the next visible assistant or tool\nevent, so clients must not infer it from subsequent output alone.","required":["turn","type"],"properties":{"id":{"type":["string","null"]},"turn":{"type":"integer","format":"int64","minimum":0},"type":{"type":"string","enum":["assistant.thinking_completed"]}}},{"type":"object","description":"Folded final assistant text for the turn.","required":["turn","content","type"],"properties":{"content":{"type":"string"},"turn":{"type":"integer","format":"int64","minimum":0},"type":{"type":"string","enum":["assistant.message"]}}},{"type":"object","description":"Durable files produced by the assistant or one of its tools. Bytes are\nserved through the same attachment endpoint as user uploads.","required":["turn","attachments","type"],"properties":{"attachments":{"type":"array","items":{"$ref":"#/components/schemas/Attachment"}},"call_id":{"oneOf":[{"type":"null"},{"$ref":"#/components/schemas/String"}]},"turn":{"type":"integer","format":"int64","minimum":0},"type":{"type":"string","enum":["assistant.artifacts"]}}},{"type":"object","required":["turn","call_id","tool","args","requires_approval","type"],"properties":{"args":{},"call_id":{"$ref":"#/components/schemas/String"},"requires_approval":{"type":"boolean"},"tool":{"type":"string"},"turn":{"type":"integer","format":"int64","minimum":0},"type":{"type":"string","enum":["tool.requested"]}}},{"type":"object","required":["turn","call_id","type"],"properties":{"call_id":{"$ref":"#/components/schemas/String"},"turn":{"type":"integer","format":"int64","minimum":0},"type":{"type":"string","enum":["approval.requested"]}}},{"type":"object","required":["call_id","decision","type"],"properties":{"call_id":{"$ref":"#/components/schemas/String"},"decision":{"$ref":"#/components/schemas/ApprovalDecision"},"type":{"type":"string","enum":["approval.resolved"]}}},{"type":"object","required":["call_id","type"],"properties":{"call_id":{"$ref":"#/components/schemas/String"},"type":{"type":"string","enum":["tool.started"]}}},{"type":"object","required":["call_id","chunk","type"],"properties":{"call_id":{"$ref":"#/components/schemas/String"},"chunk":{"type":"string"},"type":{"type":"string","enum":["tool.output"]}}},{"type":"object","required":["call_id","status","result","type"],"properties":{"call_id":{"$ref":"#/components/schemas/String"},"execution_duration_ms":{"type":["integer","null"],"format":"int64","description":"Time spent inside `ToolExecutor::execute`, measured with a\nmonotonic clock. Absent for older servers, denied calls, and\nprovider-owned tool calls that do not expose an execution span.","minimum":0},"result":{},"status":{"$ref":"#/components/schemas/ToolStatus"},"type":{"type":"string","enum":["tool.completed"]}}},{"type":"object","description":"The agent asked the user one or more questions; the turn is blocked\nuntil `question.resolved`. Clients render an answer wizard.","required":["turn","request_id","questions","type"],"properties":{"questions":{"type":"array","items":{"$ref":"#/components/schemas/Question"}},"request_id":{"$ref":"#/components/schemas/String"},"title":{"type":["string","null"]},"turn":{"type":"integer","format":"int64","minimum":0},"type":{"type":"string","enum":["question.requested"]}}},{"type":"object","description":"Answers submitted (or `answers: null` when the user skipped).","required":["request_id","type"],"properties":{"answers":{"type":["array","null"],"items":{"$ref":"#/components/schemas/QuestionAnswer"}},"request_id":{"$ref":"#/components/schemas/String"},"type":{"type":"string","enum":["question.resolved"]}}},{"type":"object","description":"The slash commands / skills the vendor harness currently accepts in\nprompts. Replaces any previously announced list for the thread.","required":["commands","type"],"properties":{"commands":{"type":"array","items":{"$ref":"#/components/schemas/CommandInfo"}},"type":{"type":"string","enum":["thread.commands_updated"]}}},{"type":"object","description":"The thread's queue of pending prompts changed (enqueue, edit,\nreorder, delete, or dispatch). Carries the full remaining queue in\nrun order; clients replace any previous list.","required":["prompts","type"],"properties":{"prompts":{"type":"array","items":{"$ref":"#/components/schemas/QueuedPrompt"}},"type":{"type":"string","enum":["thread.queue_updated"]}}},{"type":"object","description":"The thread's current todo snapshot changed. Historical `todo_write`\ntool calls remain in the stream; clients replace this snapshot.","required":["todos","type"],"properties":{"todos":{"type":"array","items":{"$ref":"#/components/schemas/TodoItem"}},"type":{"type":"string","enum":["thread.todos_updated"]}}},{"type":"object","description":"The thread's transcript neared the model's context window; the engine\nis summarizing older messages. Clients show a busy indicator.","required":["turn","type"],"properties":{"turn":{"type":"integer","format":"int64","minimum":0},"type":{"type":"string","enum":["thread.compaction_started"]}}},{"type":"object","required":["turn","messages_compacted","type"],"properties":{"messages_compacted":{"type":"integer","format":"int64","description":"Provider-transcript messages folded into the summary. Zero means\nan external harness reported the boundary without a message count.","minimum":0},"turn":{"type":"integer","format":"int64","minimum":0},"type":{"type":"string","enum":["thread.compaction_completed"]}}},{"type":"object","description":"A provider-owned compaction item terminated unsuccessfully. This is a\ndistinct terminal edge so clients can clear their busy state even when\nthe vendor turn continues producing ordinary output.","required":["turn","type"],"properties":{"turn":{"type":"integer","format":"int64","minimum":0},"type":{"type":"string","enum":["thread.compaction_failed"]}}},{"type":"object","required":["checkpoint_id","thread_id","turn","commit","type"],"properties":{"checkpoint_id":{"$ref":"#/components/schemas/String"},"commit":{"type":"string","description":"Git commit hash the checkpoint points at."},"thread_id":{"$ref":"#/components/schemas/String"},"turn":{"type":"integer","format":"int64","minimum":0},"type":{"type":"string","enum":["checkpoint.created"]}}},{"type":"object","required":["checkpoint_id","direction","type"],"properties":{"checkpoint_id":{"$ref":"#/components/schemas/String"},"direction":{"$ref":"#/components/schemas/RestoreDirection"},"type":{"type":"string","enum":["checkpoint.restored"]}}},{"type":"object","required":["path","branch","type"],"properties":{"branch":{"type":"string"},"path":{"type":"string"},"type":{"type":"string","enum":["worktree.created"]}}},{"type":"object","required":["path","branch","type"],"properties":{"branch":{"type":"string"},"path":{"type":"string"},"type":{"type":"string","enum":["worktree.removed"]}}},{"type":"object","description":"A router, reviewer, or coordinator task changed durable state.","required":["job_id","task","type"],"properties":{"job_id":{"type":"string"},"task":{"$ref":"#/components/schemas/CodeReviewTask"},"type":{"type":"string","enum":["code_review.task_updated"]}}},{"type":"object","description":"A compact task lifecycle/metrics snapshot changed while the task was\nrunning. Clients merge it into their retained task representation.","required":["job_id","task_id","progress","type"],"properties":{"job_id":{"type":"string"},"progress":{"$ref":"#/components/schemas/CodeReviewTaskProgress"},"task_id":{"type":"string"},"type":{"type":"string","enum":["code_review.task_progress_updated"]}}},{"type":"object","description":"The complete, durable persona-routing matrix was selected for a job.","required":["job_id","routing_decisions","type"],"properties":{"job_id":{"type":"string"},"routing_decisions":{"type":"array","items":{"$ref":"#/components/schemas/CodeReviewRoutingDecision"}},"type":{"type":"string","enum":["code_review.routing_updated"]}}},{"type":"object","description":"Live output projected from the disposable agent thread into durable\nreview history.","required":["job_id","task_id","stream","text","type"],"properties":{"job_id":{"type":"string"},"stream":{"$ref":"#/components/schemas/CodeReviewOutputStream"},"task_id":{"type":"string"},"text":{"type":"string"},"type":{"type":"string","enum":["code_review.output_delta"]}}},{"type":"object","description":"Reviewer-level progress changed. Coordinator/summary work is exposed\non its task but does not inflate the reviewer count.","required":["job_id","progress","type"],"properties":{"job_id":{"type":"string"},"progress":{"$ref":"#/components/schemas/CodeReviewProgress"},"type":{"type":"string","enum":["code_review.progress_updated"]}}},{"type":"object","description":"Other durable job state changed.","required":["job_id","type"],"properties":{"job_id":{"type":"string"},"type":{"type":"string","enum":["code_review.job_updated"]}}},{"type":"object","required":["workspace_id","path","type"],"properties":{"path":{"type":"string"},"type":{"type":"string","enum":["workspace.registered"]},"workspace_id":{"$ref":"#/components/schemas/String"}}},{"type":"object","description":"An account-centric PR-dashboard refresh completed for one GitHub\ninstance. Clients replace the previously folded host slice.","required":["pull_requests","type"],"properties":{"pull_requests":{"$ref":"#/components/schemas/GithubPrList"},"type":{"type":"string","enum":["github.pull_requests_updated"]}}},{"type":"object","required":["workspace_id","type"],"properties":{"type":{"type":"string","enum":["workspace.closed"]},"workspace_id":{"$ref":"#/components/schemas/String"}}},{"type":"object","required":["session_id","workspace_id","type"],"properties":{"session_id":{"$ref":"#/components/schemas/String"},"type":{"type":"string","enum":["session.created"]},"workspace_id":{"$ref":"#/components/schemas/String"}}},{"type":"object","required":["number","url","type"],"properties":{"number":{"type":"integer","format":"int64","minimum":0},"type":{"type":"string","enum":["session.pr_opened"]},"url":{"type":"string"}}},{"type":"object","description":"Legacy association emitted when a pull request browser URL appeared in\nsession chat. Current servers retain this variant only to replay old\nevent logs; mentions no longer create session PR associations.","required":["session_id","number","url","type"],"properties":{"number":{"type":"integer","format":"int64","minimum":0},"session_id":{"$ref":"#/components/schemas/String"},"type":{"type":"string","enum":["session.pr_mentioned"]},"url":{"type":"string","description":"Canonical browser URL supplied by chat. A number without repository\nidentity is not globally unique and does not emit this event."}}},{"type":"object","required":["session_id","workspace_id","type"],"properties":{"session_id":{"$ref":"#/components/schemas/String"},"type":{"type":"string","enum":["session.deleted"]},"workspace_id":{"$ref":"#/components/schemas/String"}}},{"type":"object","description":"Session metadata changed (rename / archive). Clients refetch.","required":["session_id","workspace_id","type"],"properties":{"session_id":{"$ref":"#/components/schemas/String"},"type":{"type":"string","enum":["session.updated"]},"workspace_id":{"$ref":"#/components/schemas/String"}}},{"type":"object","required":["thread_id","session_id","type"],"properties":{"session_id":{"$ref":"#/components/schemas/String"},"thread_id":{"$ref":"#/components/schemas/String"},"type":{"type":"string","enum":["thread.created"]}}},{"type":"object","description":"Thread settings changed (mode/model). Clients refetch.","required":["thread_id","session_id","type"],"properties":{"session_id":{"$ref":"#/components/schemas/String"},"thread_id":{"$ref":"#/components/schemas/String"},"type":{"type":"string","enum":["thread.updated"]}}},{"type":"object","description":"Transactionally derived status for one thread. Open and closed tabs can\nfold this server-scope event without opening a transcript SSE stream.","required":["status","type"],"properties":{"status":{"$ref":"#/components/schemas/ThreadStatus"},"type":{"type":"string","enum":["thread.status_updated"]}}},{"type":"object","description":"A session started or stopped actively processing prompts (one of its\nthreads began running turns, or the last active one went idle).\nDrives the activity indicator in session lists; `Session.active`\ncarries the same state for initial fetches.","required":["session_id","workspace_id","active","type"],"properties":{"active":{"type":"boolean"},"session_id":{"$ref":"#/components/schemas/String"},"type":{"type":"string","enum":["session.activity"]},"workspace_id":{"$ref":"#/components/schemas/String"}}},{"type":"object","description":"The server restarted while this session still had process-owned turn\nstate. Clients clear running/approval/question UI from the replacement\nsummary; those responders cannot survive the process that owned them.","required":["session_id","workspace_id","type"],"properties":{"session_id":{"$ref":"#/components/schemas/String"},"type":{"type":"string","enum":["session.recovered"]},"workspace_id":{"$ref":"#/components/schemas/String"}}},{"type":"object","description":"Transactionally derived aggregate state. `summary: null` is the\ndurable tombstone for a deleted session.","required":["session_id","summary","type"],"properties":{"session_id":{"$ref":"#/components/schemas/String"},"summary":{"oneOf":[{"type":"null"},{"$ref":"#/components/schemas/SessionSummary"}]},"type":{"type":"string","enum":["session.summary_updated"]}}},{"type":"object","description":"Compact durable edge for notifications about inactive/background\nthreads. It is appended transactionally after the replacement session\nsummary produced by the same source event.","required":["session_id","thread_id","kind","type"],"properties":{"detail":{"type":["string","null"],"description":"Optional native-equivalent failure excerpt or question subtitle."},"kind":{"$ref":"#/components/schemas/SessionNotificationKind"},"session_id":{"$ref":"#/components/schemas/String"},"thread_id":{"$ref":"#/components/schemas/String"},"type":{"type":"string","enum":["session.notification"]}}},{"type":"object","description":"A scheduled automation ran (or failed to). Clients refetch the\nautomations list — and the sessions list when it succeeded, since a\nrun creates a session.","required":["automation_id","type"],"properties":{"automation_id":{"type":"string"},"error":{"type":"string","description":"Failure reason (\"\" = success)."},"session_id":{"oneOf":[{"type":"null"},{"$ref":"#/components/schemas/String","description":"Session the run created (absent when the run failed)."}]},"type":{"type":"string","enum":["automation.fired"]}}},{"type":"object","description":"GitHub App configuration, repository policy, or a durable review job\nchanged. Clients refetch `/v1/code-review` and fold the replacement.","required":["type"],"properties":{"job_id":{"type":["string","null"]},"type":{"type":"string","enum":["code_review.updated"]}}},{"type":"object","description":"The server's internet reachability changed (it is the one talking to\nmodel vendors, so it owns this state). While offline, `/v1/models`\nlists only models that can run without internet (the managed `local`\nprovider and user-configured local endpoints); clients gate prompt\nentry on having usable models and announce recovery.\n`ServerInfo.online` carries the same\nstate for initial fetches.","required":["online","type"],"properties":{"online":{"type":"boolean"},"type":{"type":"string","enum":["server.connectivity_changed"]}}},{"type":"object","description":"The configured model used for asynchronous session and thread naming changed.\nCarries a full replacement snapshot for replay and reconnect.","required":["settings","type"],"properties":{"settings":{"$ref":"#/components/schemas/SessionNamingSettings"},"type":{"type":"string","enum":["settings.session_naming_updated"]}}},{"type":"object","description":"Legacy protocol 8.1-and-earlier naming lifecycle snapshot. Retained only\nso existing durable event logs remain decodable after upgrading.","required":["settings","type"],"properties":{"settings":{},"type":{"type":"string","enum":["settings.git_worktrees_updated"]}}},{"type":"object","description":"The persisted automated code-review execution deadlines changed.\nCarries a full replacement snapshot for replay and reconnect.","required":["settings","type"],"properties":{"settings":{"$ref":"#/components/schemas/CodeReviewSettings"},"type":{"type":"string","enum":["settings.code_review_updated"]}}},{"type":"object","description":"The concrete provider route selected for an automatic model. Another\nevent for the same turn records a safe failover to a different route.\nNew event variants are appended so generated validators retain stable\nidentifiers for the existing closed union.","required":["turn","model","provider_id","provider_model","reason","type"],"properties":{"model":{"type":"string"},"provider_id":{"type":"string"},"provider_model":{"type":"string"},"reason":{"$ref":"#/components/schemas/ModelRouteReason"},"turn":{"type":"integer","format":"int64","minimum":0},"type":{"type":"string","enum":["model.route_selected"]}}},{"type":"object","description":"The preference order used by provider-neutral model routing changed.\nCarries a full replacement snapshot for replay and reconnect.","required":["provider_order","type"],"properties":{"provider_order":{"type":"array","items":{"type":"string"}},"type":{"type":"string","enum":["settings.provider_order_updated"]}}}],"description":"Every event type in the log. Serialized with a `type` tag using\ndot-namespaced names, per the event-log design doc."};
+const schema171 = {"oneOf":[{"type":"object","description":"Legacy admission marker written before protocol 7.24. New\nservers retain this variant only to replay existing durable event logs.","required":["turn","wait_ms","background","type"],"properties":{"background":{"type":"boolean"},"turn":{"type":"integer","format":"int64","minimum":0},"type":{"type":"string","enum":["turn.capacity_acquired"]},"wait_ms":{"type":"integer","format":"int64","minimum":0}}},{"type":"object","description":"Provider admission is complete for this turn. `provider_wait_ms` is\ntime spent waiting for a shared throttling cooldown; zero means the\nturn was admitted immediately.","required":["turn","provider_wait_ms","type"],"properties":{"provider_wait_ms":{"type":"integer","format":"int64","minimum":0},"turn":{"type":"integer","format":"int64","minimum":0},"type":{"type":"string","enum":["turn.admitted"]}}},{"type":"object","required":["turn","mode","model","type"],"properties":{"mode":{"type":"string"},"model":{"type":"string"},"supports_steering":{"type":"boolean","description":"Whether the backend running this exact turn accepts additional\nuser input without cancelling or starting another turn."},"thinking_level":{"type":["string","null"],"description":"Effective provider-native thinking/reasoning selection for this\nturn after inherited defaults and model schema normalization."},"turn":{"type":"integer","format":"int64","minimum":0},"type":{"type":"string","enum":["turn.started"]}}},{"type":"object","description":"The transient activity label for a running turn changed. This updates\nthe existing activity row; it is not a transcript or tool-rail item.","required":["turn","phase","type"],"properties":{"phase":{"$ref":"#/components/schemas/TurnPhase"},"turn":{"type":"integer","format":"int64","minimum":0},"type":{"type":"string","enum":["turn.phase_changed"]}}},{"type":"object","description":"Live usage from the most recently completed model request in a running\nturn. Thread snapshots add its billing counters to `active_usage` while\nreplacing only the context fields. `last_usage` remains unchanged until\n`turn.completed` supplies the turn's final aggregates.","required":["turn","usage","type"],"properties":{"turn":{"type":"integer","format":"int64","minimum":0},"type":{"type":"string","enum":["turn.usage_updated"]},"usage":{"$ref":"#/components/schemas/Usage"}}},{"type":"object","required":["turn","usage","type"],"properties":{"checkpoint_id":{"oneOf":[{"type":"null"},{"$ref":"#/components/schemas/String"}]},"turn":{"type":"integer","format":"int64","minimum":0},"type":{"type":"string","enum":["turn.completed"]},"usage":{"$ref":"#/components/schemas/Usage"}}},{"type":"object","required":["turn","error","type"],"properties":{"error":{"type":"string"},"turn":{"type":"integer","format":"int64","minimum":0},"type":{"type":"string","enum":["turn.failed"]}}},{"type":"object","description":"The turn was interrupted by the user (via the cancel endpoint). Like\n`turn.failed` it pauses the queue, but it isn't an error condition.","required":["turn","type"],"properties":{"turn":{"type":"integer","format":"int64","minimum":0},"type":{"type":"string","enum":["turn.cancelled"]}}},{"type":"object","required":["turn","content","type"],"properties":{"attachments":{"type":"array","items":{"$ref":"#/components/schemas/Attachment"},"description":"Files the user attached to the prompt (bytes at\n`GET /v1/attachments/{id}`)."},"background":{"type":"boolean","description":"Legacy protocol 7.19–7.26 marker retained so existing durable logs\nremain replayable. New servers emit `turn.background_activity`\ninstead and leave this false for user-authored messages."},"content":{"type":"string"},"turn":{"type":"integer","format":"int64","minimum":0},"type":{"type":"string","enum":["user.message"]}}},{"type":"object","description":"The server attached a turn to vendor-autonomous agent activity. This is\ndeliberately distinct from `user.message`: no user authored a prompt.","required":["turn","type"],"properties":{"turn":{"type":"integer","format":"int64","minimum":0},"type":{"type":"string","enum":["turn.background_activity"]}}},{"type":"object","description":"Additional user input accepted by the backend while `turn` was still\nrunning. This belongs on the active turn's timeline and does not start\nor queue another turn.","required":["turn","content","type"],"properties":{"attachments":{"type":"array","items":{"$ref":"#/components/schemas/Attachment"}},"content":{"type":"string"},"turn":{"type":"integer","format":"int64","minimum":0},"type":{"type":"string","enum":["turn.steered"]}}},{"type":"object","description":"A child agent became part of this parent turn. The child transcript\nremains independently addressable while this durable boundary lets\nclients render and navigate the relationship from the parent rail.","required":["turn","thread_id","session_id","prompt","model","type"],"properties":{"call_id":{"oneOf":[{"type":"null"},{"$ref":"#/components/schemas/String","description":"The trouve spawn tool call represented by this node, when one\nexists. Provider-native collaborators do not have a parent tool\ncall. Clients may suppress the redundant spawn tool presentation."}]},"model":{"type":"string"},"prompt":{"type":"string"},"session_id":{"$ref":"#/components/schemas/String"},"thread_id":{"$ref":"#/components/schemas/String"},"turn":{"type":"integer","format":"int64","minimum":0},"type":{"type":"string","enum":["subagent.spawned"]}}},{"type":"object","description":"Streamed model output. Replaying all deltas of a turn reproduces the\nfinal message exactly.","required":["turn","text","type"],"properties":{"text":{"type":"string"},"turn":{"type":"integer","format":"int64","minimum":0},"type":{"type":"string","enum":["assistant.delta"]}}},{"type":"object","description":"Streamed user-facing progress authored by the agent harness. Progress\nis distinct from both model reasoning and answer text.","required":["turn","text","type"],"properties":{"text":{"type":"string"},"turn":{"type":"integer","format":"int64","minimum":0},"type":{"type":"string","enum":["assistant.progress"]}}},{"type":"object","description":"The harness explicitly closed the current progress item.","required":["turn","type"],"properties":{"turn":{"type":"integer","format":"int64","minimum":0},"type":{"type":"string","enum":["assistant.progress_completed"]}}},{"type":"object","description":"Streamed model reasoning (\"thinking\") text, where the provider\nexposes it. Display-only: never part of the provider transcript.\nThe id is present for identity-aware streams whose reasoning may span\ninterleaved tool events; legacy persisted events omit it.","required":["turn","text","type"],"properties":{"id":{"type":["string","null"]},"text":{"type":"string"},"turn":{"type":"integer","format":"int64","minimum":0},"type":{"type":"string","enum":["assistant.thinking"]}}},{"type":"object","description":"The provider explicitly closed the current streamed thinking item.\nThis boundary can arrive before the next visible assistant or tool\nevent, so clients must not infer it from subsequent output alone.","required":["turn","type"],"properties":{"id":{"type":["string","null"]},"turn":{"type":"integer","format":"int64","minimum":0},"type":{"type":"string","enum":["assistant.thinking_completed"]}}},{"type":"object","description":"Folded final assistant text for the turn.","required":["turn","content","type"],"properties":{"content":{"type":"string"},"turn":{"type":"integer","format":"int64","minimum":0},"type":{"type":"string","enum":["assistant.message"]}}},{"type":"object","description":"Durable files produced by the assistant or one of its tools. Bytes are\nserved through the same attachment endpoint as user uploads.","required":["turn","attachments","type"],"properties":{"attachments":{"type":"array","items":{"$ref":"#/components/schemas/Attachment"}},"call_id":{"oneOf":[{"type":"null"},{"$ref":"#/components/schemas/String"}]},"turn":{"type":"integer","format":"int64","minimum":0},"type":{"type":"string","enum":["assistant.artifacts"]}}},{"type":"object","required":["turn","call_id","tool","args","requires_approval","type"],"properties":{"args":{},"call_id":{"$ref":"#/components/schemas/String"},"requires_approval":{"type":"boolean"},"tool":{"type":"string"},"turn":{"type":"integer","format":"int64","minimum":0},"type":{"type":"string","enum":["tool.requested"]}}},{"type":"object","required":["turn","call_id","type"],"properties":{"call_id":{"$ref":"#/components/schemas/String"},"turn":{"type":"integer","format":"int64","minimum":0},"type":{"type":"string","enum":["approval.requested"]}}},{"type":"object","required":["call_id","decision","type"],"properties":{"call_id":{"$ref":"#/components/schemas/String"},"decision":{"$ref":"#/components/schemas/ApprovalDecision"},"type":{"type":"string","enum":["approval.resolved"]}}},{"type":"object","required":["call_id","type"],"properties":{"call_id":{"$ref":"#/components/schemas/String"},"type":{"type":"string","enum":["tool.started"]}}},{"type":"object","required":["call_id","chunk","type"],"properties":{"call_id":{"$ref":"#/components/schemas/String"},"chunk":{"type":"string"},"type":{"type":"string","enum":["tool.output"]}}},{"type":"object","required":["call_id","status","result","type"],"properties":{"call_id":{"$ref":"#/components/schemas/String"},"execution_duration_ms":{"type":["integer","null"],"format":"int64","description":"Time spent inside `ToolExecutor::execute`, measured with a\nmonotonic clock. Absent for older servers, denied calls, and\nprovider-owned tool calls that do not expose an execution span.","minimum":0},"result":{},"status":{"$ref":"#/components/schemas/ToolStatus"},"type":{"type":"string","enum":["tool.completed"]}}},{"type":"object","description":"The agent asked the user one or more questions; the turn is blocked\nuntil `question.resolved`. Clients render an answer wizard.","required":["turn","request_id","questions","type"],"properties":{"questions":{"type":"array","items":{"$ref":"#/components/schemas/Question"}},"request_id":{"$ref":"#/components/schemas/String"},"title":{"type":["string","null"]},"turn":{"type":"integer","format":"int64","minimum":0},"type":{"type":"string","enum":["question.requested"]}}},{"type":"object","description":"Answers submitted (or `answers: null` when the user skipped).","required":["request_id","type"],"properties":{"answers":{"type":["array","null"],"items":{"$ref":"#/components/schemas/QuestionAnswer"}},"request_id":{"$ref":"#/components/schemas/String"},"type":{"type":"string","enum":["question.resolved"]}}},{"type":"object","description":"The slash commands / skills the vendor harness currently accepts in\nprompts. Replaces any previously announced list for the thread.","required":["commands","type"],"properties":{"commands":{"type":"array","items":{"$ref":"#/components/schemas/CommandInfo"}},"type":{"type":"string","enum":["thread.commands_updated"]}}},{"type":"object","description":"The thread's queue of pending prompts changed (enqueue, edit,\nreorder, delete, or dispatch). Carries the full remaining queue in\nrun order; clients replace any previous list.","required":["prompts","type"],"properties":{"prompts":{"type":"array","items":{"$ref":"#/components/schemas/QueuedPrompt"}},"type":{"type":"string","enum":["thread.queue_updated"]}}},{"type":"object","description":"The thread's current todo snapshot changed. Historical `todo_write`\ntool calls remain in the stream; clients replace this snapshot.","required":["todos","type"],"properties":{"todos":{"type":"array","items":{"$ref":"#/components/schemas/TodoItem"}},"type":{"type":"string","enum":["thread.todos_updated"]}}},{"type":"object","description":"The thread's transcript neared the model's context window; the engine\nis summarizing older messages. Clients show a busy indicator.","required":["turn","type"],"properties":{"turn":{"type":"integer","format":"int64","minimum":0},"type":{"type":"string","enum":["thread.compaction_started"]}}},{"type":"object","required":["turn","messages_compacted","type"],"properties":{"messages_compacted":{"type":"integer","format":"int64","description":"Provider-transcript messages folded into the summary. Zero means\nan external harness reported the boundary without a message count.","minimum":0},"turn":{"type":"integer","format":"int64","minimum":0},"type":{"type":"string","enum":["thread.compaction_completed"]}}},{"type":"object","description":"A provider-owned compaction item terminated unsuccessfully. This is a\ndistinct terminal edge so clients can clear their busy state even when\nthe vendor turn continues producing ordinary output.","required":["turn","type"],"properties":{"turn":{"type":"integer","format":"int64","minimum":0},"type":{"type":"string","enum":["thread.compaction_failed"]}}},{"type":"object","required":["checkpoint_id","thread_id","turn","commit","type"],"properties":{"checkpoint_id":{"$ref":"#/components/schemas/String"},"commit":{"type":"string","description":"Git commit hash the checkpoint points at."},"thread_id":{"$ref":"#/components/schemas/String"},"turn":{"type":"integer","format":"int64","minimum":0},"type":{"type":"string","enum":["checkpoint.created"]}}},{"type":"object","required":["checkpoint_id","direction","type"],"properties":{"checkpoint_id":{"$ref":"#/components/schemas/String"},"direction":{"$ref":"#/components/schemas/RestoreDirection"},"type":{"type":"string","enum":["checkpoint.restored"]}}},{"type":"object","required":["path","branch","type"],"properties":{"branch":{"type":"string"},"path":{"type":"string"},"type":{"type":"string","enum":["worktree.created"]}}},{"type":"object","required":["path","branch","type"],"properties":{"branch":{"type":"string"},"path":{"type":"string"},"type":{"type":"string","enum":["worktree.removed"]}}},{"type":"object","description":"A router, reviewer, or coordinator task changed durable state.","required":["job_id","task","type"],"properties":{"job_id":{"type":"string"},"task":{"$ref":"#/components/schemas/CodeReviewTask"},"type":{"type":"string","enum":["code_review.task_updated"]}}},{"type":"object","description":"A compact task lifecycle/metrics snapshot changed while the task was\nrunning. Clients merge it into their retained task representation.","required":["job_id","task_id","progress","type"],"properties":{"job_id":{"type":"string"},"progress":{"$ref":"#/components/schemas/CodeReviewTaskProgress"},"task_id":{"type":"string"},"type":{"type":"string","enum":["code_review.task_progress_updated"]}}},{"type":"object","description":"The complete, durable persona-routing matrix was selected for a job.","required":["job_id","routing_decisions","type"],"properties":{"job_id":{"type":"string"},"routing_decisions":{"type":"array","items":{"$ref":"#/components/schemas/CodeReviewRoutingDecision"}},"type":{"type":"string","enum":["code_review.routing_updated"]}}},{"type":"object","description":"Live output projected from the disposable agent thread into durable\nreview history.","required":["job_id","task_id","stream","text","type"],"properties":{"job_id":{"type":"string"},"stream":{"$ref":"#/components/schemas/CodeReviewOutputStream"},"task_id":{"type":"string"},"text":{"type":"string"},"type":{"type":"string","enum":["code_review.output_delta"]}}},{"type":"object","description":"Reviewer-level progress changed. Coordinator/summary work is exposed\non its task but does not inflate the reviewer count.","required":["job_id","progress","type"],"properties":{"job_id":{"type":"string"},"progress":{"$ref":"#/components/schemas/CodeReviewProgress"},"type":{"type":"string","enum":["code_review.progress_updated"]}}},{"type":"object","description":"Other durable job state changed.","required":["job_id","type"],"properties":{"job_id":{"type":"string"},"type":{"type":"string","enum":["code_review.job_updated"]}}},{"type":"object","required":["workspace_id","path","type"],"properties":{"path":{"type":"string"},"type":{"type":"string","enum":["workspace.registered"]},"workspace_id":{"$ref":"#/components/schemas/String"}}},{"type":"object","description":"An account-centric PR-dashboard refresh completed for one GitHub\ninstance. Clients replace the previously folded host slice.","required":["pull_requests","type"],"properties":{"pull_requests":{"$ref":"#/components/schemas/GithubPrList"},"type":{"type":"string","enum":["github.pull_requests_updated"]}}},{"type":"object","required":["workspace_id","type"],"properties":{"type":{"type":"string","enum":["workspace.closed"]},"workspace_id":{"$ref":"#/components/schemas/String"}}},{"type":"object","required":["session_id","workspace_id","type"],"properties":{"session_id":{"$ref":"#/components/schemas/String"},"type":{"type":"string","enum":["session.created"]},"workspace_id":{"$ref":"#/components/schemas/String"}}},{"type":"object","required":["number","url","type"],"properties":{"number":{"type":"integer","format":"int64","minimum":0},"type":{"type":"string","enum":["session.pr_opened"]},"url":{"type":"string"}}},{"type":"object","description":"Legacy association emitted when a pull request browser URL appeared in\nsession chat. Current servers retain this variant only to replay old\nevent logs; mentions no longer create session PR associations.","required":["session_id","number","url","type"],"properties":{"number":{"type":"integer","format":"int64","minimum":0},"session_id":{"$ref":"#/components/schemas/String"},"type":{"type":"string","enum":["session.pr_mentioned"]},"url":{"type":"string","description":"Canonical browser URL supplied by chat. A number without repository\nidentity is not globally unique and does not emit this event."}}},{"type":"object","required":["session_id","workspace_id","type"],"properties":{"session_id":{"$ref":"#/components/schemas/String"},"type":{"type":"string","enum":["session.deleted"]},"workspace_id":{"$ref":"#/components/schemas/String"}}},{"type":"object","description":"Session metadata changed (rename / archive). Clients refetch.","required":["session_id","workspace_id","type"],"properties":{"session_id":{"$ref":"#/components/schemas/String"},"type":{"type":"string","enum":["session.updated"]},"workspace_id":{"$ref":"#/components/schemas/String"}}},{"type":"object","required":["thread_id","session_id","type"],"properties":{"session_id":{"$ref":"#/components/schemas/String"},"thread_id":{"$ref":"#/components/schemas/String"},"type":{"type":"string","enum":["thread.created"]}}},{"type":"object","description":"Thread settings changed (mode/model). Clients refetch.","required":["thread_id","session_id","type"],"properties":{"session_id":{"$ref":"#/components/schemas/String"},"thread_id":{"$ref":"#/components/schemas/String"},"type":{"type":"string","enum":["thread.updated"]}}},{"type":"object","description":"Transactionally derived status for one thread. Open and closed tabs can\nfold this server-scope event without opening a transcript SSE stream.","required":["status","type"],"properties":{"status":{"$ref":"#/components/schemas/ThreadStatus"},"type":{"type":"string","enum":["thread.status_updated"]}}},{"type":"object","description":"A session started or stopped actively processing prompts (one of its\nthreads began running turns, or the last active one went idle).\nDrives the activity indicator in session lists; `Session.active`\ncarries the same state for initial fetches.","required":["session_id","workspace_id","active","type"],"properties":{"active":{"type":"boolean"},"session_id":{"$ref":"#/components/schemas/String"},"type":{"type":"string","enum":["session.activity"]},"workspace_id":{"$ref":"#/components/schemas/String"}}},{"type":"object","description":"The server restarted while this session still had process-owned turn\nstate. Clients clear running/approval/question UI from the replacement\nsummary; those responders cannot survive the process that owned them.","required":["session_id","workspace_id","type"],"properties":{"session_id":{"$ref":"#/components/schemas/String"},"type":{"type":"string","enum":["session.recovered"]},"workspace_id":{"$ref":"#/components/schemas/String"}}},{"type":"object","description":"Transactionally derived aggregate state. `summary: null` is the\ndurable tombstone for a deleted session.","required":["session_id","summary","type"],"properties":{"session_id":{"$ref":"#/components/schemas/String"},"summary":{"oneOf":[{"type":"null"},{"$ref":"#/components/schemas/SessionSummary"}]},"type":{"type":"string","enum":["session.summary_updated"]}}},{"type":"object","description":"Compact durable edge for notifications about inactive/background\nthreads. It is appended transactionally after the replacement session\nsummary produced by the same source event.","required":["session_id","thread_id","kind","type"],"properties":{"detail":{"type":["string","null"],"description":"Optional native-equivalent failure excerpt or question subtitle."},"kind":{"$ref":"#/components/schemas/SessionNotificationKind"},"session_id":{"$ref":"#/components/schemas/String"},"thread_id":{"$ref":"#/components/schemas/String"},"type":{"type":"string","enum":["session.notification"]}}},{"type":"object","description":"A scheduled automation ran (or failed to). Clients refetch the\nautomations list — and the sessions list when it succeeded, since a\nrun creates a session.","required":["automation_id","type"],"properties":{"automation_id":{"type":"string"},"error":{"type":"string","description":"Failure reason (\"\" = success)."},"session_id":{"oneOf":[{"type":"null"},{"$ref":"#/components/schemas/String","description":"Session the run created (absent when the run failed)."}]},"type":{"type":"string","enum":["automation.fired"]}}},{"type":"object","description":"GitHub App configuration, repository policy, or a durable review job\nchanged. Clients refetch `/v1/code-review` and fold the replacement.","required":["type"],"properties":{"job_id":{"type":["string","null"]},"type":{"type":"string","enum":["code_review.updated"]}}},{"type":"object","description":"The server's internet reachability changed (it is the one talking to\nmodel vendors, so it owns this state). While offline, `/v1/models`\nlists only models that can run without internet (the managed `local`\nprovider and user-configured local endpoints); clients gate prompt\nentry on having usable models and announce recovery.\n`ServerInfo.online` carries the same\nstate for initial fetches.","required":["online","type"],"properties":{"online":{"type":"boolean"},"type":{"type":"string","enum":["server.connectivity_changed"]}}},{"type":"object","description":"The server-side model catalog changed: the public catalog\n(models.dev) became available or was lost, or a vendor-backed roster\n(Codex, Cursor) was rebuilt in the background. Nothing is bundled, so\nuntil the first successful download only local and vendor-only models\nexist and provider setup presets are limited to trouve's own\nintegrations; clients show a \"downloading\" state instead of \"no\nmodels\" while `available` is false and refetch the model catalog\n(`/v1/models` and the routed `/v1/model-routes`) on every\n`available: true` event. `ServerInfo.catalog_available` carries the\navailability for initial fetches.","required":["available","type"],"properties":{"available":{"type":"boolean"},"type":{"type":"string","enum":["server.model_catalog_changed"]}}},{"type":"object","description":"The configured model used for asynchronous session and thread naming changed.\nCarries a full replacement snapshot for replay and reconnect.","required":["settings","type"],"properties":{"settings":{"$ref":"#/components/schemas/SessionNamingSettings"},"type":{"type":"string","enum":["settings.session_naming_updated"]}}},{"type":"object","description":"Legacy protocol 8.1-and-earlier naming lifecycle snapshot. Retained only\nso existing durable event logs remain decodable after upgrading.","required":["settings","type"],"properties":{"settings":{},"type":{"type":"string","enum":["settings.git_worktrees_updated"]}}},{"type":"object","description":"The persisted automated code-review execution deadlines changed.\nCarries a full replacement snapshot for replay and reconnect.","required":["settings","type"],"properties":{"settings":{"$ref":"#/components/schemas/CodeReviewSettings"},"type":{"type":"string","enum":["settings.code_review_updated"]}}},{"type":"object","description":"The concrete provider route selected for an automatic model. Another\nevent for the same turn records a safe failover to a different route.\nNew event variants are appended so generated validators retain stable\nidentifiers for the existing closed union.","required":["turn","model","provider_id","provider_model","reason","type"],"properties":{"model":{"type":"string"},"provider_id":{"type":"string"},"provider_model":{"type":"string"},"reason":{"$ref":"#/components/schemas/ModelRouteReason"},"turn":{"type":"integer","format":"int64","minimum":0},"type":{"type":"string","enum":["model.route_selected"]}}},{"type":"object","description":"The preference order used by provider-neutral model routing changed.\nCarries a full replacement snapshot for replay and reconnect.","required":["provider_order","type"],"properties":{"provider_order":{"type":"array","items":{"type":"string"}},"type":{"type":"string","enum":["settings.provider_order_updated"]}}}],"description":"Every event type in the log. Serialized with a `type` tag using\ndot-namespaced names, per the event-log design doc."};
 const schema172 = {"type":"string","description":"Current user-visible activity for a running turn.","enum":["processing","connecting_tools","waiting_for_subagents"]};
 
 function validate380(data, {instancePath="", parentData, parentDataProperty, rootData=data, dynamicAnchors={}}={}){
@@ -26182,7 +26195,7 @@ const _errs495 = errors;
 if(errors === _errs495){
 if(data && typeof data == "object" && !Array.isArray(data)){
 let missing61;
-if(((data.settings === undefined) && (missing61 = "settings")) || ((data.type === undefined) && (missing61 = "type"))){
+if(((data.available === undefined) && (missing61 = "available")) || ((data.type === undefined) && (missing61 = "type"))){
 const err371 = {instancePath,schemaPath:"#/oneOf/61/required",keyword:"required",params:{missingProperty: missing61},message:"must have required property '"+missing61+"'"};
 if(vErrors === null){
 vErrors = [err371];
@@ -26193,11 +26206,17 @@ vErrors.push(err371);
 errors++;
 }
 else {
-if(data.settings !== undefined){
+if(data.available !== undefined){
 const _errs497 = errors;
-if(!(validate232(data.settings, {instancePath:instancePath+"/settings",parentData:data,parentDataProperty:"settings",rootData,dynamicAnchors}))){
-vErrors = vErrors === null ? validate232.errors : vErrors.concat(validate232.errors);
-errors = vErrors.length;
+if(typeof data.available !== "boolean"){
+const err372 = {instancePath:instancePath+"/available",schemaPath:"#/oneOf/61/properties/available/type",keyword:"type",params:{type: "boolean"},message:"must be boolean"};
+if(vErrors === null){
+vErrors = [err372];
+}
+else {
+vErrors.push(err372);
+}
+errors++;
 }
 var valid76 = _errs497 === errors;
 }
@@ -26207,19 +26226,9 @@ var valid76 = true;
 if(valid76){
 if(data.type !== undefined){
 let data207 = data.type;
-const _errs498 = errors;
+const _errs499 = errors;
 if(typeof data207 !== "string"){
-const err372 = {instancePath:instancePath+"/type",schemaPath:"#/oneOf/61/properties/type/type",keyword:"type",params:{type: "string"},message:"must be string"};
-if(vErrors === null){
-vErrors = [err372];
-}
-else {
-vErrors.push(err372);
-}
-errors++;
-}
-if(!(data207 === "settings.session_naming_updated")){
-const err373 = {instancePath:instancePath+"/type",schemaPath:"#/oneOf/61/properties/type/enum",keyword:"enum",params:{allowedValues: schema171.oneOf[61].properties.type.enum},message:"must be equal to one of the allowed values"};
+const err373 = {instancePath:instancePath+"/type",schemaPath:"#/oneOf/61/properties/type/type",keyword:"type",params:{type: "string"},message:"must be string"};
 if(vErrors === null){
 vErrors = [err373];
 }
@@ -26228,7 +26237,17 @@ vErrors.push(err373);
 }
 errors++;
 }
-var valid76 = _errs498 === errors;
+if(!(data207 === "server.model_catalog_changed")){
+const err374 = {instancePath:instancePath+"/type",schemaPath:"#/oneOf/61/properties/type/enum",keyword:"enum",params:{allowedValues: schema171.oneOf[61].properties.type.enum},message:"must be equal to one of the allowed values"};
+if(vErrors === null){
+vErrors = [err374];
+}
+else {
+vErrors.push(err374);
+}
+errors++;
+}
+var valid76 = _errs499 === errors;
 }
 else {
 var valid76 = true;
@@ -26237,12 +26256,12 @@ var valid76 = true;
 }
 }
 else {
-const err374 = {instancePath,schemaPath:"#/oneOf/61/type",keyword:"type",params:{type: "object"},message:"must be object"};
+const err375 = {instancePath,schemaPath:"#/oneOf/61/type",keyword:"type",params:{type: "object"},message:"must be object"};
 if(vErrors === null){
-vErrors = [err374];
+vErrors = [err375];
 }
 else {
-vErrors.push(err374);
+vErrors.push(err375);
 }
 errors++;
 }
@@ -26258,29 +26277,16 @@ valid0 = true;
 passing0 = 61;
 if(props0 !== true){
 props0 = props0 || {};
-props0.settings = true;
+props0.available = true;
 props0.type = true;
 }
 }
-const _errs500 = errors;
-if(errors === _errs500){
+const _errs501 = errors;
+if(errors === _errs501){
 if(data && typeof data == "object" && !Array.isArray(data)){
 let missing62;
 if(((data.settings === undefined) && (missing62 = "settings")) || ((data.type === undefined) && (missing62 = "type"))){
-const err375 = {instancePath,schemaPath:"#/oneOf/62/required",keyword:"required",params:{missingProperty: missing62},message:"must have required property '"+missing62+"'"};
-if(vErrors === null){
-vErrors = [err375];
-}
-else {
-vErrors.push(err375);
-}
-errors++;
-}
-else {
-if(data.type !== undefined){
-let data208 = data.type;
-if(typeof data208 !== "string"){
-const err376 = {instancePath:instancePath+"/type",schemaPath:"#/oneOf/62/properties/type/type",keyword:"type",params:{type: "string"},message:"must be string"};
+const err376 = {instancePath,schemaPath:"#/oneOf/62/required",keyword:"required",params:{missingProperty: missing62},message:"must have required property '"+missing62+"'"};
 if(vErrors === null){
 vErrors = [err376];
 }
@@ -26289,8 +26295,24 @@ vErrors.push(err376);
 }
 errors++;
 }
-if(!(data208 === "settings.git_worktrees_updated")){
-const err377 = {instancePath:instancePath+"/type",schemaPath:"#/oneOf/62/properties/type/enum",keyword:"enum",params:{allowedValues: schema171.oneOf[62].properties.type.enum},message:"must be equal to one of the allowed values"};
+else {
+if(data.settings !== undefined){
+const _errs503 = errors;
+if(!(validate232(data.settings, {instancePath:instancePath+"/settings",parentData:data,parentDataProperty:"settings",rootData,dynamicAnchors}))){
+vErrors = vErrors === null ? validate232.errors : vErrors.concat(validate232.errors);
+errors = vErrors.length;
+}
+var valid77 = _errs503 === errors;
+}
+else {
+var valid77 = true;
+}
+if(valid77){
+if(data.type !== undefined){
+let data209 = data.type;
+const _errs504 = errors;
+if(typeof data209 !== "string"){
+const err377 = {instancePath:instancePath+"/type",schemaPath:"#/oneOf/62/properties/type/type",keyword:"type",params:{type: "string"},message:"must be string"};
 if(vErrors === null){
 vErrors = [err377];
 }
@@ -26299,11 +26321,8 @@ vErrors.push(err377);
 }
 errors++;
 }
-}
-}
-}
-else {
-const err378 = {instancePath,schemaPath:"#/oneOf/62/type",keyword:"type",params:{type: "object"},message:"must be object"};
+if(!(data209 === "settings.session_naming_updated")){
+const err378 = {instancePath:instancePath+"/type",schemaPath:"#/oneOf/62/properties/type/enum",keyword:"enum",params:{allowedValues: schema171.oneOf[62].properties.type.enum},message:"must be equal to one of the allowed values"};
 if(vErrors === null){
 vErrors = [err378];
 }
@@ -26312,8 +26331,26 @@ vErrors.push(err378);
 }
 errors++;
 }
+var valid77 = _errs504 === errors;
 }
-var _valid0 = _errs500 === errors;
+else {
+var valid77 = true;
+}
+}
+}
+}
+else {
+const err379 = {instancePath,schemaPath:"#/oneOf/62/type",keyword:"type",params:{type: "object"},message:"must be object"};
+if(vErrors === null){
+vErrors = [err379];
+}
+else {
+vErrors.push(err379);
+}
+errors++;
+}
+}
+var _valid0 = _errs501 === errors;
 if(_valid0 && valid0){
 valid0 = false;
 passing0 = [passing0, 62];
@@ -26328,38 +26365,12 @@ props0.settings = true;
 props0.type = true;
 }
 }
-const _errs504 = errors;
-if(errors === _errs504){
+const _errs506 = errors;
+if(errors === _errs506){
 if(data && typeof data == "object" && !Array.isArray(data)){
 let missing63;
 if(((data.settings === undefined) && (missing63 = "settings")) || ((data.type === undefined) && (missing63 = "type"))){
-const err379 = {instancePath,schemaPath:"#/oneOf/63/required",keyword:"required",params:{missingProperty: missing63},message:"must have required property '"+missing63+"'"};
-if(vErrors === null){
-vErrors = [err379];
-}
-else {
-vErrors.push(err379);
-}
-errors++;
-}
-else {
-if(data.settings !== undefined){
-const _errs506 = errors;
-if(!(validate470(data.settings, {instancePath:instancePath+"/settings",parentData:data,parentDataProperty:"settings",rootData,dynamicAnchors}))){
-vErrors = vErrors === null ? validate470.errors : vErrors.concat(validate470.errors);
-errors = vErrors.length;
-}
-var valid78 = _errs506 === errors;
-}
-else {
-var valid78 = true;
-}
-if(valid78){
-if(data.type !== undefined){
-let data210 = data.type;
-const _errs507 = errors;
-if(typeof data210 !== "string"){
-const err380 = {instancePath:instancePath+"/type",schemaPath:"#/oneOf/63/properties/type/type",keyword:"type",params:{type: "string"},message:"must be string"};
+const err380 = {instancePath,schemaPath:"#/oneOf/63/required",keyword:"required",params:{missingProperty: missing63},message:"must have required property '"+missing63+"'"};
 if(vErrors === null){
 vErrors = [err380];
 }
@@ -26368,8 +26379,11 @@ vErrors.push(err380);
 }
 errors++;
 }
-if(!(data210 === "settings.code_review_updated")){
-const err381 = {instancePath:instancePath+"/type",schemaPath:"#/oneOf/63/properties/type/enum",keyword:"enum",params:{allowedValues: schema171.oneOf[63].properties.type.enum},message:"must be equal to one of the allowed values"};
+else {
+if(data.type !== undefined){
+let data210 = data.type;
+if(typeof data210 !== "string"){
+const err381 = {instancePath:instancePath+"/type",schemaPath:"#/oneOf/63/properties/type/type",keyword:"type",params:{type: "string"},message:"must be string"};
 if(vErrors === null){
 vErrors = [err381];
 }
@@ -26378,16 +26392,8 @@ vErrors.push(err381);
 }
 errors++;
 }
-var valid78 = _errs507 === errors;
-}
-else {
-var valid78 = true;
-}
-}
-}
-}
-else {
-const err382 = {instancePath,schemaPath:"#/oneOf/63/type",keyword:"type",params:{type: "object"},message:"must be object"};
+if(!(data210 === "settings.git_worktrees_updated")){
+const err382 = {instancePath:instancePath+"/type",schemaPath:"#/oneOf/63/properties/type/enum",keyword:"enum",params:{allowedValues: schema171.oneOf[63].properties.type.enum},message:"must be equal to one of the allowed values"};
 if(vErrors === null){
 vErrors = [err382];
 }
@@ -26397,7 +26403,20 @@ vErrors.push(err382);
 errors++;
 }
 }
-var _valid0 = _errs504 === errors;
+}
+}
+else {
+const err383 = {instancePath,schemaPath:"#/oneOf/63/type",keyword:"type",params:{type: "object"},message:"must be object"};
+if(vErrors === null){
+vErrors = [err383];
+}
+else {
+vErrors.push(err383);
+}
+errors++;
+}
+}
+var _valid0 = _errs506 === errors;
 if(_valid0 && valid0){
 valid0 = false;
 passing0 = [passing0, 63];
@@ -26412,25 +26431,12 @@ props0.settings = true;
 props0.type = true;
 }
 }
-const _errs509 = errors;
-if(errors === _errs509){
+const _errs510 = errors;
+if(errors === _errs510){
 if(data && typeof data == "object" && !Array.isArray(data)){
 let missing64;
-if(((((((data.turn === undefined) && (missing64 = "turn")) || ((data.model === undefined) && (missing64 = "model"))) || ((data.provider_id === undefined) && (missing64 = "provider_id"))) || ((data.provider_model === undefined) && (missing64 = "provider_model"))) || ((data.reason === undefined) && (missing64 = "reason"))) || ((data.type === undefined) && (missing64 = "type"))){
-const err383 = {instancePath,schemaPath:"#/oneOf/64/required",keyword:"required",params:{missingProperty: missing64},message:"must have required property '"+missing64+"'"};
-if(vErrors === null){
-vErrors = [err383];
-}
-else {
-vErrors.push(err383);
-}
-errors++;
-}
-else {
-if(data.model !== undefined){
-const _errs511 = errors;
-if(typeof data.model !== "string"){
-const err384 = {instancePath:instancePath+"/model",schemaPath:"#/oneOf/64/properties/model/type",keyword:"type",params:{type: "string"},message:"must be string"};
+if(((data.settings === undefined) && (missing64 = "settings")) || ((data.type === undefined) && (missing64 = "type"))){
+const err384 = {instancePath,schemaPath:"#/oneOf/64/required",keyword:"required",params:{missingProperty: missing64},message:"must have required property '"+missing64+"'"};
 if(vErrors === null){
 vErrors = [err384];
 }
@@ -26439,16 +26445,24 @@ vErrors.push(err384);
 }
 errors++;
 }
-var valid79 = _errs511 === errors;
+else {
+if(data.settings !== undefined){
+const _errs512 = errors;
+if(!(validate470(data.settings, {instancePath:instancePath+"/settings",parentData:data,parentDataProperty:"settings",rootData,dynamicAnchors}))){
+vErrors = vErrors === null ? validate470.errors : vErrors.concat(validate470.errors);
+errors = vErrors.length;
+}
+var valid79 = _errs512 === errors;
 }
 else {
 var valid79 = true;
 }
 if(valid79){
-if(data.provider_id !== undefined){
+if(data.type !== undefined){
+let data212 = data.type;
 const _errs513 = errors;
-if(typeof data.provider_id !== "string"){
-const err385 = {instancePath:instancePath+"/provider_id",schemaPath:"#/oneOf/64/properties/provider_id/type",keyword:"type",params:{type: "string"},message:"must be string"};
+if(typeof data212 !== "string"){
+const err385 = {instancePath:instancePath+"/type",schemaPath:"#/oneOf/64/properties/type/type",keyword:"type",params:{type: "string"},message:"must be string"};
 if(vErrors === null){
 vErrors = [err385];
 }
@@ -26457,16 +26471,8 @@ vErrors.push(err385);
 }
 errors++;
 }
-var valid79 = _errs513 === errors;
-}
-else {
-var valid79 = true;
-}
-if(valid79){
-if(data.provider_model !== undefined){
-const _errs515 = errors;
-if(typeof data.provider_model !== "string"){
-const err386 = {instancePath:instancePath+"/provider_model",schemaPath:"#/oneOf/64/properties/provider_model/type",keyword:"type",params:{type: "string"},message:"must be string"};
+if(!(data212 === "settings.code_review_updated")){
+const err386 = {instancePath:instancePath+"/type",schemaPath:"#/oneOf/64/properties/type/enum",keyword:"enum",params:{allowedValues: schema171.oneOf[64].properties.type.enum},message:"must be equal to one of the allowed values"};
 if(vErrors === null){
 vErrors = [err386];
 }
@@ -26475,29 +26481,16 @@ vErrors.push(err386);
 }
 errors++;
 }
-var valid79 = _errs515 === errors;
+var valid79 = _errs513 === errors;
 }
 else {
 var valid79 = true;
 }
-if(valid79){
-if(data.reason !== undefined){
-const _errs517 = errors;
-if(!(validate472(data.reason, {instancePath:instancePath+"/reason",parentData:data,parentDataProperty:"reason",rootData,dynamicAnchors}))){
-vErrors = vErrors === null ? validate472.errors : vErrors.concat(validate472.errors);
-errors = vErrors.length;
 }
-var valid79 = _errs517 === errors;
+}
 }
 else {
-var valid79 = true;
-}
-if(valid79){
-if(data.turn !== undefined){
-let data215 = data.turn;
-const _errs518 = errors;
-if(!((typeof data215 == "number") && (!(data215 % 1) && !isNaN(data215)))){
-const err387 = {instancePath:instancePath+"/turn",schemaPath:"#/oneOf/64/properties/turn/type",keyword:"type",params:{type: "integer"},message:"must be integer"};
+const err387 = {instancePath,schemaPath:"#/oneOf/64/type",keyword:"type",params:{type: "object"},message:"must be object"};
 if(vErrors === null){
 vErrors = [err387];
 }
@@ -26506,73 +26499,8 @@ vErrors.push(err387);
 }
 errors++;
 }
-if(errors === _errs518){
-if(typeof data215 == "number"){
-if(data215 < 0 || isNaN(data215)){
-const err388 = {instancePath:instancePath+"/turn",schemaPath:"#/oneOf/64/properties/turn/minimum",keyword:"minimum",params:{comparison: ">=", limit: 0},message:"must be >= 0"};
-if(vErrors === null){
-vErrors = [err388];
 }
-else {
-vErrors.push(err388);
-}
-errors++;
-}
-}
-}
-var valid79 = _errs518 === errors;
-}
-else {
-var valid79 = true;
-}
-if(valid79){
-if(data.type !== undefined){
-let data216 = data.type;
-const _errs520 = errors;
-if(typeof data216 !== "string"){
-const err389 = {instancePath:instancePath+"/type",schemaPath:"#/oneOf/64/properties/type/type",keyword:"type",params:{type: "string"},message:"must be string"};
-if(vErrors === null){
-vErrors = [err389];
-}
-else {
-vErrors.push(err389);
-}
-errors++;
-}
-if(!(data216 === "model.route_selected")){
-const err390 = {instancePath:instancePath+"/type",schemaPath:"#/oneOf/64/properties/type/enum",keyword:"enum",params:{allowedValues: schema171.oneOf[64].properties.type.enum},message:"must be equal to one of the allowed values"};
-if(vErrors === null){
-vErrors = [err390];
-}
-else {
-vErrors.push(err390);
-}
-errors++;
-}
-var valid79 = _errs520 === errors;
-}
-else {
-var valid79 = true;
-}
-}
-}
-}
-}
-}
-}
-}
-else {
-const err391 = {instancePath,schemaPath:"#/oneOf/64/type",keyword:"type",params:{type: "object"},message:"must be object"};
-if(vErrors === null){
-vErrors = [err391];
-}
-else {
-vErrors.push(err391);
-}
-errors++;
-}
-}
-var _valid0 = _errs509 === errors;
+var _valid0 = _errs510 === errors;
 if(_valid0 && valid0){
 valid0 = false;
 passing0 = [passing0, 64];
@@ -26583,20 +26511,96 @@ valid0 = true;
 passing0 = 64;
 if(props0 !== true){
 props0 = props0 || {};
-props0.model = true;
-props0.provider_id = true;
-props0.provider_model = true;
-props0.reason = true;
-props0.turn = true;
+props0.settings = true;
 props0.type = true;
 }
 }
-const _errs522 = errors;
-if(errors === _errs522){
+const _errs515 = errors;
+if(errors === _errs515){
 if(data && typeof data == "object" && !Array.isArray(data)){
 let missing65;
-if(((data.provider_order === undefined) && (missing65 = "provider_order")) || ((data.type === undefined) && (missing65 = "type"))){
-const err392 = {instancePath,schemaPath:"#/oneOf/65/required",keyword:"required",params:{missingProperty: missing65},message:"must have required property '"+missing65+"'"};
+if(((((((data.turn === undefined) && (missing65 = "turn")) || ((data.model === undefined) && (missing65 = "model"))) || ((data.provider_id === undefined) && (missing65 = "provider_id"))) || ((data.provider_model === undefined) && (missing65 = "provider_model"))) || ((data.reason === undefined) && (missing65 = "reason"))) || ((data.type === undefined) && (missing65 = "type"))){
+const err388 = {instancePath,schemaPath:"#/oneOf/65/required",keyword:"required",params:{missingProperty: missing65},message:"must have required property '"+missing65+"'"};
+if(vErrors === null){
+vErrors = [err388];
+}
+else {
+vErrors.push(err388);
+}
+errors++;
+}
+else {
+if(data.model !== undefined){
+const _errs517 = errors;
+if(typeof data.model !== "string"){
+const err389 = {instancePath:instancePath+"/model",schemaPath:"#/oneOf/65/properties/model/type",keyword:"type",params:{type: "string"},message:"must be string"};
+if(vErrors === null){
+vErrors = [err389];
+}
+else {
+vErrors.push(err389);
+}
+errors++;
+}
+var valid80 = _errs517 === errors;
+}
+else {
+var valid80 = true;
+}
+if(valid80){
+if(data.provider_id !== undefined){
+const _errs519 = errors;
+if(typeof data.provider_id !== "string"){
+const err390 = {instancePath:instancePath+"/provider_id",schemaPath:"#/oneOf/65/properties/provider_id/type",keyword:"type",params:{type: "string"},message:"must be string"};
+if(vErrors === null){
+vErrors = [err390];
+}
+else {
+vErrors.push(err390);
+}
+errors++;
+}
+var valid80 = _errs519 === errors;
+}
+else {
+var valid80 = true;
+}
+if(valid80){
+if(data.provider_model !== undefined){
+const _errs521 = errors;
+if(typeof data.provider_model !== "string"){
+const err391 = {instancePath:instancePath+"/provider_model",schemaPath:"#/oneOf/65/properties/provider_model/type",keyword:"type",params:{type: "string"},message:"must be string"};
+if(vErrors === null){
+vErrors = [err391];
+}
+else {
+vErrors.push(err391);
+}
+errors++;
+}
+var valid80 = _errs521 === errors;
+}
+else {
+var valid80 = true;
+}
+if(valid80){
+if(data.reason !== undefined){
+const _errs523 = errors;
+if(!(validate472(data.reason, {instancePath:instancePath+"/reason",parentData:data,parentDataProperty:"reason",rootData,dynamicAnchors}))){
+vErrors = vErrors === null ? validate472.errors : vErrors.concat(validate472.errors);
+errors = vErrors.length;
+}
+var valid80 = _errs523 === errors;
+}
+else {
+var valid80 = true;
+}
+if(valid80){
+if(data.turn !== undefined){
+let data217 = data.turn;
+const _errs524 = errors;
+if(!((typeof data217 == "number") && (!(data217 % 1) && !isNaN(data217)))){
+const err392 = {instancePath:instancePath+"/turn",schemaPath:"#/oneOf/65/properties/turn/type",keyword:"type",params:{type: "integer"},message:"must be integer"};
 if(vErrors === null){
 vErrors = [err392];
 }
@@ -26605,18 +26609,10 @@ vErrors.push(err392);
 }
 errors++;
 }
-else {
-if(data.provider_order !== undefined){
-let data217 = data.provider_order;
-const _errs524 = errors;
 if(errors === _errs524){
-if(Array.isArray(data217)){
-var valid81 = true;
-const len9 = data217.length;
-for(let i9=0; i9<len9; i9++){
-const _errs526 = errors;
-if(typeof data217[i9] !== "string"){
-const err393 = {instancePath:instancePath+"/provider_order/" + i9,schemaPath:"#/oneOf/65/properties/provider_order/items/type",keyword:"type",params:{type: "string"},message:"must be string"};
+if(typeof data217 == "number"){
+if(data217 < 0 || isNaN(data217)){
+const err393 = {instancePath:instancePath+"/turn",schemaPath:"#/oneOf/65/properties/turn/minimum",keyword:"minimum",params:{comparison: ">=", limit: 0},message:"must be >= 0"};
 if(vErrors === null){
 vErrors = [err393];
 }
@@ -26625,21 +26621,6 @@ vErrors.push(err393);
 }
 errors++;
 }
-var valid81 = _errs526 === errors;
-if(!valid81){
-break;
-}
-}
-}
-else {
-const err394 = {instancePath:instancePath+"/provider_order",schemaPath:"#/oneOf/65/properties/provider_order/type",keyword:"type",params:{type: "array"},message:"must be array"};
-if(vErrors === null){
-vErrors = [err394];
-}
-else {
-vErrors.push(err394);
-}
-errors++;
 }
 }
 var valid80 = _errs524 === errors;
@@ -26649,10 +26630,20 @@ var valid80 = true;
 }
 if(valid80){
 if(data.type !== undefined){
-let data219 = data.type;
-const _errs528 = errors;
-if(typeof data219 !== "string"){
-const err395 = {instancePath:instancePath+"/type",schemaPath:"#/oneOf/65/properties/type/type",keyword:"type",params:{type: "string"},message:"must be string"};
+let data218 = data.type;
+const _errs526 = errors;
+if(typeof data218 !== "string"){
+const err394 = {instancePath:instancePath+"/type",schemaPath:"#/oneOf/65/properties/type/type",keyword:"type",params:{type: "string"},message:"must be string"};
+if(vErrors === null){
+vErrors = [err394];
+}
+else {
+vErrors.push(err394);
+}
+errors++;
+}
+if(!(data218 === "model.route_selected")){
+const err395 = {instancePath:instancePath+"/type",schemaPath:"#/oneOf/65/properties/type/enum",keyword:"enum",params:{allowedValues: schema171.oneOf[65].properties.type.enum},message:"must be equal to one of the allowed values"};
 if(vErrors === null){
 vErrors = [err395];
 }
@@ -26661,8 +26652,20 @@ vErrors.push(err395);
 }
 errors++;
 }
-if(!(data219 === "settings.provider_order_updated")){
-const err396 = {instancePath:instancePath+"/type",schemaPath:"#/oneOf/65/properties/type/enum",keyword:"enum",params:{allowedValues: schema171.oneOf[65].properties.type.enum},message:"must be equal to one of the allowed values"};
+var valid80 = _errs526 === errors;
+}
+else {
+var valid80 = true;
+}
+}
+}
+}
+}
+}
+}
+}
+else {
+const err396 = {instancePath,schemaPath:"#/oneOf/65/type",keyword:"type",params:{type: "object"},message:"must be object"};
 if(vErrors === null){
 vErrors = [err396];
 }
@@ -26671,26 +26674,8 @@ vErrors.push(err396);
 }
 errors++;
 }
-var valid80 = _errs528 === errors;
 }
-else {
-var valid80 = true;
-}
-}
-}
-}
-else {
-const err397 = {instancePath,schemaPath:"#/oneOf/65/type",keyword:"type",params:{type: "object"},message:"must be object"};
-if(vErrors === null){
-vErrors = [err397];
-}
-else {
-vErrors.push(err397);
-}
-errors++;
-}
-}
-var _valid0 = _errs522 === errors;
+var _valid0 = _errs515 === errors;
 if(_valid0 && valid0){
 valid0 = false;
 passing0 = [passing0, 65];
@@ -26699,6 +26684,124 @@ else {
 if(_valid0){
 valid0 = true;
 passing0 = 65;
+if(props0 !== true){
+props0 = props0 || {};
+props0.model = true;
+props0.provider_id = true;
+props0.provider_model = true;
+props0.reason = true;
+props0.turn = true;
+props0.type = true;
+}
+}
+const _errs528 = errors;
+if(errors === _errs528){
+if(data && typeof data == "object" && !Array.isArray(data)){
+let missing66;
+if(((data.provider_order === undefined) && (missing66 = "provider_order")) || ((data.type === undefined) && (missing66 = "type"))){
+const err397 = {instancePath,schemaPath:"#/oneOf/66/required",keyword:"required",params:{missingProperty: missing66},message:"must have required property '"+missing66+"'"};
+if(vErrors === null){
+vErrors = [err397];
+}
+else {
+vErrors.push(err397);
+}
+errors++;
+}
+else {
+if(data.provider_order !== undefined){
+let data219 = data.provider_order;
+const _errs530 = errors;
+if(errors === _errs530){
+if(Array.isArray(data219)){
+var valid82 = true;
+const len9 = data219.length;
+for(let i9=0; i9<len9; i9++){
+const _errs532 = errors;
+if(typeof data219[i9] !== "string"){
+const err398 = {instancePath:instancePath+"/provider_order/" + i9,schemaPath:"#/oneOf/66/properties/provider_order/items/type",keyword:"type",params:{type: "string"},message:"must be string"};
+if(vErrors === null){
+vErrors = [err398];
+}
+else {
+vErrors.push(err398);
+}
+errors++;
+}
+var valid82 = _errs532 === errors;
+if(!valid82){
+break;
+}
+}
+}
+else {
+const err399 = {instancePath:instancePath+"/provider_order",schemaPath:"#/oneOf/66/properties/provider_order/type",keyword:"type",params:{type: "array"},message:"must be array"};
+if(vErrors === null){
+vErrors = [err399];
+}
+else {
+vErrors.push(err399);
+}
+errors++;
+}
+}
+var valid81 = _errs530 === errors;
+}
+else {
+var valid81 = true;
+}
+if(valid81){
+if(data.type !== undefined){
+let data221 = data.type;
+const _errs534 = errors;
+if(typeof data221 !== "string"){
+const err400 = {instancePath:instancePath+"/type",schemaPath:"#/oneOf/66/properties/type/type",keyword:"type",params:{type: "string"},message:"must be string"};
+if(vErrors === null){
+vErrors = [err400];
+}
+else {
+vErrors.push(err400);
+}
+errors++;
+}
+if(!(data221 === "settings.provider_order_updated")){
+const err401 = {instancePath:instancePath+"/type",schemaPath:"#/oneOf/66/properties/type/enum",keyword:"enum",params:{allowedValues: schema171.oneOf[66].properties.type.enum},message:"must be equal to one of the allowed values"};
+if(vErrors === null){
+vErrors = [err401];
+}
+else {
+vErrors.push(err401);
+}
+errors++;
+}
+var valid81 = _errs534 === errors;
+}
+else {
+var valid81 = true;
+}
+}
+}
+}
+else {
+const err402 = {instancePath,schemaPath:"#/oneOf/66/type",keyword:"type",params:{type: "object"},message:"must be object"};
+if(vErrors === null){
+vErrors = [err402];
+}
+else {
+vErrors.push(err402);
+}
+errors++;
+}
+}
+var _valid0 = _errs528 === errors;
+if(_valid0 && valid0){
+valid0 = false;
+passing0 = [passing0, 66];
+}
+else {
+if(_valid0){
+valid0 = true;
+passing0 = 66;
 if(props0 !== true){
 props0 = props0 || {};
 props0.provider_order = true;
@@ -26770,13 +26873,14 @@ props0.type = true;
 }
 }
 }
+}
 if(!valid0){
-const err398 = {instancePath,schemaPath:"#/oneOf",keyword:"oneOf",params:{passingSchemas: passing0},message:"must match exactly one schema in oneOf"};
+const err403 = {instancePath,schemaPath:"#/oneOf",keyword:"oneOf",params:{passingSchemas: passing0},message:"must match exactly one schema in oneOf"};
 if(vErrors === null){
-vErrors = [err398];
+vErrors = [err403];
 }
 else {
-vErrors.push(err398);
+vErrors.push(err403);
 }
 errors++;
 validate379.errors = vErrors;
@@ -27792,6 +27896,7 @@ export const knownEventTypes = Object.freeze([
   "automation.fired",
   "code_review.updated",
   "server.connectivity_changed",
+  "server.model_catalog_changed",
   "settings.session_naming_updated",
   "settings.git_worktrees_updated",
   "settings.code_review_updated",

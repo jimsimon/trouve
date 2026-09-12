@@ -110,6 +110,8 @@ const PENDING_TURN_CAP: usize = 64;
 /// The shared Bridge is expensive enough to reap when the backend stays idle.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const REAP_INTERVAL: Duration = Duration::from_secs(60);
+/// Trouve-owned catalog provider whose roster this backend refreshes.
+const CURSOR_CATALOG_PROVIDER: &str = "cursor";
 
 pub struct CursorBackend {
     id: String,
@@ -135,7 +137,7 @@ impl CursorBackend {
             api_key,
             state_root,
             pool: Arc::new(BridgePool::default()),
-            catalog: Arc::new(ModelsDevCatalog::embedded()),
+            catalog: Arc::new(ModelsDevCatalog::empty()),
             dashboard_base: DASHBOARD_BASE.into(),
             legacy_cli_migration_required: false,
         }
@@ -181,6 +183,58 @@ impl CursorBackend {
             .clone()
             .or_else(|| std::env::var("CURSOR_API_KEY").ok())
             .filter(|key| !key.trim().is_empty())
+    }
+
+    /// Ask Cursor Cloud for the account's model list through a short-lived
+    /// Bridge process. `SdkCursorService` needs no agent or workspace, so
+    /// this bypasses the turn pool: it runs once per catalog TTL and must
+    /// never wait on, or be waited on by, a turn. Startup and the RPC carry
+    /// their own deadlines, and the process is reaped on every exit path.
+    async fn list_models_via_bridge(
+        &self,
+        api_key: &str,
+        cancel: &CancellationToken,
+    ) -> Result<Value, BackendError> {
+        let state_dir = self.state_root.join("roster");
+        create_private_dir(&state_dir)?;
+        let callback = CallbackRouter::start(local_http_client()?).await?;
+        let closing = CancellationToken::new();
+        let events = BackendEventSender::detached();
+        let request = BridgeProcessRequest {
+            command: &self.command,
+            worktree: &state_dir,
+            state_dir: &state_dir,
+            resume_agent_id: None,
+            api_key,
+            cancel,
+            events: &events,
+        };
+        // `BridgeProcess::start` reaps the child itself on every failure,
+        // including its startup timeout; once it has returned, `shutdown` is
+        // the single reaping path and runs after the RPC regardless of
+        // outcome (`unary` enforces the RPC deadline).
+        let result = match BridgeProcess::start(&request, &callback, &closing).await {
+            Ok(mut bridge) => {
+                let models = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => Err(BackendError::Cancelled),
+                    models = bridge.client.unary(
+                        "SdkCursorService",
+                        "ListModels",
+                        json!({ "options": { "apiKey": api_key } }),
+                    ) => models,
+                };
+                if let Err(error) = bridge.shutdown().await {
+                    tracing::debug!("Cursor SDK Bridge roster process shutdown failed: {error}");
+                }
+                models
+            }
+            Err(error) => Err(error),
+        };
+        if let Err(error) = callback.stop().await {
+            tracing::debug!("Cursor callback router shutdown failed: {error}");
+        }
+        result
     }
 
     /// Ask the dashboard for the current billing period's usage (and, best
@@ -334,7 +388,7 @@ impl AgentBackend for CursorBackend {
 
     fn models(&self) -> Vec<ModelInfo> {
         self.catalog
-            .provider_models("cursor", &self.id, OptionsDialect::ClaudeCli)
+            .provider_models(CURSOR_CATALOG_PROVIDER, &self.id, OptionsDialect::ClaudeCli)
             .into_iter()
             .map(|mut model| {
                 model.input_price_per_mtok = None;
@@ -342,6 +396,44 @@ impl AgentBackend for CursorBackend {
                 model
             })
             .collect()
+    }
+
+    /// Rebuild the persisted `cursor` roster from `ListModels` when the
+    /// catalog's TTL says it is stale. `models()` keeps reading the catalog.
+    async fn refresh_model_roster(&self, cancel: &CancellationToken) -> Result<bool, BackendError> {
+        if self.legacy_cli_migration_required {
+            return Ok(false);
+        }
+        let Some(api_key) = self.effective_api_key() else {
+            return Ok(false);
+        };
+        if !self.catalog.begin_roster_refresh(CURSOR_CATALOG_PROVIDER) {
+            return Ok(false);
+        }
+        let live = self.list_models_via_bridge(&api_key, cancel).await?;
+        let seed = self.catalog.owned_provider_models(CURSOR_CATALOG_PROVIDER);
+        let roster =
+            crate::cursor_roster::rebuild_cursor_roster(&live, &seed, |provider, model| {
+                self.catalog.has_source_model(provider, model)
+            })
+            .map_err(|e| BackendError::Protocol(format!("rebuilding Cursor model roster: {e}")))?;
+        let added: Vec<_> = roster.keys().filter(|id| !seed.contains_key(*id)).collect();
+        let removed: Vec<_> = seed.keys().filter(|id| !roster.contains_key(*id)).collect();
+        if !added.is_empty() || !removed.is_empty() {
+            tracing::info!(
+                backend = %self.id,
+                ?added,
+                ?removed,
+                "Cursor model roster changed"
+            );
+        }
+        self.catalog
+            .replace_roster(CURSOR_CATALOG_PROVIDER, roster)
+            .await
+            .map_err(|e| {
+                BackendError::Protocol(format!("persisting Cursor model roster: {e:#}"))
+            })?;
+        Ok(true)
     }
 
     fn status(&self) -> BackendStatus {
@@ -4272,6 +4364,135 @@ mod tests {
         };
         assert!(error.to_string().contains("pool is shutting down"));
         callback.stop().await.unwrap();
+    }
+
+    /// The roster refresh spawns a short-lived Bridge, asks Cursor Cloud for
+    /// the account's models, and rewrites the persisted `cursor` overlay;
+    /// `models()` keeps reading the catalog.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn refresh_model_roster_rewrites_the_catalog_from_list_models() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let stub = temp.path().join("cursor-sdk-bridge-list-models");
+        let calls = temp.path().join("calls");
+        std::fs::write(
+            &stub,
+            format!(
+                r#"#!/usr/bin/env python3
+import json, os, sys, threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+CALLS = {calls:?}
+MODELS = {{"items": [
+    {{"id": "default", "displayName": "Auto", "variants": [{{"displayName": "Auto", "isDefault": True}}]}},
+    {{"id": "gpt-5.6-sol", "displayName": "GPT-5.6 Sol",
+     "parameters": [
+        {{"id": "context", "displayName": "Context", "values": [{{"value": "272k"}}, {{"value": "1m"}}]}},
+        {{"id": "reasoning", "displayName": "Reasoning", "values": [
+            {{"value": "low", "displayName": "Low"}}, {{"value": "high", "displayName": "High"}}]}},
+        {{"id": "fast", "displayName": "Fast", "values": [{{"value": "false"}}, {{"value": "true"}}]}}],
+     "variants": [{{"params": [{{"id": "context", "value": "1m"}}, {{"id": "reasoning", "value": "high"}},
+                    {{"id": "fast", "value": "false"}}], "isDefault": True}}]}}
+]}}
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *args): pass
+    def do_POST(self):
+        length = int(self.headers.get("content-length", "0"))
+        body = json.loads(self.rfile.read(length) or b"{{}}")
+        if self.headers.get("authorization") != "Bearer stub-token":
+            self.send_response(401); self.end_headers(); return
+        if self.path == "/sdk.v1.SdkCursorService/ListModels":
+            assert body["options"]["apiKey"] == "cursor-key", body
+            with open(CALLS, "a") as calls: calls.write("ListModels\n")
+            payload = MODELS
+        elif self.path == "/sdk.v1.SdkBridgeControlService/Shutdown":
+            payload = {{}}
+            threading.Thread(target=lambda: (os._exit(0))).start()
+        else:
+            self.send_response(404); self.end_headers(); return
+        data = json.dumps(payload).encode()
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+server = HTTPServer(("127.0.0.1", 0), Handler)
+ready = {{"schemaVersion": 1, "transport": "tcp", "protocol": "connect",
+         "url": "http://127.0.0.1:%d" % server.server_address[1], "authToken": "stub-token"}}
+sys.stderr.write("cursor-sdk-bridge ready " + json.dumps(ready) + "\n")
+sys.stderr.flush()
+server.serve_forever()
+"#
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let data_dir = tempfile::tempdir().unwrap();
+        let catalog = Arc::new(ModelsDevCatalog::fixture_for_data_dir(data_dir.path()));
+        let backend = CursorBackend::new(
+            "cursor",
+            Some(stub.to_string_lossy().into_owned()),
+            Some("cursor-key".into()),
+        )
+        .with_state_root(temp.path().join("state"))
+        .with_catalog(catalog.clone());
+        let seed_ids: Vec<_> = backend.models().into_iter().map(|m| m.id).collect();
+        assert!(
+            !seed_ids.is_empty(),
+            "bundled seed serves until the first refresh"
+        );
+
+        assert!(
+            backend
+                .refresh_model_roster(&CancellationToken::new())
+                .await
+                .unwrap()
+        );
+        let models = backend.models();
+        let mut ids: Vec<_> = models.iter().map(|model| model.id.as_str()).collect();
+        ids.sort();
+        assert_eq!(ids, ["cursor/default", "cursor/gpt-5.6-sol"]);
+        let sol = models
+            .iter()
+            .find(|model| model.id == "cursor/gpt-5.6-sol")
+            .unwrap();
+        assert_eq!(sol.display_name, "GPT-5.6 Sol");
+        assert_eq!(sol.context_window, 1_000_000);
+        assert!(sol.input_price_per_mtok.is_none(), "cursor strips pricing");
+        let properties = sol.options_schema["properties"].as_object().unwrap();
+        assert_eq!(properties["reasoning"]["enum"], json!(["low", "high"]));
+        assert_eq!(properties["reasoning"]["default"], "high");
+        assert_eq!(properties["fast"]["type"], "boolean");
+        assert_eq!(properties["context"]["default"], "1m");
+        assert!(
+            !properties.contains_key("effort"),
+            "inherited models.dev reasoning options must not leak under a dialect key"
+        );
+        let auto = models
+            .iter()
+            .find(|model| model.id == "cursor/default")
+            .unwrap();
+        assert_eq!(auto.display_name, "Auto");
+
+        let roster = data_dir.path().join("rosters").join("cursor.json");
+        let file: Value = serde_json::from_slice(&std::fs::read(&roster).unwrap()).unwrap();
+        assert!(file["models"]["gpt-5.6-sol"].is_object());
+        assert!(file["models"].get("composer-2.5").is_none());
+
+        // Within the TTL the refresh is a no-op that spawns nothing.
+        assert!(
+            !backend
+                .refresh_model_roster(&CancellationToken::new())
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&calls).unwrap().lines().count(),
+            1,
+            "ListModels is requested once per refresh window"
+        );
     }
 
     #[tokio::test]

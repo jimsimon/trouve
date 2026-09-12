@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "9.7"
+    "version": "9.8"
   },
   "paths": {
     "/v1/approvals": {
@@ -9444,6 +9444,25 @@
           },
           {
             "type": "object",
+            "description": "The server-side model catalog changed: the public catalog\n(models.dev) became available or was lost, or a vendor-backed roster\n(Codex, Cursor) was rebuilt in the background. Nothing is bundled, so\nuntil the first successful download only local and vendor-only models\nexist and provider setup presets are limited to trouve's own\nintegrations; clients show a \"downloading\" state instead of \"no\nmodels\" while `available` is false and refetch the model catalog\n(`/v1/models` and the routed `/v1/model-routes`) on every\n`available: true` event. `ServerInfo.catalog_available` carries the\navailability for initial fetches.",
+            "required": [
+              "available",
+              "type"
+            ],
+            "properties": {
+              "available": {
+                "type": "boolean"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "server.model_catalog_changed"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
             "description": "The configured model used for asynchronous session and thread naming changed.\nCarries a full replacement snapshot for replay and reconnect.",
             "required": [
               "settings",
@@ -12672,6 +12691,10 @@
           "protocol_version"
         ],
         "properties": {
+          "catalog_available": {
+            "type": "boolean",
+            "description": "Whether the public model catalog has been downloaded (see the\n`server.model_catalog_changed` event). Absent on older servers, which\nbundled a catalog and were never without one."
+          },
           "name": {
             "type": "string"
           },

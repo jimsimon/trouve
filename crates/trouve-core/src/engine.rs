@@ -3892,6 +3892,10 @@ pub struct Engine {
     /// configured probe (`with_connectivity_probe`) or `set_online` ever
     /// flips it, so probe-less engines (tests, embedders) never go offline.
     online: std::sync::atomic::AtomicBool,
+    /// Whether the models.dev catalog has been downloaded (see
+    /// `server.model_catalog_changed`). Mirrors `ModelsDevCatalog::is_available`
+    /// so transitions can be announced exactly once.
+    catalog_available: std::sync::atomic::AtomicBool,
     /// Reachability check driven by the connectivity monitor. `None`
     /// disables monitoring entirely.
     connectivity_probe: Option<crate::connectivity::Probe>,
@@ -4293,6 +4297,7 @@ impl Engine {
             Arc::from(trouve_providers::secrets::default_store(&data_dir));
         let model_catalog =
             Arc::new(trouve_providers::models_dev::ModelsDevCatalog::for_data_dir(&data_dir));
+        let catalog_available = model_catalog.is_available();
         let mut providers = build_all_providers(config, &secrets, &model_catalog);
         let backends = build_all_backends(config, &secrets, &data_dir, &model_catalog);
         let mcp_logs = crate::mcp::McpLogStore::default();
@@ -4400,6 +4405,7 @@ impl Engine {
             mcp_logs,
             terminals: Arc::new(crate::terminal::TerminalManager::default()),
             online: std::sync::atomic::AtomicBool::new(true),
+            catalog_available: std::sync::atomic::AtomicBool::new(catalog_available),
             connectivity_probe: None,
         }
     }
@@ -4633,6 +4639,50 @@ impl Engine {
         self.online.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Whether the public model catalog is available. Until the first
+    /// successful models.dev download only local and overlay-only models
+    /// exist and setup presets are limited to trouve's own integrations.
+    pub fn catalog_available(&self) -> bool {
+        self.catalog_available
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Announce a catalog availability change to clients (once per
+    /// transition), exactly like connectivity.
+    fn transition_catalog_availability(&self) {
+        let available = self.model_catalog.is_available();
+        let was = self
+            .catalog_available
+            .swap(available, std::sync::atomic::Ordering::Relaxed);
+        if was == available {
+            return;
+        }
+        if available {
+            tracing::info!("model catalog downloaded");
+        } else {
+            tracing::warn!("model catalog unavailable: only local models can be offered");
+        }
+        let _ = self
+            .store
+            .append_event(Scope::Server, Event::ModelCatalogChanged { available });
+    }
+
+    /// Refresh the models.dev catalog when stale (best effort, logged) and
+    /// announce availability transitions. Returns whether the catalog became
+    /// available during this call.
+    async fn refresh_catalog(&self) -> bool {
+        let was_available = self.catalog_available();
+        if let Err(error) = self.model_catalog.refresh_if_stale().await {
+            if was_available {
+                tracing::debug!("models.dev refresh failed; using cached catalog: {error:#}");
+            } else {
+                tracing::warn!("models.dev download failed; retrying shortly: {error:#}");
+            }
+        }
+        self.transition_catalog_availability();
+        !was_available && self.catalog_available()
+    }
+
     /// Force the connectivity state (tests/embedders). Emits the
     /// `server.connectivity_changed` event on an actual transition, exactly
     /// like the probe-driven monitor.
@@ -4663,10 +4713,60 @@ impl Engine {
     pub async fn init_connectivity(&self) {
         if let Some(probe) = self.connectivity_probe.clone() {
             let online = probe().await;
-            if online && let Err(error) = self.model_catalog.refresh_if_stale().await {
-                tracing::debug!("models.dev refresh failed; using cached snapshot: {error:#}");
+            if online {
+                self.refresh_catalog().await;
+                self.spawn_roster_refresh();
             }
             self.transition_connectivity(online);
+        }
+    }
+
+    /// Kick off background rebuilds of vendor-backed model rosters (the
+    /// `openai-codex` and `cursor` overlays). Each backend decides whether its
+    /// persisted roster is stale; the work runs detached so model listings
+    /// keep answering from the catalog JSON without waiting on a vendor CLI.
+    /// Like the models.dev refresh this only runs with a connectivity probe:
+    /// probe-less (test/embedded) engines never spawn vendor processes. It
+    /// also waits for the public catalog, since rosters inherit from it.
+    fn spawn_roster_refresh(&self) {
+        if self.connectivity_probe.is_none() || !self.model_catalog.is_available() {
+            return;
+        }
+        let ready: Vec<_> = self
+            .backends
+            .read()
+            .unwrap()
+            .values()
+            .filter(|backend| {
+                let status = backend.status();
+                status.installed && status.has_credentials
+            })
+            .cloned()
+            .collect();
+        let store = self.store.clone();
+        for backend in ready {
+            let store = store.clone();
+            tokio::spawn(async move {
+                // Retirement of the backend cancels this token if the refresh
+                // outlives the drain deadline.
+                let cancel = tokio_util::sync::CancellationToken::new();
+                match backend.refresh_model_roster(&cancel).await {
+                    Ok(true) => {
+                        tracing::info!(backend = backend.id(), "model roster refreshed");
+                        // The roster was replaced after any in-flight model
+                        // listing answered; tell clients to fetch again.
+                        let _ = store.append_event(
+                            Scope::Server,
+                            Event::ModelCatalogChanged { available: true },
+                        );
+                    }
+                    Ok(false) => {}
+                    Err(error) => tracing::debug!(
+                        backend = backend.id(),
+                        "model roster refresh failed; using cached roster: {error}"
+                    ),
+                }
+            });
         }
     }
 
@@ -4868,8 +4968,15 @@ impl Engine {
                 tokio::time::sleep(interval).await;
                 let online = probe().await;
                 let recovering = online && !engine.is_online();
-                if recovering && let Err(error) = engine.model_catalog.refresh_if_stale().await {
-                    tracing::debug!("models.dev refresh failed; using cached snapshot: {error:#}");
+                // Keep retrying the download on every poll while nothing has
+                // been downloaded yet: without a catalog there are no models.
+                let became_available = if online && (recovering || !engine.catalog_available()) {
+                    engine.refresh_catalog().await
+                } else {
+                    false
+                };
+                if recovering || became_available {
+                    engine.spawn_roster_refresh();
                 }
                 engine.transition_connectivity(online);
             }
@@ -5067,11 +5174,8 @@ impl Engine {
 
     /// Well-known provider presets for one-click setup in clients.
     pub async fn known_providers(&self) -> Vec<trouve_protocol::KnownProvider> {
-        if self.is_online()
-            && self.connectivity_probe.is_some()
-            && let Err(error) = self.model_catalog.refresh_if_stale().await
-        {
-            tracing::debug!("models.dev refresh failed; using cached snapshot: {error:#}");
+        if self.is_online() && self.connectivity_probe.is_some() {
+            self.refresh_catalog().await;
         }
         trouve_providers::catalog::known_providers(&self.model_catalog)
     }

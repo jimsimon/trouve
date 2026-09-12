@@ -2,13 +2,17 @@
 //!
 //! Provider APIs may contribute account-specific availability, while this
 //! catalog remains authoritative for provider identity, model metadata, model
-//! rosters, and model-specific option schemas. A generated snapshot keeps the
-//! complete public provider roster plus model details available offline; a
-//! small trouve-owned overlay describes serving surfaces that models.dev does
-//! not yet distinguish, including Cursor's stable roster and Cursor-only
-//! models. Live vendor discovery may add newly released Cursor models and
-//! account-specific transport controls. A validated disk cache is refreshed
-//! from models.dev when the server has connectivity monitoring.
+//! rosters, and model-specific option schemas. The catalog is downloaded and
+//! cached on disk (`models-dev-cache.json`, refreshed on a TTL with ETag
+//! revalidation while the server has connectivity monitoring); nothing is
+//! bundled into the binary, so until the first successful download the
+//! catalog is empty and callers should surface that state rather than guess.
+//! A small trouve-owned overlay describes serving surfaces that models.dev
+//! does not distinguish (Codex, Cursor) and fills in facts the vendors do not
+//! report. Those providers persist a per-install roster file under
+//! `<data_dir>/rosters/` that the backend rebuilds in the background from its
+//! live model list; when present it replaces the bundled seed for that
+//! provider so retired models stop being offered without a trouve release.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -25,8 +29,15 @@ use trouve_protocol::{KnownProvider, ModelInfo, ProviderConfigField};
 const API_URL: &str = "https://models.dev/api.json";
 // Version 2 retains provider metadata in addition to model records.
 const CACHE_VERSION: u32 = 2;
+const ROSTER_VERSION: u32 = 1;
 const CATALOG_TTL: Duration = Duration::from_secs(60 * 60);
 const RETRY_TTL: Duration = Duration::from_secs(5 * 60);
+/// Without any catalog at all nothing works, so retry much sooner than the
+/// steady-state backoff.
+const EMPTY_RETRY_TTL: Duration = Duration::from_secs(30);
+/// A full models.dev copy used only as test data; it never ships in release
+/// binaries.
+#[cfg(any(test, feature = "catalog-fixture"))]
 const SNAPSHOT: &str = include_str!("../data/models-dev-snapshot.json");
 const TROUVE_CATALOG: &str = include_str!("../data/trouve-model-catalog.json");
 
@@ -174,9 +185,31 @@ struct DiskCache {
     catalog: Catalog,
 }
 
+/// Per-install roster for one overlay provider, rebuilt in the background
+/// from a live vendor model list. Model bodies use the same overlay patch
+/// schema as the bundled trouve catalog (`base_model`, `reasoning_options`,
+/// `options`, `limit`, ...) so they resolve through `resolve_overlay_model`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RosterFile {
+    version: u32,
+    fetched_at: u64,
+    models: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct RosterState {
+    models: BTreeMap<String, Value>,
+    fetched_at: Option<u64>,
+    last_attempt: Option<Instant>,
+}
+
 struct CatalogState {
-    embedded: Catalog,
     owned: CatalogOverlay,
+    /// Refreshed rosters keyed by canonical overlay provider id. An entry
+    /// replaces the bundled `owned` models for that provider wholesale.
+    rosters: BTreeMap<String, RosterState>,
+    /// The last downloaded models.dev catalog; `None` until the first
+    /// successful fetch (or valid disk cache).
     remote: Option<Catalog>,
     etag: Option<String>,
     fetched_at: Option<u64>,
@@ -188,30 +221,82 @@ struct CatalogState {
 pub struct ModelsDevCatalog {
     state: RwLock<CatalogState>,
     refresh_lock: tokio::sync::Mutex<()>,
+    /// Serializes roster persistence with publication so the running catalog
+    /// and the durable file always agree on which replacement won.
+    roster_write_lock: tokio::sync::Mutex<()>,
     cache_path: Option<PathBuf>,
+    rosters_dir: Option<PathBuf>,
     client: reqwest::Client,
 }
 
 impl Default for ModelsDevCatalog {
     fn default() -> Self {
-        Self::embedded()
+        Self::empty()
     }
 }
 
 impl ModelsDevCatalog {
-    /// In-memory snapshot only. Provider unit tests and standalone provider
-    /// users never perform implicit network or filesystem access.
-    pub fn embedded() -> Self {
-        Self::from_cache_path(None)
+    /// No public catalog and no filesystem: standalone provider users and
+    /// backends constructed before the engine hands them the shared catalog.
+    /// Overlay-only models (no `base_model`) still resolve.
+    pub fn empty() -> Self {
+        Self::from_paths(None, None)
     }
 
-    /// Snapshot plus a last-known-good disk cache under the server data dir.
+    /// The bundled test copy of models.dev as the "downloaded" catalog. Tests
+    /// only: never performs network or filesystem access.
+    #[cfg(any(test, feature = "catalog-fixture"))]
+    pub fn fixture() -> Self {
+        Self::from_paths(None, None).with_fixture_catalog()
+    }
+
+    /// `for_data_dir` seeded with the test copy of models.dev whenever the
+    /// data dir holds no valid cache. Tests only.
+    #[cfg(any(test, feature = "catalog-fixture"))]
+    pub fn fixture_for_data_dir(data_dir: &Path) -> Self {
+        Self::for_data_dir(data_dir).with_fixture_catalog()
+    }
+
+    #[cfg(any(test, feature = "catalog-fixture"))]
+    fn with_fixture_catalog(self) -> Self {
+        {
+            let mut state = self.state.write().unwrap();
+            if state.remote.is_none() {
+                state.remote =
+                    Some(parse_catalog(SNAPSHOT).expect("test models.dev snapshot must be valid"));
+            }
+        }
+        self
+    }
+
+    /// Write the test copy of models.dev as a valid disk cache under
+    /// `data_dir`, so an engine built from that directory starts with the
+    /// public catalog without any network access. Tests only.
+    #[cfg(any(test, feature = "catalog-fixture"))]
+    pub fn write_fixture_cache(data_dir: &Path) -> Result<()> {
+        let catalog = parse_catalog(SNAPSHOT).expect("test models.dev snapshot must be valid");
+        let cache = DiskCache {
+            version: CACHE_VERSION,
+            fetched_at: unix_now(),
+            etag: None,
+            catalog,
+        };
+        std::fs::create_dir_all(data_dir)
+            .with_context(|| format!("creating {}", data_dir.display()))?;
+        let path = data_dir.join("models-dev-cache.json");
+        std::fs::write(&path, serde_json::to_vec(&cache)?)
+            .with_context(|| format!("writing {}", path.display()))
+    }
+
+    /// Last-known-good disk cache and rosters under the server data dir.
     pub fn for_data_dir(data_dir: &Path) -> Self {
-        Self::from_cache_path(Some(data_dir.join("models-dev-cache.json")))
+        Self::from_paths(
+            Some(data_dir.join("models-dev-cache.json")),
+            Some(data_dir.join("rosters")),
+        )
     }
 
-    fn from_cache_path(cache_path: Option<PathBuf>) -> Self {
-        let embedded = parse_catalog(SNAPSHOT).expect("bundled models.dev snapshot must be valid");
+    fn from_paths(cache_path: Option<PathBuf>, rosters_dir: Option<PathBuf>) -> Self {
         let owned = parse_catalog_overlay(TROUVE_CATALOG)
             .expect("bundled trouve model catalog must be valid");
         let disk = cache_path
@@ -221,6 +306,7 @@ impl ModelsDevCatalog {
             Some(cache) => (Some(cache.catalog), cache.etag, Some(cache.fetched_at)),
             None => (None, None, None),
         };
+        let rosters = rosters_dir.as_deref().map(load_rosters).unwrap_or_default();
         let client = reqwest::Client::builder()
             .user_agent(concat!("trouve/", env!("CARGO_PKG_VERSION")))
             .connect_timeout(Duration::from_secs(3))
@@ -229,17 +315,26 @@ impl ModelsDevCatalog {
             .expect("models.dev HTTP client configuration must be valid");
         Self {
             state: RwLock::new(CatalogState {
-                embedded,
                 owned,
+                rosters,
                 remote,
                 etag,
                 fetched_at,
                 last_attempt: None,
             }),
             refresh_lock: tokio::sync::Mutex::new(()),
+            roster_write_lock: tokio::sync::Mutex::new(()),
             cache_path,
+            rosters_dir,
             client,
         }
+    }
+
+    /// Whether a public catalog has been downloaded (or restored from disk).
+    /// While false, only overlay-only models exist and setup presets are
+    /// limited to trouve's own integrations.
+    pub fn is_available(&self) -> bool {
+        self.state.read().unwrap().remote.is_some()
     }
 
     /// Refresh a stale catalog. Failures preserve the in-memory and disk
@@ -248,9 +343,14 @@ impl ModelsDevCatalog {
         let _guard = self.refresh_lock.lock().await;
         {
             let state = self.state.read().unwrap();
+            let retry_ttl = if state.remote.is_some() {
+                RETRY_TTL
+            } else {
+                EMPTY_RETRY_TTL
+            };
             if state
                 .last_attempt
-                .is_some_and(|attempt| attempt.elapsed() < RETRY_TTL)
+                .is_some_and(|attempt| attempt.elapsed() < retry_ttl)
             {
                 return Ok(false);
             }
@@ -340,26 +440,106 @@ impl ModelsDevCatalog {
         let Some(path) = &self.cache_path else {
             return Ok(());
         };
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .with_context(|| format!("creating {}", parent.display()))?;
-        }
         let bytes = serde_json::to_vec(cache).context("serializing models.dev cache")?;
-        let temp = path.with_extension(format!("json.tmp-{}", std::process::id()));
-        tokio::fs::write(&temp, bytes)
-            .await
-            .with_context(|| format!("writing {}", temp.display()))?;
-        #[cfg(windows)]
-        if tokio::fs::try_exists(path).await.unwrap_or(false) {
-            tokio::fs::remove_file(path)
-                .await
-                .with_context(|| format!("replacing {}", path.display()))?;
+        write_json_atomically(path, bytes).await
+    }
+
+    /// The overlay patches currently in effect for a trouve-owned provider:
+    /// the refreshed roster when one exists, otherwise the bundled seed. A
+    /// roster rebuild starts from this so hand-authored extras (transport
+    /// options, context limits) survive refreshes.
+    pub fn owned_provider_models(&self, provider: &str) -> BTreeMap<String, Value> {
+        let state = self.state.read().unwrap();
+        owned_provider_models(&state, provider)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Whether `provider/model` exists in the public (remote or embedded)
+    /// catalog, i.e. whether an overlay patch may inherit from it via
+    /// `base_model`.
+    pub fn has_source_model(&self, provider: &str, model: &str) -> bool {
+        let state = self.state.read().unwrap();
+        source_model(&state, provider, model).is_some()
+    }
+
+    /// Same TTL and retry backoff as the models.dev refresh, tracked per
+    /// overlay provider. When a refresh is due this also records the attempt
+    /// under the same lock, so overlapping triggers admit exactly one live
+    /// lookup per retry window.
+    pub fn begin_roster_refresh(&self, provider: &str) -> bool {
+        let mut state = self.state.write().unwrap();
+        let roster = state
+            .rosters
+            .entry(canonical_provider_id(provider).to_string())
+            .or_default();
+        if roster
+            .last_attempt
+            .is_some_and(|attempt| attempt.elapsed() < RETRY_TTL)
+        {
+            return false;
         }
-        if let Err(error) = tokio::fs::rename(&temp, path).await {
-            let _ = tokio::fs::remove_file(&temp).await;
-            return Err(error).with_context(|| format!("replacing {}", path.display()));
+        if roster
+            .fetched_at
+            .is_some_and(|at| unix_now().saturating_sub(at) < CATALOG_TTL.as_secs())
+        {
+            return false;
         }
+        roster.last_attempt = Some(Instant::now());
+        true
+    }
+
+    /// Whether `begin_roster_refresh` would admit a refresh (status, tests).
+    pub fn roster_needs_refresh(&self, provider: &str) -> bool {
+        let state = self.state.read().unwrap();
+        let Some(roster) = state.rosters.get(canonical_provider_id(provider)) else {
+            return true;
+        };
+        if roster
+            .last_attempt
+            .is_some_and(|attempt| attempt.elapsed() < RETRY_TTL)
+        {
+            return false;
+        }
+        !roster
+            .fetched_at
+            .is_some_and(|at| unix_now().saturating_sub(at) < CATALOG_TTL.as_secs())
+    }
+
+    /// Replace a provider's roster in memory and on disk. An empty roster is
+    /// rejected so a bad live response never empties the model picker.
+    /// Replacements are serialized: the file is written and the in-memory
+    /// roster published under one lock, so overlapping refreshes can never
+    /// leave disk and memory on different winners.
+    pub async fn replace_roster(
+        &self,
+        provider: &str,
+        models: BTreeMap<String, Value>,
+    ) -> Result<()> {
+        if models.is_empty() {
+            bail!("{provider} roster contains no models");
+        }
+        // The provider id names the roster file, so only ids that survive
+        // setup-id sanitizing unchanged may be persisted.
+        let provider = canonical_provider_id(provider).to_string();
+        if provider.is_empty() || setup_provider_id(&provider) != provider {
+            bail!("refusing to persist a roster for provider id {provider:?}");
+        }
+        let _guard = self.roster_write_lock.lock().await;
+        let file = RosterFile {
+            version: ROSTER_VERSION,
+            fetched_at: unix_now(),
+            models,
+        };
+        if let Some(dir) = &self.rosters_dir {
+            let bytes = serde_json::to_vec_pretty(&file)
+                .with_context(|| format!("serializing {provider} roster"))?;
+            write_json_atomically(&dir.join(format!("{provider}.json")), bytes).await?;
+        }
+        let mut state = self.state.write().unwrap();
+        let roster = state.rosters.entry(provider).or_default();
+        roster.models = file.models;
+        roster.fetched_at = Some(file.fetched_at);
         Ok(())
     }
 
@@ -383,8 +563,11 @@ impl ModelsDevCatalog {
     /// provider's model.
     pub fn shared_model_identity(&self, catalog_provider: &str, model_id: &str) -> Option<String> {
         let state = self.state.read().unwrap();
-        if let Some(patch) = overlay_provider_by_setup_id(&state.owned, catalog_provider)
-            .and_then(|provider| provider.models.get(model_id))
+        // The refreshed roster (when present) replaces the bundled seed, so a
+        // vendor-served public model acquires its automatic route as soon as
+        // the vendor reports it, not only when the seed happens to list it.
+        if let Some(patch) =
+            owned_provider_models(&state, catalog_provider).and_then(|models| models.get(model_id))
         {
             let base = patch.as_object()?.get("base_model")?.as_str()?;
             let (provider, source_id) = base.split_once('/')?;
@@ -406,8 +589,8 @@ impl ModelsDevCatalog {
             let mut models = source_provider(&state, catalog_provider)
                 .map(|provider| provider.models.clone())
                 .unwrap_or_default();
-            if let Some(provider) = overlay_provider_by_setup_id(&state.owned, catalog_provider) {
-                for (id, patch) in &provider.models {
+            if let Some(patches) = owned_provider_models(&state, catalog_provider) {
+                for (id, patch) in patches {
                     if let Some(model) = resolve_overlay_model(&state, id, patch) {
                         models.insert(id.clone(), model);
                     }
@@ -457,7 +640,9 @@ impl ModelsDevCatalog {
     /// speaks through their OpenAI-compatible or Anthropic surfaces.
     pub fn provider_presets(&self) -> Vec<KnownProvider> {
         let state = self.state.read().unwrap();
-        let catalog = state.remote.as_ref().unwrap_or(&state.embedded);
+        let Some(catalog) = state.remote.as_ref() else {
+            return Vec::new();
+        };
         let mut providers: Vec<_> = catalog
             .iter()
             .filter_map(|(catalog_id, provider)| provider.to_known_provider(catalog_id))
@@ -476,7 +661,7 @@ impl ModelsDevCatalog {
         kind: &str,
     ) -> Option<String> {
         let state = self.state.read().unwrap();
-        let catalog = state.remote.as_ref().unwrap_or(&state.embedded);
+        let catalog = state.remote.as_ref()?;
         let suggested_id = canonical_provider_id(suggested_id);
         if let Some((catalog_id, provider)) = provider_entry_by_setup_id(catalog, suggested_id)
             && provider.endpoint_matches(catalog_id, base_url, kind)
@@ -543,11 +728,39 @@ impl ModelsDevCatalog {
 
     fn model_record(&self, provider: &str, model: &str) -> Option<CatalogModel> {
         let state = self.state.read().unwrap();
-        overlay_provider_by_setup_id(&state.owned, provider)
-            .and_then(|provider| provider.models.get(model))
+        owned_provider_models(&state, provider)
+            .and_then(|models| models.get(model))
             .and_then(|patch| resolve_overlay_model(&state, model, patch))
             .or_else(|| source_model(&state, provider, model).cloned())
     }
+}
+
+/// Write `bytes` to `path` via a same-directory temp file and rename so a
+/// crash never leaves a truncated cache behind. Every call gets its own
+/// temp file, so concurrent writers of one destination cannot clobber each
+/// other mid-write; the last rename wins. `rename` replaces an existing
+/// destination on every supported platform (Windows uses
+/// MOVEFILE_REPLACE_EXISTING), so the last-known-good file is never absent.
+async fn write_json_atomically(path: &Path, bytes: Vec<u8>) -> Result<()> {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let temp = path.with_extension(format!(
+        "json.tmp-{}-{}",
+        std::process::id(),
+        SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    tokio::fs::write(&temp, bytes)
+        .await
+        .with_context(|| format!("writing {}", temp.display()))?;
+    if let Err(error) = tokio::fs::rename(&temp, path).await {
+        let _ = tokio::fs::remove_file(&temp).await;
+        return Err(error).with_context(|| format!("replacing {}", path.display()));
+    }
+    Ok(())
 }
 
 impl CatalogModel {
@@ -907,7 +1120,6 @@ fn source_provider<'a>(state: &'a CatalogState, requested: &str) -> Option<&'a C
         .remote
         .as_ref()
         .and_then(|catalog| provider_by_setup_id(catalog, requested))
-        .or_else(|| provider_by_setup_id(&state.embedded, requested))
 }
 
 fn source_model<'a>(
@@ -920,10 +1132,6 @@ fn source_model<'a>(
         .as_ref()
         .and_then(|catalog| provider_by_setup_id(catalog, provider))
         .and_then(|provider| provider.models.get(model))
-        .or_else(|| {
-            provider_by_setup_id(&state.embedded, provider)
-                .and_then(|provider| provider.models.get(model))
-        })
 }
 
 fn overlay_provider_by_setup_id<'a>(
@@ -941,6 +1149,21 @@ fn overlay_provider_by_setup_id<'a>(
             (setup_provider_id(source_id) == requested).then_some(provider)
         })
     })
+}
+
+/// Effective overlay patches for a trouve-owned provider. A refreshed roster
+/// replaces the bundled seed wholesale so models the account can no longer
+/// use disappear instead of lingering from the seed.
+fn owned_provider_models<'a>(
+    state: &'a CatalogState,
+    requested: &str,
+) -> Option<&'a BTreeMap<String, Value>> {
+    state
+        .rosters
+        .get(canonical_provider_id(requested))
+        .filter(|roster| !roster.models.is_empty())
+        .map(|roster| &roster.models)
+        .or_else(|| overlay_provider_by_setup_id(&state.owned, requested).map(|p| &p.models))
 }
 
 /// Resolve one trouve-owned model against the newest available public base.
@@ -1181,6 +1404,47 @@ fn load_disk_cache(path: &Path) -> Result<Option<DiskCache>> {
     Ok(Some(cache))
 }
 
+/// Load every `<provider>.json` roster under `dir`. Missing, unparsable, or
+/// stale-format files are skipped so the bundled seed keeps serving.
+fn load_rosters(dir: &Path) -> BTreeMap<String, RosterState> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return BTreeMap::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                return None;
+            }
+            let provider = path.file_stem()?.to_str()?.to_string();
+            let roster = load_roster_file(&path).ok()??;
+            Some((
+                provider,
+                RosterState {
+                    models: roster.models,
+                    fetched_at: Some(roster.fetched_at),
+                    last_attempt: None,
+                },
+            ))
+        })
+        .collect()
+}
+
+fn load_roster_file(path: &Path) -> Result<Option<RosterFile>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+    };
+    let roster: RosterFile =
+        serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+    if roster.version != ROSTER_VERSION || roster.models.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(roster))
+}
+
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1194,7 +1458,7 @@ mod tests {
 
     #[test]
     fn snapshot_has_current_gpt_and_fable_metadata() {
-        let catalog = ModelsDevCatalog::embedded();
+        let catalog = ModelsDevCatalog::fixture();
         let gpt = catalog
             .model("openai", "openai", "gpt-5.6", OptionsDialect::OpenAi)
             .unwrap();
@@ -1231,11 +1495,14 @@ mod tests {
     }
 
     #[test]
-    fn trouve_owned_codex_provider_inherits_and_overrides_openai_models() {
-        let catalog = ModelsDevCatalog::embedded();
+    fn trouve_owned_codex_seed_overrides_only_what_codex_serves_differently() {
+        let catalog = ModelsDevCatalog::fixture();
         let models = catalog.provider_models("openai-codex", "codex", OptionsDialect::CodexCli);
-        assert_eq!(models.len(), 8);
+        assert_eq!(models.len(), 5, "seed = models with Codex-specific limits");
 
+        // Codex serves Sol at a 500k window although the API record says 1.05M;
+        // everything else (name, pricing, reasoning levels) is inherited until
+        // the roster refresh brings the live values.
         let sol = models
             .iter()
             .find(|model| model.id == "codex/gpt-5.6-sol")
@@ -1246,62 +1513,19 @@ mod tests {
         assert_eq!(
             sol.options_schema
                 .pointer("/properties/reasoning_effort/enum"),
-            Some(&json!(["low", "medium", "high", "xhigh", "max", "ultra"]))
+            Some(&json!(["none", "low", "medium", "high", "xhigh", "max"]))
         );
-        assert_eq!(
-            sol.options_schema
-                .pointer("/properties/reasoning_effort/default"),
-            Some(&json!("low"))
-        );
-        assert_eq!(
-            sol.options_schema.pointer("/properties/fast/default"),
-            Some(&json!(false))
+        assert!(
+            sol.options_schema.pointer("/properties/fast").is_none(),
+            "the fast tier is discovered live, not hand-written"
         );
 
-        let luna = models
-            .iter()
-            .find(|model| model.id == "codex/gpt-5.6-luna")
-            .unwrap();
-        assert_eq!(luna.context_window, 500_000);
-        assert_eq!(
-            luna.options_schema
-                .pointer("/properties/reasoning_effort/enum"),
-            Some(&json!(["low", "medium", "high", "xhigh", "max"]))
-        );
-
-        // Codex serves Astra at its full API window and adds the `ultra`
-        // effort level models.dev does not list for the direct API.
         let astra = models
             .iter()
             .find(|model| model.id == "codex/gpt-6-astra")
             .unwrap();
         assert_eq!(astra.display_name, "GPT-6 Astra");
         assert_eq!(astra.context_window, 1_050_000);
-        assert_eq!(
-            astra
-                .options_schema
-                .pointer("/properties/reasoning_effort/enum"),
-            Some(&json!(["low", "medium", "high", "xhigh", "max", "ultra"]))
-        );
-        assert_eq!(
-            astra
-                .options_schema
-                .pointer("/properties/reasoning_effort/default"),
-            Some(&json!("medium"))
-        );
-        assert_eq!(
-            catalog
-                .model_record("openai-codex", "gpt-6-astra")
-                .unwrap()
-                .limit
-                .output,
-            Some(128_000)
-        );
-
-        let gpt_55 = catalog
-            .model("openai-codex", "codex", "gpt-5.5", OptionsDialect::CodexCli)
-            .unwrap();
-        assert_eq!(gpt_55.context_window, 400_000);
         assert_eq!(
             catalog
                 .model_record("openai-codex", "gpt-5.5")
@@ -1328,92 +1552,30 @@ mod tests {
     }
 
     #[test]
-    fn trouve_owned_cursor_provider_is_available_offline() {
-        let catalog = ModelsDevCatalog::embedded();
+    fn trouve_owned_cursor_seed_covers_cursor_only_models_and_slug_remaps() {
+        let catalog = ModelsDevCatalog::fixture();
         let models = catalog.provider_models("cursor", "cursor", OptionsDialect::ClaudeCli);
-        assert_eq!(models.len(), 14);
+        let mut ids: Vec<_> = models.iter().map(|model| model.id.as_str()).collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            [
+                "cursor/composer-2.5",
+                "cursor/default",
+                "cursor/gemini-3.1-pro",
+                "cursor/gemini-3.7-flash"
+            ]
+        );
 
-        let fable = models
+        // A Cursor slug that differs from the models.dev id is remapped.
+        let gemini = models
             .iter()
-            .find(|model| model.id == "cursor/claude-fable-5")
+            .find(|model| model.id == "cursor/gemini-3.1-pro")
             .unwrap();
-        assert_eq!(fable.display_name, "Claude Fable 5");
-        assert_eq!(fable.context_window, 1_000_000);
-        assert_eq!(
-            fable.options_schema.pointer("/properties/effort/default"),
-            Some(&json!("medium"))
-        );
+        assert_eq!(gemini.display_name, "Gemini 3.1 Pro");
+        assert!(gemini.context_window > 0, "inherits the preview record");
 
-        // Newer base models must resolve from the embedded snapshot alone;
-        // an unresolvable `base_model` silently drops the overlay entry.
-        let fable_5_1 = models
-            .iter()
-            .find(|model| model.id == "cursor/claude-fable-5-1")
-            .unwrap();
-        assert_eq!(fable_5_1.display_name, "Claude Fable 5.1");
-        assert!(fable_5_1.supports_tools);
-
-        let opus = models
-            .iter()
-            .find(|model| model.id == "cursor/claude-opus-5")
-            .unwrap();
-        assert!(opus.supports_images);
-        assert_eq!(opus.context_window, 1_000_000);
-        assert_eq!(
-            catalog
-                .model_record("cursor", "claude-opus-5")
-                .unwrap()
-                .limit
-                .output,
-            Some(128_000)
-        );
-        assert_eq!(
-            opus.options_schema.pointer("/properties/effort/default"),
-            Some(&json!("high"))
-        );
-
-        let flash = models
-            .iter()
-            .find(|model| model.id == "cursor/gemini-3.8-flash")
-            .unwrap();
-        assert_eq!(flash.display_name, "Gemini 3.8 Flash");
-        assert_eq!(flash.context_window, 1_000_000);
-        assert_eq!(
-            flash.options_schema.pointer("/properties/effort/default"),
-            Some(&json!("high"))
-        );
-
-        // Cursor documents its own effort ladders and defaults for the Grok
-        // models; they must win over the xai base records.
-        let grok_4_5 = models
-            .iter()
-            .find(|model| model.id == "cursor/grok-4.5")
-            .unwrap();
-        assert_eq!(grok_4_5.context_window, 256_000);
-        assert_eq!(
-            grok_4_5
-                .options_schema
-                .pointer("/properties/effort/default"),
-            Some(&json!("high"))
-        );
-
-        let grok_4_6 = models
-            .iter()
-            .find(|model| model.id == "cursor/grok-4.6")
-            .unwrap();
-        assert_eq!(grok_4_6.display_name, "Grok 4.6");
-        assert_eq!(grok_4_6.context_window, 256_000);
-        assert_eq!(
-            grok_4_6.options_schema.pointer("/properties/effort/enum"),
-            Some(&json!(["low", "medium", "high", "xhigh"]))
-        );
-        assert_eq!(
-            grok_4_6
-                .options_schema
-                .pointer("/properties/effort/default"),
-            Some(&json!("high"))
-        );
-
+        // Cursor-only models carry their own metadata.
         let composer = models
             .iter()
             .find(|model| model.id == "cursor/composer-2.5")
@@ -1426,9 +1588,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn shared_identity_follows_reviewed_base_models_only() {
-        let catalog = ModelsDevCatalog::embedded();
+    #[tokio::test]
+    async fn shared_identity_follows_reviewed_base_models_only() {
+        let catalog = ModelsDevCatalog::fixture();
 
         assert_eq!(
             catalog.shared_model_identity("openai", "gpt-5.6-sol"),
@@ -1438,6 +1600,31 @@ mod tests {
             catalog.shared_model_identity("openai-codex", "gpt-5.6-sol"),
             Some("gpt-5.6-sol".into())
         );
+        // Cursor's public models arrive through the vendor-refreshed roster,
+        // which replaces the bundled seed for that provider.
+        assert_eq!(catalog.shared_model_identity("cursor", "gpt-5.6-sol"), None);
+        let mut roster = BTreeMap::new();
+        roster.insert(
+            "gpt-5.6-sol".to_string(),
+            json!({"base_model": "openai/gpt-5.6-sol", "reasoning_options": []}),
+        );
+        roster.insert(
+            "gemini-3.1-pro".to_string(),
+            json!({"base_model": "google/gemini-3.1-pro-preview"}),
+        );
+        roster.insert(
+            "default".to_string(),
+            json!({"name": "Auto", "tool_call": true}),
+        );
+        roster.insert(
+            "composer-2.5".to_string(),
+            json!({"name": "Composer 2.5", "tool_call": true}),
+        );
+        roster.insert(
+            "claude-opus-5".to_string(),
+            json!({"base_model": "anthropic/claude-opus-5", "reasoning_options": []}),
+        );
+        catalog.replace_roster("cursor", roster).await.unwrap();
         assert_eq!(
             catalog.shared_model_identity("cursor", "gpt-5.6-sol"),
             Some("gpt-5.6-sol".into())
@@ -1456,8 +1643,8 @@ mod tests {
             None
         );
 
-        // An owned choice becomes routable once the reviewed overlay gives it
-        // an explicit public base-model identity.
+        // An owned choice becomes routable once its roster entry gives it an
+        // explicit public base-model identity.
         assert_eq!(
             catalog.shared_model_identity("cursor", "claude-opus-5"),
             Some("claude-opus-5".into())
@@ -1466,7 +1653,7 @@ mod tests {
 
     #[test]
     fn live_ids_are_only_an_availability_overlay() {
-        let catalog = ModelsDevCatalog::embedded();
+        let catalog = ModelsDevCatalog::fixture();
         let models = catalog.provider_models_for_ids(
             "openai",
             "codex",
@@ -1497,7 +1684,7 @@ mod tests {
 
     #[test]
     fn fixed_thinking_is_a_numeric_catalog_bound_not_invented_levels() {
-        let catalog = ModelsDevCatalog::embedded();
+        let catalog = ModelsDevCatalog::fixture();
         let model = catalog
             .model(
                 "anthropic",
@@ -1522,7 +1709,7 @@ mod tests {
 
     #[test]
     fn catalog_drives_cache_and_long_context_pricing() {
-        let catalog = ModelsDevCatalog::embedded();
+        let catalog = ModelsDevCatalog::fixture();
         let model = catalog
             .model("openai", "openai", "gpt-5.6", OptionsDialect::OpenAi)
             .unwrap();
@@ -1533,7 +1720,7 @@ mod tests {
 
     #[test]
     fn snapshot_drives_provider_setup_catalog() {
-        let catalog = ModelsDevCatalog::embedded();
+        let catalog = ModelsDevCatalog::fixture();
         let providers = catalog.provider_presets();
         assert!(providers.len() >= 145, "only {} providers", providers.len());
 
@@ -1636,7 +1823,7 @@ mod tests {
 
     #[test]
     fn endpoint_matching_uses_catalog_and_preserves_old_aliases() {
-        let catalog = ModelsDevCatalog::embedded();
+        let catalog = ModelsDevCatalog::fixture();
         assert_eq!(
             catalog.provider_for_endpoint(
                 "custom",
@@ -1672,11 +1859,11 @@ mod tests {
     }
 
     #[test]
-    fn valid_disk_cache_overlays_the_embedded_snapshot() {
+    fn valid_disk_cache_is_the_public_catalog() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("models-dev-cache.json");
         let remote = parse_catalog(
-            r#"{"openai":{"models":{"future":{"id":"future","name":"Future","tool_call":true,"limit":{"context":42}},"gpt-5.6-sol":{"id":"gpt-5.6-sol","name":"Remote Sol","tool_call":true,"reasoning_options":[{"type":"effort","values":["medium"]}],"limit":{"context":777000,"input":649000,"output":128000},"cost":{"input":9.0,"output":18.0}}}}}"#,
+            r#"{"openai":{"models":{"future":{"id":"future","name":"Future","tool_call":true,"limit":{"context":42}},"gpt-5.6-sol":{"id":"gpt-5.6-sol","name":"Remote Sol","tool_call":true,"reasoning_options":[{"type":"effort","values":["low","medium"]}],"limit":{"context":777000,"input":649000,"output":128000},"cost":{"input":9.0,"output":18.0}}}}}"#,
         )
         .unwrap();
         let cache = DiskCache {
@@ -1686,7 +1873,7 @@ mod tests {
             catalog: remote,
         };
         std::fs::write(&path, serde_json::to_vec(&cache).unwrap()).unwrap();
-        let catalog = ModelsDevCatalog::from_cache_path(Some(path));
+        let catalog = ModelsDevCatalog::from_paths(Some(path), None);
         assert_eq!(
             catalog
                 .model("openai", "openai", "future", OptionsDialect::OpenAi)
@@ -1697,8 +1884,10 @@ mod tests {
         assert!(
             catalog
                 .model("openai", "openai", "gpt-5.6", OptionsDialect::OpenAi)
-                .is_some()
+                .is_none(),
+            "nothing is bundled: only the downloaded catalog is served"
         );
+        assert!(catalog.is_available());
 
         // Owned records resolve their base lazily, so a refreshed public
         // catalog updates inherited fields without replacing Codex-specific
@@ -1718,7 +1907,247 @@ mod tests {
             codex
                 .options_schema
                 .pointer("/properties/reasoning_effort/enum"),
-            Some(&json!(["low", "medium", "high", "xhigh", "max", "ultra"]))
+            Some(&json!(["low", "medium"])),
+            "seed overrides keep inheriting reasoning levels from the download"
         );
+    }
+
+    fn codex_ids(catalog: &ModelsDevCatalog) -> Vec<String> {
+        let mut ids: Vec<_> = catalog
+            .provider_models("openai-codex", "codex", OptionsDialect::CodexCli)
+            .into_iter()
+            .map(|model| model.id)
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    #[test]
+    fn roster_file_replaces_the_bundled_overlay_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let rosters = dir.path().join("rosters");
+        std::fs::create_dir_all(&rosters).unwrap();
+        let roster = json!({
+            "version": ROSTER_VERSION,
+            "fetched_at": unix_now(),
+            "models": {
+                "gpt-5.6-luna": {
+                    "base_model": "openai/gpt-5.6-luna",
+                    "reasoning_options": [{"type": "effort", "values": ["low", "high"], "default": "high"}]
+                },
+                "gpt-7-nova": {"name": "GPT-7 Nova", "tool_call": true, "attachment": true}
+            }
+        });
+        std::fs::write(
+            rosters.join("openai-codex.json"),
+            serde_json::to_vec(&roster).unwrap(),
+        )
+        .unwrap();
+
+        let catalog = ModelsDevCatalog::fixture_for_data_dir(dir.path());
+        assert_eq!(
+            codex_ids(&catalog),
+            ["codex/gpt-5.6-luna", "codex/gpt-7-nova"]
+        );
+        assert!(!catalog.roster_needs_refresh("openai-codex"));
+        assert_eq!(catalog.owned_provider_models("openai-codex").len(), 2);
+
+        let luna = catalog
+            .model(
+                "openai-codex",
+                "codex",
+                "gpt-5.6-luna",
+                OptionsDialect::CodexCli,
+            )
+            .unwrap();
+        assert!(
+            luna.context_window > 0,
+            "inherits limits from the public base"
+        );
+        assert_eq!(
+            luna.options_schema
+                .pointer("/properties/reasoning_effort/default"),
+            Some(&json!("high"))
+        );
+        let nova = catalog
+            .model(
+                "openai-codex",
+                "codex",
+                "gpt-7-nova",
+                OptionsDialect::CodexCli,
+            )
+            .unwrap();
+        assert_eq!(nova.display_name, "GPT-7 Nova");
+        assert_eq!(nova.context_window, 0);
+        assert!(nova.supports_images);
+
+        // Other overlay providers are untouched.
+        assert!(
+            !catalog
+                .provider_models("cursor", "cursor", OptionsDialect::OpenAi)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn invalid_roster_files_fall_back_to_the_bundled_seed() {
+        let dir = tempfile::tempdir().unwrap();
+        let rosters = dir.path().join("rosters");
+        std::fs::create_dir_all(&rosters).unwrap();
+        std::fs::write(rosters.join("openai-codex.json"), b"{not json").unwrap();
+        let catalog = ModelsDevCatalog::fixture_for_data_dir(dir.path());
+        assert_eq!(codex_ids(&catalog), codex_ids(&ModelsDevCatalog::fixture()));
+        assert!(catalog.roster_needs_refresh("openai-codex"));
+
+        // A stale format version is ignored too.
+        std::fs::write(
+            rosters.join("openai-codex.json"),
+            serde_json::to_vec(&json!({
+                "version": ROSTER_VERSION + 1,
+                "fetched_at": unix_now(),
+                "models": {"gpt-5.6-luna": {"base_model": "openai/gpt-5.6-luna"}}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let catalog = ModelsDevCatalog::fixture_for_data_dir(dir.path());
+        assert_eq!(codex_ids(&catalog), codex_ids(&ModelsDevCatalog::fixture()));
+    }
+
+    #[tokio::test]
+    async fn replace_roster_persists_and_reloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = ModelsDevCatalog::fixture_for_data_dir(dir.path());
+        assert!(catalog.roster_needs_refresh("openai-codex"));
+        assert!(catalog.begin_roster_refresh("openai-codex"));
+        assert!(
+            !catalog.begin_roster_refresh("openai-codex"),
+            "overlapping triggers admit one refresh per retry window"
+        );
+        assert!(
+            !catalog.roster_needs_refresh("openai-codex"),
+            "retry backoff suppresses immediate re-attempts"
+        );
+
+        assert!(
+            catalog
+                .replace_roster("openai-codex", BTreeMap::new())
+                .await
+                .is_err(),
+            "an empty roster must never replace the seed"
+        );
+
+        let mut models = BTreeMap::new();
+        models.insert(
+            "gpt-5.6-luna".to_string(),
+            json!({"base_model": "openai/gpt-5.6-luna"}),
+        );
+        catalog
+            .replace_roster("openai-codex", models)
+            .await
+            .unwrap();
+        assert_eq!(codex_ids(&catalog), ["codex/gpt-5.6-luna"]);
+        assert!(!catalog.roster_needs_refresh("openai-codex"));
+
+        let path = dir.path().join("rosters").join("openai-codex.json");
+        let file: RosterFile = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(file.version, ROSTER_VERSION);
+        assert_eq!(file.models.len(), 1);
+
+        let reloaded = ModelsDevCatalog::fixture_for_data_dir(dir.path());
+        assert_eq!(codex_ids(&reloaded), ["codex/gpt-5.6-luna"]);
+        assert!(!reloaded.roster_needs_refresh("openai-codex"));
+    }
+
+    #[tokio::test]
+    async fn unsafe_provider_ids_never_become_roster_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = ModelsDevCatalog::fixture_for_data_dir(dir.path());
+        let mut models = BTreeMap::new();
+        models.insert("m".to_string(), json!({"name": "M", "tool_call": true}));
+        for provider in ["../escape", "a/b", "a\\b", "", ".."] {
+            assert!(
+                catalog
+                    .replace_roster(provider, models.clone())
+                    .await
+                    .is_err(),
+                "{provider:?} must be rejected"
+            );
+        }
+        assert!(!dir.path().join("rosters").exists());
+        assert!(!dir.path().join("escape.json").exists());
+    }
+
+    #[tokio::test]
+    async fn concurrent_roster_writes_never_corrupt_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = std::sync::Arc::new(ModelsDevCatalog::fixture_for_data_dir(dir.path()));
+        let writes = (0..8).map(|index| {
+            let catalog = catalog.clone();
+            tokio::spawn(async move {
+                let mut models = BTreeMap::new();
+                models.insert(
+                    format!("model-{index}"),
+                    json!({"name": format!("Model {index}"), "tool_call": true}),
+                );
+                catalog.replace_roster("openai-codex", models).await
+            })
+        });
+        for write in writes {
+            write.await.unwrap().unwrap();
+        }
+        // Whichever write won, the file is complete, matches a full roster,
+        // and is the roster the running catalog publishes.
+        let path = dir.path().join("rosters").join("openai-codex.json");
+        let file: RosterFile = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(file.models.len(), 1);
+        assert_eq!(
+            catalog.owned_provider_models("openai-codex"),
+            file.models,
+            "memory and disk must agree on the winning replacement"
+        );
+        assert!(
+            std::fs::read_dir(dir.path().join("rosters"))
+                .unwrap()
+                .all(|entry| entry.unwrap().file_name() == "openai-codex.json"),
+            "no temp files are left behind"
+        );
+    }
+
+    #[test]
+    fn empty_catalog_serves_only_overlay_only_models() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = ModelsDevCatalog::for_data_dir(dir.path());
+        assert!(!catalog.is_available());
+        assert!(catalog.provider_presets().is_empty());
+        assert!(
+            catalog
+                .provider_for_endpoint("openai", "https://api.openai.com/v1", "openai-compat")
+                .is_none()
+        );
+        assert!(
+            catalog
+                .model("openai", "openai", "gpt-5.6", OptionsDialect::OpenAi)
+                .is_none()
+        );
+        // Every Codex seed entry inherits from a public record, so nothing
+        // can be described yet.
+        assert!(codex_ids(&catalog).is_empty());
+        // Cursor-only seed entries carry their own metadata.
+        let mut cursor: Vec<_> = catalog
+            .provider_models("cursor", "cursor", OptionsDialect::ClaudeCli)
+            .into_iter()
+            .map(|model| model.id)
+            .collect();
+        cursor.sort();
+        assert_eq!(
+            cursor,
+            [
+                "cursor/composer-2.5",
+                "cursor/default",
+                "cursor/gemini-3.7-flash"
+            ]
+        );
+        assert!(!catalog.has_source_model("openai", "gpt-5.6"));
     }
 }
