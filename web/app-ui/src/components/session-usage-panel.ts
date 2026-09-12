@@ -46,6 +46,11 @@ let nextSessionUsagePanelId = 0;
 
 const COLLAPSED_STORAGE_KEY = "trouve.usage-panel.v1";
 
+/** Live catalog entries carry their routes; the compatibility type omits them. */
+type UsageCatalogEntry = ProtocolModelInfo & {
+  readonly routes?: readonly UsageRouteCandidate[];
+};
+
 const loadCollapsed = (): boolean => {
   try {
     return globalThis.localStorage?.getItem(COLLAPSED_STORAGE_KEY) === "collapsed";
@@ -210,16 +215,29 @@ export class TrouveSessionUsagePanel extends withSignalTracking(LitElement) {
     return this.#store.value?.threadView(this.threadId).turnModels ?? new Map();
   }
 
-  /** The route this thread is attributed to from its own history alone. */
-  #attributedRoute(): UsageRoute | undefined {
+  #resolveRoute(
+    catalog: readonly UsageCatalogEntry[],
+    subscriptions: readonly ProtocolSubscriptionHealth[],
+  ): UsageRoute | undefined {
     if (this.model === "") return undefined;
     return usagePanelRoute({
       model: this.model,
       turnModels: this.#turnModels(),
       threadRoute: this.threadRoute,
-      candidates: [],
-      subscriptions: [],
+      candidates: modelForSelection(catalog, this.model)?.routes ?? [],
+      subscriptions,
     });
+  }
+
+  /** The route this thread is attributed to right now. Reading the catalog
+   * and provider-usage signals here keeps the reload key reactive to a
+   * healthiest-candidate change on a thread that has not run a turn yet. */
+  #attributedRoute(): UsageRoute | undefined {
+    const services = this.#services.value;
+    return this.#resolveRoute(
+      services === undefined ? [] : readSignal(services.modelCatalog.current),
+      services === undefined ? [] : readSignal(services.subscriptionHealth.current),
+    );
   }
 
   readonly #toggleCollapsed = (): void => {
@@ -515,20 +533,14 @@ export class TrouveSessionUsagePanel extends withSignalTracking(LitElement) {
           services.modelCatalog.refresh("if-stale"),
         ]);
         if (generation !== this.#generation) return;
-        const subscriptions = healthResult.status === "fulfilled" ? healthResult.value : [];
-        // Live catalog entries carry their routes; the compatibility type omits them.
-        const catalog: readonly (ProtocolModelInfo & {
-          readonly routes?: readonly UsageRouteCandidate[];
-        })[] = catalogResult.status === "fulfilled"
-          ? catalogResult.value
-          : readSignal(services.modelCatalog.current);
-        this.#route = usagePanelRoute({
-          model: this.model,
-          turnModels: this.#turnModels(),
-          threadRoute: this.threadRoute,
-          candidates: modelForSelection(catalog, this.model)?.routes ?? [],
-          subscriptions,
-        });
+        this.#route = this.#resolveRoute(
+          catalogResult.status === "fulfilled"
+            ? catalogResult.value
+            : readSignal(services.modelCatalog.current),
+          healthResult.status === "fulfilled"
+            ? healthResult.value
+            : readSignal(services.subscriptionHealth.current),
+        );
         const providerId = this.#route?.providerId;
         if (healthResult.status === "fulfilled") {
           this.#health = healthResult.value.find(
@@ -537,6 +549,10 @@ export class TrouveSessionUsagePanel extends withSignalTracking(LitElement) {
           if (this.#health === undefined || this.#health.status === "unsupported") {
             this.#health = undefined;
           }
+        } else if (this.#health?.provider_id !== providerId) {
+          // A failover reloads under the same data key. A rejected refresh may
+          // keep the same provider's last meter, never another provider's.
+          this.#health = undefined;
         }
         if (sessionResult.status === "fulfilled") {
           this.#sessionSummary = sessionResult.value;
