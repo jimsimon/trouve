@@ -75,7 +75,11 @@ const entryLimit = mode === "desktop" ? 856_000 : 850_000;
 // and 3,337,805 B; preserve less than 2 kB of headroom for each. Entry,
 // worker, and largest-chunk budgets below still prevent one bundle from
 // hiding in the aggregate.
-const totalJavaScriptLimit = mode === "desktop" ? 3_354_000 : 3_339_000;
+// The protocol 9.8 model-catalog availability state (ServerInfo field, the
+// server.model_catalog_changed event, and the downloading placeholders)
+// brings them to 3,356,390 B and 3,341,545 B; preserve less than 2 kB of
+// headroom for each.
+const totalJavaScriptLimit = mode === "desktop" ? 3_358_000 : 3_343_000;
 // beautiful-mermaid 1.1 with elk.bundled emits 1,524,273 B (469 kB gzipped).
 // Preserve less than 6 kB of headroom.
 const diagramEngineLimit = 1_530_000;
