@@ -13,14 +13,22 @@ COPY packages/protocol/package.json packages/protocol/
 COPY packages/transcript/package.json packages/transcript/
 COPY packages/ui-foundation/package.json packages/ui-foundation/
 RUN npm ci --workspace apps/review-ui --no-audit --no-fund
-COPY apps/review-ui/tsconfig.json apps/review-ui/index.html apps/review-ui/
+COPY apps/review-ui/tsconfig.json apps/review-ui/tsconfig.worker.json apps/review-ui/vite.config.ts apps/review-ui/index.html apps/review-ui/
 COPY apps/review-ui/src apps/review-ui/src
 # The shared packages are consumed as TypeScript source through their package
 # exports, so their sources (and the tsconfigs Vite reads for class-field
-# semantics) are part of this build context too: the dashboard itself and
-# the design system it is drawn with.
+# semantics) are part of this build context too: the dashboard itself, the
+# design system it is drawn with, and the transcript/content renderers it
+# shares with the desktop app.
 COPY packages/code-review/tsconfig.json packages/code-review/
 COPY packages/code-review/src packages/code-review/src
+COPY packages/content-rendering/tsconfig.json packages/content-rendering/
+COPY packages/content-rendering/src packages/content-rendering/src
+COPY packages/protocol/tsconfig.json packages/protocol/
+COPY packages/protocol/src packages/protocol/src
+COPY packages/protocol/scripts packages/protocol/scripts
+COPY packages/transcript/tsconfig.json packages/transcript/
+COPY packages/transcript/src packages/transcript/src
 COPY packages/ui-foundation/tsconfig.json packages/ui-foundation/
 COPY packages/ui-foundation/src packages/ui-foundation/src
 RUN npm run build --workspace apps/review-ui

@@ -1,3 +1,5 @@
+import { ProtocolClient } from "@trouve-ai/protocol/client";
+
 import type {
   CodeReviewSettings,
   Dashboard,
@@ -28,6 +30,10 @@ export interface RepositoryModelOptionChanges {
   router?: boolean;
   analyst?: boolean;
 }
+
+/** The protocol client needs an absolute base; resolve the site-relative default against the page. */
+const absoluteBaseUrl = (baseUrl: string): string =>
+  new URL(baseUrl || "/", globalThis.location?.href ?? "http://localhost/").href.replace(/\/+$/u, "");
 
 export interface ReviewApiOptions {
   /**
@@ -77,6 +83,14 @@ export function createReviewApi({
   // functions this factory replaced.
   const send: typeof globalThis.fetch = (input, init) =>
     (fetchImpl ?? globalThis.fetch)(input, init);
+  // Review tasks run as ordinary trouve threads on the same server, so their
+  // live transcripts come from the standard protocol client at the same base.
+  let protocolClient: ProtocolClient | undefined;
+  const protocol = (): ProtocolClient => {
+    protocolClient ??= new ProtocolClient(absoluteBaseUrl(baseUrl), { fetch: send });
+    return protocolClient;
+  };
+
   async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
     const response = await send(`${root}${path}`, {
       ...init,
@@ -351,6 +365,7 @@ export function createReviewApi({
   return {
     baseUrl,
     api,
+    protocol,
     getDashboard,
     getReviewSettings,
     saveReviewSettings,
