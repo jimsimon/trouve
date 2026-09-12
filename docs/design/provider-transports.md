@@ -70,9 +70,11 @@ process: they read the persisted roster when it exists and the seed otherwise.
 | `gitlab` | The catalog package targets GitLab's internal AI integration, not a documented general-purpose model API. |
 | `sap-ai-core` | SAP requires OAuth client-credential handling, resource-group headers, and discovery of a tenant-specific orchestration deployment URL. A static endpoint template would not be sufficient. |
 
-These records remain in the bundled catalog so adding a reviewed adapter does
-not require changing the snapshot format. They become visible only after the
-missing transport and authentication flow is implemented.
+These records are part of the downloaded models.dev catalog (and of the
+models.dev test fixture; nothing is bundled into the production binary), so
+adding a reviewed adapter does not require changing the catalog format. They
+become visible only after the missing transport and authentication flow is
+implemented.
 
 Vendor transport replacements follow the shared
 [agent backend conformance and qualification contract](agent-backend-conformance.md).
