@@ -70,10 +70,11 @@ const entryLimit = mode === "desktop" ? 856_000 : 850_000;
 // client, design tokens, content rendering, and transcript into shared
 // workspace packages, the transcript's dedicated completion announcer, and
 // hiding title-only reasoning nodes bring them to 3,328,030 B and
-// 3,313,189 B. Preserve less than 2 kB of headroom for each. Entry, worker,
-// and largest-chunk budgets below still prevent one bundle from hiding in the
-// aggregate.
-const totalJavaScriptLimit = mode === "desktop" ? 3_330_000 : 3_315_000;
+// 3,313,189 B. Removing the embedded Review operations view brings them to
+// 3,262,714 B and 3,247,873 B. Preserve less than 2 kB of headroom for
+// each. Entry, worker, and largest-chunk budgets below still prevent one
+// bundle from hiding in the aggregate.
+const totalJavaScriptLimit = mode === "desktop" ? 3_264_000 : 3_249_000;
 // beautiful-mermaid 1.1 with elk.bundled emits 1,524,273 B (469 kB gzipped).
 // Preserve less than 6 kB of headroom.
 const diagramEngineLimit = 1_530_000;

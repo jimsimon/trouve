@@ -59,9 +59,10 @@ signal and the sort key of every session list.
   (device code must render well on mobile: show code, open browser).
 - **S7 About** — `/settings/about`; frontend, server, protocol, deployment,
   connectivity, version, and licenses.
-- **S8 Code-review dashboard** — `/reviews`; App health, recent review jobs,
-  execution limits, GitHub App configuration, repository review policy and
-  routing, and built-in/custom reviewer administration.
+- **S8 Code-review dashboard** — removed from the desktop app. Automated
+  reviews are administered in the self-hosted review site
+  (`@trouve-ai/code-review`); how the desktop surfaces them is being
+  reworked.
 - **S9 Automations** — `/automations`; list, create, edit, run, and delete
   server-scheduled prompts that execute in fresh sessions, including template,
   workspace, schedule, mode, model, and permission configuration.
@@ -174,9 +175,8 @@ frontend ownership and rollback policy follow ADR 0028.
 5. **PR flow**: session branch → Pull request inspection tab → inspect current
    status and use the lifecycle actions the server reports as available.
 6. **Provider onboarding**: S6 on first run and from settings.
-7. **Automated code review**: `/reviews` → inspect App/job health → tune
-   execution settings → configure repositories and reviewer routing/personas →
-   monitor or act on review jobs.
+7. **Automated code review**: administered in the self-hosted review site,
+   not in the desktop app.
 8. **Automation administration**: `/automations` → start from a template or a
    blank automation → select workspace, schedule, prompt, and run defaults →
    save, run on demand, or delete with confirmation.
