@@ -174,10 +174,7 @@ impl OpenAiCompatProvider {
     /// endpoints that need no separate credential or model registry.
     fn native_model_api(&self) -> Option<NativeModelApi> {
         let url = reqwest::Url::parse(&self.base_url).ok()?;
-        let loopback = matches!(
-            url.host_str()?.to_ascii_lowercase().as_str(),
-            "localhost" | "127.0.0.1" | "::1"
-        );
+        let loopback = crate::catalog::endpoint_is_loopback(url.as_str());
         match self.id.as_str() {
             "ollama" => Some(NativeModelApi::Ollama),
             "lmstudio" | "lm-studio" => Some(NativeModelApi::LmStudio),
@@ -500,6 +497,11 @@ struct PartialToolCall {
 impl Provider for OpenAiCompatProvider {
     fn id(&self) -> &str {
         &self.id
+    }
+
+    fn shared_model_identity(&self, model: &str) -> Option<String> {
+        let catalog_provider = self.catalog_provider_id()?;
+        self.catalog.shared_model_identity(&catalog_provider, model)
     }
 
     fn models(&self) -> Vec<trouve_protocol::ModelInfo> {

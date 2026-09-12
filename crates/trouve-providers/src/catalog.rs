@@ -121,6 +121,34 @@ pub fn provider_category(kind: &str, auth: &str, base_url: Option<&str>) -> Stri
     }
 }
 
+/// Whether a provider endpoint's parsed host is local loopback. IPv4-mapped
+/// IPv6 addresses are normalized before classification because
+/// `Ipv6Addr::is_loopback` only recognizes `::1`.
+pub fn endpoint_is_loopback(url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host.trim_end_matches('.');
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|address| match address {
+            std::net::IpAddr::V4(address) => address.is_loopback(),
+            std::net::IpAddr::V6(address) => {
+                address.is_loopback()
+                    || address
+                        .to_ipv4_mapped()
+                        .is_some_and(|mapped| mapped.is_loopback())
+            }
+        })
+}
+
 fn is_loopback_url(url: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(url) else {
         return false;
@@ -132,12 +160,7 @@ fn is_loopback_url(url: &str) -> bool {
     {
         return false;
     }
-    url.host_str().is_some_and(|host| {
-        host.eq_ignore_ascii_case("localhost")
-            || host
-                .parse::<std::net::IpAddr>()
-                .is_ok_and(|address| address.is_loopback())
-    })
+    endpoint_is_loopback(url.as_str())
 }
 
 /// Schema for the exact effort values returned by Anthropic's live Models
@@ -250,7 +273,20 @@ mod tests {
             "local"
         );
         assert_eq!(
+            provider_category("openai-compat", "none", Some("http://localhost.:11434/v1")),
+            "local",
+            "a DNS trailing dot does not make localhost a hosted endpoint"
+        );
+        assert_eq!(
             provider_category("openai-compat", "api-key", Some("http://127.0.0.1:8000/v1")),
+            "local"
+        );
+        assert_eq!(
+            provider_category(
+                "custom",
+                "api-key",
+                Some("http://[::ffff:127.0.0.1]:8000/v1")
+            ),
             "local"
         );
         for url in [

@@ -260,6 +260,10 @@ impl AgentBackend for CodexBackend {
         &self.id
     }
 
+    fn shared_model_identity(&self, model: &str) -> Option<String> {
+        self.catalog.shared_model_identity("openai-codex", model)
+    }
+
     fn models(&self) -> Vec<ModelInfo> {
         // Codex is a distinct serving surface: its static trouve-owned
         // provider inherits shared metadata from models.dev and owns the

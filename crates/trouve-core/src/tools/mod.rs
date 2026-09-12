@@ -614,6 +614,42 @@ async fn run_optional_review_fetches(
     Ok(failures)
 }
 
+/// Ownership of one session's mutation lane after it has passed the
+/// cancellation-cleanup admission fence.
+///
+/// The execution guard serializes worktree mutations. The admission guard is
+/// deliberately acquired second and retained for the same lifetime: backend
+/// cleanup can queue an exclusive admission fence before cancellation, so a
+/// mutation already waiting for the execution guard cannot start while
+/// unacknowledged vendor cleanup is still live.
+pub(crate) struct SessionMutationPermit {
+    _admission: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
+    _execution: tokio::sync::OwnedRwLockWriteGuard<()>,
+}
+
+impl SessionMutationPermit {
+    pub(crate) fn admitted(
+        execution: tokio::sync::OwnedRwLockWriteGuard<()>,
+        admission: tokio::sync::OwnedRwLockReadGuard<()>,
+    ) -> Self {
+        Self {
+            _admission: Some(admission),
+            _execution: execution,
+        }
+    }
+}
+
+#[cfg(test)]
+impl From<tokio::sync::OwnedRwLockWriteGuard<()>> for SessionMutationPermit {
+    fn from(execution: tokio::sync::OwnedRwLockWriteGuard<()>) -> Self {
+        // Isolated tool tests construct a lease without an Engine admission
+        // gate. Production Engine paths always use `admitted`.
+        Self {
+            _admission: None,
+            _execution: execution,
+        }
+    }
+}
 /// Execution context: everything a tool may touch. Mutation paths resolve
 /// inside the session worktree; explicitly registered host resources are
 /// additionally available to read-only filesystem tools.
@@ -1181,6 +1217,34 @@ pub struct MaterializedAttachment {
     pub bytes: Arc<[u8]>,
     pub relative_path: PathBuf,
     pub absolute_path: PathBuf,
+}
+
+/// Stable worktree-relative path for a successfully materialized attachment.
+pub(crate) fn materialized_attachment_relative_path(
+    attachment: &trouve_protocol::Attachment,
+) -> Result<PathBuf, String> {
+    if attachment.id.is_empty() || matches!(attachment.id.as_str(), "." | "..") {
+        return Err("attachment id cannot form an opaque materialized path".into());
+    }
+    let ext = Path::new(&attachment.name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .filter(|extension| {
+            extension.len() <= 8
+                && extension
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric())
+        })
+        .map(|extension| format!(".{}", extension.to_ascii_lowercase()))
+        .unwrap_or_default();
+    let filename = format!("{}{}", attachment.id, ext);
+    if !filename
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+    {
+        return Err("attachment id cannot form an opaque materialized path".into());
+    }
+    Ok(Path::new(".trouve").join("attachments").join(filename))
 }
 
 pub struct SessionWorktreeCreate {
@@ -2918,30 +2982,16 @@ impl ToolExecutor for LocalToolExecutor {
                 }
                 let bytes =
                     read_attachment_secure(&source_root, &file.source, file.attachment.size_bytes)?;
-                let ext = Path::new(&file.attachment.name)
-                    .extension()
-                    .and_then(|extension| extension.to_str())
-                    .filter(|extension| {
-                        extension.len() <= 8
-                            && extension
-                                .chars()
-                                .all(|character| character.is_ascii_alphanumeric())
-                    })
-                    .map(|extension| format!(".{}", extension.to_ascii_lowercase()))
-                    .unwrap_or_default();
-                let filename = format!("{}{}", file.attachment.id, ext);
-                if !filename
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
-                {
-                    return Err("attachment id cannot form an opaque materialized path".into());
-                }
-                let absolute_path = materialized_root.join(&filename);
+                let relative_path = materialized_attachment_relative_path(&file.attachment)?;
+                let filename = relative_path.file_name().ok_or_else(|| {
+                    "materialized attachment path does not have a file name".to_string()
+                })?;
+                let absolute_path = materialized_root.join(filename);
                 ensure_materialized_attachment(&materialized_root, &absolute_path, &bytes)?;
                 out.push(MaterializedAttachment {
                     attachment: file.attachment,
                     bytes: Arc::from(bytes),
-                    relative_path: Path::new(".trouve").join("attachments").join(filename),
+                    relative_path,
                     absolute_path,
                 });
             }
@@ -3832,6 +3882,36 @@ impl ToolExecutor for LocalToolExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn materialized_attachment_path_rejects_empty_and_parent_components() {
+        for id in ["", ".", ".."] {
+            let attachment = trouve_protocol::Attachment {
+                id: id.into(),
+                name: "attachment".into(),
+                mime: "application/octet-stream".into(),
+                size_bytes: 0,
+            };
+            assert!(
+                materialized_attachment_relative_path(&attachment).is_err(),
+                "accepted unsafe attachment id {id:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn materialized_attachment_path_is_an_opaque_relative_child() {
+        let attachment = trouve_protocol::Attachment {
+            id: "at_safe-1".into(),
+            name: "Screenshot.PNG".into(),
+            mime: "image/png".into(),
+            size_bytes: 3,
+        };
+        assert_eq!(
+            materialized_attachment_relative_path(&attachment).unwrap(),
+            PathBuf::from(".trouve/attachments/at_safe-1.png")
+        );
+    }
 
     #[test]
     fn review_diff_file_preserves_two_field_construction() {

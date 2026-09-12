@@ -67,9 +67,12 @@ const entryLimit = mode === "desktop" ? 856_000 : 850_000;
 // span planner and the memoized chat-derived state bring them to 3,322,799 B
 // and 3,307,948 B. The protocol 9.5 `carried_verdict` schema on code-review
 // findings brings them to 3,325,722 B and 3,310,871 B; preserve less than
-// 2 kB of headroom for each. Entry, worker, and largest-chunk budgets below
-// still prevent one bundle from hiding in the aggregate.
-const totalJavaScriptLimit = mode === "desktop" ? 3_327_000 : 3_312_000;
+// 2 kB of headroom for each. Protocol 9.6's automatic/concrete route catalog,
+// provider-priority settings, route-selection and provider-order events, and
+// generated validators bring the combined graphs to approximately 3,346 kB
+// and 3,331 kB. Entry, worker, and largest-chunk budgets below still prevent
+// one bundle from hiding in the aggregate.
+const totalJavaScriptLimit = mode === "desktop" ? 3_348_000 : 3_333_000;
 // beautiful-mermaid 1.1 with elk.bundled emits 1,524,273 B (469 kB gzipped).
 // Preserve less than 6 kB of headroom.
 const diagramEngineLimit = 1_530_000;

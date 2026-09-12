@@ -7,6 +7,17 @@ import { createSignal, type ReadonlySignal } from "../state/reactivity.js";
 export type SubscriptionHealthFreshness = "if-stale" | "force";
 
 const DEFAULT_TTL_MS = 30_000;
+const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
+
+/** Run one request with a portable, self-clearing deadline. */
+export const requestWithDeadline = <T>(
+  timeoutMs: number,
+  request: (signal: AbortSignal) => Promise<T>,
+): Promise<T> => {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  return (async () => request(controller.signal))().finally(() => clearTimeout(timer));
+};
 
 /** One app-wide freshness and response-generation gate for provider usage.
  * Some probes launch vendor helpers, so independent component polling is both
@@ -15,6 +26,7 @@ export class SubscriptionHealthController {
   readonly #protocol: Pick<ProtocolClient, "subscriptionHealth">;
   readonly #now: () => number;
   readonly #ttlMs: number;
+  readonly #requestTimeoutMs: number;
   readonly #current = createSignal<readonly ProtocolSubscriptionHealth[]>(
     Object.freeze([]),
   );
@@ -37,11 +49,16 @@ export class SubscriptionHealthController {
 
   constructor(
     protocol: Pick<ProtocolClient, "subscriptionHealth">,
-    options: { readonly now?: () => number; readonly ttlMs?: number } = {},
+    options: {
+      readonly now?: () => number;
+      readonly ttlMs?: number;
+      readonly requestTimeoutMs?: number;
+    } = {},
   ) {
     this.#protocol = protocol;
     this.#now = options.now ?? (() => Date.now());
     this.#ttlMs = options.ttlMs ?? DEFAULT_TTL_MS;
+    this.#requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
   }
 
   refresh(
@@ -57,7 +74,10 @@ export class SubscriptionHealthController {
     this.#lastStartedAt = now;
     const generation = ++this.#generation;
     this.#loading.set(true);
-    const promise = this.#protocol.subscriptionHealth().then(
+    const promise = requestWithDeadline(
+      this.#requestTimeoutMs,
+      (signal) => this.#protocol.subscriptionHealth(signal),
+    ).then(
       (health) => {
         if (generation === this.#generation) {
           const snapshot = Object.freeze([...health]);

@@ -476,6 +476,11 @@ impl Provider for AnthropicProvider {
         &self.id
     }
 
+    fn shared_model_identity(&self, model: &str) -> Option<String> {
+        let catalog_provider = self.catalog_provider_id()?;
+        self.catalog.shared_model_identity(&catalog_provider, model)
+    }
+
     fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
         self.catalog_provider_id()
             .map(|provider| {

@@ -31,7 +31,9 @@ use trouve_protocol::{
 };
 
 use crate::config::GithubReviewAppConfig;
-use crate::engine::{Engine, EngineError, ReviewWorkspaceRegistrationFence};
+use crate::engine::{
+    Engine, EngineError, ReviewWorkspaceRegistrationFence, validate_model_selection,
+};
 use crate::store::{
     CODE_REVIEW_CARRIED_ANCHOR_CURSOR_MARKER, CodeReviewJobPhase, CodeReviewJobRecord,
     CodeReviewJobRetryOutcome, CodeReviewManualRequest, CodeReviewModelTiming,
@@ -3629,11 +3631,8 @@ impl Engine {
                 .map(str::trim)
                 .filter(|model| !model.is_empty())
                 .map(str::to_string);
-            if model.as_deref().is_some_and(|model| !model.contains('/')) {
-                return Err(EngineError::BadRequest(format!(
-                    "model override for reviewer {:?} must be provider-qualified",
-                    reviewer_override.reviewer_id
-                )));
+            if let Some(model) = model.as_deref() {
+                validate_model_selection(model)?;
             }
             let thinking_level = reviewer_override
                 .thinking_level
@@ -3641,7 +3640,9 @@ impl Engine {
                 .map(str::trim)
                 .filter(|level| !level.is_empty())
                 .map(str::to_string);
-            let model_options = scalar_model_options(&reviewer_override.model_options);
+            // Preserve invalid shapes until request validation so they are
+            // rejected instead of disappearing during normalization.
+            let model_options = reviewer_override.model_options.clone();
             let prompt = reviewer_override.prompt.trim();
             if prompt.len() > 16_000 {
                 return Err(EngineError::BadRequest(format!(
@@ -3678,11 +3679,25 @@ impl Engine {
         Ok(normalized)
     }
 
+    async fn resolve_code_review_model_info(
+        &self,
+        model: &str,
+        cache: &mut HashMap<String, trouve_protocol::ModelInfo>,
+    ) -> Result<trouve_protocol::ModelInfo, EngineError> {
+        if let Some(model_info) = cache.get(model) {
+            return Ok(model_info.clone());
+        }
+        let model_info = self.resolve_model_info(model).await?;
+        cache.insert(model.to_string(), model_info.clone());
+        Ok(model_info)
+    }
+
     async fn validate_code_review_thinking_level(
         &self,
         role: &str,
         level: Option<&str>,
         model: Option<&str>,
+        model_info_cache: &mut HashMap<String, trouve_protocol::ModelInfo>,
     ) -> Result<(), EngineError> {
         let Some(level) = level else {
             return Ok(());
@@ -3690,7 +3705,9 @@ impl Engine {
         let selected_model = model.ok_or_else(|| {
             EngineError::BadRequest(format!("{role} thinking level requires a configured model"))
         })?;
-        let model_info = self.resolve_model_info(selected_model).await?;
+        let model_info = self
+            .resolve_code_review_model_info(selected_model, model_info_cache)
+            .await?;
         let supported = crate::engine::advertised_thinking_levels(&model_info);
         if supported.contains(&level) {
             return Ok(());
@@ -3730,8 +3747,9 @@ impl Engine {
         role: &str,
         options: &serde_json::Map<String, serde_json::Value>,
         model: Option<&str>,
+        model_info_cache: &mut HashMap<String, trouve_protocol::ModelInfo>,
     ) -> Result<serde_json::Map<String, serde_json::Value>, EngineError> {
-        let options = scalar_model_options(options);
+        let options = validate_scalar_model_options(role, options)?;
         if options.is_empty() {
             return Ok(options);
         }
@@ -3743,7 +3761,9 @@ impl Engine {
         let selected_model = model.ok_or_else(|| {
             EngineError::BadRequest(format!("{role} model options require a configured model"))
         })?;
-        let model_info = self.resolve_model_info(selected_model).await?;
+        let model_info = self
+            .resolve_code_review_model_info(selected_model, model_info_cache)
+            .await?;
         crate::engine::validate_model_options(&options, &model_info).map_err(
             |error| match error {
                 EngineError::BadRequest(message) => {
@@ -3798,16 +3818,15 @@ impl Engine {
         if request.model.is_some() && model.is_none() {
             return Err(EngineError::BadRequest("model cannot be empty".into()));
         }
-        if model.as_deref().is_some_and(|model| !model.contains('/')) {
-            return Err(EngineError::BadRequest(
-                "review model must be provider-qualified".into(),
-            ));
+        if let Some(model) = model.as_deref() {
+            validate_model_selection(model)?;
         }
         if request.mode != CodeReviewMode::Off && model.is_none() {
             return Err(EngineError::BadRequest(
                 "enabled code review requires an explicit repository model".into(),
             ));
         }
+        let mut model_info_cache = HashMap::new();
         let coordinator_thinking_level = request
             .coordinator_thinking_level
             .as_ref()
@@ -3817,6 +3836,7 @@ impl Engine {
             "coordinator",
             coordinator_thinking_level.as_deref(),
             model.as_deref(),
+            &mut model_info_cache,
         )
         .await?;
         let router_model = request
@@ -3829,13 +3849,8 @@ impl Engine {
                 "router model cannot be empty".into(),
             ));
         }
-        if router_model
-            .as_deref()
-            .is_some_and(|model| !model.contains('/'))
-        {
-            return Err(EngineError::BadRequest(
-                "router model must be provider-qualified".into(),
-            ));
+        if let Some(router_model) = router_model.as_deref() {
+            validate_model_selection(router_model)?;
         }
         let router_thinking_level = request
             .router_thinking_level
@@ -3846,6 +3861,7 @@ impl Engine {
             "router",
             router_thinking_level.as_deref(),
             router_model.as_deref().or(model.as_deref()),
+            &mut model_info_cache,
         )
         .await?;
         let analyst_model = request
@@ -3858,13 +3874,8 @@ impl Engine {
                 "analyst model cannot be empty".into(),
             ));
         }
-        if analyst_model
-            .as_deref()
-            .is_some_and(|model| !model.contains('/'))
-        {
-            return Err(EngineError::BadRequest(
-                "analyst model must be provider-qualified".into(),
-            ));
+        if let Some(analyst_model) = analyst_model.as_deref() {
+            validate_model_selection(analyst_model)?;
         }
         let analyst_thinking_level = request
             .analyst_thinking_level
@@ -3875,6 +3886,7 @@ impl Engine {
             "analyst",
             analyst_thinking_level.as_deref(),
             analyst_model.as_deref().or(model.as_deref()),
+            &mut model_info_cache,
         )
         .await?;
         let existing = self
@@ -3898,6 +3910,7 @@ impl Engine {
                 "coordinator",
                 &coordinator_model_options,
                 model.as_deref(),
+                &mut model_info_cache,
             )
             .await?;
         let router_model_options = request
@@ -3914,6 +3927,7 @@ impl Engine {
                 "router",
                 &router_model_options,
                 router_model.as_deref().or(model.as_deref()),
+                &mut model_info_cache,
             )
             .await?;
         let analyst_model_options = request
@@ -3930,6 +3944,7 @@ impl Engine {
                 "analyst",
                 &analyst_model_options,
                 analyst_model.as_deref().or(model.as_deref()),
+                &mut model_info_cache,
             )
             .await?;
         let reviewer_ids = request
@@ -4067,12 +4082,14 @@ impl Engine {
                 &role,
                 reviewer_override.thinking_level.as_deref(),
                 effective_model,
+                &mut model_info_cache,
             )
             .await?;
             self.validate_code_review_model_options(
                 &role,
                 &reviewer_override.model_options,
                 effective_model,
+                &mut model_info_cache,
             )
             .await?;
         }
@@ -15296,6 +15313,21 @@ fn scalar_model_options(
         .collect()
 }
 
+fn validate_scalar_model_options(
+    role: &str,
+    options: &serde_json::Map<String, serde_json::Value>,
+) -> Result<serde_json::Map<String, serde_json::Value>, EngineError> {
+    if let Some((name, _)) = options
+        .iter()
+        .find(|(_, value)| !value.is_string() && !value.is_number() && !value.is_boolean())
+    {
+        return Err(EngineError::BadRequest(format!(
+            "{role} model option {name} must be a string, number, or boolean"
+        )));
+    }
+    Ok(options.clone())
+}
+
 /// Thread options for one review role: the role's stored non-thinking
 /// options plus the legacy thinking-level shorthand, unless those options
 /// already carry a thinking selection.
@@ -20437,6 +20469,7 @@ mod tests {
 
     struct RouterThinkingProvider {
         stall: bool,
+        list_calls: Option<Arc<AtomicUsize>>,
     }
 
     #[async_trait::async_trait]
@@ -20504,6 +20537,9 @@ mod tests {
         }
 
         async fn list_models(&self) -> Vec<trouve_protocol::ModelInfo> {
+            if let Some(list_calls) = &self.list_calls {
+                list_calls.fetch_add(1, Ordering::SeqCst);
+            }
             if self.stall {
                 return std::future::pending().await;
             }
@@ -33105,7 +33141,10 @@ rename to src/new.rs
         )
         .with_provider(
             "provider",
-            Arc::new(RouterThinkingProvider { stall: false }),
+            Arc::new(RouterThinkingProvider {
+                stall: false,
+                list_calls: None,
+            }),
         );
         let request =
             |router_model: Option<&str>, level: Option<&str>| UpdateCodeReviewRepositoryRequest {
@@ -33149,6 +33188,13 @@ rename to src/new.rs
             .find(|repository| repository.repository == "acme/widgets")
             .unwrap();
         assert_eq!(unchanged.router_thinking_level.as_deref(), Some("low"));
+
+        let saved = engine
+            .update_code_review_repository(&request(Some("provider/router"), Some("high")))
+            .await
+            .unwrap();
+        assert_eq!(saved.router_model.as_deref(), Some("provider/router"));
+        assert_eq!(saved.router_thinking_level.as_deref(), Some("high"));
 
         let error = engine
             .update_code_review_repository(&request(Some("provider/plain"), Some("low")))
@@ -33215,8 +33261,13 @@ rename to src/new.rs
             .unwrap_err();
         assert!(error.to_string().contains("supported levels: low, high"));
 
-        let engine =
-            engine.with_provider("provider", Arc::new(RouterThinkingProvider { stall: true }));
+        let engine = engine.with_provider(
+            "provider",
+            Arc::new(RouterThinkingProvider {
+                stall: true,
+                list_calls: None,
+            }),
+        );
         let error = tokio::time::timeout(
             Duration::from_secs(1),
             engine.update_code_review_repository(&request(None, Some("low"))),
@@ -33238,6 +33289,7 @@ rename to src/new.rs
         store
             .upsert_discovered_code_review_repository(7, "acme/widgets", false)
             .unwrap();
+        let list_calls = Arc::new(AtomicUsize::new(0));
         let engine = Engine::new(
             store,
             data.path().to_path_buf(),
@@ -33245,7 +33297,10 @@ rename to src/new.rs
         )
         .with_provider(
             "provider",
-            Arc::new(RouterThinkingProvider { stall: false }),
+            Arc::new(RouterThinkingProvider {
+                stall: false,
+                list_calls: Some(list_calls.clone()),
+            }),
         );
         let fast = || serde_json::Map::from_iter([("fast".to_string(), serde_json::json!(true))]);
         let request = || UpdateCodeReviewRepositoryRequest {
@@ -33285,6 +33340,7 @@ rename to src/new.rs
         assert!(saved.router_model_options.is_empty());
         assert_eq!(saved.reviewer_overrides.len(), 1);
         assert_eq!(saved.reviewer_overrides[0].model_options, fast());
+        assert_eq!(list_calls.load(Ordering::SeqCst), 1);
         let reviewers = engine.reviewers_for_repository_policy(&saved).unwrap();
         let security = reviewers
             .iter()
@@ -33366,6 +33422,41 @@ rename to src/new.rs
             .await
             .unwrap_err();
         assert!(error.to_string().contains("cannot set thinking"), "{error}");
+
+        for value in [
+            serde_json::Value::Null,
+            serde_json::json!([]),
+            serde_json::json!({}),
+        ] {
+            let mut non_scalar = request();
+            non_scalar.coordinator_thinking_level = None;
+            non_scalar.coordinator_model_options =
+                Some(serde_json::Map::from_iter([("fast".to_string(), value)]));
+            let error = engine
+                .update_code_review_repository(&non_scalar)
+                .await
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("must be a string, number, or boolean"),
+                "{error}"
+            );
+        }
+
+        let mut non_scalar_override = request();
+        non_scalar_override.reviewer_overrides.as_mut().unwrap()[0].model_options =
+            serde_json::Map::from_iter([("fast".to_string(), serde_json::Value::Null)]);
+        let error = engine
+            .update_code_review_repository(&non_scalar_override)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains(
+                "reviewer \"security\" model option fast must be a string, number, or boolean"
+            ),
+            "{error}"
+        );
 
         // Snapshotted jobs dispatch the stored options merged with the
         // legacy thinking shorthand.
@@ -33452,6 +33543,49 @@ rename to src/new.rs
                 "expected {expected:?}, got {error}"
             );
         }
+
+        let mut invalid = request();
+        invalid.model = Some("auto/default".into());
+        rejected(
+            &engine,
+            invalid,
+            "model must be auto/<model> or provider/<model>",
+        )
+        .await;
+
+        let mut invalid = request();
+        invalid.router_model = Some("auto/default".into());
+        rejected(
+            &engine,
+            invalid,
+            "model must be auto/<model> or provider/<model>",
+        )
+        .await;
+
+        let mut invalid = request();
+        invalid.analyst_model = Some("auto/default".into());
+        rejected(
+            &engine,
+            invalid,
+            "model must be auto/<model> or provider/<model>",
+        )
+        .await;
+
+        let mut invalid = request();
+        invalid.reviewer_overrides = Some(vec![ReviewerOverride {
+            reviewer_id: "security".into(),
+            model: Some("auto/default".into()),
+            thinking_level: None,
+            model_options: Default::default(),
+            prompt_mode: ReviewerPromptMode::Inherit,
+            prompt: String::new(),
+        }]);
+        rejected(
+            &engine,
+            invalid,
+            "model must be auto/<model> or provider/<model>",
+        )
+        .await;
 
         let mut invalid = request();
         invalid.reviewer_ids = Some(Vec::new());

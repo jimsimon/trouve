@@ -126,7 +126,7 @@ pub struct ServerInfo {
 /// Global asynchronous naming settings shown under Settings → Sessions & Chat.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SessionNamingSettings {
-    /// Provider-qualified configured model used for session and thread names.
+    /// `auto/<model>` selector or provider-qualified pin used for names.
     pub model: String,
     /// Rename the compact worktree branch after the session receives its name.
     pub derive_branch_name_from_session_title: bool,
@@ -267,7 +267,9 @@ pub struct CreateThreadRequest {
     /// Agent persona id (default: "code").
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
-    /// Provider/model identifier, e.g. "openai/gpt-4.1".
+    /// Model id from `/v1/model-routes`. `auto/<model>` selects dynamically;
+    /// `provider/<model>` explicitly pins the thread to that route. Bare
+    /// neutral ids remain accepted for compatibility.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     /// Model-specific options validated against the model's options schema.
@@ -591,6 +593,8 @@ pub struct UpdateThreadRequest {
     pub expected_title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
+    /// `auto/<model>` selects dynamically; `provider/<model>` is a hard pin.
+    /// Changing this value clears the thread's automatic route affinity.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     /// Replaces the thread's model options when present.
@@ -972,6 +976,8 @@ pub struct ServerProjection {
     pub github_pull_requests: Vec<GithubPrHostProjection>,
     pub session_pull_requests: Vec<SessionPrProjection>,
     pub session_naming_settings: SessionNamingSettings,
+    /// Full provider preference order used for automatic model routing.
+    pub provider_order: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -1750,8 +1756,9 @@ pub enum CodeReviewRoutingMode {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 pub struct ReviewerOverride {
     pub reviewer_id: String,
-    /// Provider-qualified model. Absent means inherit the profile, which in
-    /// turn may inherit the repository/default model.
+    /// Automatic model selector or provider-qualified pin. Absent means
+    /// inherit the profile, which in turn may inherit the repository/default
+    /// model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     /// Preferred thinking level or fixed token budget. Absent means inherit
@@ -1781,8 +1788,9 @@ pub struct CodeReviewRepository {
     pub private: bool,
     #[serde(default)]
     pub mode: CodeReviewMode,
-    /// Provider-qualified model used by the coordinator and inherited by
-    /// reviewers without an override. Required while reviews are enabled.
+    /// Automatic model selector or provider-qualified pin used by the
+    /// coordinator and inherited by reviewers without an override. Required
+    /// while reviews are enabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     /// Preferred thinking level or fixed token budget for the final
@@ -1795,7 +1803,8 @@ pub struct CodeReviewRepository {
     #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
     #[schema(value_type = std::collections::BTreeMap<String, ModelOptionValue>)]
     pub coordinator_model_options: serde_json::Map<String, serde_json::Value>,
-    /// Provider-qualified model used by semantic persona triage. Absent
+    /// Automatic model selector or provider-qualified pin used by semantic
+    /// persona triage. Absent
     /// inherits `model`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub router_model: Option<String>,
@@ -1807,7 +1816,8 @@ pub struct CodeReviewRepository {
     #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
     #[schema(value_type = std::collections::BTreeMap<String, ModelOptionValue>)]
     pub router_model_options: serde_json::Map<String, serde_json::Value>,
-    /// Provider-qualified model used by the per-round implementation
+    /// Automatic model selector or provider-qualified pin used by the
+    /// per-round implementation
     /// analyst. Absent inherits `model`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub analyst_model: Option<String>,
@@ -2024,7 +2034,8 @@ pub struct CodeReviewTask {
     /// cancellation.
     #[serde(default)]
     pub lifecycle_stage: CodeReviewTaskLifecycleStage,
-    /// The provider-qualified model actually used by the created thread.
+    /// The automatic model selector or provider-qualified pin stored on the
+    /// created thread. Concrete route choices are reported by route events.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2889,7 +2900,13 @@ pub struct ProviderInfo {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ProvidersResponse {
     pub providers: Vec<ProviderInfo>,
-    /// Default model for new threads, e.g. "openai/gpt-4.1-mini".
+    /// Provider ids in preferred routing order. Every currently configured
+    /// provider is present; providers not explicitly ordered on the server
+    /// are appended deterministically.
+    #[serde(default)]
+    pub provider_order: Vec<String>,
+    /// Default model for new threads. `auto/<model>` selects dynamically and
+    /// `provider/<model>` pins one route. Bare neutral values remain accepted.
     pub default_model: String,
     /// Global thinking level for new threads. None leaves the selected
     /// model at its own default.
@@ -2899,6 +2916,18 @@ pub struct ProvidersResponse {
     /// a default of their own. Absent on older servers means Ask.
     #[serde(default)]
     pub default_permission_mode: PermissionMode,
+}
+
+/// Replace the global preference prefix used for provider-neutral routing.
+/// Omitted configured providers remain eligible after the listed providers.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct SetProviderOrderRequest {
+    /// Full resolved order observed before this edit. When present, the
+    /// server rejects the write if another client or provider mutation has
+    /// changed that order in the meantime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_provider_ids: Option<Vec<String>>,
+    pub provider_ids: Vec<String>,
 }
 
 /// Create or update a provider. The API key (when given) goes to the secret
@@ -2933,7 +2962,7 @@ pub struct UpsertProviderRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SetDefaultModelRequest {
-    /// Provider-qualified id, e.g. "openai/gpt-4.1-mini".
+    /// `auto/<model>` id, or a provider-qualified id to pin a route.
     pub model: String,
     /// Global thinking level for the selected model. Omitted when the model
     /// has no thinking knob, preserving the existing global setting for
@@ -2946,7 +2975,7 @@ pub struct SetDefaultModelRequest {
 /// (`PUT /v1/config/defaults`).
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SetGlobalDefaultsRequest {
-    /// Provider-qualified id, e.g. "openai/gpt-4.1-mini".
+    /// `auto/<model>` id, or a provider-qualified id to pin a route.
     pub model: String,
     /// Global thinking level for the selected model. None clears the default
     /// so the model chooses its own setting.
@@ -3353,7 +3382,8 @@ pub struct CliInstallStatus {
 /// to render selection and options UIs generically.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ModelInfo {
-    /// Provider-qualified id, e.g. "openai/gpt-4.1-mini".
+    /// Model selector id: `auto/<model>` for dynamic routing or
+    /// `provider/<model>` for a concrete pin.
     pub id: String,
     pub display_name: String,
     pub context_window: u64,
@@ -3371,6 +3401,42 @@ pub struct ModelInfo {
     /// Clients render these controls from the schema, not from hardcoded
     /// per-model knowledge.
     pub options_schema: serde_json::Value,
+}
+
+/// One concrete provider route for an automatic or pinned model selection.
+/// `provider_model` is the provider's own model id, without trouve's
+/// provider prefix, and is the value passed to that provider at execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ModelRouteInfo {
+    pub provider_id: String,
+    pub provider_model: String,
+}
+
+/// A model-picker entry. Automatic entries contain every compatible route;
+/// concrete provider entries contain exactly one. [`ModelInfo`] is the
+/// compatibility shape for clients that do not consume route details.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RoutedModelInfo {
+    /// `auto/<model>` for dynamic routing, or `provider/<model>` for a hard
+    /// pin. Models without a safe shared identity have only concrete entries.
+    pub id: String,
+    pub display_name: String,
+    /// Smallest context window across the available routes, so clients never
+    /// advertise a limit that the selected provider cannot honor.
+    pub context_window: u64,
+    pub supports_tools: bool,
+    /// True only when every eligible route accepts image inputs.
+    #[serde(default)]
+    pub supports_images: bool,
+    /// Prices are present only when every route reports the same value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_price_per_mtok: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_price_per_mtok: Option<f64>,
+    /// Provider-neutral options schema. Provider-specific option names are
+    /// translated after the harness selects a route.
+    pub options_schema: serde_json::Value,
+    pub routes: Vec<ModelRouteInfo>,
 }
 
 /// Aggregated usage for a thread or session.
@@ -3415,6 +3481,14 @@ mod tests {
 
         assert!(request.fetch_latest);
         assert!(request.checkout_ref.is_none());
+    }
+
+    #[test]
+    fn provider_order_requires_an_explicit_array() {
+        assert!(serde_json::from_value::<SetProviderOrderRequest>(serde_json::json!({})).is_err());
+        let reset: SetProviderOrderRequest =
+            serde_json::from_value(serde_json::json!({ "provider_ids": [] })).unwrap();
+        assert!(reset.provider_ids.is_empty());
     }
 
     #[test]

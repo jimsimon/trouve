@@ -32,6 +32,7 @@ import type {
   ProtocolUpdateThreadRequest,
   ProtocolUsageSummary,
 } from "../services/protocol-client.js";
+import { modelForSelection } from "../services/model-catalog-controller.js";
 import {
   beginTitleGeneration,
   LOCAL_MODEL_WAITING_LABEL,
@@ -1822,7 +1823,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     this.#renderedComposerSignature = this.#composerRenderSignature(hasComposerContent);
     const selectedModel = thread === undefined
       ? undefined
-      : models.find((model) => model.id === thread.model);
+      : modelForSelection(models, thread.model);
     const runningTurn = this.#latestRunningTurn(view?.items ?? []);
     const activeTurnSteerable = runningTurn !== undefined
       && view?.turnSteerable.get(runningTurn) === true;
@@ -3349,7 +3350,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     const stateKind = turnStateKind(unit, turnState);
     const modelLabel = turnLabels.get(unit.turn);
     const modelId = turnModels.get(unit.turn);
-    const model = this.#availableModels().find((candidate) => candidate.id === modelId);
+    const model = modelForSelection(this.#availableModels(), modelId);
     const usage = turnState?.kind === "running" || turnState?.kind === "completed"
       ? turnState.usage
       : undefined;

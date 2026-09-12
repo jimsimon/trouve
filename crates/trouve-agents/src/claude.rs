@@ -859,6 +859,10 @@ impl AgentBackend for ClaudeBackend {
         &self.id
     }
 
+    fn shared_model_identity(&self, model: &str) -> Option<String> {
+        self.catalog.shared_model_identity("anthropic", model)
+    }
+
     fn models(&self) -> Vec<ModelInfo> {
         // The same catalog as the per-use Anthropic API provider, so both
         // surface the same metadata. Claude Code accepts full model ids; the

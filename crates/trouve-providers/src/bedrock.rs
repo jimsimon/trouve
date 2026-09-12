@@ -214,6 +214,10 @@ impl Provider for BedrockProvider {
         &self.id
     }
 
+    fn shared_model_identity(&self, model: &str) -> Option<String> {
+        self.catalog.shared_model_identity("amazon-bedrock", model)
+    }
+
     fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
         self.catalog
             .provider_models("amazon-bedrock", &self.id, OptionsDialect::Anthropic)

@@ -62,3 +62,5 @@ sequentially.
 | [0050](0050-shared-cursor-sdk-bridge-process.md) | One shared Cursor SDK Bridge per backend | Accepted |
 | [0051](0051-cursor-shared-store-transition-and-quarantine.md) | Cursor shared-store transition and callback quarantine | Accepted |
 | [0052](0052-owned-os-sandbox-for-shell-commands.md) | Trouve owns an OS sandbox for shell commands | Proposed |
+| [0053](0053-policy-ordered-cross-adapter-model-routing.md) | Policy-ordered cross-adapter model routing | Partially superseded by 0054 |
+| [0054](0054-explicit-and-sticky-model-route-selection.md) | Explicit and sticky model route selection | Accepted |

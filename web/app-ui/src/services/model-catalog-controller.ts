@@ -1,12 +1,54 @@
-import type {
-  ProtocolClient,
-  ProtocolModelInfo,
-} from "./protocol-client.js";
+import type { ProtocolModelInfo } from "./protocol-client.js";
 import { createSignal, type ReadonlySignal } from "../state/reactivity.js";
 
 export type ModelCatalogFreshness = "if-stale" | "force";
 
+export interface ModelSelectionCatalogEntry {
+  readonly id: string;
+  readonly routes?: readonly {
+    readonly provider_id: string;
+    readonly provider_model: string;
+  }[];
+}
+
+/** Resolve current ids, pre-auto-namespace bare ids, and concrete route pins. */
+export const modelForSelection = <T extends ModelSelectionCatalogEntry>(
+  models: readonly T[],
+  selection: string | null | undefined,
+): T | undefined => {
+  if (!selection) return undefined;
+  const exact = models.find((model) => model.id === selection);
+  if (exact !== undefined) return exact;
+  if (!selection.includes("/")) {
+    const automatic = models.find((model) => model.id === `auto/${selection}`);
+    if (automatic !== undefined) return automatic;
+  }
+  return models.find((model) => model.routes?.some(
+    (route) => `${route.provider_id}/${route.provider_model}` === selection,
+  ));
+};
+
+/** Canonical picker value for a persisted selection. */
+export const modelSelectionValue = (
+  models: readonly ModelSelectionCatalogEntry[],
+  selection: string | null | undefined,
+): string => {
+  if (!selection) return "";
+  if (
+    !selection.includes("/")
+    && models.some((model) => model.id === `auto/${selection}`)
+  ) {
+    return `auto/${selection}`;
+  }
+  return selection;
+};
+
 const DEFAULT_LIVE_TTL_MS = 300_000;
+
+interface ModelCatalogProtocol {
+  models(): Promise<readonly ProtocolModelInfo[]>;
+  modelRoutes(): Promise<readonly ProtocolModelInfo[]>;
+}
 
 /** App-wide stale-while-revalidate model catalog.
  *
@@ -16,7 +58,7 @@ const DEFAULT_LIVE_TTL_MS = 300_000;
  * any setup or composer control behind ACP startup.
  */
 export class ModelCatalogController {
-  readonly #protocol: Pick<ProtocolClient, "models" | "refreshModels">;
+  readonly #protocol: ModelCatalogProtocol;
   readonly #now: () => number;
   readonly #liveTtlMs: number;
   readonly #current = createSignal<readonly ProtocolModelInfo[]>(
@@ -45,9 +87,10 @@ export class ModelCatalogController {
   #staticFailure: { readonly error: unknown } | undefined;
   #lastLiveCheckedAt: number | undefined;
   #generation = 0;
+  #revision = 0;
 
   constructor(
-    protocol: Pick<ProtocolClient, "models" | "refreshModels">,
+    protocol: ModelCatalogProtocol,
     options: { readonly now?: () => number; readonly liveTtlMs?: number } = {},
   ) {
     this.#protocol = protocol;
@@ -172,7 +215,7 @@ export class ModelCatalogController {
     this.#refreshing.set(true);
     let request: Promise<readonly ProtocolModelInfo[]>;
     try {
-      request = this.#protocol.refreshModels();
+      request = this.#protocol.modelRoutes();
     } catch (error: unknown) {
       request = Promise.reject(error);
     }

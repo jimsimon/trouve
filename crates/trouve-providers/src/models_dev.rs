@@ -374,6 +374,27 @@ impl ModelsDevCatalog {
         (!record.is_deprecated()).then(|| record.to_model_info(output_provider, model_id, dialect))
     }
 
+    /// Return the catalog identity used to group equivalent serving routes.
+    ///
+    /// Public catalog entries use their canonical model id. Trouve-owned
+    /// serving-surface overlays participate only when they explicitly inherit
+    /// a public `base_model`; transport-owned entries without that link remain
+    /// concrete-only even when their display id happens to match another
+    /// provider's model.
+    pub fn shared_model_identity(&self, catalog_provider: &str, model_id: &str) -> Option<String> {
+        let state = self.state.read().unwrap();
+        if let Some(patch) = overlay_provider_by_setup_id(&state.owned, catalog_provider)
+            .and_then(|provider| provider.models.get(model_id))
+        {
+            let base = patch.as_object()?.get("base_model")?.as_str()?;
+            let (provider, source_id) = base.split_once('/')?;
+            let record = source_model(&state, provider, source_id)?;
+            return runnable_shared_identity(record, source_id);
+        }
+        let record = source_model(&state, catalog_provider, model_id)?;
+        runnable_shared_identity(record, model_id)
+    }
+
     pub fn provider_models(
         &self,
         catalog_provider: &str,
@@ -657,6 +678,16 @@ impl CatalogModel {
         }
         json!({"type": "object", "properties": properties})
     }
+}
+
+fn runnable_shared_identity(record: &CatalogModel, fallback_id: &str) -> Option<String> {
+    (!record.is_deprecated() && record.tool_call == Some(true)).then(|| {
+        if record.id.is_empty() {
+            fallback_id.to_string()
+        } else {
+            record.id.clone()
+        }
+    })
 }
 
 impl CatalogProvider {
@@ -1392,6 +1423,44 @@ mod tests {
         assert_eq!(
             composer.options_schema.pointer("/properties/fast/default"),
             Some(&json!(false))
+        );
+    }
+
+    #[test]
+    fn shared_identity_follows_reviewed_base_models_only() {
+        let catalog = ModelsDevCatalog::embedded();
+
+        assert_eq!(
+            catalog.shared_model_identity("openai", "gpt-5.6-sol"),
+            Some("gpt-5.6-sol".into())
+        );
+        assert_eq!(
+            catalog.shared_model_identity("openai-codex", "gpt-5.6-sol"),
+            Some("gpt-5.6-sol".into())
+        );
+        assert_eq!(
+            catalog.shared_model_identity("cursor", "gpt-5.6-sol"),
+            Some("gpt-5.6-sol".into())
+        );
+        assert_eq!(
+            catalog.shared_model_identity("cursor", "gemini-3.1-pro"),
+            Some("gemini-3.1-pro-preview".into())
+        );
+
+        // Cursor-owned choices can still be selected explicitly but must not
+        // acquire an automatic route merely because another provider later
+        // publishes a coincidentally identical id.
+        assert_eq!(catalog.shared_model_identity("cursor", "default"), None);
+        assert_eq!(
+            catalog.shared_model_identity("cursor", "composer-2.5"),
+            None
+        );
+
+        // An owned choice becomes routable once the reviewed overlay gives it
+        // an explicit public base-model identity.
+        assert_eq!(
+            catalog.shared_model_identity("cursor", "claude-opus-5"),
+            Some("claude-opus-5".into())
         );
     }
 

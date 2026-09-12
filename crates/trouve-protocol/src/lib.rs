@@ -380,7 +380,11 @@ pub use requests::*;
 // 9.5: open code-review findings carried across rounds expose the latest
 // round's `carried_verdict` — the coordinator's reason the current head still
 // exhibits the issue (additive).
-pub const PROTOCOL_VERSION: &str = "9.5";
+// 9.6: model catalogs expose provider-neutral `auto/<model>` entries alongside
+// concrete provider pins, provider preference writes and cold-start projection
+// are versioned, sticky route selection is durable, and turns emit their
+// selected route (additive).
+pub const PROTOCOL_VERSION: &str = "9.6";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";
 pub const ERROR_CODE_GITHUB_REAUTHENTICATION_REQUIRED: &str = "github_reauthentication_required";

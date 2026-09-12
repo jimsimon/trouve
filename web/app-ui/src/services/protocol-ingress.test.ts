@@ -282,6 +282,7 @@ describe("ProtocolIngress", () => {
             model: "provider/model",
             derive_branch_name_from_session_title: false,
           },
+          provider_order: ["codex", "cursor"],
         },
       })),
       serverEvents: vi.fn(async () => fakeStream),
@@ -325,6 +326,7 @@ describe("ProtocolIngress", () => {
           model: "provider/model",
           derive_branch_name_from_session_title: false,
         },
+        provider_order: ["codex", "cursor"],
       },
     }));
     const protocol = {

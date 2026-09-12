@@ -174,6 +174,11 @@ Thread scope:
   The number of fold-in passes per turn is bounded so a model that
   spawns again on every pass cannot hold the turn open indefinitely. Cancelling
   the parent cancels the running descendants and aborts the wait.
+- `model.route_selected` `{turn, model, provider_id, provider_model, reason}` —
+  the concrete route chosen for an automatic model, emitted initially and
+  again after each safe capacity, authentication, or availability failover;
+  authentication and availability both use `route_failover`, while exhausted
+  quota/capacity uses `capacity_failover`
 - `user.message` `{turn, content}` — user-authored input only; the legacy
   `background` field is read solely when replaying protocol 7.19–7.26 logs
 - `turn.background_activity` `{turn}` — the server attached a turn to
@@ -247,6 +252,8 @@ Server scope:
 - `settings.code_review_updated` `{settings}` — full replacement snapshot
   after the automated-review total, reviewer, or final-editor deadline
   changes
+- `settings.provider_order_updated` `{provider_order}` — full replacement
+  snapshot after automatic-routing provider priority changes
 
 Code-review-job scope:
 
