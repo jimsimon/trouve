@@ -92,6 +92,27 @@ describe("buildChatLayout", () => {
     expect(layout.unitIdForItem.get("body")).toBe("turn:4");
   });
 
+  it("omits reasoning nodes that carry only a section title", () => {
+    const items: ThreadChatItem[] = [
+      { id: "u4", kind: "user", turn: 4, content: "Inspect it", attachments: [] },
+      { id: "bold", kind: "thinking", turn: 4, content: "**Planning release announcement**", complete: true },
+      { id: "bold-ws", kind: "thinking", turn: 4, content: "\n**Identifying skill directory**\n\n", complete: false },
+      { id: "under", kind: "thinking", turn: 4, content: "__Reading config__", complete: true },
+      { id: "hash", kind: "thinking", turn: 4, content: "## Checking the adapter", complete: true },
+      { id: "titled", kind: "thinking", turn: 4, content: "**Checking the adapter**\n\nLooking at the override.", complete: true },
+      { id: "plain", kind: "thinking", turn: 4, content: "Found it.", complete: true },
+      { id: "inline", kind: "thinking", turn: 4, content: "**Note** this is **important**", complete: true },
+    ];
+
+    const layout = buildChatLayout(items);
+    expect(layout.units).toHaveLength(1);
+    expect(layout.units[0]?.items.map((item) => item.id)).toEqual(["titled", "plain", "inline"]);
+    expect(layout.unitIdForItem.has("bold")).toBe(false);
+    expect(layout.unitIdForItem.has("bold-ws")).toBe(false);
+    expect(layout.unitIdForItem.has("under")).toBe(false);
+    expect(layout.unitIdForItem.has("hash")).toBe(false);
+  });
+
   it("does not create a transcript row for an orphaned empty reasoning node", () => {
     const layout = buildChatLayout([
       { id: "empty", kind: "thinking", turn: 4, content: "", complete: true },
