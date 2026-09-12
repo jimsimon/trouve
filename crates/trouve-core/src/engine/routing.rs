@@ -3929,7 +3929,7 @@ mod tests {
         };
         let mut native = TurnAccounting::default();
         native.add_native(
-            &trouve_providers::models_dev::ModelsDevCatalog::embedded(),
+            &trouve_providers::models_dev::ModelsDevCatalog::fixture(),
             &route,
             &usage,
         );
@@ -4004,6 +4004,9 @@ mod tests {
     #[tokio::test]
     async fn configured_loopback_catalog_provider_is_concrete_only() {
         let data = tempfile::tempdir().unwrap();
+        // The openai roster comes from the downloaded catalog; seed the data
+        // dir with the test copy so this offline engine has one.
+        trouve_providers::models_dev::ModelsDevCatalog::write_fixture_cache(data.path()).unwrap();
         let engine = Engine::new(
             Store::open_in_memory().unwrap(),
             data.path().into(),

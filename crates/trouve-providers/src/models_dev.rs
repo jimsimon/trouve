@@ -1587,7 +1587,7 @@ mod tests {
 
     #[test]
     fn shared_identity_follows_reviewed_base_models_only() {
-        let catalog = ModelsDevCatalog::embedded();
+        let catalog = ModelsDevCatalog::fixture();
 
         assert_eq!(
             catalog.shared_model_identity("openai", "gpt-5.6-sol"),

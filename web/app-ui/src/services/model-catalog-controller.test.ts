@@ -607,7 +607,7 @@ describe("ModelCatalogController", () => {
     const controller = new ModelCatalogController(
       {
         models: async () => [],
-        refreshModels: async () => {
+        modelRoutes: async () => {
           liveCalls += 1;
           return [];
         },
