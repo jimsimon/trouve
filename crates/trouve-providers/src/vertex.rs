@@ -517,7 +517,7 @@ mod tests {
             "google-vertex",
             "https://us-central1-aiplatform.googleapis.com/v1/projects/test/locations/us-central1/publishers/google",
             None,
-            Arc::new(ModelsDevCatalog::embedded()),
+            Arc::new(ModelsDevCatalog::fixture()),
         );
         let models = provider.models();
         assert!(!models.is_empty());

@@ -209,7 +209,7 @@ mod tests {
 
     #[test]
     fn catalog_providers_merge_with_trouve_integrations() {
-        let catalog = crate::models_dev::ModelsDevCatalog::embedded();
+        let catalog = crate::models_dev::ModelsDevCatalog::fixture();
         let providers = known_providers(&catalog);
         let ids: std::collections::HashSet<_> = providers
             .iter()

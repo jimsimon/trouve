@@ -935,6 +935,15 @@ export class AppStore {
         }
         return false;
       }
+      case "server.model_catalog_changed": {
+        const current = this.#serverInfo.get();
+        if (current !== undefined && current.catalog_available !== envelope.available) {
+          this.#serverInfo.set(
+            Object.freeze({ ...current, catalog_available: envelope.available }),
+          );
+        }
+        return false;
+      }
       default:
         return false;
     }

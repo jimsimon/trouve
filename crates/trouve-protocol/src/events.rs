@@ -665,6 +665,18 @@ pub enum Event {
     /// state for initial fetches.
     #[serde(rename = "server.connectivity_changed")]
     ConnectivityChanged { online: bool },
+    /// The server-side model catalog changed: the public catalog
+    /// (models.dev) became available or was lost, or a vendor-backed roster
+    /// (Codex, Cursor) was rebuilt in the background. Nothing is bundled, so
+    /// until the first successful download only local and vendor-only models
+    /// exist and provider setup presets are limited to trouve's own
+    /// integrations; clients show a "downloading" state instead of "no
+    /// models" while `available` is false and refetch the model catalog
+    /// (`/v1/models` and the routed `/v1/model-routes`) on every
+    /// `available: true` event. `ServerInfo.catalog_available` carries the
+    /// availability for initial fetches.
+    #[serde(rename = "server.model_catalog_changed")]
+    ModelCatalogChanged { available: bool },
     /// The configured model used for asynchronous session and thread naming changed.
     /// Carries a full replacement snapshot for replay and reconnect.
     #[serde(rename = "settings.session_naming_updated")]

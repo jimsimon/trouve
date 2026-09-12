@@ -34,6 +34,9 @@ trouve-process.workspace = true
 trouve-providers.workspace = true
 uuid.workspace = true
 
+[dev-dependencies]
+trouve-providers = { workspace = true, features = ["catalog-fixture"] }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",

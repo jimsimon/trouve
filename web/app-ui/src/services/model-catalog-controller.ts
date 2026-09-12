@@ -1,5 +1,5 @@
 import type { ProtocolModelInfo } from "./protocol-client.js";
-import { createSignal, type ReadonlySignal } from "../state/reactivity.js";
+import { createComputed, createSignal, type ReadonlySignal } from "../state/reactivity.js";
 
 export type ModelCatalogFreshness = "if-stale" | "force";
 
@@ -79,6 +79,12 @@ export class ModelCatalogController {
   readonly liveLoaded: ReadonlySignal<boolean> = this.#liveLoaded;
   readonly #refreshing = createSignal(false);
   readonly refreshing: ReadonlySignal<boolean> = this.#refreshing;
+  /** Whether the server has downloaded the public model catalog (mirrors
+   * `ServerInfo.catalog_available`). While false, empty results are transient
+   * ("downloading") rather than "no models", and they are never cached as
+   * fresh. */
+  readonly #isCatalogAvailable: () => boolean;
+  readonly catalogAvailable: ReadonlySignal<boolean>;
 
   #staticPending: Promise<readonly ProtocolModelInfo[]> | undefined;
   #livePending: Promise<readonly ProtocolModelInfo[]> | undefined;
@@ -91,11 +97,17 @@ export class ModelCatalogController {
 
   constructor(
     protocol: ModelCatalogProtocol,
-    options: { readonly now?: () => number; readonly liveTtlMs?: number } = {},
+    options: {
+      readonly now?: () => number;
+      readonly liveTtlMs?: number;
+      readonly catalogAvailable?: () => boolean;
+    } = {},
   ) {
     this.#protocol = protocol;
     this.#now = options.now ?? (() => Date.now());
     this.#liveTtlMs = options.liveTtlMs ?? DEFAULT_LIVE_TTL_MS;
+    this.#isCatalogAvailable = options.catalogAvailable ?? (() => true);
+    this.catalogAvailable = createComputed(() => this.#isCatalogAvailable());
   }
 
   refresh(
@@ -225,7 +237,9 @@ export class ModelCatalogController {
             return this.#current.get();
           }
           const snapshot = Object.freeze([...models]);
-          this.#lastLiveCheckedAt = this.#now();
+          // An empty roster from a server that is still downloading its
+          // catalog must not be cached as fresh.
+          this.#lastLiveCheckedAt = this.#isCatalogAvailable() ? this.#now() : undefined;
           this.#liveLoaded.set(true);
           this.#live.set(snapshot);
           this.#current.set(snapshot);

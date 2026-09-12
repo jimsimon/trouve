@@ -119,6 +119,11 @@ pub struct ServerInfo {
     /// never report offline.
     #[serde(default = "default_true")]
     pub online: bool,
+    /// Whether the public model catalog has been downloaded (see the
+    /// `server.model_catalog_changed` event). Absent on older servers, which
+    /// bundled a catalog and were never without one.
+    #[serde(default = "default_true")]
+    pub catalog_available: bool,
 }
 
 // --- session and thread naming ------------------------------------------

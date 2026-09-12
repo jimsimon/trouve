@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Refresh the generated offline subset of the public models.dev catalog.
+"""Refresh the checked-in copy of the public models.dev catalog.
 
-Provider and model metadata are kept for the complete catalog so setup and
-model selection remain useful before the first successful runtime refresh.
+The copy is test data only (`ModelsDevCatalog::fixture()` behind the
+`catalog-fixture` Cargo feature); release binaries download the catalog at
+runtime (ADR 0055). Provider and model metadata are kept for the complete
+catalog so tests can exercise every transport.
 """
 
 from __future__ import annotations

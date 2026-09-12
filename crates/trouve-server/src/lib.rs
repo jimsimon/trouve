@@ -1015,6 +1015,7 @@ async fn info(State(engine): State<Arc<Engine>>) -> Json<ServerInfo> {
         version: env!("CARGO_PKG_VERSION").into(),
         protocol_version: PROTOCOL_VERSION.into(),
         online: engine.is_online(),
+        catalog_available: engine.catalog_available(),
     })
 }
 

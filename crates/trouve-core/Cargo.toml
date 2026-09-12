@@ -58,3 +58,4 @@ xattr.workspace = true
 [dev-dependencies]
 rsa = { version = "0.9.10", features = ["getrandom"] }
 tokio = { workspace = true, features = ["test-util"] }
+trouve-providers = { workspace = true, features = ["catalog-fixture"] }
