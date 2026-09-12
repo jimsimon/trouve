@@ -3320,6 +3320,11 @@ mod tests {
         calls: Arc<AtomicUsize>,
     }
 
+    struct BlockingFailingPinnedProvider {
+        started: Arc<tokio::sync::Semaphore>,
+        release: Arc<tokio::sync::Semaphore>,
+    }
+
     struct DiscoveringCatalogProvider {
         id: String,
         calls: Arc<AtomicUsize>,
@@ -3410,6 +3415,32 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Err(trouve_providers::ProviderError::Request(
                 "injected route outage".into(),
+            ))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl trouve_providers::Provider for BlockingFailingPinnedProvider {
+        fn id(&self) -> &str {
+            "provider"
+        }
+
+        fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
+            vec![catalog_model("provider/model")]
+        }
+
+        async fn stream_chat(
+            &self,
+            _model: &str,
+            _messages: &[trouve_providers::Message],
+            _tools: &[trouve_providers::ToolSpec],
+            _options: &serde_json::Map<String, serde_json::Value>,
+        ) -> std::result::Result<trouve_providers::EventStream, trouve_providers::ProviderError>
+        {
+            self.started.add_permits(1);
+            self.release.acquire().await.unwrap().forget();
+            Err(trouve_providers::ProviderError::Api(
+                "HTTP 429 Too Many Requests".into(),
             ))
         }
     }
@@ -3594,7 +3625,7 @@ mod tests {
         }
     }
 
-    fn routing_thread(store: &Store, path: &Path, suffix: &str) -> Thread {
+    fn model_thread(store: &Store, path: &Path, suffix: &str, model: &str) -> Thread {
         let workspace = Workspace {
             id: format!("ws_{suffix}"),
             name: format!("routing {suffix}"),
@@ -3619,7 +3650,7 @@ mod tests {
             parent_thread_id: None,
             title: None,
             mode: "plan".into(),
-            model: "auto/shared".into(),
+            model: model.into(),
             model_options: Default::default(),
             permission_mode: trouve_protocol::PermissionMode::Ask,
             created_at: chrono::Utc::now(),
@@ -3628,6 +3659,10 @@ mod tests {
         };
         store.insert_thread(&thread, &Default::default()).unwrap();
         thread
+    }
+
+    fn routing_thread(store: &Store, path: &Path, suffix: &str) -> Thread {
+        model_thread(store, path, suffix, "auto/shared")
     }
 
     async fn wait_for_terminal_turn(engine: &Engine, store: &Store, thread: &Thread, turn: u64) {
@@ -4474,6 +4509,54 @@ mod tests {
 
         assert!(applied.is_none());
         assert!(store.route_health().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn stale_pinned_turn_cannot_restore_replaced_provider_cooldown() {
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let thread = model_thread(&store, data.path(), "stale-pinned", "provider/model");
+        let started = Arc::new(tokio::sync::Semaphore::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let engine = Arc::new(
+            Engine::new(store.clone(), data.path().into(), &Config::default()).with_provider(
+                "provider",
+                Arc::new(BlockingFailingPinnedProvider {
+                    started: started.clone(),
+                    release: release.clone(),
+                }),
+            ),
+        );
+
+        engine
+            .send_message(&thread.id, "Wait for replacement".into(), Vec::new())
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), started.acquire())
+            .await
+            .expect("pinned provider request did not start")
+            .unwrap()
+            .forget();
+
+        {
+            let _transition = engine
+                .provider_transition_lock("provider")
+                .lock_owned()
+                .await;
+            engine.invalidate_provider_route_state("provider").unwrap();
+            engine
+                .providers
+                .write()
+                .unwrap()
+                .insert("provider".into(), Arc::new(CatalogTestProvider));
+        }
+        release.add_permits(1);
+        wait_for_terminal_turn(&engine, &store, &thread, 1).await;
+
+        assert_eq!(
+            engine.turn_scheduler.cooldown_remaining("provider/model"),
+            None,
+            "the replaced provider's late 429 restored a stale cooldown"
+        );
     }
 
     #[test]

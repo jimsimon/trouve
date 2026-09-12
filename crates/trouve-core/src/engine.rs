@@ -3019,6 +3019,24 @@ struct ProviderReloadGuard {
     _exclusive: Option<tokio::sync::OwnedRwLockWriteGuard<()>>,
 }
 
+enum ConcreteExecutor {
+    Native(Arc<dyn Provider>),
+    Backend(Arc<dyn AgentBackend>),
+}
+
+struct ConcreteExecutorSnapshot {
+    provider_id: String,
+    provider_generation: u64,
+    model_name: String,
+    executor: ConcreteExecutor,
+}
+
+struct ConcreteAttemptSnapshot {
+    provider_id: String,
+    provider_generation: u64,
+    attempt_order: i64,
+}
+
 impl ProviderReloadGuard {
     fn shared(guard: tokio::sync::OwnedRwLockReadGuard<()>) -> Self {
         Self {
@@ -13286,6 +13304,67 @@ impl Engine {
         Ok((provider, model_name.to_string()))
     }
 
+    /// Bind a pinned turn to one concrete executor incarnation. Provider
+    /// replacement advances the generation before publishing a new registry
+    /// entry, so snapshot both behind the provider transition lock.
+    async fn resolve_concrete_executor(
+        &self,
+        model: &str,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<ConcreteExecutorSnapshot> {
+        let (provider_id, model_name) = model.split_once('/').ok_or_else(|| {
+            anyhow!("model must be provider-qualified (e.g. openai/gpt-4.1-mini): {model}")
+        })?;
+        let transition = self.provider_transition_lock(provider_id);
+        let _transition = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => bail!("turn cancelled"),
+            guard = transition.lock_owned() => guard,
+        };
+        let provider_generation = self
+            .provider_generations
+            .lock()
+            .unwrap()
+            .get(provider_id)
+            .copied()
+            .unwrap_or(0);
+        let backend = self.backends.read().unwrap().get(provider_id).cloned();
+        let executor = if let Some(backend) = backend {
+            ConcreteExecutor::Backend(backend)
+        } else if let Some(provider) = self.providers.read().unwrap().get(provider_id).cloned() {
+            ConcreteExecutor::Native(provider)
+        } else {
+            bail!(
+                "provider {provider_id} is not configured (configured: {})",
+                self.provider_ids().join(", ")
+            );
+        };
+        Ok(ConcreteExecutorSnapshot {
+            provider_id: provider_id.to_string(),
+            provider_generation,
+            model_name: model_name.to_string(),
+            executor,
+        })
+    }
+
+    fn record_concrete_attempt_outcome(
+        &self,
+        model: &str,
+        attempt: ConcreteAttemptSnapshot,
+        error: Option<&str>,
+    ) -> Result<()> {
+        self.with_current_provider_generation(
+            &attempt.provider_id,
+            attempt.provider_generation,
+            || {
+                self.turn_scheduler
+                    .record_ordered_outcome(model, error, attempt.attempt_order);
+                Ok(())
+            },
+        )?;
+        Ok(())
+    }
+
     pub(crate) async fn resolve_model_info(
         &self,
         model: &str,
@@ -14780,7 +14859,7 @@ impl Engine {
                 .expect("an active queue prompt must have a cancellation token");
             let prompt_persisted = AtomicBool::new(shell_persisted);
             let routed_attempt = Mutex::new(None);
-            let concrete_attempt_order = Mutex::new(None);
+            let concrete_attempt = Mutex::new(None);
             let automatic = routing::automatic_model_name(&thread.model).is_some();
             let turn_future = async {
                 if automatic {
@@ -14800,7 +14879,7 @@ impl Engine {
                         &prompt,
                         cancel.clone(),
                         &prompt_persisted,
-                        &concrete_attempt_order,
+                        &concrete_attempt,
                     )
                     .await
                 }
@@ -14843,13 +14922,13 @@ impl Engine {
                             },
                         )?;
                     } else if !cancel.is_cancelled()
-                        && let Some(attempt_order) = concrete_attempt_order.lock().unwrap().take()
+                        && let Some(attempt) = concrete_attempt.lock().unwrap().take()
                     {
-                        self.turn_scheduler.record_ordered_outcome(
+                        self.record_concrete_attempt_outcome(
                             &thread.model,
+                            attempt,
                             Some("internal error"),
-                            attempt_order,
-                        );
+                        )?;
                     }
                     self.store
                         .append_event(
@@ -14875,12 +14954,12 @@ impl Engine {
             let cancelled = cancel.is_cancelled();
             if !cancelled && !automatic {
                 let outcome_error = result.as_ref().err().map(ToString::to_string);
-                if let Some(attempt_order) = concrete_attempt_order.lock().unwrap().take() {
-                    self.turn_scheduler.record_ordered_outcome(
+                if let Some(attempt) = concrete_attempt.lock().unwrap().take() {
+                    self.record_concrete_attempt_outcome(
                         &thread.model,
+                        attempt,
                         outcome_error.as_deref(),
-                        attempt_order,
-                    );
+                    )?;
                 }
             }
             // Cancellation wins a race with startup/stream errors only after
@@ -15171,7 +15250,7 @@ impl Engine {
         prompt: &trouve_protocol::QueuedPrompt,
         cancel: tokio_util::sync::CancellationToken,
         prompt_persisted: &AtomicBool,
-        active_attempt_order: &Mutex<Option<i64>>,
+        active_attempt: &Mutex<Option<ConcreteAttemptSnapshot>>,
     ) -> Result<()> {
         let content = prompt.content.clone();
         let attachments = prompt.attachments.clone();
@@ -15262,7 +15341,19 @@ impl Engine {
             guard = session_lifecycle.read() => guard,
         };
         let admission = self.turn_scheduler.admit(&thread.model, &cancel).await?;
-        *active_attempt_order.lock().unwrap() = Some(admission.attempt_order);
+        let ConcreteExecutorSnapshot {
+            provider_id,
+            provider_generation,
+            model_name,
+            executor,
+        } = self
+            .resolve_concrete_executor(&thread.model, &cancel)
+            .await?;
+        *active_attempt.lock().unwrap() = Some(ConcreteAttemptSnapshot {
+            provider_id: provider_id.clone(),
+            provider_generation,
+            attempt_order: admission.attempt_order,
+        });
 
         // External agent backend? The vendor harness owns the loop; we
         // stream its events and bridge approvals. The shared lifecycle lease
@@ -15270,35 +15361,35 @@ impl Engine {
         // Admission is published there, once the backend's startup lane has
         // also been passed, so the reported wait covers every queue the turn
         // stood in before the vendor saw it.
-        if let Some((backend_id, backend, model_name)) = self.backend_for(&thread.model) {
-            return self
-                .run_backend_turn(
-                    &session,
-                    thread,
-                    turn,
-                    &mode,
-                    &backend_id,
-                    backend,
-                    model_name,
-                    content,
-                    attachments,
-                    cancel,
-                    &prompt.id,
-                    tools_enabled,
-                    prompt.background,
-                    admission.provider_wait_ms,
-                    turn_steer_rx,
-                    turn_steer_mutation_lane_state,
-                    None,
-                )
-                .await;
-        }
+        let provider = match executor {
+            ConcreteExecutor::Backend(backend) => {
+                return self
+                    .run_backend_turn(
+                        &session,
+                        thread,
+                        turn,
+                        &mode,
+                        &provider_id,
+                        backend,
+                        model_name,
+                        content,
+                        attachments,
+                        cancel,
+                        &prompt.id,
+                        tools_enabled,
+                        prompt.background,
+                        admission.provider_wait_ms,
+                        turn_steer_rx,
+                        turn_steer_mutation_lane_state,
+                        None,
+                    )
+                    .await;
+            }
+            ConcreteExecutor::Native(provider) => provider,
+        };
         self.publish_turn_admission(thread, turn, background, admission.provider_wait_ms)
             .await?;
 
-        let (provider, model_name) = self
-            .resolve_provider(&thread.model)
-            .map_err(|e| anyhow!(e.to_string()))?;
         let mut model_options = self.store.thread_model_options(&thread.id)?;
         let model_catalog = tokio::select! {
             biased;

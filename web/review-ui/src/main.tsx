@@ -579,6 +579,7 @@ function App() {
           dashboard={dashboard}
           models={models}
           modelsLoaded={modelCatalog.loaded}
+          modelsError={modelCatalog.error || staticModelError}
           onChanged={() => void loadDashboard(true)}
         />
       )}
@@ -587,6 +588,7 @@ function App() {
           reviewers={dashboard.reviewers}
           models={models}
           modelsLoaded={modelCatalog.loaded}
+          modelsError={modelCatalog.error || staticModelError}
           defaultModel={providers?.default_model}
           onChanged={() => void loadDashboard(true)}
         />
@@ -2305,15 +2307,18 @@ function RepositoriesPage({
   dashboard,
   models,
   modelsLoaded,
+  modelsError,
   onChanged,
 }: {
   dashboard: Dashboard;
   models: Model[];
   modelsLoaded: boolean;
+  modelsError: string;
   onChanged: () => void;
 }) {
   const [showAll, setShowAll] = useState(false);
   const [query, setQuery] = useState("");
+  const modelCatalogStatus = modelCatalogStatusMessage(modelsLoaded, modelsError);
   const repositories = dashboard.repositories.filter(
     (repository) =>
       (showAll || repository.mode !== "off") &&
@@ -2326,6 +2331,11 @@ function RepositoriesPage({
         title="Repositories"
         description="Configured repositories are shown by default. Discovery remains available without cluttering the working set."
       />
+      {modelCatalogStatus && (
+        <p class="error-text" role="status">
+          {modelCatalogStatus}
+        </p>
+      )}
       <section class="panel">
         <div class="filters">
           <label class="grow">
@@ -3146,6 +3156,7 @@ function RepositoryEditor({
           {reviewModelInvalid && (
             <span class="error-text">Select a review model before enabling reviews.</span>
           )}
+          {/* Disabling is reversible, so dormant model options remain available on re-enable. */}
           {repository.mode !== "off" && (
             <button
               class="danger ghost"
@@ -3173,15 +3184,18 @@ function ReviewersPage({
   reviewers,
   models,
   modelsLoaded,
+  modelsError,
   defaultModel,
   onChanged,
 }: {
   reviewers: ReviewerProfile[];
   models: Model[];
   modelsLoaded: boolean;
+  modelsError: string;
   defaultModel?: string;
   onChanged: () => void;
 }) {
+  const modelCatalogStatus = modelCatalogStatusMessage(modelsLoaded, modelsError);
   return (
     <section>
       <PageHeader
@@ -3189,6 +3203,11 @@ function ReviewersPage({
         title="Reviewer personas"
         description="Focused personas run concurrently and retain separate model, duration, and issue statistics."
       />
+      {modelCatalogStatus && (
+        <p class="error-text" role="status">
+          {modelCatalogStatus}
+        </p>
+      )}
       <div class="reviewer-grid">
         {reviewers.map((reviewer) => (
           <ReviewerEditor

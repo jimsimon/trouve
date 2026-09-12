@@ -3795,9 +3795,24 @@ impl Engine {
         validate_repository(&request.repository)
             .map_err(|error| EngineError::BadRequest(error.to_string()))?;
         // Disabling must always be an escape hatch for legacy or otherwise
-        // invalid enabled policies. Persist the dormant configuration as-is;
-        // it will be normalized and validated before a later re-enable.
+        // invalid enabled policies. Preserve omitted dormant configuration,
+        // but reject newly supplied option maps that violate the wire contract.
         if request.mode == CodeReviewMode::Off {
+            for (role, options) in [
+                ("coordinator", request.coordinator_model_options.as_ref()),
+                ("router", request.router_model_options.as_ref()),
+                ("analyst", request.analyst_model_options.as_ref()),
+            ] {
+                if let Some(options) = options {
+                    validate_scalar_model_options(role, options)?;
+                }
+            }
+            if let Some(reviewer_overrides) = request.reviewer_overrides.as_ref() {
+                for reviewer_override in reviewer_overrides {
+                    let role = format!("reviewer {:?}", reviewer_override.reviewer_id);
+                    validate_scalar_model_options(&role, &reviewer_override.model_options)?;
+                }
+            }
             let _persona_mutation = self.persona_mutations.lock().await;
             self.store.update_code_review_repository(request)?;
             let repository = self
@@ -33085,6 +33100,8 @@ rename to src/new.rs
         store
             .upsert_discovered_code_review_repository(7, "acme/widgets", false)
             .unwrap();
+        let legacy_options =
+            serde_json::Map::from_iter([("legacy".to_string(), serde_json::json!(true))]);
         let legacy = UpdateCodeReviewRepositoryRequest {
             installation_id: 7,
             repository: "acme/widgets".into(),
@@ -33095,7 +33112,7 @@ rename to src/new.rs
             router_thinking_level: Some("unsupported".into()),
             analyst_model: None,
             analyst_thinking_level: None,
-            coordinator_model_options: None,
+            coordinator_model_options: Some(legacy_options.clone()),
             router_model_options: None,
             analyst_model_options: None,
             prompt: String::new(),
@@ -33115,7 +33132,8 @@ rename to src/new.rs
         let disabled = engine
             .update_code_review_repository(&UpdateCodeReviewRepositoryRequest {
                 mode: CodeReviewMode::Off,
-                ..legacy
+                coordinator_model_options: None,
+                ..legacy.clone()
             })
             .await
             .unwrap();
@@ -33124,6 +33142,62 @@ rename to src/new.rs
         assert_eq!(
             disabled.router_model.as_deref(),
             Some("legacy-unqualified-model")
+        );
+        assert_eq!(disabled.coordinator_model_options, legacy_options);
+
+        for role in ["coordinator", "router", "analyst"] {
+            let mut invalid = UpdateCodeReviewRepositoryRequest {
+                mode: CodeReviewMode::Off,
+                coordinator_model_options: None,
+                ..legacy.clone()
+            };
+            let options = Some(serde_json::Map::from_iter([(
+                "invalid".to_string(),
+                serde_json::Value::Null,
+            )]));
+            match role {
+                "coordinator" => invalid.coordinator_model_options = options,
+                "router" => invalid.router_model_options = options,
+                "analyst" => invalid.analyst_model_options = options,
+                _ => unreachable!(),
+            }
+            let error = engine
+                .update_code_review_repository(&invalid)
+                .await
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("{role} model option invalid must be a string")),
+                "{error}"
+            );
+        }
+
+        let mut invalid_override = UpdateCodeReviewRepositoryRequest {
+            mode: CodeReviewMode::Off,
+            coordinator_model_options: None,
+            ..legacy
+        };
+        invalid_override.reviewer_overrides = Some(vec![ReviewerOverride {
+            reviewer_id: "security".into(),
+            model: None,
+            thinking_level: None,
+            model_options: serde_json::Map::from_iter([(
+                "invalid".to_string(),
+                serde_json::Value::Null,
+            )]),
+            prompt_mode: ReviewerPromptMode::Inherit,
+            prompt: String::new(),
+        }]);
+        let error = engine
+            .update_code_review_repository(&invalid_override)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("reviewer \"security\" model option invalid must be a string"),
+            "{error}"
         );
     }
 

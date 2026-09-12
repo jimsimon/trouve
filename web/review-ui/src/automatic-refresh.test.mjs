@@ -73,5 +73,23 @@ test("model discovery retries independently on configuration routes", () => {
     /if \(!isConfigurationRoute \|\| !modelCatalog\.error\) return;[\s\S]*?void loadModelRoutes\(\);/u,
   );
   assert.doesNotMatch(source, /\bneedsConfiguration\b/u);
-  assert.match(source, /modelsError=\{modelCatalog\.error \|\| staticModelError\}/u);
+  assert.equal(
+    [...source.matchAll(/modelsError=\{modelCatalog\.error \|\| staticModelError\}/gu)].length,
+    3,
+  );
+  const repositoriesPage = source.slice(
+    source.indexOf("function RepositoriesPage"),
+    source.indexOf("function ThinkingSetting"),
+  );
+  const reviewersPage = source.slice(
+    source.indexOf("function ReviewersPage"),
+    source.indexOf("function ReviewerEditor"),
+  );
+  for (const page of [repositoriesPage, reviewersPage]) {
+    assert.match(
+      page,
+      /const modelCatalogStatus = modelCatalogStatusMessage\(modelsLoaded, modelsError\);/u,
+    );
+    assert.match(page, /role="status"[\s\S]*?\{modelCatalogStatus\}/u);
+  }
 });

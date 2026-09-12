@@ -8829,7 +8829,7 @@ impl Store {
                 staging_cleanup_claim,
             },
         )?;
-        self.append_pending_events(pending)
+        self.append_pending_events_isolated(pending)
     }
 
     // --- queued prompts -------------------------------------------------------
