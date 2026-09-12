@@ -4738,8 +4738,12 @@ impl Engine {
             .unwrap()
             .values()
             .filter(|backend| {
-                let status = backend.status();
-                status.installed && status.has_credentials
+                // Cheap catalog-side check first: most listings find every
+                // roster current and must not spawn a task per backend.
+                backend.model_roster_is_stale() && {
+                    let status = backend.status();
+                    status.installed && status.has_credentials
+                }
             })
             .cloned()
             .collect();

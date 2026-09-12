@@ -280,6 +280,10 @@ impl AgentBackend for CodexBackend {
     /// Rebuild the persisted `openai-codex` roster from the app-server's
     /// `model/list` when the catalog's TTL says it is stale. `models()`
     /// keeps reading the catalog, so this never sits on a request path.
+    fn model_roster_is_stale(&self) -> bool {
+        self.catalog.roster_needs_refresh(CODEX_CATALOG_PROVIDER)
+    }
+
     async fn refresh_model_roster(
         &self,
         cancel: &tokio_util::sync::CancellationToken,
@@ -9267,12 +9271,17 @@ for line in sys.stdin:
                 .any(|model| model.id == "codex/gpt-6-astra"),
             "bundled seed serves until the first refresh"
         );
+        assert!(backend.model_roster_is_stale(), "no roster yet");
 
         assert!(
             backend
                 .refresh_model_roster(&tokio_util::sync::CancellationToken::new())
                 .await
                 .unwrap()
+        );
+        assert!(
+            !backend.model_roster_is_stale(),
+            "fresh roster is not rescheduled"
         );
         let models = backend.models();
         let mut ids: Vec<_> = models.iter().map(|model| model.id.as_str()).collect();

@@ -400,6 +400,11 @@ impl AgentBackend for CursorBackend {
 
     /// Rebuild the persisted `cursor` roster from `ListModels` when the
     /// catalog's TTL says it is stale. `models()` keeps reading the catalog.
+    fn model_roster_is_stale(&self) -> bool {
+        !self.legacy_cli_migration_required
+            && self.catalog.roster_needs_refresh(CURSOR_CATALOG_PROVIDER)
+    }
+
     async fn refresh_model_roster(&self, cancel: &CancellationToken) -> Result<bool, BackendError> {
         if self.legacy_cli_migration_required {
             return Ok(false);
@@ -4443,12 +4448,17 @@ server.serve_forever()
             !seed_ids.is_empty(),
             "bundled seed serves until the first refresh"
         );
+        assert!(backend.model_roster_is_stale(), "no roster yet");
 
         assert!(
             backend
                 .refresh_model_roster(&CancellationToken::new())
                 .await
                 .unwrap()
+        );
+        assert!(
+            !backend.model_roster_is_stale(),
+            "fresh roster is not rescheduled"
         );
         let models = backend.models();
         let mut ids: Vec<_> = models.iter().map(|model| model.id.as_str()).collect();

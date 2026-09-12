@@ -495,6 +495,13 @@ pub trait AgentBackend: Send + Sync {
         Ok(false)
     }
 
+    /// Whether the persisted model roster is due for a refresh. Cheap and
+    /// free of vendor I/O, so the engine can skip scheduling refresh tasks
+    /// for backends whose roster is current. The default has no roster.
+    fn model_roster_is_stale(&self) -> bool {
+        false
+    }
+
     fn status(&self) -> BackendStatus;
 
     /// Whether the backend can guarantee that a requested tool-free turn
@@ -745,6 +752,10 @@ impl AgentBackend for RetirementAwareBackend {
         self.inner.refresh_model_roster(cancel).await
     }
 
+    fn model_roster_is_stale(&self) -> bool {
+        self.inner.model_roster_is_stale()
+    }
+
     fn status(&self) -> BackendStatus {
         self.inner.status()
     }
@@ -859,6 +870,10 @@ impl AgentBackend for RuntimeLeasedBackend {
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<bool, BackendError> {
         self.inner.refresh_model_roster(cancel).await
+    }
+
+    fn model_roster_is_stale(&self) -> bool {
+        self.inner.model_roster_is_stale()
     }
 
     fn status(&self) -> BackendStatus {
