@@ -9,6 +9,15 @@ use utoipa::ToSchema;
 
 use crate::{CallId, CheckpointId, SessionId, ThreadId, WorkspaceId};
 
+/// Why an automatic model selected a concrete provider route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelRouteReason {
+    Initial,
+    CapacityFailover,
+    RouteFailover,
+}
+
 fn deserialize_optional_f64<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -649,9 +658,10 @@ pub enum Event {
     },
     /// The server's internet reachability changed (it is the one talking to
     /// model vendors, so it owns this state). While offline, `/v1/models`
-    /// lists only models that can run without internet (local provider,
-    /// loopback endpoints); clients gate prompt entry on having usable
-    /// models and announce recovery. `ServerInfo.online` carries the same
+    /// lists only models that can run without internet (the managed `local`
+    /// provider and user-configured local endpoints); clients gate prompt
+    /// entry on having usable models and announce recovery.
+    /// `ServerInfo.online` carries the same
     /// state for initial fetches.
     #[serde(rename = "server.connectivity_changed")]
     ConnectivityChanged { online: bool },
@@ -669,6 +679,22 @@ pub enum Event {
     /// Carries a full replacement snapshot for replay and reconnect.
     #[serde(rename = "settings.code_review_updated")]
     CodeReviewSettingsUpdated { settings: crate::CodeReviewSettings },
+    /// The concrete provider route selected for an automatic model. Another
+    /// event for the same turn records a safe failover to a different route.
+    /// New event variants are appended so generated validators retain stable
+    /// identifiers for the existing closed union.
+    #[serde(rename = "model.route_selected")]
+    ModelRouteSelected {
+        turn: u64,
+        model: String,
+        provider_id: String,
+        provider_model: String,
+        reason: ModelRouteReason,
+    },
+    /// The preference order used by provider-neutral model routing changed.
+    /// Carries a full replacement snapshot for replay and reconnect.
+    #[serde(rename = "settings.provider_order_updated")]
+    ProviderOrderUpdated { provider_order: Vec<String> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -729,6 +755,33 @@ mod tests {
         assert_eq!(
             routing["routing_decisions"][0]["reviewer_id"],
             "concurrency"
+        );
+    }
+
+    #[test]
+    fn model_route_reason_is_a_closed_snake_case_enum() {
+        let event = Event::ModelRouteSelected {
+            turn: 1,
+            model: "auto/shared".into(),
+            provider_id: "provider".into(),
+            provider_model: "shared".into(),
+            reason: ModelRouteReason::CapacityFailover,
+        };
+        let value = serde_json::to_value(event).unwrap();
+        assert_eq!(value["reason"], "capacity_failover");
+        assert!(serde_json::from_value::<ModelRouteReason>(serde_json::json!("other")).is_err());
+    }
+
+    #[test]
+    fn provider_order_event_uses_namespaced_tag() {
+        let event = Event::ProviderOrderUpdated {
+            provider_order: vec!["cursor".into(), "codex".into()],
+        };
+        let value = serde_json::to_value(event).unwrap();
+        assert_eq!(value["type"], "settings.provider_order_updated");
+        assert_eq!(
+            value["provider_order"],
+            serde_json::json!(["cursor", "codex"])
         );
     }
 

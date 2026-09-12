@@ -141,6 +141,16 @@ impl ThreadProjection {
                 let idx = self.push_turn_start(ThreadViewItem::TurnStatus { turn: *turn, state });
                 self.indexes.turns.insert(*turn, idx);
             }
+            Event::ModelRouteSelected {
+                turn,
+                provider_id,
+                provider_model,
+                ..
+            } => {
+                self.snapshot
+                    .turn_models
+                    .insert(*turn, format!("{provider_id}/{provider_model}"));
+            }
             Event::TurnPhaseChanged { phase, .. } => {
                 self.snapshot.turn_phase = Some(*phase);
             }
@@ -1034,6 +1044,38 @@ mod tests {
                 state: ThreadTurnState::Running,
             })
         ));
+    }
+
+    #[test]
+    fn automatic_route_replaces_the_turn_selector_with_its_concrete_model() {
+        let mut projection = ThreadProjection::default();
+        projection.apply(&envelope(
+            1,
+            0,
+            Event::TurnStarted {
+                turn: 9,
+                mode: "code".into(),
+                model: "auto/gpt-5.6-sol".into(),
+                thinking_level: None,
+                supports_steering: false,
+            },
+        ));
+        projection.apply(&envelope(
+            2,
+            1,
+            Event::ModelRouteSelected {
+                turn: 9,
+                model: "auto/gpt-5.6-sol".into(),
+                provider_id: "codex".into(),
+                provider_model: "gpt-5.6-sol".into(),
+                reason: trouve_protocol::ModelRouteReason::Initial,
+            },
+        ));
+
+        assert_eq!(
+            projection.snapshot.turn_models.get(&9).map(String::as_str),
+            Some("codex/gpt-5.6-sol")
+        );
     }
 
     #[test]

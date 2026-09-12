@@ -66,6 +66,7 @@ const rustEventToWire = {
   CompactionCompleted: "thread.compaction_completed",
   CompactionFailed: "thread.compaction_failed",
   CompactionStarted: "thread.compaction_started",
+  ModelRouteSelected: "model.route_selected",
   QuestionRequested: "question.requested",
   QuestionResolved: "question.resolved",
   QueueUpdated: "thread.queue_updated",

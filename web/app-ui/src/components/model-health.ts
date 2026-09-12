@@ -11,6 +11,13 @@ export interface ModelHealthPresentation {
   readonly tone: ModelHealthTone;
 }
 
+interface ModelWithRoutes extends ProtocolModelInfo {
+  readonly routes?: readonly {
+    readonly provider_id: string;
+    readonly provider_model: string;
+  }[];
+}
+
 export const boundedSubscriptionUsage = (usedPercent: number): number =>
   Math.max(0, Math.min(100, usedPercent));
 
@@ -93,16 +100,34 @@ export const modelHealthPresentation = (
 };
 
 export const modelHealthPresentations = (
-  models: readonly ProtocolModelInfo[],
+  models: readonly ModelWithRoutes[],
   subscriptions: readonly ProtocolSubscriptionHealth[],
 ): readonly (ModelHealthPresentation | undefined)[] => {
   const byProvider = new Map(
     subscriptions.map((health) => [health.provider_id, health] as const),
   );
   return models.map((model) => {
+    const routeProviders = model.routes?.map((route) => route.provider_id) ?? [];
     const separator = model.id.indexOf("/");
-    if (separator <= 0) return undefined;
-    const health = byProvider.get(model.id.slice(0, separator));
+    const providerIds = routeProviders.length > 0
+      ? routeProviders
+      : separator <= 0
+        ? []
+        : [model.id.slice(0, separator)];
+    const health = providerIds
+      .map((providerId) => byProvider.get(providerId))
+      .filter((candidate): candidate is ProtocolSubscriptionHealth => candidate !== undefined)
+      .sort((left, right) => {
+        const statusRank = (candidate: ProtocolSubscriptionHealth): number =>
+          candidate.status === "ok" ? 0 : candidate.status === "unsupported" ? 1 : 2;
+        const highestUsage = (candidate: ProtocolSubscriptionHealth): number =>
+          candidate.windows.reduce(
+            (highest, window) => Math.max(highest, boundedSubscriptionUsage(window.used_percent)),
+            0,
+          );
+        return statusRank(left) - statusRank(right)
+          || highestUsage(left) - highestUsage(right);
+      })[0];
     return health === undefined ? undefined : modelHealthPresentation(health);
   });
 };

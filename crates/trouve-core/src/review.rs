@@ -31,7 +31,9 @@ use trouve_protocol::{
 };
 
 use crate::config::GithubReviewAppConfig;
-use crate::engine::{Engine, EngineError, ReviewWorkspaceRegistrationFence};
+use crate::engine::{
+    Engine, EngineError, ReviewWorkspaceRegistrationFence, validate_model_selection,
+};
 use crate::store::{
     CODE_REVIEW_CARRIED_ANCHOR_CURSOR_MARKER, CodeReviewJobPhase, CodeReviewJobRecord,
     CodeReviewJobRetryOutcome, CodeReviewManualRequest, CodeReviewModelTiming,
@@ -3629,11 +3631,8 @@ impl Engine {
                 .map(str::trim)
                 .filter(|model| !model.is_empty())
                 .map(str::to_string);
-            if model.as_deref().is_some_and(|model| !model.contains('/')) {
-                return Err(EngineError::BadRequest(format!(
-                    "model override for reviewer {:?} must be provider-qualified",
-                    reviewer_override.reviewer_id
-                )));
+            if let Some(model) = model.as_deref() {
+                validate_model_selection(model)?;
             }
             let thinking_level = reviewer_override
                 .thinking_level
@@ -3641,7 +3640,9 @@ impl Engine {
                 .map(str::trim)
                 .filter(|level| !level.is_empty())
                 .map(str::to_string);
-            let model_options = scalar_model_options(&reviewer_override.model_options);
+            // Preserve invalid shapes until request validation so they are
+            // rejected instead of disappearing during normalization.
+            let model_options = reviewer_override.model_options.clone();
             let prompt = reviewer_override.prompt.trim();
             if prompt.len() > 16_000 {
                 return Err(EngineError::BadRequest(format!(
@@ -3678,11 +3679,25 @@ impl Engine {
         Ok(normalized)
     }
 
+    async fn resolve_code_review_model_info(
+        &self,
+        model: &str,
+        cache: &mut HashMap<String, trouve_protocol::ModelInfo>,
+    ) -> Result<trouve_protocol::ModelInfo, EngineError> {
+        if let Some(model_info) = cache.get(model) {
+            return Ok(model_info.clone());
+        }
+        let model_info = self.resolve_model_info(model).await?;
+        cache.insert(model.to_string(), model_info.clone());
+        Ok(model_info)
+    }
+
     async fn validate_code_review_thinking_level(
         &self,
         role: &str,
         level: Option<&str>,
         model: Option<&str>,
+        model_info_cache: &mut HashMap<String, trouve_protocol::ModelInfo>,
     ) -> Result<(), EngineError> {
         let Some(level) = level else {
             return Ok(());
@@ -3690,7 +3705,9 @@ impl Engine {
         let selected_model = model.ok_or_else(|| {
             EngineError::BadRequest(format!("{role} thinking level requires a configured model"))
         })?;
-        let model_info = self.resolve_model_info(selected_model).await?;
+        let model_info = self
+            .resolve_code_review_model_info(selected_model, model_info_cache)
+            .await?;
         let supported = crate::engine::advertised_thinking_levels(&model_info);
         if supported.contains(&level) {
             return Ok(());
@@ -3730,8 +3747,9 @@ impl Engine {
         role: &str,
         options: &serde_json::Map<String, serde_json::Value>,
         model: Option<&str>,
+        model_info_cache: &mut HashMap<String, trouve_protocol::ModelInfo>,
     ) -> Result<serde_json::Map<String, serde_json::Value>, EngineError> {
-        let options = scalar_model_options(options);
+        let options = validate_scalar_model_options(role, options)?;
         if options.is_empty() {
             return Ok(options);
         }
@@ -3743,7 +3761,9 @@ impl Engine {
         let selected_model = model.ok_or_else(|| {
             EngineError::BadRequest(format!("{role} model options require a configured model"))
         })?;
-        let model_info = self.resolve_model_info(selected_model).await?;
+        let model_info = self
+            .resolve_code_review_model_info(selected_model, model_info_cache)
+            .await?;
         crate::engine::validate_model_options(&options, &model_info).map_err(
             |error| match error {
                 EngineError::BadRequest(message) => {
@@ -3775,9 +3795,24 @@ impl Engine {
         validate_repository(&request.repository)
             .map_err(|error| EngineError::BadRequest(error.to_string()))?;
         // Disabling must always be an escape hatch for legacy or otherwise
-        // invalid enabled policies. Persist the dormant configuration as-is;
-        // it will be normalized and validated before a later re-enable.
+        // invalid enabled policies. Preserve omitted dormant configuration,
+        // but reject newly supplied option maps that violate the wire contract.
         if request.mode == CodeReviewMode::Off {
+            for (role, options) in [
+                ("coordinator", request.coordinator_model_options.as_ref()),
+                ("router", request.router_model_options.as_ref()),
+                ("analyst", request.analyst_model_options.as_ref()),
+            ] {
+                if let Some(options) = options {
+                    validate_scalar_model_options(role, options)?;
+                }
+            }
+            if let Some(reviewer_overrides) = request.reviewer_overrides.as_ref() {
+                for reviewer_override in reviewer_overrides {
+                    let role = format!("reviewer {:?}", reviewer_override.reviewer_id);
+                    validate_scalar_model_options(&role, &reviewer_override.model_options)?;
+                }
+            }
             let _persona_mutation = self.persona_mutations.lock().await;
             self.store.update_code_review_repository(request)?;
             let repository = self
@@ -3798,16 +3833,15 @@ impl Engine {
         if request.model.is_some() && model.is_none() {
             return Err(EngineError::BadRequest("model cannot be empty".into()));
         }
-        if model.as_deref().is_some_and(|model| !model.contains('/')) {
-            return Err(EngineError::BadRequest(
-                "review model must be provider-qualified".into(),
-            ));
+        if let Some(model) = model.as_deref() {
+            validate_model_selection(model)?;
         }
         if request.mode != CodeReviewMode::Off && model.is_none() {
             return Err(EngineError::BadRequest(
                 "enabled code review requires an explicit repository model".into(),
             ));
         }
+        let mut model_info_cache = HashMap::new();
         let coordinator_thinking_level = request
             .coordinator_thinking_level
             .as_ref()
@@ -3817,6 +3851,7 @@ impl Engine {
             "coordinator",
             coordinator_thinking_level.as_deref(),
             model.as_deref(),
+            &mut model_info_cache,
         )
         .await?;
         let router_model = request
@@ -3829,13 +3864,8 @@ impl Engine {
                 "router model cannot be empty".into(),
             ));
         }
-        if router_model
-            .as_deref()
-            .is_some_and(|model| !model.contains('/'))
-        {
-            return Err(EngineError::BadRequest(
-                "router model must be provider-qualified".into(),
-            ));
+        if let Some(router_model) = router_model.as_deref() {
+            validate_model_selection(router_model)?;
         }
         let router_thinking_level = request
             .router_thinking_level
@@ -3846,6 +3876,7 @@ impl Engine {
             "router",
             router_thinking_level.as_deref(),
             router_model.as_deref().or(model.as_deref()),
+            &mut model_info_cache,
         )
         .await?;
         let analyst_model = request
@@ -3858,13 +3889,8 @@ impl Engine {
                 "analyst model cannot be empty".into(),
             ));
         }
-        if analyst_model
-            .as_deref()
-            .is_some_and(|model| !model.contains('/'))
-        {
-            return Err(EngineError::BadRequest(
-                "analyst model must be provider-qualified".into(),
-            ));
+        if let Some(analyst_model) = analyst_model.as_deref() {
+            validate_model_selection(analyst_model)?;
         }
         let analyst_thinking_level = request
             .analyst_thinking_level
@@ -3875,6 +3901,7 @@ impl Engine {
             "analyst",
             analyst_thinking_level.as_deref(),
             analyst_model.as_deref().or(model.as_deref()),
+            &mut model_info_cache,
         )
         .await?;
         let existing = self
@@ -3898,6 +3925,7 @@ impl Engine {
                 "coordinator",
                 &coordinator_model_options,
                 model.as_deref(),
+                &mut model_info_cache,
             )
             .await?;
         let router_model_options = request
@@ -3914,6 +3942,7 @@ impl Engine {
                 "router",
                 &router_model_options,
                 router_model.as_deref().or(model.as_deref()),
+                &mut model_info_cache,
             )
             .await?;
         let analyst_model_options = request
@@ -3930,6 +3959,7 @@ impl Engine {
                 "analyst",
                 &analyst_model_options,
                 analyst_model.as_deref().or(model.as_deref()),
+                &mut model_info_cache,
             )
             .await?;
         let reviewer_ids = request
@@ -4067,12 +4097,14 @@ impl Engine {
                 &role,
                 reviewer_override.thinking_level.as_deref(),
                 effective_model,
+                &mut model_info_cache,
             )
             .await?;
             self.validate_code_review_model_options(
                 &role,
                 &reviewer_override.model_options,
                 effective_model,
+                &mut model_info_cache,
             )
             .await?;
         }
@@ -7386,7 +7418,7 @@ impl Engine {
         // Blocking findings from earlier rounds this round left open travel
         // in the review body with the coordinator's reason, so a round with
         // no new findings never posts an empty "changes requested".
-        let carried_open = carried_open_findings(&previous_findings, &parsed);
+        let carried_open = carried_open_findings(&previous_findings, &parsed, coordinator_skipped);
         let published_review = self
             .publish_review_with_carried(
                 &api,
@@ -7415,13 +7447,22 @@ impl Engine {
                 continuation_request.as_ref(),
             )?;
         // Persist why each carried finding stayed open so the check run,
-        // lifecycle comment, dashboard, and the next round's coordinator
-        // can all cite it. The record covers every unresolved open finding,
-        // with a fallback where the coordinator gave no verdict, so an
-        // older round's reason never survives as the latest word.
-        let carried_verdicts = carried_verdict_records(&previous_findings, &parsed);
-        self.store
-            .record_code_review_carried_verdicts(&job.id, &carried_verdicts)?;
+        // lifecycle comment, dashboard, and the next round's coordinator can
+        // all cite it. A skipped coordinator produced no new verdict, so its
+        // unchanged findings retain the last substantive reason.
+        if !coordinator_skipped {
+            let carried_verdicts = carried_verdict_records(&previous_findings, &parsed, false);
+            if let Err(error) = self
+                .store
+                .record_code_review_carried_verdicts(&job.id, &carried_verdicts)
+            {
+                tracing::warn!(
+                    job_id = %job.id,
+                    error = %format!("{error:#}"),
+                    "recording carried-finding verdicts failed after publication"
+                );
+            }
+        }
         // Remote cleanup is detached from the round entirely: it starts only
         // after every piece of publication bookkeeping, runs outside the job
         // future with bounded requests, and no failure in it can fail a job
@@ -14809,19 +14850,20 @@ struct CarriedOpenFinding<'a> {
 }
 
 /// Reason recorded for a carried finding the coordinator left open without
-/// a verdict of its own. Every open finding is stamped with this round's
-/// head either way, so no surface can present an older round's explanation
-/// as the current one.
+/// a verdict of its own. When a coordinator actually runs, every open finding
+/// is stamped with this round's head so no surface presents an older judgment
+/// as current. A fully skipped coordinator retains the last judgment instead.
 const CARRIED_VERDICT_FALLBACK_REASON: &str =
     "The final editor recorded no verdict for this finding at this revision; no fix was verified.";
 
 /// This round's verdict record for every open finding from earlier rounds
-/// that `output` did not resolve: the coordinator's `still_open` reason
-/// when it gave one, the fallback otherwise. Exhaustive by construction, so
-/// persisting it supersedes every earlier round's verdict.
+/// that `output` did not resolve. A normal coordinator round uses its
+/// `still_open` reason or the fallback. A skipped coordinator instead keeps
+/// an existing reason because it made no new judgment.
 fn carried_verdict_records<'a>(
     previous_findings: &'a [trouve_protocol::CodeReviewFinding],
     output: &'a ReviewOutput,
+    preserve_existing_reasons: bool,
 ) -> Vec<(&'a str, &'a str)> {
     let reason_by_id = output
         .carried_findings
@@ -14840,6 +14882,13 @@ fn carried_verdict_records<'a>(
                 reason_by_id
                     .get(finding.id.as_str())
                     .copied()
+                    .or_else(|| {
+                        preserve_existing_reasons
+                            .then_some(finding.carried_verdict.as_ref())
+                            .flatten()
+                            .map(|verdict| verdict.reason.as_str())
+                            .filter(|reason| !reason.is_empty())
+                    })
                     .unwrap_or(CARRIED_VERDICT_FALLBACK_REASON),
             )
         })
@@ -14852,10 +14901,12 @@ fn carried_verdict_records<'a>(
 fn carried_open_findings<'a>(
     previous_findings: &'a [trouve_protocol::CodeReviewFinding],
     output: &'a ReviewOutput,
+    preserve_existing_reasons: bool,
 ) -> Vec<CarriedOpenFinding<'a>> {
-    let reason_by_id = carried_verdict_records(previous_findings, output)
-        .into_iter()
-        .collect::<HashMap<_, _>>();
+    let reason_by_id =
+        carried_verdict_records(previous_findings, output, preserve_existing_reasons)
+            .into_iter()
+            .collect::<HashMap<_, _>>();
     previous_findings
         .iter()
         .filter(|finding| {
@@ -15294,6 +15345,21 @@ fn scalar_model_options(
         .filter(|(_, value)| value.is_string() || value.is_number() || value.is_boolean())
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect()
+}
+
+fn validate_scalar_model_options(
+    role: &str,
+    options: &serde_json::Map<String, serde_json::Value>,
+) -> Result<serde_json::Map<String, serde_json::Value>, EngineError> {
+    if let Some((name, _)) = options
+        .iter()
+        .find(|(_, value)| !value.is_string() && !value.is_number() && !value.is_boolean())
+    {
+        return Err(EngineError::BadRequest(format!(
+            "{role} model option {name} must be a string, number, or boolean"
+        )));
+    }
+    Ok(options.clone())
 }
 
 /// Thread options for one review role: the role's stored non-thinking
@@ -20437,6 +20503,7 @@ mod tests {
 
     struct RouterThinkingProvider {
         stall: bool,
+        list_calls: Option<Arc<AtomicUsize>>,
     }
 
     #[async_trait::async_trait]
@@ -20504,6 +20571,9 @@ mod tests {
         }
 
         async fn list_models(&self) -> Vec<trouve_protocol::ModelInfo> {
+            if let Some(list_calls) = &self.list_calls {
+                list_calls.fetch_add(1, Ordering::SeqCst);
+            }
             if self.stall {
                 return std::future::pending().await;
             }
@@ -24370,7 +24440,7 @@ rename to src/new.rs
         let previous = vec![threaded, grouped, resolved, advisory, missed];
 
         // Only blocking, gating, unresolved findings travel in the body.
-        let carried = carried_open_findings(&previous, &output);
+        let carried = carried_open_findings(&previous, &output, false);
         assert_eq!(
             carried
                 .iter()
@@ -24441,7 +24511,7 @@ rename to src/new.rs
             ],
         );
         let previous = [explained, omitted, resolved, fixed];
-        let records = carried_verdict_records(&previous, &output);
+        let records = carried_verdict_records(&previous, &output, false);
         assert_eq!(
             records,
             [
@@ -24450,6 +24520,37 @@ rename to src/new.rs
             ],
             "an omitted open finding gets this round's fallback instead of keeping an \
              older round's reason; resolved and closed findings get nothing"
+        );
+    }
+
+    #[test]
+    fn skipped_coordinator_keeps_the_latest_carried_reason() {
+        let mut explained = open_history_finding("rvf_explained", "src/lib.rs", 1, "high");
+        explained.carried_verdict = Some(trouve_protocol::CodeReviewCarriedVerdict {
+            job_id: "rv_older".into(),
+            head_sha: "b".repeat(40),
+            reason: "The unsafe branch is still present.".into(),
+        });
+        let missing = open_history_finding("rvf_missing", "src/lib.rs", 2, "high");
+        let previous = [explained, missing];
+        let output = review_output_with_carried(Vec::new(), Vec::new());
+
+        assert_eq!(
+            carried_verdict_records(&previous, &output, true),
+            [
+                ("rvf_explained", "The unsafe branch is still present."),
+                ("rvf_missing", CARRIED_VERDICT_FALLBACK_REASON),
+            ]
+        );
+        assert_eq!(
+            carried_open_findings(&previous, &output, true)
+                .into_iter()
+                .map(|entry| (entry.finding.id.as_str(), entry.reason))
+                .collect::<Vec<_>>(),
+            [
+                ("rvf_explained", "The unsafe branch is still present."),
+                ("rvf_missing", CARRIED_VERDICT_FALLBACK_REASON),
+            ]
         );
     }
 
@@ -24472,7 +24573,7 @@ rename to src/new.rs
                 .map(|finding| carried_verdict(&finding.id, "still_open", &"r".repeat(900)))
                 .collect(),
         );
-        let carried = carried_open_findings(&previous, &output);
+        let carried = carried_open_findings(&previous, &output, false);
         let (request, _) =
             inline_review_request(&job, "REQUEST_CHANGES", &[], &[], &[], &[], &carried);
         let body = request["body"].as_str().unwrap();
@@ -33049,6 +33150,8 @@ rename to src/new.rs
         store
             .upsert_discovered_code_review_repository(7, "acme/widgets", false)
             .unwrap();
+        let legacy_options =
+            serde_json::Map::from_iter([("legacy".to_string(), serde_json::json!(true))]);
         let legacy = UpdateCodeReviewRepositoryRequest {
             installation_id: 7,
             repository: "acme/widgets".into(),
@@ -33059,7 +33162,7 @@ rename to src/new.rs
             router_thinking_level: Some("unsupported".into()),
             analyst_model: None,
             analyst_thinking_level: None,
-            coordinator_model_options: None,
+            coordinator_model_options: Some(legacy_options.clone()),
             router_model_options: None,
             analyst_model_options: None,
             prompt: String::new(),
@@ -33079,7 +33182,8 @@ rename to src/new.rs
         let disabled = engine
             .update_code_review_repository(&UpdateCodeReviewRepositoryRequest {
                 mode: CodeReviewMode::Off,
-                ..legacy
+                coordinator_model_options: None,
+                ..legacy.clone()
             })
             .await
             .unwrap();
@@ -33088,6 +33192,62 @@ rename to src/new.rs
         assert_eq!(
             disabled.router_model.as_deref(),
             Some("legacy-unqualified-model")
+        );
+        assert_eq!(disabled.coordinator_model_options, legacy_options);
+
+        for role in ["coordinator", "router", "analyst"] {
+            let mut invalid = UpdateCodeReviewRepositoryRequest {
+                mode: CodeReviewMode::Off,
+                coordinator_model_options: None,
+                ..legacy.clone()
+            };
+            let options = Some(serde_json::Map::from_iter([(
+                "invalid".to_string(),
+                serde_json::Value::Null,
+            )]));
+            match role {
+                "coordinator" => invalid.coordinator_model_options = options,
+                "router" => invalid.router_model_options = options,
+                "analyst" => invalid.analyst_model_options = options,
+                _ => unreachable!(),
+            }
+            let error = engine
+                .update_code_review_repository(&invalid)
+                .await
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("{role} model option invalid must be a string")),
+                "{error}"
+            );
+        }
+
+        let mut invalid_override = UpdateCodeReviewRepositoryRequest {
+            mode: CodeReviewMode::Off,
+            coordinator_model_options: None,
+            ..legacy
+        };
+        invalid_override.reviewer_overrides = Some(vec![ReviewerOverride {
+            reviewer_id: "security".into(),
+            model: None,
+            thinking_level: None,
+            model_options: serde_json::Map::from_iter([(
+                "invalid".to_string(),
+                serde_json::Value::Null,
+            )]),
+            prompt_mode: ReviewerPromptMode::Inherit,
+            prompt: String::new(),
+        }]);
+        let error = engine
+            .update_code_review_repository(&invalid_override)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("reviewer \"security\" model option invalid must be a string"),
+            "{error}"
         );
     }
 
@@ -33105,7 +33265,10 @@ rename to src/new.rs
         )
         .with_provider(
             "provider",
-            Arc::new(RouterThinkingProvider { stall: false }),
+            Arc::new(RouterThinkingProvider {
+                stall: false,
+                list_calls: None,
+            }),
         );
         let request =
             |router_model: Option<&str>, level: Option<&str>| UpdateCodeReviewRepositoryRequest {
@@ -33149,6 +33312,13 @@ rename to src/new.rs
             .find(|repository| repository.repository == "acme/widgets")
             .unwrap();
         assert_eq!(unchanged.router_thinking_level.as_deref(), Some("low"));
+
+        let saved = engine
+            .update_code_review_repository(&request(Some("provider/router"), Some("high")))
+            .await
+            .unwrap();
+        assert_eq!(saved.router_model.as_deref(), Some("provider/router"));
+        assert_eq!(saved.router_thinking_level.as_deref(), Some("high"));
 
         let error = engine
             .update_code_review_repository(&request(Some("provider/plain"), Some("low")))
@@ -33215,8 +33385,13 @@ rename to src/new.rs
             .unwrap_err();
         assert!(error.to_string().contains("supported levels: low, high"));
 
-        let engine =
-            engine.with_provider("provider", Arc::new(RouterThinkingProvider { stall: true }));
+        let engine = engine.with_provider(
+            "provider",
+            Arc::new(RouterThinkingProvider {
+                stall: true,
+                list_calls: None,
+            }),
+        );
         let error = tokio::time::timeout(
             Duration::from_secs(1),
             engine.update_code_review_repository(&request(None, Some("low"))),
@@ -33238,6 +33413,7 @@ rename to src/new.rs
         store
             .upsert_discovered_code_review_repository(7, "acme/widgets", false)
             .unwrap();
+        let list_calls = Arc::new(AtomicUsize::new(0));
         let engine = Engine::new(
             store,
             data.path().to_path_buf(),
@@ -33245,7 +33421,10 @@ rename to src/new.rs
         )
         .with_provider(
             "provider",
-            Arc::new(RouterThinkingProvider { stall: false }),
+            Arc::new(RouterThinkingProvider {
+                stall: false,
+                list_calls: Some(list_calls.clone()),
+            }),
         );
         let fast = || serde_json::Map::from_iter([("fast".to_string(), serde_json::json!(true))]);
         let request = || UpdateCodeReviewRepositoryRequest {
@@ -33285,6 +33464,7 @@ rename to src/new.rs
         assert!(saved.router_model_options.is_empty());
         assert_eq!(saved.reviewer_overrides.len(), 1);
         assert_eq!(saved.reviewer_overrides[0].model_options, fast());
+        assert_eq!(list_calls.load(Ordering::SeqCst), 1);
         let reviewers = engine.reviewers_for_repository_policy(&saved).unwrap();
         let security = reviewers
             .iter()
@@ -33366,6 +33546,41 @@ rename to src/new.rs
             .await
             .unwrap_err();
         assert!(error.to_string().contains("cannot set thinking"), "{error}");
+
+        for value in [
+            serde_json::Value::Null,
+            serde_json::json!([]),
+            serde_json::json!({}),
+        ] {
+            let mut non_scalar = request();
+            non_scalar.coordinator_thinking_level = None;
+            non_scalar.coordinator_model_options =
+                Some(serde_json::Map::from_iter([("fast".to_string(), value)]));
+            let error = engine
+                .update_code_review_repository(&non_scalar)
+                .await
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("must be a string, number, or boolean"),
+                "{error}"
+            );
+        }
+
+        let mut non_scalar_override = request();
+        non_scalar_override.reviewer_overrides.as_mut().unwrap()[0].model_options =
+            serde_json::Map::from_iter([("fast".to_string(), serde_json::Value::Null)]);
+        let error = engine
+            .update_code_review_repository(&non_scalar_override)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains(
+                "reviewer \"security\" model option fast must be a string, number, or boolean"
+            ),
+            "{error}"
+        );
 
         // Snapshotted jobs dispatch the stored options merged with the
         // legacy thinking shorthand.
@@ -33452,6 +33667,49 @@ rename to src/new.rs
                 "expected {expected:?}, got {error}"
             );
         }
+
+        let mut invalid = request();
+        invalid.model = Some("auto/default".into());
+        rejected(
+            &engine,
+            invalid,
+            "model must be auto/<model> or provider/<model>",
+        )
+        .await;
+
+        let mut invalid = request();
+        invalid.router_model = Some("auto/default".into());
+        rejected(
+            &engine,
+            invalid,
+            "model must be auto/<model> or provider/<model>",
+        )
+        .await;
+
+        let mut invalid = request();
+        invalid.analyst_model = Some("auto/default".into());
+        rejected(
+            &engine,
+            invalid,
+            "model must be auto/<model> or provider/<model>",
+        )
+        .await;
+
+        let mut invalid = request();
+        invalid.reviewer_overrides = Some(vec![ReviewerOverride {
+            reviewer_id: "security".into(),
+            model: Some("auto/default".into()),
+            thinking_level: None,
+            model_options: Default::default(),
+            prompt_mode: ReviewerPromptMode::Inherit,
+            prompt: String::new(),
+        }]);
+        rejected(
+            &engine,
+            invalid,
+            "model must be auto/<model> or provider/<model>",
+        )
+        .await;
 
         let mut invalid = request();
         invalid.reviewer_ids = Some(Vec::new());

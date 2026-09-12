@@ -65,6 +65,60 @@ describe("ThreadViewModel", () => {
     expect(vm.turnPhase).toBeUndefined();
   });
 
+  it("tracks the concrete automatic route for usage presentation", () => {
+    const vm = new ThreadViewModel();
+    vm.apply(envelope(1, {
+      type: "turn.started",
+      turn: 4,
+      mode: "code",
+      model: "auto/gpt-5.6-sol",
+    }));
+    vm.apply(envelope(2, {
+      type: "model.route_selected",
+      turn: 4,
+      model: "auto/gpt-5.6-sol",
+      provider_id: "codex",
+      provider_model: "gpt-5.6-sol",
+      reason: "initial",
+    }));
+    vm.apply(envelope(3, {
+      type: "turn.admitted",
+      turn: 4,
+      provider_wait_ms: 0,
+    }));
+    vm.apply(envelope(4, {
+      type: "turn.usage_updated",
+      turn: 4,
+      usage: {
+        input_tokens: 90_606,
+        output_tokens: 1,
+        cached_input_tokens: 80_640,
+      },
+    }));
+
+    expect(vm.turnModels.get(4)).toBe("codex/gpt-5.6-sol");
+    expect(vm.usageModel()).toBe("codex/gpt-5.6-sol");
+
+    // A newer turn without usage does not take ownership of the previous
+    // completed-turn usage shown beside the composer.
+    vm.apply(envelope(5, {
+      type: "turn.completed",
+      turn: 4,
+      usage: {
+        input_tokens: 90_606,
+        output_tokens: 1,
+        cached_input_tokens: 80_640,
+      },
+    }));
+    vm.apply(envelope(6, {
+      type: "turn.started",
+      turn: 5,
+      mode: "code",
+      model: "auto/gpt-5.6-sol",
+    }));
+    expect(vm.usageModel()).toBe("codex/gpt-5.6-sol");
+  });
+
   it("bumps the items revision only for events that can touch the transcript", () => {
     const vm = new ThreadViewModel();
     vm.apply(envelope(1, { type: "turn.started", turn: 4, mode: "code", model: "test/model" }));

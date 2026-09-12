@@ -267,6 +267,12 @@ impl Provider for VertexProvider {
         &self.id
     }
 
+    fn shared_model_identity(&self, model: &str) -> Option<String> {
+        model
+            .starts_with("gemini-")
+            .then(|| self.catalog.shared_model_identity("google-vertex", model))?
+    }
+
     fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
         let prefix = format!("{}/", self.id);
         self.catalog

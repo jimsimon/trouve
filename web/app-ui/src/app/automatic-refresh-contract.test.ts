@@ -30,4 +30,10 @@ describe("automatic data refresh contract", () => {
   it("does not ship the removed pull-to-refresh gesture", () => {
     expect(existsSync(`${sourceRoot}/services/pull-to-refresh.ts`)).toBe(false);
   });
+
+  it("keeps request deadlines compatible with older system WebViews", () => {
+    for (const path of productionSources(sourceRoot)) {
+      expect(readFileSync(path, "utf8"), path).not.toContain("AbortSignal.timeout(");
+    }
+  });
 });

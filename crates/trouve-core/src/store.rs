@@ -109,6 +109,8 @@ CREATE TABLE IF NOT EXISTS threads (
   model TEXT NOT NULL,
   permission_mode TEXT NOT NULL,
   model_options TEXT NOT NULL DEFAULT '{}',
+  route_provider_id TEXT,
+  route_provider_model TEXT,
   todos TEXT NOT NULL DEFAULT '[]',
   last_turn INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL
@@ -153,6 +155,16 @@ CREATE TABLE IF NOT EXISTS backend_sessions (
   -- a resumed vendor session be told what other models did in between.
   seen_messages INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (thread_id, backend)
+);
+CREATE TABLE IF NOT EXISTS route_health (
+  provider_id TEXT NOT NULL,
+  provider_model TEXT NOT NULL,
+  consecutive_failures INTEGER NOT NULL DEFAULT 0,
+  retry_after INTEGER,
+  last_success_at INTEGER,
+  last_failure_at INTEGER,
+  last_outcome_started_at INTEGER,
+  PRIMARY KEY (provider_id, provider_model)
 );
 CREATE TABLE IF NOT EXISTS queued_prompts (
   id TEXT PRIMARY KEY,
@@ -815,6 +827,20 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE automations ADD COLUMN model_options TEXT NOT NULL DEFAULT '{}'",
     "ALTER TABLE threads ADD COLUMN todos TEXT NOT NULL DEFAULT '[]'",
     "ALTER TABLE threads ADD COLUMN title TEXT",
+    "ALTER TABLE threads ADD COLUMN route_provider_id TEXT",
+    "ALTER TABLE threads ADD COLUMN route_provider_model TEXT",
+    "CREATE TABLE IF NOT EXISTS route_health (
+       provider_id TEXT NOT NULL,
+       provider_model TEXT NOT NULL,
+       consecutive_failures INTEGER NOT NULL DEFAULT 0,
+       retry_after INTEGER,
+       last_success_at INTEGER,
+       last_failure_at INTEGER,
+       last_outcome_started_at INTEGER,
+       PRIMARY KEY (provider_id, provider_model)
+     )",
+    "ALTER TABLE route_health ADD COLUMN last_failure_at INTEGER",
+    "ALTER TABLE route_health ADD COLUMN last_outcome_started_at INTEGER",
     "ALTER TABLE thread_statuses ADD COLUMN started_at TEXT",
     "ALTER TABLE thread_statuses ADD COLUMN completed_at TEXT",
     "ALTER TABLE thread_view_items ADD COLUMN turn_start INTEGER NOT NULL DEFAULT 0",
@@ -4897,6 +4923,20 @@ pub enum UsageScope<'a> {
     Session(&'a str),
 }
 
+/// Persisted circuit-breaker state for one concrete provider/model route.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteHealthRow {
+    pub provider_id: String,
+    pub provider_model: String,
+    pub consecutive_failures: u32,
+    pub retry_after: Option<i64>,
+    pub last_success_at: Option<i64>,
+    pub last_failure_at: Option<i64>,
+    /// Hybrid logical order of the newest admitted attempt whose outcome was
+    /// recorded. The backing column keeps its original migration name.
+    pub last_outcome_order: Option<i64>,
+}
+
 #[derive(Debug, Clone)]
 pub struct CheckpointRow {
     pub id: String,
@@ -5639,6 +5679,14 @@ fn update_thread_row(conn: &Connection, id: &str, request: &UpdateThreadRequest)
         "UPDATE threads
          SET title = COALESCE(?2, title),
              mode = COALESCE(?3, mode),
+             route_provider_id = CASE
+                 WHEN ?4 IS NOT NULL AND ?4 <> model THEN NULL
+                 ELSE route_provider_id
+             END,
+             route_provider_model = CASE
+                 WHEN ?4 IS NOT NULL AND ?4 <> model THEN NULL
+                 ELSE route_provider_model
+             END,
              model = COALESCE(?4, model),
              model_options = COALESCE(?5, model_options),
              permission_mode = COALESCE(?6, permission_mode)
@@ -8781,7 +8829,7 @@ impl Store {
                 staging_cleanup_claim,
             },
         )?;
-        self.append_pending_events(pending)
+        self.append_pending_events_isolated(pending)
     }
 
     // --- queued prompts -------------------------------------------------------
@@ -17295,18 +17343,62 @@ impl Store {
         backend_session_id: &str,
     ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO backend_sessions (thread_id, backend, backend_session_id)
-             VALUES (?1, ?2, ?3)
+        let tx = write_transaction(&conn)?;
+        tx.execute(
+            "INSERT INTO backend_sessions
+                 (thread_id, backend, backend_session_id, seen_messages)
+             VALUES (
+                 ?1, ?2, ?3,
+                 COALESCE(
+                     (SELECT seen_messages FROM backend_sessions
+                      WHERE thread_id = ?1 AND backend = ?2),
+                     (SELECT seen_messages FROM backend_sessions
+                      WHERE thread_id = ?1 AND backend = ''
+                        AND backend_session_id = ?3),
+                     0
+                 )
+             )
              ON CONFLICT(thread_id, backend)
                DO UPDATE SET backend_session_id = excluded.backend_session_id",
             params![thread_id, backend, backend_session_id],
         )?;
         // A properly keyed row supersedes any migrated legacy fallback.
-        conn.execute(
+        tx.execute(
             "DELETE FROM backend_sessions WHERE thread_id = ?1 AND backend = ''",
             params![thread_id],
         )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Persist a newly reported vendor session together with the transcript
+    /// watermark submitted to it. One transaction prevents a restart from
+    /// replaying history the new vendor session already consumed.
+    pub fn set_backend_session_at_watermark(
+        &self,
+        thread_id: &str,
+        backend: &str,
+        backend_session_id: &str,
+        seen: u64,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let seen = i64::try_from(seen).context("backend seen_messages exceeds SQLite range")?;
+        let tx = write_transaction(&conn)?;
+        tx.execute(
+            "INSERT INTO backend_sessions
+                 (thread_id, backend, backend_session_id, seen_messages)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(thread_id, backend)
+               DO UPDATE SET
+                 backend_session_id = excluded.backend_session_id,
+                 seen_messages = excluded.seen_messages",
+            params![thread_id, backend, backend_session_id, seen],
+        )?;
+        tx.execute(
+            "DELETE FROM backend_sessions WHERE thread_id = ?1 AND backend = ''",
+            params![thread_id],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -17322,6 +17414,292 @@ impl Store {
              WHERE thread_id = ?1 AND backend = ?2",
             params![thread_id, backend, seen],
         )?;
+        Ok(())
+    }
+
+    // --- automatic provider route state ------------------------------------
+
+    /// Last successful concrete route for this thread's automatic model.
+    /// Model changes clear the two columns in the same update statement.
+    pub fn thread_route_affinity(&self, id: &str) -> Result<Option<(String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT route_provider_id, route_provider_model FROM threads WHERE id = ?1",
+            params![id],
+            |row| {
+                let provider_id: Option<String> = row.get(0)?;
+                let provider_model: Option<String> = row.get(1)?;
+                Ok(provider_id.zip(provider_model))
+            },
+        )
+        .optional()
+        .map(|row| row.flatten())
+        .map_err(Into::into)
+    }
+
+    pub fn set_thread_route_affinity(
+        &self,
+        id: &str,
+        expected_model: &str,
+        provider_id: &str,
+        provider_model: &str,
+    ) -> Result<bool> {
+        let updated = self.conn.lock().unwrap().execute(
+            "UPDATE threads
+             SET route_provider_id = ?3, route_provider_model = ?4
+             WHERE id = ?1 AND model = ?2",
+            params![id, expected_model, provider_id, provider_model],
+        )?;
+        Ok(updated == 1)
+    }
+
+    pub fn clear_thread_route_affinity_if_matches(
+        &self,
+        id: &str,
+        provider_id: &str,
+        provider_model: &str,
+    ) -> Result<bool> {
+        let updated = self.conn.lock().unwrap().execute(
+            "UPDATE threads
+             SET route_provider_id = NULL, route_provider_model = NULL
+             WHERE id = ?1 AND route_provider_id = ?2 AND route_provider_model = ?3",
+            params![id, provider_id, provider_model],
+        )?;
+        Ok(updated == 1)
+    }
+
+    /// Circuit-breaker snapshots keyed by concrete provider/model route.
+    pub fn route_health(&self) -> Result<HashMap<(String, String), RouteHealthRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT provider_id, provider_model, consecutive_failures,
+                    retry_after, last_success_at, last_failure_at,
+                    last_outcome_started_at
+             FROM route_health",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let provider_id: String = row.get(0)?;
+            let provider_model: String = row.get(1)?;
+            Ok(RouteHealthRow {
+                provider_id: provider_id.clone(),
+                provider_model: provider_model.clone(),
+                consecutive_failures: row.get::<_, i64>(2)?.max(0) as u32,
+                retry_after: row.get(3)?,
+                last_success_at: row.get(4)?,
+                last_failure_at: row.get(5)?,
+                last_outcome_order: row.get(6)?,
+            })
+        })?;
+        let mut health = HashMap::new();
+        for row in rows {
+            let row = row?;
+            health.insert((row.provider_id.clone(), row.provider_model.clone()), row);
+        }
+        Ok(health)
+    }
+
+    /// Open or extend a route's cooldown with capped exponential backoff.
+    pub fn record_route_failure(
+        &self,
+        provider_id: &str,
+        provider_model: &str,
+        attempt_order: i64,
+        base_cooldown_secs: i64,
+        max_cooldown_secs: i64,
+    ) -> Result<RouteHealthRow> {
+        let conn = self.conn.lock().unwrap();
+        let previous = conn
+            .query_row(
+                "SELECT consecutive_failures, retry_after, last_success_at,
+                        last_failure_at, last_outcome_started_at
+                 FROM route_health
+                 WHERE provider_id = ?1 AND provider_model = ?2",
+                params![provider_id, provider_model],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if previous
+            .as_ref()
+            .and_then(|(_, _, _, _, order)| *order)
+            .is_some_and(|order| order >= attempt_order)
+        {
+            let (failures, retry_after, last_success_at, last_failure_at, last_outcome) =
+                previous.unwrap();
+            return Ok(RouteHealthRow {
+                provider_id: provider_id.into(),
+                provider_model: provider_model.into(),
+                consecutive_failures: failures.max(0) as u32,
+                retry_after,
+                last_success_at,
+                last_failure_at,
+                last_outcome_order: last_outcome,
+            });
+        }
+        let consecutive_failures = previous
+            .as_ref()
+            .map(|(failures, _, _, _, _)| failures.saturating_add(1))
+            .unwrap_or(1)
+            .max(1);
+        let exponent = u32::try_from(consecutive_failures.saturating_sub(1).min(20)).unwrap_or(20);
+        let multiplier = 1i64.checked_shl(exponent).unwrap_or(i64::MAX);
+        let cooldown = base_cooldown_secs
+            .max(1)
+            .saturating_mul(multiplier)
+            .min(max_cooldown_secs.max(1));
+        let retry_after = chrono::Utc::now().timestamp().saturating_add(cooldown);
+        let last_failure_at = chrono::Utc::now().timestamp_micros();
+        conn.execute(
+            "INSERT INTO route_health
+                 (provider_id, provider_model, consecutive_failures, retry_after,
+                  last_success_at, last_failure_at, last_outcome_started_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(provider_id, provider_model) DO UPDATE SET
+                 consecutive_failures = excluded.consecutive_failures,
+                 retry_after = excluded.retry_after,
+                 last_failure_at = excluded.last_failure_at,
+                 last_outcome_started_at = excluded.last_outcome_started_at",
+            params![
+                provider_id,
+                provider_model,
+                consecutive_failures,
+                retry_after,
+                previous.as_ref().and_then(|(_, _, success, _, _)| *success),
+                last_failure_at,
+                attempt_order,
+            ],
+        )?;
+        Ok(RouteHealthRow {
+            provider_id: provider_id.into(),
+            provider_model: provider_model.into(),
+            consecutive_failures: consecutive_failures as u32,
+            retry_after: Some(retry_after),
+            last_success_at: previous.and_then(|(_, _, success, _, _)| success),
+            last_failure_at: Some(last_failure_at),
+            last_outcome_order: Some(attempt_order),
+        })
+    }
+
+    /// Close a route's circuit and remember it as a proven-good choice, but
+    /// only when no newer attempt has failed in the meantime.
+    pub fn record_route_success(
+        &self,
+        provider_id: &str,
+        provider_model: &str,
+        attempt_order: i64,
+    ) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO route_health
+                 (provider_id, provider_model, consecutive_failures, retry_after,
+                  last_success_at, last_failure_at, last_outcome_started_at)
+             VALUES (?1, ?2, 0, NULL, ?3, NULL, ?4)
+             ON CONFLICT(provider_id, provider_model) DO UPDATE SET
+                 consecutive_failures = 0,
+                 retry_after = NULL,
+                 last_success_at = excluded.last_success_at,
+                 last_failure_at = NULL,
+                 last_outcome_started_at = excluded.last_outcome_started_at
+             WHERE route_health.last_outcome_started_at IS NULL
+                OR route_health.last_outcome_started_at < ?4",
+            params![
+                provider_id,
+                provider_model,
+                chrono::Utc::now().timestamp(),
+                attempt_order,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Configuration changes invalidate failures learned under the previous
+    /// credentials or endpoint.
+    pub fn clear_route_health(&self, provider_id: &str) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "DELETE FROM route_health WHERE provider_id = ?1",
+            params![provider_id],
+        )?;
+        Ok(())
+    }
+
+    /// Snapshot and clear selected providers' learned health in one short
+    /// transaction. Callers retain the provider-generation fence until their
+    /// corresponding configuration publication succeeds or this snapshot is
+    /// restored.
+    pub(crate) fn take_route_health(&self, provider_ids: &[String]) -> Result<Vec<RouteHealthRow>> {
+        let conn = self.conn.lock().unwrap();
+        let tx = write_transaction(&conn)?;
+        let mut previous = Vec::new();
+        for provider_id in provider_ids {
+            {
+                let mut stmt = tx.prepare(
+                    "SELECT provider_id, provider_model, consecutive_failures,
+                            retry_after, last_success_at, last_failure_at,
+                            last_outcome_started_at
+                     FROM route_health
+                     WHERE provider_id = ?1
+                     ORDER BY provider_model",
+                )?;
+                let rows = stmt.query_map(params![provider_id], |row| {
+                    Ok(RouteHealthRow {
+                        provider_id: row.get(0)?,
+                        provider_model: row.get(1)?,
+                        consecutive_failures: row.get::<_, i64>(2)?.max(0) as u32,
+                        retry_after: row.get(3)?,
+                        last_success_at: row.get(4)?,
+                        last_failure_at: row.get(5)?,
+                        last_outcome_order: row.get(6)?,
+                    })
+                })?;
+                for row in rows {
+                    previous.push(row?);
+                }
+            }
+            tx.execute(
+                "DELETE FROM route_health WHERE provider_id = ?1",
+                params![provider_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(previous)
+    }
+
+    /// Restore an exact route-health snapshot after a later configuration
+    /// publication step fails. The caller's generation fence prevents new
+    /// outcomes for these routes from interleaving with the compensation.
+    pub(crate) fn restore_route_health(&self, rows: &[RouteHealthRow]) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let tx = write_transaction(&conn)?;
+        for row in rows {
+            tx.execute(
+                "INSERT INTO route_health
+                     (provider_id, provider_model, consecutive_failures, retry_after,
+                      last_success_at, last_failure_at, last_outcome_started_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(provider_id, provider_model) DO UPDATE SET
+                     consecutive_failures = excluded.consecutive_failures,
+                     retry_after = excluded.retry_after,
+                     last_success_at = excluded.last_success_at,
+                     last_failure_at = excluded.last_failure_at,
+                     last_outcome_started_at = excluded.last_outcome_started_at",
+                params![
+                    row.provider_id,
+                    row.provider_model,
+                    i64::from(row.consecutive_failures),
+                    row.retry_after,
+                    row.last_success_at,
+                    row.last_failure_at,
+                    row.last_outcome_order,
+                ],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -21178,6 +21556,225 @@ mod tests {
         );
     }
 
+    #[test]
+    fn route_health_persists_backoff_success_and_config_reset() {
+        let store = Store::open_in_memory().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let first_attempt = chrono::Utc::now().timestamp_micros();
+        let first = store
+            .record_route_failure("provider", "model", first_attempt, 10, 25)
+            .unwrap();
+        assert_eq!(first.consecutive_failures, 1);
+        assert!(first.retry_after.unwrap() >= now + 10);
+
+        let second = store
+            .record_route_failure("provider", "model", first_attempt.saturating_add(1), 10, 25)
+            .unwrap();
+        assert_eq!(second.consecutive_failures, 2);
+        assert!(second.retry_after.unwrap() >= now + 20);
+
+        let third = store
+            .record_route_failure("provider", "model", first_attempt.saturating_add(2), 10, 25)
+            .unwrap();
+        assert_eq!(third.consecutive_failures, 3);
+        let third_retry_after = third.retry_after.unwrap();
+        assert!(third_retry_after >= now + 25);
+        assert!(third_retry_after <= chrono::Utc::now().timestamp() + 25);
+
+        let successful_attempt = first_attempt.saturating_add(3);
+        store
+            .record_route_success("provider", "model", successful_attempt)
+            .unwrap();
+        let health = store.route_health().unwrap();
+        let route = &health[&("provider".to_string(), "model".to_string())];
+        assert_eq!(route.consecutive_failures, 0);
+        assert_eq!(route.retry_after, None);
+        assert!(route.last_success_at.is_some());
+        assert_eq!(route.last_failure_at, None);
+
+        store.clear_route_health("provider").unwrap();
+        assert!(store.route_health().unwrap().is_empty());
+    }
+
+    #[test]
+    fn migrations_upgrade_legacy_route_health_table() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE route_health (
+               provider_id TEXT NOT NULL,
+               provider_model TEXT NOT NULL,
+               consecutive_failures INTEGER NOT NULL DEFAULT 0,
+               retry_after INTEGER,
+               last_success_at INTEGER,
+               PRIMARY KEY (provider_id, provider_model)
+             );",
+        )
+        .unwrap();
+
+        conn.execute_batch(SCHEMA).unwrap();
+        apply_migrations(&mut conn).unwrap();
+
+        let ordering_columns: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('route_health')
+                 WHERE name IN ('last_failure_at', 'last_outcome_started_at')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ordering_columns, 2);
+    }
+
+    #[test]
+    fn migrations_create_route_health_for_pre_routing_database() {
+        let temporary = tempfile::tempdir().unwrap();
+        let database = temporary.path().join("trouve.db");
+        let legacy = Connection::open(&database).unwrap();
+        legacy
+            .execute_batch(
+                "CREATE TABLE legacy_marker (
+                   id INTEGER PRIMARY KEY
+                 );
+                 INSERT INTO legacy_marker (id) VALUES (1);",
+            )
+            .unwrap();
+        let route_health_tables: i64 = legacy
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'route_health'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(route_health_tables, 0);
+        drop(legacy);
+
+        // Schema migration is shape-based rather than ledger-based. For this
+        // feature, table absence is the relevant state of every database from
+        // before automatic routing; unrelated legacy tables cannot affect it.
+        for _ in 0..2 {
+            let store = Store::open(&database).unwrap();
+            let conn = store.conn.lock().unwrap();
+            let ordering_columns: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('route_health')
+                     WHERE name IN ('last_failure_at', 'last_outcome_started_at')",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(ordering_columns, 2);
+        }
+    }
+
+    #[test]
+    fn older_route_success_cannot_erase_a_newer_failure() {
+        let store = Store::open_in_memory().unwrap();
+        let attempt_order = chrono::Utc::now().timestamp_micros();
+        let failure = store
+            .record_route_failure("provider", "model", attempt_order.saturating_add(1), 10, 25)
+            .unwrap();
+
+        store
+            .record_route_success("provider", "model", attempt_order)
+            .unwrap();
+        let route = &store.route_health().unwrap()[&("provider".to_string(), "model".to_string())];
+        assert_eq!(route.consecutive_failures, 1);
+        assert_eq!(route.last_failure_at, failure.last_failure_at);
+
+        store
+            .record_route_success("provider", "model", attempt_order.saturating_add(2))
+            .unwrap();
+        let route = &store.route_health().unwrap()[&("provider".to_string(), "model".to_string())];
+        assert_eq!(route.consecutive_failures, 0);
+        assert_eq!(route.last_failure_at, None);
+    }
+
+    #[test]
+    fn older_route_failure_cannot_overwrite_a_newer_success() {
+        let store = Store::open_in_memory().unwrap();
+        let older_attempt = chrono::Utc::now().timestamp_micros();
+        let newer_attempt = older_attempt.saturating_add(1);
+        store
+            .record_route_success("provider", "model", newer_attempt)
+            .unwrap();
+
+        let route = store
+            .record_route_failure("provider", "model", older_attempt, 10, 25)
+            .unwrap();
+        assert_eq!(route.consecutive_failures, 0);
+        assert_eq!(route.retry_after, None);
+        assert!(route.last_success_at.is_some());
+        assert_eq!(route.last_failure_at, None);
+        assert_eq!(route.last_outcome_order, Some(newer_attempt));
+    }
+
+    #[test]
+    fn thread_route_affinity_persists_until_the_model_changes() {
+        let store = Store::open_in_memory().unwrap();
+        seed_thread(&store, "th_affinity");
+        assert_eq!(store.thread_route_affinity("th_affinity").unwrap(), None);
+
+        assert!(
+            store
+                .set_thread_route_affinity("th_affinity", "p/m", "codex", "gpt-5.6-sol")
+                .unwrap()
+        );
+        assert_eq!(
+            store.thread_route_affinity("th_affinity").unwrap(),
+            Some(("codex".into(), "gpt-5.6-sol".into()))
+        );
+
+        store
+            .update_thread(
+                "th_affinity",
+                &UpdateThreadRequest {
+                    mode: Some("plan".into()),
+                    ..UpdateThreadRequest::default()
+                },
+            )
+            .unwrap();
+        assert!(
+            store
+                .thread_route_affinity("th_affinity")
+                .unwrap()
+                .is_some()
+        );
+
+        store
+            .update_thread(
+                "th_affinity",
+                &UpdateThreadRequest {
+                    model: Some("p/m".into()),
+                    ..UpdateThreadRequest::default()
+                },
+            )
+            .unwrap();
+        assert!(
+            store
+                .thread_route_affinity("th_affinity")
+                .unwrap()
+                .is_some()
+        );
+
+        store
+            .update_thread(
+                "th_affinity",
+                &UpdateThreadRequest {
+                    model: Some("auto/claude-sonnet-4-5".into()),
+                    ..UpdateThreadRequest::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(store.thread_route_affinity("th_affinity").unwrap(), None);
+        assert!(
+            !store
+                .set_thread_route_affinity("th_affinity", "p/m", "codex", "gpt-5.6-sol")
+                .unwrap()
+        );
+        assert_eq!(store.thread_route_affinity("th_affinity").unwrap(), None);
+    }
+
     /// Opening a database created before backend_sessions was keyed by
     /// (thread, backend) rebuilds the table and keeps the rows.
     #[test]
@@ -21202,6 +21799,69 @@ mod tests {
             store.backend_session("th_old", "anything").unwrap(),
             Some(("vendor-legacy".into(), 0))
         );
+    }
+
+    #[test]
+    fn thread_route_affinity_migrates_legacy_schema_repeat_safely() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("legacy-affinity.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE workspaces (
+                   id TEXT PRIMARY KEY,
+                   name TEXT NOT NULL,
+                   path TEXT NOT NULL UNIQUE,
+                   closed INTEGER NOT NULL DEFAULT 0,
+                   created_at TEXT NOT NULL
+                 );
+                 CREATE TABLE sessions (
+                   id TEXT PRIMARY KEY,
+                   workspace_id TEXT NOT NULL REFERENCES workspaces(id),
+                   title TEXT NOT NULL,
+                   branch TEXT NOT NULL,
+                   worktree_path TEXT NOT NULL,
+                   base_ref TEXT NOT NULL,
+                   undo_pos INTEGER,
+                   archived INTEGER NOT NULL DEFAULT 0,
+                   created_at TEXT NOT NULL
+                 );
+                 CREATE TABLE threads (
+                   id TEXT PRIMARY KEY,
+                   session_id TEXT NOT NULL REFERENCES sessions(id),
+                   title TEXT,
+                   mode TEXT NOT NULL,
+                   model TEXT NOT NULL,
+                   permission_mode TEXT NOT NULL,
+                   model_options TEXT NOT NULL DEFAULT '{}',
+                   todos TEXT NOT NULL DEFAULT '[]',
+                   last_turn INTEGER NOT NULL DEFAULT 0,
+                   created_at TEXT NOT NULL
+                 );
+                 INSERT INTO workspaces (id, name, path, created_at)
+                 VALUES ('ws_old', 'Legacy', '/tmp/legacy-affinity', '2026-01-01T00:00:00Z');
+                 INSERT INTO sessions
+                   (id, workspace_id, title, branch, worktree_path, base_ref, created_at)
+                 VALUES
+                   ('se_old', 'ws_old', 'Legacy', 'legacy', '/tmp/legacy-affinity-wt', 'main', '2026-01-01T00:00:00Z');
+                 INSERT INTO threads
+                   (id, session_id, mode, model, permission_mode, created_at)
+                 VALUES ('th_old', 'se_old', 'code', 'auto/shared', 'ask', '2026-01-01T00:00:00Z');",
+            )
+            .unwrap();
+        }
+
+        for _ in 0..2 {
+            let store = Store::open(&path).unwrap();
+            store
+                .set_thread_route_affinity("th_old", "auto/shared", "codex", "shared")
+                .unwrap();
+            assert_eq!(
+                store.thread_route_affinity("th_old").unwrap(),
+                Some(("codex".into(), "shared".into()))
+            );
+            drop(store);
+        }
     }
 
     /// Workspace + session + thread rows so FK-checked inserts succeed.

@@ -328,6 +328,10 @@ impl AgentBackend for CursorBackend {
         &self.id
     }
 
+    fn shared_model_identity(&self, model: &str) -> Option<String> {
+        self.catalog.shared_model_identity("cursor", model)
+    }
+
     fn models(&self) -> Vec<ModelInfo> {
         self.catalog
             .provider_models("cursor", &self.id, OptionsDialect::ClaudeCli)

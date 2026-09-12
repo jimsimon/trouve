@@ -1,6 +1,7 @@
 //! Server configuration: data locations and provider credentials.
 
-use std::path::PathBuf;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -32,7 +33,15 @@ pub fn config_path() -> PathBuf {
 pub struct Config {
     #[serde(default)]
     pub providers: std::collections::BTreeMap<String, ProviderConfig>,
-    /// Default model for new threads, e.g. "openai/gpt-4.1-mini".
+    /// Global preference order for provider-neutral model routing. Providers
+    /// omitted from this list remain eligible after the explicitly ordered
+    /// entries. An empty list leaves routing to live health and learned
+    /// route history.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_order: Vec<String>,
+    /// Default model for new threads. `auto/<model>` selects dynamically; a
+    /// provider-qualified value explicitly pins that route. Bare neutral ids
+    /// remain supported for compatibility.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
     /// Global thinking level for new threads. The selected model's options
@@ -48,8 +57,9 @@ pub struct Config {
     /// active. Unset means enabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_enabled: Option<bool>,
-    /// Provider-qualified configured model used to name new sessions and threads.
-    /// Unset inherits `default_model`.
+    /// Model selector used to name new sessions and threads. This may be an
+    /// automatic `auto/<model>` route or a concrete provider pin. Unset
+    /// inherits `default_model`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_naming_model: Option<String>,
     /// Rename a session's compact worktree branch after asynchronous naming.
@@ -182,6 +192,72 @@ fn default_kind() -> String {
     "openai-compat".into()
 }
 
+/// A fully written configuration candidate awaiting its atomic promotion.
+/// Dropping it before `publish` removes the temporary file without changing
+/// the live configuration.
+pub(crate) struct StagedConfigWrite {
+    temporary: tempfile::NamedTempFile,
+    destination: PathBuf,
+}
+
+impl StagedConfigWrite {
+    pub(crate) fn publish(self) -> Result<()> {
+        let Self {
+            temporary,
+            destination,
+        } = self;
+        temporary
+            .persist(&destination)
+            .map(|_| ())
+            .map_err(|error| error.error)
+            .with_context(|| format!("writing {}", destination.display()))
+    }
+}
+
+fn config_write_target(path: &Path) -> Result<PathBuf> {
+    config_write_target_inner(path, 0)
+}
+
+fn config_write_target_inner(path: &Path, symlink_depth: usize) -> Result<PathBuf> {
+    if let Ok(target) = std::fs::canonicalize(path) {
+        return Ok(target);
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            if symlink_depth >= 40 {
+                anyhow::bail!("too many symlinks resolving config path {}", path.display());
+            }
+            let target = std::fs::read_link(path)
+                .with_context(|| format!("reading config symlink {}", path.display()))?;
+            let target = if target.is_absolute() {
+                target
+            } else {
+                path.parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new("."))
+                    .join(target)
+            };
+            return config_write_target_inner(&target, symlink_depth + 1);
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("reading metadata for {}", path.display()));
+        }
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    let parent = std::fs::canonicalize(parent)
+        .with_context(|| format!("resolving config directory {}", parent.display()))?;
+    let file_name = path
+        .file_name()
+        .with_context(|| format!("config path has no file name: {}", path.display()))?;
+    Ok(parent.join(file_name))
+}
+
 impl Config {
     pub fn load() -> Self {
         Self::load_from(&config_path())
@@ -189,7 +265,16 @@ impl Config {
 
     pub fn load_from(path: &std::path::Path) -> Self {
         match std::fs::read_to_string(path) {
-            Ok(text) => toml::from_str(&text).unwrap_or_else(|e| {
+            Ok(text) => toml::from_str(&text).map(|mut config: Self| {
+                // Older hand-edited configs may contain duplicate routing
+                // priorities. Keep the first occurrence so routing and the
+                // settings response consume one canonical order.
+                let mut seen = std::collections::HashSet::new();
+                config
+                    .provider_order
+                    .retain(|provider| seen.insert(provider.clone()));
+                config
+            }).unwrap_or_else(|e| {
                 // A malformed file must not silently become defaults: the
                 // very next persisted setting change would then rewrite
                 // config.toml from that default snapshot, destroying the
@@ -223,7 +308,7 @@ impl Config {
         self.save_to(&config_path())
     }
 
-    pub fn save_to(&self, path: &std::path::Path) -> Result<()> {
+    fn serialized_for(&self, path: &Path) -> Result<String> {
         if self.load_failed {
             anyhow::bail!(
                 "refusing to overwrite {}: it failed to parse at startup (a backup is at \
@@ -231,13 +316,58 @@ impl Config {
                 path.display()
             );
         }
+        toml::to_string_pretty(self).context("serializing config")
+    }
+
+    pub fn save_to(&self, path: &Path) -> Result<()> {
+        let text = self.serialized_for(path)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
-        let text = toml::to_string_pretty(self).context("serializing config")?;
         std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))?;
         Ok(())
+    }
+
+    /// Serialize and flush a same-directory replacement without changing the
+    /// live file. The caller can perform `publish` after releasing unrelated
+    /// persistence locks; a dropped candidate is cleaned up automatically.
+    pub(crate) fn stage_to(&self, path: &Path) -> Result<StagedConfigWrite> {
+        let text = self.serialized_for(path)?;
+        let destination = config_write_target(path)?;
+        let parent = destination
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let mut temporary = tempfile::NamedTempFile::new_in(parent)
+            .with_context(|| format!("creating temporary config in {}", parent.display()))?;
+        let existing_permissions = match std::fs::metadata(&destination) {
+            Ok(metadata) if metadata.is_file() => Some(metadata.permissions()),
+            Ok(_) => None,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("reading metadata for {}", destination.display()));
+            }
+        };
+        temporary
+            .as_file_mut()
+            .write_all(text.as_bytes())
+            .with_context(|| format!("writing staged config for {}", path.display()))?;
+        if let Some(permissions) = existing_permissions {
+            temporary
+                .as_file()
+                .set_permissions(permissions)
+                .with_context(|| format!("preserving permissions for {}", path.display()))?;
+        }
+        temporary
+            .as_file_mut()
+            .sync_all()
+            .with_context(|| format!("flushing staged config for {}", path.display()))?;
+        Ok(StagedConfigWrite {
+            temporary,
+            destination,
+        })
     }
 }
 
@@ -291,5 +421,87 @@ mod tests {
         assert_eq!(cfg.code_review_timeout_seconds, Some(1_200));
         assert_eq!(cfg.code_review_reviewer_timeout_seconds, Some(720));
         assert_eq!(cfg.code_review_coordinator_timeout_seconds, Some(360));
+    }
+
+    #[test]
+    fn provider_order_is_canonicalized_when_loaded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "provider_order = [\"first\", \"second\", \"first\", \"third\", \"second\"]\n",
+        )
+        .unwrap();
+
+        let config = Config::load_from(&path);
+
+        assert_eq!(config.provider_order, ["first", "second", "third"]);
+    }
+
+    #[test]
+    fn staged_config_is_invisible_until_published() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        let original = Config {
+            default_model: Some("provider/old".into()),
+            ..Default::default()
+        };
+        original.save_to(&path).unwrap();
+        let replacement = Config {
+            default_model: Some("provider/new".into()),
+            ..Default::default()
+        };
+
+        let staged = replacement.stage_to(&path).unwrap();
+        assert_eq!(
+            Config::load_from(&path).default_model.as_deref(),
+            Some("provider/old")
+        );
+
+        staged.publish().unwrap();
+        assert_eq!(
+            Config::load_from(&path).default_model.as_deref(),
+            Some("provider/new")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_config_updates_a_symlink_target_without_replacing_the_link() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("managed-config.toml");
+        let link = tmp.path().join("config.toml");
+        Config {
+            default_model: Some("provider/old".into()),
+            ..Default::default()
+        }
+        .save_to(&target)
+        .unwrap();
+        symlink("managed-config.toml", &link).unwrap();
+
+        let staged = Config {
+            default_model: Some("provider/new".into()),
+            ..Default::default()
+        }
+        .stage_to(&link)
+        .unwrap();
+        assert_eq!(
+            Config::load_from(&link).default_model.as_deref(),
+            Some("provider/old")
+        );
+
+        staged.publish().unwrap();
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            Config::load_from(&target).default_model.as_deref(),
+            Some("provider/new")
+        );
     }
 }

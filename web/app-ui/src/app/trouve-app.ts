@@ -119,7 +119,10 @@ import {
 } from "../services/title-generation.js";
 import { createBrowserThreadIngress } from "../services/thread-ingress.js";
 import { SubscriptionHealthController } from "../services/subscription-health-controller.js";
-import { ModelCatalogController } from "../services/model-catalog-controller.js";
+import {
+  ModelCatalogController,
+  modelForSelection,
+} from "../services/model-catalog-controller.js";
 import {
   createBrowserThemeController,
   isThemePreference,

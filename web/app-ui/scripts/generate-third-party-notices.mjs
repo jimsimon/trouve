@@ -61,6 +61,7 @@ if (prohibited.length > 0) {
 packages.sort((left, right) =>
   left.name.localeCompare(right.name) || left.version.localeCompare(right.version),
 );
+const elkjs = packages.find(({ name }) => name === "elkjs");
 
 const lines = [
   "# Third-party notices — Lit frontend",
@@ -76,6 +77,13 @@ const lines = [
   "The Pro distribution is prohibited by the generator unless a future ADR and",
   "license review deliberately change that policy.",
   "",
+  ...(elkjs === undefined
+    ? []
+    : [
+        `The corresponding source for \`elkjs\` ${elkjs.version} is available from`,
+        `https://github.com/kieler/elkjs/tree/${elkjs.version}.`,
+        "",
+      ]),
   "| Package | Version | License | Scope |",
   "| --- | --- | --- | --- |",
   ...packages.map(({ name, version, license, development }) =>

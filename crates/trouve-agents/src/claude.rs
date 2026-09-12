@@ -859,6 +859,10 @@ impl AgentBackend for ClaudeBackend {
         &self.id
     }
 
+    fn shared_model_identity(&self, model: &str) -> Option<String> {
+        self.catalog.shared_model_identity("anthropic", model)
+    }
+
     fn models(&self) -> Vec<ModelInfo> {
         // The same catalog as the per-use Anthropic API provider, so both
         // surface the same metadata. Claude Code accepts full model ids; the
@@ -1523,6 +1527,11 @@ impl ClaudeBackend {
         // through the normal permission path (approval_prompt in Ask mode).
         let mut mcp_servers = serde_json::Map::new();
         for server in &turn.mcp_servers {
+            // Defense in depth for direct BackendTurn callers. The bridge
+            // identity must never refer to a user-controlled process.
+            if server.name.eq_ignore_ascii_case("trouve") {
+                continue;
+            }
             let env: serde_json::Map<String, serde_json::Value> = server
                 .env
                 .iter()

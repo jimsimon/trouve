@@ -6,6 +6,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Provider-neutral model routing**: model pickers expose `auto/<model>`
+  alongside hard-pinned `provider/model` choices. Automatic selections keep a
+  healthy provider sticky across turns and use bounded, preference-ordered
+  failover across compatible hosted API and vendor-agent routes.
+
+### Changed
+
+- **Client/server compatibility**: protocol compatibility advances to 9.6 for
+  the route catalog, provider preference order, sticky route selection, and
+  selected-route events.
+
 ## [4.11.0] - 2026-09-11
 
 This release adds native web search and inline Mermaid diagrams, makes long

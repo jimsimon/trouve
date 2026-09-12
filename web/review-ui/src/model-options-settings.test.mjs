@@ -9,11 +9,20 @@ const api = readFileSync(new URL("./api.ts", import.meta.url), "utf8");
 test("repositories, overrides, and jobs model per-role model options", () => {
   for (const role of ["coordinator", "router", "analyst"]) {
     assert.match(types, new RegExp(`${role}_model_options\\?: ModelOptions;`, "u"));
-    // Maps are always sent so an empty map clears stale options server-side.
+    // Untouched maps are omitted, while an intentional clear serializes {}.
     assert.match(
       api,
-      new RegExp(`${role}_model_options: repository\\.${role}_model_options \\?\\? \\{\\},`, "u"),
+      new RegExp(
+        `changedModelOptions\\.${role}[\\s\\S]*${role}_model_options: repository\\.${role}_model_options \\?\\? \\{\\}`,
+        "u",
+      ),
     );
+  }
+  assert.match(api, /changedModelOptions: RepositoryModelOptionChanges = \{\}/u);
+  assert.match(source, /await saveRepository\(next, modelOptionChanges\)/u);
+  assert.match(source, /markModelOptionsChanged\("coordinator", "router", "analyst"\)/u);
+  for (const role of ["coordinator", "router", "analyst"]) {
+    assert.match(source, new RegExp(`markModelOptionsChanged\\("${role}"\\)`, "u"));
   }
   assert.match(types, /model_options\?: ModelOptions;\n  prompt_mode:/u);
 });
@@ -35,6 +44,14 @@ test("the settings form renders schema-driven option controls per role", () => {
     );
   }
   assert.match(source, /model_options: compatibleOptions\(\s*override\??\.model_options,/u);
+  // The analyst path must resolve automatic aliases and preserve pinned routes
+  // just like the pre-existing coordinator and router paths.
+  assert.match(
+    source,
+    /const effectiveAnalystModel = modelForSelection\(models, draft\.analyst_model \|\| draft\.model\)/u,
+  );
+  assert.match(source, /value=\{modelSelectionValue\(models, draft\.analyst_model\)\}/u);
+  assert.match(source, /<ModelOptions models=\{models\} selection=\{draft\.analyst_model\} \/>/u);
   // Overrides with only model options are retained.
   assert.match(source, /Object\.keys\(updated\.model_options \?\? \{\}\)\.length > 0/u);
 });

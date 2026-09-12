@@ -256,6 +256,7 @@ const latestNumericMapKey = (map: ReadonlyMap<number, unknown>): number | undefi
 /** Events whose `#applyEnvelope` branch never reads or writes `items`. Every
  * other event may mutate an item in place and must bump `itemsRevision`. */
 const TRANSCRIPT_NEUTRAL_EVENTS: ReadonlySet<ProtocolEventEnvelope["type"]> = new Set([
+  "model.route_selected",
   "turn.phase_changed",
   "thread.commands_updated",
   "thread.queue_updated",
@@ -607,6 +608,24 @@ export class ThreadViewModel {
     this.todos = todos.map((todo) => ({ ...todo }));
   }
 
+  /** Concrete route for the turn whose counters feed `lastUsage`. A newer
+   * running turn does not take ownership until it reports usage. */
+  usageModel(): string | undefined {
+    let usageTurn: number | undefined;
+    for (const item of this.items) {
+      if (
+        item.kind !== "turn-status"
+        || (
+          item.state.kind !== "completed"
+          && !(item.state.kind === "running" && item.state.usage !== undefined)
+        )
+        || (usageTurn !== undefined && item.turn <= usageTurn)
+      ) continue;
+      usageTurn = item.turn;
+    }
+    return usageTurn === undefined ? undefined : this.turnModels.get(usageTurn);
+  }
+
   apply(envelope: ProtocolEventEnvelope): boolean {
     // Events mutate items in place through many branches; treat every
     // envelope as a potential transcript change except the few that only
@@ -661,6 +680,12 @@ export class ThreadViewModel {
         });
         return true;
       }
+      case "model.route_selected":
+        this.turnModels.set(
+          envelope.turn,
+          `${envelope.provider_id}/${envelope.provider_model}`,
+        );
+        return true;
       case "turn.phase_changed":
         this.turnPhase = envelope.phase;
         return true;

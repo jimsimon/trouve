@@ -609,8 +609,8 @@ export const changeModelOption = <T>(
   );
 };
 
-/** Model selectors use the provider-qualified protocol id as their visible
- * label so identically named models from different providers stay distinct. */
+/** Model selectors expose the exact protocol id so automatic choices and
+ * identically named concrete provider pins remain distinct. */
 export const modelSelectorLabel = (
   model: Pick<ProtocolModelInfo, "id">,
 ): string => model.id;

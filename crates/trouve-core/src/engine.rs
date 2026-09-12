@@ -4,6 +4,8 @@
 //! reported exclusively through the event log. Worktree mutations are
 //! serialized per session (threads share the session worktree, ADR 0003).
 
+mod routing;
+
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
@@ -11,8 +13,22 @@ use std::hash::{Hash, Hasher};
 /// activity instead of prompting the model. The durable display boundary is
 /// the dedicated `turn.background_activity` event, not a user message.
 pub const BACKGROUND_ATTACH_PROMPT: &str = "[background agent activity]";
+
+fn background_attach_prompt(backend_id: &str) -> String {
+    format!("{BACKGROUND_ATTACH_PROMPT}\nbackend={backend_id}")
+}
+
+fn background_attach_backend_id(content: &str) -> Option<&str> {
+    let backend_id = content
+        .strip_prefix(BACKGROUND_ATTACH_PROMPT)?
+        .strip_prefix("\nbackend=")?;
+    (!backend_id.is_empty()
+        && backend_id == backend_id.trim()
+        && !backend_id.chars().any(char::is_whitespace))
+    .then_some(backend_id)
+}
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, TryLockError, Weak};
 use std::time::{Duration, Instant};
 
@@ -31,7 +47,7 @@ use trouve_protocol::{
 };
 use trouve_providers::{InferencePriority, Message, Provider, ProviderEvent, ToolSpec};
 
-use crate::config::{Config, ProviderConfig};
+use crate::config::{Config, ProviderConfig, StagedConfigWrite};
 use crate::permissions::{
     ApprovalHub, ApprovalResolution, Gate, QuestionHub, QuestionResolution, allow_key, gate_tool,
 };
@@ -42,8 +58,8 @@ use crate::store::{
 use crate::tools::{
     AttachmentMaterialization, AttachmentMaterializationFile, DeletedSessionCleanup,
     LocalToolExecutor, MaterializedAttachment, McpConfigMutation, McpConfigMutationOutcome,
-    McpConfigMutationRequest, SessionBranchRename, SessionRepositoryDiff, SessionRepositoryPush,
-    ToolCtx, ToolExecutor, ToolResult, edit_strategy_for_model,
+    McpConfigMutationRequest, SessionBranchRename, SessionMutationPermit, SessionRepositoryDiff,
+    SessionRepositoryPush, ToolCtx, ToolExecutor, ToolResult, edit_strategy_for_model,
 };
 use crate::{context, git, new_id, personas};
 
@@ -66,17 +82,24 @@ const MAX_ITERATIONS: usize = 32;
 /// run to fold awaited subagent results back in. Native turns are bounded by
 /// `MAX_ITERATIONS` instead, since each fold-in consumes an iteration.
 const MAX_SUBAGENT_CONTINUATIONS: usize = 4;
+/// A wedged child must not hold its parent's terminal response open forever.
+/// Timed-out descendants remain active and inspectable; only the parent's
+/// synthetic wait ends.
+const SUBAGENT_WAIT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// Per-child cap on the final message copied into the `await_subagents`
 /// digest and tool result; the full text stays on the child thread.
 const SUBAGENT_DIGEST_MESSAGE_BYTES: usize = 8 * 1024;
-/// Whole-digest cap on child text (final messages and quoted failure
-/// reasons) across every awaited child.
+/// Whole prompt-digest cap, including child metadata, final messages, and
+/// quoted failure reasons across every awaited child.
 /// Once spent, later children are reported by status only, so a wide
 /// fan-out cannot turn the fold-in prompt into a context overflow.
 const SUBAGENT_DIGEST_TOTAL_BYTES: usize = 48 * 1024;
-/// Per-child cap on a failure reason quoted in the digest; the tool result
-/// keeps the whole error.
+/// Per-child cap on a failure reason copied into the digest and tool result.
 const SUBAGENT_DIGEST_ERROR_BYTES: usize = 1024;
+/// Reserve enough fixed space per result for a capped title, thread id,
+/// status, and omission/truncation guidance before dividing the text budget.
+const SUBAGENT_DIGEST_SECTION_OVERHEAD_BYTES: usize = 512;
+const SUBAGENT_DIGEST_TITLE_BYTES: usize = 128;
 /// Bound native provider fan-out so a malformed or over-eager response cannot
 /// monopolize the runtime. Results are still written to the provider
 /// transcript in request order.
@@ -833,7 +856,7 @@ struct BackendCollaboratorProjection {
     suppressed_bridge_calls: HashSet<String>,
     /// Vendor-native mutations retain the session execution lane from
     /// approval until the matching completion event.
-    mutation_permits: HashMap<String, tokio::sync::OwnedRwLockWriteGuard<()>>,
+    mutation_permits: HashMap<String, SessionMutationPermit>,
     pending_approval: Option<PendingCollaboratorApproval>,
     approval_cancels: HashMap<String, tokio_util::sync::CancellationToken>,
     persisted: Vec<Event>,
@@ -1188,7 +1211,7 @@ struct BackendApprovalOutcome {
     /// Held from approval until the vendor reports tool completion. This is
     /// the fallback confinement mechanism for vendor protocols that cannot
     /// replace their mutation tools with trouve's full MCP bridge.
-    mutation_permit: Option<tokio::sync::OwnedRwLockWriteGuard<()>>,
+    mutation_permit: Option<SessionMutationPermit>,
 }
 
 struct PendingApprovalCleanup {
@@ -1392,6 +1415,10 @@ struct ProviderTurnCapacity {
 struct ProviderBackoff {
     until: Option<tokio::time::Instant>,
     delay: std::time::Duration,
+    /// Last admitted attempt whose outcome was applied. Provider turns can
+    /// finish out of admission order, so stale completions must not undo a
+    /// newer route's cooldown.
+    last_outcome_order: Option<i64>,
 }
 
 /// Provider throttle state shared by interactive desktop turns, spawned
@@ -1404,10 +1431,16 @@ struct TurnScheduler {
     planned_setups: Arc<tokio::sync::Semaphore>,
     backend_startups: Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
     providers: Mutex<HashMap<String, ProviderTurnCapacity>>,
+    /// Hybrid logical clock used to reject out-of-order route outcomes.
+    attempt_order: AtomicI64,
 }
 
 struct TurnAdmission {
+    /// Provider turns are deliberately uncapped. Keep each admission scoped
+    /// to one route attempt so its outcome order and any future capacity lease
+    /// have the correct handoff lifetime.
     provider_wait_ms: u64,
+    attempt_order: i64,
 }
 
 impl TurnScheduler {
@@ -1424,7 +1457,41 @@ impl TurnScheduler {
             planned_setups: Arc::new(tokio::sync::Semaphore::new(PLANNED_TURN_SETUP_CONCURRENCY)),
             backend_startups: Mutex::new(HashMap::new()),
             providers: Mutex::new(HashMap::new()),
+            attempt_order: AtomicI64::new(chrono::Utc::now().timestamp_micros()),
         }
+    }
+
+    fn next_attempt_order(&self) -> i64 {
+        let wall_order = chrono::Utc::now().timestamp_micros();
+        let mut observed = self.attempt_order.load(Ordering::Acquire);
+        loop {
+            let next = observed
+                .checked_add(1)
+                .expect("provider attempt order exhausted")
+                .max(wall_order);
+            match self.attempt_order.compare_exchange_weak(
+                observed,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return next,
+                Err(actual) => observed = actual,
+            }
+        }
+    }
+
+    fn cooldown_remaining(&self, model: &str) -> Option<Duration> {
+        self.provider(model)
+            .backoff
+            .lock()
+            .unwrap()
+            .until
+            .and_then(|until| until.checked_duration_since(tokio::time::Instant::now()))
+    }
+
+    fn reset_provider_outcomes(&self, provider_id: &str) {
+        self.providers.lock().unwrap().remove(provider_id);
     }
 
     async fn acquire_planned_setup(
@@ -1512,12 +1579,23 @@ impl TurnScheduler {
         }
         Ok(TurnAdmission {
             provider_wait_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+            // Allocate only after cooldown admission. Every concrete and
+            // automatic completion carries this order so an older turn can
+            // never overwrite a newer route outcome.
+            attempt_order: self.next_attempt_order(),
         })
     }
 
-    fn record_outcome(&self, model: &str, error: Option<&str>) {
+    fn record_ordered_outcome(&self, model: &str, error: Option<&str>, attempt_order: i64) {
         let provider = self.provider(model);
         let mut backoff = provider.backoff.lock().unwrap();
+        if backoff
+            .last_outcome_order
+            .is_some_and(|latest| latest >= attempt_order)
+        {
+            return;
+        }
+        backoff.last_outcome_order = Some(attempt_order);
         let throttled = error.is_some_and(|error| {
             let error = error.to_ascii_lowercase();
             [
@@ -1679,6 +1757,28 @@ fn validate_persona_id(id: &str) -> Result<(), EngineError> {
         return Err(EngineError::BadRequest(
             "persona id must be non-empty and [a-zA-Z0-9_-] only".into(),
         ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_model_selection(model: &str) -> Result<(), EngineError> {
+    if model.trim().is_empty() {
+        return Err(EngineError::BadRequest("model must not be empty".into()));
+    }
+    if model.trim() != model {
+        return Err(EngineError::BadRequest(
+            "model must not have surrounding whitespace".into(),
+        ));
+    }
+    let valid = if model.starts_with("auto/") || !model.contains('/') {
+        routing::automatic_model_name(model).is_some()
+    } else {
+        routing::valid_concrete_selection(model).is_some() && !model.split('/').any(str::is_empty)
+    };
+    if !valid {
+        return Err(EngineError::BadRequest(format!(
+            "model must be auto/<model> or provider/<model>: {model}"
+        )));
     }
     Ok(())
 }
@@ -2926,6 +3026,24 @@ struct ProviderReloadGuard {
     _exclusive: Option<tokio::sync::OwnedRwLockWriteGuard<()>>,
 }
 
+enum ConcreteExecutor {
+    Native(Arc<dyn Provider>),
+    Backend(Arc<dyn AgentBackend>),
+}
+
+struct ConcreteExecutorSnapshot {
+    provider_id: String,
+    provider_generation: u64,
+    model_name: String,
+    executor: ConcreteExecutor,
+}
+
+struct ConcreteAttemptSnapshot {
+    provider_id: String,
+    provider_generation: u64,
+    attempt_order: i64,
+}
+
 impl ProviderReloadGuard {
     fn shared(guard: tokio::sync::OwnedRwLockReadGuard<()>) -> Self {
         Self {
@@ -2954,6 +3072,8 @@ struct BackendRetirement {
     engine: Weak<Engine>,
     target_ids: HashSet<String>,
     rollback_on_drop: bool,
+    route_state_prepared: bool,
+    preserve_route_state: bool,
     secret_transaction: Option<ProviderSecretTransaction>,
     reload: Option<ProviderReloadGuard>,
     _target_transitions: Vec<tokio::sync::OwnedMutexGuard<()>>,
@@ -2971,10 +3091,61 @@ impl BackendRetirement {
             engine: Arc::downgrade(engine),
             target_ids,
             rollback_on_drop: false,
+            route_state_prepared: false,
+            preserve_route_state: false,
             secret_transaction,
             reload: Some(reload),
             _target_transitions: target_transitions,
         }
+    }
+
+    /// Invalidate cooldowns learned under the previous provider definition
+    /// before the replacement configuration becomes durable. The candidate's
+    /// slow write and flush have already completed; only its atomic promotion
+    /// occurs while route outcomes are fenced, outside any SQLite transaction.
+    /// A failed promotion restores the exact previous cooldown snapshot.
+    fn prepare_route_state(&mut self, staged_config: Option<StagedConfigWrite>) -> Result<()> {
+        let engine = self
+            .engine
+            .upgrade()
+            .context("engine dropped while preparing provider route state")?;
+        let mut target_ids = self.target_ids.iter().cloned().collect::<Vec<_>>();
+        target_ids.sort_unstable();
+        let mut generations = engine.provider_generations.lock().unwrap();
+        let next_generations = target_ids
+            .iter()
+            .map(|id| {
+                generations
+                    .get(id)
+                    .copied()
+                    .unwrap_or(0)
+                    .checked_add(1)
+                    .with_context(|| format!("provider generation exhausted for {id}"))
+                    .map(|generation| (id, generation))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let previous_health = engine.store.take_route_health(&target_ids)?;
+        self.preserve_route_state = false;
+        if let Some(staged_config) = staged_config
+            && let Err(publish_error) = staged_config.publish()
+        {
+            return match engine.store.restore_route_health(&previous_health) {
+                Ok(()) => {
+                    self.preserve_route_state = true;
+                    Err(publish_error)
+                }
+                Err(restore_error) => Err(anyhow!(
+                    "publishing provider configuration failed: {publish_error:#}; \
+                     restoring previous route health also failed: {restore_error:#}"
+                )),
+            };
+        }
+        for (id, generation) in next_generations {
+            generations.insert(id.clone(), generation);
+            engine.turn_scheduler.reset_provider_outcomes(id);
+        }
+        self.route_state_prepared = true;
+        Ok(())
     }
 
     /// Publish replacements from the caller's now-current configuration and
@@ -2990,7 +3161,11 @@ impl BackendRetirement {
             }
             retirement.rollback_on_drop = false;
             if let Some(engine) = retirement.engine.upgrade() {
-                engine.replace_provider_registries_for_ids(&retirement.target_ids);
+                if retirement.route_state_prepared {
+                    engine.rebuild_provider_registries_for_ids(&retirement.target_ids);
+                } else {
+                    engine.replace_provider_registries_for_ids(&retirement.target_ids);
+                }
             }
         })
         .await
@@ -3008,12 +3183,17 @@ impl BackendRetirement {
         self.rollback_on_drop = true;
     }
 
+    fn preserve_route_state_on_rollback(&mut self) {
+        self.preserve_route_state = true;
+    }
+
     /// Restore tentative credentials before an old durable definition can be
     /// republished. Secret-store implementations may block on a keychain or
     /// filesystem, so the detached retirement task performs that I/O on the
     /// blocking pool while this owner retains the provider transition fence.
     async fn rollback(mut self) -> Result<()> {
         let rebuild = self.rollback_on_drop;
+        let preserve_route_state = self.preserve_route_state;
         if let Some(mut transaction) = self.secret_transaction.take() {
             let rollback = tokio::task::spawn_blocking(move || {
                 let result = transaction.try_rollback();
@@ -3038,7 +3218,7 @@ impl BackendRetirement {
         }
         self.rollback_on_drop = false;
         if rebuild && let Some(engine) = self.engine.upgrade() {
-            engine.replace_provider_registries_for_ids(&self.target_ids);
+            engine.restore_provider_registries_for_ids(&self.target_ids, preserve_route_state);
         }
         Ok(())
     }
@@ -3062,6 +3242,7 @@ impl BackendRetirement {
             engine: self.engine.clone(),
             target_ids: self.target_ids.clone(),
             rebuild,
+            preserve_route_state: self.preserve_route_state,
             transaction,
             _target_transitions: std::mem::take(&mut self._target_transitions),
         };
@@ -3074,6 +3255,7 @@ impl BackendRetirement {
 impl Drop for BackendRetirement {
     fn drop(&mut self) {
         let rebuild = self.rollback_on_drop;
+        let preserve_route_state = self.preserve_route_state;
         if self.secret_transaction.is_some() {
             if !self.schedule_secret_rollback_retry(rebuild) {
                 // BackendRetirement is created and dropped from async engine
@@ -3089,7 +3271,7 @@ impl Drop for BackendRetirement {
         }
         self.rollback_on_drop = false;
         if rebuild && let Some(engine) = self.engine.upgrade() {
-            engine.replace_provider_registries_for_ids(&self.target_ids);
+            engine.restore_provider_registries_for_ids(&self.target_ids, preserve_route_state);
         }
     }
 }
@@ -3098,6 +3280,7 @@ struct ProviderSecretRollbackReconciliation {
     engine: Weak<Engine>,
     target_ids: HashSet<String>,
     rebuild: bool,
+    preserve_route_state: bool,
     transaction: ProviderSecretTransaction,
     _target_transitions: Vec<tokio::sync::OwnedMutexGuard<()>>,
 }
@@ -3108,6 +3291,7 @@ impl ProviderSecretRollbackReconciliation {
             engine,
             target_ids,
             rebuild,
+            preserve_route_state,
             mut transaction,
             _target_transitions,
         } = self;
@@ -3138,7 +3322,8 @@ impl ProviderSecretRollbackReconciliation {
             match result {
                 Ok(()) => {
                     if rebuild && let Some(engine) = engine.upgrade() {
-                        engine.replace_provider_registries_for_ids(&target_ids);
+                        engine
+                            .restore_provider_registries_for_ids(&target_ids, preserve_route_state);
                     }
                     return;
                 }
@@ -3360,6 +3545,7 @@ async fn supervise_provider_secret_write(
             engine,
             target_ids,
             rebuild: false,
+            preserve_route_state: false,
             transaction,
             _target_transitions: target_transitions,
         }
@@ -3564,6 +3750,9 @@ pub struct Engine {
     /// Read-only tools may overlap; every potential mutation is exclusive.
     /// Weak entries keep completed/deleted sessions from growing this map.
     tool_execution_locks: Mutex<HashMap<String, Weak<tokio::sync::RwLock<()>>>>,
+    /// A separate fair gate lets failed vendor turns fence new mutations
+    /// before cancellation cleanup begins.
+    tool_mutation_admission_locks: Mutex<HashMap<String, Weak<tokio::sync::RwLock<()>>>>,
     /// Serializes durable PR-intent reconciliation per session. Weak entries
     /// avoid retaining deleted sessions while still preventing duplicate
     /// GitHub reads and association events from overlapping retry triggers.
@@ -3636,6 +3825,9 @@ pub struct Engine {
     /// and managed-runtime removal. Targeted transitions take shared admission;
     /// runtime-wide operations take exclusive admission.
     provider_reload: Arc<tokio::sync::RwLock<()>>,
+    /// Process-local incarnation of each configured execution route. Outcomes
+    /// from a replaced provider are discarded after its generation advances.
+    provider_generations: Mutex<HashMap<String, u64>>,
     /// Serializes persona-file mutations with durable deletion replay so a
     /// recreate cannot race a pending cleanup of the same user-level file.
     pub(crate) persona_mutations: Arc<tokio::sync::Mutex<()>>,
@@ -3910,20 +4102,7 @@ fn provider_auth_kind(pc: &ProviderConfig) -> String {
 /// `localhost.attacker.example` and mislabel them as offline-capable
 /// keyless endpoints.
 fn is_loopback_base_url(url: &str) -> bool {
-    let Ok(parsed) = reqwest::Url::parse(url) else {
-        return false;
-    };
-    let Some(host) = parsed.host_str() else {
-        return false;
-    };
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
-    // IPv6 hosts come back bracketed; IpAddr parsing wants them bare.
-    host.trim_start_matches('[')
-        .trim_end_matches(']')
-        .parse::<std::net::IpAddr>()
-        .is_ok_and(|ip| ip.is_loopback())
+    trouve_providers::catalog::endpoint_is_loopback(url)
 }
 
 /// Build the provider registry from config + zero-config env defaults.
@@ -4055,6 +4234,46 @@ fn build_backends_for_ids(
     backends
 }
 
+struct ProviderOrderProjection {
+    known: HashSet<String>,
+    resolved: Vec<String>,
+}
+
+fn resolve_provider_order(explicit: &[String], known: &HashSet<String>) -> Vec<String> {
+    let mut resolved = explicit
+        .iter()
+        .filter(|id| known.contains(id.as_str()))
+        .fold(Vec::new(), |mut order, id| {
+            if !order.contains(id) {
+                order.push(id.clone());
+            }
+            order
+        });
+    let mut remaining = known.iter().cloned().collect::<Vec<_>>();
+    remaining.sort();
+    for id in remaining {
+        if !resolved.contains(&id) {
+            resolved.push(id);
+        }
+    }
+    resolved
+}
+
+/// Build the membership and resolved order used by both the provider listing
+/// and its compare-and-swap update. Keeping this projection shared prevents a
+/// programmatically injected route from being visible to only one side.
+fn provider_order_projection(
+    config: &Config,
+    provider_ids: impl IntoIterator<Item = String>,
+    backend_ids: impl IntoIterator<Item = String>,
+) -> ProviderOrderProjection {
+    let mut known: HashSet<String> = config.providers.keys().cloned().collect();
+    known.extend(provider_ids);
+    known.extend(backend_ids);
+    let resolved = resolve_provider_order(&config.provider_order, &known);
+    ProviderOrderProjection { known, resolved }
+}
+
 impl Engine {
     pub(crate) async fn acquire_planned_turn_setup(
         &self,
@@ -4122,6 +4341,7 @@ impl Engine {
             automation_mutation_states: Mutex::new(HashMap::new()),
             automation_model_options_validations: Mutex::new(HashMap::new()),
             tool_execution_locks: Mutex::new(HashMap::new()),
+            tool_mutation_admission_locks: Mutex::new(HashMap::new()),
             session_pr_verification_locks: Mutex::new(HashMap::new()),
             session_pr_verification_wake: Arc::new(tokio::sync::Notify::new()),
             session_pr_verification_worker_started: AtomicBool::new(false),
@@ -4142,6 +4362,7 @@ impl Engine {
             provider_locks: Mutex::new(HashMap::new()),
             provider_transition_locks: Mutex::new(HashMap::new()),
             provider_reload: Arc::new(tokio::sync::RwLock::new(())),
+            provider_generations: Mutex::new(HashMap::new()),
             persona_mutations: Arc::new(tokio::sync::Mutex::new(())),
             config: Mutex::new(config.clone()),
             // No write-back by default: only a caller that loaded `config`
@@ -4601,13 +4822,21 @@ impl Engine {
         // that treats it as a literal prompt — so confirm the thread still
         // resolves to the signaling backend.
         let thread = self.get_thread(thread_id)?;
-        match self.backend_for(&thread.model) {
-            Some((backend_id, _, _)) if backend_id == signaling_backend_id => {}
-            resolved => {
+        let resolved_backend = if routing::automatic_model_name(&thread.model).is_some() {
+            self.store
+                .thread_route_affinity(&thread.id)?
+                .map(|(provider_id, _)| provider_id)
+        } else {
+            self.backend_for(&thread.model)
+                .map(|(backend_id, _, _)| backend_id)
+        };
+        match resolved_backend {
+            Some(backend_id) if backend_id == signaling_backend_id => {}
+            resolved_backend => {
                 tracing::debug!(
                     %thread_id,
                     signaling_backend = %signaling_backend_id,
-                    resolved_backend = resolved.map(|(id, _, _)| id).unwrap_or_default(),
+                    resolved_backend = resolved_backend.unwrap_or_default(),
                     "skipping background attach: thread no longer resolves to the signaling backend"
                 );
                 return Ok(());
@@ -4615,7 +4844,7 @@ impl Engine {
         }
         self.send_message_inner(
             thread_id,
-            BACKGROUND_ATTACH_PROMPT.to_string(),
+            background_attach_prompt(signaling_backend_id),
             Vec::new(),
             true,
             true,
@@ -4726,6 +4955,12 @@ impl Engine {
     /// Register (or replace) a provider instance under an id. Survives
     /// config-driven registry reloads.
     pub fn with_provider(self, id: &str, provider: Arc<dyn Provider>) -> Self {
+        if let Err(error) = self.invalidate_provider_route_state(id) {
+            tracing::warn!(
+                provider = id,
+                "could not reset injected provider route state: {error:#}"
+            );
+        }
         self.injected_providers
             .lock()
             .unwrap()
@@ -4740,6 +4975,12 @@ impl Engine {
     /// Register (or replace) an agent backend instance under an id. Survives
     /// config-driven registry reloads (tests, embedders).
     pub fn with_backend(self, id: &str, backend: Arc<dyn AgentBackend>) -> Self {
+        if let Err(error) = self.invalidate_provider_route_state(id) {
+            tracing::warn!(
+                provider = id,
+                "could not reset injected backend route state: {error:#}"
+            );
+        }
         self.injected_backends
             .lock()
             .unwrap()
@@ -4799,89 +5040,14 @@ impl Engine {
     /// on. Live account and vendor-CLI availability is resolved separately by
     /// refresh_models so first paint never waits for network or CLI startup.
     pub async fn list_models(&self) -> Vec<trouve_protocol::ModelInfo> {
-        let online = self.is_online();
-        let offline_capable = if online {
-            std::collections::HashSet::new()
-        } else {
-            self.offline_capable_provider_ids()
-        };
-        let providers: Vec<_> = self
-            .providers
-            .read()
-            .unwrap()
-            .iter()
-            .filter(|(id, _)| online || offline_capable.contains(id.as_str()))
-            .map(|(_, p)| p.clone())
-            .collect();
-        let mut models: Vec<_> = providers
-            .iter()
-            .flat_map(|provider| provider.models())
-            .collect();
-        let ready: Vec<_> = if online {
-            self.backends
-                .read()
-                .unwrap()
-                .values()
-                .filter(|b| {
-                    let status = b.status();
-                    status.installed && status.has_credentials
-                })
-                .cloned()
-                .collect()
-        } else {
-            Vec::new() // vendor backends all need their cloud
-        };
-        models.extend(ready.iter().flat_map(|backend| backend.models()));
-        models.sort_by(|a, b| a.id.cmp(&b.id));
-        models
+        routing::compatibility_model_catalog(self.available_model_candidates())
     }
 
     /// Resolve live account-visible and vendor-CLI model availability. Clients
     /// call this after painting list_models, then replace the static snapshot
     /// when this richer result arrives.
     pub async fn refresh_models(&self) -> Vec<trouve_protocol::ModelInfo> {
-        let online = self.is_online();
-        if online
-            && self.connectivity_probe.is_some()
-            && let Err(error) = self.model_catalog.refresh_if_stale().await
-        {
-            tracing::debug!("models.dev refresh failed; using cached snapshot: {error:#}");
-        }
-        let offline_capable = if online {
-            std::collections::HashSet::new()
-        } else {
-            self.offline_capable_provider_ids()
-        };
-        let providers: Vec<_> = self
-            .providers
-            .read()
-            .unwrap()
-            .iter()
-            .filter(|(id, _)| online || offline_capable.contains(id.as_str()))
-            .map(|(_, provider)| provider.clone())
-            .collect();
-        let provider_lists =
-            futures::future::join_all(providers.iter().map(|provider| provider.list_models()))
-                .await;
-        let mut models: Vec<_> = provider_lists.into_iter().flatten().collect();
-        let ready: Vec<_> = if online {
-            self.backends
-                .read()
-                .unwrap()
-                .values()
-                .filter(|backend| {
-                    let status = backend.status();
-                    status.installed && status.has_credentials
-                })
-                .cloned()
-                .collect()
-        } else {
-            Vec::new()
-        };
-        let listings = futures::future::join_all(ready.iter().map(|b| b.list_models())).await;
-        models.extend(listings.into_iter().flatten());
-        models.sort_by(|a, b| a.id.cmp(&b.id));
-        models
+        routing::compatibility_model_catalog(self.refresh_model_candidates().await)
     }
 
     /// Provider ids that keep working without internet: the built-in local
@@ -4956,10 +5122,34 @@ impl Engine {
                 });
             }
         }
+        let provider_ids = registry.keys().cloned().collect::<Vec<_>>();
+        drop(registry);
+        // Programmatically injected backends are routable even without a
+        // config-file row. Expose them to the same preference editor.
+        let backends = self.backends.read().unwrap();
+        for (id, backend) in backends.iter() {
+            if !config.providers.contains_key(id) && !infos.iter().any(|info| info.id == *id) {
+                let status = backend.status();
+                infos.push(ProviderInfo {
+                    id: id.clone(),
+                    kind: "agent-backend".into(),
+                    base_url: None,
+                    settings: Default::default(),
+                    has_credentials: status.installed && status.has_credentials,
+                    auth: "cli".into(),
+                    category: "subscription".into(),
+                    experimental: false,
+                });
+            }
+        }
+        let backend_ids = backends.keys().cloned().collect::<Vec<_>>();
+        drop(backends);
         infos.sort_by(|a, b| a.id.cmp(&b.id));
+        let provider_order = provider_order_projection(&config, provider_ids, backend_ids).resolved;
         let defaults = self.global_defaults.read().unwrap().clone();
         ProvidersResponse {
             providers: infos,
+            provider_order,
             default_model: defaults.model,
             default_thinking_level: defaults.thinking_level,
             default_permission_mode: defaults.permission_mode,
@@ -5054,6 +5244,11 @@ impl Engine {
                 "provider id must be non-empty ascii alphanumeric/dashes".into(),
             ));
         }
+        if id == "auto" {
+            return Err(EngineError::BadRequest(
+                "provider id auto is reserved for automatic model routing".into(),
+            ));
+        }
         let provider_lock = self.provider_lock(id);
         let _provider_guard = provider_lock.lock().await;
         let target_ids = HashSet::from([id.to_string()]);
@@ -5113,6 +5308,7 @@ impl Engine {
                         engine: Arc::downgrade(self),
                         target_ids,
                         rebuild: false,
+                        preserve_route_state: false,
                         transaction,
                         _target_transitions: target_transitions,
                     };
@@ -5132,7 +5328,7 @@ impl Engine {
         // The retirement owns cleanup and registry rollback independently of
         // this request future, so cancellation cannot expose a closing backend
         // or lose the previous process tree.
-        let retirement = self
+        let mut retirement = self
             .retire_config_backends_matching_ids_locked(
                 &target_ids,
                 BACKEND_RETIREMENT_TIMEOUT,
@@ -5141,9 +5337,11 @@ impl Engine {
                 Some(secret_transaction),
             )
             .await?;
+        retirement.preserve_route_state_on_rollback();
         {
             let mut config = self.config.lock().unwrap();
-            let entry = config.providers.entry(id.to_string()).or_default();
+            let mut next = config.clone();
+            let entry = next.providers.entry(id.to_string()).or_default();
             let runtime_kind_changed = entry.kind != req.kind;
             entry.kind = req.kind.clone();
             if runtime_kind_changed {
@@ -5191,7 +5389,17 @@ impl Engine {
                     entry.query_params = req.query_params.clone();
                 }
             }
-            self.persist_config(&config);
+            let staged_config = self
+                .config_file
+                .as_ref()
+                .map(|path| {
+                    next.stage_to(path).with_context(|| {
+                        format!("persisting provider configuration to {}", path.display())
+                    })
+                })
+                .transpose()?;
+            retirement.prepare_route_state(staged_config)?;
+            *config = next;
         }
         // Keep the registry transition serialized until the new durable
         // definition and its credentials are committed.
@@ -5237,10 +5445,18 @@ impl Engine {
         let mut retirement = self
             .retire_config_backends_matching_ids(&target_ids)
             .await?;
+        retirement.preserve_route_state_on_rollback();
         {
             let mut config = self.config.lock().unwrap();
-            config.providers.remove(id);
-            self.persist_config(&config);
+            let mut next = config.clone();
+            next.providers.remove(id);
+            next.provider_order.retain(|provider_id| provider_id != id);
+            if let Some(path) = &self.config_file {
+                next.save_to(path).with_context(|| {
+                    format!("persisting provider configuration to {}", path.display())
+                })?;
+            }
+            *config = next;
         };
         // API-backed providers have no backend instance for retirement to
         // detach. Remove the config-owned request path as soon as the durable
@@ -5287,6 +5503,72 @@ impl Engine {
                 "provider deletion supervisor failed before acknowledgement: {error}"
             ))
         })??;
+        Ok(())
+    }
+
+    /// Replace the explicit provider preference prefix. Omitted configured
+    /// providers remain eligible after the listed entries.
+    pub fn set_provider_order(
+        &self,
+        provider_ids: &[String],
+        expected_provider_ids: Option<&[String]>,
+    ) -> Result<(), EngineError> {
+        let mut config = self.config.lock().unwrap();
+        let native_provider_ids = self
+            .providers
+            .read()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        let backend_ids = self
+            .backends
+            .read()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        let projection = provider_order_projection(&config, native_provider_ids, backend_ids);
+        let known = projection.known;
+        let current = projection.resolved;
+        if expected_provider_ids.is_some_and(|expected| expected != current) {
+            return Err(EngineError::Conflict(
+                "provider order changed while this edit was in progress; reload and try again"
+                    .into(),
+            ));
+        }
+        let mut seen = HashSet::new();
+        for id in provider_ids {
+            if !known.contains(id) {
+                return Err(EngineError::BadRequest(format!(
+                    "provider order contains unknown provider {id}"
+                )));
+            }
+            if !seen.insert(id) {
+                return Err(EngineError::BadRequest(format!(
+                    "provider order contains duplicate provider {id}"
+                )));
+            }
+        }
+        let mut next = config.clone();
+        next.provider_order = provider_ids.to_vec();
+        let effective_provider_order = resolve_provider_order(provider_ids, &known);
+        if let Some(path) = &self.config_file {
+            let staged_config = next
+                .stage_to(path)
+                .with_context(|| format!("staging provider order update for {}", path.display()))?;
+            staged_config
+                .publish()
+                .with_context(|| format!("persisting provider order to {}", path.display()))?;
+        }
+        *config = next;
+        drop(config);
+        self.store.append_event(
+            Scope::Server,
+            Event::ProviderOrderUpdated {
+                provider_order: effective_provider_order,
+            },
+        )?;
         Ok(())
     }
 
@@ -6648,6 +6930,9 @@ impl Engine {
     }
 
     fn known_model_info(&self, model_id: &str) -> Option<trouve_protocol::ModelInfo> {
+        if let Some(model) = self.known_automatic_model_info(model_id) {
+            return Some(model);
+        }
         if let Some((_, backend, _)) = self.backend_for(model_id) {
             return backend
                 .models()
@@ -7322,11 +7607,7 @@ impl Engine {
         model: &str,
         thinking_level: Option<&str>,
     ) -> Result<(), EngineError> {
-        if !model.contains('/') {
-            return Err(EngineError::BadRequest(format!(
-                "model must be provider-qualified (e.g. openai/gpt-4.1-mini): {model}"
-            )));
-        }
+        validate_model_selection(model)?;
         validate_thinking_level(thinking_level)?;
         {
             let mut config = self.config.lock().unwrap();
@@ -7351,11 +7632,7 @@ impl Engine {
         thinking_level: Option<&str>,
         permission_mode: trouve_protocol::PermissionMode,
     ) -> Result<(), EngineError> {
-        if !model.contains('/') {
-            return Err(EngineError::BadRequest(format!(
-                "model must be provider-qualified (e.g. openai/gpt-4.1-mini): {model}"
-            )));
-        }
+        validate_model_selection(model)?;
         validate_thinking_level(thinking_level)?;
 
         let next_defaults = GlobalDefaults {
@@ -7514,106 +7791,170 @@ impl Engine {
         }
         let model_info = self.resolve_model_info(&settings.model).await?;
         let model_options = crate::title_model::model_options(&model_info);
+        if routing::automatic_model_name(&settings.model).is_some() {
+            return self
+                .generate_automatic_title(
+                    &session,
+                    &settings.model,
+                    prompt,
+                    attachments,
+                    &model_info,
+                    &model_options,
+                )
+                .await;
+        }
         if let Some((_, backend, model_name)) = self.backend_for(&settings.model) {
-            use base64::Engine as _;
-            let cancel = tokio_util::sync::CancellationToken::new();
-            // Naming requests carry raw uploads rather than durable
-            // attachments, so path-only vendors (Codex) get short-lived opaque
-            // copies outside both the durable store and the session worktree.
-            let mut staged = StagedTitleImages {
-                executor: self.executor.clone(),
-                root: self.title_image_root(),
-                paths: Vec::new(),
-            };
-            let stage_locally = backend.requires_local_image_paths();
-            let backend_attachments = attachments
-                .iter()
-                .filter(|_| model_info.supports_images)
-                .filter(|attachment| attachment.mime.starts_with("image/"))
-                .map(|attachment| {
-                    let bytes = base64::engine::general_purpose::STANDARD
-                        .decode(&attachment.data)
-                        .map_err(|error| EngineError::BadRequest(error.to_string()))?;
-                    let local_path = if stage_locally {
-                        let path = staged.root.join(format!(
-                            "title_{}{}",
-                            uuid::Uuid::new_v4().simple(),
-                            opaque_attachment_extension(&attachment.name)
-                        ));
-                        self.executor
-                            .prepare_attachment_file(&staged.root, &path, &bytes)
-                            .map_err(|error| EngineError::Internal(anyhow!(error)))?;
-                        staged.paths.push(path.clone());
-                        Some(path)
-                    } else {
-                        None
-                    };
-                    Ok(trouve_agents::TurnAttachment {
-                        name: attachment.name.clone(),
-                        mime: attachment.mime.clone(),
-                        bytes: Arc::from(bytes),
-                        local_path,
-                    })
-                })
-                .collect::<Result<Vec<_>, EngineError>>()?;
-            let turn = BackendTurn {
-                cancel: cancel.clone(),
-                thread_id: format!("title_{}", uuid::Uuid::new_v4()),
-                worktree: PathBuf::from(session.worktree_path),
-                session: None,
-                model: model_name,
-                model_options: model_options.clone(),
-                prompt: crate::title_model::backend_prompt(prompt),
-                attachments: backend_attachments,
-                instructions: None,
-                permission: BackendPermission::ReadOnly,
-                tool_free: true,
-                attach_background: false,
-                mcp_bridge: None,
-                mcp_servers: Vec::new(),
-            };
-            let title = tokio::time::timeout(SESSION_TITLE_TIMEOUT, async {
-                let mut stream = backend
-                    .run_turn(turn)
-                    .await
-                    .map_err(|error| EngineError::BadRequest(error.to_string()))?;
-                let mut output = String::new();
-                while let Some(event) = stream.next().await {
-                    match event.map_err(|error| EngineError::BadRequest(error.to_string()))? {
-                        BackendEvent::TextDelta(delta) => {
-                            crate::title_model::append_output(&mut output, &delta)?;
-                        }
-                        BackendEvent::ToolStarted { .. }
-                        | BackendEvent::ToolOutput { .. }
-                        | BackendEvent::ToolCompleted { .. } => {
-                            cancel.cancel();
-                            return Err(EngineError::BadRequest(
-                                "naming backend attempted to use a tool".into(),
-                            ));
-                        }
-                        BackendEvent::ApprovalNeeded { responder, .. } => {
-                            let _ = responder.send(false);
-                        }
-                        BackendEvent::QuestionsNeeded { responder, .. } => {
-                            let _ = responder.send(None);
-                        }
-                        _ => {}
-                    }
-                }
-                crate::title_model::title_from_output(prompt, &output)
-                    .map_err(|error| EngineError::BadRequest(error.to_string()))
-            })
-            .await
-            .map_err(|_| {
-                cancel.cancel();
-                EngineError::BadRequest("title generation timed out".into())
-            })??;
-            return Ok(trouve_protocol::GeneratedTitle { title });
+            return self
+                .generate_title_with_backend(
+                    &session,
+                    prompt,
+                    attachments,
+                    model_info.supports_images,
+                    &model_options,
+                    backend,
+                    model_name,
+                )
+                .await;
         }
         let (provider, model_name) = self.resolve_provider(&settings.model)?;
+        let timeout = if settings.model.starts_with("local/") {
+            LOCAL_SESSION_TITLE_TIMEOUT
+        } else {
+            SESSION_TITLE_TIMEOUT
+        };
+        self.generate_title_with_provider(
+            prompt,
+            attachments,
+            model_info.supports_images,
+            &model_options,
+            provider,
+            model_name,
+            timeout,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn generate_title_with_backend(
+        &self,
+        session: &Session,
+        prompt: &str,
+        attachments: &[trouve_protocol::AttachmentUpload],
+        supports_images: bool,
+        model_options: &serde_json::Map<String, serde_json::Value>,
+        backend: Arc<dyn AgentBackend>,
+        model_name: String,
+    ) -> Result<trouve_protocol::GeneratedTitle, EngineError> {
+        use base64::Engine as _;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        // Naming requests carry raw uploads rather than durable attachments,
+        // so path-only vendors get short-lived opaque copies outside both the
+        // durable store and the session worktree.
+        let mut staged = StagedTitleImages {
+            executor: self.executor.clone(),
+            root: self.title_image_root(),
+            paths: Vec::new(),
+        };
+        let stage_locally = backend.requires_local_image_paths();
+        let backend_attachments = attachments
+            .iter()
+            .filter(|_| supports_images)
+            .filter(|attachment| attachment.mime.starts_with("image/"))
+            .map(|attachment| {
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(&attachment.data)
+                    .map_err(|error| EngineError::BadRequest(error.to_string()))?;
+                let local_path = if stage_locally {
+                    let path = staged.root.join(format!(
+                        "title_{}{}",
+                        uuid::Uuid::new_v4().simple(),
+                        opaque_attachment_extension(&attachment.name)
+                    ));
+                    self.executor
+                        .prepare_attachment_file(&staged.root, &path, &bytes)
+                        .map_err(|error| EngineError::Internal(anyhow!(error)))?;
+                    staged.paths.push(path.clone());
+                    Some(path)
+                } else {
+                    None
+                };
+                Ok(trouve_agents::TurnAttachment {
+                    name: attachment.name.clone(),
+                    mime: attachment.mime.clone(),
+                    bytes: Arc::from(bytes),
+                    local_path,
+                })
+            })
+            .collect::<Result<Vec<_>, EngineError>>()?;
+        let turn = BackendTurn {
+            cancel: cancel.clone(),
+            thread_id: format!("title_{}", uuid::Uuid::new_v4()),
+            worktree: PathBuf::from(&session.worktree_path),
+            session: None,
+            model: model_name,
+            model_options: model_options.clone(),
+            prompt: crate::title_model::backend_prompt(prompt),
+            attachments: backend_attachments,
+            instructions: None,
+            permission: BackendPermission::ReadOnly,
+            tool_free: true,
+            attach_background: false,
+            mcp_bridge: None,
+            mcp_servers: Vec::new(),
+        };
+        let title = tokio::time::timeout(SESSION_TITLE_TIMEOUT, async {
+            let mut stream = backend
+                .run_turn(turn)
+                .await
+                .map_err(|error| EngineError::BadRequest(error.to_string()))?;
+            let mut output = String::new();
+            while let Some(event) = stream.next().await {
+                match event.map_err(|error| EngineError::BadRequest(error.to_string()))? {
+                    BackendEvent::TextDelta(delta) => {
+                        crate::title_model::append_output(&mut output, &delta)?;
+                    }
+                    BackendEvent::ToolStarted { .. }
+                    | BackendEvent::ToolOutput { .. }
+                    | BackendEvent::ToolCompleted { .. } => {
+                        cancel.cancel();
+                        return Err(EngineError::BadRequest(
+                            "naming backend attempted to use a tool".into(),
+                        ));
+                    }
+                    BackendEvent::ApprovalNeeded { responder, .. } => {
+                        let _ = responder.send(false);
+                    }
+                    BackendEvent::QuestionsNeeded { responder, .. } => {
+                        let _ = responder.send(None);
+                    }
+                    _ => {}
+                }
+            }
+            crate::title_model::title_from_output(prompt, &output)
+                .map_err(|error| EngineError::BadRequest(error.to_string()))
+        })
+        .await
+        .map_err(|_| {
+            cancel.cancel();
+            EngineError::BadRequest("title generation timed out".into())
+        })??;
+        Ok(trouve_protocol::GeneratedTitle { title })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn generate_title_with_provider(
+        &self,
+        prompt: &str,
+        attachments: &[trouve_protocol::AttachmentUpload],
+        supports_images: bool,
+        model_options: &serde_json::Map<String, serde_json::Value>,
+        provider: Arc<dyn Provider>,
+        model_name: String,
+        timeout: Duration,
+    ) -> Result<trouve_protocol::GeneratedTitle, EngineError> {
         let images = attachments
             .iter()
-            .filter(|_| model_info.supports_images)
+            .filter(|_| supports_images)
             .filter(|attachment| attachment.mime.starts_with("image/"))
             .map(|attachment| trouve_providers::ToolImage {
                 mime: attachment.mime.clone(),
@@ -7621,18 +7962,13 @@ impl Engine {
             })
             .collect();
         let messages = crate::title_model::messages(prompt, images);
-        let timeout = if settings.model.starts_with("local/") {
-            LOCAL_SESSION_TITLE_TIMEOUT
-        } else {
-            SESSION_TITLE_TIMEOUT
-        };
         let title = tokio::time::timeout(timeout, async {
             let mut stream = provider
                 .stream_chat_with_priority(
                     &model_name,
                     &messages,
                     &[],
-                    &model_options,
+                    model_options,
                     InferencePriority::Background,
                 )
                 .await
@@ -8114,10 +8450,38 @@ impl Engine {
         }
     }
 
-    /// Rebuild only selected provider/backend ids after their previous
-    /// config-owned backends have completed asynchronous teardown. Unrelated
-    /// instances keep their vendor sessions, process pools, and receivers.
+    /// Restore the previous config-owned backends after a failed transition.
+    /// If the compensating transaction restored route health exactly, avoid
+    /// invalidating that state again while rebuilding the detached backend.
+    fn restore_provider_registries_for_ids(
+        &self,
+        target_ids: &HashSet<String>,
+        preserve_route_state: bool,
+    ) {
+        if preserve_route_state {
+            self.rebuild_provider_registries_for_ids(target_ids);
+        } else {
+            self.replace_provider_registries_for_ids(target_ids);
+        }
+    }
+
+    /// Rebuild selected provider/backend ids and invalidate route state that
+    /// may have been learned by their detached instances.
     fn replace_provider_registries_for_ids(&self, target_ids: &HashSet<String>) {
+        for id in target_ids {
+            if let Err(error) = self.invalidate_provider_route_state(id) {
+                tracing::error!(
+                    provider = id,
+                    "could not reset provider route state: {error:#}"
+                );
+            }
+        }
+        self.rebuild_provider_registries_for_ids(target_ids);
+    }
+
+    /// Rebuild provider instances after their old route state has already
+    /// been invalidated authoritatively by the serialized update path.
+    fn rebuild_provider_registries_for_ids(&self, target_ids: &HashSet<String>) {
         let config = self.config.lock().unwrap().clone();
         let mut provider_replacements = build_providers_for_ids(
             &config,
@@ -8450,12 +8814,8 @@ impl Engine {
             .config_dir
             .as_deref()
             .ok_or_else(|| EngineError::BadRequest("no config dir".into()))?;
-        if let Some(model) = req.default_model.as_deref()
-            && !model.contains('/')
-        {
-            return Err(EngineError::BadRequest(format!(
-                "default_model must be provider-qualified (\"provider/model\"), got {model}"
-            )));
+        if let Some(model) = req.default_model.as_deref() {
+            validate_model_selection(model)?;
         }
         validate_thinking_level(req.default_thinking_level.as_deref())?;
         let persona = AgentPersona {
@@ -9141,10 +9501,9 @@ impl Engine {
                 let Ok(Some(session)) = self.store.session(session_id) else {
                     return;
                 };
-                let lane = self.tool_execution_lock(session_id);
                 let Ok(permit) = tokio::time::timeout(
                     SESSION_PR_LEGACY_EVIDENCE_LOCK_TIMEOUT,
-                    lane.write_owned(),
+                    self.tool_mutation_permit(session_id),
                 )
                 .await
                 else {
@@ -10018,12 +10377,14 @@ impl Engine {
         }
 
         let session_naming_settings = self.session_naming_settings();
+        let provider_order = self.list_providers().provider_order;
         Ok((
             cursor,
             trouve_protocol::ServerProjection {
                 github_pull_requests,
                 session_pull_requests,
                 session_naming_settings,
+                provider_order,
             },
         ))
     }
@@ -10213,6 +10574,12 @@ impl Engine {
             return Err(EngineError::BadRequest(
                 "server name must be non-empty and free of '__' and '/'".into(),
             ));
+        }
+        if crate::mcp::is_reserved_server_name(name) {
+            return Err(EngineError::BadRequest(format!(
+                "server name `{}` is reserved for trouve's internal bridge",
+                crate::mcp::INTERNAL_SERVER_NAME
+            )));
         }
         if req.command.trim().is_empty() {
             return Err(EngineError::BadRequest("command is required".into()));
@@ -10525,7 +10892,7 @@ impl Engine {
         req: &trouve_protocol::CreatePrRequest,
     ) -> Result<trouve_protocol::PrInfo, EngineError> {
         let _lifecycle = self.session_lock(session_id).read_owned().await;
-        let _execution = self.tool_execution_lock(session_id).write_owned().await;
+        let _execution = self.tool_mutation_permit(session_id).await;
         let session = self
             .store
             .session(session_id)?
@@ -11002,6 +11369,28 @@ impl Engine {
         let lock = Arc::new(tokio::sync::RwLock::new(()));
         locks.insert(session_id.to_string(), Arc::downgrade(&lock));
         lock
+    }
+
+    fn tool_mutation_admission_lock(&self, session_id: &str) -> Arc<tokio::sync::RwLock<()>> {
+        let mut locks = self.tool_mutation_admission_locks.lock().unwrap();
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(session_id).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(tokio::sync::RwLock::new(()));
+        locks.insert(session_id.to_string(), Arc::downgrade(&lock));
+        lock
+    }
+
+    async fn tool_mutation_permit(&self, session_id: &str) -> SessionMutationPermit {
+        // Execution comes first so cleanup queued on the exclusive admission
+        // fence can overtake mutations already waiting for the worktree lane.
+        let execution = self.tool_execution_lock(session_id).write_owned().await;
+        let admission = self
+            .tool_mutation_admission_lock(session_id)
+            .read_owned()
+            .await;
+        SessionMutationPermit::admitted(execution, admission)
     }
 
     // --- workspaces ---------------------------------------------------------
@@ -12332,7 +12721,7 @@ impl Engine {
         // lease and the same exclusive execution lane used by agent tools so
         // deletion, restore, and active turns cannot race the rename.
         let _lifecycle = self.session_lock(session_id).read_owned().await;
-        let _execution = self.tool_execution_lock(session_id).write_owned().await;
+        let _execution = self.tool_mutation_permit(session_id).await;
         let mut session = self.get_session(session_id)?;
         if let Some(pending) = self.store.session_branch_rename_intent(session_id)? {
             if should_replay_session_branch_rename(&pending, &session.title, title) {
@@ -12407,7 +12796,7 @@ impl Engine {
         for intent in intents {
             let session_id = intent.session_id.clone();
             let _lifecycle = self.session_lock(&session_id).read_owned().await;
-            let _execution = self.tool_execution_lock(&session_id).write_owned().await;
+            let _execution = self.tool_mutation_permit(&session_id).await;
             let Some(session) = self.store.session(&session_id).ok().flatten() else {
                 let _ = self.store.clear_session_branch_rename_intent(&session_id);
                 continue;
@@ -12888,12 +13277,8 @@ impl Engine {
             personas::find_persona(&all_modes, mode_id)
                 .ok_or_else(|| EngineError::BadRequest(format!("unknown persona: {mode_id}")))?;
         }
-        if let Some(model) = req.model.as_deref()
-            && !model.contains('/')
-        {
-            return Err(EngineError::BadRequest(format!(
-                "model must be provider-qualified (e.g. openai/gpt-4.1-mini): {model}"
-            )));
+        if let Some(model) = req.model.as_deref() {
+            validate_model_selection(model)?;
         }
         if let Some(model_options) = req.model_options.as_ref() {
             validate_thinking_option_aliases(model_options)?;
@@ -12932,10 +13317,74 @@ impl Engine {
         Ok((provider, model_name.to_string()))
     }
 
+    /// Bind a pinned turn to one concrete executor incarnation. Provider
+    /// replacement advances the generation before publishing a new registry
+    /// entry, so snapshot both behind the provider transition lock.
+    async fn resolve_concrete_executor(
+        &self,
+        model: &str,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<ConcreteExecutorSnapshot> {
+        let (provider_id, model_name) = model.split_once('/').ok_or_else(|| {
+            anyhow!("model must be provider-qualified (e.g. openai/gpt-4.1-mini): {model}")
+        })?;
+        let transition = self.provider_transition_lock(provider_id);
+        let _transition = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => bail!("turn cancelled"),
+            guard = transition.lock_owned() => guard,
+        };
+        let provider_generation = self
+            .provider_generations
+            .lock()
+            .unwrap()
+            .get(provider_id)
+            .copied()
+            .unwrap_or(0);
+        let backend = self.backends.read().unwrap().get(provider_id).cloned();
+        let executor = if let Some(backend) = backend {
+            ConcreteExecutor::Backend(backend)
+        } else if let Some(provider) = self.providers.read().unwrap().get(provider_id).cloned() {
+            ConcreteExecutor::Native(provider)
+        } else {
+            bail!(
+                "provider {provider_id} is not configured (configured: {})",
+                self.provider_ids().join(", ")
+            );
+        };
+        Ok(ConcreteExecutorSnapshot {
+            provider_id: provider_id.to_string(),
+            provider_generation,
+            model_name: model_name.to_string(),
+            executor,
+        })
+    }
+
+    fn record_concrete_attempt_outcome(
+        &self,
+        model: &str,
+        attempt: ConcreteAttemptSnapshot,
+        error: Option<&str>,
+    ) -> Result<()> {
+        self.with_current_provider_generation(
+            &attempt.provider_id,
+            attempt.provider_generation,
+            || {
+                self.turn_scheduler
+                    .record_ordered_outcome(model, error, attempt.attempt_order);
+                Ok(())
+            },
+        )?;
+        Ok(())
+    }
+
     pub(crate) async fn resolve_model_info(
         &self,
         model: &str,
     ) -> Result<trouve_protocol::ModelInfo, EngineError> {
+        if let Some(info) = self.resolve_automatic_model_info(model).await? {
+            return Ok(info);
+        }
         if let Some((_, backend, _)) = self.backend_for(model) {
             let models =
                 tokio::time::timeout(MODEL_CATALOG_VALIDATION_TIMEOUT, backend.list_models())
@@ -13272,6 +13721,7 @@ impl Engine {
 
     fn turn_supports_steering(&self, thread: &Thread, tools_enabled: bool) -> bool {
         tools_enabled
+            && routing::automatic_model_name(&thread.model).is_none()
             && self
                 .backend_for(&thread.model)
                 .is_none_or(|(_, backend, _)| backend.supports_steering())
@@ -13285,22 +13735,7 @@ impl Engine {
         supports_steering: bool,
     ) -> Result<Vec<Event>, EngineError> {
         let mut model_options = self.store.thread_model_options(&thread.id)?;
-        let selected_model =
-            if let Some((_backend_id, backend, _model_name)) = self.backend_for(&thread.model) {
-                backend
-                    .models()
-                    .into_iter()
-                    .find(|model| model.id == thread.model)
-            } else {
-                self.resolve_provider(&thread.model)
-                    .ok()
-                    .and_then(|(provider, _)| {
-                        provider
-                            .models()
-                            .into_iter()
-                            .find(|model| model.id == thread.model)
-                    })
-            };
+        let selected_model = self.known_model_info(&thread.model);
         if selected_model.is_some() {
             normalize_thinking_option(&mut model_options, selected_model.as_ref());
         }
@@ -13523,25 +13958,17 @@ impl Engine {
         let materialized = if staged.is_empty() {
             Vec::new()
         } else {
-            let lane = self.tool_execution_lock(&session.id);
-            let permit = match lane.try_write_owned() {
-                Ok(permit) => permit,
-                Err(_) => {
-                    mutation_lane_state.send_replace(SteerMutationLaneState::Waiting);
-                    let lane = self.tool_execution_lock(&session.id);
-                    let permit = tokio::select! {
-                        biased;
-                        _ = cancel.cancelled() => {
-                            mutation_lane_state.send_replace(SteerMutationLaneState::Idle);
-                            response.send(Err("turn cancelled".into()));
-                            return Ok(());
-                        }
-                        permit = lane.write_owned() => permit,
-                    };
+            mutation_lane_state.send_replace(SteerMutationLaneState::Waiting);
+            let permit = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
                     mutation_lane_state.send_replace(SteerMutationLaneState::Idle);
-                    permit
+                    response.send(Err("turn cancelled".into()));
+                    return Ok(());
                 }
+                permit = self.tool_mutation_permit(&session.id) => permit,
             };
+            mutation_lane_state.send_replace(SteerMutationLaneState::Idle);
             let result = self
                 .executor
                 .materialize_attachments(&AttachmentMaterialization {
@@ -13970,11 +14397,10 @@ impl Engine {
         if files.is_empty() {
             return Ok(Vec::new());
         }
-        let lane = self.tool_execution_lock(&session.id);
         let _mutation = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err(EngineError::Conflict("turn cancelled".into())),
-            permit = lane.write_owned() => permit,
+            permit = self.tool_mutation_permit(&session.id) => permit,
         };
         self.executor
             .materialize_attachments(&AttachmentMaterialization {
@@ -14445,19 +14871,78 @@ impl Engine {
                 .take()
                 .expect("an active queue prompt must have a cancellation token");
             let prompt_persisted = AtomicBool::new(shell_persisted);
-            let result = std::panic::AssertUnwindSafe(self.run_turn(
-                &thread,
-                turn,
-                &prompt,
-                cancel.clone(),
-                &prompt_persisted,
-            ))
-            .catch_unwind()
-            .await;
+            let routed_attempt = Mutex::new(None);
+            let concrete_attempt = Mutex::new(None);
+            let automatic = routing::automatic_model_name(&thread.model).is_some();
+            let turn_future = async {
+                if automatic {
+                    self.run_routed_turn(
+                        &thread,
+                        turn,
+                        &prompt,
+                        cancel.clone(),
+                        &prompt_persisted,
+                        &routed_attempt,
+                    )
+                    .await
+                } else {
+                    self.run_turn(
+                        &thread,
+                        turn,
+                        &prompt,
+                        cancel.clone(),
+                        &prompt_persisted,
+                        &concrete_attempt,
+                    )
+                    .await
+                }
+            };
+            let result = std::panic::AssertUnwindSafe(turn_future)
+                .catch_unwind()
+                .await;
             let result = match result {
                 Ok(result) => result,
                 Err(_) => {
                     tracing::error!("turn {turn} of {} panicked", thread.id);
+                    if !cancel.is_cancelled()
+                        && let Some(attempt) = routed_attempt.lock().unwrap().take()
+                    {
+                        let (base, max) = routing::RouteFailureKind::Unavailable.cooldown();
+                        self.with_current_provider_generation(
+                            &attempt.provider_id,
+                            attempt.provider_generation,
+                            || {
+                                let concrete =
+                                    format!("{}/{}", attempt.provider_id, attempt.provider_model);
+                                self.turn_scheduler.record_ordered_outcome(
+                                    &concrete,
+                                    Some("internal error"),
+                                    attempt.attempt_order,
+                                );
+                                self.store.record_route_failure(
+                                    &attempt.provider_id,
+                                    &attempt.provider_model,
+                                    attempt.attempt_order,
+                                    base,
+                                    max,
+                                )?;
+                                self.store.clear_thread_route_affinity_if_matches(
+                                    &thread.id,
+                                    &attempt.provider_id,
+                                    &attempt.provider_model,
+                                )?;
+                                Ok(())
+                            },
+                        )?;
+                    } else if !cancel.is_cancelled()
+                        && let Some(attempt) = concrete_attempt.lock().unwrap().take()
+                    {
+                        self.record_concrete_attempt_outcome(
+                            &thread.model,
+                            attempt,
+                            Some("internal error"),
+                        )?;
+                    }
                     self.store
                         .append_event(
                             Scope::Thread(thread.id.clone()),
@@ -14480,10 +14965,15 @@ impl Engine {
                 }
             };
             let cancelled = cancel.is_cancelled();
-            if !cancelled {
+            if !cancelled && !automatic {
                 let outcome_error = result.as_ref().err().map(ToString::to_string);
-                self.turn_scheduler
-                    .record_outcome(&thread.model, outcome_error.as_deref());
+                if let Some(attempt) = concrete_attempt.lock().unwrap().take() {
+                    self.record_concrete_attempt_outcome(
+                        &thread.model,
+                        attempt,
+                        outcome_error.as_deref(),
+                    )?;
+                }
             }
             // Cancellation wins a race with startup/stream errors only after
             // run_turn has returned, which is the adapter/tool acknowledgement
@@ -14773,6 +15263,7 @@ impl Engine {
         prompt: &trouve_protocol::QueuedPrompt,
         cancel: tokio_util::sync::CancellationToken,
         prompt_persisted: &AtomicBool,
+        active_attempt: &Mutex<Option<ConcreteAttemptSnapshot>>,
     ) -> Result<()> {
         let content = prompt.content.clone();
         let attachments = prompt.attachments.clone();
@@ -14863,6 +15354,19 @@ impl Engine {
             guard = session_lifecycle.read() => guard,
         };
         let admission = self.turn_scheduler.admit(&thread.model, &cancel).await?;
+        let ConcreteExecutorSnapshot {
+            provider_id,
+            provider_generation,
+            model_name,
+            executor,
+        } = self
+            .resolve_concrete_executor(&thread.model, &cancel)
+            .await?;
+        *active_attempt.lock().unwrap() = Some(ConcreteAttemptSnapshot {
+            provider_id: provider_id.clone(),
+            provider_generation,
+            attempt_order: admission.attempt_order,
+        });
 
         // External agent backend? The vendor harness owns the loop; we
         // stream its events and bridge approvals. The shared lifecycle lease
@@ -14870,35 +15374,35 @@ impl Engine {
         // Admission is published there, once the backend's startup lane has
         // also been passed, so the reported wait covers every queue the turn
         // stood in before the vendor saw it.
-        if let Some((backend_id, backend, model_name)) = self.backend_for(&thread.model) {
-            return self
-                .run_backend_turn(
-                    &session,
-                    thread,
-                    turn,
-                    &mode,
-                    &backend_id,
-                    backend,
-                    model_name,
-                    content,
-                    attachments,
-                    cancel,
-                    &prompt.id,
-                    tools_enabled,
-                    prompt.background,
-                    admission.provider_wait_ms,
-                    turn_steer_rx,
-                    turn_steer_mutation_lane_state,
-                    None,
-                )
-                .await;
-        }
+        let provider = match executor {
+            ConcreteExecutor::Backend(backend) => {
+                return self
+                    .run_backend_turn(
+                        &session,
+                        thread,
+                        turn,
+                        &mode,
+                        &provider_id,
+                        backend,
+                        model_name,
+                        content,
+                        attachments,
+                        cancel,
+                        &prompt.id,
+                        tools_enabled,
+                        prompt.background,
+                        admission.provider_wait_ms,
+                        turn_steer_rx,
+                        turn_steer_mutation_lane_state,
+                        None,
+                    )
+                    .await;
+            }
+            ConcreteExecutor::Native(provider) => provider,
+        };
         self.publish_turn_admission(thread, turn, background, admission.provider_wait_ms)
             .await?;
 
-        let (provider, model_name) = self
-            .resolve_provider(&thread.model)
-            .map_err(|e| anyhow!(e.to_string()))?;
         let mut model_options = self.store.thread_model_options(&thread.id)?;
         let model_catalog = tokio::select! {
             biased;
@@ -14912,7 +15416,7 @@ impl Engine {
         // before this turn's user message joins it (the stored transcript —
         // the event above is display-only).
         if let Err(e) = self
-            .maybe_compact(thread, turn, &provider, &model_name, &cancel)
+            .maybe_compact(thread, turn, &provider, &model_name, None, &cancel)
             .await
         {
             // Compaction is best-effort; the turn proceeds with full history.
@@ -15543,6 +16047,20 @@ impl Engine {
         let (backend_id, model_name) = model.split_once('/')?;
         let backend = self.backends.read().unwrap().get(backend_id).cloned()?;
         Some((backend_id.to_string(), backend, model_name.to_string()))
+    }
+
+    fn full_tool_bridge_available_for(&self, backend_id: &str) -> bool {
+        let configured = {
+            let config = self.config.lock().unwrap();
+            config.providers.get(backend_id).is_some_and(|provider| {
+                matches!(
+                    provider.kind.as_str(),
+                    "claude-cli" | "codex-app-server" | "cursor-sdk" | "cursor-cli"
+                ) && (matches!(provider.kind.as_str(), "cursor-sdk" | "cursor-cli")
+                    || provider.tool_bridge.unwrap_or(true))
+            })
+        };
+        configured && self.base_url.read().unwrap().is_some()
     }
 
     /// MCP tool-bridge config for a backend turn. Claude Code and Codex use
@@ -17327,8 +17845,7 @@ impl Engine {
         let mut pending_backend_approvals = futures::stream::FuturesUnordered::new();
         let mut backend_approval_cancels =
             HashMap::<String, tokio_util::sync::CancellationToken>::new();
-        let mut backend_mutation_permits =
-            HashMap::<String, tokio::sync::OwnedRwLockWriteGuard<()>>::new();
+        let mut backend_mutation_permits = HashMap::<String, SessionMutationPermit>::new();
         let mut pending_steer = None;
         let mut pending_steer_lane = None;
         let mut pending_steer_permit = None;
@@ -17420,26 +17937,19 @@ impl Engine {
                     } else if let Some(permit) = pending_steer_permit.take() {
                         Some(permit)
                     } else {
-                        let lane = self.tool_execution_lock(&session.id);
-                        match lane.try_write_owned() {
-                            Ok(permit) => Some(permit),
-                            Err(_) => {
-                                // Wait for actual lane availability as another
-                                // select branch. Backend events and approval
-                                // outcomes continue to flow while this future
-                                // is pending, including the completion that
-                                // releases an in-flight vendor mutation.
-                                pending_steer = Some(command);
-                                steer_mutation_lane_state
-                                    .send_replace(SteerMutationLaneState::Waiting);
-                                let lane = self.tool_execution_lock(&session.id);
-                                pending_steer_lane = Some(
-                                    async move { lane.write_owned().await }.boxed(),
-                                );
-                                consecutive_backend_events = 0;
-                                continue;
-                            }
-                        }
+                        // Wait for actual lane availability as another select
+                        // branch. Backend events and approval outcomes continue
+                        // to flow while the future is pending, including the
+                        // completion that releases an in-flight mutation.
+                        pending_steer = Some(command);
+                        steer_mutation_lane_state.send_replace(SteerMutationLaneState::Waiting);
+                        let engine = self.clone();
+                        let session_id = session.id.clone();
+                        pending_steer_lane = Some(
+                            async move { engine.tool_mutation_permit(&session_id).await }.boxed(),
+                        );
+                        consecutive_backend_events = 0;
+                        continue;
                     };
                     flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
                     persist_deadline = None;
@@ -18492,11 +19002,10 @@ impl Engine {
                 && approved.as_ref().is_ok_and(|approved| *approved)
                 && engine.backend_tool_mutates(&tool)
             {
-                let lock = engine.tool_execution_lock(&session.id);
                 match tokio::select! {
                     biased;
                     _ = cancel.cancelled() => None,
-                    permit = lock.write_owned() => Some(permit),
+                    permit = engine.tool_mutation_permit(&session.id) => Some(permit),
                 } {
                     Some(permit) => mutation_permit = Some(permit),
                     None => approved = Ok(false),
@@ -18660,6 +19169,7 @@ impl Engine {
         turn: u64,
         provider: &Arc<dyn Provider>,
         model_name: &str,
+        context_window_override: Option<u64>,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<()> {
         // The live listing knows gateway models (kilocode, openrouter, ...)
@@ -18672,13 +19182,13 @@ impl Engine {
             models = provider.list_models() => models,
         };
         let known = provider.models();
-        let Some(context_window) = live
-            .iter()
-            .chain(known.iter())
-            .find(|m| m.id == thread.model)
-            .map(|m| m.context_window)
-            .filter(|w| *w > 0)
-        else {
+        let Some(context_window) = context_window_override.or_else(|| {
+            live.iter()
+                .chain(known.iter())
+                .filter(|m| m.id == thread.model)
+                .map(|m| m.context_window)
+                .find(|w| *w > 0)
+        }) else {
             if self
                 .compaction_warnings
                 .lock()
@@ -19181,17 +19691,14 @@ impl Engine {
                 _guard: tokio::sync::OwnedRwLockReadGuard<()>,
             },
             Write {
-                guard: Option<tokio::sync::OwnedRwLockWriteGuard<()>>,
+                guard: Option<SessionMutationPermit>,
             },
             /// Background-job control must be able to poll or terminate a
             /// process while that process retains the write lane.
             BackgroundControl,
         }
         let execution_lock = self.tool_execution_lock(&session.id);
-        let permit = if matches!(
-            call.name.as_str(),
-            "shell_output" | "write_stdin" | "shell_kill"
-        ) {
+        let permit = if matches!(call.name.as_str(), "shell_output" | "shell_kill") {
             Some(ExecutionPermit::BackgroundControl)
         } else if mutates || pr_creation.is_some() {
             // A confirmed or unresolved creator must hold the write lane even
@@ -19200,7 +19707,7 @@ impl Engine {
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => None,
-                permit = execution_lock.clone().write_owned() => Some(ExecutionPermit::Write { guard: Some(permit) }),
+                permit = self.tool_mutation_permit(&session.id) => Some(ExecutionPermit::Write { guard: Some(permit) }),
             }
         } else {
             tokio::select! {
@@ -19501,9 +20008,7 @@ impl Engine {
             .and_then(serde_json::Value::as_str)
             .unwrap_or(&thread.model)
             .to_string();
-        if !child_model.contains('/') {
-            bail!("model must be provider-qualified (e.g. openai/gpt-4.1-mini): {child_model}");
-        }
+        validate_model_selection(&child_model).map_err(|error| anyhow!(error.to_string()))?;
         // Same model: the parent's option choices (thinking level, …) carry
         // over. A different model validates its own options; start clean.
         let model_options = if child_model == thread.model {
@@ -19728,8 +20233,8 @@ impl Engine {
     /// The wait is rendered as a synthetic `await_subagents` tool call so the
     /// rail shows what the turn is blocked on, and the turn phase flips to
     /// `waiting_for_subagents` for the activity label. Returns `None` when
-    /// nothing was running or the turn was cancelled mid-wait; callers
-    /// already treat a tripped token as the end of the turn.
+    /// nothing was running, the turn was cancelled, or the bounded wait timed
+    /// out; callers already treat each case as the end of the turn.
     async fn await_spawned_descendants(
         &self,
         thread: &Thread,
@@ -19771,10 +20276,17 @@ impl Engine {
             },
         )?;
         let started = Instant::now();
+        let deadline = tokio::time::Instant::now() + SUBAGENT_WAIT_TIMEOUT;
+        #[derive(Clone, Copy)]
+        enum WaitOutcome {
+            Completed,
+            Cancelled,
+            TimedOut,
+        }
         // Wait for the whole subtree, not just the awaited children: a
         // child whose own turn returned still counts as running while one
         // of its descendants is active, exactly as `spawn_output` reports.
-        let cancelled = loop {
+        let outcome = loop {
             let descendants = self.list_thread_descendants(&thread.id)?;
             let any_active = {
                 let active = self.active_threads.lock().unwrap();
@@ -19783,17 +20295,18 @@ impl Engine {
                     .any(|descendant| active.contains_key(&descendant.id))
             };
             if !any_active {
-                break false;
+                break WaitOutcome::Completed;
             }
             tokio::select! {
                 biased;
-                _ = cancel.cancelled() => break true,
+                _ = cancel.cancelled() => break WaitOutcome::Cancelled,
+                _ = tokio::time::sleep_until(deadline) => break WaitOutcome::TimedOut,
                 _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
             }
         };
         let execution_duration_ms =
             Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
-        if cancelled {
+        if matches!(outcome, WaitOutcome::Cancelled) {
             self.store.append_event(
                 scope,
                 Event::ToolCompleted {
@@ -19805,14 +20318,59 @@ impl Engine {
             )?;
             return Ok(None);
         }
+        if matches!(outcome, WaitOutcome::TimedOut) {
+            let active_thread_ids = {
+                let descendants = self.list_thread_descendants(&thread.id)?;
+                let active = self.active_threads.lock().unwrap();
+                descendants
+                    .into_iter()
+                    .filter(|descendant| active.contains_key(&descendant.id))
+                    .map(|descendant| descendant.id)
+                    .collect::<Vec<_>>()
+            };
+            self.store.append_event(
+                scope.clone(),
+                Event::ToolCompleted {
+                    call_id,
+                    status: ToolStatus::Error,
+                    result: serde_json::json!({
+                        "error": format!(
+                            "timed out after {} seconds waiting for subagents; the child threads remain available for inspection",
+                            SUBAGENT_WAIT_TIMEOUT.as_secs()
+                        ),
+                        "timed_out": true,
+                        "thread_ids": active_thread_ids,
+                    }),
+                    execution_duration_ms,
+                },
+            )?;
+            self.store.append_event(
+                scope,
+                Event::TurnPhaseChanged {
+                    turn,
+                    phase: TurnPhase::Processing,
+                },
+            )?;
+            return Ok(None);
+        }
 
+        const FINAL_INSTRUCTION: &str = "\nIncorporate these results and finish your response to the user. These subagents \
+             have already completed; do not wait for or poll them again.";
         let mut results = Vec::with_capacity(awaited.len());
         let mut digest = format!(
             "[Harness] This turn was held open until the {} subagent(s) it spawned finished. \
              Their results:\n",
             awaited.len()
         );
-        let mut message_bytes = 0usize;
+        let payload_budget = SUBAGENT_DIGEST_TOTAL_BYTES
+            .saturating_sub(digest.len())
+            .saturating_sub(FINAL_INSTRUCTION.len())
+            .saturating_sub(
+                awaited
+                    .len()
+                    .saturating_mul(SUBAGENT_DIGEST_SECTION_OVERHEAD_BYTES),
+            );
+        let mut payload_bytes = 0usize;
         for child_id in &awaited {
             let mut status = self.spawn_status(child_id)?;
             let title = self
@@ -19820,6 +20378,14 @@ impl Engine {
                 .thread(child_id)?
                 .and_then(|child| child.title)
                 .unwrap_or_default();
+            let title = if title.len() > SUBAGENT_DIGEST_TITLE_BYTES {
+                cap_chars(
+                    &title,
+                    SUBAGENT_DIGEST_TITLE_BYTES.saturating_sub(CAP_CHARS_MARKER.len()),
+                )
+            } else {
+                title
+            };
             let heading = if title.is_empty() {
                 child_id.clone()
             } else {
@@ -19829,19 +20395,44 @@ impl Engine {
                 "\n### {heading} — {}\n",
                 status["status"].as_str().unwrap_or("unknown")
             ));
-            if let Some(error) = status["error"].as_str() {
-                // Vendor failures can carry whole stderr dumps; the tool
-                // result keeps the full text, the prompt digest a bounded cut.
-                let error = cap_chars(error, SUBAGENT_DIGEST_ERROR_BYTES);
-                message_bytes += error.len();
-                digest.push_str(&format!("Error: {error}\n"));
+            if let Some(error) = status["error"].as_str().map(str::to_owned) {
+                // Vendor failures can carry whole stderr dumps. Bound both
+                // persisted and prompt copies, sharing the aggregate payload
+                // budget with final messages.
+                let remaining = payload_budget.saturating_sub(payload_bytes);
+                let budget = SUBAGENT_DIGEST_ERROR_BYTES.min(remaining);
+                let truncated = error.len() > budget;
+                let error = if !truncated {
+                    error
+                } else if budget > CAP_CHARS_MARKER.len() {
+                    cap_chars(&error, budget - CAP_CHARS_MARKER.len())
+                } else {
+                    String::new()
+                };
+                payload_bytes += error.len();
+                status["error"] = serde_json::json!(error);
+                if truncated {
+                    status["error_truncated"] = serde_json::json!(true);
+                }
+                if error.is_empty() {
+                    digest.push_str(&format!(
+                        "(error omitted: the {SUBAGENT_DIGEST_TOTAL_BYTES}-byte digest budget is \
+                         spent; read thread {child_id} with search_transcript)\n"
+                    ));
+                } else {
+                    digest.push_str(&format!("Error: {error}\n"));
+                }
             }
             // Child answers are unbounded; keep the digest (which becomes
             // prompt context) and the persisted tool result within a fixed
             // per-child and whole-digest budget, pointing at the child
             // thread for whatever was left out.
-            let last_message = status["last_message"].as_str().unwrap_or("").trim();
-            let remaining = SUBAGENT_DIGEST_TOTAL_BYTES.saturating_sub(message_bytes);
+            let last_message = status["last_message"]
+                .as_str()
+                .unwrap_or("")
+                .trim()
+                .to_owned();
+            let remaining = payload_budget.saturating_sub(payload_bytes);
             // The truncation marker counts against the budget too, so a run of
             // capped messages cannot creep past the whole-digest ceiling.
             let budget = SUBAGENT_DIGEST_MESSAGE_BYTES
@@ -19857,9 +20448,9 @@ impl Engine {
                 status["last_message"] = serde_json::json!("");
                 status["last_message_truncated"] = serde_json::json!(true);
             } else if last_message.len() > budget {
-                let capped = cap_chars(last_message, budget);
+                let capped = cap_chars(&last_message, budget);
                 debug_assert!(capped.len() <= budget + CAP_CHARS_MARKER.len());
-                message_bytes += capped.len();
+                payload_bytes += capped.len();
                 digest.push_str(&format!(
                     "{capped}\n(final message truncated at {budget} bytes; read thread \
                      {child_id} with search_transcript for the rest)\n"
@@ -19867,22 +20458,29 @@ impl Engine {
                 status["last_message"] = serde_json::json!(capped);
                 status["last_message_truncated"] = serde_json::json!(true);
             } else {
-                message_bytes += last_message.len();
-                digest.push_str(last_message);
+                payload_bytes += last_message.len();
+                digest.push_str(&last_message);
                 digest.push('\n');
             }
             results.push(status);
         }
-        digest.push_str(
-            "\nIncorporate these results and finish your response to the user. These subagents \
-             have already completed; do not wait for or poll them again.",
-        );
+        // The fixed per-section reserve above preserves ordinary metadata;
+        // this final guard makes the limit unconditional even if a future id
+        // or status representation grows beyond that reserve.
+        let body_limit = SUBAGENT_DIGEST_TOTAL_BYTES.saturating_sub(FINAL_INSTRUCTION.len());
+        if digest.len() > body_limit {
+            let keep = body_limit.saturating_sub(CAP_CHARS_MARKER.len());
+            digest.truncate(floor_char_boundary(&digest, keep));
+            digest.push_str(CAP_CHARS_MARKER);
+        }
+        digest.push_str(FINAL_INSTRUCTION);
+        debug_assert!(digest.len() <= SUBAGENT_DIGEST_TOTAL_BYTES);
         self.store.append_event(
             scope.clone(),
             Event::ToolCompleted {
                 call_id,
                 status: ToolStatus::Ok,
-                result: serde_json::json!({ "subagents": results }),
+                result: bounded_subagent_tool_result(results),
                 execution_duration_ms,
             },
         )?;
@@ -20076,11 +20674,10 @@ impl Engine {
         turn: u64,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<Option<String>> {
-        let execution_lock = self.tool_execution_lock(&session.id);
         let _mutation_guard = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Ok(None),
-            guard = execution_lock.write_owned() => guard,
+            guard = self.tool_mutation_permit(&session.id) => guard,
         };
         let worktree = PathBuf::from(&session.worktree_path);
         let dirty = {
@@ -20400,6 +20997,66 @@ fn cap_chars(s: &str, max: usize) -> String {
     }
     let end = floor_char_boundary(s, max);
     format!("{}{CAP_CHARS_MARKER}", &s[..end])
+}
+
+/// Bound the exact serialized `await_subagents` tool result. Raw text caps are
+/// insufficient because JSON escaping can expand messages and descendant
+/// failure metadata can grow independently of those messages.
+fn bounded_subagent_tool_result(results: Vec<serde_json::Value>) -> serde_json::Value {
+    const SUMMARY_ID_BYTES: usize = 256;
+    const SUMMARY_STATUS_BYTES: usize = 64;
+
+    let total_subagents = results.len();
+    let mut truncated = false;
+    let serialized_len = |subagents: &[serde_json::Value], was_truncated: bool| {
+        serde_json::to_vec(&serde_json::json!({
+            "subagents": subagents,
+            "total_subagents": total_subagents,
+            "truncated": was_truncated,
+        }))
+        .map(|bytes| bytes.len())
+        .unwrap_or(usize::MAX)
+    };
+    let mut bounded = Vec::with_capacity(results.len());
+    for status in results {
+        bounded.push(status);
+        if serialized_len(&bounded, truncated) <= SUBAGENT_DIGEST_TOTAL_BYTES {
+            continue;
+        }
+
+        let status = bounded.pop().expect("just pushed a subagent status");
+        truncated = true;
+        let summary = serde_json::json!({
+            "thread_id": cap_chars(
+                status["thread_id"].as_str().unwrap_or("unknown"),
+                SUMMARY_ID_BYTES.saturating_sub(CAP_CHARS_MARKER.len()),
+            ),
+            "status": cap_chars(
+                status["status"].as_str().unwrap_or("unknown"),
+                SUMMARY_STATUS_BYTES.saturating_sub(CAP_CHARS_MARKER.len()),
+            ),
+            "last_message": "",
+            "last_message_truncated": true,
+            "details_omitted": true,
+        });
+        bounded.push(summary);
+        if serialized_len(&bounded, true) > SUBAGENT_DIGEST_TOTAL_BYTES {
+            bounded.pop();
+            break;
+        }
+    }
+    truncated |= bounded.len() < total_subagents;
+    let result = serde_json::json!({
+        "subagents": bounded,
+        "total_subagents": total_subagents,
+        "truncated": truncated,
+    });
+    debug_assert!(
+        serde_json::to_vec(&result)
+            .map(|bytes| bytes.len() <= SUBAGENT_DIGEST_TOTAL_BYTES)
+            .unwrap_or(false)
+    );
+    result
 }
 
 /// Largest index `<= at` that lands on a char boundary.
@@ -22220,29 +22877,41 @@ fn build_provider(
             "provider {id} endpoint must use http or https"
         );
     }
+    let local = base_url.as_deref().is_some_and(is_loopback_base_url);
+    let apply_routing_scope = |provider: Arc<dyn Provider>| -> Arc<dyn Provider> {
+        if local {
+            Arc::new(trouve_providers::ConcreteOnlyProvider::new(provider))
+        } else {
+            provider
+        }
+    };
 
     if pc.kind == "amazon-bedrock" {
-        return Ok(Arc::new(trouve_providers::bedrock::BedrockProvider::new(
-            id,
-            values
-                .get("AWS_REGION")
-                .cloned()
-                .or_else(|| std::env::var("AWS_REGION").ok()),
-            values
-                .get("AWS_PROFILE")
-                .cloned()
-                .or_else(|| std::env::var("AWS_PROFILE").ok()),
-            catalog.clone(),
+        return Ok(apply_routing_scope(Arc::new(
+            trouve_providers::bedrock::BedrockProvider::new(
+                id,
+                values
+                    .get("AWS_REGION")
+                    .cloned()
+                    .or_else(|| std::env::var("AWS_REGION").ok()),
+                values
+                    .get("AWS_PROFILE")
+                    .cloned()
+                    .or_else(|| std::env::var("AWS_PROFILE").ok()),
+                catalog.clone(),
+            ),
         )));
     }
     if pc.kind == "google-vertex" {
         let endpoint =
             base_url.ok_or_else(|| anyhow::anyhow!("google-vertex requires an endpoint"))?;
-        return Ok(Arc::new(trouve_providers::vertex::VertexProvider::new(
-            id,
-            endpoint,
-            values.get("GOOGLE_APPLICATION_CREDENTIALS").cloned(),
-            catalog.clone(),
+        return Ok(apply_routing_scope(Arc::new(
+            trouve_providers::vertex::VertexProvider::new(
+                id,
+                endpoint,
+                values.get("GOOGLE_APPLICATION_CREDENTIALS").cloned(),
+                catalog.clone(),
+            ),
         )));
     }
     if pc.kind == "google-vertex-anthropic" {
@@ -22251,15 +22920,14 @@ fn build_provider(
         let token = Arc::new(trouve_providers::vertex::GoogleAccessToken::new(
             values.get("GOOGLE_APPLICATION_CREDENTIALS").cloned(),
         ));
-        return Ok(Arc::new(
+        return Ok(apply_routing_scope(Arc::new(
             trouve_providers::anthropic::AnthropicProvider::new(id, Some(endpoint), token)
                 .with_catalog(catalog.clone())
                 .with_catalog_provider(id)
                 .with_vertex_bearer(),
-        ));
+        )));
     }
     // Local endpoints (e.g. Ollama) don't need a key; send an empty token.
-    let local = base_url.as_deref().is_some_and(is_loopback_base_url);
     let mut oauth_bearer = false;
     let token: Arc<dyn TokenSource> = match (api_key, &pc.oauth) {
         (Some(key), _) => Arc::new(StaticToken(key)),
@@ -22295,20 +22963,22 @@ fn build_provider(
             if let Some(catalog_provider) = known_catalog_provider {
                 provider = provider.with_catalog_provider(catalog_provider);
             }
-            Ok(Arc::new(provider))
+            Ok(apply_routing_scope(Arc::new(provider)))
         }
         "azure-openai" => {
             let endpoint =
                 base_url.ok_or_else(|| anyhow::anyhow!("azure-openai requires an endpoint"))?;
             let catalog_provider = known_catalog_provider.unwrap_or_else(|| "azure".into());
-            Ok(Arc::new(trouve_providers::azure::AzureOpenAiProvider::new(
-                id,
-                endpoint,
-                token,
-                catalog.clone(),
-                catalog_provider,
-                headers,
-                query_params,
+            Ok(apply_routing_scope(Arc::new(
+                trouve_providers::azure::AzureOpenAiProvider::new(
+                    id,
+                    endpoint,
+                    token,
+                    catalog.clone(),
+                    catalog_provider,
+                    headers,
+                    query_params,
+                ),
             )))
         }
         "anthropic" => {
@@ -22325,7 +22995,7 @@ fn build_provider(
             if oauth_bearer {
                 provider = provider.with_oauth_bearer();
             }
-            Ok(Arc::new(provider))
+            Ok(apply_routing_scope(Arc::new(provider)))
         }
         other => anyhow::bail!("unknown provider kind {other:?}"),
     }
@@ -22398,7 +23068,9 @@ mod tests {
         let shell = |command: &str| serde_json::json!({ "command": command });
         // The shell tool is statically mutating; a recognised read-only
         // command is reclassified per call, an unrecognised one is not.
-        assert!(!call_mutates(
+        // Repository-aware Git reads can execute configured helpers and keep
+        // the shell tool's conservative mutating classification.
+        assert!(call_mutates(
             Some(true),
             "shell",
             &shell("git log --oneline"),
@@ -22450,9 +23122,14 @@ mod tests {
         assert!(call_mutates(None, "mystery", &shell("ls"), wt));
 
         // Claude's native Bash carries the same command text.
-        assert!(vendor_shell_command_is_read_only(
+        assert!(!vendor_shell_command_is_read_only(
             "Bash",
             &shell("git status"),
+            wt
+        ));
+        assert!(vendor_shell_command_is_read_only(
+            "Bash",
+            &shell("git --version"),
             wt
         ));
         assert!(!vendor_shell_command_is_read_only(
@@ -22490,11 +23167,18 @@ mod tests {
 
     #[test]
     fn dispatched_background_activity_is_not_a_user_message() {
+        let routed_content = background_attach_prompt("cursor");
+        assert_eq!(
+            background_attach_backend_id(&routed_content),
+            Some("cursor")
+        );
+        assert_eq!(background_attach_backend_id(BACKGROUND_ATTACH_PROMPT), None);
+
         let prompt = trouve_protocol::QueuedPrompt {
             id: "qp_background".into(),
             thread_id: "th_background".into(),
             position: 0,
-            content: BACKGROUND_ATTACH_PROMPT.into(),
+            content: routed_content,
             background: true,
             attachments: Vec::new(),
             created_at: "2026-08-30T00:00:00Z".into(),
@@ -22723,7 +23407,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn provider_cooldown_wait_observes_extensions() {
         let scheduler = Arc::new(TurnScheduler::new());
-        scheduler.record_outcome("provider/model", Some("429 rate limit"));
+        let first_order = scheduler.next_attempt_order();
+        scheduler.record_ordered_outcome("provider/model", Some("429 rate limit"), first_order);
         let cancel = tokio_util::sync::CancellationToken::new();
         let waiter = {
             let scheduler = Arc::clone(&scheduler);
@@ -22732,7 +23417,8 @@ mod tests {
 
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_millis(500)).await;
-        scheduler.record_outcome("provider/model", Some("429 rate limit"));
+        let second_order = scheduler.next_attempt_order();
+        scheduler.record_ordered_outcome("provider/model", Some("429 rate limit"), second_order);
         tokio::time::advance(Duration::from_millis(500)).await;
         tokio::task::yield_now().await;
         assert!(!waiter.is_finished());
@@ -23993,6 +24679,12 @@ mod tests {
         release: Arc<tokio::sync::Semaphore>,
     }
 
+    struct RoutedTitleProvider {
+        id: String,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        fail: bool,
+    }
+
     fn catalog_test_model(id: &str, display_name: &str) -> trouve_protocol::ModelInfo {
         trouve_protocol::ModelInfo {
             id: id.into(),
@@ -24103,6 +24795,10 @@ mod tests {
             "title-test"
         }
 
+        fn shared_model_identity(&self, model: &str) -> Option<String> {
+            (model == "model").then(|| model.to_string())
+        }
+
         fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
             vec![catalog_test_model("title-test/model", "Title test model")]
         }
@@ -24119,6 +24815,47 @@ mod tests {
             self.release.acquire().await.unwrap().forget();
             Ok(Box::pin(futures::stream::iter(vec![
                 Ok(ProviderEvent::TextDelta("Prioritize Local Naming".into())),
+                Ok(ProviderEvent::Completed {
+                    usage: Usage::default(),
+                }),
+            ])))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for RoutedTitleProvider {
+        fn id(&self) -> &str {
+            &self.id
+        }
+
+        fn shared_model_identity(&self, model: &str) -> Option<String> {
+            (model == "model").then(|| model.to_string())
+        }
+
+        fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
+            vec![catalog_test_model(
+                &format!("{}/model", self.id),
+                "Routed title model",
+            )]
+        }
+
+        async fn stream_chat(
+            &self,
+            model: &str,
+            _messages: &[trouve_providers::Message],
+            tools: &[trouve_providers::ToolSpec],
+            _options: &serde_json::Map<String, serde_json::Value>,
+        ) -> Result<trouve_providers::EventStream, trouve_providers::ProviderError> {
+            assert_eq!(model, "model");
+            assert!(tools.is_empty());
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fail {
+                return Err(trouve_providers::ProviderError::Request(
+                    "injected naming failure".into(),
+                ));
+            }
+            Ok(Box::pin(futures::stream::iter(vec![
+                Ok(ProviderEvent::TextDelta("Recover Routed Naming".into())),
                 Ok(ProviderEvent::Completed {
                     usage: Usage::default(),
                 }),
@@ -25543,13 +26280,15 @@ mod tests {
     #[tokio::test]
     async fn await_spawned_descendants_bounds_the_whole_digest() {
         let (engine, _temp, parent, first_child) = await_subagents_fixture("total");
-        // Enough children at the per-child cap to overrun the whole-digest
-        // budget, so the later ones must be reported by status only.
+        // Enough failed children with long titles, errors, and messages to
+        // overrun the whole-digest budget, so the later ones must be reported
+        // by status only.
         let child_count = SUBAGENT_DIGEST_TOTAL_BYTES / SUBAGENT_DIGEST_MESSAGE_BYTES + 2;
         let mut children = vec![first_child.clone()];
         for index in 1..child_count {
             let child = Thread {
                 id: format!("{}_{index}", first_child.id),
+                title: Some("wide metadata ".repeat(SUBAGENT_DIGEST_TITLE_BYTES)),
                 ..first_child.clone()
             };
             engine
@@ -25559,6 +26298,7 @@ mod tests {
             children.push(child);
         }
         let long_message = format!("{}END", "x".repeat(SUBAGENT_DIGEST_MESSAGE_BYTES * 2));
+        let long_error = format!("{}ERROR_END", "e".repeat(SUBAGENT_DIGEST_ERROR_BYTES * 4));
         for child in &children {
             engine
                 .active_threads
@@ -25574,10 +26314,9 @@ mod tests {
                             turn: 1,
                             content: long_message.clone(),
                         },
-                        Event::TurnCompleted {
+                        Event::TurnFailed {
                             turn: 1,
-                            checkpoint_id: None,
-                            usage: Usage::default(),
+                            error: long_error.clone(),
                         },
                     ],
                 )
@@ -25604,16 +26343,16 @@ mod tests {
         .unwrap();
 
         assert!(!digest.contains("END"));
+        assert!(digest.contains("Error: "));
+        assert!(!digest.contains("ERROR_END"));
         assert!(digest.contains("final message truncated"));
         assert!(digest.contains("final message omitted"));
         assert!(digest.contains("search_transcript"));
         for child in &children {
             assert!(digest.contains(&child.id), "digest names {}", child.id);
         }
-        // The prose around each result is small; the message payload itself
-        // must stay inside the whole-digest budget.
         assert!(
-            digest.len() < SUBAGENT_DIGEST_TOTAL_BYTES + child_count * 512,
+            digest.len() <= SUBAGENT_DIGEST_TOTAL_BYTES,
             "digest is {} bytes",
             digest.len()
         );
@@ -25625,6 +26364,12 @@ mod tests {
                 _ => None,
             })
             .expect("await_subagents tool result");
+        let serialized_result = serde_json::to_vec(&result).unwrap();
+        assert!(
+            serialized_result.len() <= SUBAGENT_DIGEST_TOTAL_BYTES,
+            "tool result is {} bytes",
+            serialized_result.len()
+        );
         let reported = result["subagents"].as_array().unwrap();
         assert_eq!(reported.len(), child_count);
         let message_bytes: usize = reported
@@ -25702,7 +26447,11 @@ mod tests {
                 _ => None,
             })
             .expect("await_subagents tool result");
-        assert_eq!(result["subagents"][0]["error"], long_error);
+        let reported = &result["subagents"][0];
+        let reported_error = reported["error"].as_str().unwrap();
+        assert!(!reported_error.contains("END"));
+        assert!(reported_error.len() <= SUBAGENT_DIGEST_ERROR_BYTES);
+        assert_eq!(reported["error_truncated"], true);
     }
 
     #[tokio::test]
@@ -25744,6 +26493,57 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn await_spawned_descendants_times_out_without_stopping_the_child() {
+        let (engine, _temp, parent, child) = await_subagents_fixture("timeout");
+        engine
+            .active_threads
+            .lock()
+            .unwrap()
+            .insert(child.id.clone(), parent.session_id.clone());
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let waiter = {
+            let engine = Arc::clone(&engine);
+            let parent = parent.clone();
+            tokio::spawn(async move { engine.await_spawned_descendants(&parent, 2, &cancel).await })
+        };
+        tokio::task::yield_now().await;
+
+        tokio::time::advance(SUBAGENT_WAIT_TIMEOUT + Duration::from_millis(1)).await;
+        let digest = waiter.await.unwrap().unwrap();
+
+        assert!(digest.is_none());
+        assert!(
+            engine
+                .active_threads
+                .lock()
+                .unwrap()
+                .contains_key(&child.id),
+            "timing out the parent wait must not cancel or discard the child"
+        );
+        let events = parent_events(&engine, &parent);
+        match &events[3] {
+            Event::ToolCompleted {
+                status: ToolStatus::Error,
+                result,
+                ..
+            } => {
+                assert_eq!(result["timed_out"], true);
+                assert_eq!(result["thread_ids"], serde_json::json!([child.id]));
+                assert!(result["error"].as_str().unwrap().contains("1800 seconds"));
+            }
+            other => panic!("expected timed-out ToolCompleted, got {other:?}"),
+        }
+        assert!(matches!(
+            events.last(),
+            Some(Event::TurnPhaseChanged {
+                turn: 2,
+                phase: TurnPhase::Processing,
+            })
+        ));
+        assert_eq!(events.len(), 5);
     }
 
     #[test]
@@ -25878,6 +26678,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn automatic_session_naming_fails_over_between_provider_routes() {
+        let data = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let workspace = Workspace {
+            id: "ws_routed_title".into(),
+            name: "routed title".into(),
+            path: data.path().to_string_lossy().into_owned(),
+        };
+        store.insert_workspace(&workspace).unwrap();
+        let session = Session {
+            id: "se_routed_title".into(),
+            workspace_id: workspace.id,
+            title: "New Session".into(),
+            branch: "trouve/routed-title".into(),
+            worktree_path: data.path().to_string_lossy().into_owned(),
+            base_ref: "main".into(),
+            archived: false,
+            active: false,
+            created_at: chrono::Utc::now(),
+        };
+        store.insert_session(&session).unwrap();
+        let failed_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let healthy_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let engine = Engine::new(
+            store,
+            data.path().into(),
+            &Config {
+                provider_order: vec!["failed".into(), "healthy".into()],
+                session_naming_model: Some("auto/model".into()),
+                local_enabled: Some(false),
+                ..Default::default()
+            },
+        )
+        .with_provider(
+            "failed",
+            Arc::new(RoutedTitleProvider {
+                id: "failed".into(),
+                calls: failed_calls.clone(),
+                fail: true,
+            }),
+        )
+        .with_provider(
+            "healthy",
+            Arc::new(RoutedTitleProvider {
+                id: "healthy".into(),
+                calls: healthy_calls.clone(),
+                fail: false,
+            }),
+        );
+
+        let title = engine
+            .generate_title(&session.id, "Route naming automatically", &[])
+            .await
+            .unwrap();
+        assert_eq!(title.title, "Recover Routed Naming");
+        assert_eq!(failed_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(healthy_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn identical_title_requests_share_one_provider_inference() {
         let data = tempfile::tempdir().unwrap();
         let store = Store::open_in_memory().unwrap();
@@ -25908,7 +26768,7 @@ mod tests {
                 data.path().into(),
                 &Config {
                     local_enabled: Some(false),
-                    session_naming_model: Some("title-test/model".into()),
+                    session_naming_model: Some("auto/model".into()),
                     ..Default::default()
                 },
             )
@@ -25941,12 +26801,7 @@ mod tests {
                     .await
             }
         });
-        let coalesced_key = title_job_key(
-            &session.id,
-            "title-test/model",
-            "Schedule local naming",
-            &[],
-        );
+        let coalesced_key = title_job_key(&session.id, "auto/model", "Schedule local naming", &[]);
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             loop {
                 let waiter_count = engine
@@ -25996,8 +26851,7 @@ mod tests {
         );
 
         engine.title_jobs.lock().unwrap().clear();
-        let follower_key =
-            title_job_key(&session.id, "title-test/model", "Too many followers", &[]);
+        let follower_key = title_job_key(&session.id, "auto/model", "Too many followers", &[]);
         let mut follower_receivers = Vec::with_capacity(MAX_TITLE_JOB_FOLLOWERS);
         let follower_senders = (0..MAX_TITLE_JOB_FOLLOWERS)
             .map(|_| {
@@ -30350,9 +31204,11 @@ default_permission_mode = "ask"
         for url in [
             "http://localhost:11434",
             "http://LOCALHOST:11434/v1",
+            "http://localhost.:11434/v1",
             "http://127.0.0.1:8080/v1",
             "https://127.1.2.3", // whole 127/8 block is loopback
             "http://[::1]:8000",
+            "http://[::ffff:127.0.0.1]:8000/v1",
         ] {
             assert!(is_loopback_base_url(url), "should be loopback: {url}");
         }
@@ -30721,6 +31577,41 @@ default_permission_mode = "ask"
         let capped = cap_chars(&"é".repeat(100), 21);
         assert!(capped.starts_with("éééééééééé"));
         assert!(capped.ends_with("[truncated]"));
+    }
+
+    #[test]
+    fn subagent_tool_result_bounds_escaped_payloads_and_descendant_metadata() {
+        let statuses = (0..MAX_ACTIVE_DESCENDANTS)
+            .map(|index| {
+                serde_json::json!({
+                    "thread_id": format!("th_{index}"),
+                    "status": "failed",
+                    "last_message": "\"\n".repeat(SUBAGENT_DIGEST_MESSAGE_BYTES / 2),
+                    "error": "\\\n".repeat(SUBAGENT_DIGEST_ERROR_BYTES / 2),
+                    "failed_descendants": (0..2_000)
+                        .map(|descendant| format!("th_{index}_{descendant}_{}", "x".repeat(16)))
+                        .collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+
+        let result = bounded_subagent_tool_result(statuses);
+        let serialized = serde_json::to_vec(&result).unwrap();
+
+        assert!(
+            serialized.len() <= SUBAGENT_DIGEST_TOTAL_BYTES,
+            "tool result is {} bytes",
+            serialized.len()
+        );
+        assert_eq!(result["total_subagents"], MAX_ACTIVE_DESCENDANTS);
+        assert_eq!(result["truncated"], true);
+        assert!(
+            result["subagents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|status| status["details_omitted"] == true)
+        );
     }
 
     #[test]
@@ -32485,7 +33376,10 @@ default_permission_mode = "ask"
                         2,
                         &mode,
                         &ctx,
-                        calls(&["write_one", "write_two"]),
+                        // Driving a background process is an arbitrary write,
+                        // unlike polling or terminating it, and must retain
+                        // the same session lane as every other mutation.
+                        calls(&["write_stdin", "write_two"]),
                         &tokio_util::sync::CancellationToken::new(),
                     )
                     .await
@@ -32548,6 +33442,27 @@ default_permission_mode = "ask"
         );
         // Safety: restore the unique test variable.
         unsafe { std::env::remove_var(ENV_ONLY) };
+    }
+
+    #[tokio::test]
+    async fn automatic_selector_namespace_cannot_be_a_provider_id() {
+        let data = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::new(
+            Store::open_in_memory().unwrap(),
+            data.path().to_path_buf(),
+            &Config::default(),
+        ));
+        let error = engine
+            .upsert_provider(
+                "auto",
+                &UpsertProviderRequest {
+                    kind: "openai-compat".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("reserved"));
     }
 
     #[tokio::test]

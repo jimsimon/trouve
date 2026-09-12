@@ -52,6 +52,17 @@ export type AgentBodySpan =
 const toolCallNeedsApproval = (item: AgentActivityItem): boolean =>
   item.kind === "tool" && item.status === "awaiting-approval";
 
+/** Legacy clients represented the same boundary as a synthetic tool directly
+ * before the native lifecycle marker. Only that adjacent pair is redundant;
+ * another legacy boundary in the turn remains independently visible. */
+const legacyCompactionIsShadowed = (
+  items: readonly AgentChatItem[],
+  index: number,
+): boolean =>
+  items[index]?.kind === "tool"
+  && isContextCompactionTool(items[index] as AgentActivityItem)
+  && items[index + 1]?.kind === "compaction";
+
 const activityFollows = (
   items: readonly AgentChatItem[],
   start: number,
@@ -60,7 +71,10 @@ const activityFollows = (
   for (let cursor = start; cursor < items.length; cursor += 1) {
     const candidate = items[cursor];
     if (candidate === undefined) return false;
-    if (candidate.kind === "tool" && isContextCompactionTool(candidate)) continue;
+    if (candidate.kind === "tool" && isContextCompactionTool(candidate)) {
+      if (legacyCompactionIsShadowed(items, cursor)) continue;
+      return false;
+    }
     return (candidate.kind === "progress" && candidate.id !== responseId)
       || candidate.kind === "thinking"
       || candidate.kind === "todo"
@@ -74,24 +88,20 @@ const activityFollows = (
 export const activityRunItems = (
   items: readonly AgentChatItem[],
   span: { readonly start: number; readonly end: number },
-  hasNativeCompaction: boolean,
 ): AgentActivityItem[] => {
   const run: AgentActivityItem[] = [];
   for (let index = span.start; index < span.end; index += 1) {
     const candidate = items[index];
     if (candidate === undefined) continue;
     if (
-      hasNativeCompaction
-      && candidate.kind === "tool"
+      candidate.kind === "tool"
       && isContextCompactionTool(candidate)
+      && legacyCompactionIsShadowed(items, index)
     ) continue;
     run.push(candidate as AgentActivityItem);
   }
   return run;
 };
-
-export const hasNativeCompactionMarker = (items: readonly AgentChatItem[]): boolean =>
-  items.some((item) => item.kind === "compaction");
 
 /** Rendered-row budget per virtual row. Each item in a span costs one row
  * because expanded groups mount one card per item. */
@@ -111,7 +121,6 @@ export const planAgentBody = (
   responseId?: string,
 ): readonly AgentBodySpan[] => {
   const spans: AgentBodySpan[] = [];
-  const hasNativeCompaction = hasNativeCompactionMarker(items);
   let index = 0;
   while (index < items.length) {
     const item = items[index];
@@ -154,7 +163,7 @@ export const planAgentBody = (
       continue;
     }
     if (item.kind === "tool" && isContextCompactionTool(item)) {
-      if (hasNativeCompaction) {
+      if (legacyCompactionIsShadowed(items, index)) {
         spans.push({
           kind: "skip",
           start: index,

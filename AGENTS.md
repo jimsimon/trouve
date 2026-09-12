@@ -104,6 +104,11 @@ These are load-bearing. Do not violate them without a new ADR.
     is declared before launch and transferred to a scoped managed-background
     owner together with its cancellation and resource leases; self-daemonizing
     is never an implicit ownership transfer (ADR 0049).
+11. **Model identity is separate from execution route.** A concrete
+    `provider/model` selection is a hard pin. An `auto/model` selection may use
+    only catalog-compatible hosted routes, preserves thread affinity while
+    healthy, and crosses adapters solely through the durable transcript and
+    worktree boundary under bounded failover (ADRs 0053 and 0054).
 
 ## Conventions
 

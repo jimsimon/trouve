@@ -20,3 +20,76 @@ test("persona retry labels describe the actual terminal state", () => {
   );
   assert.match(source, /group\.persona \? "Retry all" : "Retry"/u);
 });
+
+test("model discovery does not block unrelated repository and persona saves", () => {
+  const repositoryEditor = source.slice(
+    source.indexOf("function RepositoryEditor"),
+    source.indexOf("function ReviewersPage"),
+  );
+  const reviewerEditor = source.slice(
+    source.indexOf("function ReviewerEditor"),
+    source.indexOf("function StatsPage"),
+  );
+  assert.match(source, /void loadModelRoutes\(\);/u);
+  const configurationLoader = source.slice(
+    source.indexOf("const loadConfiguration"),
+    source.indexOf("const isConfigurationRoute"),
+  );
+  assert.match(configurationLoader, /void loadStaticModels\(\);/u);
+  assert.doesNotMatch(
+    configurationLoader,
+    /Promise\.allSettled\(\[\s*getModels\(\)/u,
+  );
+  const staticLoader = source.slice(
+    source.indexOf("const loadStaticModels"),
+    source.indexOf("const loadConfiguration"),
+  );
+  assert.doesNotMatch(
+    staticLoader,
+    /current\.loaded \? current : \{ \.\.\.current, error \}/u,
+  );
+  assert.match(
+    staticLoader,
+    /current\.loaded \? current : \{ \.\.\.current, models, loaded: true \}/u,
+  );
+  assert.doesNotMatch(
+    repositoryEditor,
+    /disabled=\{busy \|\| !modelsLoaded \|\| reviewerPolicyInvalid/u,
+  );
+  assert.doesNotMatch(reviewerEditor, /disabled=\{busy \|\| !modelsLoaded\}>/u);
+});
+
+test("model discovery retries independently on configuration routes", () => {
+  assert.match(
+    source,
+    /const \[staticModelError, setStaticModelError\] = useState\(""\);/u,
+  );
+  assert.match(
+    source,
+    /if \(!isConfigurationRoute \|\| !staticModelError\) return;[\s\S]*?void loadStaticModels\(\);/u,
+  );
+  assert.match(
+    source,
+    /if \(!isConfigurationRoute \|\| !modelCatalog\.error\) return;[\s\S]*?void loadModelRoutes\(\);/u,
+  );
+  assert.doesNotMatch(source, /\bneedsConfiguration\b/u);
+  assert.equal(
+    [...source.matchAll(/modelsError=\{modelCatalog\.error \|\| staticModelError\}/gu)].length,
+    3,
+  );
+  const repositoriesPage = source.slice(
+    source.indexOf("function RepositoriesPage"),
+    source.indexOf("function ThinkingSetting"),
+  );
+  const reviewersPage = source.slice(
+    source.indexOf("function ReviewersPage"),
+    source.indexOf("function ReviewerEditor"),
+  );
+  for (const page of [repositoriesPage, reviewersPage]) {
+    assert.match(
+      page,
+      /const modelCatalogStatus = modelCatalogStatusMessage\(modelsLoaded, modelsError\);/u,
+    );
+    assert.match(page, /role="status"[\s\S]*?\{modelCatalogStatus\}/u);
+  }
+});

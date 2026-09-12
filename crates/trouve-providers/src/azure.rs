@@ -65,6 +65,12 @@ impl Provider for AzureOpenAiProvider {
         self.inner.id()
     }
 
+    fn shared_model_identity(&self, model: &str) -> Option<String> {
+        (!model.starts_with("claude-"))
+            .then(|| self.inner.shared_model_identity(model))
+            .flatten()
+    }
+
     fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
         self.compatible_models(self.inner.models())
     }

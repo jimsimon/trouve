@@ -300,8 +300,8 @@ pub struct ThreadViewModel {
     latest_thinking_turn: Option<u64>,
     /// Current transient startup activity for the running turn.
     pub turn_phase: Option<TurnPhase>,
-    /// The model that ran each turn ("cursor/claude-fable-5"), from
-    /// turn.started — shown in the agent card header.
+    /// The model that ran each turn ("cursor/claude-fable-5"). Automatic
+    /// selectors from turn.started are replaced by model.route_selected.
     pub turn_models: HashMap<u64, String>,
     /// The effective provider-native thinking selection for each turn, from
     /// turn.started — shown alongside the model in the agent card header.
@@ -728,6 +728,18 @@ impl ThreadViewModel {
                 };
                 self.items.push(ChatItem::TurnStatus { turn: *turn, state });
                 Some(self.items.len() - 1)
+            }
+            Event::ModelRouteSelected {
+                turn,
+                provider_id,
+                provider_model,
+                ..
+            } => {
+                self.turn_models
+                    .insert(*turn, format!("{provider_id}/{provider_model}"));
+                self.items.iter().rposition(
+                    |item| matches!(item, ChatItem::TurnStatus { turn: item_turn, .. } if item_turn == turn),
+                )
             }
             Event::TurnPhaseChanged { phase, .. } => {
                 self.turn_phase = Some(*phase);
@@ -1531,6 +1543,30 @@ mod tests {
 
         vm.apply(&env(Event::TurnCancelled { turn: 1 }));
         assert_eq!(vm.turn_phase, None);
+    }
+
+    #[test]
+    fn automatic_route_replaces_the_turn_selector_with_its_concrete_model() {
+        let mut vm = ThreadViewModel::new();
+        vm.apply(&env(Event::TurnStarted {
+            turn: 1,
+            mode: "code".into(),
+            model: "auto/gpt-5.6-sol".into(),
+            thinking_level: None,
+            supports_steering: false,
+        }));
+        vm.apply(&env(Event::ModelRouteSelected {
+            turn: 1,
+            model: "auto/gpt-5.6-sol".into(),
+            provider_id: "codex".into(),
+            provider_model: "gpt-5.6-sol".into(),
+            reason: trouve_protocol::ModelRouteReason::Initial,
+        }));
+
+        assert_eq!(
+            vm.turn_models.get(&1).map(String::as_str),
+            Some("codex/gpt-5.6-sol")
+        );
     }
 
     #[test]

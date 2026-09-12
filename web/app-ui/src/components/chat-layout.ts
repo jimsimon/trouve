@@ -62,11 +62,11 @@ const isAgentItem = (item: ThreadChatItem): item is AgentChatItem =>
 export const reasoningHasBody = (content: string): boolean => {
   const lines = content.split("\n").map((line) => line.trim()).filter((line) => line !== "");
   if (lines.length === 0) return false;
-  if (lines.length > 1) return true;
-  const line = lines[0] ?? "";
-  if (/^#{1,6}\s+\S/u.test(line)) return false;
-  const bold = /^(\*\*|__)(.+)\1$/u.exec(line);
-  return bold === null || bold[2]?.includes(bold[1] ?? "") === true;
+  return lines.some((line) => {
+    if (/^#{1,6}\s+\S/u.test(line)) return false;
+    const bold = /^(\*\*|__)(.+)\1$/u.exec(line);
+    return bold === null || bold[2]?.includes(bold[1] ?? "") === true;
+  });
 };
 
 interface MutableTurnUnit {

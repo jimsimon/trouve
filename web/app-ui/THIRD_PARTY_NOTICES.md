@@ -11,6 +11,9 @@ WebAwesome is the MIT-licensed Free distribution (`@awesome.me/webawesome`).
 The Pro distribution is prohibited by the generator unless a future ADR and
 license review deliberately change that policy.
 
+The corresponding source for `elkjs` 0.11.1 is available from
+https://github.com/kieler/elkjs/tree/0.11.1.
+
 | Package | Version | License | Scope |
 | --- | --- | --- | --- |
 | @awesome.me/webawesome | 3.11.0 | MIT | runtime/transitive |
