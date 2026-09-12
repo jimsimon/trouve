@@ -563,8 +563,11 @@ impl ModelsDevCatalog {
     /// provider's model.
     pub fn shared_model_identity(&self, catalog_provider: &str, model_id: &str) -> Option<String> {
         let state = self.state.read().unwrap();
-        if let Some(patch) = overlay_provider_by_setup_id(&state.owned, catalog_provider)
-            .and_then(|provider| provider.models.get(model_id))
+        // The refreshed roster (when present) replaces the bundled seed, so a
+        // vendor-served public model acquires its automatic route as soon as
+        // the vendor reports it, not only when the seed happens to list it.
+        if let Some(patch) =
+            owned_provider_models(&state, catalog_provider).and_then(|models| models.get(model_id))
         {
             let base = patch.as_object()?.get("base_model")?.as_str()?;
             let (provider, source_id) = base.split_once('/')?;
@@ -1585,8 +1588,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn shared_identity_follows_reviewed_base_models_only() {
+    #[tokio::test]
+    async fn shared_identity_follows_reviewed_base_models_only() {
         let catalog = ModelsDevCatalog::fixture();
 
         assert_eq!(
@@ -1597,6 +1600,31 @@ mod tests {
             catalog.shared_model_identity("openai-codex", "gpt-5.6-sol"),
             Some("gpt-5.6-sol".into())
         );
+        // Cursor's public models arrive through the vendor-refreshed roster,
+        // which replaces the bundled seed for that provider.
+        assert_eq!(catalog.shared_model_identity("cursor", "gpt-5.6-sol"), None);
+        let mut roster = BTreeMap::new();
+        roster.insert(
+            "gpt-5.6-sol".to_string(),
+            json!({"base_model": "openai/gpt-5.6-sol", "reasoning_options": []}),
+        );
+        roster.insert(
+            "gemini-3.1-pro".to_string(),
+            json!({"base_model": "google/gemini-3.1-pro-preview"}),
+        );
+        roster.insert(
+            "default".to_string(),
+            json!({"name": "Auto", "tool_call": true}),
+        );
+        roster.insert(
+            "composer-2.5".to_string(),
+            json!({"name": "Composer 2.5", "tool_call": true}),
+        );
+        roster.insert(
+            "claude-opus-5".to_string(),
+            json!({"base_model": "anthropic/claude-opus-5", "reasoning_options": []}),
+        );
+        catalog.replace_roster("cursor", roster).await.unwrap();
         assert_eq!(
             catalog.shared_model_identity("cursor", "gpt-5.6-sol"),
             Some("gpt-5.6-sol".into())
@@ -1615,8 +1643,8 @@ mod tests {
             None
         );
 
-        // An owned choice becomes routable once the reviewed overlay gives it
-        // an explicit public base-model identity.
+        // An owned choice becomes routable once its roster entry gives it an
+        // explicit public base-model identity.
         assert_eq!(
             catalog.shared_model_identity("cursor", "claude-opus-5"),
             Some("claude-opus-5".into())
