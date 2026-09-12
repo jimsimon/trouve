@@ -1,0 +1,233 @@
+import type { ProtocolModelInfo } from "@trouve-ai/protocol/client";
+import { createComputed, createSignal, type ReadonlySignal } from "@trouve-ai/ui-foundation/reactivity";
+
+export type ModelCatalogFreshness = "if-stale" | "force";
+
+export {
+  type ModelSelectionCatalogEntry,
+  modelForSelection,
+  modelSelectionValue,
+} from "@trouve-ai/protocol/model-selection";
+
+const DEFAULT_LIVE_TTL_MS = 300_000;
+
+interface ModelCatalogProtocol {
+  models(): Promise<readonly ProtocolModelInfo[]>;
+  modelRoutes(): Promise<readonly ProtocolModelInfo[]>;
+}
+
+/** App-wide stale-while-revalidate model catalog.
+ *
+ * The static endpoint is intentionally first-paint safe. Live provider and
+ * vendor-CLI discovery follows in one coalesced request and replaces the
+ * signal when it resolves, so Cursor can enrich every picker without holding
+ * any setup or composer control behind ACP startup.
+ */
+export class ModelCatalogController {
+  readonly #protocol: ModelCatalogProtocol;
+  readonly #now: () => number;
+  readonly #liveTtlMs: number;
+  readonly #current = createSignal<readonly ProtocolModelInfo[]>(
+    Object.freeze([]),
+  );
+  readonly current: ReadonlySignal<readonly ProtocolModelInfo[]> = this.#current;
+  readonly #static = createSignal<readonly ProtocolModelInfo[]>(
+    Object.freeze([]),
+  );
+  readonly staticCurrent: ReadonlySignal<readonly ProtocolModelInfo[]> = this.#static;
+  readonly #live = createSignal<readonly ProtocolModelInfo[]>(
+    Object.freeze([]),
+  );
+  readonly #liveListeners = new Set<
+    (models: readonly ProtocolModelInfo[]) => void
+  >();
+  readonly #liveLoaded = createSignal(false);
+  readonly liveLoaded: ReadonlySignal<boolean> = this.#liveLoaded;
+  readonly #refreshing = createSignal(false);
+  readonly refreshing: ReadonlySignal<boolean> = this.#refreshing;
+  /** Whether the server has downloaded the public model catalog (mirrors
+   * `ServerInfo.catalog_available`). While false, empty results are transient
+   * ("downloading") rather than "no models", and they are never cached as
+   * fresh. */
+  readonly #isCatalogAvailable: () => boolean;
+  readonly catalogAvailable: ReadonlySignal<boolean>;
+
+  #staticPending: Promise<readonly ProtocolModelInfo[]> | undefined;
+  #livePending: Promise<readonly ProtocolModelInfo[]> | undefined;
+  #livePendingForced = false;
+  #staticLoaded = false;
+  #staticFailure: { readonly error: unknown } | undefined;
+  #lastLiveCheckedAt: number | undefined;
+  #generation = 0;
+  #revision = 0;
+
+  constructor(
+    protocol: ModelCatalogProtocol,
+    options: {
+      readonly now?: () => number;
+      readonly liveTtlMs?: number;
+      readonly catalogAvailable?: () => boolean;
+    } = {},
+  ) {
+    this.#protocol = protocol;
+    this.#now = options.now ?? (() => Date.now());
+    this.#liveTtlMs = options.liveTtlMs ?? DEFAULT_LIVE_TTL_MS;
+    this.#isCatalogAvailable = options.catalogAvailable ?? (() => true);
+    this.catalogAvailable = createComputed(() => this.#isCatalogAvailable());
+  }
+
+  refresh(
+    freshness: ModelCatalogFreshness = "if-stale",
+  ): Promise<readonly ProtocolModelInfo[]> {
+    const current = this.#current.get();
+    if (
+      freshness === "if-stale"
+      && (current.length > 0 || this.#liveLoaded.get())
+    ) {
+      if (!this.#staticLoaded) void this.#loadStatic().catch(() => undefined);
+      void this.#refreshLive(freshness).catch(() => undefined);
+      return Promise.resolve(current);
+    }
+    const immediate = this.#loadStatic();
+    void immediate
+      .then(() => this.#refreshLive(freshness))
+      .catch(() => undefined);
+    return immediate;
+  }
+
+  /** Authoritative offline-safe metadata used to resolve configured defaults. */
+  staticModels(): Promise<readonly ProtocolModelInfo[]> {
+    if (this.#staticPending !== undefined) {
+      return this.#staticLoaded
+        ? this.#staticPending.catch(() => this.#static.get())
+        : this.#staticPending;
+    }
+    const current = this.#static.get();
+    return this.#staticLoaded ? Promise.resolve(current) : this.#loadStatic();
+  }
+
+  /** Wait for live availability while retaining the static first-paint path. */
+  liveModels(
+    freshness: ModelCatalogFreshness = "if-stale",
+  ): Promise<readonly ProtocolModelInfo[]> {
+    const knownStaticFailure = this.#staticFailure;
+    void this.staticModels().catch(() => undefined);
+    return this.#refreshLive(freshness).catch((liveError: unknown) => {
+      if (!this.#staticLoaded && this.#staticPending === undefined) {
+        const failure = this.#staticFailure ?? knownStaticFailure;
+        if (failure !== undefined) throw failure.error;
+      }
+      throw liveError;
+    });
+  }
+
+  subscribeLive(
+    listener: (models: readonly ProtocolModelInfo[]) => void,
+  ): () => void {
+    this.#liveListeners.add(listener);
+    return () => this.#liveListeners.delete(listener);
+  }
+
+  #publishLive(models: readonly ProtocolModelInfo[]): void {
+    for (const listener of this.#liveListeners) {
+      try {
+        listener(models);
+      } catch {
+        // Consumer failures must not turn successful discovery into a refresh failure.
+      }
+    }
+  }
+
+  #loadStatic(): Promise<readonly ProtocolModelInfo[]> {
+    if (this.#staticPending !== undefined) return this.#staticPending;
+    const promise = this.#protocol.models().then(
+      (models) => {
+        const snapshot = Object.freeze([...models]);
+        this.#staticLoaded = true;
+        this.#staticFailure = undefined;
+        this.#static.set(snapshot);
+        this.#current.set(this.#liveLoaded.get() ? this.#live.get() : snapshot);
+        return snapshot;
+      },
+      (error: unknown) => {
+        this.#staticFailure = { error };
+        throw error;
+      },
+    ).finally(() => {
+      if (this.#staticPending === promise) this.#staticPending = undefined;
+    });
+    this.#staticPending = promise;
+    return promise;
+  }
+
+  #refreshLive(
+    freshness: ModelCatalogFreshness,
+  ): Promise<readonly ProtocolModelInfo[]> {
+    if (this.#livePending !== undefined) {
+      if (freshness === "force") this.#livePendingForced = true;
+      return this.#livePending;
+    }
+    const now = this.#now();
+    const fresh = this.#lastLiveCheckedAt !== undefined
+      && Math.max(0, now - this.#lastLiveCheckedAt) < this.#liveTtlMs;
+    if (freshness === "if-stale" && fresh) {
+      return Promise.resolve(this.#current.get());
+    }
+
+    const generation = ++this.#generation;
+    this.#livePendingForced = freshness === "force";
+    let resolvePending!: (models: readonly ProtocolModelInfo[]) => void;
+    let rejectPending!: (error: unknown) => void;
+    const promise = new Promise<readonly ProtocolModelInfo[]>((resolve, reject) => {
+      resolvePending = resolve;
+      rejectPending = reject;
+    });
+    const finish = (): boolean => {
+      if (this.#livePending !== promise) return false;
+      this.#livePending = undefined;
+      this.#livePendingForced = false;
+      this.#refreshing.set(false);
+      return true;
+    };
+    this.#livePending = promise;
+    this.#refreshing.set(true);
+    let request: Promise<readonly ProtocolModelInfo[]>;
+    try {
+      request = this.#protocol.modelRoutes();
+    } catch (error: unknown) {
+      request = Promise.reject(error);
+    }
+    void request.then(
+        (models) => {
+          if (!finish() || generation !== this.#generation) {
+            return this.#current.get();
+          }
+          const snapshot = Object.freeze([...models]);
+          // An empty roster from a server that is still downloading its
+          // catalog must not be cached as fresh.
+          this.#lastLiveCheckedAt = this.#isCatalogAvailable() ? this.#now() : undefined;
+          this.#liveLoaded.set(true);
+          this.#live.set(snapshot);
+          this.#current.set(snapshot);
+          this.#publishLive(snapshot);
+          return snapshot;
+        },
+        (error: unknown) => {
+          const forced = this.#livePendingForced;
+          if (!finish() || generation !== this.#generation) {
+            return this.#current.get();
+          }
+          if (!forced && this.#liveLoaded.get()) {
+            this.#lastLiveCheckedAt = this.#now();
+          } else {
+            this.#lastLiveCheckedAt = undefined;
+            this.#liveLoaded.set(false);
+            if (this.#staticLoaded) this.#current.set(this.#static.get());
+          }
+          throw error;
+        },
+      )
+      .then(resolvePending, rejectPending);
+    return promise;
+  }
+}

@@ -1,0 +1,41 @@
+{
+  "name": "@trouve-ai/code-review",
+  "version": "4.11.0",
+  "private": true,
+  "type": "module",
+  "description": "Lit code review dashboard shared by the self-hosted review site and the desktop app, drawn from the ui-foundation design system and rendering task activity through the shared transcript: the review operations screens, the parameterized review API client, protocol types, and the dashboard stylesheet.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jimsimon/trouve.git",
+    "directory": "web/packages/code-review"
+  },
+  "exports": {
+    "./api": "./src/api.ts",
+    "./app": "./src/app.ts",
+    "./cli": "./src/cli.ts",
+    "./model-settings": "./src/model-settings.ts",
+    "./provider-settings": "./src/provider-settings.ts",
+    "./review-output": "./src/review-output.ts",
+    "./review-progress": "./src/review-progress.ts",
+    "./review-settings": "./src/review-settings.ts",
+    "./review-transcript": "./src/review-transcript.ts",
+    "./route": "./src/route.ts",
+    "./routing-labels": "./src/routing-labels.ts",
+    "./security": "./src/security.ts",
+    "./styles.css": "./src/styles.css",
+    "./types": "./src/types.ts"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "dependencies": {
+    "@trouve-ai/ui-foundation": "4.11.0",
+    "chart.js": "^4.5.0",
+    "lit": "^3.3.3"
+  }
+}

@@ -69,7 +69,7 @@ class RustSbomTests(unittest.TestCase):
         self.assertIn(f"`{command}`", generated)
         self.assertIn(f"`{command} --check`", generated)
         self.assertIn(
-            "(../../web/app-ui/THIRD_PARTY_NOTICES.md)",
+            "(../../web/apps/app-ui/THIRD_PARTY_NOTICES.md)",
             generated,
         )
 

@@ -56,13 +56,13 @@ jobs:
         with:
           node-version: 24
           cache: npm
-          cache-dependency-path: web/app-ui/package-lock.json
+          cache-dependency-path: web/package-lock.json
       - name: Build desktop UI for the cached release app
         if: github.ref == 'refs/heads/main'
-        working-directory: web/app-ui
+        working-directory: web
         run: |
           npm ci
-          npm run build
+          npm run build --workspace apps/app-ui
       - name: Unit and integration tests (offline)
         run: cargo test --workspace
       # Match the release job's package set and target on trusted main pushes.
@@ -76,7 +76,7 @@ jobs:
           --package trouve-app
           --target ${{ matrix.target }}
         env:
-          TROUVE_APP_UI_DIST: ${{ github.workspace }}/web/app-ui/dist/desktop
+          TROUVE_APP_UI_DIST: ${{ github.workspace }}/web/apps/app-ui/dist/desktop
 
   # Windows-only dependencies and trait impls must be compiled on Windows.
   # Pull requests check the release profile so they can reuse the dependency

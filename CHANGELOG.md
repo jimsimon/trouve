@@ -39,6 +39,27 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **One Lit web frontend**: the self-hosted review dashboard is now a Lit
+  application (`@trouve-ai/code-review`) built in the same npm workspace as
+  the desktop app, replacing the separate Preact implementation. The
+  desktop's protocol client, design tokens, content rendering, and chat
+  transcript move into shared packages (`@trouve-ai/protocol`,
+  `@trouve-ai/ui-foundation`, `@trouve-ai/content-rendering`, and
+  `@trouve-ai/transcript`) that the desktop app imports and the review
+  dashboard builds on. The review dashboard's screens and behaviour are
+  unchanged.
+- **Screen readers hear concise transcript status instead of every streamed
+  fragment**: the chat log is no longer an `aria-live` region, so streamed
+  Markdown, tool output, and progress text are not announced piecemeal (or
+  as one large announcement once the turn settles). The running activity
+  label keeps its own status region, and a new one announces "Turn N
+  complete" when a turn the reader watched finishes; failed and cancelled
+  turns still announce through their own markers.
+- **The review dashboard uses the desktop design system**: the self-hosted
+  review site now renders from the same design tokens, controls, navigation,
+  and icons as the desktop app, with the same light, dark, and high-contrast
+  themes, and remembers a theme choice (defaulting to the system theme) in
+  its sidebar.
 - **Client/server compatibility**: protocol compatibility advances to 9.7 for
   the route catalog, provider preference order, sticky route selection,
   selected-route events, and the sticky `route` exposed on threads.
