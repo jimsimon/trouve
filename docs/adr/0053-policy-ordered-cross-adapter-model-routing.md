@@ -1,6 +1,6 @@
 # 0053 — Policy-ordered cross-adapter model routing
 
-Status: Accepted (2026-08).
+Status: Partially superseded by ADR 0054 (2026-08)
 
 ## Context
 

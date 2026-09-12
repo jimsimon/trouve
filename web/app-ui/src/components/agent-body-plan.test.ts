@@ -156,8 +156,23 @@ describe("planAgentBody", () => {
     });
     const leading = [compactionTool("cc"), compaction("c1"), tool("t2")];
     expect(planAgentBody(leading, folded)[0]).toMatchObject({ kind: "skip", flush: false });
-    expect(activityRunItems(items, { start: 0, end: 2 }, true).map((item) => item.id))
+    expect(activityRunItems(items, { start: 0, end: 2 }).map((item) => item.id))
       .toEqual(["t1"]);
+  });
+
+  it("keeps an unrelated legacy compaction alongside a native boundary", () => {
+    const items = [
+      compactionTool("legacy"),
+      tool("between"),
+      compaction("native"),
+      tool("after"),
+    ];
+    expect(spanIds(items, planAgentBody(items, collapse))).toEqual([
+      { kind: "compaction", ids: ["legacy"] },
+      { kind: "run", ids: ["between"] },
+      { kind: "compaction", ids: ["native"] },
+      { kind: "run", ids: ["after"] },
+    ]);
   });
 
   it("draws a turn's response progress as answer content, not activity", () => {
@@ -228,7 +243,7 @@ describe("planAgentBody", () => {
     const items = [tool("t1"), tool("t2")];
     const [span] = planAgentBody(items, collapse);
     expect(span).toBeDefined();
-    expect(activityRunItems(items, span!, false).map((item) => item.id)).toEqual(["t1", "t2"]);
+    expect(activityRunItems(items, span!).map((item) => item.id)).toEqual(["t1", "t2"]);
   });
 });
 

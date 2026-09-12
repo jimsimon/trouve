@@ -10571,6 +10571,12 @@ impl Engine {
                 "server name must be non-empty and free of '__' and '/'".into(),
             ));
         }
+        if crate::mcp::is_reserved_server_name(name) {
+            return Err(EngineError::BadRequest(format!(
+                "server name `{}` is reserved for trouve's internal bridge",
+                crate::mcp::INTERNAL_SERVER_NAME
+            )));
+        }
         if req.command.trim().is_empty() {
             return Err(EngineError::BadRequest("command is required".into()));
         }

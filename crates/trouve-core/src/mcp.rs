@@ -43,6 +43,12 @@ use trouve_providers::ToolSpec;
 
 /// Prefix for MCP tool names: `mcp__<server>__<tool>`.
 pub const TOOL_PREFIX: &str = "mcp__";
+/// Reserved server identity for trouve's permission-gated vendor bridge.
+pub const INTERNAL_SERVER_NAME: &str = "trouve";
+
+pub fn is_reserved_server_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case(INTERNAL_SERVER_NAME)
+}
 
 /// Upper bound on any single JSON-RPC request (handshake or tool call). Tool
 /// calls can be slow, but not unbounded — a hung server must not wedge the
@@ -275,7 +281,15 @@ pub fn read_servers(path: &Path) -> BTreeMap<String, McpServerConfig> {
         return BTreeMap::new();
     };
     match serde_json::from_str::<McpFile>(&text) {
-        Ok(file) => file.mcp_servers,
+        Ok(file) => {
+            let mut servers = file.mcp_servers;
+            let before = servers.len();
+            servers.retain(|name, _| !is_reserved_server_name(name));
+            if servers.len() != before {
+                tracing::warn!("ignoring reserved MCP server name in {}", path.display());
+            }
+            servers
+        }
         Err(e) => {
             tracing::warn!("ignoring malformed {}: {e}", path.display());
             BTreeMap::new()
@@ -286,6 +300,10 @@ pub fn read_servers(path: &Path) -> BTreeMap<String, McpServerConfig> {
 /// Add or replace one server in a config file, preserving any unrelated
 /// keys the file may carry. Creates the file (and parent dir) if missing.
 pub fn upsert_server(path: &Path, name: &str, config: &McpServerConfig) -> Result<()> {
+    anyhow::ensure!(
+        !is_reserved_server_name(name),
+        "MCP server name `{INTERNAL_SERVER_NAME}` is reserved for trouve's internal bridge"
+    );
     edit_file(path, true, |servers| {
         let Value::Object(next) = serde_json::to_value(config).expect("mcp config serializes")
         else {
@@ -3229,6 +3247,33 @@ for line in sys.stdin:
         assert_eq!(read_servers(&fresh).len(), 1);
         // Removing from a missing file is a no-op.
         remove_server(&tmp.path().join("missing.json"), "x").unwrap();
+    }
+
+    #[test]
+    fn reserved_bridge_name_is_rejected_and_ignored() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("mcp.json");
+        std::fs::write(
+            &path,
+            r#"{"mcpServers":{
+                "trouve":{"command":"spoofed-bridge"},
+                "jira":{"command":"jira-mcp"}
+            }}"#,
+        )
+        .unwrap();
+
+        let servers = read_servers(&path);
+        assert_eq!(servers.len(), 1);
+        assert!(servers.contains_key("jira"));
+        assert!(!servers.contains_key(INTERNAL_SERVER_NAME));
+
+        let error = upsert_server(
+            &path,
+            INTERNAL_SERVER_NAME,
+            &test_server_config("spoofed-bridge"),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("reserved"));
     }
 
     #[test]

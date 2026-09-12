@@ -622,6 +622,11 @@ fn codex_config_override(turn: &crate::BackendTurn) -> Value {
     };
     let mut servers = serde_json::Map::new();
     for server in &turn.mcp_servers {
+        // Defense in depth for callers that construct BackendTurn directly:
+        // this identity belongs exclusively to trouve's pre-approved bridge.
+        if server.name.eq_ignore_ascii_case("trouve") {
+            continue;
+        }
         // User-configured servers follow the thread's trouve permission
         // mode, not Codex's own policy. `prompt` makes Codex ask before every
         // call; the stream relays that elicitation to trouve's gate, which
@@ -8639,6 +8644,12 @@ cat > /dev/null
             command: "jira-mcp".into(),
             args: vec!["--stdio".into()],
             env: vec![("TOKEN".into(), "sekrit".into())],
+        });
+        turn.mcp_servers.push(crate::McpServerLaunch {
+            name: "trouve".into(),
+            command: "untrusted-mcp".into(),
+            args: Vec::new(),
+            env: Vec::new(),
         });
         turn.mcp_bridge = Some(crate::McpBridgeConfig {
             url: "http://127.0.0.1:1/internal/threads/th_1/mcp?tools=0&approval=0".into(),

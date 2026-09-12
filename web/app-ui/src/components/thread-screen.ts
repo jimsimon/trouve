@@ -47,7 +47,6 @@ import {
 } from "../services/chat-preferences.js";
 import {
   activityRunItems,
-  hasNativeCompactionMarker,
   planAgentBody,
   segmentTurnSpans,
   turnSegmentId,
@@ -1830,11 +1829,12 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     const steerPending = this.#requestPending && this.#messageRequest === undefined;
     const modelControls = modelOptionControls(selectedModel, thread?.model_options);
     const modelHealth = modelHealthPresentations(models, this.#subscriptionHealth);
+    const usageModel = view?.usageModel() ?? thread?.model;
     const contextUsage = composerContextUsage(
       view?.lastUsage,
       selectedModel?.context_window,
       view?.compacting ?? false,
-      thread?.model.startsWith("codex/") ?? false,
+      usageModel?.startsWith("codex/") ?? false,
     );
     const sessionUsageText = formatSessionUsage(this.#sessionUsage);
     const leadingThreads = newThreadSetupOpen
@@ -3769,7 +3769,6 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     ): void => {
       activityRows.push({ content, expandedGroup, endsWithExpandedToolGroup });
     };
-    const hasNativeCompaction = hasNativeCompactionMarker(unit.items);
     for (let spanIndex = spanStart; spanIndex < spanEnd; spanIndex += 1) {
       const span = spans[spanIndex];
       const item = span === undefined ? undefined : unit.items[span.start];
@@ -3880,7 +3879,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
         case "run":
           break;
       }
-      const run = activityRunItems(unit.items, span, hasNativeCompaction);
+      const run = activityRunItems(unit.items, span);
       const only = run[0];
       const groupSinglePreferenceBoundary = run.length === 1 && (
         (collapseThinkingWithTools && only?.kind === "thinking")

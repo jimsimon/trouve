@@ -7418,7 +7418,7 @@ impl Engine {
         // Blocking findings from earlier rounds this round left open travel
         // in the review body with the coordinator's reason, so a round with
         // no new findings never posts an empty "changes requested".
-        let carried_open = carried_open_findings(&previous_findings, &parsed);
+        let carried_open = carried_open_findings(&previous_findings, &parsed, coordinator_skipped);
         let published_review = self
             .publish_review_with_carried(
                 &api,
@@ -7447,13 +7447,22 @@ impl Engine {
                 continuation_request.as_ref(),
             )?;
         // Persist why each carried finding stayed open so the check run,
-        // lifecycle comment, dashboard, and the next round's coordinator
-        // can all cite it. The record covers every unresolved open finding,
-        // with a fallback where the coordinator gave no verdict, so an
-        // older round's reason never survives as the latest word.
-        let carried_verdicts = carried_verdict_records(&previous_findings, &parsed);
-        self.store
-            .record_code_review_carried_verdicts(&job.id, &carried_verdicts)?;
+        // lifecycle comment, dashboard, and the next round's coordinator can
+        // all cite it. A skipped coordinator produced no new verdict, so its
+        // unchanged findings retain the last substantive reason.
+        if !coordinator_skipped {
+            let carried_verdicts = carried_verdict_records(&previous_findings, &parsed, false);
+            if let Err(error) = self
+                .store
+                .record_code_review_carried_verdicts(&job.id, &carried_verdicts)
+            {
+                tracing::warn!(
+                    job_id = %job.id,
+                    error = %format!("{error:#}"),
+                    "recording carried-finding verdicts failed after publication"
+                );
+            }
+        }
         // Remote cleanup is detached from the round entirely: it starts only
         // after every piece of publication bookkeeping, runs outside the job
         // future with bounded requests, and no failure in it can fail a job
@@ -14841,19 +14850,20 @@ struct CarriedOpenFinding<'a> {
 }
 
 /// Reason recorded for a carried finding the coordinator left open without
-/// a verdict of its own. Every open finding is stamped with this round's
-/// head either way, so no surface can present an older round's explanation
-/// as the current one.
+/// a verdict of its own. When a coordinator actually runs, every open finding
+/// is stamped with this round's head so no surface presents an older judgment
+/// as current. A fully skipped coordinator retains the last judgment instead.
 const CARRIED_VERDICT_FALLBACK_REASON: &str =
     "The final editor recorded no verdict for this finding at this revision; no fix was verified.";
 
 /// This round's verdict record for every open finding from earlier rounds
-/// that `output` did not resolve: the coordinator's `still_open` reason
-/// when it gave one, the fallback otherwise. Exhaustive by construction, so
-/// persisting it supersedes every earlier round's verdict.
+/// that `output` did not resolve. A normal coordinator round uses its
+/// `still_open` reason or the fallback. A skipped coordinator instead keeps
+/// an existing reason because it made no new judgment.
 fn carried_verdict_records<'a>(
     previous_findings: &'a [trouve_protocol::CodeReviewFinding],
     output: &'a ReviewOutput,
+    preserve_existing_reasons: bool,
 ) -> Vec<(&'a str, &'a str)> {
     let reason_by_id = output
         .carried_findings
@@ -14872,6 +14882,13 @@ fn carried_verdict_records<'a>(
                 reason_by_id
                     .get(finding.id.as_str())
                     .copied()
+                    .or_else(|| {
+                        preserve_existing_reasons
+                            .then_some(finding.carried_verdict.as_ref())
+                            .flatten()
+                            .map(|verdict| verdict.reason.as_str())
+                            .filter(|reason| !reason.is_empty())
+                    })
                     .unwrap_or(CARRIED_VERDICT_FALLBACK_REASON),
             )
         })
@@ -14884,10 +14901,12 @@ fn carried_verdict_records<'a>(
 fn carried_open_findings<'a>(
     previous_findings: &'a [trouve_protocol::CodeReviewFinding],
     output: &'a ReviewOutput,
+    preserve_existing_reasons: bool,
 ) -> Vec<CarriedOpenFinding<'a>> {
-    let reason_by_id = carried_verdict_records(previous_findings, output)
-        .into_iter()
-        .collect::<HashMap<_, _>>();
+    let reason_by_id =
+        carried_verdict_records(previous_findings, output, preserve_existing_reasons)
+            .into_iter()
+            .collect::<HashMap<_, _>>();
     previous_findings
         .iter()
         .filter(|finding| {
@@ -24421,7 +24440,7 @@ rename to src/new.rs
         let previous = vec![threaded, grouped, resolved, advisory, missed];
 
         // Only blocking, gating, unresolved findings travel in the body.
-        let carried = carried_open_findings(&previous, &output);
+        let carried = carried_open_findings(&previous, &output, false);
         assert_eq!(
             carried
                 .iter()
@@ -24492,7 +24511,7 @@ rename to src/new.rs
             ],
         );
         let previous = [explained, omitted, resolved, fixed];
-        let records = carried_verdict_records(&previous, &output);
+        let records = carried_verdict_records(&previous, &output, false);
         assert_eq!(
             records,
             [
@@ -24501,6 +24520,37 @@ rename to src/new.rs
             ],
             "an omitted open finding gets this round's fallback instead of keeping an \
              older round's reason; resolved and closed findings get nothing"
+        );
+    }
+
+    #[test]
+    fn skipped_coordinator_keeps_the_latest_carried_reason() {
+        let mut explained = open_history_finding("rvf_explained", "src/lib.rs", 1, "high");
+        explained.carried_verdict = Some(trouve_protocol::CodeReviewCarriedVerdict {
+            job_id: "rv_older".into(),
+            head_sha: "b".repeat(40),
+            reason: "The unsafe branch is still present.".into(),
+        });
+        let missing = open_history_finding("rvf_missing", "src/lib.rs", 2, "high");
+        let previous = [explained, missing];
+        let output = review_output_with_carried(Vec::new(), Vec::new());
+
+        assert_eq!(
+            carried_verdict_records(&previous, &output, true),
+            [
+                ("rvf_explained", "The unsafe branch is still present."),
+                ("rvf_missing", CARRIED_VERDICT_FALLBACK_REASON),
+            ]
+        );
+        assert_eq!(
+            carried_open_findings(&previous, &output, true)
+                .into_iter()
+                .map(|entry| (entry.finding.id.as_str(), entry.reason))
+                .collect::<Vec<_>>(),
+            [
+                ("rvf_explained", "The unsafe branch is still present."),
+                ("rvf_missing", CARRIED_VERDICT_FALLBACK_REASON),
+            ]
         );
     }
 
@@ -24523,7 +24573,7 @@ rename to src/new.rs
                 .map(|finding| carried_verdict(&finding.id, "still_open", &"r".repeat(900)))
                 .collect(),
         );
-        let carried = carried_open_findings(&previous, &output);
+        let carried = carried_open_findings(&previous, &output, false);
         let (request, _) =
             inline_review_request(&job, "REQUEST_CHANGES", &[], &[], &[], &[], &carried);
         let body = request["body"].as_str().unwrap();

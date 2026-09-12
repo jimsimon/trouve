@@ -17,6 +17,10 @@ test("mermaid fences render as inline diagrams", async ({ page }) => {
   await expect(diagram).toHaveCount(1);
   await expect(diagram.locator("svg")).toBeVisible();
   await expect(diagram.locator("svg")).toContainText("trouve-plugin-api");
+  await expect(diagram.locator(".diagram")).toHaveAttribute("aria-describedby", "diagram-source");
+  await expect(diagram.locator("#diagram-source")).toContainText(
+    "core[trouve-core] --> api[trouve-plugin-api]",
+  );
   await expect(view.locator("code.language-mermaid")).toHaveCount(0);
   await expect(view).toContainText("Before");
   await expect(view).toContainText("After");

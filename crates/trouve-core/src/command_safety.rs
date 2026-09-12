@@ -249,10 +249,15 @@ impl Scope<'_> {
         {
             return false;
         }
-        // Any symlink beneath the prefix that leaves the worktree could be
-        // matched by the pattern (directly, or as a directory the shell
-        // expands through), so its presence rejects. The walk itself never
-        // follows links.
+        // A glob component cannot match across `/`, so only the remaining
+        // pattern depth is reachable. This keeps a shallow glob such as `*`
+        // from scanning the whole checkout while still inspecting every
+        // symlink the shell could expand through.
+        let depth = Path::new(pattern)
+            .components()
+            .skip(prefix.components().count())
+            .count()
+            .max(1);
         let mut visited = 0usize;
         for entry in ignore::WalkBuilder::new(&root)
             .hidden(false)
@@ -260,6 +265,7 @@ impl Scope<'_> {
             .git_global(false)
             .git_exclude(false)
             .follow_links(false)
+            .max_depth(Some(depth))
             .build()
         {
             visited += 1;
@@ -684,6 +690,25 @@ mod tests {
         // operand itself is confined.
         assert!(wt.read_only("rg pattern src"));
         assert!(wt.read_only("grep -rn pattern crates"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn glob_symlink_checks_are_bounded_by_match_depth() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "secret").unwrap();
+        let wt = Worktree::new();
+        std::fs::create_dir(wt.path().join("src/nested")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("secret.txt"),
+            wt.path().join("src/nested/leak.txt"),
+        )
+        .unwrap();
+
+        // A single component cannot reach the deeper symlink.
+        assert!(wt.read_only("cat src/*.rs"));
+        // A nested glob can reach it and therefore fails closed.
+        assert!(!wt.read_only("cat src/*/*.txt"));
     }
 
     #[test]

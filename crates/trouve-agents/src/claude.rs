@@ -1527,6 +1527,11 @@ impl ClaudeBackend {
         // through the normal permission path (approval_prompt in Ask mode).
         let mut mcp_servers = serde_json::Map::new();
         for server in &turn.mcp_servers {
+            // Defense in depth for direct BackendTurn callers. The bridge
+            // identity must never refer to a user-controlled process.
+            if server.name.eq_ignore_ascii_case("trouve") {
+                continue;
+            }
             let env: serde_json::Map<String, serde_json::Value> = server
                 .env
                 .iter()

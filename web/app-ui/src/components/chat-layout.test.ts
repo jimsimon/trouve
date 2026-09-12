@@ -99,6 +99,7 @@ describe("buildChatLayout", () => {
       { id: "bold-ws", kind: "thinking", turn: 4, content: "\n**Identifying skill directory**\n\n", complete: false },
       { id: "under", kind: "thinking", turn: 4, content: "__Reading config__", complete: true },
       { id: "hash", kind: "thinking", turn: 4, content: "## Checking the adapter", complete: true },
+      { id: "titles", kind: "thinking", turn: 4, content: "**Plan**\n\n## Validation", complete: true },
       { id: "titled", kind: "thinking", turn: 4, content: "**Checking the adapter**\n\nLooking at the override.", complete: true },
       { id: "plain", kind: "thinking", turn: 4, content: "Found it.", complete: true },
       { id: "inline", kind: "thinking", turn: 4, content: "**Note** this is **important**", complete: true },
@@ -111,6 +112,7 @@ describe("buildChatLayout", () => {
     expect(layout.unitIdForItem.has("bold-ws")).toBe(false);
     expect(layout.unitIdForItem.has("under")).toBe(false);
     expect(layout.unitIdForItem.has("hash")).toBe(false);
+    expect(layout.unitIdForItem.has("titles")).toBe(false);
   });
 
   it("does not create a transcript row for an orphaned empty reasoning node", () => {

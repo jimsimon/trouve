@@ -22,6 +22,8 @@ describe("renderMermaid", () => {
   });
 
   it("reports unsupported diagram text so the code block is kept", async () => {
-    await expect(renderMermaid("not a diagram")).resolves.toBeUndefined();
+    const source = "not a diagram";
+    await expect(renderMermaid(source)).resolves.toBeUndefined();
+    await expect(renderMermaid(source)).resolves.toBeUndefined();
   });
 });
