@@ -1,0 +1,48 @@
+{
+  "name": "@trouve-ai/content-rendering",
+  "version": "4.11.0",
+  "private": true,
+  "type": "module",
+  "description": "Sanitized Markdown, inline Mermaid diagrams, unified-diff parsing, source highlighting, media previews, and the bounded off-thread content worker shared by the trouve Lit frontends.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jimsimon/trouve.git",
+    "directory": "web/packages/content-rendering"
+  },
+  "exports": {
+    "./chat-file-link": "./src/chat-file-link.ts",
+    "./content-worker-client": "./src/content-worker-client.ts",
+    "./content-worker-handlers": "./src/content-worker-handlers.ts",
+    "./content-worker-protocol": "./src/content-worker-protocol.ts",
+    "./diff-line-numbers": "./src/diff-line-numbers.ts",
+    "./diff-parser": "./src/diff-parser.ts",
+    "./file-language": "./src/file-language.ts",
+    "./image-preview": "./src/image-preview.ts",
+    "./markdown-renderer": "./src/markdown-renderer.ts",
+    "./markdown-view": "./src/markdown-view.ts",
+    "./mermaid-diagram": "./src/mermaid-diagram.ts",
+    "./source-highlighter": "./src/source-highlighter.ts",
+    "./streaming-markdown": "./src/streaming-markdown.ts"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "dependencies": {
+    "@lezer/highlight": "^1.2.3",
+    "@lezer/javascript": "^1.5.4",
+    "@trouve-ai/ui-foundation": "4.11.0",
+    "beautiful-mermaid": "^1.1.3",
+    "lit": "^3.3.3",
+    "rehype-sanitize": "^6.0.0",
+    "rehype-stringify": "^10.0.1",
+    "remark-gfm": "^4.0.1",
+    "remark-parse": "^11.0.0",
+    "remark-rehype": "^11.1.2",
+    "unified": "^11.0.5"
+  }
+}

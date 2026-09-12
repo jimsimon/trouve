@@ -24,7 +24,9 @@ services:
 
   review-ui:
     image: ghcr.io/jimsimon/trouve-review-ui:${TROUVE_VERSION:?set TROUVE_VERSION in .env}
-    build: web/review-ui
+    build:
+      context: web
+      dockerfile: apps/review-ui/Dockerfile
     restart: unless-stopped
     depends_on:
       trouve-server:

@@ -35,8 +35,8 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
-      - name: App UI formatting
-        working-directory: web/app-ui
+      - name: Web workspace formatting
+        working-directory: web
         run: npm run format:check
 
   # Build the frontend and its compliance evidence in parallel with the cheap
@@ -51,28 +51,28 @@ jobs:
         with:
           node-version: 24
           cache: npm
-          cache-dependency-path: web/app-ui/package-lock.json
-      - name: Install app UI dependencies
-        working-directory: web/app-ui
+          cache-dependency-path: web/package-lock.json
+      - name: Install web workspace dependencies
+        working-directory: web
         run: npm ci
       - name: Generated protocol is current
-        working-directory: web/app-ui
+        working-directory: web
         run: |
           npm run generate:protocol
-          git diff --exit-code -- src/generated
-      - name: App UI lint, types, and unit tests
-        working-directory: web/app-ui
+          git diff --exit-code -- packages/protocol/src/generated apps/app-ui/src/generated
+      - name: Web workspace lint, types, and unit tests
+        working-directory: web
         run: |
           npm run lint
           npm run typecheck
           npm test
       - name: App UI compliance
-        working-directory: web/app-ui
+        working-directory: web/apps/app-ui
         run: |
           npm run verify:notices
           npm run generate:sbom
       - name: Build desktop and PWA bundles
-        working-directory: web/app-ui
+        working-directory: web/apps/app-ui
         run: |
           npm run build
           npm run build:pwa
@@ -81,7 +81,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: lint-desktop-ui-build
-          path: web/app-ui/dist/desktop
+          path: web/apps/app-ui/dist/desktop
           if-no-files-found: error
           retention-days: 1
       - name: Upload frontend compliance evidence
@@ -89,8 +89,8 @@ jobs:
         with:
           name: app-ui-compliance
           path: |
-            web/app-ui/THIRD_PARTY_NOTICES.md
-            web/app-ui/dist/npm-sbom.cdx.json
+            web/apps/app-ui/THIRD_PARTY_NOTICES.md
+            web/apps/app-ui/dist/npm-sbom.cdx.json
           if-no-files-found: error
 
   # Keep browser engines isolated and parallel while sharing one immutable,
@@ -114,12 +114,12 @@ jobs:
         with:
           node-version: 24
           cache: npm
-          cache-dependency-path: web/app-ui/package-lock.json
-      - name: Install app UI dependencies
-        working-directory: web/app-ui
+          cache-dependency-path: web/package-lock.json
+      - name: Install web workspace dependencies
+        working-directory: web
         run: npm ci
       - name: Verify container browser revision
-        working-directory: web/app-ui
+        working-directory: web/apps/app-ui
         env:
           BROWSER_ENGINE: ${{ matrix.engine }}
         run: >-
@@ -130,7 +130,7 @@ jobs:
           accessSync(engine.executablePath(), constants.X_OK);'
       - name: Browser, accessibility, and visual checks
         shell: bash
-        working-directory: web/app-ui
+        working-directory: web/apps/app-ui
         env:
           BROWSER_ENGINE: ${{ matrix.engine }}
         run: |
@@ -144,7 +144,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: browser-failure-${{ matrix.engine }}
-          path: web/app-ui/test-results
+          path: web/apps/app-ui/test-results
           if-no-files-found: warn
           retention-days: 1
 
@@ -173,9 +173,6 @@ jobs:
       - name: Hashline analyzer tests
         working-directory: benchmarks/hashline
         run: python3 -m unittest test_analyze.py
-      - name: Review UI tests
-        working-directory: web/review-ui
-        run: npm test
       - name: Cursor SDK qualification helper tests
         run: node --test scripts/qualify_cursor_sdk_bridge.test.mjs
       # The test-with-model job in test.yml runs ignored tests from these three
@@ -222,7 +219,7 @@ jobs:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: lint-desktop-ui-build
-          path: web/app-ui/dist/desktop
+          path: web/apps/app-ui/dist/desktop
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           components: clippy
@@ -247,7 +244,7 @@ jobs:
           cargo check -p trouve-app --bin trouve
           cargo check -p trouve-app --features web-preview --bin trouve-web-preview
         env:
-          TROUVE_APP_UI_DIST: ${{ github.workspace }}/web/app-ui/dist/desktop
+          TROUVE_APP_UI_DIST: ${{ github.workspace }}/web/apps/app-ui/dist/desktop
 
   npm-packages:
     runs-on: ubuntu-latest

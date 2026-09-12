@@ -24,7 +24,22 @@ on. Decisions live in `docs/adr/` — check there before re-litigating one.
   capability boundary, and replaceable desktop webview host.
 - `crates/trouve-app` — main desktop application; ships the Lit frontend in
   Wry and embeds the protocol server for local use.
-- `web/app-ui` — Lit application shared by the desktop webview and mobile PWA.
+- `web/` — npm workspace for the web frontends. `web/apps/app-ui` is the Lit
+  application shared by the desktop webview and mobile PWA; `web/apps/review-ui`
+  is the self-hosted code review site; `web/packages/*` hold code shared
+  between them, layered bottom-up: `@trouve-ai/ui-foundation` (tokens, themes,
+  element defaults, theme controller, icon helper, signals adapter, tab
+  navigation, virtualizer),
+  `@trouve-ai/protocol` (generated server types, fetch client, cursor event
+  stream, CSP-safe validators), `@trouve-ai/content-rendering` (sanitized
+  Markdown, diff parsing, highlighting, media previews, the bounded content
+  worker), `@trouve-ai/transcript` (thread view model, tool/activity
+  presentation, the read-only transcript renderer, element, and stylesheet),
+  and `@trouve-ai/code-review` (the review dashboard screens, drawn from the
+  same tokens; ADR 0053 and ADR 0054).
+  Packages are consumed as TypeScript source through their `exports` maps;
+  run `npm run lint`, `format:check`, `typecheck`, and `test` from `web/` to
+  cover every workspace member.
 - `docs/adr/` — architectural decision records. `docs/design/` — living
   design docs (event log schema, UX screen map).
 
@@ -69,7 +84,7 @@ These are load-bearing. Do not violate them without a new ADR.
 6. **Agent personas are data.** Personas (plan/code/review/…) are prompt + tool
    policy + default permission mode. Adding a persona must not require new Rust
    control flow.
-7. **One product frontend.** `web/app-ui` is the shared Lit application for
+7. **One product frontend.** `web/apps/app-ui` is the shared Lit application for
    Wry desktop and the PWA. Native hosts provide only the gateway and typed OS
    capabilities; they do not reimplement product screens or durable state.
 8. **One workspace version.** Every first-party Cargo crate, Node package,

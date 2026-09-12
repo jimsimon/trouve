@@ -277,7 +277,7 @@ version = "2.1.0"
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             package_path = root / "npm/package.json"
-            review_path = root / "web/review-ui/package.json"
+            review_path = root / "web/apps/review-ui/package.json"
             lock_path = root / "npm/package-lock.json"
             claude_path = root / "npm/plugin/.claude-plugin/plugin.json"
             codex_path = root / "npm/plugin/.codex-plugin/plugin.json"

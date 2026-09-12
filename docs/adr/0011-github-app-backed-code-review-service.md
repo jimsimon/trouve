@@ -1,6 +1,10 @@
 # GitHub App-backed code review service
 
-Status: Accepted (2026-07)
+Status: Accepted (2026-07); amended by ADR 0053 (2026-09)
+
+ADR 0053 replaces the separately implemented review SPA with a Lit package
+built in the same web workspace as the desktop app, on the packages the two
+share. The server-side decisions below are unchanged.
 
 ## Context
 

@@ -1,0 +1,39 @@
+{
+  "name": "@trouve-ai/protocol",
+  "version": "4.11.0",
+  "private": true,
+  "type": "module",
+  "description": "Typed trouve server protocol: OpenAPI-generated types, the fetch client, the cursor event stream, and CSP-safe runtime validators.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jimsimon/trouve.git",
+    "directory": "web/packages/protocol"
+  },
+  "exports": {
+    "./client": "./src/protocol-client.ts",
+    "./event-stream": "./src/cursor-event-stream.ts",
+    "./json": "./src/protocol-json.ts",
+    "./types": "./src/generated/protocol.ts",
+    "./utf8-text": "./src/utf8-text.ts",
+    "./codegen/runtime-validators": "./scripts/runtime-validators.mjs"
+  },
+  "scripts": {
+    "generate:protocol": "openapi-typescript ../../../crates/trouve-server/tests/snapshots/openapi.json -o src/generated/protocol.ts && node scripts/copy-openapi-schema.mjs && npm run generate:validators",
+    "generate:validators": "node scripts/generate-runtime-validators.mjs",
+    "test": "npm run verify:validators && vitest run",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "verify:validators": "node scripts/generate-runtime-validators.mjs --check"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "dependencies": {
+    "@trouve-ai/ui-foundation": "4.11.0",
+    "openapi-fetch": "0.17.0"
+  },
+  "devDependencies": {
+    "ajv": "8.20.0",
+    "openapi-typescript": "7.13.0"
+  }
+}

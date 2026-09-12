@@ -1,0 +1,37 @@
+{
+  "name": "@trouve-ai/ui-foundation",
+  "version": "4.11.0",
+  "private": true,
+  "type": "module",
+  "description": "Foundation shared by every trouve Lit frontend: design tokens, semantic themes, element defaults, the theme controller, the icon element, the contained signals adapter, tab navigation, and the owned virtualizer.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jimsimon/trouve.git",
+    "directory": "web/packages/ui-foundation"
+  },
+  "exports": {
+    "./font-awesome-icon": "./src/font-awesome-icon.ts",
+    "./inline-style": "./src/inline-style.ts",
+    "./reactivity": "./src/reactivity.ts",
+    "./tab-navigation": "./src/tab-navigation.ts",
+    "./theme-controller": "./src/theme-controller.ts",
+    "./virtualizer": "./src/virtualizer.ts",
+    "./styles/base.css": "./src/styles/base.css",
+    "./styles/themes.css": "./src/styles/themes.css",
+    "./styles/tokens.css": "./src/styles/tokens.css"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "dependencies": {
+    "@fortawesome/fontawesome-free": "7.3.1",
+    "@lit-labs/signals": "0.3.0",
+    "lit": "^3.3.3",
+    "signal-polyfill": "0.2.2"
+  }
+}

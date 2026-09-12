@@ -20,9 +20,9 @@ sequentially.
 | [0008](0008-embedded-server-in-desktop-app.md) | Desktop app embeds trouve-server in-process | Accepted |
 | [0009](0009-thread-owned-todo-snapshots.md) | Thread-owned todo snapshots | Accepted |
 | [0010](0010-account-centric-multi-instance-github.md) | Account-centric, multi-instance GitHub integration | Accepted |
-| [0011](0011-github-app-backed-code-review-service.md) | GitHub App-backed code review service | Accepted |
+| [0011](0011-github-app-backed-code-review-service.md) | GitHub App-backed code review service | Amended by 0053 |
 | [0012](0012-single-version-monorepo-release-train.md) | Single-version monorepo release train | Accepted |
-| [0013](0013-preact-review-dashboard.md) | Preact application for the review dashboard | Accepted |
+| [0013](0013-preact-review-dashboard.md) | Preact application for the review dashboard | Superseded by 0053 |
 | [0014](0014-durable-code-review-job-artifacts.md) | Durable code-review job artifacts and event streams | Partially superseded by 0045 |
 | [0015](0015-read-shared-turns-and-prioritized-capacity.md) | Read-shared turns and prioritized model capacity | Partially superseded by 0042 |
 | [0016](0016-catalog-backed-provider-transports.md) | Catalog-backed provider transports | Accepted |
@@ -62,3 +62,5 @@ sequentially.
 | [0050](0050-shared-cursor-sdk-bridge-process.md) | One shared Cursor SDK Bridge per backend | Accepted |
 | [0051](0051-cursor-shared-store-transition-and-quarantine.md) | Cursor shared-store transition and callback quarantine | Accepted |
 | [0052](0052-owned-os-sandbox-for-shell-commands.md) | Trouve owns an OS sandbox for shell commands | Proposed |
+| [0053](0053-shared-lit-web-packages-and-review-ui.md) | Shared Lit web packages and review UI | Amended by 0054 |
+| [0054](0054-review-ui-on-the-desktop-design-system.md) | Review UI on the desktop design system | Accepted |
