@@ -2,8 +2,8 @@
  * and type size resolves through the ui-foundation tokens and semantic themes
  * (`--trouve-*`), so the dashboard follows whichever `data-theme` its host
  * applies (the self-hosted site's own picker sets it on `<html>`).
- * Element defaults (`base.css`) load before this file; this file only adds
- * dashboard-specific composition. */
+ * Element defaults (`base.css`) and the shared transcript stylesheet load
+ * before this file; this file only adds dashboard-specific composition. */
 
 /* ---- Shell -------------------------------------------------------------- */
 .shell { display: grid; grid-template-columns: var(--trouve-navigation-width) minmax(0, 1fr); width: 100%; height: 100%; min-width: 0; min-height: 0; color: var(--trouve-text); background: var(--trouve-win-bg); font: var(--trouve-font-size)/var(--trouve-line-height) var(--trouve-font-sans); }
@@ -197,6 +197,12 @@ pre { max-height: 430px; margin: 0 0 12px; overflow: auto; border: 1px solid var
 .nested { margin-bottom: 12px; }
 .nested summary { color: var(--trouve-text-dim); font-size: 12px; cursor: pointer; }
 
+/* The task transcript is the shared chat renderer: a bounded scroller so the
+ * detail pane keeps its own scroll position while the rail follows the tail. */
+.task-transcript { position: relative; display: grid; height: clamp(320px, 60vh, 720px); margin: 12px 0; overflow: hidden; border: 1px solid var(--trouve-rule); border-radius: var(--trouve-radius); background: var(--trouve-win-bg); }
+.task-transcript > trouve-transcript-view { display: grid; grid-template-rows: minmax(0, 1fr); min-width: 0; min-height: 0; }
+.task-transcript-note { display: flex; justify-content: space-between; gap: 12px; margin: 12px 0 0; color: var(--trouve-text-dim); font-size: 11px; }
+
 /* ---- Repositories, reviewers, settings ----------------------------------- */
 .repository-list { display: flex; flex-direction: column; gap: 8px; }
 .repository-editor { border: 1px solid var(--trouve-border); border-radius: var(--trouve-radius); background: var(--trouve-surface); }
@@ -312,6 +318,7 @@ a[target="_blank"] > .trouve-icon { --trouve-icon-width: 1em; margin-left: 4px; 
   .persona-layout { grid-template-columns: 1fr; }
   .persona-groups { max-height: 280px; overflow: auto; }
   .task-facts { grid-template-columns: 1fr 1fr; }
+  .task-transcript { height: clamp(280px, 55vh, 560px); }
   .candidate-decisions > summary { flex-direction: column; }
   .routing-decisions > summary { flex-direction: column; }
 }

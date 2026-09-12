@@ -1,6 +1,6 @@
 /* Document composition for the self-hosted review site. Everything visual
- * comes from the shared ui-foundation tokens/themes, base.css, and the
- * code-review stylesheet; this file only sizes the
+ * comes from the shared ui-foundation tokens/themes, base.css, the transcript
+ * stylesheet and the code-review stylesheet; this file only sizes the
  * dashboard to the browser viewport. */
 html, body, #app { height: 100%; margin: 0; }
 body { overflow: hidden; color: var(--trouve-text); background: var(--trouve-win-bg); font: var(--trouve-font-size)/var(--trouve-line-height) var(--trouve-font-sans); }

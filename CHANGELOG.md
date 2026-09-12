@@ -14,9 +14,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   desktop's protocol client, design tokens, content rendering, and chat
   transcript move into shared packages (`@trouve-ai/protocol`,
   `@trouve-ai/ui-foundation`, `@trouve-ai/content-rendering`, and
-  `@trouve-ai/transcript`) that the desktop app imports and the review
-  dashboard builds on. The review dashboard's screens and behaviour are
-  unchanged.
+  `@trouve-ai/transcript`) that both frontends use. The review dashboard's
+  screens and behaviour are unchanged.
 - **Screen readers hear concise transcript status instead of every streamed
   fragment**: the chat log is no longer an `aria-live` region, so streamed
   Markdown, tool output, and progress text are not announced piecemeal (or
@@ -29,6 +28,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and icons as the desktop app, with the same light, dark, and high-contrast
   themes, and remembers a theme choice (defaulting to the system theme) in
   its sidebar.
+- **Review task activity reads like a desktop conversation**: a job's task
+  detail renders the prompt, reasoning, tool output, and response through the
+  desktop's chat transcript (turn rail, grouped tool activity, Markdown)
+  instead of raw text blocks, streaming live while a task runs and rebuilt
+  from retained output once it finishes. Markdown, diffs, and syntax
+  highlighting render off the main thread.
 
 ## [4.11.0] - 2026-09-11
 

@@ -55,7 +55,7 @@ is a fix in both products. Shared packages carry their own tests and
 import-boundary checks, so `app-ui` cannot quietly reach back into a
 package's private files. The review site gains the desktop's rendering
 quality for free where it adopts the shared packages (ADR 0054 does so for
-the design system).
+the design system and task transcripts).
 
 The cost is workspace plumbing: one lockfile, per-package `tsconfig`s, and
 version numbers that `scripts/sync_versions.py` keeps aligned with the Cargo

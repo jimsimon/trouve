@@ -3,5 +3,6 @@
   "compilerOptions": {
     "types": ["vite/client"]
   },
-  "include": ["src"]
+  "include": ["src", "vite.config.ts"],
+  "exclude": ["src/content-worker.ts"]
 }
