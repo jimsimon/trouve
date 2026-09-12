@@ -833,7 +833,6 @@ fn form_elicitation_content(
             return None;
         }
         let property = properties.get(&answer.question_id)?;
-        let kind = property["type"].as_str()?;
         let has_enum = property["enum"].is_array();
         let raw = answer
             .selected_option_ids
@@ -859,7 +858,7 @@ fn form_elicitation_content(
                 })
                 .cloned()?
         } else {
-            match kind {
+            match property["type"].as_str()? {
                 "boolean" => match raw.as_str() {
                     "true" => Value::Bool(true),
                     "false" => Value::Bool(false),
@@ -8710,7 +8709,7 @@ cat > /dev/null
             "requestedSchema": {
                 "type": "object",
                 "properties": {
-                    "project": { "type": "string", "enum": ["OPS", "DEV"], "enumNames": ["Operations", "Development"] },
+                    "project": { "enum": ["OPS", "DEV"], "enumNames": ["Operations", "Development"] },
                     "urgent": { "type": "boolean", "title": "Urgent" },
                     "summary": { "type": "string", "description": "Issue summary" },
                     "points": { "type": "integer" }
