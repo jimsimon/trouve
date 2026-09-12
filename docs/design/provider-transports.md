@@ -4,10 +4,16 @@ Trouve reads the provider roster and model metadata from models.dev
 `api.json`. A provider is offered in Settings only when its catalog record can
 be assigned to a transport below. For catalog-covered providers, live model
 discovery contributes account-visible ids only; metadata and option schemas
-always come from models.dev. The catalog is downloaded and cached under the
-data directory; nothing is bundled, so until the first successful download the
-server reports `catalog_available: false`, retries every connectivity poll,
-and offers only local models and trouve's own integrations (ADR 0055).
+always come from models.dev. The public catalog is downloaded and cached under
+the data directory (`models-dev-cache.json`); no models.dev snapshot ships in
+the binary. What is bundled is the small trouve-owned overlay
+(`trouve-model-catalog.json`) whose `openai-codex` and `cursor` sections seed
+those rosters until their first background refresh; overlay entries that
+declare a `base_model` still resolve only once the public record they inherit
+from has been downloaded. Until the first successful download the server
+therefore reports `catalog_available: false`, retries every connectivity
+poll, and offers only local models, overlay-only models, and trouve's own
+integrations (ADR 0055).
 
 ## Supported transports
 
