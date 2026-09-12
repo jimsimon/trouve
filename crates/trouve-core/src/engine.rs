@@ -26280,8 +26280,9 @@ mod tests {
     #[tokio::test]
     async fn await_spawned_descendants_bounds_the_whole_digest() {
         let (engine, _temp, parent, first_child) = await_subagents_fixture("total");
-        // Enough children at the per-child cap to overrun the whole-digest
-        // budget, so the later ones must be reported by status only.
+        // Enough failed children with long titles, errors, and messages to
+        // overrun the whole-digest budget, so the later ones must be reported
+        // by status only.
         let child_count = SUBAGENT_DIGEST_TOTAL_BYTES / SUBAGENT_DIGEST_MESSAGE_BYTES + 2;
         let mut children = vec![first_child.clone()];
         for index in 1..child_count {
@@ -26297,6 +26298,7 @@ mod tests {
             children.push(child);
         }
         let long_message = format!("{}END", "x".repeat(SUBAGENT_DIGEST_MESSAGE_BYTES * 2));
+        let long_error = format!("{}ERROR_END", "e".repeat(SUBAGENT_DIGEST_ERROR_BYTES * 4));
         for child in &children {
             engine
                 .active_threads
@@ -26312,10 +26314,9 @@ mod tests {
                             turn: 1,
                             content: long_message.clone(),
                         },
-                        Event::TurnCompleted {
+                        Event::TurnFailed {
                             turn: 1,
-                            checkpoint_id: None,
-                            usage: Usage::default(),
+                            error: long_error.clone(),
                         },
                     ],
                 )
@@ -26342,6 +26343,8 @@ mod tests {
         .unwrap();
 
         assert!(!digest.contains("END"));
+        assert!(digest.contains("Error: "));
+        assert!(!digest.contains("ERROR_END"));
         assert!(digest.contains("final message truncated"));
         assert!(digest.contains("final message omitted"));
         assert!(digest.contains("search_transcript"));
