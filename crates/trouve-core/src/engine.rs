@@ -12973,6 +12973,7 @@ impl Engine {
         );
         validate_thinking_option_aliases(&model_options)?;
         let thread = Thread {
+            route: None,
             id: new_id("th"),
             session_id: session.id.clone(),
             parent_thread_id: spawn.map(|(parent, _)| parent.to_string()),
@@ -24461,6 +24462,7 @@ mod tests {
         };
         store.insert_session(&session).unwrap();
         let thread = Thread {
+            route: None,
             id: "th_minimal_bridge".into(),
             session_id: session.id,
             parent_thread_id: None,
@@ -25864,6 +25866,7 @@ mod tests {
             created_at: chrono::Utc::now(),
         };
         let parent = Thread {
+            route: None,
             id: "th_spawn_cancel_parent".into(),
             session_id: session.id.clone(),
             parent_thread_id: None,
@@ -25945,6 +25948,7 @@ mod tests {
             created_at: chrono::Utc::now(),
         };
         let parent = Thread {
+            route: None,
             id: "th_cascade_parent".into(),
             session_id: session.id.clone(),
             parent_thread_id: None,
@@ -26046,6 +26050,7 @@ mod tests {
             created_at: chrono::Utc::now(),
         };
         let parent = Thread {
+            route: None,
             id: format!("th_await_{tag}_parent"),
             session_id: session.id.clone(),
             parent_thread_id: None,
@@ -26570,6 +26575,7 @@ mod tests {
             created_at: chrono::Utc::now(),
         };
         let thread = Thread {
+            route: None,
             id: "th_attachment_cleanup".into(),
             session_id: session.id.clone(),
             parent_thread_id: None,
@@ -26943,6 +26949,7 @@ mod tests {
         };
         store.insert_session(&session).unwrap();
         let thread = Thread {
+            route: None,
             id: "th_fast_accept".into(),
             session_id: session.id,
             parent_thread_id: None,
@@ -27015,6 +27022,7 @@ mod tests {
         };
         store.insert_session(&session).unwrap();
         let thread = Thread {
+            route: None,
             id: "th_fast_queue".into(),
             session_id: session.id.clone(),
             parent_thread_id: None,
@@ -27092,6 +27100,7 @@ mod tests {
         };
         store.insert_session(&session).unwrap();
         let thread = Thread {
+            route: None,
             id: "th_cancel_question".into(),
             session_id: session.id,
             parent_thread_id: None,
@@ -31332,6 +31341,7 @@ default_permission_mode = "ask"
         };
         store.insert_session(&session).unwrap();
         let thread = Thread {
+            route: None,
             id: "th_todo".into(),
             session_id: session.id.clone(),
             parent_thread_id: None,
@@ -32969,6 +32979,7 @@ default_permission_mode = "ask"
             created_at: chrono::Utc::now(),
         };
         let thread = Thread {
+            route: None,
             id: "th_no_tools_approval".into(),
             session_id: session.id.clone(),
             parent_thread_id: None,
@@ -33037,6 +33048,7 @@ default_permission_mode = "ask"
             created_at: chrono::Utc::now(),
         };
         let thread = Thread {
+            route: None,
             id: "th_vendor_lane".into(),
             session_id: session.id.clone(),
             parent_thread_id: None,
@@ -33102,6 +33114,7 @@ default_permission_mode = "ask"
         };
         store.insert_session(&session).unwrap();
         let thread = Thread {
+            route: None,
             id: "th_cancel_tool".into(),
             session_id: session.id.clone(),
             parent_thread_id: None,
@@ -33277,6 +33290,7 @@ default_permission_mode = "ask"
         };
         store.insert_session(&session).unwrap();
         let thread = Thread {
+            route: None,
             id: "th_parallel_tools".into(),
             session_id: session.id.clone(),
             parent_thread_id: None,

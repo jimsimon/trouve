@@ -4902,6 +4902,7 @@ export interface components {
             };
             parent_thread_id?: null | components["schemas"]["String"];
             permission_mode: components["schemas"]["PermissionMode"];
+            route?: null | components["schemas"]["ModelRouteInfo"];
             session_id: components["schemas"]["String"];
             /**
              * @description True when an agent spawned this thread (spawn_thread/spawn_session

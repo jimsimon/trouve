@@ -71,6 +71,20 @@ describe("session usage panel asynchronous lifecycle guards", () => {
     expect(source).toContain("String(sessionUsageRevision)");
   });
 
+  it("attributes automatic models to a concrete route and reloads when it changes", () => {
+    expect(source).not.toContain('this.model.split("/", 1)[0]');
+    expect(source).toContain("this.#route = usagePanelRoute({");
+    expect(source).toContain("candidates: modelForSelection(catalog, this.model)?.routes ?? []");
+    expect(source).toContain("candidate.provider_id === providerId");
+    const keyStart = source.indexOf("const key = [");
+    const keyEnd = source.indexOf('].join("|");', keyStart);
+    expect(source.slice(keyStart, keyEnd)).toContain(
+      "`${attributed.providerId}/${attributed.providerModel}`",
+    );
+    expect(source).toContain(".threadRoute");
+    expect(source).toContain("Routed to <strong>${route.providerId}</strong>");
+  });
+
   it("keeps complete model labels visible without hover-only truncation", () => {
     expect(source).toContain("<small>${this.model}</small>");
     expect(source).toContain("<span>${row.label}</span>");

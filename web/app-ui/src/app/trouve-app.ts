@@ -3502,6 +3502,7 @@ export class TrouveApp extends withSignalTracking(LitElement) {
             session-id=${route.kind === "session" ? route.sessionId : ""}
             thread-id=${route.kind === "session" ? route.threadId ?? "" : ""}
             model=${activeThread?.model ?? ""}
+            .threadRoute=${activeThread?.route}
             .placeholder=${sessions.length === 0
               || this.#newSessionSetup.status === "open"
               || (route.kind === "session" && this.#newThreadSetupOpen)}

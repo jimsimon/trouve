@@ -20291,6 +20291,7 @@ mod tests {
         };
         store.insert_session(&session).unwrap();
         let thread = Thread {
+            route: None,
             id: "th_progress".into(),
             session_id: session.id.clone(),
             parent_thread_id: None,

@@ -12,12 +12,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   alongside hard-pinned `provider/model` choices. Automatic selections keep a
   healthy provider sticky across turns and use bounded, preference-ordered
   failover across compatible hosted API and vendor-agent routes.
+- **Usage panel for automatic models**: the sidebar usage panel attributes an
+  `auto/<model>` thread to the concrete provider it last ran on and shows that
+  subscription's meters, falling back to the healthiest candidate route before
+  the first turn completes.
 
 ### Changed
 
-- **Client/server compatibility**: protocol compatibility advances to 9.6 for
-  the route catalog, provider preference order, sticky route selection, and
-  selected-route events.
+- **Client/server compatibility**: protocol compatibility advances to 9.7 for
+  the route catalog, provider preference order, sticky route selection,
+  selected-route events, and the sticky `route` exposed on threads.
 
 ## [4.11.0] - 2026-09-11
 

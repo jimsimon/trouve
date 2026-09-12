@@ -3645,6 +3645,7 @@ mod tests {
         };
         store.insert_session(&session).unwrap();
         let thread = Thread {
+            route: None,
             id: format!("th_{suffix}"),
             session_id: session.id,
             parent_thread_id: None,
