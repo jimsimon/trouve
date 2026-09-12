@@ -70,9 +70,12 @@ const entryLimit = mode === "desktop" ? 856_000 : 850_000;
 // 2 kB of headroom for each. Protocol 9.6's automatic/concrete route catalog,
 // provider-priority settings, route-selection and provider-order events, and
 // generated validators bring the combined graphs to approximately 3,346 kB
-// and 3,331 kB. Entry, worker, and largest-chunk budgets below still prevent
-// one bundle from hiding in the aggregate.
-const totalJavaScriptLimit = mode === "desktop" ? 3_348_000 : 3_333_000;
+// and 3,331 kB. Protocol 9.7's sticky thread `route` schema and the usage
+// panel's route attribution for automatic models bring them to 3,352,650 B
+// and 3,337,805 B; preserve less than 2 kB of headroom for each. Entry,
+// worker, and largest-chunk budgets below still prevent one bundle from
+// hiding in the aggregate.
+const totalJavaScriptLimit = mode === "desktop" ? 3_354_000 : 3_339_000;
 // beautiful-mermaid 1.1 with elk.bundled emits 1,524,273 B (469 kB gzipped).
 // Preserve less than 6 kB of headroom.
 const diagramEngineLimit = 1_530_000;
