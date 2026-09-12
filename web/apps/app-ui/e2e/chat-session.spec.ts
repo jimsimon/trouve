@@ -214,8 +214,6 @@ interface ProtocolFixtureOptions {
   readonly additionalSessions?: readonly Record<string, unknown>[];
   readonly additionalSessionSummaries?: readonly Record<string, unknown>[];
   readonly restoredCheckpointIds?: string[];
-  readonly codeReviewDashboard?: Record<string, unknown>;
-  readonly codeReviewSettings?: Record<string, unknown>;
   readonly sessionDiff?: string;
   readonly sessionDiffRequests?: string[];
   readonly sessionPullRequests?: readonly Record<string, unknown>[];
@@ -244,8 +242,6 @@ const installProtocolFixtures = async (
     additionalSessions = [],
     additionalSessionSummaries = [],
     restoredCheckpointIds = [],
-    codeReviewDashboard,
-    codeReviewSettings,
     sessionDiff = "",
     sessionDiffRequests = [],
     sessionPullRequests = [],
@@ -603,12 +599,6 @@ const installProtocolFixtures = async (
       },
       "GET /v1/sessions/se_2/prs": [],
       "GET /v1/sessions/se_2/mcp-servers": [],
-      ...(codeReviewDashboard === undefined
-        ? {}
-        : { "GET /v1/code-review": codeReviewDashboard }),
-      ...(codeReviewSettings === undefined
-        ? {}
-        : { "GET /v1/config/code-review": codeReviewSettings }),
     };
     const response = responses[key];
     if (response === undefined) {
@@ -1235,64 +1225,6 @@ test("a collapsed multi-segment turn keeps its trailing checkpoint actions", asy
   await expect(actions.getByRole("button", {
     name: "Restore files to the checkpoint after turn 8",
   })).toBeVisible();
-});
-
-test("code review repository groups reorder through rendered keyboard controls", async ({ page }) => {
-  const job = (id: string, repository: string, pullNumber: number) => ({
-    id,
-    installation_id: 1,
-    repository,
-    pull_number: pullNumber,
-    pull_title: `Review ${repository}`,
-    pull_url: `https://github.com/${repository}/pull/${pullNumber}`,
-    head_sha: "a".repeat(40),
-    base_ref: "main",
-    head_ref: `feature/${pullNumber}`,
-    trigger: "automatic",
-    status: "succeeded",
-    created_at: "2026-08-04T08:00:00Z",
-  });
-  await installProtocolFixtures(page, {
-    codeReviewDashboard: {
-      app: { configured: true },
-      reviewers: [],
-      repositories: [
-        { installation_id: 1, repository: "trouve/alpha", mode: "automatic" },
-        { installation_id: 1, repository: "trouve/beta", mode: "automatic" },
-      ],
-      jobs: [
-        job("review-alpha", "trouve/alpha", 1),
-        job("review-beta", "trouve/beta", 2),
-      ],
-    },
-    codeReviewSettings: {
-      max_parallel_reviews: 2,
-      total_timeout_seconds: 1_200,
-      reviewer_timeout_seconds: 720,
-      coordinator_timeout_seconds: 360,
-    },
-  });
-  await page.goto("/reviews");
-  await page.getByRole("button", { name: "Review operations" }).click();
-
-  const groups = page.locator("[data-review-group]");
-  await expect(groups).toHaveCount(2);
-  await expect(groups.nth(0)).toHaveAttribute("data-review-group", "trouve/alpha");
-  await expect(page.getByRole("button", { name: "Move trouve/alpha up" }))
-    .toBeDisabled();
-  await expect(page.getByRole("button", { name: "Move trouve/beta down" }))
-    .toBeDisabled();
-
-  const betaGrip = page.locator('[data-review-group="trouve/beta"]')
-    .locator('[data-group-order-control="grip"]');
-  await betaGrip.press("ArrowUp");
-  await expect(groups.nth(0)).toHaveAttribute("data-review-group", "trouve/beta");
-  await expect(page.locator("trouve-code-review-dashboard [role=status]").first()).toContainText(
-    "trouve/beta moved to position 1 of 2",
-  );
-  await expect.poll(() => page.evaluate(() =>
-    globalThis.localStorage.getItem("trouve.code-review-group-order.v1")
-  )).toBe('["trouve/beta","trouve/alpha"]');
 });
 
 test("the chat log is not a live region and completion is announced once", async ({ page }) => {

@@ -6,6 +6,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Removed
+
+- **Review operations in the desktop app**: the Pull Requests page no longer
+  has a Review operations view (code-review service health, recent jobs,
+  execution limits, GitHub App setup, repository routing, and reviewer
+  personas). Automated reviews are administered in the self-hosted review
+  site; how the desktop app surfaces them is being reworked.
+
 ### Changed
 
 - **One Lit web frontend**: the self-hosted review dashboard is now a Lit
