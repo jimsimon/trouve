@@ -1890,6 +1890,9 @@ impl Engine {
             let mut text = String::new();
             let mut tool_calls = Vec::new();
             let mut reasoning = Vec::new();
+            // Any client-visible output (text, streamed thinking, reasoning
+            // blocks) makes a verbatim same-route retry unsafe.
+            let mut produced_output = false;
             let attempt_error = match provider
                 .stream_chat(&route.provider_model, &messages, specs, &model_options)
                 .await
@@ -1914,6 +1917,7 @@ impl Engine {
                                 break;
                             }
                             Ok(ProviderEvent::TextDelta(delta)) => {
+                                produced_output = true;
                                 text.push_str(&delta);
                                 self.store.append_event(
                                     scope.clone(),
@@ -1922,6 +1926,7 @@ impl Engine {
                             }
                             Ok(ProviderEvent::ThinkingStarted { .. }) => {}
                             Ok(ProviderEvent::ThinkingDelta { id, text }) => {
+                                produced_output = true;
                                 self.store.append_event(
                                     scope.clone(),
                                     Event::AssistantThinking {
@@ -1937,7 +1942,10 @@ impl Engine {
                                     Event::AssistantThinkingCompleted { turn, id: Some(id) },
                                 )?;
                             }
-                            Ok(ProviderEvent::Reasoning(block)) => reasoning.push(block),
+                            Ok(ProviderEvent::Reasoning(block)) => {
+                                produced_output = true;
+                                reasoning.push(block);
+                            }
                             Ok(ProviderEvent::ToolCall(call)) => tool_calls.push(call),
                             Ok(ProviderEvent::Completed { usage }) => {
                                 completed = true;
@@ -1955,7 +1963,6 @@ impl Engine {
             };
 
             if let Some(error) = attempt_error {
-                let produced_output = !text.is_empty() || !reasoning.is_empty();
                 if !text.is_empty() {
                     self.store.append_event(
                         scope.clone(),
@@ -1965,7 +1972,7 @@ impl Engine {
                         },
                     )?;
                 }
-                if produced_output {
+                if !text.is_empty() || !reasoning.is_empty() {
                     self.store.append_message(
                         &thread.id,
                         &serde_json::to_value(Message::Assistant {
@@ -2106,6 +2113,9 @@ impl Engine {
         )));
         let mut text = String::new();
         let mut reasoning = Vec::new();
+        // Any client-visible output (text, streamed thinking, reasoning
+        // blocks) makes a verbatim same-route retry unsafe.
+        let mut produced_output = false;
         let error = match provider
             .stream_chat(&route.provider_model, &messages, &[], model_options)
             .await
@@ -2126,6 +2136,7 @@ impl Engine {
                     };
                     match event {
                         Ok(ProviderEvent::TextDelta(delta)) => {
+                            produced_output = true;
                             text.push_str(&delta);
                             self.store.append_event(
                                 scope.clone(),
@@ -2134,6 +2145,7 @@ impl Engine {
                         }
                         Ok(ProviderEvent::ThinkingStarted { .. }) => {}
                         Ok(ProviderEvent::ThinkingDelta { id, text }) => {
+                            produced_output = true;
                             self.store.append_event(
                                 scope.clone(),
                                 Event::AssistantThinking {
@@ -2149,7 +2161,10 @@ impl Engine {
                                 Event::AssistantThinkingCompleted { turn, id: Some(id) },
                             )?;
                         }
-                        Ok(ProviderEvent::Reasoning(block)) => reasoning.push(block),
+                        Ok(ProviderEvent::Reasoning(block)) => {
+                            produced_output = true;
+                            reasoning.push(block);
+                        }
                         Ok(ProviderEvent::Completed { usage }) => {
                             completed = true;
                             accounting.add_native(&self.model_catalog, route, &usage);
@@ -2192,7 +2207,6 @@ impl Engine {
             return Ok(RouteAttemptResult::Cancelled);
         }
         if let Some(error) = error {
-            let produced_output = !text.is_empty() || !reasoning.is_empty();
             if !text.is_empty() {
                 self.store.append_event(
                     scope.clone(),
@@ -2202,7 +2216,7 @@ impl Engine {
                     },
                 )?;
             }
-            if produced_output {
+            if !text.is_empty() || !reasoning.is_empty() {
                 self.store.append_message(
                     &thread.id,
                     &serde_json::to_value(Message::Assistant {
@@ -2796,6 +2810,9 @@ impl Engine {
                     model,
                     thinking_level,
                 } => {
+                    // Spawning a collaborator is a side effect: it may run
+                    // tools of its own, so this attempt cannot be replayed.
+                    side_effect_started = true;
                     flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
                     let vendor_session_id = session_id.clone();
                     let prompt_announced =
@@ -3137,6 +3154,9 @@ impl Engine {
                     // Vendor question extensions are another engine-served
                     // interaction path. Reserve before publishing or waiting
                     // so they share the same hard review-turn allowance.
+                    // Asking the user is a side effect too: a replay would
+                    // ask again.
+                    side_effect_started = true;
                     self.automated_review_tool_budgets.reserve(&thread.id)?;
                     if !segment.is_empty() {
                         persisted.push(Event::AssistantMessage {
@@ -3384,6 +3404,9 @@ mod tests {
         id: String,
         calls: Arc<AtomicUsize>,
         failures: usize,
+        /// Stream a thinking delta before each injected failure, so the
+        /// client has seen output from the attempt.
+        fail_after_thinking: bool,
     }
 
     struct BlockingFailingPinnedProvider {
@@ -3535,6 +3558,17 @@ mod tests {
         {
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
             if call < self.failures {
+                if self.fail_after_thinking {
+                    return Ok(Box::pin(futures::stream::iter([
+                        Ok(trouve_providers::ProviderEvent::ThinkingDelta {
+                            id: "reasoning".into(),
+                            text: "Considering a rebase".into(),
+                        }),
+                        Err(trouve_providers::ProviderError::Request(
+                            "injected transient outage".into(),
+                        )),
+                    ])));
+                }
                 return Err(trouve_providers::ProviderError::Request(
                     "injected transient outage".into(),
                 ));
@@ -4584,6 +4618,7 @@ mod tests {
                         id: "flaky".into(),
                         calls: flaky_calls.clone(),
                         failures: 1,
+                        fail_after_thinking: false,
                     }),
                 )
                 .with_backend(
@@ -4928,6 +4963,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_route_does_not_replay_after_streamed_thinking() {
+        let data = tempfile::tempdir().unwrap();
+        let worktree = data.path().join("worktrees/native-thinking");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let thread = routing_thread(&store, &worktree, "native_thinking");
+        let flaky_calls = Arc::new(AtomicUsize::new(0));
+        let backend_turns = Arc::new(Mutex::new(Vec::new()));
+        let config = Config {
+            providers: BTreeMap::from([(
+                "backend".into(),
+                crate::config::ProviderConfig {
+                    kind: "claude-cli".into(),
+                    tool_bridge: Some(true),
+                    ..Default::default()
+                },
+            )]),
+            provider_order: vec!["flaky".into(), "backend".into()],
+            local_enabled: Some(false),
+            ..Default::default()
+        };
+        let engine = Arc::new(
+            Engine::new(store.clone(), data.path().into(), &config)
+                .with_provider(
+                    "flaky",
+                    Arc::new(FlakyCatalogProvider {
+                        id: "flaky".into(),
+                        calls: flaky_calls.clone(),
+                        failures: 1,
+                        fail_after_thinking: true,
+                    }),
+                )
+                .with_backend(
+                    "backend",
+                    Arc::new(trouve_agents::RetirementAwareBackend::new(Arc::new(
+                        RecordingBackend {
+                            turns: backend_turns.clone(),
+                        },
+                    ))),
+                ),
+        );
+        engine.set_base_url("http://127.0.0.1:4000");
+
+        engine
+            .send_message(&thread.id, "Start the task".into(), Vec::new())
+            .unwrap();
+        wait_for_terminal_turn(&engine, &store, &thread, 1).await;
+
+        assert_eq!(
+            flaky_calls.load(Ordering::SeqCst),
+            1,
+            "thinking the client already saw must not be replayed by a verbatim retry"
+        );
+        assert_eq!(
+            backend_turns.lock().unwrap().len(),
+            1,
+            "no side effect ran, so the turn still fails over to the next route"
+        );
+    }
+
+    #[tokio::test]
     async fn persistent_route_failure_retries_once_then_fails_over() {
         let data = tempfile::tempdir().unwrap();
         let worktree = data.path().join("worktrees/retry-then-failover");
@@ -4959,6 +5055,7 @@ mod tests {
                         // Would recover on a third call; the turn must not
                         // keep hammering one route to find out.
                         failures: 2,
+                        fail_after_thinking: false,
                     }),
                 )
                 .with_backend(
