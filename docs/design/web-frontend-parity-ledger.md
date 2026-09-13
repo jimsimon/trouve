@@ -26,10 +26,10 @@ not current gates or runbooks.
 This document records source-inspected Lit coverage for the 21 migration
 surfaces in section 10 of the migration plan. The retired frontend's
 user-visible action contract is represented in Lit and frozen by
-[the application action contract](../../web/app-ui/src/app/app-action-contract.test.ts),
+[the application action contract](../../web/apps/app-ui/src/app/app-action-contract.test.ts),
 which requires one implementation-evidence disposition for each of the 149
 established actions. The complementary
-[native source contract](../../web/app-ui/src/app/native-source-contract.test.ts)
+[native source contract](../../web/apps/app-ui/src/app/native-source-contract.test.ts)
 inventories the remaining Rust desktop-host boundary and mechanically rejects
 an unreviewed native source or Rust/TypeScript thread-event reducer mismatch.
 
@@ -92,9 +92,9 @@ intentional difference that affects the visible or interactive contract must
 be documented and approved in the deviation register before promotion.
 
 The web architecture continues to use
-[@lit/context](../../web/app-ui/src/contexts/app-contexts.ts) for stable
+[@lit/context](../../web/apps/app-ui/src/contexts/app-contexts.ts) for stable
 service and scoped-store injection. It contains
-[@lit-labs/signals](../../web/app-ui/src/state/reactivity.ts) behind the small,
+[@lit-labs/signals](../../web/packages/ui-foundation/src/reactivity.ts) behind the small,
 Trouve-owned reactivity adapter rather than exposing the experimental package
 throughout the component tree.
 
@@ -111,52 +111,53 @@ target.
 
 The main cross-cutting implementation anchors are:
 
-- [Lit application shell](../../web/app-ui/src/app/trouve-app.ts)
-- [application router](../../web/app-ui/src/router/app-router.ts)
-- [normalized application store](../../web/app-ui/src/state/app-store.ts)
-- [cold-start durable protocol ingress](../../web/app-ui/src/services/protocol-ingress.ts)
-- [attention-first inbox projection](../../web/app-ui/src/state/session-inbox-model.ts)
-- [command palette](../../web/app-ui/src/components/command-palette.ts)
-- [command palette model](../../web/app-ui/src/components/command-palette-model.ts)
-- [stable application contexts](../../web/app-ui/src/contexts/app-contexts.ts)
-- [contained signals adapter](../../web/app-ui/src/state/reactivity.ts)
-- [reactivity import-boundary test](../../web/app-ui/src/state/reactivity-boundary.test.ts)
-- [theme controller](../../web/app-ui/src/services/theme-controller.ts)
-- [semantic themes](../../web/app-ui/src/styles/themes.css)
-- [application tokens](../../web/app-ui/src/styles/tokens.css)
-- [semantic theme-role contract](../../web/app-ui/src/styles/visual-contract.test.ts)
-- [visual parity component gallery](../../web/app-ui/src/app/component-gallery.ts)
-- [static visual contract tests](../../web/app-ui/src/styles/visual-contract.test.ts)
-- [application action contract](../../web/app-ui/src/app/app-action-contract.test.ts)
-- [application parity contract tests](../../web/app-ui/src/app/trouve-app-parity.test.ts)
-- [humanized tool, inline-diff, todo, and activity presentation](../../web/app-ui/src/components/tool-presentation.ts)
-- [session pull-request integration and lifecycle panel](../../web/app-ui/src/components/session-pr-panel.ts)
-- [local model, runtime, catalog, and fit controls](../../web/app-ui/src/components/local-model-settings.ts)
-- [desktop notification and lifecycle coordinator](../../web/app-ui/src/services/desktop-host-coordinator.ts)
-- [event-derived session notifications](../../web/app-ui/src/services/session-notifications.ts)
-- [PWA install controller](../../web/app-ui/src/services/pwa-install.ts)
-- [PWA pull-to-refresh controller](../../web/app-ui/src/services/pull-to-refresh.ts)
-- [typed host capability controller](../../web/app-ui/src/services/capabilities.ts)
-- [desktop/PWA host client boundary](../../web/app-ui/src/services/host-client.ts)
+- [Lit application shell](../../web/apps/app-ui/src/app/trouve-app.ts)
+- [application router](../../web/apps/app-ui/src/router/app-router.ts)
+- [normalized application store](../../web/apps/app-ui/src/state/app-store.ts)
+- [cold-start durable protocol ingress](../../web/apps/app-ui/src/services/protocol-ingress.ts)
+- [attention-first inbox projection](../../web/apps/app-ui/src/state/session-inbox-model.ts)
+- [command palette](../../web/apps/app-ui/src/components/command-palette.ts)
+- [command palette model](../../web/apps/app-ui/src/components/command-palette-model.ts)
+- [stable application contexts](../../web/apps/app-ui/src/contexts/app-contexts.ts)
+- [contained signals adapter](../../web/packages/ui-foundation/src/reactivity.ts)
+- [reactivity import-boundary test](../../web/packages/ui-foundation/src/reactivity-boundary.test.ts)
+- [theme controller](../../web/apps/app-ui/src/services/theme-controller.ts)
+- [semantic themes](../../web/packages/ui-foundation/src/styles/themes.css)
+- [application tokens](../../web/packages/ui-foundation/src/styles/tokens.css)
+- [semantic theme-role contract](../../web/apps/app-ui/src/styles/visual-contract.test.ts)
+- [visual parity component gallery](../../web/apps/app-ui/src/app/component-gallery.ts)
+- [static visual contract tests](../../web/apps/app-ui/src/styles/visual-contract.test.ts)
+- [application action contract](../../web/apps/app-ui/src/app/app-action-contract.test.ts)
+- [application parity contract tests](../../web/apps/app-ui/src/app/trouve-app-parity.test.ts)
+- [humanized tool, inline-diff, todo, and activity presentation](../../web/packages/transcript/src/tool-presentation.ts)
+- [session pull-request integration and lifecycle panel](../../web/apps/app-ui/src/components/session-pr-panel.ts)
+- [local model, runtime, catalog, and fit controls](../../web/apps/app-ui/src/components/local-model-settings.ts)
+- [desktop notification and lifecycle coordinator](../../web/apps/app-ui/src/services/desktop-host-coordinator.ts)
+- [event-derived session notifications](../../web/apps/app-ui/src/services/session-notifications.ts)
+- [PWA install controller](../../web/apps/app-ui/src/services/pwa-install.ts)
+- [PWA pull-to-refresh controller](../../web/apps/app-ui/src/services/pull-to-refresh.ts)
+- [typed host capability controller](../../web/apps/app-ui/src/services/capabilities.ts)
+- [desktop/PWA host client boundary](../../web/apps/app-ui/src/services/host-client.ts)
 - [desktop gateway and webview host](../../crates/trouve-desktop-host/src/lib.rs)
 - [Wry database-safe preview bootstrap](../../crates/trouve-app/src/web_preview_support.rs)
 - [chrome-free pinned Servo nightly embedding harness](../../crates/trouve-servo-embed-preview/README.md)
 - [Servo database-safe host bootstrap](../../crates/trouve-servo-embed-preview/src/web_preview_support.rs)
 - [Wry default and comparison host](../../crates/trouve-app/src/web_preview.rs)
-- [PWA service worker](../../web/app-ui/src/pwa/service-worker.ts)
+- [PWA service worker](../../web/apps/app-ui/src/pwa/service-worker.ts)
 - [shared Rust/web thread projection fixture](../../crates/trouve-client-core/fixtures/thread-turn.json)
-- [bounded live tool-output projection](../../web/app-ui/src/state/tool-output.ts)
-- [approval action controller](../../web/app-ui/src/components/approval-controls.ts)
-- [lazy content-worker client](../../web/app-ui/src/services/content-worker-client.ts)
-- [content worker](../../web/app-ui/src/workers/content-worker.ts)
-- [Playwright browser matrix](../../web/app-ui/playwright.config.ts)
-- [visual and accessibility browser suite](../../web/app-ui/e2e/visual-accessibility.spec.ts)
-- [shared pull-request projection browser suite](../../web/app-ui/e2e/app-shell.spec.ts)
-- [bundle budget gate](../../web/app-ui/scripts/check-bundle-budget.mjs)
-- [source format check](../../web/app-ui/scripts/check-source-format.mjs)
-- [source policy lint](../../web/app-ui/scripts/check-source-policy.mjs)
-- [npm dependency notice gate](../../web/app-ui/scripts/generate-third-party-notices.mjs)
-- [npm CycloneDX SBOM generator](../../web/app-ui/scripts/generate-npm-sbom.mjs)
+- [bounded live tool-output projection](../../web/packages/transcript/src/tool-output.ts)
+- [approval action controller](../../web/apps/app-ui/src/components/approval-controls.ts)
+- [lazy content-worker client](../../web/apps/app-ui/src/services/content-worker-client.ts)
+- [content worker](../../web/apps/app-ui/src/workers/content-worker.ts)
+- [Playwright browser matrix](../../web/apps/app-ui/playwright.config.ts)
+- [visual and accessibility browser suite](../../web/apps/app-ui/e2e/visual-accessibility.spec.ts)
+- [shared pull-request projection browser suite](../../web/apps/app-ui/e2e/app-shell.spec.ts)
+- [bundle budget gate](../../web/apps/app-ui/scripts/check-bundle-budget.mjs)
+- [source format check](../../web/scripts/check-source-format.mjs)
+- [source policy lint](../../web/scripts/check-source-policy.mjs)
+- [review-ui Dockerfile staging check](../../web/scripts/check-review-dockerfile.mjs)
+- [npm dependency notice gate](../../web/apps/app-ui/scripts/generate-third-party-notices.mjs)
+- [npm CycloneDX SBOM generator](../../web/apps/app-ui/scripts/generate-npm-sbom.mjs)
 - [Rust dependency notice gate](../../scripts/generate_rust_third_party_notices.py)
 
 These paths establish that the preview has real implementation coverage. They
@@ -200,12 +201,12 @@ are data-integrity constraints: two live engines over one SQLite database
 would have competing writers and separate in-memory event broadcasts,
 schedulers, turn state, and worktree locks.
 
-From the repository root, after building `web/app-ui/dist/desktop`, run Servo
+From the repository root, after building `web/apps/app-ui/dist/desktop`, run Servo
 first:
 
 ```sh
 TROUVE_SERVER_URL=http://127.0.0.1:7433 \
-TROUVE_APP_UI_DIST=/absolute/path/to/trouve/web/app-ui/dist/desktop \
+TROUVE_APP_UI_DIST=/absolute/path/to/trouve/web/apps/app-ui/dist/desktop \
   cargo run \
     --manifest-path crates/trouve-servo-embed-preview/Cargo.toml \
     --locked
@@ -215,14 +216,14 @@ Use the explicit Wry comparison host without opening the default database:
 
 ```sh
 TROUVE_SERVER_URL=http://127.0.0.1:7433 \
-TROUVE_APP_UI_DIST=/absolute/path/to/trouve/web/app-ui/dist/desktop \
+TROUVE_APP_UI_DIST=/absolute/path/to/trouve/web/apps/app-ui/dist/desktop \
   cargo run -p trouve-app --features web-preview --bin trouve-web-preview
 ```
 
 Both hosts use ADR 0026's shared desktop-host source selector. In debug and
 qualification runs, `TROUVE_APP_UI_DIST` is loaded at process startup and does
 not trigger a Cargo rebuild. For HMR, omit that variable, run `npm run dev`
-from `web/app-ui`, and set
+from `web/apps/app-ui`, and set
 `TROUVE_APP_UI_DEV_URL=http://127.0.0.1:5173` on the selected preview. The
 gateway remains the page origin and reserves its native and `/v1` routes.
 
@@ -284,27 +285,27 @@ xterm input/resize are examples.
 
 | # | Surface | Functional port coverage | Principal evidence | Remaining promotion qualification |
 | ---: | --- | --- | --- | --- |
-| 1 | Shell and inbox | Three-column desktop shell, persisted splitters, responsive pane routes, workspace register/close/reorder, active and archived session groups, attention-first sorting, selection recovery, session rename/archive/delete, PR badges, command palette, and connection/retry states. | [application shell](../../web/app-ui/src/app/trouve-app.ts), [session list](../../web/app-ui/src/components/session-list.ts), [workspace settings](../../web/app-ui/src/components/workspace-settings.ts) | Paired Slint/Lit screenshots, focus and AT matrix, real desktop/PWA lifecycle, performance, and memory. |
-| 2 | Session and thread management | Prompt-first session creation with workspace, branch/fetch, persona, model, thinking, permission, bounded attachments, provisional creation recovery, and cancelable new-thread setup with inherited defaults. Thread select, create, rename, archive, delete, and route restoration are wired. | [new-session model](../../web/app-ui/src/app/new-session-model.ts), [new-thread setup](../../web/app-ui/src/components/new-thread-setup.ts), [thread screen](../../web/app-ui/src/components/thread-screen.ts) | Failure-injection, slow/offline races, full keyboard/IME/AT runs, and visual evidence. |
-| 3 | Chat | Streaming user/assistant/thinking/tool/error turns, sanitized selectable Markdown, safe links, hover/focus response copy plus a **Copy as markdown** context action, attachments, disclosure state, raw and formatted tool regions, humanized tool names, file links, inline diffs, todos, timeline-based activity hierarchy, usage, tool/thought/attachment copy, Slint-shaped inline desktop approvals and a large-target mobile approval sheet, question interaction, bounded output, keyed virtualization, follow-tail, stable anchoring with invalid-bookmark recovery, tail-only live-log announcements, active-stream foreground resume, reduced motion, and an accessible full-history fallback. | [thread screen](../../web/app-ui/src/components/thread-screen.ts), [chat presentation](../../web/app-ui/src/components/chat-presentation.ts), [tool presentation](../../web/app-ui/src/components/tool-presentation.ts), [thread ingress](../../web/app-ui/src/services/thread-ingress.ts) | Large-history measurements, renderer/selection testing on both engines, screen readers, mobile memory, and screenshot comparison. |
-| 4 | Composer, completion, queue, and attachments | Autogrow input, IME-safe keyboard handling, slash and file completion with DOM UTF-16/protocol UTF-8 conversion, acknowledgement-aware start/cancel/queue/send-after-cancel controls, queued prompt edit/delete/reorder/send-now and paused-queue restart, durable thread-scoped unsubmitted text/cursor/attachment drafts, thread-scoped async mutation recovery, context and session usage, file picker, drag/drop, pasted images, attachment limits, and PWA quick replies. | [thread screen](../../web/app-ui/src/components/thread-screen.ts), [draft persistence](../../web/app-ui/src/services/composer-drafts.ts), [turn controls](../../web/app-ui/src/components/chat-turn-controls.ts), [completion model](../../web/app-ui/src/components/composer-completion.ts), [queue controls](../../web/app-ui/src/components/queue-controls.ts), [attachments service](../../web/app-ui/src/services/attachments.ts) | Cross-engine IME/dead-key/mobile-keyboard matrix, picker denial/cancel, queue recovery soak, and visual evidence. |
-| 5 | Diff | Unified/split modes, per-file grouping, line numbers, changed-file keyboard navigation, copy, responsive unified-only behavior, refresh, exact turn-checkpoint restoration from transcript actions, expansion/collapse, and parsed status/error states. | [diff view](../../web/app-ui/src/components/diff-view.ts), [inspection diff controls](../../web/app-ui/src/components/inspection-diff-controls.ts), [inspection workspace](../../web/app-ui/src/components/inspection-workspace.ts) | Large-patch performance/memory, selection/AT alternatives, theme screenshots, touch, and engine disposal. |
-| 6 | Files and code | Lazy cached directory tree, roving keyboard navigation, retry/error/empty states, file loading, syntax-aware code view, line/range reveal, Markdown preview, selection/copy, capability-gated desktop open/reveal actions, and a narrow list-to-viewer flow whose tree toggle provides the return path. | [inspection file tree](../../web/app-ui/src/components/inspection-file-tree.ts), [code view](../../web/app-ui/src/components/code-view.ts), [file reveal model](../../web/app-ui/src/components/file-reveal.ts) | Large-tree/file budgets, binary fixtures, engine selection, mobile copy/scroll, visual and AT evidence. |
-| 7 | Terminal | Multiple PTY tabs, create/select/restart/close/exit state, xterm input/paste/copy/selection/search/links/mouse/wheel/resize/IME, offset resume, duplicate-free streaming, OSC 52 confirmation, and renderer disposal. | [terminal panel](../../web/app-ui/src/components/terminal-panel.ts), [terminal view](../../web/app-ui/src/components/terminal-view.ts), [terminal clipboard policy](../../web/app-ui/src/components/terminal-clipboard.ts) | Native clipboard and IME matrices, one/five-terminal budgets, suspend/resume and renderer recreation, AT alternative, touch controls. |
-| 8 | Todos and plan | Current plan snapshot, pending/in-progress/completed/cancelled semantics, progress summary, empty state, and conditional inspection tab. | [todo plan panel](../../web/app-ui/src/components/todo-plan-panel.ts), [todo plan model](../../web/app-ui/src/components/todo-plan-model.ts) | Streaming/stale fixture comparison, responsive screenshots, semantics and live-region verification. |
-| 9 | Session pull request | Explicit GitHub setup route, PR eligibility/create form, list/detail state, checks, reviews, reviewers, mergeability, safe external open, refresh/errors, and lifecycle controls advertised by the server. The pane and session status indicators consume one shared session projection: durable account snapshots provide current GitHub state while the authoritative session lookup preserves cross-branch associations discovered from session activity. | [session PR panel](../../web/app-ui/src/components/session-pr-panel.ts), [shared application store](../../web/app-ui/src/state/app-store.ts), [session PR model](../../web/app-ui/src/components/session-pr-panel-model.ts) | Live GitHub enterprise/host runs, OAuth expiry, browser navigation, lifecycle failure recovery, visual/AT evidence. |
-| 10 | Pull-request dashboard | Repository filters, grouped/reorderable/collapsible PR inbox with keyboard, drag, and explicit coarse-pointer ordering controls, countdown and refresh, status/reviewer/check summaries, open/copy/chat/fix actions, App health and administration, repository policy, reviewer personas, review jobs, and Review operations. Cold startup replays durable server projections through the session-summary boundary so an unchanged refresh cannot leave the dashboard or session indicators empty. | [PR dashboard](../../web/app-ui/src/components/pull-requests-dashboard.ts), [durable protocol ingress](../../web/app-ui/src/services/protocol-ingress.ts), [code-review dashboard](../../web/app-ui/src/components/code-review-dashboard.ts) | Large-list and live-provider soak, route/focus restore, screenshots, keyboard/AT/mobile matrices. |
-| 11 | Automations | List/detail, templates, create/edit/delete confirmation, enable/disable, run-now, schedule/day/time/time-zone controls, workspace/persona/model/permission configuration, validation, history, selection, loading, and failure states. | [automations screen](../../web/app-ui/src/components/automations-screen.ts), [automation model](../../web/app-ui/src/components/automations-model.ts) | Live scheduler failures/concurrency, touch schedule editing, screenshots, keyboard/AT and lifecycle runs. |
-| 12 | General and appearance | All five themes, system preference, font scale, reduced motion, semantic preview, layout preference persistence, keep-awake/sleep preference, and capability-aware PWA/desktop explanations. | [settings screen](../../web/app-ui/src/components/settings-screen.ts), [appearance preferences](../../web/app-ui/src/services/appearance-preferences.ts), [general preferences](../../web/app-ui/src/services/general-preferences.ts) | Five-theme paired captures, forced colors/zoom, persistence/restart, OS sleep behavior, and supported-device matrix. |
-| 13 | Notifications | Preference toggles, permission/capability state, user-initiated test, exact durable approval/question/completion/failure edges, repeated attention requests, compact failure/question detail, focused-session suppression, activation routing, desktop attention/sound, and unsupported/reliability explanations. | [notification preferences](../../web/app-ui/src/services/notification-preferences.ts), [session notifications](../../web/app-ui/src/services/session-notifications.ts), [desktop host coordinator](../../web/app-ui/src/services/desktop-host-coordinator.ts) | Real OS/browser permission matrices, background/suspend reliability, activation routes, quiet/offline and PWA publication evidence. |
-| 14 | Providers and onboarding | Provider presets and custom endpoints, secret entry, reset/validation, health and models, API-key and OAuth/device/callback login, polling, cancellation, failure/expiry, delete, and vendor CLI install/update/cancel/uninstall lifecycle. | [provider settings](../../web/app-ui/src/components/provider-settings.ts), [CLI settings](../../web/app-ui/src/components/cli-settings.ts) | Live provider matrices, secret redaction audit, OAuth interruption/expiry, onboarding screenshots, keyboard/mobile/AT evidence. |
-| 15 | Personas and models | Data-driven personas, per-persona provider/model/thinking/permission defaults, inheritance, availability/health cues, model options, search, reset, and refresh. | [persona settings](../../web/app-ui/src/components/persona-settings-panel.ts), [model picker](../../web/app-ui/src/components/model-picker.ts), [model option controls](../../web/app-ui/src/components/model-option-controls.ts) | Unsupported-combination fixtures, live catalog churn, visual density, keyboard combobox and mobile evidence. |
-| 16 | Local models | Enabled/status/hardware state, llama.cpp runtime install/update/cancel/uninstall, server start/stop/restart controls, installed model management, download progress/cancel/delete, catalog search, GPU/CPU/too-large fit filters, and manual model addition. | [local model settings](../../web/app-ui/src/components/local-model-settings.ts) | Live runtime/download/disk/concurrency failures, remote-host wording on devices, progress screenshots, memory and AT evidence. |
-| 17 | Session naming | Configured asynchronous session/thread naming with image attachments, placeholder-safe compare-and-set updates, and optional post-title branch renaming. No web client bypasses the protocol or session-owned worktree boundary. | [management settings panels](../../web/app-ui/src/components/management-settings-panels.ts), [settings screen](../../web/app-ui/src/components/settings-screen.ts) | Naming failure fixtures exposed by the server, visual hierarchy, accessibility, and live worktree soak. |
-| 18 | MCP | User/workspace scoped server CRUD, command/args/environment editing, enable/disable, effective per-session scopes, health refresh/reconnect, logs, copying, masking, validation, and responsive long-output behavior. | [management settings panels](../../web/app-ui/src/components/management-settings-panels.ts), [session MCP panel](../../web/app-ui/src/components/session-mcp-panel.ts) | Live reconnect/restart/secret audit, large-log memory/disposal, mobile long lines, screenshots and AT evidence. |
-| 19 | Integrations | GitHub.com and enterprise host add/remove, configuration status, login/device/callback flows, polling/cancel, disconnect, health/errors, validated navigation, and integration deep links from PR surfaces. | [management settings panels](../../web/app-ui/src/components/management-settings-panels.ts), [session PR panel](../../web/app-ui/src/components/session-pr-panel.ts) | Live multi-host OAuth and re-auth, PWA redirect origins, cancellation/expiry, security and visual/AT evidence. |
-| 20 | About and licensing | Frontend/server/protocol/deployment/connectivity/version data, packaged dependency notices, conditional Slint attribution while shipped, and desktop/PWA capability/revision information. | [settings screen](../../web/app-ui/src/components/settings-screen.ts), [generated host schema](../../web/app-ui/src/generated/host.ts) | Packaged offline artifact inspection, final inventories, platform/version screenshots, link and compliance review. |
-| 21 | Desktop integration and web capabilities | Versioned typed host v13, hardened asset/API/SSE gateway, preferences, pickers, clipboard, validated file/HTTPS open, notifications, attention, sleep, focus/visibility/occlusion/window lifecycle, exact close-request acknowledgement plus cancel/quit decisions, Wry host, historical direct chrome-free Servo host, and PWA service worker/install/wake-lock/pull-refresh adapters are implemented. | [desktop host](../../crates/trouve-desktop-host/src/lib.rs), [historical Servo harness](../../crates/trouve-servo-embed-preview/src/main.rs), [Wry preview](../../crates/trouve-app/src/web_preview.rs), [PWA worker](../../web/app-ui/src/pwa/service-worker.ts) | **Gated:** Wry matrix, host security review, crash/OOM recovery, packaging/signing, six-platform artifacts, production PWA HTTPS/auth/update/deployment, and soak. Servo evidence is retained only as history following ADR 0039. |
+| 1 | Shell and inbox | Three-column desktop shell, persisted splitters, responsive pane routes, workspace register/close/reorder, active and archived session groups, attention-first sorting, selection recovery, session rename/archive/delete, PR badges, command palette, and connection/retry states. | [application shell](../../web/apps/app-ui/src/app/trouve-app.ts), [session list](../../web/apps/app-ui/src/components/session-list.ts), [workspace settings](../../web/apps/app-ui/src/components/workspace-settings.ts) | Paired Slint/Lit screenshots, focus and AT matrix, real desktop/PWA lifecycle, performance, and memory. |
+| 2 | Session and thread management | Prompt-first session creation with workspace, branch/fetch, persona, model, thinking, permission, bounded attachments, provisional creation recovery, and cancelable new-thread setup with inherited defaults. Thread select, create, rename, archive, delete, and route restoration are wired. | [new-session model](../../web/apps/app-ui/src/app/new-session-model.ts), [new-thread setup](../../web/apps/app-ui/src/components/new-thread-setup.ts), [thread screen](../../web/apps/app-ui/src/components/thread-screen.ts) | Failure-injection, slow/offline races, full keyboard/IME/AT runs, and visual evidence. |
+| 3 | Chat | Streaming user/assistant/thinking/tool/error turns, sanitized selectable Markdown, safe links, hover/focus response copy plus a **Copy as markdown** context action, attachments, disclosure state, raw and formatted tool regions, humanized tool names, file links, inline diffs, todos, timeline-based activity hierarchy, usage, tool/thought/attachment copy, Slint-shaped inline desktop approvals and a large-target mobile approval sheet, question interaction, bounded output, keyed virtualization, follow-tail, stable anchoring with invalid-bookmark recovery, tail-only live-log announcements, active-stream foreground resume, reduced motion, and an accessible full-history fallback. | [thread screen](../../web/apps/app-ui/src/components/thread-screen.ts), [chat presentation](../../web/packages/transcript/src/chat-presentation.ts), [tool presentation](../../web/packages/transcript/src/tool-presentation.ts), [thread ingress](../../web/apps/app-ui/src/services/thread-ingress.ts) | Large-history measurements, renderer/selection testing on both engines, screen readers, mobile memory, and screenshot comparison. |
+| 4 | Composer, completion, queue, and attachments | Autogrow input, IME-safe keyboard handling, slash and file completion with DOM UTF-16/protocol UTF-8 conversion, acknowledgement-aware start/cancel/queue/send-after-cancel controls, queued prompt edit/delete/reorder/send-now and paused-queue restart, durable thread-scoped unsubmitted text/cursor/attachment drafts, thread-scoped async mutation recovery, context and session usage, file picker, drag/drop, pasted images, attachment limits, and PWA quick replies. | [thread screen](../../web/apps/app-ui/src/components/thread-screen.ts), [draft persistence](../../web/apps/app-ui/src/services/composer-drafts.ts), [turn controls](../../web/apps/app-ui/src/components/chat-turn-controls.ts), [completion model](../../web/apps/app-ui/src/components/composer-completion.ts), [queue controls](../../web/apps/app-ui/src/components/queue-controls.ts), [attachments service](../../web/packages/transcript/src/attachments.ts) | Cross-engine IME/dead-key/mobile-keyboard matrix, picker denial/cancel, queue recovery soak, and visual evidence. |
+| 5 | Diff | Unified/split modes, per-file grouping, line numbers, changed-file keyboard navigation, copy, responsive unified-only behavior, refresh, exact turn-checkpoint restoration from transcript actions, expansion/collapse, and parsed status/error states. | [diff view](../../web/apps/app-ui/src/components/diff-view.ts), [inspection diff controls](../../web/apps/app-ui/src/components/inspection-diff-controls.ts), [inspection workspace](../../web/apps/app-ui/src/components/inspection-workspace.ts) | Large-patch performance/memory, selection/AT alternatives, theme screenshots, touch, and engine disposal. |
+| 6 | Files and code | Lazy cached directory tree, roving keyboard navigation, retry/error/empty states, file loading, syntax-aware code view, line/range reveal, Markdown preview, selection/copy, capability-gated desktop open/reveal actions, and a narrow list-to-viewer flow whose tree toggle provides the return path. | [inspection file tree](../../web/apps/app-ui/src/components/inspection-file-tree.ts), [code view](../../web/apps/app-ui/src/components/code-view.ts), [file reveal model](../../web/apps/app-ui/src/components/file-reveal.ts) | Large-tree/file budgets, binary fixtures, engine selection, mobile copy/scroll, visual and AT evidence. |
+| 7 | Terminal | Multiple PTY tabs, create/select/restart/close/exit state, xterm input/paste/copy/selection/search/links/mouse/wheel/resize/IME, offset resume, duplicate-free streaming, OSC 52 confirmation, and renderer disposal. | [terminal panel](../../web/apps/app-ui/src/components/terminal-panel.ts), [terminal view](../../web/apps/app-ui/src/components/terminal-view.ts), [terminal clipboard policy](../../web/apps/app-ui/src/components/terminal-clipboard.ts) | Native clipboard and IME matrices, one/five-terminal budgets, suspend/resume and renderer recreation, AT alternative, touch controls. |
+| 8 | Todos and plan | Current plan snapshot, pending/in-progress/completed/cancelled semantics, progress summary, empty state, and conditional inspection tab. | [todo plan panel](../../web/apps/app-ui/src/components/todo-plan-panel.ts), [todo plan model](../../web/packages/transcript/src/todo-plan-model.ts) | Streaming/stale fixture comparison, responsive screenshots, semantics and live-region verification. |
+| 9 | Session pull request | Explicit GitHub setup route, PR eligibility/create form, list/detail state, checks, reviews, reviewers, mergeability, safe external open, refresh/errors, and lifecycle controls advertised by the server. The pane and session status indicators consume one shared session projection: durable account snapshots provide current GitHub state while the authoritative session lookup preserves cross-branch associations discovered from session activity. | [session PR panel](../../web/apps/app-ui/src/components/session-pr-panel.ts), [shared application store](../../web/apps/app-ui/src/state/app-store.ts), [session PR model](../../web/apps/app-ui/src/components/session-pr-panel-model.ts) | Live GitHub enterprise/host runs, OAuth expiry, browser navigation, lifecycle failure recovery, visual/AT evidence. |
+| 10 | Pull-request dashboard | Repository filters, grouped/reorderable/collapsible PR inbox with keyboard, drag, and explicit coarse-pointer ordering controls, countdown and refresh, status/reviewer/check summaries, open/copy/chat/fix actions, App health and administration, repository policy, reviewer personas, review jobs, and Review operations. Cold startup replays durable server projections through the session-summary boundary so an unchanged refresh cannot leave the dashboard or session indicators empty. | [PR dashboard](../../web/apps/app-ui/src/components/pull-requests-dashboard.ts), [durable protocol ingress](../../web/apps/app-ui/src/services/protocol-ingress.ts), [code-review dashboard](../../web/apps/app-ui/src/components/code-review-dashboard.ts) | Large-list and live-provider soak, route/focus restore, screenshots, keyboard/AT/mobile matrices. |
+| 11 | Automations | List/detail, templates, create/edit/delete confirmation, enable/disable, run-now, schedule/day/time/time-zone controls, workspace/persona/model/permission configuration, validation, history, selection, loading, and failure states. | [automations screen](../../web/apps/app-ui/src/components/automations-screen.ts), [automation model](../../web/apps/app-ui/src/components/automations-model.ts) | Live scheduler failures/concurrency, touch schedule editing, screenshots, keyboard/AT and lifecycle runs. |
+| 12 | General and appearance | All five themes, system preference, font scale, reduced motion, semantic preview, layout preference persistence, keep-awake/sleep preference, and capability-aware PWA/desktop explanations. | [settings screen](../../web/apps/app-ui/src/components/settings-screen.ts), [appearance preferences](../../web/apps/app-ui/src/services/appearance-preferences.ts), [general preferences](../../web/apps/app-ui/src/services/general-preferences.ts) | Five-theme paired captures, forced colors/zoom, persistence/restart, OS sleep behavior, and supported-device matrix. |
+| 13 | Notifications | Preference toggles, permission/capability state, user-initiated test, exact durable approval/question/completion/failure edges, repeated attention requests, compact failure/question detail, focused-session suppression, activation routing, desktop attention/sound, and unsupported/reliability explanations. | [notification preferences](../../web/apps/app-ui/src/services/notification-preferences.ts), [session notifications](../../web/apps/app-ui/src/services/session-notifications.ts), [desktop host coordinator](../../web/apps/app-ui/src/services/desktop-host-coordinator.ts) | Real OS/browser permission matrices, background/suspend reliability, activation routes, quiet/offline and PWA publication evidence. |
+| 14 | Providers and onboarding | Provider presets and custom endpoints, secret entry, reset/validation, health and models, API-key and OAuth/device/callback login, polling, cancellation, failure/expiry, delete, and vendor CLI install/update/cancel/uninstall lifecycle. | [provider settings](../../web/apps/app-ui/src/components/provider-settings.ts), [CLI settings](../../web/apps/app-ui/src/components/cli-settings.ts) | Live provider matrices, secret redaction audit, OAuth interruption/expiry, onboarding screenshots, keyboard/mobile/AT evidence. |
+| 15 | Personas and models | Data-driven personas, per-persona provider/model/thinking/permission defaults, inheritance, availability/health cues, model options, search, reset, and refresh. | [persona settings](../../web/apps/app-ui/src/components/persona-settings-panel.ts), [model picker](../../web/apps/app-ui/src/components/model-picker.ts), [model option controls](../../web/apps/app-ui/src/components/model-option-controls.ts) | Unsupported-combination fixtures, live catalog churn, visual density, keyboard combobox and mobile evidence. |
+| 16 | Local models | Enabled/status/hardware state, llama.cpp runtime install/update/cancel/uninstall, server start/stop/restart controls, installed model management, download progress/cancel/delete, catalog search, GPU/CPU/too-large fit filters, and manual model addition. | [local model settings](../../web/apps/app-ui/src/components/local-model-settings.ts) | Live runtime/download/disk/concurrency failures, remote-host wording on devices, progress screenshots, memory and AT evidence. |
+| 17 | Session naming | Configured asynchronous session/thread naming with image attachments, placeholder-safe compare-and-set updates, and optional post-title branch renaming. No web client bypasses the protocol or session-owned worktree boundary. | [management settings panels](../../web/apps/app-ui/src/components/management-settings-panels.ts), [settings screen](../../web/apps/app-ui/src/components/settings-screen.ts) | Naming failure fixtures exposed by the server, visual hierarchy, accessibility, and live worktree soak. |
+| 18 | MCP | User/workspace scoped server CRUD, command/args/environment editing, enable/disable, effective per-session scopes, health refresh/reconnect, logs, copying, masking, validation, and responsive long-output behavior. | [management settings panels](../../web/apps/app-ui/src/components/management-settings-panels.ts), [session MCP panel](../../web/apps/app-ui/src/components/session-mcp-panel.ts) | Live reconnect/restart/secret audit, large-log memory/disposal, mobile long lines, screenshots and AT evidence. |
+| 19 | Integrations | GitHub.com and enterprise host add/remove, configuration status, login/device/callback flows, polling/cancel, disconnect, health/errors, validated navigation, and integration deep links from PR surfaces. | [management settings panels](../../web/apps/app-ui/src/components/management-settings-panels.ts), [session PR panel](../../web/apps/app-ui/src/components/session-pr-panel.ts) | Live multi-host OAuth and re-auth, PWA redirect origins, cancellation/expiry, security and visual/AT evidence. |
+| 20 | About and licensing | Frontend/server/protocol/deployment/connectivity/version data, packaged dependency notices, conditional Slint attribution while shipped, and desktop/PWA capability/revision information. | [settings screen](../../web/apps/app-ui/src/components/settings-screen.ts), [generated host schema](../../web/apps/app-ui/src/generated/host.ts) | Packaged offline artifact inspection, final inventories, platform/version screenshots, link and compliance review. |
+| 21 | Desktop integration and web capabilities | Versioned typed host v13, hardened asset/API/SSE gateway, preferences, pickers, clipboard, validated file/HTTPS open, notifications, attention, sleep, focus/visibility/occlusion/window lifecycle, exact close-request acknowledgement plus cancel/quit decisions, Wry host, historical direct chrome-free Servo host, and PWA service worker/install/wake-lock/pull-refresh adapters are implemented. | [desktop host](../../crates/trouve-desktop-host/src/lib.rs), [historical Servo harness](../../crates/trouve-servo-embed-preview/src/main.rs), [Wry preview](../../crates/trouve-app/src/web_preview.rs), [PWA worker](../../web/apps/app-ui/src/pwa/service-worker.ts) | **Gated:** Wry matrix, host security review, crash/OOM recovery, packaging/signing, six-platform artifacts, production PWA HTTPS/auth/update/deployment, and soak. Servo evidence is retained only as history following ADR 0039. |
 
 Surfaces 1–20 are **functionally-ported**. Surface 21 is **gated** because its
 shipping Wry host and production PWA deployment still require the independent
@@ -354,19 +355,19 @@ functional status.
 
 **Primary Lit evidence**
 
-- [application shell](../../web/app-ui/src/app/trouve-app.ts)
-- [shell and responsive styling](../../web/app-ui/src/styles/app.css)
-- [session list](../../web/app-ui/src/components/session-list.ts)
-- [session inbox model](../../web/app-ui/src/state/session-inbox-model.ts)
-- [command palette](../../web/app-ui/src/components/command-palette.ts)
-- [command palette model](../../web/app-ui/src/components/command-palette-model.ts)
-- [workspace management](../../web/app-ui/src/components/workspace-settings.ts)
-- [workspace management model](../../web/app-ui/src/components/workspace-settings-model.ts)
-- [typed host client](../../web/app-ui/src/services/host-client.ts)
-- [router](../../web/app-ui/src/router/app-router.ts)
-- [application store](../../web/app-ui/src/state/app-store.ts)
-- [cursor-safe protocol ingress](../../web/app-ui/src/services/protocol-ingress.ts)
-- [protocol ingress race/recovery tests](../../web/app-ui/src/services/protocol-ingress.test.ts)
+- [application shell](../../web/apps/app-ui/src/app/trouve-app.ts)
+- [shell and responsive styling](../../web/apps/app-ui/src/styles/app.css)
+- [session list](../../web/apps/app-ui/src/components/session-list.ts)
+- [session inbox model](../../web/apps/app-ui/src/state/session-inbox-model.ts)
+- [command palette](../../web/apps/app-ui/src/components/command-palette.ts)
+- [command palette model](../../web/apps/app-ui/src/components/command-palette-model.ts)
+- [workspace management](../../web/apps/app-ui/src/components/workspace-settings.ts)
+- [workspace management model](../../web/apps/app-ui/src/components/workspace-settings-model.ts)
+- [typed host client](../../web/apps/app-ui/src/services/host-client.ts)
+- [router](../../web/apps/app-ui/src/router/app-router.ts)
+- [application store](../../web/apps/app-ui/src/state/app-store.ts)
+- [cursor-safe protocol ingress](../../web/apps/app-ui/src/services/protocol-ingress.ts)
+- [protocol ingress race/recovery tests](../../web/apps/app-ui/src/services/protocol-ingress.test.ts)
 
 **Missing parity and qualification work**
 
@@ -417,17 +418,17 @@ desktop-device, mobile-PWA, or performance evidence is recorded.
 
 **Primary Lit evidence**
 
-- [thread screen](../../web/app-ui/src/components/thread-screen.ts)
-- [new-thread setup](../../web/app-ui/src/components/new-thread-setup.ts)
-- [new-thread setup model](../../web/app-ui/src/components/new-thread-setup-model.ts)
-- [new-thread integration tests](../../web/app-ui/src/components/thread-new-setup-integration.test.ts)
-- [new-session shell flow](../../web/app-ui/src/app/trouve-app.ts)
-- [new-session request and fallback model](../../web/app-ui/src/app/new-session-model.ts)
-- [new-session model tests](../../web/app-ui/src/app/new-session-model.test.ts)
-- [thread view model](../../web/app-ui/src/state/thread-view-model.ts)
-- [shared tab-navigation model](../../web/app-ui/src/components/tab-navigation.ts)
-- [application store](../../web/app-ui/src/state/app-store.ts)
-- [application contexts](../../web/app-ui/src/contexts/app-contexts.ts)
+- [thread screen](../../web/apps/app-ui/src/components/thread-screen.ts)
+- [new-thread setup](../../web/apps/app-ui/src/components/new-thread-setup.ts)
+- [new-thread setup model](../../web/apps/app-ui/src/components/new-thread-setup-model.ts)
+- [new-thread integration tests](../../web/apps/app-ui/src/components/thread-new-setup-integration.test.ts)
+- [new-session shell flow](../../web/apps/app-ui/src/app/trouve-app.ts)
+- [new-session request and fallback model](../../web/apps/app-ui/src/app/new-session-model.ts)
+- [new-session model tests](../../web/apps/app-ui/src/app/new-session-model.test.ts)
+- [thread view model](../../web/packages/transcript/src/thread-view-model.ts)
+- [shared tab-navigation model](../../web/packages/ui-foundation/src/tab-navigation.ts)
+- [application store](../../web/apps/app-ui/src/state/app-store.ts)
+- [application contexts](../../web/apps/app-ui/src/contexts/app-contexts.ts)
 
 **Missing parity and qualification work**
 
@@ -507,17 +508,17 @@ desktop-device, mobile-PWA, or performance evidence is recorded.
 
 **Primary Lit evidence**
 
-- [thread screen](../../web/app-ui/src/components/thread-screen.ts)
-- [chat hierarchy](../../web/app-ui/src/components/chat-layout.ts)
-- [turn controls](../../web/app-ui/src/components/chat-turn-controls.ts)
-- [thread event projection](../../web/app-ui/src/state/thread-view-model.ts)
-- [active thread ingress](../../web/app-ui/src/services/thread-ingress.ts)
-- [bounded tool-output model](../../web/app-ui/src/state/tool-output.ts)
-- [approval controls](../../web/app-ui/src/components/approval-controls.ts)
-- [Markdown view](../../web/app-ui/src/components/markdown-view.ts)
-- [owned virtualizer](../../web/app-ui/src/components/virtualization/virtualizer.ts)
-- [virtualizer tests](../../web/app-ui/src/components/virtualization/virtualizer.test.ts)
-- [stateful browser chat tests](../../web/app-ui/e2e/chat-session.spec.ts)
+- [thread screen](../../web/apps/app-ui/src/components/thread-screen.ts)
+- [chat hierarchy](../../web/packages/transcript/src/chat-layout.ts)
+- [turn controls](../../web/apps/app-ui/src/components/chat-turn-controls.ts)
+- [thread event projection](../../web/packages/transcript/src/thread-view-model.ts)
+- [active thread ingress](../../web/apps/app-ui/src/services/thread-ingress.ts)
+- [bounded tool-output model](../../web/packages/transcript/src/tool-output.ts)
+- [approval controls](../../web/apps/app-ui/src/components/approval-controls.ts)
+- [Markdown view](../../web/packages/content-rendering/src/markdown-view.ts)
+- [owned virtualizer](../../web/packages/ui-foundation/src/virtualizer.ts)
+- [virtualizer tests](../../web/packages/ui-foundation/src/virtualizer.test.ts)
+- [stateful browser chat tests](../../web/apps/app-ui/e2e/chat-session.spec.ts)
 
 **Missing parity and qualification work**
 
@@ -569,13 +570,13 @@ open.
 
 **Primary Lit evidence**
 
-- [thread screen and composer](../../web/app-ui/src/components/thread-screen.ts)
-- [thread-scoped draft controller](../../web/app-ui/src/services/composer-drafts.ts)
-- [turn-state control model](../../web/app-ui/src/components/chat-turn-controls.ts)
-- [bounded composer completion model](../../web/app-ui/src/components/composer-completion.ts)
-- [queue control model](../../web/app-ui/src/components/queue-controls.ts)
-- [attachment service](../../web/app-ui/src/services/attachments.ts)
-- [thread view model](../../web/app-ui/src/state/thread-view-model.ts)
+- [thread screen and composer](../../web/apps/app-ui/src/components/thread-screen.ts)
+- [thread-scoped draft controller](../../web/apps/app-ui/src/services/composer-drafts.ts)
+- [turn-state control model](../../web/apps/app-ui/src/components/chat-turn-controls.ts)
+- [bounded composer completion model](../../web/apps/app-ui/src/components/composer-completion.ts)
+- [queue control model](../../web/apps/app-ui/src/components/queue-controls.ts)
+- [attachment service](../../web/packages/transcript/src/attachments.ts)
+- [thread view model](../../web/packages/transcript/src/thread-view-model.ts)
 
 **Missing parity and qualification work**
 
@@ -610,11 +611,11 @@ open.
 
 **Primary Lit evidence**
 
-- [diff view](../../web/app-ui/src/components/diff-view.ts)
-- [bounded diff parser](../../web/app-ui/src/components/diff-parser.ts)
-- [responsive diff-mode contract](../../web/app-ui/src/components/diff-mode.ts)
-- [inspection workspace](../../web/app-ui/src/components/inspection-workspace.ts)
-- [diff copy and keyboard model](../../web/app-ui/src/components/inspection-diff-controls.ts)
+- [diff view](../../web/apps/app-ui/src/components/diff-view.ts)
+- [bounded diff parser](../../web/packages/content-rendering/src/diff-parser.ts)
+- [responsive diff-mode contract](../../web/apps/app-ui/src/components/diff-mode.ts)
+- [inspection workspace](../../web/apps/app-ui/src/components/inspection-workspace.ts)
+- [diff copy and keyboard model](../../web/apps/app-ui/src/components/inspection-diff-controls.ts)
 
 **Missing parity and qualification work**
 
@@ -651,11 +652,11 @@ open.
 
 **Primary Lit evidence**
 
-- [inspection workspace](../../web/app-ui/src/components/inspection-workspace.ts)
-- [lazy file-tree model](../../web/app-ui/src/components/inspection-file-tree.ts)
-- [file-tree model tests](../../web/app-ui/src/components/inspection-file-tree.test.ts)
-- [code view](../../web/app-ui/src/components/code-view.ts)
-- [protocol client](../../web/app-ui/src/services/protocol-client.ts)
+- [inspection workspace](../../web/apps/app-ui/src/components/inspection-workspace.ts)
+- [lazy file-tree model](../../web/apps/app-ui/src/components/inspection-file-tree.ts)
+- [file-tree model tests](../../web/apps/app-ui/src/components/inspection-file-tree.test.ts)
+- [code view](../../web/apps/app-ui/src/components/code-view.ts)
+- [protocol client](../../web/packages/protocol/src/protocol-client.ts)
 
 **Missing parity and qualification work**
 
@@ -687,9 +688,9 @@ open.
 
 **Primary Lit evidence**
 
-- [terminal panel](../../web/app-ui/src/components/terminal-panel.ts)
-- [xterm view](../../web/app-ui/src/components/terminal-view.ts)
-- [terminal output stream](../../web/app-ui/src/services/terminal-output-stream.ts)
+- [terminal panel](../../web/apps/app-ui/src/components/terminal-panel.ts)
+- [xterm view](../../web/apps/app-ui/src/components/terminal-view.ts)
+- [terminal output stream](../../web/apps/app-ui/src/services/terminal-output-stream.ts)
 
 **Missing parity and qualification work**
 
@@ -719,8 +720,8 @@ remains open.
 
 **Primary Lit evidence**
 
-- [plan rendering in the application shell](../../web/app-ui/src/app/trouve-app.ts)
-- [thread view model](../../web/app-ui/src/state/thread-view-model.ts)
+- [plan rendering in the application shell](../../web/apps/app-ui/src/app/trouve-app.ts)
+- [thread view model](../../web/packages/transcript/src/thread-view-model.ts)
 
 **Missing parity and qualification work**
 
@@ -745,8 +746,8 @@ remains open.
 
 **Primary Lit evidence**
 
-- [session PR panel](../../web/app-ui/src/components/session-pr-panel.ts)
-- [session PR panel model](../../web/app-ui/src/components/session-pr-panel-model.ts)
+- [session PR panel](../../web/apps/app-ui/src/components/session-pr-panel.ts)
+- [session PR panel model](../../web/apps/app-ui/src/components/session-pr-panel-model.ts)
 
 **Missing parity and qualification work**
 
@@ -776,8 +777,8 @@ remains open.
 
 **Primary Lit evidence**
 
-- [code-review dashboard](../../web/app-ui/src/components/code-review-dashboard.ts)
-- [code-review dashboard model](../../web/app-ui/src/components/code-review-dashboard-model.ts)
+- [code-review dashboard](../../web/apps/app-ui/src/components/code-review-dashboard.ts)
+- [code-review dashboard model](../../web/apps/app-ui/src/components/code-review-dashboard-model.ts)
 
 **Missing parity and qualification work**
 
@@ -807,10 +808,10 @@ remains open.
 
 **Primary Lit evidence**
 
-- [automations screen](../../web/app-ui/src/components/automations-screen.ts)
-- [automations model](../../web/app-ui/src/components/automations-model.ts)
-- [automations model tests](../../web/app-ui/src/components/automations-model.test.ts)
-- [protocol client](../../web/app-ui/src/services/protocol-client.ts)
+- [automations screen](../../web/apps/app-ui/src/components/automations-screen.ts)
+- [automations model](../../web/apps/app-ui/src/components/automations-model.ts)
+- [automations model tests](../../web/apps/app-ui/src/components/automations-model.test.ts)
+- [protocol client](../../web/packages/protocol/src/protocol-client.ts)
 
 **Missing parity and qualification work**
 
@@ -843,14 +844,14 @@ remains open.
 
 **Primary Lit evidence**
 
-- [settings screen](../../web/app-ui/src/components/settings-screen.ts)
-- [system-font discovery](../../web/app-ui/src/services/system-fonts.ts)
+- [settings screen](../../web/apps/app-ui/src/components/settings-screen.ts)
+- [system-font discovery](../../web/apps/app-ui/src/services/system-fonts.ts)
 - [typed desktop-host bootstrap](../../crates/trouve-desktop-host/src/gateway.rs)
-- [theme controller](../../web/app-ui/src/services/theme-controller.ts)
-- [semantic themes](../../web/app-ui/src/styles/themes.css)
-- [semantic theme-role contract](../../web/app-ui/src/styles/visual-contract.test.ts)
-- [component gallery](../../web/app-ui/src/app/component-gallery.ts)
-- [visual contract tests](../../web/app-ui/src/styles/visual-contract.test.ts)
+- [theme controller](../../web/apps/app-ui/src/services/theme-controller.ts)
+- [semantic themes](../../web/packages/ui-foundation/src/styles/themes.css)
+- [semantic theme-role contract](../../web/apps/app-ui/src/styles/visual-contract.test.ts)
+- [component gallery](../../web/apps/app-ui/src/app/component-gallery.ts)
+- [visual contract tests](../../web/apps/app-ui/src/styles/visual-contract.test.ts)
 
 **Missing parity and qualification work**
 
@@ -885,10 +886,10 @@ remains open.
 
 **Primary Lit evidence**
 
-- [settings screen](../../web/app-ui/src/components/settings-screen.ts)
-- [browser notification adapter and test model](../../web/app-ui/src/services/browser-notifications.ts)
-- [capability controller](../../web/app-ui/src/services/capabilities.ts)
-- [host client](../../web/app-ui/src/services/host-client.ts)
+- [settings screen](../../web/apps/app-ui/src/components/settings-screen.ts)
+- [browser notification adapter and test model](../../web/apps/app-ui/src/services/browser-notifications.ts)
+- [capability controller](../../web/apps/app-ui/src/services/capabilities.ts)
+- [host client](../../web/apps/app-ui/src/services/host-client.ts)
 - [desktop host boundary](../../crates/trouve-desktop-host/src/lib.rs)
 
 **Missing parity and qualification work**
@@ -920,9 +921,9 @@ or platform gate is recorded.
 
 **Primary Lit evidence**
 
-- [provider settings](../../web/app-ui/src/components/provider-settings.ts)
-- [vendor CLI settings](../../web/app-ui/src/components/cli-settings.ts)
-- [settings router/screen](../../web/app-ui/src/components/settings-screen.ts)
+- [provider settings](../../web/apps/app-ui/src/components/provider-settings.ts)
+- [vendor CLI settings](../../web/apps/app-ui/src/components/cli-settings.ts)
+- [settings router/screen](../../web/apps/app-ui/src/components/settings-screen.ts)
 
 **Missing parity and qualification work**
 
@@ -950,9 +951,9 @@ or platform gate is recorded.
 
 **Primary Lit evidence**
 
-- [persona settings panel](../../web/app-ui/src/components/persona-settings-panel.ts)
-- [settings screen](../../web/app-ui/src/components/settings-screen.ts)
-- [thread controls](../../web/app-ui/src/components/thread-screen.ts)
+- [persona settings panel](../../web/apps/app-ui/src/components/persona-settings-panel.ts)
+- [settings screen](../../web/apps/app-ui/src/components/settings-screen.ts)
+- [thread controls](../../web/apps/app-ui/src/components/thread-screen.ts)
 
 **Missing parity and qualification work**
 
@@ -979,9 +980,9 @@ remains open.
 
 **Primary Lit evidence**
 
-- [local-model settings](../../web/app-ui/src/components/local-model-settings.ts)
-- [local-model settings tests](../../web/app-ui/src/components/local-model-settings.test.ts)
-- [protocol client](../../web/app-ui/src/services/protocol-client.ts)
+- [local-model settings](../../web/apps/app-ui/src/components/local-model-settings.ts)
+- [local-model settings tests](../../web/apps/app-ui/src/components/local-model-settings.test.ts)
+- [protocol client](../../web/packages/protocol/src/protocol-client.ts)
 
 **Missing parity and qualification work**
 
@@ -1014,9 +1015,9 @@ remains open.
 
 **Primary Lit evidence**
 
-- [management settings panels](../../web/app-ui/src/components/management-settings-panels.ts)
-- [thread screen](../../web/app-ui/src/components/thread-screen.ts)
-- [protocol client](../../web/app-ui/src/services/protocol-client.ts)
+- [management settings panels](../../web/apps/app-ui/src/components/management-settings-panels.ts)
+- [thread screen](../../web/apps/app-ui/src/components/thread-screen.ts)
+- [protocol client](../../web/packages/protocol/src/protocol-client.ts)
 
 **Missing parity and qualification work**
 
@@ -1042,9 +1043,9 @@ remains open.
 
 **Primary Lit evidence**
 
-- [management settings panels](../../web/app-ui/src/components/management-settings-panels.ts)
-- [settings screen](../../web/app-ui/src/components/settings-screen.ts)
-- [protocol client](../../web/app-ui/src/services/protocol-client.ts)
+- [management settings panels](../../web/apps/app-ui/src/components/management-settings-panels.ts)
+- [settings screen](../../web/apps/app-ui/src/components/settings-screen.ts)
+- [protocol client](../../web/packages/protocol/src/protocol-client.ts)
 
 **Missing parity and qualification work**
 
@@ -1073,9 +1074,9 @@ remains open.
 
 **Primary Lit evidence**
 
-- [management settings panels](../../web/app-ui/src/components/management-settings-panels.ts)
-- [settings screen](../../web/app-ui/src/components/settings-screen.ts)
-- [host client](../../web/app-ui/src/services/host-client.ts)
+- [management settings panels](../../web/apps/app-ui/src/components/management-settings-panels.ts)
+- [settings screen](../../web/apps/app-ui/src/components/settings-screen.ts)
+- [host client](../../web/apps/app-ui/src/services/host-client.ts)
 
 **Missing parity and qualification work**
 
@@ -1104,9 +1105,9 @@ remains open.
 
 **Primary Lit evidence**
 
-- [settings screen and About section](../../web/app-ui/src/components/settings-screen.ts)
-- [application metadata](../../web/app-ui/src/app/trouve-app.ts)
-- [PWA service worker](../../web/app-ui/src/pwa/service-worker.ts)
+- [settings screen and About section](../../web/apps/app-ui/src/components/settings-screen.ts)
+- [application metadata](../../web/apps/app-ui/src/app/trouve-app.ts)
+- [PWA service worker](../../web/apps/app-ui/src/pwa/service-worker.ts)
 
 **Missing parity and qualification work**
 
@@ -1167,9 +1168,9 @@ remains open.
 
 **Primary Lit/host evidence**
 
-- [host client](../../web/app-ui/src/services/host-client.ts)
-- [capability controller](../../web/app-ui/src/services/capabilities.ts)
-- [application contexts](../../web/app-ui/src/contexts/app-contexts.ts)
+- [host client](../../web/apps/app-ui/src/services/host-client.ts)
+- [capability controller](../../web/apps/app-ui/src/services/capabilities.ts)
+- [application contexts](../../web/apps/app-ui/src/contexts/app-contexts.ts)
 - [desktop gateway and host](../../crates/trouve-desktop-host/src/lib.rs)
 - [desktop gateway security boundary](../../crates/trouve-desktop-host/src/gateway.rs)
 - [Wry database-safe preview bootstrap](../../crates/trouve-app/src/web_preview_support.rs)
@@ -1224,27 +1225,27 @@ still be qualified.
 
 | ID | Surface | Enhancement | Rationale | Relationship to Slint baseline | Status and evidence |
 | --- | --- | --- | --- | --- | --- |
-| ENH-001 | Shell and inbox | A compact icon control beside the Workspaces heading opens the same route/session/thread/action palette as Ctrl/Cmd-K. | Makes the palette discoverable and gives pointer and touch users a direct entry point without adding another primary navigation row. | Additive control not present in the Slint baseline; its compact placement preserves the existing navigation hierarchy, density, and primary-action prominence. | Preview implemented and unqualified; [application shell](../../web/app-ui/src/app/trouve-app.ts), [command palette](../../web/app-ui/src/components/command-palette.ts), and [palette tests](../../web/app-ui/src/components/command-palette.test.ts). |
-| ENH-002 | Pull-request dashboard | **Review operations** exposes code-review service health, recent jobs, limits, GitHub App setup, repository routing, and reviewer personas in the shared dashboard. | Keeps review administration adjacent to the PR inbox instead of hiding it in a disconnected utility. | Additive management view; it must not displace the existing grouped PR workflow or change its priority. | Implemented and unqualified; [code-review dashboard](../../web/app-ui/src/components/code-review-dashboard.ts) and [configuration](../../web/app-ui/src/components/code-review-configuration.ts). |
-| ENH-003 | Session pull request | Merge, squash, and rebase controls are shown only when the server and PR state permit them, with explicit confirmation. | Lets users complete the visible PR lifecycle without leaving Trouve. | Additive mutation beyond the Slint inspection baseline; server policy remains authoritative and safe external-open remains available. | Implemented and unqualified; [session PR panel](../../web/app-ui/src/components/session-pr-panel.ts) and [model](../../web/app-ui/src/components/session-pr-panel-model.ts). |
-| ENH-004 | Diff and files | Raw-diff/file copy plus capability-gated local file open/reveal actions. | Makes common review handoffs faster while using the existing typed host boundary. | Additive shortcuts; they do not replace the diff/code views and are hidden or explained when unsupported. | Implemented and unqualified; [inspection workspace](../../web/app-ui/src/components/inspection-workspace.ts), [file reveal](../../web/app-ui/src/components/file-reveal.ts), and [host client](../../web/app-ui/src/services/host-client.ts). |
-| ENH-005 | Chat | An accessible full-history mode can disable virtualization for assistive-technology review. | Provides a deliberate semantic fallback when virtualized history impedes navigation. | Additive accessibility mode; default density, anchoring, and bounded rendering remain unchanged. | Implemented and unqualified; [thread screen](../../web/app-ui/src/components/thread-screen.ts) and [virtualizer](../../web/app-ui/src/components/virtualization/virtualizer.ts). |
-| ENH-006 | Mobile PWA composer | Quick-reply chips for **Continue**, **Explain**, and **Undo** on narrow layouts. | Reduces virtual-keyboard friction for frequent steering actions. | Mobile-only additive affordance; it sends ordinary prompts and does not create a second command path. | Implemented and unqualified; [thread screen](../../web/app-ui/src/components/thread-screen.ts). |
-| ENH-007 | Mobile PWA shell | Pull-to-refresh plus an explicit refresh action. | Gives touch users a familiar recovery gesture while retaining an accessible non-gesture control. | Additive refresh entry points; protocol cursor and recovery semantics remain unchanged. | Implemented and unqualified; [pull-to-refresh controller](../../web/app-ui/src/services/pull-to-refresh.ts) and [application shell](../../web/app-ui/src/app/trouve-app.ts). |
-| ENH-008 | Mobile PWA shell | Capability-aware **Install app** affordance with deferred browser prompt handling and installed-state suppression. | Makes the initial mobile PWA delivery discoverable without overstating browser support. | Additive packaging affordance; absent when the browser does not expose installation and unrelated to desktop parity. | Implemented and unqualified; [PWA install controller](../../web/app-ui/src/services/pwa-install.ts) and [application shell](../../web/app-ui/src/app/trouve-app.ts). |
-| ENH-009 | Shell and inbox | Session rows can display aggregate pull-request state badges. | Brings review attention into the session inbox where users already triage work. | Additive status signal; it uses existing semantic tones and must not outrank needs-attention session state. | Implemented and unqualified; [session PR badge model](../../web/app-ui/src/components/session-pull-request-badge.ts) and [session list](../../web/app-ui/src/components/session-list.ts). |
-| ENH-010 | About and capabilities | A direct `settings/capabilities` diagnostic view enumerates the typed desktop/PWA capability boundary. | Makes unsupported host behavior inspectable and prevents a PWA limitation from looking like a broken or successful native action. | Additive diagnostic route associated with About; it is not a replacement for ordinary capability-aware wording on each workflow. | Implemented and unqualified; [settings screen](../../web/app-ui/src/components/settings-screen.ts), [capability controller](../../web/app-ui/src/services/capabilities.ts), and [host schema](../../web/app-ui/src/generated/host.ts). |
-| ENH-011 | Git, worktrees, and shell | A full workspace administration surface supplements the compact Open/close/reorder controls in the inbox. | Gives users one place to inspect, register, and close repositories while retaining the fast shell actions. | Additive management presentation over existing protocol operations; the Slint-shaped inbox remains the primary workspace hierarchy. | Implemented and unqualified; [workspace settings](../../web/app-ui/src/components/workspace-settings.ts) and [workspace settings model](../../web/app-ui/src/components/workspace-settings-model.ts). |
-| ENH-012 | Appearance | A **System** theme preference follows the browser/OS light-dark preference while resolving to one of the existing Trouve palettes. | Avoids forcing PWA and webview users to duplicate an OS-level appearance choice. | Additive preference; it does not add a sixth palette or change any Slint-derived semantic color role. | Implemented and unqualified; [theme controller](../../web/app-ui/src/services/theme-controller.ts), [settings screen](../../web/app-ui/src/components/settings-screen.ts), and [application shell](../../web/app-ui/src/app/trouve-app.ts). |
-| ENH-013 | Shell status | A normally hidden, context-sensitive status strip appears for host/protocol recovery, PWA install/update, and related actionable state; when present it also identifies the active model and permission mode. | Keeps routine desktop geometry faithful to Slint while putting recovery and trust information next to the action that needs it. | Additive status surface, hidden during ordinary desktop operation and always adapted into the mobile navigation row. | Implemented and unqualified; [application shell](../../web/app-ui/src/app/trouve-app.ts) and [shell styles](../../web/app-ui/src/styles/app.css). |
-| ENH-014 | Diff, files, terminal, providers, PR, and integrations | Keyboard-focus-only expert actions expose manual refresh, local reveal, terminal Copy/Paste, and integration disconnect without permanently adding visible chrome. | Preserves recovery and explicit browser/native actions for keyboard users while keeping the Slint action hierarchy visually stable. | Additive controls are visually suppressed until focused or until their state is relevant; primary baseline actions retain their original placement. | Implemented and unqualified; [inspection workspace](../../web/app-ui/src/components/inspection-workspace.ts), [terminal panel](../../web/app-ui/src/components/terminal-panel.ts), [session PR panel](../../web/app-ui/src/components/session-pr-panel.ts), [CLI settings](../../web/app-ui/src/components/cli-settings.ts), and [integration settings](../../web/app-ui/src/components/management-settings-panels.ts). |
-| ENH-015 | Files and diff | Read-only CodeMirror views provide Ctrl/Cmd-F search and match highlighting in source and opt-in editor-based diff views. | Adds the expected browser/editor search path for large source and review tasks. | Additive editor capability; the default Slint-shaped Files and continuous unified-diff composition remains unchanged. | Implemented and unqualified; [code view](../../web/app-ui/src/components/code-view.ts) and [diff view](../../web/app-ui/src/components/diff-view.ts). |
-| ENH-016 | Diff | A keyboard-reachable **Split view** opens the selected file in CodeMirror MergeView; the default stays the continuous Slint-style unified diff and narrow layouts stay unified-only. | Supports detailed desktop before/after review without making the migration a visual redesign. | Additive, opt-in desktop view. Returning to Unified restores the baseline presentation; binary changes use an explicit fallback. | Implemented and unqualified; [inspection workspace](../../web/app-ui/src/components/inspection-workspace.ts), [diff view](../../web/app-ui/src/components/diff-view.ts), and [responsive diff contract](../../web/app-ui/src/components/diff-mode.ts). |
-| ENH-017 | Mobile PWA | Explicit coarse-pointer PR-group move controls, tree-to-viewer Files navigation, a large-target approval sheet, and safe-area-aware full-screen headers adapt desktop workflows to phones and tablets. | Supplies usable non-drag and non-hover paths and avoids display cutouts without creating a second client implementation. | Mobile-only adaptation of existing operations; desktop hierarchy and default visuals remain unchanged. | Implemented and unqualified; [PR dashboard](../../web/app-ui/src/components/pull-requests-dashboard.ts), [inspection workspace](../../web/app-ui/src/components/inspection-workspace.ts), [thread screen](../../web/app-ui/src/components/thread-screen.ts), [Automations](../../web/app-ui/src/components/automations-screen.ts), and [responsive shell styles](../../web/app-ui/src/styles/app.css). |
-| ENH-018 | Chat turn controls | Explicit `Sending…`, `Queueing…`, `Starting…`, `Stopping…`, `Send next`, and retained cancellation transcript messages bridge request acknowledgements to durable turn events. | Makes in-flight and accepted-but-not-yet-streamed work visible and keeps the follow-up path discoverable during cancellation instead of looking unresponsive. | Additive acknowledgement and cancellation feedback over the same send/cancel/queue protocol; it does not create a second turn state or bypass durable SSE truth. | Implemented and browser-tested; [turn control model](../../web/app-ui/src/components/chat-turn-controls.ts), [thread screen](../../web/app-ui/src/components/thread-screen.ts), and [stateful chat tests](../../web/app-ui/e2e/chat-session.spec.ts). |
-| ENH-019 | Chat and settings | Independent **Chat** preferences can opt thinking output and context-compaction boundaries into collapsed tool activity. The defaults instead keep each visible as a labeled top-level boundary and split tool groups on either side. | Makes reasoning and context-window transitions difficult to miss without removing the compact transcript options for users who prefer them. | Additive frontend-owned presentation policy implemented in both Slint and Lit; it changes neither durable thread state nor the harness protocol. | Implemented and unqualified; [Lit chat preferences](../../web/app-ui/src/services/chat-preferences.ts), [Lit transcript](../../web/app-ui/src/components/thread-screen.ts), [Slint settings](../../crates/trouve-app/ui/settings-window.slint), and [Slint transcript fold](../../crates/trouve-app/src/render.rs). |
-| ENH-020 | Composer | Unsubmitted composer text, cursor position, and pending attachments persist independently for each thread across reloads and session/thread navigation. Accepted submissions clear only the originating draft; rejected submissions retain it. | Prevents partially written prompts and staged context from being lost when users compare threads, follow notifications, or refresh a preview. | Additive local frontend state. It does not enter the durable protocol/event log, alter submitted messages, or bypass attachment limits; browser storage is bounded and malformed restored data is rejected. | Implemented and browser-tested; [draft controller](../../web/app-ui/src/services/composer-drafts.ts), [thread integration](../../web/app-ui/src/components/thread-screen.ts), [unit tests](../../web/app-ui/src/services/composer-drafts.test.ts), and [cross-session/reload browser test](../../web/app-ui/e2e/chat-session.spec.ts). |
-| ENH-021 | Session pull request | Compact heading actions open the existing create form or launch the associated repository's GitHub pull-request list through the safe external-open boundary. | Keeps the create workflow available without a full-width primary button and makes repository-level PR navigation available beside it. | Additive browser shortcut plus a denser placement of the existing create action; eligibility, form behavior, protocol mutations, and PR state remain unchanged. | Implemented and unqualified; [session PR panel](../../web/app-ui/src/components/session-pr-panel.ts), [safe repository-link model](../../web/app-ui/src/components/session-pr-panel-model.ts), and [browser shell coverage](../../web/app-ui/e2e/app-shell.spec.ts). |
+| ENH-001 | Shell and inbox | A compact icon control beside the Workspaces heading opens the same route/session/thread/action palette as Ctrl/Cmd-K. | Makes the palette discoverable and gives pointer and touch users a direct entry point without adding another primary navigation row. | Additive control not present in the Slint baseline; its compact placement preserves the existing navigation hierarchy, density, and primary-action prominence. | Preview implemented and unqualified; [application shell](../../web/apps/app-ui/src/app/trouve-app.ts), [command palette](../../web/apps/app-ui/src/components/command-palette.ts), and [palette tests](../../web/apps/app-ui/src/components/command-palette.test.ts). |
+| ENH-002 | Pull-request dashboard | **Review operations** exposes code-review service health, recent jobs, limits, GitHub App setup, repository routing, and reviewer personas in the shared dashboard. | Keeps review administration adjacent to the PR inbox instead of hiding it in a disconnected utility. | Additive management view; it must not displace the existing grouped PR workflow or change its priority. | Implemented and unqualified; [code-review dashboard](../../web/apps/app-ui/src/components/code-review-dashboard.ts) and [configuration](../../web/apps/app-ui/src/components/code-review-configuration.ts). |
+| ENH-003 | Session pull request | Merge, squash, and rebase controls are shown only when the server and PR state permit them, with explicit confirmation. | Lets users complete the visible PR lifecycle without leaving Trouve. | Additive mutation beyond the Slint inspection baseline; server policy remains authoritative and safe external-open remains available. | Implemented and unqualified; [session PR panel](../../web/apps/app-ui/src/components/session-pr-panel.ts) and [model](../../web/apps/app-ui/src/components/session-pr-panel-model.ts). |
+| ENH-004 | Diff and files | Raw-diff/file copy plus capability-gated local file open/reveal actions. | Makes common review handoffs faster while using the existing typed host boundary. | Additive shortcuts; they do not replace the diff/code views and are hidden or explained when unsupported. | Implemented and unqualified; [inspection workspace](../../web/apps/app-ui/src/components/inspection-workspace.ts), [file reveal](../../web/apps/app-ui/src/components/file-reveal.ts), and [host client](../../web/apps/app-ui/src/services/host-client.ts). |
+| ENH-005 | Chat | An accessible full-history mode can disable virtualization for assistive-technology review. | Provides a deliberate semantic fallback when virtualized history impedes navigation. | Additive accessibility mode; default density, anchoring, and bounded rendering remain unchanged. | Implemented and unqualified; [thread screen](../../web/apps/app-ui/src/components/thread-screen.ts) and [virtualizer](../../web/packages/ui-foundation/src/virtualizer.ts). |
+| ENH-006 | Mobile PWA composer | Quick-reply chips for **Continue**, **Explain**, and **Undo** on narrow layouts. | Reduces virtual-keyboard friction for frequent steering actions. | Mobile-only additive affordance; it sends ordinary prompts and does not create a second command path. | Implemented and unqualified; [thread screen](../../web/apps/app-ui/src/components/thread-screen.ts). |
+| ENH-007 | Mobile PWA shell | Pull-to-refresh plus an explicit refresh action. | Gives touch users a familiar recovery gesture while retaining an accessible non-gesture control. | Additive refresh entry points; protocol cursor and recovery semantics remain unchanged. | Implemented and unqualified; [pull-to-refresh controller](../../web/apps/app-ui/src/services/pull-to-refresh.ts) and [application shell](../../web/apps/app-ui/src/app/trouve-app.ts). |
+| ENH-008 | Mobile PWA shell | Capability-aware **Install app** affordance with deferred browser prompt handling and installed-state suppression. | Makes the initial mobile PWA delivery discoverable without overstating browser support. | Additive packaging affordance; absent when the browser does not expose installation and unrelated to desktop parity. | Implemented and unqualified; [PWA install controller](../../web/apps/app-ui/src/services/pwa-install.ts) and [application shell](../../web/apps/app-ui/src/app/trouve-app.ts). |
+| ENH-009 | Shell and inbox | Session rows can display aggregate pull-request state badges. | Brings review attention into the session inbox where users already triage work. | Additive status signal; it uses existing semantic tones and must not outrank needs-attention session state. | Implemented and unqualified; [session PR badge model](../../web/apps/app-ui/src/components/session-pull-request-badge.ts) and [session list](../../web/apps/app-ui/src/components/session-list.ts). |
+| ENH-010 | About and capabilities | A direct `settings/capabilities` diagnostic view enumerates the typed desktop/PWA capability boundary. | Makes unsupported host behavior inspectable and prevents a PWA limitation from looking like a broken or successful native action. | Additive diagnostic route associated with About; it is not a replacement for ordinary capability-aware wording on each workflow. | Implemented and unqualified; [settings screen](../../web/apps/app-ui/src/components/settings-screen.ts), [capability controller](../../web/apps/app-ui/src/services/capabilities.ts), and [host schema](../../web/apps/app-ui/src/generated/host.ts). |
+| ENH-011 | Git, worktrees, and shell | A full workspace administration surface supplements the compact Open/close/reorder controls in the inbox. | Gives users one place to inspect, register, and close repositories while retaining the fast shell actions. | Additive management presentation over existing protocol operations; the Slint-shaped inbox remains the primary workspace hierarchy. | Implemented and unqualified; [workspace settings](../../web/apps/app-ui/src/components/workspace-settings.ts) and [workspace settings model](../../web/apps/app-ui/src/components/workspace-settings-model.ts). |
+| ENH-012 | Appearance | A **System** theme preference follows the browser/OS light-dark preference while resolving to one of the existing Trouve palettes. | Avoids forcing PWA and webview users to duplicate an OS-level appearance choice. | Additive preference; it does not add a sixth palette or change any Slint-derived semantic color role. | Implemented and unqualified; [theme controller](../../web/apps/app-ui/src/services/theme-controller.ts), [settings screen](../../web/apps/app-ui/src/components/settings-screen.ts), and [application shell](../../web/apps/app-ui/src/app/trouve-app.ts). |
+| ENH-013 | Shell status | A normally hidden, context-sensitive status strip appears for host/protocol recovery, PWA install/update, and related actionable state; when present it also identifies the active model and permission mode. | Keeps routine desktop geometry faithful to Slint while putting recovery and trust information next to the action that needs it. | Additive status surface, hidden during ordinary desktop operation and always adapted into the mobile navigation row. | Implemented and unqualified; [application shell](../../web/apps/app-ui/src/app/trouve-app.ts) and [shell styles](../../web/apps/app-ui/src/styles/app.css). |
+| ENH-014 | Diff, files, terminal, providers, PR, and integrations | Keyboard-focus-only expert actions expose manual refresh, local reveal, terminal Copy/Paste, and integration disconnect without permanently adding visible chrome. | Preserves recovery and explicit browser/native actions for keyboard users while keeping the Slint action hierarchy visually stable. | Additive controls are visually suppressed until focused or until their state is relevant; primary baseline actions retain their original placement. | Implemented and unqualified; [inspection workspace](../../web/apps/app-ui/src/components/inspection-workspace.ts), [terminal panel](../../web/apps/app-ui/src/components/terminal-panel.ts), [session PR panel](../../web/apps/app-ui/src/components/session-pr-panel.ts), [CLI settings](../../web/apps/app-ui/src/components/cli-settings.ts), and [integration settings](../../web/apps/app-ui/src/components/management-settings-panels.ts). |
+| ENH-015 | Files and diff | Read-only CodeMirror views provide Ctrl/Cmd-F search and match highlighting in source and opt-in editor-based diff views. | Adds the expected browser/editor search path for large source and review tasks. | Additive editor capability; the default Slint-shaped Files and continuous unified-diff composition remains unchanged. | Implemented and unqualified; [code view](../../web/apps/app-ui/src/components/code-view.ts) and [diff view](../../web/apps/app-ui/src/components/diff-view.ts). |
+| ENH-016 | Diff | A keyboard-reachable **Split view** opens the selected file in CodeMirror MergeView; the default stays the continuous Slint-style unified diff and narrow layouts stay unified-only. | Supports detailed desktop before/after review without making the migration a visual redesign. | Additive, opt-in desktop view. Returning to Unified restores the baseline presentation; binary changes use an explicit fallback. | Implemented and unqualified; [inspection workspace](../../web/apps/app-ui/src/components/inspection-workspace.ts), [diff view](../../web/apps/app-ui/src/components/diff-view.ts), and [responsive diff contract](../../web/apps/app-ui/src/components/diff-mode.ts). |
+| ENH-017 | Mobile PWA | Explicit coarse-pointer PR-group move controls, tree-to-viewer Files navigation, a large-target approval sheet, and safe-area-aware full-screen headers adapt desktop workflows to phones and tablets. | Supplies usable non-drag and non-hover paths and avoids display cutouts without creating a second client implementation. | Mobile-only adaptation of existing operations; desktop hierarchy and default visuals remain unchanged. | Implemented and unqualified; [PR dashboard](../../web/apps/app-ui/src/components/pull-requests-dashboard.ts), [inspection workspace](../../web/apps/app-ui/src/components/inspection-workspace.ts), [thread screen](../../web/apps/app-ui/src/components/thread-screen.ts), [Automations](../../web/apps/app-ui/src/components/automations-screen.ts), and [responsive shell styles](../../web/apps/app-ui/src/styles/app.css). |
+| ENH-018 | Chat turn controls | Explicit `Sending…`, `Queueing…`, `Starting…`, `Stopping…`, `Send next`, and retained cancellation transcript messages bridge request acknowledgements to durable turn events. | Makes in-flight and accepted-but-not-yet-streamed work visible and keeps the follow-up path discoverable during cancellation instead of looking unresponsive. | Additive acknowledgement and cancellation feedback over the same send/cancel/queue protocol; it does not create a second turn state or bypass durable SSE truth. | Implemented and browser-tested; [turn control model](../../web/apps/app-ui/src/components/chat-turn-controls.ts), [thread screen](../../web/apps/app-ui/src/components/thread-screen.ts), and [stateful chat tests](../../web/apps/app-ui/e2e/chat-session.spec.ts). |
+| ENH-019 | Chat and settings | Independent **Chat** preferences can opt thinking output and context-compaction boundaries into collapsed tool activity. The defaults instead keep each visible as a labeled top-level boundary and split tool groups on either side. | Makes reasoning and context-window transitions difficult to miss without removing the compact transcript options for users who prefer them. | Additive frontend-owned presentation policy implemented in both Slint and Lit; it changes neither durable thread state nor the harness protocol. | Implemented and unqualified; [Lit chat preferences](../../web/packages/transcript/src/chat-preferences.ts), [Lit transcript](../../web/apps/app-ui/src/components/thread-screen.ts), [Slint settings](../../crates/trouve-app/ui/settings-window.slint), and [Slint transcript fold](../../crates/trouve-app/src/render.rs). |
+| ENH-020 | Composer | Unsubmitted composer text, cursor position, and pending attachments persist independently for each thread across reloads and session/thread navigation. Accepted submissions clear only the originating draft; rejected submissions retain it. | Prevents partially written prompts and staged context from being lost when users compare threads, follow notifications, or refresh a preview. | Additive local frontend state. It does not enter the durable protocol/event log, alter submitted messages, or bypass attachment limits; browser storage is bounded and malformed restored data is rejected. | Implemented and browser-tested; [draft controller](../../web/apps/app-ui/src/services/composer-drafts.ts), [thread integration](../../web/apps/app-ui/src/components/thread-screen.ts), [unit tests](../../web/apps/app-ui/src/services/composer-drafts.test.ts), and [cross-session/reload browser test](../../web/apps/app-ui/e2e/chat-session.spec.ts). |
+| ENH-021 | Session pull request | Compact heading actions open the existing create form or launch the associated repository's GitHub pull-request list through the safe external-open boundary. | Keeps the create workflow available without a full-width primary button and makes repository-level PR navigation available beside it. | Additive browser shortcut plus a denser placement of the existing create action; eligibility, form behavior, protocol mutations, and PR state remain unchanged. | Implemented and unqualified; [session PR panel](../../web/apps/app-ui/src/components/session-pr-panel.ts), [safe repository-link model](../../web/apps/app-ui/src/components/session-pr-panel-model.ts), and [browser shell coverage](../../web/apps/app-ui/e2e/app-shell.spec.ts). |
 
 ## Approved deviations
 
@@ -1254,8 +1255,8 @@ objective qualification evidence before promotion.
 
 | ID | Surface | Slint baseline behavior | Approved Lit deviation | Why parity is preserved | Approver and date | Evidence packet |
 | --- | --- | --- | --- | --- | --- | --- |
-| DEV-001 | Chat response actions | Slint exposes response copy and raw-Markdown header buttons because general rendered-text selection is limited. | Lit exposes the formatted-response copy action only on hover or keyboard focus and omits the raw-Markdown header button. Rendered response text remains selectable, while right-click or Shift+F10 on the Agent response exposes **Copy as markdown** and an ordinary **Copy** item when a selection exists. Native link/image and nested activity menus are not replaced. | Quick copy retains parity without permanent header chrome; the complete Markdown source remains available from the context menu, ordinary browser selection is preserved, and both actions are keyboard-operable. | User approval, 2026-08-07 | [thread screen](../../web/app-ui/src/components/thread-screen.ts) and [desktop/mobile browser interaction test](../../web/app-ui/e2e/chat-session.spec.ts). |
-| DEV-002 | Chat activity hierarchy | Slint uses bordered/collapsible activity rows and grouped tool presentation. | Lit uses a faint neutral rail and small nodes for each contiguous thought/tool sequence. Completed work is neutral; active, expanded, hovered, or focused work is blue; approval and failure nodes retain semantic colors. Tool groups remain transparent, visible thoughts use quiet labels, compaction and prose split the timeline, and response prose uses a readable maximum measure. | Disclosure, status color, grouping, ordering, output separation, and action semantics are unchanged; the treatment reduces repeated chrome and gives activity, compaction, and the final response distinct hierarchy. | User approval, 2026-08-06 | [chat styling](../../web/app-ui/src/styles/app.css), [visual contract](../../web/app-ui/src/styles/visual-contract.test.ts), and [desktop/mobile browser interaction test](../../web/app-ui/e2e/chat-session.spec.ts). |
+| DEV-001 | Chat response actions | Slint exposes response copy and raw-Markdown header buttons because general rendered-text selection is limited. | Lit exposes the formatted-response copy action only on hover or keyboard focus and omits the raw-Markdown header button. Rendered response text remains selectable, while right-click or Shift+F10 on the Agent response exposes **Copy as markdown** and an ordinary **Copy** item when a selection exists. Native link/image and nested activity menus are not replaced. | Quick copy retains parity without permanent header chrome; the complete Markdown source remains available from the context menu, ordinary browser selection is preserved, and both actions are keyboard-operable. | User approval, 2026-08-07 | [thread screen](../../web/apps/app-ui/src/components/thread-screen.ts) and [desktop/mobile browser interaction test](../../web/apps/app-ui/e2e/chat-session.spec.ts). |
+| DEV-002 | Chat activity hierarchy | Slint uses bordered/collapsible activity rows and grouped tool presentation. | Lit uses a faint neutral rail and small nodes for each contiguous thought/tool sequence. Completed work is neutral; active, expanded, hovered, or focused work is blue; approval and failure nodes retain semantic colors. Tool groups remain transparent, visible thoughts use quiet labels, compaction and prose split the timeline, and response prose uses a readable maximum measure. | Disclosure, status color, grouping, ordering, output separation, and action semantics are unchanged; the treatment reduces repeated chrome and gives activity, compaction, and the final response distinct hierarchy. | User approval, 2026-08-06 | [chat styling](../../web/apps/app-ui/src/styles/app.css), [visual contract](../../web/apps/app-ui/src/styles/visual-contract.test.ts), and [desktop/mobile browser interaction test](../../web/apps/app-ui/e2e/chat-session.spec.ts). |
 
 ## Open decisions and deviations
 

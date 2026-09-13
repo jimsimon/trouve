@@ -1,0 +1,18 @@
+/* Element defaults shared by every trouve Lit frontend. `themes.css` and
+ * `tokens.css` supply the palette and geometry; this layer makes native
+ * controls inherit them and gives every frontend the same focus, disabled,
+ * icon-spin, and reduced-motion treatment. Load it after the tokens and before
+ * application stylesheets so those can still override it by source order. */
+* { box-sizing: border-box; }
+button, textarea, input, select { font: inherit; }
+button { color: inherit; }
+button:focus-visible, textarea:focus-visible, input:focus-visible, select:focus-visible, summary:focus-visible { outline: 2px solid var(--trouve-accent); outline-offset: 1px; }
+button:disabled, textarea:disabled, input:disabled, select:disabled { cursor: not-allowed; opacity: .56; }
+.trouve-icon-spin { animation: trouve-font-awesome-spin 900ms linear infinite; }
+@keyframes trouve-font-awesome-spin { to { transform: rotate(360deg); } }
+.visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+[data-reduce-motion] .trouve-icon-spin { animation: none; }
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .001ms !important; transition-duration: .001ms !important; }
+  .trouve-icon-spin { animation: none !important; }
+}

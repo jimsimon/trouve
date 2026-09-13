@@ -131,7 +131,7 @@ def notice_commands(manifest_path: Path | None, notice: Path) -> tuple[str, str]
 def frontend_notice_link(notice: Path) -> str:
     absolute_notice = notice if notice.is_absolute() else ROOT / notice
     relative = os.path.relpath(
-        ROOT / "web" / "app-ui" / "THIRD_PARTY_NOTICES.md",
+        ROOT / "web" / "apps" / "app-ui" / "THIRD_PARTY_NOTICES.md",
         absolute_notice.parent,
     )
     return Path(relative).as_posix()
@@ -175,7 +175,7 @@ def generate(
         f"`{check_command}`.",
         "",
         "The Lit frontend's npm inventory is generated separately in",
-        f"[`web/app-ui/THIRD_PARTY_NOTICES.md`]({frontend_link}).",
+        f"[`web/apps/app-ui/THIRD_PARTY_NOTICES.md`]({frontend_link}).",
         "",
         "| Package | Version | License expression | Source |",
         "| --- | --- | --- | --- |",

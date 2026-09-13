@@ -6,7 +6,7 @@ dependency graph, including development dependencies. Regenerate it with
 `python3 scripts/generate_rust_third_party_notices.py --check`.
 
 The Lit frontend's npm inventory is generated separately in
-[`web/app-ui/THIRD_PARTY_NOTICES.md`](web/app-ui/THIRD_PARTY_NOTICES.md).
+[`web/apps/app-ui/THIRD_PARTY_NOTICES.md`](web/apps/app-ui/THIRD_PARTY_NOTICES.md).
 
 | Package | Version | License expression | Source |
 | --- | --- | --- | --- |

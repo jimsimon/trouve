@@ -1,0 +1,49 @@
+{
+  "name": "@trouve-ai/transcript",
+  "version": "4.11.0",
+  "private": true,
+  "type": "module",
+  "description": "Thread transcript projection and rendering shared by the trouve Lit frontends: the event-folding view model, tool and activity presentation, the transcript stylesheet, and the read-only transcript renderer and element.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jimsimon/trouve.git",
+    "directory": "web/packages/transcript"
+  },
+  "exports": {
+    "./agent-activity": "./src/agent-activity.ts",
+    "./agent-activity-model": "./src/agent-activity-model.ts",
+    "./attachments": "./src/attachments.ts",
+    "./agent-body-plan": "./src/agent-body-plan.ts",
+    "./chat-layout": "./src/chat-layout.ts",
+    "./chat-preferences": "./src/chat-preferences.ts",
+    "./chat-presentation": "./src/chat-presentation.ts",
+    "./composer-usage": "./src/composer-usage.ts",
+    "./model-option-label": "./src/model-option-label.ts",
+    "./question-wizard": "./src/question-wizard.ts",
+    "./thread-view-model": "./src/thread-view-model.ts",
+    "./todo-plan-model": "./src/todo-plan-model.ts",
+    "./tool-detail-view": "./src/tool-detail-view.ts",
+    "./tool-output": "./src/tool-output.ts",
+    "./tool-presentation": "./src/tool-presentation.ts",
+    "./transcript-renderer": "./src/transcript-renderer.ts",
+    "./transcript-view": "./src/transcript-view.ts",
+    "./turn-announcements": "./src/turn-announcements.ts",
+    "./turn-checkpoint-actions": "./src/turn-checkpoint-actions.ts",
+    "./turn-metadata": "./src/turn-metadata.ts",
+    "./styles/transcript.css": "./src/styles/transcript.css"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "dependencies": {
+    "@trouve-ai/content-rendering": "4.11.0",
+    "@trouve-ai/protocol": "4.11.0",
+    "@trouve-ai/ui-foundation": "4.11.0",
+    "lit": "^3.3.3"
+  }
+}
