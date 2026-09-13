@@ -18,7 +18,6 @@ import {
 } from "./pull-requests-dashboard-model.js";
 import { fontAwesomeIcon } from "@trouve-ai/ui-foundation/font-awesome-icon";
 import { safeSessionPrHref } from "./session-pr-panel-model.js";
-import "./code-review-dashboard.js";
 
 export const PULL_REQUEST_CHAT_EVENT = "trouve-pull-request-chat";
 export const PULL_REQUEST_FIX_EVENT = "trouve-pull-request-fix";
@@ -32,7 +31,6 @@ export interface PullRequestFixDetail extends PullRequestChatDetail {
   readonly prompt: string;
 }
 
-type ReviewsView = "pull-requests" | "operations";
 const GROUP_DRAG_TYPE = "application/x-trouve-pull-request-group";
 const INTEGRATION_RETRY_MS = 5_000;
 
@@ -118,13 +116,6 @@ export class TrouvePullRequestsDashboard extends withSignalTracking(LitElement) 
       margin-inline: auto;
       padding: 16px;
     }
-    .operations {
-      min-width: 0;
-      min-height: 0;
-      height: 100%;
-    }
-    trouve-code-review-dashboard { display: block; height: 100%; }
-
     .dashboard-controls {
       display: flex;
       align-items: center;
@@ -445,7 +436,6 @@ export class TrouvePullRequestsDashboard extends withSignalTracking(LitElement) 
     }));
   };
 
-  #view: ReviewsView = "pull-requests";
   #integration: ProtocolGithubIntegration | undefined;
   #integrationLoading = true;
   #error = "";
@@ -518,32 +508,15 @@ export class TrouvePullRequestsDashboard extends withSignalTracking(LitElement) 
         <header class="page-header">
           <h1 id="pull-requests-title">Pull Requests</h1>
           <div class="page-actions">
-            ${this.#view === "pull-requests"
-              ? html`<button
-                  class="control operations-button"
-                  type="button"
-                  @click=${() => this.#selectView("operations")}
-                >Review operations</button>`
-              : html`<button
-                  class="control"
-                  type="button"
-                  @click=${() => this.#selectView("pull-requests")}
-                >${fontAwesomeIcon("arrow-left")} Pull requests</button>`}
             <button class="control" type="button" @click=${this.#close}>${fontAwesomeIcon("xmark")} Close</button>
           </div>
         </header>
 
-        ${this.#view === "operations"
-          ? html`<div
-              id="review-operations-panel"
-              class="operations"
-              aria-label="Review operations"
-            ><trouve-code-review-dashboard></trouve-code-review-dashboard></div>`
-          : html`<div
-              id="pull-request-inbox-panel"
-              class="account-scroll"
-              aria-busy=${this.#integrationLoading}
-            >
+        <div
+          id="pull-request-inbox-panel"
+          class="account-scroll"
+          aria-busy=${this.#integrationLoading}
+        >
               <div class="account-body">
                 <p class="visually-hidden" role="status" aria-live="polite" aria-atomic="true">
                   ${this.#orderStatus}
@@ -589,7 +562,7 @@ export class TrouvePullRequestsDashboard extends withSignalTracking(LitElement) 
                         </div>
                       `}
               </div>
-            </div>`}
+        </div>
       </section>
     `;
   }
@@ -819,11 +792,6 @@ export class TrouvePullRequestsDashboard extends withSignalTracking(LitElement) 
     const age = Math.max(0, Math.floor((this.#clock - last) / 1_000));
     const ageLabel = age === 1 ? "1 second ago" : `${age} seconds ago`;
     return `Last refreshed ${ageLabel}`;
-  }
-
-  #selectView(view: ReviewsView): void {
-    this.#view = view;
-    this.requestUpdate();
   }
 
   readonly #openIntegrations = (): void => {
