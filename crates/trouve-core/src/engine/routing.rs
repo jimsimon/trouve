@@ -467,7 +467,7 @@ fn native_attempt_failure(
 ) -> RouteAttemptFailure {
     let kind = if error.is_capacity_exhausted() {
         RouteFailureKind::Capacity
-    } else if matches!(&error, trouve_providers::ProviderError::Auth(_)) {
+    } else if error.is_authentication_failure() {
         RouteFailureKind::Authentication
     } else {
         RouteFailureKind::Unavailable
@@ -488,10 +488,7 @@ fn backend_attempt_failure(
     let capacity = error.is_capacity_exhausted();
     let kind = if capacity {
         RouteFailureKind::Capacity
-    } else if matches!(
-        &error,
-        BackendError::Auth(_) | BackendError::NotInstalled(_)
-    ) {
+    } else if error.is_authentication_failure() {
         RouteFailureKind::Authentication
     } else {
         RouteFailureKind::Unavailable
@@ -4191,6 +4188,31 @@ mod tests {
         let auth = backend_attempt_failure(BackendError::Auth("logged out".into()), false, false);
         assert_eq!(auth.kind, RouteFailureKind::Authentication);
         assert!(!auth.retryable_on_same_route());
+
+        // A provider that rejects the key answers over HTTP, not with a
+        // local credential error; that is still not a transient outage.
+        let rejected_native = native_attempt_failure(
+            trouve_providers::ProviderError::Api(
+                "401 Unauthorized: {\"error\":{\"type\":\"authentication_error\"}}".into(),
+            ),
+            false,
+            false,
+        );
+        assert_eq!(rejected_native.kind, RouteFailureKind::Authentication);
+        assert!(!rejected_native.retryable_on_same_route());
+        let forbidden_native = native_attempt_failure(
+            trouve_providers::ProviderError::Api("403 Forbidden: permission denied".into()),
+            false,
+            false,
+        );
+        assert_eq!(forbidden_native.kind, RouteFailureKind::Authentication);
+        let rejected_backend = backend_attempt_failure(
+            BackendError::Protocol("API Error: 401 Unauthorized".into()),
+            false,
+            false,
+        );
+        assert_eq!(rejected_backend.kind, RouteFailureKind::Authentication);
+        assert!(!rejected_backend.retryable_on_same_route());
 
         // Partial text is already in the transcript; resending the prompt
         // verbatim would leave a dangling assistant turn before it.

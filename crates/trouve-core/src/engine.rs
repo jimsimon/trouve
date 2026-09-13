@@ -20902,10 +20902,8 @@ impl Engine {
 /// clears within seconds.
 fn backend_error_retryable_in_place(error: &BackendError) -> bool {
     !error.is_capacity_exhausted()
-        && !matches!(
-            error,
-            BackendError::Cancelled | BackendError::Auth(_) | BackendError::NotInstalled(_)
-        )
+        && !error.is_authentication_failure()
+        && !matches!(error, BackendError::Cancelled)
 }
 
 fn is_transient_sqlite_contention(error: &anyhow::Error) -> bool {
@@ -24377,6 +24375,9 @@ mod tests {
         )));
         assert!(!backend_error_retryable_in_place(&BackendError::Auth(
             "logged out".into()
+        )));
+        assert!(!backend_error_retryable_in_place(&BackendError::Protocol(
+            "API Error: 401 Unauthorized".into()
         )));
         assert!(!backend_error_retryable_in_place(
             &BackendError::NotInstalled("claude".into())
