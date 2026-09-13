@@ -17789,12 +17789,37 @@ impl Engine {
         }
         let backend_turn_started = Instant::now();
         // Kept for one in-place retry if the vendor fails before producing
-        // anything (see the stream error branch below).
+        // anything: either here, before it returns a stream, or in the
+        // stream error branch below. Whichever fires first consumes it.
         let mut retry_turn = Some(backend_turn.clone());
-        let mut stream = match backend.run_turn(backend_turn).await {
-            Ok(stream) => stream,
-            Err(BackendError::Cancelled) if cancel.is_cancelled() => return Ok(()),
-            Err(error) => return Err(anyhow!("backend error: {error}")),
+        let mut next_turn = backend_turn;
+        let mut stream = loop {
+            match backend.run_turn(next_turn).await {
+                Ok(stream) => break stream,
+                Err(BackendError::Cancelled) if cancel.is_cancelled() => return Ok(()),
+                Err(error) => {
+                    let Some(turn_to_retry) = retry_turn
+                        .take()
+                        .filter(|_| backend_error_retryable_in_place(&error))
+                    else {
+                        return Err(anyhow!("backend error: {error}"));
+                    };
+                    tracing::warn!(
+                        thread_id = %thread.id,
+                        turn,
+                        backend = %backend_id,
+                        error = %error,
+                        "backend failed to start the turn; retrying once in place"
+                    );
+                    // The startup lane is still held; the retry runs inside it.
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => return Ok(()),
+                        _ = tokio::time::sleep(SAME_ROUTE_RETRY_DELAY) => {}
+                    }
+                    next_turn = turn_to_retry;
+                }
+            }
         };
         // The vendor has accepted the turn; the startup slot is free for the
         // next waiter while this turn streams.

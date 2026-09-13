@@ -2473,6 +2473,9 @@ impl Engine {
         let mut open_tools = HashSet::new();
         let mut seen_tool_cards = HashSet::new();
         let mut side_effect_started = false;
+        // Any visible output (text, progress, or reasoning) makes a verbatim
+        // same-route retry unsafe: the client has already seen this attempt.
+        let mut produced_output = false;
         let mut tool_calls =
             HashMap::<String, (String, serde_json::Value, PullRequestCreationRequest)>::new();
         let mut tool_started_at = HashMap::<String, Instant>::new();
@@ -2617,11 +2620,13 @@ impl Engine {
                     }
                 }
                 BackendEvent::TextDelta(delta) => {
+                    produced_output = true;
                     text.push_str(&delta);
                     segment.push_str(&delta);
                     persisted.push(Event::AssistantDelta { turn, text: delta });
                 }
                 BackendEvent::ProgressDelta(delta) => {
+                    produced_output = true;
                     if !segment.is_empty() {
                         persisted.push(Event::AssistantMessage {
                             turn,
@@ -2634,6 +2639,7 @@ impl Engine {
                     persisted.push(Event::AssistantProgressCompleted { turn });
                 }
                 BackendEvent::ThinkingDelta(delta) => {
+                    produced_output = true;
                     if !segment.is_empty() {
                         persisted.push(Event::AssistantMessage {
                             turn,
@@ -3298,7 +3304,7 @@ impl Engine {
             return Ok(RouteAttemptResult::Failed(backend_attempt_failure(
                 error,
                 side_effect_started,
-                !text.is_empty(),
+                produced_output,
             )));
         }
 
@@ -3414,13 +3420,26 @@ mod tests {
         turns: Arc<Mutex<Vec<RecordedBackendTurn>>>,
     }
 
-    /// Announces a vendor session, then fails the first `failures` turns
-    /// mid-stream before any output (the shape of a CLI that lost a
-    /// credential refresh race). Records the session each attempt resumed.
+    /// Fails the first `failures` turns in the given `shape`, then answers
+    /// normally. Records the session each attempt was asked to resume.
     struct FlakyBackend {
         sessions: ResumedSessions,
         failures: usize,
         error: fn() -> BackendError,
+        shape: FlakyShape,
+    }
+
+    #[derive(Clone, Copy)]
+    enum FlakyShape {
+        /// `run_turn` itself errors before returning a stream (process
+        /// failed to spawn, transport refused).
+        BeforeStream,
+        /// The stream announces a session, then errors before any output
+        /// (a CLI that lost a credential refresh race on its first request).
+        AfterSessionStart,
+        /// The stream announces a session and streams reasoning, then errors
+        /// before any text.
+        AfterReasoning,
     }
 
     /// The `BackendTurn::session` each `FlakyBackend` attempt was asked to
@@ -3775,10 +3794,18 @@ mod tests {
             };
             let session_id = format!("vendor-session-{attempt}");
             if attempt < self.failures {
-                return Ok(Box::pin(futures::stream::iter([
-                    Ok(BackendEvent::SessionStarted { session_id }),
-                    Err((self.error)()),
-                ])));
+                return match self.shape {
+                    FlakyShape::BeforeStream => Err((self.error)()),
+                    FlakyShape::AfterSessionStart => Ok(Box::pin(futures::stream::iter([
+                        Ok(BackendEvent::SessionStarted { session_id }),
+                        Err((self.error)()),
+                    ]))),
+                    FlakyShape::AfterReasoning => Ok(Box::pin(futures::stream::iter([
+                        Ok(BackendEvent::SessionStarted { session_id }),
+                        Ok(BackendEvent::ThinkingDelta("Considering a rebase".into())),
+                        Err((self.error)()),
+                    ]))),
+                };
             }
             Ok(Box::pin(futures::stream::iter([
                 Ok(BackendEvent::SessionStarted { session_id }),
@@ -4621,6 +4648,7 @@ mod tests {
         data: &Path,
         failures: usize,
         error: fn() -> BackendError,
+        shape: FlakyShape,
     ) -> (Arc<Engine>, ResumedSessions) {
         let sessions = Arc::new(Mutex::new(Vec::new()));
         let config = Config {
@@ -4643,6 +4671,7 @@ mod tests {
                         sessions: sessions.clone(),
                         failures,
                         error,
+                        shape,
                     },
                 ))),
             ),
@@ -4681,7 +4710,13 @@ mod tests {
         std::fs::create_dir_all(&worktree).unwrap();
         let store = Store::open_in_memory().unwrap();
         let thread = model_thread(&store, &worktree, "concrete_retry", "backend/shared");
-        let (engine, sessions) = flaky_backend_engine(&store, data.path(), 1, refresh_race_error);
+        let (engine, sessions) = flaky_backend_engine(
+            &store,
+            data.path(),
+            1,
+            refresh_race_error,
+            FlakyShape::AfterSessionStart,
+        );
 
         engine
             .send_message(&thread.id, "Rebase".into(), Vec::new())
@@ -4704,13 +4739,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concrete_backend_turn_retries_a_transient_startup_failure_in_place() {
+        let data = tempfile::tempdir().unwrap();
+        let worktree = data.path().join("worktrees/concrete-startup-retry");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let thread = model_thread(
+            &store,
+            &worktree,
+            "concrete_startup_retry",
+            "backend/shared",
+        );
+        let (engine, sessions) = flaky_backend_engine(
+            &store,
+            data.path(),
+            1,
+            || BackendError::Io(std::io::Error::other("claude exited with status 1")),
+            FlakyShape::BeforeStream,
+        );
+
+        engine
+            .send_message(&thread.id, "Rebase".into(), Vec::new())
+            .unwrap();
+        wait_for_terminal_turn(&engine, &store, &thread, 1).await;
+
+        let (completed, failed) = turn_outcome(&store, &thread, 1);
+        assert_eq!(
+            sessions.lock().unwrap().len(),
+            2,
+            "an error before the stream exists is retried once too"
+        );
+        assert!(completed && !failed);
+    }
+
+    #[tokio::test]
     async fn concrete_backend_turn_retries_in_place_only_once() {
         let data = tempfile::tempdir().unwrap();
         let worktree = data.path().join("worktrees/concrete-retry-once");
         std::fs::create_dir_all(&worktree).unwrap();
         let store = Store::open_in_memory().unwrap();
         let thread = model_thread(&store, &worktree, "concrete_retry_once", "backend/shared");
-        let (engine, sessions) = flaky_backend_engine(&store, data.path(), 2, refresh_race_error);
+        let (engine, sessions) = flaky_backend_engine(
+            &store,
+            data.path(),
+            2,
+            refresh_race_error,
+            FlakyShape::AfterSessionStart,
+        );
 
         engine
             .send_message(&thread.id, "Rebase".into(), Vec::new())
@@ -4732,7 +4807,13 @@ mod tests {
         std::fs::create_dir_all(&worktree).unwrap();
         let store = Store::open_in_memory().unwrap();
         let thread = model_thread(&store, &worktree, "concrete_capacity", "backend/shared");
-        let (engine, sessions) = flaky_backend_engine(&store, data.path(), 1, capacity_error);
+        let (engine, sessions) = flaky_backend_engine(
+            &store,
+            data.path(),
+            1,
+            capacity_error,
+            FlakyShape::AfterSessionStart,
+        );
 
         engine
             .send_message(&thread.id, "Rebase".into(), Vec::new())
@@ -4755,7 +4836,13 @@ mod tests {
         std::fs::create_dir_all(&worktree).unwrap();
         let store = Store::open_in_memory().unwrap();
         let thread = routing_thread(&store, &worktree, "auto_backend_retry");
-        let (engine, sessions) = flaky_backend_engine(&store, data.path(), 1, refresh_race_error);
+        let (engine, sessions) = flaky_backend_engine(
+            &store,
+            data.path(),
+            1,
+            refresh_race_error,
+            FlakyShape::AfterSessionStart,
+        );
 
         engine
             .send_message(&thread.id, "Rebase".into(), Vec::new())
@@ -4784,6 +4871,60 @@ mod tests {
             .get(&("backend".to_string(), "shared".to_string()))
             .expect("the successful attempt records route health");
         assert_eq!(backend_health.consecutive_failures, 0);
+    }
+
+    #[tokio::test]
+    async fn automatic_backend_route_does_not_replay_after_streamed_reasoning() {
+        let data = tempfile::tempdir().unwrap();
+        let worktree = data.path().join("worktrees/auto-backend-reasoning");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let thread = routing_thread(&store, &worktree, "auto_backend_reasoning");
+        let (engine, sessions) = flaky_backend_engine(
+            &store,
+            data.path(),
+            1,
+            refresh_race_error,
+            FlakyShape::AfterReasoning,
+        );
+
+        engine
+            .send_message(&thread.id, "Rebase".into(), Vec::new())
+            .unwrap();
+        wait_for_terminal_turn(&engine, &store, &thread, 1).await;
+
+        let (completed, failed) = turn_outcome(&store, &thread, 1);
+        assert_eq!(
+            sessions.lock().unwrap().len(),
+            1,
+            "reasoning the client already saw must not be replayed by a verbatim retry"
+        );
+        assert!(failed && !completed, "with no other route the turn fails");
+    }
+
+    #[tokio::test]
+    async fn concrete_backend_turn_does_not_replay_after_streamed_reasoning() {
+        let data = tempfile::tempdir().unwrap();
+        let worktree = data.path().join("worktrees/concrete-reasoning");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let thread = model_thread(&store, &worktree, "concrete_reasoning", "backend/shared");
+        let (engine, sessions) = flaky_backend_engine(
+            &store,
+            data.path(),
+            1,
+            refresh_race_error,
+            FlakyShape::AfterReasoning,
+        );
+
+        engine
+            .send_message(&thread.id, "Rebase".into(), Vec::new())
+            .unwrap();
+        wait_for_terminal_turn(&engine, &store, &thread, 1).await;
+
+        let (completed, failed) = turn_outcome(&store, &thread, 1);
+        assert_eq!(sessions.lock().unwrap().len(), 1);
+        assert!(failed && !completed);
     }
 
     #[tokio::test]
