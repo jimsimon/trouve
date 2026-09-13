@@ -3,6 +3,8 @@ import { keyed } from "lit/directives/keyed.js";
 import { createRef, ref } from "lit/directives/ref.js";
 import { repeat } from "lit/directives/repeat.js";
 
+import "@trouve-ai/transcript/transcript-view";
+import type { TranscriptStateDetail } from "@trouve-ai/transcript/transcript-view";
 import { fontAwesomeIcon } from "@trouve-ai/ui-foundation/font-awesome-icon";
 
 import type { ReviewApi } from "./api";
@@ -29,6 +31,11 @@ import {
   type ReviewOutputField,
 } from "./review-output";
 import { liveModelElapsed, mergeReviewTaskSnapshot } from "./review-progress";
+import {
+  isLiveTaskStatus,
+  RetainedTranscriptClient,
+  retainedThreadId,
+} from "./review-transcript";
 import { dispatchNavigate, type Section } from "./route";
 import { routingReasonLabel } from "./routing-labels";
 import {
@@ -81,6 +88,7 @@ export class JobDetailPane extends ReviewElement {
     eventCursor: { state: true },
     routingOpen: { state: true },
     navigationStatus: { state: true },
+    liveTranscriptUnavailable: { state: true },
   };
 
   api!: ReviewApi;
@@ -101,6 +109,9 @@ export class JobDetailPane extends ReviewElement {
   private eventCursor: number | null = null;
   private routingOpen = false;
   private navigationStatus = "";
+  /** Task ids whose live thread could not be opened; they fall back to retained output. */
+  private liveTranscriptUnavailable: Record<string, true> = {};
+  private retainedClient: { key: string; client: RetainedTranscriptClient } | undefined;
 
   private readonly clock = new Clock(this);
   /** The job this pane currently shows; `null` once it moved on or unmounted. */
@@ -610,6 +621,66 @@ export class JobDetailPane extends ReviewElement {
           : nothing}
       </div>
     </article>`;
+  }
+
+  /**
+   * Task activity renders through the desktop transcript. Running tasks stream
+   * their live thread from the review server; once the server has deleted the
+   * session (every finished task) the retained prompt/reasoning/tool/output
+   * columns are folded into a static snapshot for the same renderer. A running
+   * task whose thread is unreachable streams its retained columns instead.
+   */
+  private renderTaskTranscript(task: ReviewTask): TemplateResult {
+    const live = isLiveTaskStatus(task.status);
+    if (live && task.thread_id && !this.liveTranscriptUnavailable[task.id]) {
+      return html`<div class="task-transcript">
+        <trouve-transcript-view
+          .client=${this.api.protocol()}
+          .threadId=${task.thread_id}
+          @trouve-transcript-state=${(event: CustomEvent<TranscriptStateDetail>) => {
+            if (event.detail.state !== "error") return;
+            this.liveTranscriptUnavailable = { ...this.liveTranscriptUnavailable, [task.id]: true };
+          }}
+        ></trouve-transcript-view>
+      </div>`;
+    }
+    if (live) {
+      return html`<trouve-code-review-output-block
+          .heading=${"Assistant output"}
+          .value=${task.output ?? ""}
+          .followTail=${task.status === "running"}
+        ></trouve-code-review-output-block>
+        <trouve-code-review-output-block
+          .heading=${"Reasoning"}
+          .value=${task.thinking ?? ""}
+          .followTail=${task.status === "running"}
+        ></trouve-code-review-output-block>
+        <trouve-code-review-output-block
+          .heading=${"Tool output"}
+          .value=${task.tool_output ?? ""}
+          .followTail=${task.status === "running"}
+        ></trouve-code-review-output-block>
+        ${task.prompt
+          ? html`<details class="nested">
+              <summary>Prompt</summary>
+              <pre>${task.prompt}</pre>
+            </details>`
+          : nothing}`;
+    }
+    // The snapshot only changes when the retained columns do, so the renderer
+    // keeps its client (and scroll position) across unrelated re-renders.
+    const key = [task.id, task.status, task.prompt, task.thinking, task.tool_output, task.output, task.error]
+      .map((part) => part ?? "")
+      .join("\u0000");
+    if (this.retainedClient?.key !== key) {
+      this.retainedClient = { key, client: new RetainedTranscriptClient(task) };
+    }
+    return html`<div class="task-transcript">
+      <trouve-transcript-view
+        .client=${this.retainedClient.client}
+        .threadId=${retainedThreadId(task.id)}
+      ></trouve-transcript-view>
+    </div>`;
   }
 
   private renderRoutingReasons(
@@ -1273,27 +1344,7 @@ export class JobDetailPane extends ReviewElement {
                             <span>Retrying automatically.</span>
                           </div>`
                         : nothing}
-                      <trouve-code-review-output-block
-                        .heading=${"Assistant output"}
-                        .value=${selectedTask.output ?? ""}
-                        .followTail=${selectedTask.status === "running"}
-                      ></trouve-code-review-output-block>
-                      <trouve-code-review-output-block
-                        .heading=${"Reasoning"}
-                        .value=${selectedTask.thinking ?? ""}
-                        .followTail=${selectedTask.status === "running"}
-                      ></trouve-code-review-output-block>
-                      <trouve-code-review-output-block
-                        .heading=${"Tool output"}
-                        .value=${selectedTask.tool_output ?? ""}
-                        .followTail=${selectedTask.status === "running"}
-                      ></trouve-code-review-output-block>
-                      ${selectedTask.prompt
-                        ? html`<details class="nested">
-                            <summary>Prompt</summary>
-                            <pre>${selectedTask.prompt}</pre>
-                          </details>`
-                        : nothing}
+                      ${this.renderTaskTranscript(selectedTask)}
                       ${selectedTask.error ? html`<p class="error-text">${selectedTask.error}</p>` : nothing}
                     </article>`,
                   )

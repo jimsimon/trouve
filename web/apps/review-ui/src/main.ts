@@ -1,9 +1,11 @@
 import "@trouve-ai/ui-foundation/styles/themes.css";
 import "@trouve-ai/ui-foundation/styles/tokens.css";
 import "@trouve-ai/ui-foundation/styles/base.css";
+import "@trouve-ai/transcript/styles/transcript.css";
 import "@trouve-ai/code-review/styles.css";
 import "./styles/site.css";
 
+import { configureContentWorker } from "@trouve-ai/content-rendering/content-worker-client";
 import {
   hashForRoute,
   NAVIGATE_EVENT,
@@ -20,6 +22,12 @@ import { createBrowserThemeController } from "@trouve-ai/ui-foundation/theme-con
 // Preact application used, so existing bookmarks and links keep working.
 const root = document.querySelector<HTMLElement>("#app");
 if (!root) throw new Error("missing #app");
+
+// Markdown, diffs, and highlighting for task transcripts render off-thread
+// through the same bounded worker protocol the desktop uses.
+configureContentWorker(
+  () => new Worker(new URL("./content-worker.ts", import.meta.url), { type: "module", name: "trouve-content" }),
+);
 
 // The site owns its theme the way the desktop shell does: the same
 // controller, the same `data-theme` themes, persisted in this browser.
