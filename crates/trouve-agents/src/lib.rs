@@ -49,7 +49,7 @@ pub enum BackendPermission {
 }
 
 /// Everything a backend needs to run one turn.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct BackendTurn {
     /// Cooperative cancellation for every phase of this vendor turn. An
     /// adapter must not finish its stream after observing cancellation until

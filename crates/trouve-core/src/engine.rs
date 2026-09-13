@@ -82,6 +82,16 @@ const MAX_ITERATIONS: usize = 32;
 /// run to fold awaited subagent results back in. Native turns are bounded by
 /// `MAX_ITERATIONS` instead, since each fold-in consumes an iteration.
 const MAX_SUBAGENT_CONTINUATIONS: usize = 4;
+/// Pause before re-running a provider route that failed transiently before
+/// the model produced anything. Switching providers replays the whole
+/// transcript to the new vendor, so one cheap retry on the same route comes
+/// first. A short pause covers the common causes (a credential refresh held
+/// by a sibling vendor process, a process that exited on startup) without
+/// stretching real outages.
+#[cfg(not(test))]
+const SAME_ROUTE_RETRY_DELAY: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const SAME_ROUTE_RETRY_DELAY: Duration = Duration::from_millis(10);
 /// A wedged child must not hold its parent's terminal response open forever.
 /// Timed-out descendants remain active and inspectable; only the parent's
 /// synthetic wait ends.
@@ -17778,6 +17788,9 @@ impl Engine {
                 .await?;
         }
         let backend_turn_started = Instant::now();
+        // Kept for one in-place retry if the vendor fails before producing
+        // anything (see the stream error branch below).
+        let mut retry_turn = Some(backend_turn.clone());
         let mut stream = match backend.run_turn(backend_turn).await {
             Ok(stream) => stream,
             Err(BackendError::Cancelled) if cancel.is_cancelled() => return Ok(()),
@@ -18170,6 +18183,49 @@ impl Engine {
                     }
                     Err(BackendError::Cancelled) if cancel.is_cancelled() => break,
                     Err(error) => {
+                        // A transient failure before the first substantive
+                        // event (nothing streamed, no tool started, no
+                        // collaborator) gets one more attempt on the same
+                        // backend. The vendor session persisted so far is
+                        // resumed; the prompt is re-sent verbatim.
+                        if first_substantive_event
+                            && backend_error_retryable_in_place(&error)
+                            && let Some(mut turn_to_retry) = retry_turn.take()
+                        {
+                            tracing::warn!(
+                                thread_id = %thread.id,
+                                turn,
+                                backend = %backend_id,
+                                error = %error,
+                                "backend failed before producing output; retrying once in place"
+                            );
+                            tokio::select! {
+                                biased;
+                                _ = cancel.cancelled() => break,
+                                _ = tokio::time::sleep(SAME_ROUTE_RETRY_DELAY) => {}
+                            }
+                            if active_vendor_session.is_some() {
+                                turn_to_retry.session = active_vendor_session.clone();
+                            }
+                            let retry_permit = match self
+                                .turn_scheduler
+                                .acquire_backend_startup(backend_id, &cancel)
+                                .await
+                            {
+                                Ok(permit) => permit,
+                                Err(_) if cancel.is_cancelled() => break,
+                                Err(error) => return Err(error),
+                            };
+                            stream = match backend.run_turn(turn_to_retry).await {
+                                Ok(stream) => stream,
+                                Err(BackendError::Cancelled) if cancel.is_cancelled() => break,
+                                Err(error) => {
+                                    return Err(anyhow!("backend error: {error}"));
+                                }
+                            };
+                            drop(retry_permit);
+                            continue;
+                        }
                         flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
                         flush_backend_collaborator_batches(&self.store, &mut collaborators).await?;
                         for collaborator in collaborators.values_mut() {
@@ -18200,6 +18256,8 @@ impl Engine {
             };
             if first_substantive_event && !matches!(&event, BackendEvent::SessionStarted { .. }) {
                 first_substantive_event = false;
+                // Past this point a retry could not be replayed verbatim.
+                retry_turn = None;
                 tracing::info!(
                     thread_id = %thread.id,
                     turn,
@@ -20809,6 +20867,20 @@ impl Engine {
         }
         Ok(Some(checkpoint_id))
     }
+}
+
+/// Whether a concrete backend turn that failed before its first substantive
+/// event is worth one more attempt on the same backend. Capacity exhaustion
+/// and login problems are deterministic for minutes at least; everything
+/// else (protocol and I/O failures such as a credential refresh lost to a
+/// sibling vendor process, or a process that exited on startup) usually
+/// clears within seconds.
+fn backend_error_retryable_in_place(error: &BackendError) -> bool {
+    !error.is_capacity_exhausted()
+        && !matches!(
+            error,
+            BackendError::Cancelled | BackendError::Auth(_) | BackendError::NotInstalled(_)
+        )
 }
 
 fn is_transient_sqlite_contention(error: &anyhow::Error) -> bool {
@@ -24265,6 +24337,26 @@ mod tests {
             rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_LOCKED),
             Some("database table is locked".into()),
         ))
+    }
+
+    #[test]
+    fn concrete_backend_retries_in_place_only_for_transient_failures() {
+        assert!(backend_error_retryable_in_place(&BackendError::Protocol(
+            "Failed to refresh OAuth token: another Claude Code process is refreshing it".into()
+        )));
+        assert!(backend_error_retryable_in_place(&BackendError::Io(
+            std::io::Error::other("claude exited with status 1")
+        )));
+        assert!(!backend_error_retryable_in_place(&BackendError::Protocol(
+            "HTTP 429 Too Many Requests".into()
+        )));
+        assert!(!backend_error_retryable_in_place(&BackendError::Auth(
+            "logged out".into()
+        )));
+        assert!(!backend_error_retryable_in_place(
+            &BackendError::NotInstalled("claude".into())
+        ));
+        assert!(!backend_error_retryable_in_place(&BackendError::Cancelled));
     }
 
     #[tokio::test]
