@@ -25,7 +25,7 @@ COPY packages/ui-foundation/tsconfig.json packages/ui-foundation/
 COPY packages/ui-foundation/src packages/ui-foundation/src
 RUN npm run build --workspace apps/review-ui
 
-FROM nginxinc/nginx-unprivileged:1.29.4-alpine
+FROM nginxinc/nginx-unprivileged:1.31.5-alpine
 COPY apps/review-ui/nginx.conf /etc/nginx/conf.d/default.conf
 COPY --from=build /web/apps/review-ui/dist /usr/share/nginx/html
 EXPOSE 8080
