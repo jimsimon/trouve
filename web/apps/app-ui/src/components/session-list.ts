@@ -161,6 +161,9 @@ export class TrouveSessionList extends withSignalTracking(LitElement) {
     if (groups.sections.length === 0 && groups.archived.length === 0) {
       return html`<p class="context-placeholder">No matching sessions</p>`;
     }
+    const renameFailure = this.#editingSessionId === ""
+      ? undefined
+      : this.#store.value?.titleGenerationFailure(this.#editingSessionId);
     return html`
       ${groups.sections.length === 0
         ? html`<p class="context-placeholder session-list-empty">No active sessions</p>`
@@ -210,6 +213,9 @@ export class TrouveSessionList extends withSignalTracking(LitElement) {
                 <h2 id=${this.#modalTitleId}>Rename session</h2>
                 <label class="visually-hidden" for=${`rename-${this.#editingSessionId}`}>Session title</label>
                 <input id=${`rename-${this.#editingSessionId}`} name="title" .value=${this.#modalTitle} @input=${(event: InputEvent) => { this.#modalTitle = (event.currentTarget as HTMLInputElement).value; }} maxlength="200" placeholder="Session title" required />
+                ${renameFailure === undefined
+                  ? nothing
+                  : html`<p class="naming-failure-note">${renameFailure}</p>`}
                 ${this.#requestError === "" ? nothing : html`<p class="dialog-error" role="alert">${this.#requestError}</p>`}
                 <footer>
                   <button data-session-modal-action="cancel" type="button" @click=${this.#closeActions}>Cancel</button>
@@ -286,6 +292,9 @@ export class TrouveSessionList extends withSignalTracking(LitElement) {
     const age = sessionAgePresentation(session.updatedAt, now);
     const titleWaiting = this.#store.value?.titleGenerationWaiting(session.id);
     const titleShimmer = titleWaiting === false;
+    const titleFailure = titleWaiting === undefined
+      ? this.#store.value?.titleGenerationFailure(session.id)
+      : undefined;
     return html`
       <li class="session-entry">
         <div
@@ -319,10 +328,14 @@ export class TrouveSessionList extends withSignalTracking(LitElement) {
                   <span class="session-copy">
                     <strong class=${titleWaiting ? "title-waiting" : nothing} title=${titleWaiting ? LOCAL_MODEL_WAITING_LABEL : nothing}>${titleShimmer
                       ? html`<span class="naming-title-shimmer session-title-shimmer" aria-hidden="true"></span><span class="visually-hidden">Naming session…</span>`
-                      : session.title}</strong>
+                      : session.title}${titleFailure === undefined
+                      ? nothing
+                      : html`<span class="naming-title-failed" title=${titleFailure} aria-hidden="true">${fontAwesomeIcon("triangle-exclamation")}</span>`}</strong>
                     ${titleWaiting
                       ? html`<span class="visually-hidden" role="status">${SESSION_TITLE_WAITING_STATUS}</span>`
-                      : nothing}
+                      : titleFailure === undefined
+                        ? nothing
+                        : html`<span class="visually-hidden">${titleFailure}</span>`}
                     ${this.showBranches
                       ? html`<small class="session-branch" title=${session.branch}>${session.branch}</small>`
                       : nothing}

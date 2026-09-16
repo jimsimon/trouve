@@ -37,6 +37,7 @@ import {
   beginTitleGeneration,
   LOCAL_MODEL_WAITING_LABEL,
   THREAD_TITLE_WAITING_STATUS,
+  titleGenerationFailureMessage,
   titleGenerationTimeoutMs,
 } from "../services/title-generation.js";
 import type { ComposerDraft } from "../services/composer-drafts.js";
@@ -1699,6 +1700,12 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
           ? store.titleGenerationWaiting(this.sessionId)
           : undefined);
       const titleShimmer = titleWaiting === false;
+      const titleFailure = titleWaiting === undefined
+        ? store.titleGenerationFailure(candidate.id)
+          ?? (candidate.id === initialThreadId
+            ? store.titleGenerationFailure(this.sessionId)
+            : undefined)
+        : undefined;
       const indicator = sessionIndicatorPresentation(
         store.threadIndicatorState(candidate.id),
       );
@@ -1707,6 +1714,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       const accessibleLabel = titleShimmer
         ? "Naming thread…"
         : titleWaiting ? `${label}. ${THREAD_TITLE_WAITING_STATUS}`
+        : titleFailure !== undefined ? `${label}. ${titleFailure}`
         : statusLabel === "" ? label : `${label}, ${statusLabel}`;
       return html`
         <span class="thread-tab-item" role="presentation" @contextmenu=${(event: MouseEvent) => this.#openThreadTabContextMenu(event, candidate.id)}>
@@ -1741,7 +1749,9 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
               ? fontAwesomeIcon("thumbtack", { className: "thread-tab-pin" })
               : nothing}<span class="thread-tab-title ${titleWaiting ? "title-waiting" : ""}">${titleShimmer
                 ? html`<span class="naming-title-shimmer thread-title-shimmer" aria-hidden="true"></span><span class="visually-hidden">Naming thread…</span>`
-                : label}</span></span>
+                : label}</span>${titleFailure === undefined
+              ? nothing
+              : html`<span class="naming-title-failed" aria-hidden="true">${fontAwesomeIcon("triangle-exclamation")}</span>`}</span>
             ${threadTodoProgress(candidate.todos) === ""
               ? nothing
               : html`<span class="thread-todo-progress">${threadTodoProgress(candidate.todos)}</span>`}
@@ -5056,8 +5066,10 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
               expected_title: NEW_THREAD_TITLE_FALLBACK,
             });
             store.upsertThread(renamed);
-          } catch {
-            // Naming is cosmetic; preserve the placeholder or a user rename.
+          } catch (error) {
+            // Naming is cosmetic; preserve the placeholder or a user rename
+            // and let the tab explain why the placeholder stayed.
+            store.failTitleGeneration(thread.id, titleGenerationFailureMessage(error));
           } finally {
             globalThis.clearTimeout(timeout);
             globalThis.clearTimeout(waitingTimer);

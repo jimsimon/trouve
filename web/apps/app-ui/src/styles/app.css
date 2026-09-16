@@ -305,6 +305,8 @@ trouve-session-list[hidden] { display: none; }
 @keyframes naming-title-shimmer { to { background-position: -250% 0; } }
 .title-waiting::after { display: inline-block; width: 6px; height: 6px; margin-inline-start: 5px; border-radius: 999px; background: var(--trouve-accent); box-shadow: 0 0 0 2px var(--trouve-accent-dim); animation: naming-title-pending 1.4s ease-in-out infinite; content: ""; }
 @keyframes naming-title-pending { 50% { opacity: .35; } }
+.naming-title-failed { display: inline-block; margin-inline-start: 5px; color: var(--trouve-warn); font-size: 10px; vertical-align: 1px; }
+.naming-failure-note { color: var(--trouve-warn) !important; overflow-wrap: anywhere; }
 .session-indicator.thread-tab-indicator { width: 14px; height: 18px; flex: 0 0 14px; margin: 0; border-radius: 3px; }
 .session-indicator.thread-tab-indicator.approval, .session-indicator.thread-tab-indicator.question, .session-indicator.thread-tab-indicator.both { font-size: 10px; }
 .session-indicator.thread-tab-indicator.error { font-size: 12px; }
