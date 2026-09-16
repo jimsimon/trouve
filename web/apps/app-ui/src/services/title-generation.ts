@@ -9,10 +9,27 @@ export const SESSION_TITLE_WAITING_STATUS =
 export const THREAD_TITLE_WAITING_STATUS =
   `Thread name pending. ${LOCAL_MODEL_WAITING_LABEL}`;
 
+export const TITLE_GENERATION_FAILED_LABEL = "Automatic naming failed";
+export const TITLE_GENERATION_TIMED_OUT_MESSAGE =
+  `${TITLE_GENERATION_FAILED_LABEL}: the naming model did not answer in time.`;
+
 type TitleGenerationStore = Pick<
   AppStore,
   "beginTitleGeneration" | "markTitleGenerationWaiting"
 >;
+
+/** Explain a failed naming request in one line for tooltips and assistive
+ * text. Server messages already name the model and route that failed. */
+export const titleGenerationFailureMessage = (error: unknown): string => {
+  if (
+    error instanceof Error
+    && (error.name === "AbortError" || error.name === "TimeoutError")
+  ) return TITLE_GENERATION_TIMED_OUT_MESSAGE;
+  const detail = error instanceof Error ? error.message.trim() : "";
+  return detail === ""
+    ? `${TITLE_GENERATION_FAILED_LABEL}.`
+    : `${TITLE_GENERATION_FAILED_LABEL}: ${detail}`;
+};
 
 export const beginTitleGeneration = (
   store: TitleGenerationStore,

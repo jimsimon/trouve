@@ -1090,6 +1090,41 @@ describe("AppStore", () => {
     expect(store.thread("th_1")?.title).toBe("New Thread");
   });
 
+  it("keeps the naming failure reason until a rename or a new attempt", () => {
+    const store = new AppStore();
+    store.upsertSessionMetadata({ ...metadata, title: "New Session" });
+    store.upsertThread({ ...thread("th_1"), title: "New Thread" });
+
+    // A failure without an active attempt has nothing to explain.
+    store.failTitleGeneration("se_1", "Automatic naming failed: stale");
+    expect(store.titleGenerationFailure("se_1")).toBeUndefined();
+
+    store.beginTitleGeneration("se_1", "New Session");
+    store.beginTitleGeneration("th_1", "New Thread");
+    store.failTitleGeneration("se_1", "Automatic naming failed: at capacity");
+    store.failTitleGeneration("th_1", "Automatic naming failed: at capacity");
+    store.endTitleGeneration("se_1");
+    store.endTitleGeneration("th_1");
+    expect(store.titleGenerationWaiting("se_1")).toBeUndefined();
+    expect(store.titleGenerationFailure("se_1")).toBe("Automatic naming failed: at capacity");
+    expect(store.titleGenerationFailure("th_1")).toBe("Automatic naming failed: at capacity");
+
+    // Metadata refreshes that keep the placeholder keep the explanation.
+    store.upsertSessionMetadata({ ...metadata, title: "New Session" });
+    store.upsertThread({ ...thread("th_1"), title: "New Thread" });
+    expect(store.titleGenerationFailure("se_1")).toBe("Automatic naming failed: at capacity");
+    expect(store.titleGenerationFailure("th_1")).toBe("Automatic naming failed: at capacity");
+
+    // A rename supersedes it; so does the next attempt.
+    store.upsertSessionMetadata({ ...metadata, title: "Renamed Session" });
+    expect(store.titleGenerationFailure("se_1")).toBeUndefined();
+    store.beginTitleGeneration("th_1", "New Thread");
+    expect(store.titleGenerationFailure("th_1")).toBeUndefined();
+    store.failTitleGeneration("th_1", "Automatic naming failed: again");
+    store.removeSession("se_1");
+    expect(store.titleGenerationFailure("th_1")).toBeUndefined();
+  });
+
   it("retains the live todo replacement across late metadata and LRU recreation", () => {
     const store = new AppStore({ maxThreadViews: 1 });
     const live = [

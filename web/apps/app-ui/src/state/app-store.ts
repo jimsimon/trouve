@@ -59,6 +59,7 @@ export interface ThreadIndicatorState {
 }
 
 type TitleGenerationState = [provisionalTitle: string, waiting: boolean];
+type TitleGenerationFailure = [provisionalTitle: string, message: string];
 
 export interface SessionPullRequestIdentity {
   readonly workspaceId: string;
@@ -218,6 +219,9 @@ export class AppStore {
   readonly #workspaces = new Map<string, ProtocolWorkspace>();
   readonly #threads = new Map<string, ProtocolThread>();
   readonly #generatingTitles = new Map<string, TitleGenerationState>();
+  // Why automatic naming left the placeholder in place. Cleared by a rename
+  // or by the next naming attempt for the same id.
+  readonly #titleGenerationFailures = new Map<string, TitleGenerationFailure>();
   readonly #threadStatuses = new Map<string, ProtocolThreadStatus>();
   readonly #seenThreadCursors = new Map<string, number>();
   readonly #initializedThreadSessions = new Set<string>();
@@ -291,10 +295,7 @@ export class AppStore {
     for (const session of sessions) {
       if (this.#deletedSessions.has(session.id)) continue;
       this.#sessionMetadata.set(session.id, session);
-      const generation = this.#generatingTitles.get(session.id);
-      if (generation !== undefined && session.title !== generation[0]) {
-        this.#generatingTitles.delete(session.id);
-      }
+      this.#reconcileTitleGeneration(session.id, session.title);
     }
     this.#touch();
   }
@@ -302,10 +303,7 @@ export class AppStore {
   upsertSessionMetadata(session: ProtocolSession): void {
     if (this.#deletedSessions.has(session.id)) return;
     this.#sessionMetadata.set(session.id, session);
-    const generation = this.#generatingTitles.get(session.id);
-    if (generation !== undefined && session.title !== generation[0]) {
-      this.#generatingTitles.delete(session.id);
-    }
+    this.#reconcileTitleGeneration(session.id, session.title);
     const summary = this.#sessionSummaries.get(session.id);
     if (summary !== undefined && session.archived !== undefined) {
       this.#sessionSummaries.set(session.id, {
@@ -332,7 +330,7 @@ export class AppStore {
     this.#seenSessionCursors.delete(sessionId);
     this.#sessionPullRequests.delete(sessionId);
     this.#sessionUsageRevisions.delete(sessionId);
-    this.#generatingTitles.delete(sessionId);
+    this.#forgetTitleGeneration(sessionId);
     for (const [threadId, thread] of this.#threads) {
       if (thread.session_id === sessionId) {
         this.#threads.delete(threadId);
@@ -340,7 +338,7 @@ export class AppStore {
         this.#threadTodoEvents.delete(threadId);
         this.#threadStatuses.delete(threadId);
         this.#seenThreadCursors.delete(threadId);
-        this.#generatingTitles.delete(threadId);
+        this.#forgetTitleGeneration(threadId);
       }
     }
     // Status snapshots can arrive before (or without) thread metadata. Purge
@@ -352,16 +350,50 @@ export class AppStore {
       this.#seenThreadCursors.delete(threadId);
       this.#threadViews.delete(threadId);
       this.#threadTodoEvents.delete(threadId);
-      this.#generatingTitles.delete(threadId);
+      this.#forgetTitleGeneration(threadId);
     }
     this.#initializedThreadSessions.delete(sessionId);
     this.#initializedThreadStatusSessions.delete(sessionId);
     this.#touch();
   }
 
+  /** A title that differs from the provisional one is a rename or a
+   * generated name, either of which supersedes in-flight naming state. */
+  #reconcileTitleGeneration(id: string, title: string | null | undefined): void {
+    if (title === undefined) return;
+    const generation = this.#generatingTitles.get(id);
+    if (generation !== undefined && title !== generation[0]) {
+      this.#generatingTitles.delete(id);
+    }
+    const failure = this.#titleGenerationFailures.get(id);
+    if (failure !== undefined && title !== failure[0]) {
+      this.#titleGenerationFailures.delete(id);
+    }
+  }
+
+  #forgetTitleGeneration(id: string): void {
+    this.#generatingTitles.delete(id);
+    this.#titleGenerationFailures.delete(id);
+  }
+
   beginTitleGeneration(id: string, provisionalTitle: string): void {
     this.#generatingTitles.set(id, [provisionalTitle, false]);
+    this.#titleGenerationFailures.delete(id);
     this.#touch();
+  }
+
+  /** Record why automatic naming left the placeholder. Ignored when a rename
+   * already superseded the attempt, since there is nothing left to explain. */
+  failTitleGeneration(id: string, message: string): void {
+    const current = this.#generatingTitles.get(id);
+    if (current === undefined) return;
+    this.#titleGenerationFailures.set(id, [current[0], message]);
+    this.#touch();
+  }
+
+  titleGenerationFailure(id: string): string | undefined {
+    this.#revision.get();
+    return this.#titleGenerationFailures.get(id)?.[1];
   }
 
   markTitleGenerationWaiting(id: string, provisionalTitle: string): void {
@@ -1016,14 +1048,7 @@ export class AppStore {
       ? thread
       : { ...thread, todos: todos.map((todo) => ({ ...todo })) };
     this.#threads.set(thread.id, stored);
-    const generation = this.#generatingTitles.get(thread.id);
-    if (
-      generation !== undefined
-      && thread.title !== undefined
-      && thread.title !== generation[0]
-    ) {
-      this.#generatingTitles.delete(thread.id);
-    }
+    this.#reconcileTitleGeneration(thread.id, thread.title);
     if (todoEvent === undefined && thread.todos !== undefined) {
       this.#threadViews.get(thread.id)?.replaceTodos(thread.todos);
     }

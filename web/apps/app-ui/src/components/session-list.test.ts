@@ -82,6 +82,12 @@ describe("session list component contract", () => {
     expect(component).toContain('role="status"');
     expect(component).toContain("SESSION_TITLE_WAITING_STATUS");
     expect(styles).toContain(".title-waiting::after");
+    expect(component).toContain("titleGenerationFailure(session.id)");
+    expect(component).toContain('class="naming-title-failed" title=${titleFailure} aria-hidden="true"');
+    expect(component).toContain('<span class="visually-hidden">${titleFailure}</span>');
+    expect(component).toContain('class="naming-failure-note"');
+    expect(styles).toContain(".naming-title-failed");
+    expect(styles).toContain(".naming-failure-note");
     expect(component).toContain("sessionAgePresentation(session.updatedAt, now)");
     expect(component).toContain('class="session-age"');
     expect(component).toContain("this.showBranches");

@@ -115,6 +115,7 @@ import {
 } from "@trouve-ai/protocol/client";
 import {
   beginTitleGeneration,
+  titleGenerationFailureMessage,
   titleGenerationTimeoutMs,
 } from "../services/title-generation.js";
 import { createBrowserThreadIngress } from "../services/thread-ingress.js";
@@ -2167,8 +2168,10 @@ export class TrouveApp extends withSignalTracking(LitElement) {
             expected_title: provisionalTitle,
           }));
         }
-      } catch {
-        // Naming is cosmetic; the placeholder or a user rename remains.
+      } catch (error) {
+        // Naming is cosmetic; the placeholder or a user rename remains, and
+        // the list explains why the placeholder stayed.
+        this.#store.failTitleGeneration(id, titleGenerationFailureMessage(error));
       } finally {
         globalThis.clearTimeout(waitingTimer);
         this.#store.endTitleGeneration(id);

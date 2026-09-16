@@ -679,6 +679,15 @@ const STALE_TITLE_IMAGE_AGE: std::time::Duration =
 // stalled sidecar cannot retain an arbitrary number of request tasks.
 const MAX_PENDING_TITLE_JOBS: usize = 32;
 const MAX_TITLE_JOB_FOLLOWERS: usize = 32;
+// Naming failures are usually transient (a provider briefly at capacity, a
+// malformed title from a nondeterministic model). One short retry recovers
+// most of them; a request that already spent its whole budget is not retried
+// so the worst case does not double.
+#[cfg(not(test))]
+const SESSION_TITLE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+#[cfg(test)]
+const SESSION_TITLE_RETRY_DELAY: std::time::Duration = std::time::Duration::ZERO;
+const TITLE_GENERATION_TIMED_OUT: &str = "title generation timed out";
 #[cfg(not(test))]
 const MODEL_CATALOG_VALIDATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 #[cfg(test)]
@@ -3614,6 +3623,16 @@ struct TitleJobState {
 struct TitleJobLeader<'a> {
     jobs: &'a Mutex<HashMap<TitleJobKey, TitleJobState>>,
     key: Option<TitleJobKey>,
+}
+
+/// Provider and backend failures are worth one more try. A timed-out attempt
+/// has already consumed the full naming budget, and non-request errors
+/// (missing session, internal faults) will not change on a retry.
+fn title_attempt_is_retryable(error: &EngineError) -> bool {
+    matches!(
+        error,
+        EngineError::BadRequest(message) if !message.contains(TITLE_GENERATION_TIMED_OUT)
+    )
 }
 
 fn title_job_key(
@@ -7899,33 +7918,91 @@ impl Engine {
         }
         let model_info = self.resolve_model_info(&settings.model).await?;
         let model_options = crate::title_model::model_options(&model_info);
-        if routing::automatic_model_name(&settings.model).is_some() {
+        let first = self
+            .generate_title_attempt(
+                &session,
+                &settings.model,
+                prompt,
+                attachments,
+                &model_info,
+                &model_options,
+            )
+            .await;
+        let error = match first {
+            Ok(title) => return Ok(title),
+            Err(error) if !title_attempt_is_retryable(&error) => return Err(error),
+            Err(error) => error,
+        };
+        tracing::warn!(
+            session_id,
+            model = %settings.model,
+            error = %error,
+            "session naming attempt failed; retrying once"
+        );
+        tokio::time::sleep(SESSION_TITLE_RETRY_DELAY).await;
+        self.generate_title_attempt(
+            &session,
+            &settings.model,
+            prompt,
+            attachments,
+            &model_info,
+            &model_options,
+        )
+        .await
+        .map_err(|retry_error| {
+            tracing::warn!(
+                session_id,
+                model = %settings.model,
+                error = %retry_error,
+                "session naming retry failed"
+            );
+            match retry_error {
+                EngineError::BadRequest(message) => {
+                    EngineError::BadRequest(format!("{message} (a retry also failed)"))
+                }
+                other => other,
+            }
+        })
+    }
+
+    /// One naming attempt against the configured model. Validation and model
+    /// resolution happen in the caller so only provider work is retried.
+    async fn generate_title_attempt(
+        &self,
+        session: &Session,
+        model: &str,
+        prompt: &str,
+        attachments: &[trouve_protocol::AttachmentUpload],
+        model_info: &trouve_protocol::ModelInfo,
+        model_options: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<trouve_protocol::GeneratedTitle, EngineError> {
+        if routing::automatic_model_name(model).is_some() {
             return self
                 .generate_automatic_title(
-                    &session,
-                    &settings.model,
+                    session,
+                    model,
                     prompt,
                     attachments,
-                    &model_info,
-                    &model_options,
+                    model_info,
+                    model_options,
                 )
                 .await;
         }
-        if let Some((_, backend, model_name)) = self.backend_for(&settings.model) {
+        if let Some((_, backend, model_name)) = self.backend_for(model) {
             return self
                 .generate_title_with_backend(
-                    &session,
+                    session,
                     prompt,
                     attachments,
                     model_info.supports_images,
-                    &model_options,
+                    model_options,
                     backend,
                     model_name,
                 )
                 .await;
         }
-        let (provider, model_name) = self.resolve_provider(&settings.model)?;
-        let timeout = if settings.model.starts_with("local/") {
+        let (provider, model_name) = self.resolve_provider(model)?;
+        let timeout = if model.starts_with("local/") {
             LOCAL_SESSION_TITLE_TIMEOUT
         } else {
             SESSION_TITLE_TIMEOUT
@@ -7934,7 +8011,7 @@ impl Engine {
             prompt,
             attachments,
             model_info.supports_images,
-            &model_options,
+            model_options,
             provider,
             model_name,
             timeout,
@@ -8044,7 +8121,7 @@ impl Engine {
         .await
         .map_err(|_| {
             cancel.cancel();
-            EngineError::BadRequest("title generation timed out".into())
+            EngineError::BadRequest(TITLE_GENERATION_TIMED_OUT.into())
         })??;
         Ok(trouve_protocol::GeneratedTitle { title })
     }
@@ -8093,7 +8170,7 @@ impl Engine {
                 .map_err(|error| EngineError::BadRequest(error.to_string()))
         })
         .await
-        .map_err(|_| EngineError::BadRequest("title generation timed out".into()))??;
+        .map_err(|_| EngineError::BadRequest(TITLE_GENERATION_TIMED_OUT.into()))??;
         Ok(trouve_protocol::GeneratedTitle { title })
     }
 
@@ -26789,6 +26866,133 @@ mod tests {
                 .any(|model| model.id == "catalog-test/live")
         );
         assert_eq!(live_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    struct FlakyTitleProvider {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        failures_before_success: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for FlakyTitleProvider {
+        fn id(&self) -> &str {
+            "flaky"
+        }
+
+        fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
+            vec![catalog_test_model("flaky/model", "Flaky title model")]
+        }
+
+        async fn stream_chat(
+            &self,
+            _model: &str,
+            _messages: &[trouve_providers::Message],
+            _tools: &[trouve_providers::ToolSpec],
+            _options: &serde_json::Map<String, serde_json::Value>,
+        ) -> Result<trouve_providers::EventStream, trouve_providers::ProviderError> {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call < self.failures_before_success {
+                return Err(trouve_providers::ProviderError::Request(
+                    "selected model is at capacity".into(),
+                ));
+            }
+            Ok(Box::pin(futures::stream::iter(vec![
+                Ok(ProviderEvent::TextDelta("Recover Flaky Naming".into())),
+                Ok(ProviderEvent::Completed {
+                    usage: Usage::default(),
+                }),
+            ])))
+        }
+    }
+
+    fn flaky_title_engine(
+        data: &tempfile::TempDir,
+        failures_before_success: usize,
+    ) -> (Engine, Session, Arc<std::sync::atomic::AtomicUsize>) {
+        let store = Store::open_in_memory().unwrap();
+        let workspace = Workspace {
+            id: "ws_flaky_title".into(),
+            name: "flaky title".into(),
+            path: data.path().to_string_lossy().into_owned(),
+        };
+        store.insert_workspace(&workspace).unwrap();
+        let session = Session {
+            id: "se_flaky_title".into(),
+            workspace_id: workspace.id,
+            title: "New Session".into(),
+            branch: "trouve/flaky-title".into(),
+            worktree_path: data.path().to_string_lossy().into_owned(),
+            base_ref: "main".into(),
+            archived: false,
+            active: false,
+            created_at: chrono::Utc::now(),
+        };
+        store.insert_session(&session).unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let engine = Engine::new(
+            store,
+            data.path().into(),
+            &Config {
+                session_naming_model: Some("flaky/model".into()),
+                local_enabled: Some(false),
+                ..Default::default()
+            },
+        )
+        .with_provider(
+            "flaky",
+            Arc::new(FlakyTitleProvider {
+                calls: calls.clone(),
+                failures_before_success,
+            }),
+        );
+        (engine, session, calls)
+    }
+
+    #[tokio::test]
+    async fn session_naming_retries_a_transient_provider_failure_once() {
+        let data = tempfile::tempdir().unwrap();
+        let (engine, session, calls) = flaky_title_engine(&data, 1);
+
+        let title = engine
+            .generate_title(&session.id, "Retry transient naming", &[])
+            .await
+            .unwrap();
+        assert_eq!(title.title, "Recover Flaky Naming");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn session_naming_reports_the_retried_failure() {
+        let data = tempfile::tempdir().unwrap();
+        let (engine, session, calls) = flaky_title_engine(&data, usize::MAX);
+
+        let error = engine
+            .generate_title(&session.id, "Retry transient naming", &[])
+            .await
+            .unwrap_err();
+        assert!(matches!(error, EngineError::BadRequest(_)));
+        let message = error.to_string();
+        assert!(message.contains("at capacity"), "{message}");
+        assert!(message.ends_with("(a retry also failed)"), "{message}");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn timed_out_naming_attempts_are_not_retried() {
+        assert!(title_attempt_is_retryable(&EngineError::BadRequest(
+            "flaky/model: at capacity".into()
+        )));
+        assert!(!title_attempt_is_retryable(&EngineError::BadRequest(
+            TITLE_GENERATION_TIMED_OUT.into()
+        )));
+        assert!(!title_attempt_is_retryable(&EngineError::BadRequest(
+            format!(
+                "automatic naming with auto/model failed after trying 1 route(s): p/model: {TITLE_GENERATION_TIMED_OUT}"
+            )
+        )));
+        assert!(!title_attempt_is_retryable(&EngineError::Conflict(
+            "all routes are cooling down".into()
+        )));
     }
 
     #[tokio::test]
