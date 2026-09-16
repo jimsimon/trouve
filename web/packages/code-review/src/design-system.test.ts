@@ -88,6 +88,15 @@ describe("code-review design system", () => {
     expect(read("shared-views.ts")).toContain('fontAwesomeIcon("arrow-up-right-from-square")');
   });
 
+  it("renders task activity through the shared transcript view", () => {
+    const jobDetail = read("job-detail.ts");
+    expect(jobDetail).toContain('import "@trouve-ai/transcript/transcript-view"');
+    expect(jobDetail).toContain("<trouve-transcript-view");
+    expect(jobDetail).toContain("RetainedTranscriptClient");
+    expect(jobDetail).toContain(".client=${this.api.protocol()}");
+    expect(styles).toMatch(/\.task-transcript \{[^}]*height:/u);
+  });
+
   it("uses the shared visually-hidden utility instead of a local sr-only class", () => {
     expect(components).not.toContain("sr-only");
     expect(styles).not.toContain("sr-only");
