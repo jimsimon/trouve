@@ -4,6 +4,7 @@ import {
   isLiveTaskStatus,
   RETAINED_TOOL_OUTPUT_CALL_ID,
   RetainedTranscriptClient,
+  retainedTaskKey,
   retainedTaskSnapshot,
   retainedThreadId,
   type RetainedTask,
@@ -73,6 +74,33 @@ describe("retainedTaskSnapshot", () => {
     expect(retainedTaskSnapshot(task({ status: "queued", output: undefined })).items.at(-1)).toMatchObject({
       state: { state: "waiting_for_capacity" },
     });
+  });
+});
+
+describe("retainedTaskKey", () => {
+  it("is stable for equal tasks and changes with every snapshot input", () => {
+    expect(retainedTaskKey(task())).toBe(retainedTaskKey(task()));
+    const changed: { [K in keyof RetainedTask]: RetainedTask[K] } = {
+      id: "task-2",
+      status: "failed",
+      model: "codex/gpt-5",
+      prompt: "Review this other diff.",
+      output: "# Findings\n\nOne.",
+      thinking: "Reconsidering…",
+      tool_output: "$ git diff\n+2 -0",
+      error: "Provider timed out",
+      created_at: "2026-09-08T11:00:00Z",
+      started_at: "2026-09-08T11:00:05Z",
+      elapsed_ms: 43_000,
+      input_tokens: 1201,
+      cached_input_tokens: 301,
+      output_tokens: 81,
+    };
+    for (const [field, value] of Object.entries(changed) as [keyof RetainedTask, unknown][]) {
+      expect(retainedTaskKey(task({ [field]: value })), field).not.toBe(retainedTaskKey(task()));
+    }
+    // Absent and empty columns render the same snapshot, so they share a key.
+    expect(retainedTaskKey(task({ error: "" }))).toBe(retainedTaskKey(task()));
   });
 });
 

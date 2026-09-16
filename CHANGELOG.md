@@ -45,8 +45,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   desktop's protocol client, design tokens, content rendering, and chat
   transcript move into shared packages (`@trouve-ai/protocol`,
   `@trouve-ai/ui-foundation`, `@trouve-ai/content-rendering`, and
-  `@trouve-ai/transcript`) that both frontends use. The review dashboard's
-  screens and behaviour are unchanged.
+  `@trouve-ai/transcript`) that both frontends use. The framework port itself
+  leaves the review dashboard's screens and behaviour unchanged; the entry
+  below is the one visible change riding on it.
 - **Screen readers hear concise transcript status instead of every streamed
   fragment**: the chat log is no longer an `aria-live` region, so streamed
   Markdown, tool output, and progress text are not announced piecemeal (or

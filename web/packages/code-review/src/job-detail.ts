@@ -34,6 +34,7 @@ import { liveModelElapsed, mergeReviewTaskSnapshot } from "./review-progress";
 import {
   isLiveTaskStatus,
   RetainedTranscriptClient,
+  retainedTaskKey,
   retainedThreadId,
 } from "./review-transcript";
 import { dispatchNavigate, type Section } from "./route";
@@ -669,9 +670,7 @@ export class JobDetailPane extends ReviewElement {
     }
     // The snapshot only changes when the retained columns do, so the renderer
     // keeps its client (and scroll position) across unrelated re-renders.
-    const key = [task.id, task.status, task.prompt, task.thinking, task.tool_output, task.output, task.error]
-      .map((part) => part ?? "")
-      .join("\u0000");
+    const key = retainedTaskKey(task);
     if (this.retainedClient?.key !== key) {
       this.retainedClient = { key, client: new RetainedTranscriptClient(task) };
     }

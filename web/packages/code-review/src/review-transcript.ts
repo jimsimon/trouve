@@ -33,6 +33,34 @@ export type RetainedTask = Pick<
   | "output_tokens"
 >;
 
+/** Every column `retainedTaskSnapshot` reads, so the key below cannot drift from it. */
+const RETAINED_TASK_FIELDS = [
+  "id",
+  "status",
+  "model",
+  "prompt",
+  "output",
+  "thinking",
+  "tool_output",
+  "error",
+  "started_at",
+  "created_at",
+  "elapsed_ms",
+  "input_tokens",
+  "cached_input_tokens",
+  "output_tokens",
+] as const satisfies readonly (keyof RetainedTask)[];
+
+/**
+ * Identity of a task's retained snapshot. Two tasks with equal keys render the
+ * same transcript, so a host can keep its `RetainedTranscriptClient` (and the
+ * reader's scroll position) across re-renders that change nothing the
+ * snapshot shows, and must replace it when any input changes, including the
+ * model, timestamps, duration, and token usage that arrive as metadata.
+ */
+export const retainedTaskKey = (task: RetainedTask): string =>
+  RETAINED_TASK_FIELDS.map((field) => String(task[field] ?? "")).join("\u0000");
+
 /** Tool name for the retained, concatenated tool log; the renderer titles it "Tool Output". */
 export const RETAINED_TOOL_OUTPUT_CALL_ID = "retained-tool-output";
 
