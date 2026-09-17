@@ -294,7 +294,7 @@ xterm input/resize are examples.
 | 7 | Terminal | Multiple PTY tabs, create/select/restart/close/exit state, xterm input/paste/copy/selection/search/links/mouse/wheel/resize/IME, offset resume, duplicate-free streaming, OSC 52 confirmation, and renderer disposal. | [terminal panel](../../web/apps/app-ui/src/components/terminal-panel.ts), [terminal view](../../web/apps/app-ui/src/components/terminal-view.ts), [terminal clipboard policy](../../web/apps/app-ui/src/components/terminal-clipboard.ts) | Native clipboard and IME matrices, one/five-terminal budgets, suspend/resume and renderer recreation, AT alternative, touch controls. |
 | 8 | Todos and plan | Current plan snapshot, pending/in-progress/completed/cancelled semantics, progress summary, empty state, and conditional inspection tab. | [todo plan panel](../../web/apps/app-ui/src/components/todo-plan-panel.ts), [todo plan model](../../web/packages/transcript/src/todo-plan-model.ts) | Streaming/stale fixture comparison, responsive screenshots, semantics and live-region verification. |
 | 9 | Session pull request | Explicit GitHub setup route, PR eligibility/create form, list/detail state, checks, reviews, reviewers, mergeability, safe external open, refresh/errors, and lifecycle controls advertised by the server. The pane and session status indicators consume one shared session projection: durable account snapshots provide current GitHub state while the authoritative session lookup preserves cross-branch associations discovered from session activity. | [session PR panel](../../web/apps/app-ui/src/components/session-pr-panel.ts), [shared application store](../../web/apps/app-ui/src/state/app-store.ts), [session PR model](../../web/apps/app-ui/src/components/session-pr-panel-model.ts) | Live GitHub enterprise/host runs, OAuth expiry, browser navigation, lifecycle failure recovery, visual/AT evidence. |
-| 10 | Pull-request dashboard | Repository filters, grouped/reorderable/collapsible PR inbox with keyboard, drag, and explicit coarse-pointer ordering controls, countdown and refresh, status/reviewer/check summaries, and open/copy/chat/fix actions. Cold startup replays durable server projections through the session-summary boundary so an unchanged refresh cannot leave the dashboard or session indicators empty. Review administration moved to the `/reviews` route backed by `@trouve-ai/code-review` (ADR 0053). | [PR dashboard](../../web/apps/app-ui/src/components/pull-requests-dashboard.ts), [durable protocol ingress](../../web/apps/app-ui/src/services/protocol-ingress.ts), [shared review UI](../../web/packages/code-review) | Large-list and live-provider soak, route/focus restore, screenshots, keyboard/AT/mobile matrices. |
+| 10 | Pull-request dashboard | Repository filters, grouped/reorderable/collapsible PR inbox with keyboard, drag, and explicit coarse-pointer ordering controls, countdown and refresh, status/reviewer/check summaries, and open/copy/chat/fix actions. Cold startup replays durable server projections through the session-summary boundary so an unchanged refresh cannot leave the dashboard or session indicators empty. `/reviews` is the pull-request inbox only: the Review operations administration view was removed from the desktop app, and automated reviews are administered in the self-hosted review site (`@trouve-ai/code-review`). | [PR dashboard](../../web/apps/app-ui/src/components/pull-requests-dashboard.ts), [PR dashboard model](../../web/apps/app-ui/src/components/pull-requests-dashboard-model.ts), [durable protocol ingress](../../web/apps/app-ui/src/services/protocol-ingress.ts) | Large-list and live-provider soak, route/focus restore, screenshots, keyboard/AT/mobile matrices. |
 | 11 | Automations | List/detail, templates, create/edit/delete confirmation, enable/disable, run-now, schedule/day/time/time-zone controls, workspace/persona/model/permission configuration, validation, history, selection, loading, and failure states. | [automations screen](../../web/apps/app-ui/src/components/automations-screen.ts), [automation model](../../web/apps/app-ui/src/components/automations-model.ts) | Live scheduler failures/concurrency, touch schedule editing, screenshots, keyboard/AT and lifecycle runs. |
 | 12 | General and appearance | All five themes, system preference, font scale, reduced motion, semantic preview, layout preference persistence, keep-awake/sleep preference, and capability-aware PWA/desktop explanations. | [settings screen](../../web/apps/app-ui/src/components/settings-screen.ts), [appearance preferences](../../web/apps/app-ui/src/services/appearance-preferences.ts), [general preferences](../../web/apps/app-ui/src/services/general-preferences.ts) | Five-theme paired captures, forced colors/zoom, persistence/restart, OS sleep behavior, and supported-device matrix. |
 | 13 | Notifications | Preference toggles, permission/capability state, user-initiated test, exact durable approval/question/completion/failure edges, repeated attention requests, compact failure/question detail, focused-session suppression, activation routing, desktop attention/sound, and unsupported/reliability explanations. | [notification preferences](../../web/apps/app-ui/src/services/notification-preferences.ts), [session notifications](../../web/apps/app-ui/src/services/session-notifications.ts), [desktop host coordinator](../../web/apps/app-ui/src/services/desktop-host-coordinator.ts) | Real OS/browser permission matrices, background/suspend reliability, activation routes, quiet/offline and PWA publication evidence. |
@@ -769,34 +769,41 @@ remains open.
 
 **Current functional preview coverage**
 
-- A full-screen Lit dashboard renders grouped repositories/jobs, status
-  filters, refresh, cancel/retry confirmations, job links, and repository/
-  reviewer settings.
-- A dedicated model transforms dashboard/settings protocol data for the
-  component.
+- A full-screen Lit dashboard renders the account's pull requests as grouped,
+  reorderable, collapsible cards with repository filters, keyboard, drag, and
+  explicit coarse-pointer ordering controls, refresh countdown, status/
+  reviewer/check summaries, and open/copy/chat/fix actions.
+- A dedicated model classifies pull requests into groups and pills from the
+  shared store's durable projection, and cold startup replays server
+  projections through the session-summary boundary so an unchanged refresh
+  cannot leave the dashboard or session indicators empty.
+- Historical: the embedded code-review dashboard and its model that used to
+  share this route were removed together with the Review operations view;
+  automated reviews are administered in the self-hosted review site
+  ([`@trouve-ai/code-review`](../../web/packages/code-review)), and how the
+  desktop surfaces them is being reworked.
 
 **Primary Lit evidence**
 
-- Historical: the embedded `code-review-dashboard.ts` and its model were
-  removed together with the Review operations view; automated reviews are
-  administered in the self-hosted review site
-  ([`@trouve-ai/code-review`](../../web/packages/code-review)).
+- [PR dashboard](../../web/apps/app-ui/src/components/pull-requests-dashboard.ts)
+- [PR dashboard model](../../web/apps/app-ui/src/components/pull-requests-dashboard-model.ts)
+- [PR group order](../../web/apps/app-ui/src/services/pull-request-group-order.ts)
+- [durable protocol ingress](../../web/apps/app-ui/src/services/protocol-ingress.ts)
 
 **Missing parity and qualification work**
 
-- Complete grouped-card virtualization, pagination, route restoration, all
-  review-job artifacts, repository/provider distinctions, and the complete
-  loading/empty/stale/offline/error/cancellation matrix.
-- Treat the separate Preact review UI only as an API/fixture reference; verify
-  parity against the current Slint dashboard’s hierarchy and theme.
-- Match group ordering, card density, metadata prominence, filters, status
-  colors, actions, and responsive cards in every theme.
-- Test keyboard filtering/card navigation, screen readers, large job sets,
+- Complete large-list virtualization, route and focus restoration, and the
+  complete loading/empty/stale/offline/error matrix.
+- Match the Slint pull-requests screen's group ordering, card density,
+  metadata prominence, filters, status colors, actions, and responsive cards
+  in every theme.
+- Test keyboard filtering/card navigation, screen readers, large PR sets,
   refresh races, restart/replay, mobile route restoration, and render/memory
   budgets.
 
 **Qualification state:** Core preview workflow exists; every promotion gate
 remains open.
+
 
 ### 11. Automations — functional-preview
 

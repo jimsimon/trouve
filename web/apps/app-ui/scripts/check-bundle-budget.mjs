@@ -78,10 +78,12 @@ const entryLimit = mode === "desktop" ? 856_000 : 850_000;
 // Moving the protocol client, design tokens, content rendering, and
 // transcript into shared workspace packages, the transcript's dedicated
 // completion announcer, and hiding title-only reasoning nodes bring them to
-// 3,358,466 B and 3,343,621 B. Removing the embedded Review operations view
-// brings them to 3,294,306 B and 3,279,461 B. Preserve less than 2 kB of
-// headroom for each. Entry, worker, and largest-chunk budgets below still
-// prevent one bundle from hiding in the aggregate.
+// 3,358,466 B and 3,343,621 B. Retrying session naming once and surfacing
+// naming failures bring them to 3,359,622 B and 3,344,777 B. Removing the
+// embedded Review operations view brings them to 3,294,306 B and
+// 3,279,461 B. Preserve less than 2 kB of headroom for each. Entry, worker,
+// and largest-chunk budgets below still prevent one bundle from hiding in
+// the aggregate.
 const totalJavaScriptLimit = mode === "desktop" ? 3_295_000 : 3_280_000;
 // beautiful-mermaid 1.1 with elk.bundled emits 1,524,273 B (469 kB gzipped).
 // Preserve less than 6 kB of headroom.
