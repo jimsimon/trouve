@@ -57,7 +57,6 @@ describe("Trouve visual contract", () => {
   const settings = read("../components/settings-screen.ts");
   const automations = read("../components/automations-screen.ts");
   const pullRequests = read("../components/pull-requests-dashboard.ts");
-  const review = read("../components/code-review-dashboard.ts");
   const providerSettings = read("../components/provider-settings.ts");
   const managementSettings = read("../components/management-settings-panels.ts");
   const cliSettings = read("../components/cli-settings.ts");
@@ -307,7 +306,6 @@ describe("Trouve visual contract", () => {
     expect(shell).toContain('data-drop-placeholder="workspace"');
     expect(thread).toContain('data-drop-placeholder="queue"');
     expect(pullRequests).toContain('data-drop-placeholder="pull-request-group"');
-    expect(review).toContain('data-drop-placeholder="code-review-group"');
 
     expect(app).toMatch(
       /\.workspace-drop-placeholder\s*\{[^}]*border:\s*1px dashed var\(--trouve-accent\)/s,
@@ -318,14 +316,10 @@ describe("Trouve visual contract", () => {
     expect(pullRequests).toMatch(
       /\.group-drop-placeholder\s*\{[^}]*border:\s*1px dashed var\(--trouve-accent\)/s,
     );
-    expect(review).toMatch(
-      /\.review-group-drop-placeholder\s*\{[^}]*border:\s*1px dashed var\(--trouve-accent\)/s,
-    );
 
     expect(app).not.toContain(".workspace-group.drop-before::before");
     expect(app).not.toContain('li[data-queue-drop="before"]::before');
     expect(pullRequests).not.toContain(".group-card.drop-target");
-    expect(review).not.toContain(".review-job-group.drop-before");
   });
 
   it("renders settings, automations, and pull requests as dedicated full-window screens", () => {
@@ -835,7 +829,7 @@ describe("Trouve visual contract", () => {
   });
 
   it("keeps load-bearing styles compatible with supported system webviews", () => {
-    const desktopStyles = [tokens, app, newThread, automations, review].join("\n");
+    const desktopStyles = [tokens, app, newThread, automations].join("\n");
     expect(desktopStyles).not.toContain(":has(");
     expect(desktopStyles).not.toContain("color-mix(");
     expect(app).toContain(".attachment-button:focus-within");
