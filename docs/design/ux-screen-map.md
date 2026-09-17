@@ -59,10 +59,14 @@ signal and the sort key of every session list.
   (device code must render well on mobile: show code, open browser).
 - **S7 About** — `/settings/about`; frontend, server, protocol, deployment,
   connectivity, version, and licenses.
-- **S8 Code-review dashboard** — removed from the desktop app. Automated
-  reviews are administered in the self-hosted review site
-  (`@trouve-ai/code-review`); how the desktop surfaces them is being
-  reworked.
+- **S8 Pull-request inbox** — `/reviews`; the account's pull requests grouped
+  by project with filters, status/reviewer/check summaries, and open, copy,
+  chat, and fix actions (`trouve-pull-requests-dashboard`). The Review
+  operations view that used to sit beside it (code-review service health,
+  recent jobs, execution limits, GitHub App setup, repository routing, and
+  reviewer personas) is removed from the desktop app; automated reviews are
+  administered in the self-hosted review site (`@trouve-ai/code-review`), and
+  how the desktop surfaces them is being reworked.
 - **S9 Automations** — `/automations`; list, create, edit, run, and delete
   server-scheduled prompts that execute in fresh sessions, including template,
   workspace, schedule, mode, model, and permission configuration.
@@ -113,7 +117,7 @@ signal and the sort key of every session list.
 - **Diff review** = S4 as per-file list → single-file unified diff (no
   side-by-side on narrow screens). Read and approve only.
 - Composer: text + quick-reply chips ("continue", "explain", "undo").
-- **Code review, automations, and settings** = S8, S9, and S5 as full-screen
+- **Pull requests, automations, and settings** = S8, S9, and S5 as full-screen
   routes using the same responsive panels and controls as desktop.
 
 ## Mobile-first discipline (applies to desktop now)
