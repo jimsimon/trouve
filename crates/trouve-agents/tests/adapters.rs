@@ -883,6 +883,31 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.wfile.flush()
                 return
             names = active_options.get("tools", {}).get("names", [])
+            run_id = "sdk-run-" + str(send_count)
+            # Like the production Bridge, stream the run identity and the
+            # tool_call lifecycle frame before invoking the custom-tool
+            # callback: the adapter dispatches a callback only once the Send
+            # stream has announced its call id.
+            self.protocol_version = "HTTP/1.1"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/connect+json")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            def write_chunk(data):
+                self.wfile.write(format(len(data), "x").encode("ascii") + b"\r\n")
+                self.wfile.write(data + b"\r\n")
+                self.wfile.flush()
+            write_chunk(frame({
+                "sdkMessage": {
+                    "type": "system",
+                    "message": {
+                        "type": "system",
+                        "agent_id": agent_id,
+                        "run_id": run_id
+                    }
+                }
+            }))
             if names == ["mcp"]:
                 import concurrent.futures
                 tool_name = "trouve_test_echo"
@@ -925,6 +950,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         return json.loads(response_body)
                     finally:
                         connection.close()
+                write_chunk(frame({
+                    "sdkMessage": {
+                        "type": "tool_call",
+                        "message": {
+                            "type": "tool_call",
+                            "name": "mcp",
+                            "call_id": callback["toolCallId"],
+                            "status": "started"
+                        }
+                    }
+                }))
                 if finish_with_blocked_callback:
                     threading.Thread(target=call_tool, args=(0,), daemon=True).start()
                     deadline = time.monotonic() + 10
@@ -937,20 +973,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         callback_responses = list(executor.map(call_tool, range(2)))
                     write_json(binary + ".callback.json", callback_responses[0])
                     write_json(binary + ".callback-replay.json", callback_responses[1])
-            run_id = "sdk-run-" + str(send_count)
             finished = "RUN_LIFECYCLE_STATUS_FINISHED"
-            messages = [
-                {
-                    "sdkMessage": {
-                        "type": "system",
-                        "message": {
-                            "type": "system",
-                            "agent_id": agent_id,
-                            "run_id": run_id
-                        }
-                    }
-                }
-            ]
+            messages = []
             if names == ["mcp"]:
                 messages.append({
                     "sdkMessage": {
@@ -996,11 +1020,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 {"done": {"agentId": agent_id, "runId": run_id}}
             ])
             body = b"".join(frame(message) for message in messages) + frame({}, 2)
-            self.send_response(200)
-            self.send_header("Content-Type", "application/connect+json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            write_chunk(body)
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
             return
 
         request = json.loads(raw.decode("utf-8") or "{}")
@@ -1257,8 +1279,8 @@ async fn cursor_adapter_uses_sdk_bridge_and_trouve_owned_tools() {
         std::fs::read_to_string(format!("{stub}.spawns"))
             .unwrap()
             .trim(),
-        "2",
-        "resuming one durable agent must rotate its process-wide callback boundary"
+        "1",
+        "resuming a cleanly retired agent must reuse the warm Bridge; callbacks are bound to a turn by its Send stream, not by rotating the process"
     );
     assert!(
         !Path::new(&format!("{stub}.callback-updates")).exists(),
@@ -1275,7 +1297,7 @@ async fn cursor_adapter_uses_sdk_bridge_and_trouve_owned_tools() {
 }
 
 #[tokio::test]
-async fn cursor_adapter_cancellation_settles_route_and_recycles_before_resume() {
+async fn cursor_adapter_cancellation_settles_route_and_reuses_bridge_on_resume() {
     use axum::routing::post;
 
     let tmp = tempfile::tempdir().unwrap();
@@ -1432,8 +1454,8 @@ async fn cursor_adapter_cancellation_settles_route_and_recycles_before_resume() 
         std::fs::read_to_string(format!("{stub}.spawns"))
             .unwrap()
             .trim(),
-        "2",
-        "resuming after cancellation must rotate the retired agent's callback boundary"
+        "1",
+        "a cancelled turn whose callback settled must not rotate the shared Bridge before resume"
     );
 
     let port: u16 = std::fs::read_to_string(format!("{stub}.port"))
@@ -1445,32 +1467,32 @@ async fn cursor_adapter_cancellation_settles_route_and_recycles_before_resume() 
         tokio::net::TcpStream::connect(("127.0.0.1", port))
             .await
             .is_ok(),
-        "the replacement shared Cursor Bridge is not accepting RPCs"
+        "the shared Cursor Bridge is not accepting RPCs"
     );
     #[cfg(target_os = "linux")]
-    assert!(
-        !std::path::Path::new(&format!("/proc/{pid}")).exists(),
-        "the retired callback boundary survived durable-agent resume"
-    );
-    #[cfg(target_os = "linux")]
-    let recovered_pid: u32 = std::fs::read_to_string(format!("{stub}.pid"))
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
-    #[cfg(target_os = "linux")]
-    assert!(std::path::Path::new(&format!("/proc/{recovered_pid}")).exists());
+    {
+        let recovered_pid: u32 = std::fs::read_to_string(format!("{stub}.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            recovered_pid, pid,
+            "durable-agent resume replaced the warm Bridge process"
+        );
+        assert!(std::path::Path::new(&format!("/proc/{pid}")).exists());
+    }
     backend.shutdown().await.unwrap();
     #[cfg(target_os = "linux")]
     assert!(
-        !std::path::Path::new(&format!("/proc/{recovered_pid}")).exists(),
+        !std::path::Path::new(&format!("/proc/{pid}")).exists(),
         "backend shutdown did not reap the shared Cursor Bridge process"
     );
     mcp_task.abort();
 }
 
 #[tokio::test]
-async fn cursor_adapter_normal_completion_bounds_callback_drain_and_recycles_before_resume() {
+async fn cursor_adapter_normal_completion_bounds_callback_drain_and_reuses_bridge_on_resume() {
     use axum::routing::post;
 
     let tmp = tempfile::tempdir().unwrap();
@@ -1593,8 +1615,8 @@ async fn cursor_adapter_normal_completion_bounds_callback_drain_and_recycles_bef
         std::fs::read_to_string(format!("{stub}.spawns"))
             .unwrap()
             .trim(),
-        "2",
-        "resuming after completion must rotate the retired agent's callback boundary"
+        "1",
+        "a completed turn whose callback drained within bounds must not rotate the shared Bridge before resume"
     );
 
     backend.shutdown().await.unwrap();

@@ -3,7 +3,10 @@
 //! One credential-bound backend owns one warm Bridge process and one callback
 //! router. Cursor's local SQLite store holds every agent for that backend; the
 //! router maps each callback's exact `agent_id` and ingress generation to one
-//! turn-scoped MCP route.
+//! turn-scoped MCP route. The callback wire carries no turn nonce, so a
+//! callback executes only after the owning turn's Send stream has announced
+//! its call id; that binding lets a resumed agent rebind on the same Bridge
+//! instead of forcing a process rotation between its turns.
 //! Cursor's native tools are replaced with the single SDK `mcp` capability;
 //! concrete tool schemas and calls are proxied to trouve's internal,
 //! thread-scoped MCP endpoint and therefore still pass through `ToolExecutor`.
@@ -49,7 +52,11 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const CANCEL_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 const SEND_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
-const CALLBACK_ROUTE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+// Route settlement aborts supervised callback tasks and joins them; the join
+// completes at their next yield. Missing this deadline quarantines the shared
+// Bridge, so leave headroom for a loaded runtime rather than rotating the
+// process over scheduler jitter.
+const CALLBACK_ROUTE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const CALLBACK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_RPC_BODY_BYTES: usize = 8 * 1024 * 1024;
@@ -65,10 +72,19 @@ const MAX_CALLBACKS_PER_TURN: usize = 4 * 1024;
 // retry from an earlier turn cannot bind to a replacement route. Recycle the
 // process at the bound instead of evicting authorization tombstones.
 const MAX_CALLBACK_IDENTITIES_PER_PROCESS: usize = 16 * 1024;
-// The process-wide callback endpoint has no vendor-visible turn nonce. Never
-// route the same durable agent id twice through one endpoint; recycle at this
-// bound even when a long-lived process sees only distinct, tool-free agents.
-const MAX_RETIRED_AGENT_IDS_PER_PROCESS: usize = 16 * 1024;
+// The process-wide callback endpoint has no vendor-visible turn nonce, so a
+// callback is dispatched only after the current turn's Send stream has
+// announced its call id. A callback whose id the stream never announces
+// within this window is a delayed retry from an earlier turn (or a Bridge
+// that invokes tools before reporting them) and is refused without
+// executing. Ordinary callbacks wait only for the cross-channel skew between
+// the Send stream and the callback HTTP request.
+const CALLBACK_CORROBORATION_TIMEOUT: Duration = Duration::from_secs(10);
+// A cancelled fresh CreateAgent may still have committed inside the Bridge.
+// The orphan never receives a Send and is unreachable by any later turn, so
+// tool-free turns tolerate it, but the leaked in-process agent is reclaimed
+// only by process rotation. Rotate once this many accumulate.
+const MAX_ORPHANED_AGENTS_PER_PROCESS: usize = 16;
 const MAX_CALLBACK_REPLAY_RECORDS: usize = 64;
 const MAX_CALLBACK_REPLAY_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CALLBACK_CONCURRENCY: usize = 8;
@@ -101,8 +117,13 @@ const CURSOR_NATIVE_TOOL_DENYLIST: &[&str] = &[
     "generateImage",
     "applyAgentDiff",
 ];
-/// Concurrent turns admitted to one shared Cursor Bridge process.
+/// Concurrent tool-capable turns admitted to one shared Cursor Bridge
+/// process. This bounds callback owners, so it sizes the callback ingress.
 const MAX_CONCURRENT_TURNS: usize = 3;
+/// Concurrent tool-free turns (session titling) admitted alongside the
+/// tool-capable lanes. They own no callback route and are short, so they get
+/// their own small lane instead of displacing interactive turns.
+const MAX_CONCURRENT_TOOL_FREE_TURNS: usize = 2;
 /// Turns allowed to retain per-thread admission state while all execution
 /// lanes are occupied. Excess bursts fail before allocating a gate or
 /// lifecycle guard, keeping distinct-thread queues bounded.
@@ -601,6 +622,7 @@ struct BridgePool {
     closing: CancellationToken,
     pending_turn_admission: Arc<Semaphore>,
     turn_admission: Arc<Semaphore>,
+    tool_free_turn_admission: Arc<Semaphore>,
     available: Arc<Notify>,
     reaper_started: AtomicBool,
 }
@@ -617,6 +639,7 @@ impl Default for BridgePool {
             closing: CancellationToken::new(),
             pending_turn_admission: Arc::new(Semaphore::new(PENDING_TURN_CAP)),
             turn_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_TURNS)),
+            tool_free_turn_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_TOOL_FREE_TURNS)),
             available: Arc::new(Notify::new()),
             reaper_started: AtomicBool::new(false),
         }
@@ -696,9 +719,13 @@ impl BridgePool {
             let existing = {
                 let process = self.process.lock().await;
                 process.as_ref().map(|process| {
-                    // The callback wire has no turn nonce. A durable agent id
-                    // already routed through this listener requires a fresh
-                    // process-wide URL and bearer before ResumeAgent.
+                    // Resuming an agent whose previous turn's route is still
+                    // registered (an unsettled or duplicate route) cannot bind
+                    // a second route; recycle after that route drains. A
+                    // cleanly retired id re-registers on the same listener:
+                    // callbacks dispatch only once the new turn's Send stream
+                    // announces their call id, so an earlier turn's delayed
+                    // retry can never reach the replacement route.
                     let agent_route_available = request
                         .resume_agent_id
                         .is_none_or(|agent_id| process.callback.accepts_agent_id(agent_id));
@@ -818,6 +845,7 @@ impl BridgePool {
                 callback,
                 reusable: Arc::new(AtomicBool::new(true)),
                 active_leases: std::sync::atomic::AtomicUsize::new(1),
+                orphaned_agents: AtomicUsize::new(0),
                 state_dir: request.state_dir.to_path_buf(),
                 last_used: StdMutex::new(Instant::now()),
             });
@@ -875,6 +903,7 @@ impl BridgePool {
         self.closed.store(true, Ordering::Release);
         self.pending_turn_admission.close();
         self.turn_admission.close();
+        self.tool_free_turn_admission.close();
         notify_available(&self.available);
         let _lifecycle = match tokio::time::timeout_at(drain_deadline, self.lifecycle.write()).await
         {
@@ -988,6 +1017,27 @@ impl BridgePool {
         cancel: &CancellationToken,
         events: &BackendEventSender,
     ) -> Result<OwnedSemaphorePermit, BackendError> {
+        self.acquire_turn_lane(&self.turn_admission, cancel, events)
+            .await
+    }
+
+    /// Tool-free turns own no callback route, so they do not count against
+    /// the callback-owner lanes that size the shared ingress.
+    async fn acquire_tool_free_turn_admission(
+        &self,
+        cancel: &CancellationToken,
+        events: &BackendEventSender,
+    ) -> Result<OwnedSemaphorePermit, BackendError> {
+        self.acquire_turn_lane(&self.tool_free_turn_admission, cancel, events)
+            .await
+    }
+
+    async fn acquire_turn_lane(
+        &self,
+        lane: &Arc<Semaphore>,
+        cancel: &CancellationToken,
+        events: &BackendEventSender,
+    ) -> Result<OwnedSemaphorePermit, BackendError> {
         if !self.is_open() {
             return Err(Self::closed_error());
         }
@@ -996,7 +1046,7 @@ impl BridgePool {
             _ = self.closing.cancelled() => Err(Self::closed_error()),
             _ = cancel.cancelled() => Err(BackendError::Cancelled),
             _ = events.closed() => Err(BackendError::Cancelled),
-            permit = self.turn_admission.clone().acquire_owned() => {
+            permit = lane.clone().acquire_owned() => {
                 let permit = permit.map_err(|_| Self::closed_error())?;
                 if !self.is_open() {
                     drop(permit);
@@ -1114,6 +1164,7 @@ struct PooledBridge {
     callback: Arc<CallbackRouter>,
     reusable: Arc<AtomicBool>,
     active_leases: std::sync::atomic::AtomicUsize,
+    orphaned_agents: AtomicUsize,
     state_dir: PathBuf,
     last_used: StdMutex<Instant>,
 }
@@ -1121,6 +1172,20 @@ struct PooledBridge {
 impl PooledBridge {
     fn acquire_lease(&self) {
         self.active_leases.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Record a fresh agent that may have committed inside the Bridge after
+    /// its CreateAgent was abandoned. Quarantine once the leak bound is hit.
+    fn record_orphaned_agent(&self) {
+        let orphaned = self.orphaned_agents.fetch_add(1, Ordering::AcqRel) + 1;
+        if orphaned >= MAX_ORPHANED_AGENTS_PER_PROCESS {
+            tracing::debug!(
+                backend_state_dir = %self.state_dir.display(),
+                orphaned,
+                "cursor: orphaned-agent bound reached; recycling shared Bridge after active turns drain"
+            );
+            self.quarantine();
+        }
     }
 
     fn release_lease(&self) {
@@ -1207,7 +1272,13 @@ async fn run_sdk_turn(
     // Bound tool discovery along with every other turn-scoped resource. Tool
     // lists may be large, so queued turns must not fetch and retain one before
     // they own both their thread lane and a pool-wide admission slot.
-    let _turn_admission = match pool.acquire_turn_admission(&turn.cancel, events).await {
+    let turn_admission = if turn.tool_free {
+        pool.acquire_tool_free_turn_admission(&turn.cancel, events)
+            .await
+    } else {
+        pool.acquire_turn_admission(&turn.cancel, events).await
+    };
+    let _turn_admission = match turn_admission {
         Ok(permit) => permit,
         Err(BackendError::Cancelled) if events.is_closed() => {
             return Ok(TurnTerminal::ConsumerClosed);
@@ -1276,9 +1347,21 @@ async fn run_sdk_turn(
         Err(error) => {
             // A cancelled or failed CreateAgent/ResumeAgent request can still
             // have committed inside the Bridge after the HTTP future was
-            // dropped. Quarantine the process so its shared store is reopened
-            // cleanly once already-active turns have drained.
-            pool.quarantine(process.pooled()).await;
+            // dropped. A committed ResumeAgent leaves that durable agent open
+            // in the shared store, so the process is quarantined and reopened
+            // cleanly once already-active turns have drained. A cancelled
+            // fresh CreateAgent on a tool-free turn only strands an agent no
+            // later turn will ever address and that never receives a Send:
+            // count it against the per-process leak bound instead of
+            // rotating the Bridge under every other active turn.
+            let tolerated_orphan = turn.tool_free
+                && session.resume.is_none()
+                && matches!(error, BackendError::Cancelled);
+            if tolerated_orphan {
+                process.record_orphaned_agent();
+            } else {
+                pool.quarantine(process.pooled()).await;
+            }
             if pool.closing.is_cancelled() {
                 return Err(BridgePool::closed_error());
             }
@@ -1313,9 +1396,9 @@ async fn run_sdk_turn(
     {
         Ok(route) => route,
         Err(error) => {
-            // A duplicate or retired agent id cannot safely bind here. Closing
-            // an active duplicate would interrupt that turn, and a retired id
-            // needs a new callback boundary. Recycle after current routes drain.
+            // A duplicate agent id cannot safely bind here: closing the
+            // active duplicate would interrupt that turn. Recycle after
+            // current routes drain.
             pool.quarantine(process.pooled()).await;
             return Err(error);
         }
@@ -1841,7 +1924,6 @@ async fn mcp_request(
 struct CallbackState {
     bearer: Arc<str>,
     routes: Arc<StdRwLock<HashMap<String, Arc<CallbackRoute>>>>,
-    retired_agent_ids: Arc<StdRwLock<HashSet<CallbackKey>>>,
     route_generation: Arc<AtomicU64>,
     identities: Arc<StdMutex<CallbackIdentities>>,
     request_slots: Arc<Semaphore>,
@@ -1857,6 +1939,9 @@ struct CallbackRoute {
     request_slots: Arc<Semaphore>,
     identities: Arc<StdMutex<CallbackIdentities>>,
     streamed_call_ids: StdMutex<HashSet<CallbackKey>>,
+    /// Bumped after every `streamed_call_ids` insertion so callbacks that
+    /// arrived ahead of their Send-stream announcement can wake and dispatch.
+    streamed_call_version: watch::Sender<u64>,
     owner_reusable: Option<Weak<AtomicBool>>,
     accepting: AtomicBool,
 }
@@ -1939,6 +2024,9 @@ impl CallbackRoute {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .insert(call_id);
+                self.streamed_call_version.send_modify(|version| {
+                    *version = version.wrapping_add(1);
+                });
                 Ok(())
             }
             CallbackIdentityClaim::Stale => {
@@ -1950,10 +2038,56 @@ impl CallbackRoute {
         }
     }
 
-    async fn identities_correlated(&self) -> bool {
+    fn stream_announced(&self, call_id: &CallbackKey) -> bool {
+        self.streamed_call_ids
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(call_id)
+    }
+
+    /// Wait until this turn's Send stream has announced `call_id`. The
+    /// callback wire identifies only the durable agent, so a callback is
+    /// bound to the current turn by the stream rather than by rotating the
+    /// process-wide endpoint between turns. Returns `false` when the stream
+    /// never announces the id before the deadline or the route stops.
+    async fn await_stream_corroboration(&self, call_id: &CallbackKey) -> bool {
         // Direct router unit tests that do not own a pooled process exercise
         // HTTP routing in isolation. Production routes always carry the owner
         // flag and require the Send stream to corroborate every callback id.
+        if self.owner_reusable.is_none() {
+            return true;
+        }
+        // Subscribe before the first check so an announcement that lands
+        // between the check and the wait still wakes this waiter.
+        let mut version = self.streamed_call_version.subscribe();
+        if self.stream_announced(call_id) {
+            return true;
+        }
+        let deadline = tokio::time::Instant::now() + CALLBACK_CORROBORATION_TIMEOUT;
+        let waited = Instant::now();
+        loop {
+            tokio::select! {
+                biased;
+                _ = self.supervisor.cancel.cancelled() => return false,
+                changed = tokio::time::timeout_at(deadline, version.changed()) => {
+                    match changed {
+                        Ok(Ok(())) => {}
+                        Ok(Err(_)) | Err(_) => return false,
+                    }
+                }
+            }
+            if self.stream_announced(call_id) {
+                tracing::debug!(
+                    waited_ms = waited.elapsed().as_millis() as u64,
+                    "cursor: callback waited for its Send-stream announcement"
+                );
+                return true;
+            }
+        }
+    }
+
+    async fn identities_correlated(&self) -> bool {
+        // See `await_stream_corroboration` for the owner-less test exemption.
         if self.owner_reusable.is_none() {
             return true;
         }
@@ -2144,7 +2278,6 @@ struct CallbackRouteLease {
     agent_id: String,
     route: Arc<CallbackRoute>,
     routes: Arc<StdRwLock<HashMap<String, Arc<CallbackRoute>>>>,
-    retired_agent_ids: Arc<StdRwLock<HashSet<CallbackKey>>>,
     supervisor: Arc<CallbackSupervisor>,
     active: bool,
 }
@@ -2159,7 +2292,6 @@ impl CallbackRouter {
         let state = CallbackState {
             bearer: Arc::from(bearer.as_str()),
             routes: Arc::new(StdRwLock::new(HashMap::new())),
-            retired_agent_ids: Arc::new(StdRwLock::new(HashSet::new())),
             route_generation: Arc::new(AtomicU64::new(0)),
             identities: Arc::new(StdMutex::new(CallbackIdentities::default())),
             request_slots: Arc::new(Semaphore::new(MAX_CALLBACK_HTTP_CONCURRENCY)),
@@ -2201,19 +2333,17 @@ impl CallbackRouter {
             .is_some_and(|task| !task.is_finished())
     }
 
+    /// Whether a route for `agent_id` can bind now. Only a still-registered
+    /// route blocks: a cleanly retired id re-registers on this listener, and
+    /// stream corroboration keeps an earlier turn's delayed callback from
+    /// reaching the replacement route.
     fn accepts_agent_id(&self, agent_id: &str) -> bool {
-        let routes = self
+        !self
             .state
             .routes
             .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        !routes.contains_key(agent_id)
-            && !self
-                .state
-                .retired_agent_ids
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .contains(&callback_key(agent_id))
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(agent_id)
     }
 
     async fn register(
@@ -2239,17 +2369,6 @@ impl CallbackRouter {
                 "Cursor callback route for agent {agent_id} is already active"
             )));
         }
-        if self
-            .state
-            .retired_agent_ids
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains(&callback_key(&agent_id))
-        {
-            return Err(BackendError::Protocol(format!(
-                "Cursor callback route for agent {agent_id} was already retired by this Bridge"
-            )));
-        }
         let generation = self
             .state
             .route_generation
@@ -2269,6 +2388,7 @@ impl CallbackRouter {
             request_slots: Arc::new(Semaphore::new(MAX_CALLBACK_CONCURRENCY)),
             identities: self.state.identities.clone(),
             streamed_call_ids: StdMutex::new(HashSet::new()),
+            streamed_call_version: watch::Sender::new(0),
             owner_reusable,
             accepting: AtomicBool::new(true),
         });
@@ -2284,7 +2404,6 @@ impl CallbackRouter {
             agent_id,
             route,
             routes: self.state.routes.clone(),
-            retired_agent_ids: self.state.retired_agent_ids.clone(),
             supervisor,
             active: true,
         })
@@ -2428,18 +2547,11 @@ impl CallbackRouteLease {
             .get(&self.agent_id)
             .is_some_and(|route| Arc::ptr_eq(route, &self.route))
         {
-            let retire_at_capacity = {
-                let mut retired = self
-                    .retired_agent_ids
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                retired.insert(callback_key(&self.agent_id));
-                retired.len() >= MAX_RETIRED_AGENT_IDS_PER_PROCESS
-            };
+            // The agent id becomes bindable again immediately. Any callback
+            // this turn's identities already own stays fenced by
+            // `CallbackIdentities`, and a callback the stream never announced
+            // is refused by the replacement route's corroboration wait.
             routes.remove(&self.agent_id);
-            if retire_at_capacity {
-                self.route.quarantine_owner();
-            }
         }
         self.active = false;
     }
@@ -2574,6 +2686,21 @@ async fn custom_tool_callback(
                 "Cursor callback identity history reached its process bound",
             );
         }
+    }
+    // Bind the callback to the current turn before executing anything. The
+    // route permit held above bounds how many callbacks can wait here.
+    if !route.await_stream_corroboration(&call_key).await {
+        if route.accepting.load(Ordering::Acquire) {
+            tracing::warn!(
+                "cursor: refusing custom-tool callback for agent {} whose call id the Send stream never announced",
+                request.agent_id
+            );
+        }
+        return callback_error(
+            StatusCode::FORBIDDEN,
+            "permission_denied",
+            "tool-call id was not announced by the active Cursor turn",
+        );
     }
     let fingerprint = callback_fingerprint(&request);
     let (mut outcome, execute) = {
@@ -4657,6 +4784,51 @@ server.serve_forever()
     }
 
     #[tokio::test]
+    async fn tool_free_turns_do_not_occupy_callback_owner_lanes() {
+        let pool = BridgePool::default();
+        let (sender_tx, sender_rx) = tokio::sync::oneshot::channel();
+        let _stream = async_stream(move |events| async move {
+            let _ = sender_tx.send(events);
+            std::future::pending::<()>().await;
+        });
+        let events = sender_rx.await.unwrap();
+        let cancel = CancellationToken::new();
+
+        let _tool_turns = (0..MAX_CONCURRENT_TURNS)
+            .map(|_| pool.turn_admission.clone().try_acquire_owned().unwrap())
+            .collect::<Vec<_>>();
+        let _title_turn = tokio::time::timeout(
+            Duration::from_secs(1),
+            pool.acquire_tool_free_turn_admission(&cancel, &events),
+        )
+        .await
+        .expect("a tool-free turn queued behind saturated tool-capable lanes")
+        .unwrap();
+
+        let _title_turns = (1..MAX_CONCURRENT_TOOL_FREE_TURNS)
+            .map(|_| {
+                pool.tool_free_turn_admission
+                    .clone()
+                    .try_acquire_owned()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let mut saturated = std::pin::pin!(pool.acquire_tool_free_turn_admission(&cancel, &events));
+        assert!(futures::poll!(saturated.as_mut()).is_pending());
+        assert_eq!(
+            pool.turn_admission.available_permits(),
+            0,
+            "tool-free turns are bounded by their own lane, not the callback-owner lanes"
+        );
+
+        pool.shutdown().await.unwrap();
+        assert!(
+            saturated.await.is_err(),
+            "shutdown did not wake a queued tool-free turn"
+        );
+    }
+
+    #[tokio::test]
     async fn queued_turn_does_not_discover_tools_before_admission() {
         let pool = BridgePool::default();
         let _permits = (0..MAX_CONCURRENT_TURNS)
@@ -5474,7 +5646,7 @@ server.serve_forever()
     }
 
     #[tokio::test]
-    async fn retired_agent_id_cannot_bind_to_a_replacement_route() {
+    async fn retired_agent_id_rebinds_and_only_stream_announced_callbacks_execute() {
         let mcp_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
@@ -5515,10 +5687,37 @@ server.serve_forever()
             )
             .await
             .unwrap();
+        previous
+            .route
+            .observe_stream_call_id("first-turn-call")
+            .unwrap();
+        let http = reqwest::Client::new();
+        let send_callback = |call_id: &str| {
+            http.post(format!("{}{}", callback.url, CALLBACK_PATH))
+                .bearer_auth(&callback.bearer)
+                .json(&json!({
+                    "toolName": "shared_tool",
+                    "toolCallId": call_id,
+                    "agentId": "agent-reused",
+                    "args": {},
+                }))
+                .send()
+        };
+        assert_eq!(
+            send_callback("first-turn-call").await.unwrap().status(),
+            StatusCode::OK
+        );
+        assert_eq!(mcp_calls.load(Ordering::Acquire), 1);
         assert!(previous.stop().await);
-        assert!(!callback.accepts_agent_id("agent-reused"));
+        assert!(
+            callback.accepts_agent_id("agent-reused"),
+            "a cleanly retired agent id forced a Bridge rotation"
+        );
+        assert!(reusable.load(Ordering::Acquire));
 
-        let error = match callback
+        // The resumed turn binds on the same listener. Only call ids its own
+        // Send stream announces may execute.
+        let mut resumed = callback
             .register(
                 "agent-reused".into(),
                 Some(format!("http://{address}/mcp")),
@@ -5527,29 +5726,62 @@ server.serve_forever()
                 Some(Arc::downgrade(&reusable)),
             )
             .await
-        {
-            Ok(_) => panic!("a retired agent id was routed twice through one Bridge"),
-            Err(error) => error,
-        };
-        assert!(error.to_string().contains("already retired"), "{error}");
+            .expect("a retired agent id could not rebind on the shared listener");
 
-        let delayed = reqwest::Client::new()
-            .post(format!("{}{}", callback.url, CALLBACK_PATH))
-            .bearer_auth(&callback.bearer)
-            .json(&json!({
-                "toolName": "shared_tool",
-                "toolCallId": "previously-unseen-late-call",
-                "agentId": "agent-reused",
-                "args": {},
-            }))
-            .send()
-            .await
+        // A retry of the first turn's call id is fenced by identity ownership.
+        let replayed = send_callback("first-turn-call").await.unwrap();
+        assert_eq!(replayed.status(), StatusCode::FORBIDDEN);
+        assert!(
+            !reusable.load(Ordering::Acquire),
+            "a replayed earlier-turn call id did not quarantine the Bridge"
+        );
+        reusable.store(true, Ordering::Release);
+
+        // A late callback the first turn never saw is refused because this
+        // turn's stream never announces it; the route stopping ends the wait.
+        let unannounced = tokio::spawn(send_callback("previously-unseen-late-call"));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !unannounced.is_finished(),
+            "an unannounced callback did not wait"
+        );
+
+        // A callback announced by this turn's stream, even after the callback
+        // arrived, dispatches.
+        let early = tokio::spawn(send_callback("second-turn-call"));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !early.is_finished(),
+            "a callback executed before its stream announcement"
+        );
+        assert_eq!(mcp_calls.load(Ordering::Acquire), 1);
+        resumed
+            .route
+            .observe_stream_call_id("second-turn-call")
             .unwrap();
-        assert_eq!(delayed.status(), StatusCode::FORBIDDEN);
+        let early = tokio::time::timeout(Duration::from_secs(2), early)
+            .await
+            .expect("an announced callback did not dispatch")
+            .unwrap()
+            .unwrap();
+        assert_eq!(early.status(), StatusCode::OK);
+        assert_eq!(mcp_calls.load(Ordering::Acquire), 2);
+
+        assert!(resumed.stop().await);
+        let unannounced = tokio::time::timeout(Duration::from_secs(2), unannounced)
+            .await
+            .expect("route stop did not release the unannounced callback")
+            .unwrap()
+            .unwrap();
+        assert_eq!(unannounced.status(), StatusCode::FORBIDDEN);
         assert_eq!(
             mcp_calls.load(Ordering::Acquire),
-            0,
-            "a callback for a retired agent reached a replacement MCP route"
+            2,
+            "an unannounced callback reached the replacement MCP route"
+        );
+        assert!(
+            reusable.load(Ordering::Acquire),
+            "a refused unannounced callback quarantined the Bridge"
         );
 
         callback.stop().await.unwrap();
@@ -5592,6 +5824,7 @@ server.serve_forever()
             )
             .await
             .unwrap();
+        route.route.observe_stream_call_id("dropped-call").unwrap();
         let callback_request = tokio::spawn({
             let url = format!("{}{}", callback.url, CALLBACK_PATH);
             let bearer = callback.bearer.clone();
