@@ -1420,7 +1420,15 @@ impl Engine {
             .iter()
             .map(|file| (file.attachment.clone(), file.relative_path.clone()))
             .collect::<Vec<_>>();
-        let backend_content = annotate_attachments(content, &backend_files);
+        // Engine-owned skills: a leading `/skill` is expanded for vendor
+        // routes and appended to the native system prompt below, while the
+        // transcript keeps the user's original text.
+        let skills =
+            crate::skills::discover(self.config_dir.as_deref(), Some(Path::new(&workspace.path)));
+        let backend_content = annotate_attachments(
+            crate::skills::expand_invocation(&content, &skills),
+            &backend_files,
+        );
         let transcript_files = images
             .iter()
             .chain(files.iter())
@@ -1478,6 +1486,10 @@ impl Engine {
             self.config_dir.as_deref(),
             Path::new(&workspace.path),
         );
+        if let Some(invocation) = crate::skills::invocation(&prompt.content, &skills) {
+            system.push_str("\n\n");
+            system.push_str(&crate::skills::invocation_block(&invocation));
+        }
         if background {
             personas::append_automated_review_guidance(&mut system);
         }
@@ -2282,6 +2294,7 @@ impl Engine {
             .is_some_and(|bridge| bridge.bridge_tools);
         let automated_review = self.store.is_code_review_thread(&thread.id)?;
         append_vendor_search_guidance(&mut instructions, mcp_bridge.is_some(), automated_review);
+        append_skills_catalog(&mut instructions, &self.session_skills(session)?);
         enforce_automated_review_backend_boundary(
             automated_review,
             tools_enabled,
@@ -2704,9 +2717,6 @@ impl Engine {
                             .push_str(&chunk);
                     }
                     persisted.push(Event::ToolOutput { call_id, chunk });
-                }
-                BackendEvent::CommandsUpdated { commands } => {
-                    persisted.push(Event::CommandsUpdated { commands });
                 }
                 BackendEvent::TodosUpdated { todos } => {
                     flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;

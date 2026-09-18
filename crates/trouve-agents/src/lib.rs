@@ -211,12 +211,6 @@ pub enum BackendEvent {
         questions: Vec<trouve_protocol::Question>,
         responder: tokio::sync::oneshot::Sender<Option<Vec<trouve_protocol::QuestionAnswer>>>,
     },
-    /// The vendor harness announced the slash commands / skills it accepts
-    /// in prompts (cursor sends these per session; claude lists them at
-    /// init). Replaces any earlier list.
-    CommandsUpdated {
-        commands: Vec<trouve_protocol::CommandInfo>,
-    },
     /// The vendor harness replaced its current plan. Unlike a tool call,
     /// this is durable thread state and should not render as transcript
     /// activity; the core publishes the canonical todo snapshot separately.
@@ -380,9 +374,6 @@ impl std::fmt::Debug for BackendEvent {
             }
             Self::ApprovalNeeded { call_id, tool, .. } => {
                 write!(f, "ApprovalNeeded({call_id}, {tool})")
-            }
-            Self::CommandsUpdated { commands } => {
-                write!(f, "CommandsUpdated({} commands)", commands.len())
             }
             Self::TodosUpdated { todos } => {
                 write!(f, "TodosUpdated({} todos)", todos.len())
@@ -1377,9 +1368,6 @@ fn backend_event_size(event: &Result<BackendEvent, BackendError>) -> usize {
             request_id.len()
                 + title.as_ref().map_or(0, String::len)
                 + serde_json::to_string(questions).map_or(0, |json| json.len())
-        }
-        Ok(BackendEvent::CommandsUpdated { commands }) => {
-            serde_json::to_string(commands).map_or(0, |json| json.len())
         }
         Ok(BackendEvent::TodosUpdated { todos }) => {
             serde_json::to_string(todos).map_or(0, |json| json.len())

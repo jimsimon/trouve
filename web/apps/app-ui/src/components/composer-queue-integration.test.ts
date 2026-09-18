@@ -7,7 +7,7 @@ describe("thread composer and queue integration", () => {
 
   it("shows explicit completion loading, empty, unavailable, and automatic retry states", () => {
     expect(screen).toContain("Loading workspace files…");
-    expect(screen).toContain("Slash commands are unavailable for this thread.");
+    expect(screen).toContain("No skills found. Add one under .agents/skills/<name>/SKILL.md.");
     expect(screen).toContain("No matching workspace files.");
     expect(screen).toContain("File suggestions are unavailable.");
     expect(screen).toContain("#scheduleMentionPathsRetry(sessionId)");

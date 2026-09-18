@@ -448,8 +448,10 @@ pub enum Event {
         answers: Option<Vec<QuestionAnswer>>,
     },
 
-    /// The slash commands / skills the vendor harness currently accepts in
-    /// prompts. Replaces any previously announced list for the thread.
+    /// The slash commands (engine-discovered skills from `<config>/skills`
+    /// and `<workspace>/.agents/skills`) a prompt on this thread may start
+    /// with. Published on thread creation and refreshed at every turn start
+    /// for every provider and vendor route; replaces any previous list.
     #[serde(rename = "thread.commands_updated")]
     CommandsUpdated { commands: Vec<CommandInfo> },
 

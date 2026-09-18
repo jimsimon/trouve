@@ -1757,9 +1757,7 @@ cat > /dev/null
             BackendEvent::CollaboratorStarted { .. } | BackendEvent::CollaboratorEvent { .. } => {
                 panic!("single-threaded adapter fixture emitted a collaborator event")
             }
-            BackendEvent::QuestionsNeeded { .. }
-            | BackendEvent::CommandsUpdated { .. }
-            | BackendEvent::CompactionFailed => {}
+            BackendEvent::QuestionsNeeded { .. } | BackendEvent::CompactionFailed => {}
         }
     }
 
@@ -2827,7 +2825,9 @@ EOF
     assert!(args.contains("--permission-prompt-tool"), "{args}");
     assert!(args.contains("mcp__trouve__approval_prompt"), "{args}");
     assert!(!args.contains("--dangerously-skip-permissions"), "{args}");
-    assert!(!args.contains("--disallowedTools"), "{args}");
+    // Only Claude's native skill loader is denied: skills are engine-owned.
+    assert!(args.contains("--disallowedTools\nSkill\n"), "{args}");
+    assert!(!args.contains("Write,Edit"), "{args}");
     assert!(
         args.contains("mcp__trouve__search,mcp__trouve__find_related"),
         "{args}"

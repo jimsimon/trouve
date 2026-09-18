@@ -9,6 +9,12 @@
 //! Discovery locations (later wins on name collision, workspace > global):
 //!   1. `<config>/skills/*/SKILL.md`
 //!   2. `<workspace>/.agents/skills/*/SKILL.md`
+//!
+//! The engine owns this roster for every route. It is published to clients
+//! as slash-command completions, advertised to native and vendor models
+//! alike, and a prompt that starts with `/<skill>` is expanded here before
+//! it reaches any model. Vendor-native skill mechanisms are switched off in
+//! the adapters so that this directory layout is the only one that matters.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -17,6 +23,11 @@ use std::path::{Path, PathBuf};
 /// may inspect without granting mutation access outside the session worktree.
 pub const READ_ONLY_ROOTS_ENV: &str = "TROUVE_READ_ONLY_ROOTS";
 
+/// Upper bound on how much of a SKILL.md is inlined for a `/skill`
+/// invocation. Larger files are truncated with a pointer back to the path so
+/// the model can read the remainder with its file tools.
+const MAX_INLINED_SKILL_BYTES: usize = 32 * 1024;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Skill {
     /// Directory name unless front matter overrides it.
@@ -24,6 +35,116 @@ pub struct Skill {
     pub description: String,
     /// Absolute path to the SKILL.md file.
     pub path: PathBuf,
+}
+
+impl Skill {
+    /// Composer completion entry for this skill.
+    pub fn command_info(&self) -> trouve_protocol::CommandInfo {
+        trouve_protocol::CommandInfo {
+            name: self.name.clone(),
+            description: self.description.clone(),
+        }
+    }
+}
+
+/// A prompt whose first token is `/<skill>` for a discovered skill.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Invocation<'s, 'p> {
+    pub skill: &'s Skill,
+    /// Everything after the command token, trimmed.
+    pub arguments: &'p str,
+}
+
+/// Split a leading `/name` off `prompt`. Only the first token counts, so
+/// paths and URLs later in the message are never mistaken for commands.
+fn parse_slash(prompt: &str) -> Option<(&str, &str)> {
+    let trimmed = prompt.trim_start();
+    let body = trimmed.strip_prefix('/')?;
+    let end = body.find(char::is_whitespace).unwrap_or(body.len());
+    let name = &body[..end];
+    let valid = !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ':' | '.'));
+    valid.then(|| (name, body[end..].trim()))
+}
+
+/// Resolve a `/skill` invocation at the start of `prompt` against the
+/// discovered roster. Unknown names are left alone; they are ordinary text.
+pub fn invocation<'s, 'p>(prompt: &'p str, skills: &'s [Skill]) -> Option<Invocation<'s, 'p>> {
+    let (name, arguments) = parse_slash(prompt)?;
+    let skill = skills.iter().find(|skill| skill.name == name)?;
+    Some(Invocation { skill, arguments })
+}
+
+/// SKILL.md body with the front matter fence removed.
+fn strip_front_matter(text: &str) -> &str {
+    let mut offset = 0;
+    for (index, segment) in text.split_inclusive('\n').enumerate() {
+        offset += segment.len();
+        if index == 0 {
+            if segment.trim() != "---" {
+                return text;
+            }
+            continue;
+        }
+        if segment.trim() == "---" {
+            return &text[offset..];
+        }
+    }
+    text
+}
+
+/// Render the instruction block for an invoked skill. The same block goes to
+/// every route: vendor backends receive it inline in the prompt, native
+/// providers in the system prompt, so the transcript keeps the user's
+/// original `/skill` text.
+pub fn invocation_block(invocation: &Invocation<'_, '_>) -> String {
+    let skill = invocation.skill;
+    let raw = std::fs::read_to_string(&skill.path).unwrap_or_default();
+    let mut body = strip_front_matter(&raw).trim().to_string();
+    if body.len() > MAX_INLINED_SKILL_BYTES {
+        let mut cut = MAX_INLINED_SKILL_BYTES;
+        while !body.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        body.truncate(cut);
+        body.push_str(&format!(
+            "\n\n[truncated; read {} for the rest]",
+            skill.path.display()
+        ));
+    }
+    let mut block = format!(
+        "The user invoked the `{name}` skill with `/{name}`. Follow the skill \
+         instructions below for this request.\n\n\
+         <invoked_skill name=\"{name}\" path=\"{path}\">\n{body}\n</invoked_skill>",
+        name = skill.name,
+        path = skill.path.display(),
+    );
+    if !invocation.arguments.is_empty() {
+        block.push_str(&format!(
+            "\n\nArguments supplied with the invocation: {}",
+            invocation.arguments
+        ));
+    }
+    block
+}
+
+/// Prompt text for a vendor backend: a leading `/skill` is replaced by the
+/// skill block followed by the remaining text, so the vendor never sees a
+/// bare slash command it might route to its own command handling.
+pub fn expand_invocation(prompt: &str, skills: &[Skill]) -> String {
+    match invocation(prompt, skills) {
+        Some(invocation) => {
+            let mut expanded = invocation_block(&invocation);
+            if !invocation.arguments.is_empty() {
+                expanded.push_str("\n\n");
+                expanded.push_str(invocation.arguments);
+            }
+            expanded
+        }
+        None => prompt.to_string(),
+    }
 }
 
 /// Parse `key: value` front matter between `---` fences at the top of a
@@ -163,8 +284,9 @@ pub fn prompt_section(skills: &[Skill]) -> Option<String> {
         return None;
     }
     let mut section = String::from(
-        "## Available skills\n\nWhen a task matches a skill below, read its SKILL.md with the \
-         read_file tool and follow it before proceeding.\n",
+        "## Available skills\n\nWhen a task matches a skill below, read its SKILL.md with your \
+         file-reading tool and follow it before proceeding. The user can also invoke a skill \
+         explicitly by starting a message with `/<skill name>`.\n",
     );
     for skill in skills {
         section.push_str(&format!(
@@ -185,6 +307,53 @@ mod tests {
         let d = root.join(dir);
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(d.join("SKILL.md"), contents).unwrap();
+    }
+
+    #[test]
+    fn slash_invocation_matches_only_the_leading_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        write_skill(
+            &repo,
+            ".agents/skills/ship",
+            "---\nname: ship\ndescription: Ship it\n---\n# Ship\n\nRun the release checklist.\n",
+        );
+        let skills = discover(None, Some(&repo));
+
+        let hit = invocation("  /ship to staging", &skills).expect("skill invoked");
+        assert_eq!(hit.skill.name, "ship");
+        assert_eq!(hit.arguments, "to staging");
+        assert!(invocation("/unknown thing", &skills).is_none());
+        assert!(invocation("see /ship later", &skills).is_none());
+        assert!(invocation("/ship/SKILL.md", &skills).is_none());
+        assert_eq!(invocation("/ship", &skills).unwrap().arguments, "");
+
+        let block = invocation_block(&hit);
+        assert!(block.contains("<invoked_skill name=\"ship\""));
+        assert!(block.contains("Run the release checklist."));
+        assert!(
+            !block.contains("description: Ship it"),
+            "front matter is stripped"
+        );
+        assert!(block.contains("Arguments supplied with the invocation: to staging"));
+
+        let expanded = expand_invocation("/ship to staging", &skills);
+        assert!(expanded.starts_with("The user invoked the `ship` skill"));
+        assert!(expanded.ends_with("\n\nto staging"));
+        assert_eq!(expand_invocation("plain text", &skills), "plain text");
+        assert_eq!(expand_invocation("/unknown", &skills), "/unknown");
+    }
+
+    #[test]
+    fn oversized_skill_bodies_are_truncated_with_a_pointer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let body = "x".repeat(MAX_INLINED_SKILL_BYTES + 100);
+        write_skill(&repo, ".agents/skills/big", &format!("# Big\n\n{body}"));
+        let skills = discover(None, Some(&repo));
+        let block = invocation_block(&invocation("/big", &skills).unwrap());
+        assert!(block.contains("[truncated; read "));
+        assert!(block.len() < MAX_INLINED_SKILL_BYTES + 1024);
     }
 
     #[test]

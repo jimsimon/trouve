@@ -2468,7 +2468,7 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       token.kind === "file" && this.#pathsUnavailableSessionId === this.sessionId;
     const emptyMessage = token.kind === "command"
       ? commands.length === 0
-        ? "Slash commands are unavailable for this thread."
+        ? "No skills found. Add one under .agents/skills/<name>/SKILL.md."
         : "No matching slash commands."
       : this.#pathsSessionId === this.sessionId && this.#sessionPaths.length === 0
         ? "No workspace files are available."
