@@ -13129,22 +13129,26 @@ impl Engine {
             .store
             .session(&session.id)?
             .ok_or_else(|| EngineError::NotFound(format!("session {}", session.id)))?;
-        self.store.insert_thread_with_event(
+        // The slash-command roster is published in the same transaction as
+        // the thread so the composer can complete `/skill` before the first
+        // turn and no thread ever exists durably without its roster.
+        let commands_updated = self.commands_updated_event(&session)?;
+        self.store.insert_thread_with_events(
             &thread,
             &model_options,
             spawn,
-            Event::ThreadCreated {
-                thread_id: thread.id.clone(),
-                session_id: live_session.id,
-            },
+            vec![
+                (
+                    Scope::Server,
+                    Event::ThreadCreated {
+                        thread_id: thread.id.clone(),
+                        session_id: live_session.id,
+                    },
+                ),
+                (Scope::Thread(thread.id.clone()), commands_updated),
+            ],
         )?;
         drop(deleting);
-        // Publish the slash-command roster immediately so the composer can
-        // complete `/skill` before the first turn runs.
-        self.store.append_event(
-            Scope::Thread(thread.id.clone()),
-            self.commands_updated_event(&session)?,
-        )?;
         Ok(thread)
     }
 

@@ -83,14 +83,22 @@ The engine owns this roster for every route. On each turn it is:
 - advertised as a name + description + path list — in the native system
   prompt and in the instructions passed to vendor backends — so the model
   reads a relevant SKILL.md with its file tool. Skill bodies are not inlined
-  here, so many skills cost almost nothing;
+  here, descriptions are capped at 200 characters, and the catalog stops at
+  12 KiB with a count of omitted skills, so a large roster cannot crowd out
+  the model's context;
 - published to clients as `thread.commands_updated` (on thread creation and
   at every turn start), which drives `/` completion in the composer;
 - honoured as an explicit invocation: a prompt starting with `/<skill>`
   inlines that skill's body (front matter stripped, capped at 32 KiB) for
   the model. Native providers receive it in the system prompt; vendor
-  backends receive it in place of the slash token in the prompt. The
+  backends receive it in place of the slash token in the prompt, and a
+  vendor failover re-supplies it alongside the transcript handoff. The
   transcript always keeps the user's original `/skill ...` text.
+
+Skill files are workspace-controlled input. A `SKILL.md` is only read if it
+resolves (after following symlinks) beneath the skills directory it was
+discovered in, at most ~36 KiB of it is ever read, and a skill whose name
+cannot be typed back as a single `/token` is not published.
 
 Vendor-native skill mechanisms are disabled so exactly one roster applies:
 Codex threads start with `skills.include_instructions = false` and

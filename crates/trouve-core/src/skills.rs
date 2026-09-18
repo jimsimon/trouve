@@ -17,6 +17,7 @@
 //! the adapters so that this directory layout is the only one that matters.
 
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 /// Host-controlled path-list of additional resources that file-reading tools
@@ -27,6 +28,15 @@ pub const READ_ONLY_ROOTS_ENV: &str = "TROUVE_READ_ONLY_ROOTS";
 /// invocation. Larger files are truncated with a pointer back to the path so
 /// the model can read the remainder with its file tools.
 const MAX_INLINED_SKILL_BYTES: usize = 32 * 1024;
+/// Bytes actually read from a SKILL.md: the inlined body plus headroom for
+/// front matter. Nothing past this offset is ever loaded into memory.
+const MAX_SKILL_READ_BYTES: usize = MAX_INLINED_SKILL_BYTES + 4 * 1024;
+/// Roster descriptions are workspace-controlled; keep each one short so the
+/// catalog, the published command list, and the composer stay bounded.
+const MAX_DESCRIPTION_CHARS: usize = 200;
+/// Byte budget for the advertised catalog in a system prompt or vendor
+/// instructions. Entries past the budget are summarised as a count.
+const MAX_CATALOG_BYTES: usize = 12 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Skill {
@@ -35,6 +45,10 @@ pub struct Skill {
     pub description: String,
     /// Absolute path to the SKILL.md file.
     pub path: PathBuf,
+    /// Canonical skills directory the file was discovered in. Reads verify
+    /// the file still resolves beneath it, so a symlink swapped in after
+    /// discovery cannot pull foreign content into a prompt.
+    root: PathBuf,
 }
 
 impl Skill {
@@ -55,6 +69,13 @@ pub struct Invocation<'s, 'p> {
     pub arguments: &'p str,
 }
 
+/// One grammar for publication and parsing: any non-empty token without
+/// whitespace can be published as `/<name>` and typed back. Roster matching
+/// is the only other validity check.
+fn is_command_name(name: &str) -> bool {
+    !name.is_empty() && !name.starts_with('/') && !name.contains(char::is_whitespace)
+}
+
 /// Split a leading `/name` off `prompt`. Only the first token counts, so
 /// paths and URLs later in the message are never mistaken for commands.
 fn parse_slash(prompt: &str) -> Option<(&str, &str)> {
@@ -62,11 +83,7 @@ fn parse_slash(prompt: &str) -> Option<(&str, &str)> {
     let body = trimmed.strip_prefix('/')?;
     let end = body.find(char::is_whitespace).unwrap_or(body.len());
     let name = &body[..end];
-    let valid = !name.is_empty()
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ':' | '.'));
-    valid.then(|| (name, body[end..].trim()))
+    is_command_name(name).then(|| (name, body[end..].trim()))
 }
 
 /// Resolve a `/skill` invocation at the start of `prompt` against the
@@ -95,29 +112,82 @@ fn strip_front_matter(text: &str) -> &str {
     text
 }
 
+/// Bounded, confined read of a SKILL.md. The file must resolve (after
+/// following symlinks) beneath `root`, and at most [`MAX_SKILL_READ_BYTES`]
+/// are read. Returns the text and whether the file continued past the cap.
+fn read_confined(path: &Path, root: &Path) -> Option<(String, bool)> {
+    let canonical = path.canonicalize().ok()?;
+    if !canonical.starts_with(root) {
+        return None;
+    }
+    let file = std::fs::File::open(&canonical).ok()?;
+    let mut bytes = Vec::new();
+    file.take(MAX_SKILL_READ_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    let truncated = bytes.len() > MAX_SKILL_READ_BYTES;
+    bytes.truncate(MAX_SKILL_READ_BYTES);
+    let text = match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(error) => {
+            // A cap can land inside a multi-byte character; drop the partial
+            // tail rather than the whole file. Invalid UTF-8 earlier in the
+            // file is treated the same way so nothing is guessed at.
+            let valid = error.utf8_error().valid_up_to();
+            let mut bytes = error.into_bytes();
+            bytes.truncate(valid);
+            String::from_utf8(bytes).unwrap_or_default()
+        }
+    };
+    Some((text, truncated))
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    let mut out: String = text.chars().take(max_chars).collect();
+    if out.len() < text.len() {
+        out.push('…');
+    }
+    out
+}
+
 /// Render the instruction block for an invoked skill. The same block goes to
 /// every route: vendor backends receive it inline in the prompt, native
 /// providers in the system prompt, so the transcript keeps the user's
 /// original `/skill` text.
 pub fn invocation_block(invocation: &Invocation<'_, '_>) -> String {
     let skill = invocation.skill;
-    let raw = std::fs::read_to_string(&skill.path).unwrap_or_default();
-    let mut body = strip_front_matter(&raw).trim().to_string();
+    let Some((raw, read_truncated)) = read_confined(&skill.path, &skill.root) else {
+        return format!(
+            "The user invoked `/{name}`, but its SKILL.md at {path} could not be read \
+             from within the approved skills directory (missing, unreadable, or a \
+             symlink leaving that directory). Tell the user the skill is unavailable \
+             and do not guess at its contents.",
+            name = skill.name,
+            path = skill.path.display(),
+        );
+    };
+    let mut body = strip_front_matter(&raw).trim();
+    let mut body_truncated = read_truncated;
     if body.len() > MAX_INLINED_SKILL_BYTES {
         let mut cut = MAX_INLINED_SKILL_BYTES;
         while !body.is_char_boundary(cut) {
             cut -= 1;
         }
-        body.truncate(cut);
-        body.push_str(&format!(
+        body = &body[..cut];
+        body_truncated = true;
+    }
+    let truncation_note = if body_truncated {
+        format!(
             "\n\n[truncated; read {} for the rest]",
             skill.path.display()
-        ));
-    }
+        )
+    } else {
+        String::new()
+    };
     let mut block = format!(
         "The user invoked the `{name}` skill with `/{name}`. Follow the skill \
          instructions below for this request.\n\n\
-         <invoked_skill name=\"{name}\" path=\"{path}\">\n{body}\n</invoked_skill>",
+         <invoked_skill name=\"{name}\" path=\"{path}\">\n{body}{truncation_note}\n</invoked_skill>",
         name = skill.name,
         path = skill.path.display(),
     );
@@ -174,17 +244,24 @@ fn parse_front_matter(text: &str) -> (Option<String>, Option<String>) {
 }
 
 fn load_dir(dir: &Path, out: &mut BTreeMap<String, Skill>) {
+    // Canonicalise the root once; every SKILL.md must resolve beneath it.
+    let Ok(root) = dir.canonicalize() else {
+        return;
+    };
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
         let skill_md = entry.path().join("SKILL.md");
-        let Ok(text) = std::fs::read_to_string(&skill_md) else {
+        let Some((text, _)) = read_confined(&skill_md, &root) else {
             continue;
         };
         let dir_name = entry.file_name().to_string_lossy().to_string();
         let (name, description) = parse_front_matter(&text);
         let name = name.unwrap_or(dir_name);
+        if !is_command_name(&name) {
+            continue;
+        }
         let description = description.unwrap_or_else(|| {
             // Fall back to the first non-heading, non-empty line.
             text.lines()
@@ -193,12 +270,14 @@ fn load_dir(dir: &Path, out: &mut BTreeMap<String, Skill>) {
                 .unwrap_or("")
                 .to_string()
         });
+        let description = truncate_chars(&description, MAX_DESCRIPTION_CHARS);
         out.insert(
             name.clone(),
             Skill {
                 name,
                 description,
                 path: skill_md,
+                root: root.clone(),
             },
         );
     }
@@ -288,13 +367,25 @@ pub fn prompt_section(skills: &[Skill]) -> Option<String> {
          file-reading tool and follow it before proceeding. The user can also invoke a skill \
          explicitly by starting a message with `/<skill name>`.\n",
     );
-    for skill in skills {
-        section.push_str(&format!(
+    for (index, skill) in skills.iter().enumerate() {
+        let entry = format!(
             "\n- **{}** — {} ({})",
             skill.name,
             skill.description,
             skill.path.display()
-        ));
+        );
+        // Deterministic budget: the roster is workspace-controlled, so an
+        // oversized one must not consume the model's context or exceed a
+        // vendor's request limit. Skills stay invocable by name regardless.
+        if section.len() + entry.len() > MAX_CATALOG_BYTES {
+            section.push_str(&format!(
+                "\n- … {} more skill(s) not listed to keep this catalog short; they remain \
+                 invocable with `/<name>` and readable under the skills directories.",
+                skills.len() - index
+            ));
+            break;
+        }
+        section.push_str(&entry);
     }
     Some(section)
 }
@@ -307,6 +398,98 @@ mod tests {
         let d = root.join(dir);
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(d.join("SKILL.md"), contents).unwrap();
+    }
+
+    fn skill(name: &str, description: &str, path: &str) -> Skill {
+        Skill {
+            name: name.into(),
+            description: description.into(),
+            path: path.into(),
+            root: "/".into(),
+        }
+    }
+
+    #[test]
+    fn published_names_and_parsed_names_share_one_grammar() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        write_skill(&repo, ".agents/skills/cafe", "---\nname: café\n---\nbody");
+        write_skill(
+            &repo,
+            ".agents/skills/spaced",
+            "---\nname: two words\n---\nbody",
+        );
+        let skills = discover(None, Some(&repo));
+        let names: Vec<_> = skills.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["café"],
+            "names that cannot be typed back are not published"
+        );
+        assert_eq!(invocation("/café now", &skills).unwrap().arguments, "now");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_escaping_the_skills_root_are_not_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let secret = tmp.path().join("secret.md");
+        std::fs::write(&secret, "TOP SECRET").unwrap();
+        let escaping = repo.join(".agents/skills/leak");
+        std::fs::create_dir_all(&escaping).unwrap();
+        std::os::unix::fs::symlink(&secret, escaping.join("SKILL.md")).unwrap();
+        // Discovery skips it outright.
+        assert!(discover(None, Some(&repo)).is_empty());
+
+        // A file that is swapped for an escaping symlink after discovery is
+        // refused at read time too.
+        write_skill(&repo, ".agents/skills/ship", "# Ship\n\nreal body");
+        let skills = discover(None, Some(&repo));
+        assert_eq!(skills.len(), 1);
+        std::fs::remove_file(skills[0].path.as_path()).unwrap();
+        std::os::unix::fs::symlink(&secret, &skills[0].path).unwrap();
+        let block = invocation_block(&invocation("/ship", &skills).unwrap());
+        assert!(!block.contains("TOP SECRET"));
+        assert!(block.contains("could not be read"));
+    }
+
+    #[test]
+    fn long_descriptions_and_catalogs_are_bounded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let long = "d".repeat(MAX_DESCRIPTION_CHARS + 50);
+        write_skill(
+            &repo,
+            ".agents/skills/verbose",
+            &format!("---\ndescription: {long}\n---\nbody"),
+        );
+        let skills = discover(None, Some(&repo));
+        assert_eq!(
+            skills[0].description.chars().count(),
+            MAX_DESCRIPTION_CHARS + 1
+        );
+        assert!(skills[0].description.ends_with('…'));
+
+        let many: Vec<_> = (0..500)
+            .map(|i| {
+                skill(
+                    &format!("skill-{i:03}"),
+                    &"x".repeat(MAX_DESCRIPTION_CHARS),
+                    "/tmp/skills/x/SKILL.md",
+                )
+            })
+            .collect();
+        let section = prompt_section(&many).unwrap();
+        assert!(
+            section.len() <= MAX_CATALOG_BYTES + 256,
+            "{}",
+            section.len()
+        );
+        assert!(section.contains("more skill(s) not listed"));
+        assert!(section.contains("skill-000"));
+        assert!(!section.contains("skill-499"));
+        assert_eq!(section, prompt_section(&many).unwrap(), "deterministic");
     }
 
     #[test]
@@ -348,7 +531,8 @@ mod tests {
     fn oversized_skill_bodies_are_truncated_with_a_pointer() {
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().join("repo");
-        let body = "x".repeat(MAX_INLINED_SKILL_BYTES + 100);
+        // Far larger than the read cap: only a bounded prefix is loaded.
+        let body = "é".repeat(MAX_SKILL_READ_BYTES * 4);
         write_skill(&repo, ".agents/skills/big", &format!("# Big\n\n{body}"));
         let skills = discover(None, Some(&repo));
         let block = invocation_block(&invocation("/big", &skills).unwrap());
@@ -388,11 +572,7 @@ mod tests {
 
     #[test]
     fn prompt_section_lists_skills() {
-        let skills = vec![Skill {
-            name: "write-adr".into(),
-            description: "Write an ADR".into(),
-            path: "/x/SKILL.md".into(),
-        }];
+        let skills = vec![skill("write-adr", "Write an ADR", "/x/SKILL.md")];
         let section = prompt_section(&skills).unwrap();
         assert!(section.contains("write-adr"));
         assert!(section.contains("/x/SKILL.md"));
