@@ -6,6 +6,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [4.12.0] - 2026-09-18
+
+This release adds resilient provider-neutral model routing and live vendor
+model discovery, unifies the desktop and review frontends on shared Lit
+packages, and improves review activity and transcript accessibility.
+
 ### Added
 
 - **The model catalog is downloaded, not bundled**: `trouve-server` no longer
@@ -77,6 +83,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Client/server compatibility**: protocol compatibility advances to 9.7 for
   the route catalog, provider preference order, sticky route selection,
   selected-route events, and the sticky `route` exposed on threads.
+
+### Fixed
+
+- **Temporary naming failures recover and remain visible**: session and thread
+  title generation retries eligible transient failures once, and the app shows
+  an accessible warning with the failure reason when naming still fails.
+- **Concurrent Cursor sessions no longer stall behind Bridge rotation**:
+  resumed agents safely reuse the shared SDK Bridge after callbacks are bound
+  to the announcing turn, while separate capacity for tool-free naming work
+  keeps it from displacing interactive turns.
+- **Empty reasoning titles stay out of the transcript**: completed reasoning
+  entries that contain only a Markdown heading or emphasized title are hidden,
+  while titled entries with substantive content remain visible.
 
 ## [4.11.0] - 2026-09-11
 
@@ -1545,6 +1564,7 @@ semble ([BENCHMARKS.md](BENCHMARKS.md)):
 - Incremental reindex (1 file touched): 0.86 s vs ~3 min (212x)
 - Warm query: 0.55 s vs 7.2 s (13x)
 
+[4.12.0]: https://github.com/jimsimon/trouve/compare/v4.11.0...v4.12.0
 [4.11.0]: https://github.com/jimsimon/trouve/compare/v4.10.1...v4.11.0
 [4.10.1]: https://github.com/jimsimon/trouve/compare/v4.10.0...v4.10.1
 [4.10.0]: https://github.com/jimsimon/trouve/compare/v4.9.0...v4.10.0
