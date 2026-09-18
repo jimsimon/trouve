@@ -1,6 +1,6 @@
 {
   "name": "@trouve-ai/content-rendering",
-  "version": "4.11.0",
+  "version": "4.12.0",
   "private": true,
   "type": "module",
   "description": "Sanitized Markdown, inline Mermaid diagrams, unified-diff parsing, source highlighting, media previews, and the bounded off-thread content worker shared by the trouve Lit frontends.",
@@ -35,7 +35,7 @@
   "dependencies": {
     "@lezer/highlight": "^1.2.3",
     "@lezer/javascript": "^1.5.4",
-    "@trouve-ai/ui-foundation": "4.11.0",
+    "@trouve-ai/ui-foundation": "4.12.0",
     "beautiful-mermaid": "^1.1.3",
     "lit": "^3.3.3",
     "rehype-sanitize": "^6.0.0",

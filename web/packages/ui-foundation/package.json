@@ -1,6 +1,6 @@
 {
   "name": "@trouve-ai/ui-foundation",
-  "version": "4.11.0",
+  "version": "4.12.0",
   "private": true,
   "type": "module",
   "description": "Foundation shared by every trouve Lit frontend: design tokens, semantic themes, element defaults, the theme controller, the icon element, the contained signals adapter, tab navigation, and the owned virtualizer.",
