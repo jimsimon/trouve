@@ -49,8 +49,8 @@ fn usage() -> Usage {
 
 #[derive(Default)]
 struct ProviderObservation {
-    saw_system_instructions: bool,
-    saw_user_prompt: bool,
+    system: String,
+    user_messages: Vec<String>,
 }
 
 struct ConformanceProvider {
@@ -75,12 +75,20 @@ impl Provider for ConformanceProvider {
         _options: &serde_json::Map<String, serde_json::Value>,
     ) -> Result<EventStream, ProviderError> {
         let mut observation = self.observation.lock().unwrap();
-        observation.saw_system_instructions = messages
+        observation.system = messages
             .iter()
-            .any(|message| matches!(message, Message::System(text) if !text.trim().is_empty()));
-        observation.saw_user_prompt = messages
+            .find_map(|message| match message {
+                Message::System(text) => Some(text.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        observation.user_messages = messages
             .iter()
-            .any(|message| matches!(message, Message::User(text) if text == "verify parity"));
+            .filter_map(|message| match message {
+                Message::User(text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
         drop(observation);
         Ok(Box::pin(futures::stream::iter(vec![
             Ok(ProviderEvent::ThinkingStarted {
@@ -101,8 +109,8 @@ impl Provider for ConformanceProvider {
 
 #[derive(Default)]
 struct BackendObservation {
-    saw_mode_instructions: bool,
-    saw_user_prompt: bool,
+    instructions: String,
+    prompt: String,
     permission: Option<BackendPermission>,
 }
 
@@ -133,11 +141,8 @@ impl AgentBackend for ConformanceBackend {
 
     async fn run_turn(&self, turn: BackendTurn) -> Result<BackendEventStream, BackendError> {
         let mut observation = self.observation.lock().unwrap();
-        observation.saw_mode_instructions = turn
-            .instructions
-            .as_deref()
-            .is_some_and(|instructions| !instructions.trim().is_empty());
-        observation.saw_user_prompt = turn.prompt == "verify parity";
+        observation.instructions = turn.instructions.clone().unwrap_or_default();
+        observation.prompt = turn.prompt.clone();
         observation.permission = Some(turn.permission);
         drop(observation);
         Ok(Box::pin(futures::stream::iter(vec![
@@ -213,6 +218,25 @@ async fn run_visible_turn(
     session_id: &str,
     selected_model: &str,
 ) -> Vec<serde_json::Value> {
+    run_visible_turn_with(
+        engine,
+        client,
+        base,
+        session_id,
+        selected_model,
+        "verify parity",
+    )
+    .await
+}
+
+async fn run_visible_turn_with(
+    engine: &Engine,
+    client: &reqwest::Client,
+    base: &str,
+    session_id: &str,
+    selected_model: &str,
+    content: &str,
+) -> Vec<serde_json::Value> {
     let thread: serde_json::Value = client
         .post(format!("{base}/threads"))
         .json(&serde_json::json!({
@@ -231,7 +255,7 @@ async fn run_visible_turn(
     let thread_id = thread["id"].as_str().unwrap();
     client
         .post(format!("{base}/threads/{thread_id}/messages"))
-        .json(&serde_json::json!({"content":"verify parity"}))
+        .json(&serde_json::json!({"content":content}))
         .send()
         .await
         .unwrap()
@@ -430,8 +454,19 @@ fn visible_turn_fold_rejects_malformed_lifecycle_histories() {
     );
 }
 
-#[tokio::test]
-async fn raw_provider_and_vendor_backend_share_the_visible_turn_contract() {
+struct Harness {
+    /// Owns the repository and data directories for the harness lifetime.
+    temporary: tempfile::TempDir,
+    repository: std::path::PathBuf,
+    engine: Arc<Engine>,
+    client: reqwest::Client,
+    base: String,
+    session_id: String,
+    provider_observation: Arc<Mutex<ProviderObservation>>,
+    backend_observation: Arc<Mutex<BackendObservation>>,
+}
+
+async fn harness() -> Harness {
     let temporary = tempfile::tempdir().unwrap();
     let repository = temporary.path().join("repo");
     std::fs::create_dir(&repository).unwrap();
@@ -491,23 +526,156 @@ async fn raw_provider_and_vendor_backend_share_the_visible_turn_contract() {
         .json()
         .await
         .unwrap();
-    let session_id = session["id"].as_str().unwrap();
+    let session_id = session["id"].as_str().unwrap().to_string();
+    Harness {
+        temporary,
+        repository,
+        engine,
+        client,
+        base,
+        session_id,
+        provider_observation,
+        backend_observation,
+    }
+}
 
-    let raw = run_visible_turn(&engine, &client, &base, session_id, "raw/model").await;
-    let vendor = run_visible_turn(&engine, &client, &base, session_id, "vendor/model").await;
+#[tokio::test]
+async fn raw_provider_and_vendor_backend_share_the_visible_turn_contract() {
+    let Harness {
+        temporary,
+        engine,
+        client,
+        base,
+        session_id,
+        provider_observation,
+        backend_observation,
+        ..
+    } = harness().await;
+
+    let raw = run_visible_turn(&engine, &client, &base, &session_id, "raw/model").await;
+    let vendor = run_visible_turn(&engine, &client, &base, &session_id, "vendor/model").await;
     assert_eq!(
         fold_visible_turn(&raw).expect("raw provider emitted a malformed visible lifecycle"),
         fold_visible_turn(&vendor).expect("vendor backend emitted a malformed visible lifecycle")
     );
 
     let raw_observation = provider_observation.lock().unwrap();
-    assert!(raw_observation.saw_system_instructions);
-    assert!(raw_observation.saw_user_prompt);
+    assert!(!raw_observation.system.trim().is_empty());
+    assert!(
+        raw_observation
+            .user_messages
+            .iter()
+            .any(|text| text == "verify parity")
+    );
     let vendor_observation = backend_observation.lock().unwrap();
-    assert!(vendor_observation.saw_mode_instructions);
-    assert!(vendor_observation.saw_user_prompt);
+    assert!(!vendor_observation.instructions.trim().is_empty());
+    assert_eq!(vendor_observation.prompt, "verify parity");
     assert_eq!(
         vendor_observation.permission,
         Some(BackendPermission::ReadOnly)
     );
+    drop(temporary);
+}
+
+/// Skills are discovered by the engine from `.agents/skills`, published to
+/// clients as slash commands, advertised to both execution paths, and a
+/// leading `/skill` is expanded before any model sees the prompt while the
+/// transcript keeps the user's words.
+#[tokio::test]
+async fn engine_owned_skills_reach_raw_providers_and_vendor_backends_alike() {
+    let Harness {
+        temporary,
+        repository,
+        engine,
+        client,
+        base,
+        session_id,
+        provider_observation,
+        backend_observation,
+        ..
+    } = harness().await;
+    let skill_dir = repository.join(".agents/skills/ship");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: ship\ndescription: Ship a release\n---\n# Ship\n\nRun the release checklist.\n",
+    )
+    .unwrap();
+
+    let roster_of = |events: &[serde_json::Value]| -> Vec<Vec<String>> {
+        events
+            .iter()
+            .filter(|event| event["type"] == "thread.commands_updated")
+            .map(|event| {
+                event["commands"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|command| command["name"].as_str().unwrap().to_string())
+                    .collect()
+            })
+            .collect()
+    };
+
+    let raw = run_visible_turn_with(
+        &engine,
+        &client,
+        &base,
+        &session_id,
+        "raw/model",
+        "/ship to staging",
+    )
+    .await;
+    // Once at thread creation, once at turn start; both name the skill.
+    let raw_rosters = roster_of(&raw);
+    assert_eq!(raw_rosters.len(), 2, "{raw:#?}");
+    assert!(
+        raw_rosters
+            .iter()
+            .all(|roster| roster == &["ship".to_string()])
+    );
+    let transcript_message = raw
+        .iter()
+        .find(|event| event["type"] == "user.message")
+        .unwrap();
+    assert_eq!(transcript_message["content"], "/ship to staging");
+    {
+        let observation = provider_observation.lock().unwrap();
+        assert!(observation.system.contains("## Available skills"));
+        assert!(observation.system.contains("<invoked_skill name=\"ship\""));
+        assert!(observation.system.contains("Run the release checklist."));
+        assert!(observation.system.contains("to staging"));
+        assert_eq!(
+            observation.user_messages,
+            vec!["/ship to staging".to_string()]
+        );
+    }
+
+    let vendor = run_visible_turn_with(
+        &engine,
+        &client,
+        &base,
+        &session_id,
+        "vendor/model",
+        "/ship to staging",
+    )
+    .await;
+    assert_eq!(roster_of(&vendor).len(), 2);
+    let transcript_message = vendor
+        .iter()
+        .find(|event| event["type"] == "user.message")
+        .unwrap();
+    assert_eq!(transcript_message["content"], "/ship to staging");
+    let observation = backend_observation.lock().unwrap();
+    assert!(observation.instructions.contains("## Available skills"));
+    assert!(observation.instructions.contains("**ship**"));
+    assert!(
+        observation
+            .prompt
+            .starts_with("The user invoked the `ship` skill")
+    );
+    assert!(observation.prompt.contains("Run the release checklist."));
+    assert!(observation.prompt.ends_with("to staging"));
+    assert!(!observation.prompt.contains("/ship to staging"));
+    drop(temporary);
 }

@@ -1420,7 +1420,21 @@ impl Engine {
             .iter()
             .map(|file| (file.attachment.clone(), file.relative_path.clone()))
             .collect::<Vec<_>>();
-        let backend_content = annotate_attachments(content, &backend_files);
+        // Engine-owned skills: a leading `/skill` is expanded for vendor
+        // routes and appended to the native system prompt below, while the
+        // transcript keeps the user's original text.
+        let skills =
+            crate::skills::discover(self.config_dir.as_deref(), Some(Path::new(&workspace.path)));
+        // Rendered once: the first vendor attempt inlines it in place of the
+        // slash token, native attempts carry it in the system prompt, and a
+        // vendor failover re-supplies it because the persisted handoff only
+        // contains the user's bare `/skill` text.
+        let invoked_skill_block = crate::skills::invocation(&content, &skills)
+            .map(|invocation| crate::skills::invocation_block(&invocation));
+        let backend_content = annotate_attachments(
+            crate::skills::expand_invocation(&content, &skills),
+            &backend_files,
+        );
         let transcript_files = images
             .iter()
             .chain(files.iter())
@@ -1478,6 +1492,10 @@ impl Engine {
             self.config_dir.as_deref(),
             Path::new(&workspace.path),
         );
+        if let Some(block) = &invoked_skill_block {
+            system.push_str("\n\n");
+            system.push_str(block);
+        }
         if background {
             personas::append_automated_review_guidance(&mut system);
         }
@@ -1565,6 +1583,7 @@ impl Engine {
                         &mode,
                         route,
                         &backend_content,
+                        invoked_skill_block.as_deref(),
                         &backend_attachments,
                         &history_before,
                         &stored_model_options,
@@ -2204,6 +2223,7 @@ impl Engine {
         mode: &AgentPersona,
         route: &ModelCandidate,
         initial_content: &str,
+        invoked_skill_block: Option<&str>,
         attachments: &[trouve_agents::TurnAttachment],
         history_before: &[serde_json::Value],
         stored_model_options: &serde_json::Map<String, serde_json::Value>,
@@ -2261,10 +2281,17 @@ impl Engine {
             let continuation = "Another provider could not continue this turn. Continue the \
                 in-progress task from the transcript and current worktree. Do not repeat \
                 completed text, commands, or edits; inspect state when unsure.";
-            match handoff {
-                Some(digest) => format!("{digest}\n\n{continuation}"),
-                None => continuation.into(),
+            let mut prompt = String::new();
+            if let Some(digest) = handoff {
+                prompt.push_str(&digest);
+                prompt.push_str("\n\n");
             }
+            if let Some(block) = invoked_skill_block {
+                prompt.push_str(block);
+                prompt.push_str("\n\n");
+            }
+            prompt.push_str(continuation);
+            prompt
         } else {
             match handoff {
                 Some(digest) => format!("{digest}\n\n{initial_content}"),
@@ -2282,6 +2309,7 @@ impl Engine {
             .is_some_and(|bridge| bridge.bridge_tools);
         let automated_review = self.store.is_code_review_thread(&thread.id)?;
         append_vendor_search_guidance(&mut instructions, mcp_bridge.is_some(), automated_review);
+        append_skills_catalog(&mut instructions, &self.session_skills(session)?);
         enforce_automated_review_backend_boundary(
             automated_review,
             tools_enabled,
@@ -2704,9 +2732,6 @@ impl Engine {
                             .push_str(&chunk);
                     }
                     persisted.push(Event::ToolOutput { call_id, chunk });
-                }
-                BackendEvent::CommandsUpdated { commands } => {
-                    persisted.push(Event::CommandsUpdated { commands });
                 }
                 BackendEvent::TodosUpdated { todos } => {
                     flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
@@ -4298,6 +4323,88 @@ mod tests {
             "a healthy affinity should avoid replaying history to the failed API route"
         );
         assert_eq!(backend_turns.lock().unwrap().len(), 2);
+    }
+
+    /// A vendor failover receives the invoked skill body even though the
+    /// persisted handoff only carries the user's bare `/skill` text and the
+    /// vendor's own skill loader is switched off.
+    #[tokio::test]
+    async fn native_to_backend_failover_re_supplies_the_invoked_skill() {
+        let data = tempfile::tempdir().unwrap();
+        let worktree = data.path().join("worktrees/skill-failover");
+        let skill_dir = worktree.join(".agents/skills/ship");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: ship\ndescription: Ship a release\n---\n# Ship\n\nRun the release checklist.\n",
+        )
+        .unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let thread = routing_thread(&store, &worktree, "skill_failover");
+        let api_calls = Arc::new(AtomicUsize::new(0));
+        let backend_turns = Arc::new(Mutex::new(Vec::new()));
+        let config = Config {
+            providers: BTreeMap::from([(
+                "backend".into(),
+                crate::config::ProviderConfig {
+                    kind: "claude-cli".into(),
+                    tool_bridge: Some(true),
+                    ..Default::default()
+                },
+            )]),
+            provider_order: vec!["api".into(), "backend".into()],
+            local_enabled: Some(false),
+            ..Default::default()
+        };
+        let engine = Arc::new(
+            Engine::new(store.clone(), data.path().into(), &config)
+                .with_provider(
+                    "api",
+                    Arc::new(FailingCatalogProvider {
+                        id: "api".into(),
+                        calls: api_calls.clone(),
+                    }),
+                )
+                .with_backend(
+                    "backend",
+                    Arc::new(trouve_agents::RetirementAwareBackend::new(Arc::new(
+                        RecordingBackend {
+                            turns: backend_turns.clone(),
+                        },
+                    ))),
+                ),
+        );
+        engine.set_base_url("http://127.0.0.1:4000");
+
+        engine
+            .send_message(&thread.id, "/ship to staging".into(), Vec::new())
+            .unwrap();
+        wait_for_terminal_turn(&engine, &store, &thread, 1).await;
+
+        let turns = backend_turns.lock().unwrap();
+        assert_eq!(turns.len(), 1);
+        let prompt = &turns[0].prompt;
+        assert!(
+            prompt.contains("Another provider could not continue"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("<invoked_skill name=\"ship\""), "{prompt}");
+        assert!(prompt.contains("Run the release checklist."), "{prompt}");
+        assert!(
+            prompt.contains("Arguments supplied with the invocation: to staging"),
+            "{prompt}"
+        );
+        let events = store
+            .events_after(&Scope::Thread(thread.id.clone()), 0)
+            .unwrap();
+        assert!(events.iter().any(|event| matches!(
+            &event.event,
+            Event::UserMessage { content, .. } if content == "/ship to staging"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            &event.event,
+            Event::CommandsUpdated { commands } if commands.iter().any(|c| c.name == "ship")
+        )));
     }
 
     #[tokio::test]

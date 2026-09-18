@@ -78,10 +78,39 @@ A skill is a directory with a `SKILL.md` (optional `---` front matter with
 - `<config>/skills/*/SKILL.md` — user-global
 - `<workspace>/.agents/skills/*/SKILL.md` — per-repo (wins on collision)
 
-Skills are advertised in the system prompt as a name + description + path
-list; the agent reads the SKILL.md with its normal `read_file` tool when
-relevant. Skill bodies are never inlined into the prompt, so many skills
-cost almost nothing. This repo dogfoods the mechanism (`.agents/skills/`).
+The engine owns this roster for every route. On each turn it is:
+
+- advertised as a name + description + path list — in the native system
+  prompt and in the instructions passed to vendor backends — so the model
+  reads a relevant SKILL.md with its file tool. Skill bodies are not inlined
+  here, descriptions are capped at 200 characters, and the catalog stops at
+  12 KiB with a count of omitted skills, so a large roster cannot crowd out
+  the model's context;
+- published to clients as `thread.commands_updated` (on thread creation and
+  at every turn start), which drives `/` completion in the composer;
+- honoured as an explicit invocation: a prompt starting with `/<skill>`
+  inlines that skill's body (front matter stripped, capped at 32 KiB) for
+  the model. Native providers receive it in the system prompt; vendor
+  backends receive it in place of the slash token in the prompt, and a
+  vendor failover re-supplies it alongside the transcript handoff. The
+  transcript always keeps the user's original `/skill ...` text.
+
+Skill files are workspace-controlled input. Every `SKILL.md` is opened by
+walking `<skills dir>/<name>/SKILL.md` component by component from a handle
+on the canonical config dir or workspace root with `O_NOFOLLOW`, so no
+symlink at any level is followed and a link swapped in between discovery
+and invocation cannot redirect the read. At most ~36 KiB of a file is read,
+at most 256 skill directories per root are examined (sorted by name), and a
+skill whose name cannot be typed back as a single `/token` of ≤ 64
+characters is not published.
+
+Vendor-native skill mechanisms are disabled so exactly one roster applies:
+Codex threads start with `skills.include_instructions = false` and
+`skills.bundled.enabled = false` (its built-in `/` commands are TUI-only and
+never see prompt text), Claude runs with `--disable-slash-commands` (built-in
+commands, `.claude/commands`, and `.claude/skills`/plugin skills) plus its
+`Skill` tool disallowed, and the Cursor SDK bridge runs with
+`settingSources: []`. This repo dogfoods the mechanism (`.agents/skills/`).
 
 ## GitHub PRs
 

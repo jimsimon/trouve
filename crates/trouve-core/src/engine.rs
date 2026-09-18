@@ -772,7 +772,6 @@ fn backend_event_name(event: &BackendEvent) -> &'static str {
         BackendEvent::ToolCompleted { .. } => "tool_completed",
         BackendEvent::ApprovalNeeded { .. } => "approval_needed",
         BackendEvent::QuestionsNeeded { .. } => "questions_needed",
-        BackendEvent::CommandsUpdated { .. } => "commands_updated",
         BackendEvent::TodosUpdated { .. } => "todos_updated",
         BackendEvent::UsageUpdated { .. } => "usage_updated",
         BackendEvent::CompactionStarted => "compaction_started",
@@ -814,6 +813,18 @@ fn append_vendor_search_guidance(
         instructions.push_str("\n\n");
     }
     instructions.push_str(crate::tools::VENDOR_SEARCH_GUIDANCE);
+}
+
+/// Advertise the engine-owned skill roster to a vendor backend. Vendors run
+/// with their own skill loaders disabled, so this section is the only way a
+/// vendor model learns about `.agents/skills`.
+pub(super) fn append_skills_catalog(instructions: &mut String, skills: &[crate::skills::Skill]) {
+    if let Some(section) = crate::skills::prompt_section(skills) {
+        if !instructions.is_empty() {
+            instructions.push_str("\n\n");
+        }
+        instructions.push_str(&section);
+    }
 }
 
 fn append_vendor_rendering_guidance(instructions: &mut String, automated_review: bool) {
@@ -13195,14 +13206,24 @@ impl Engine {
             .store
             .session(&session.id)?
             .ok_or_else(|| EngineError::NotFound(format!("session {}", session.id)))?;
-        self.store.insert_thread_with_event(
+        // The slash-command roster is published in the same transaction as
+        // the thread so the composer can complete `/skill` before the first
+        // turn and no thread ever exists durably without its roster.
+        let commands_updated = self.commands_updated_event(&session)?;
+        self.store.insert_thread_with_events(
             &thread,
             &model_options,
             spawn,
-            Event::ThreadCreated {
-                thread_id: thread.id.clone(),
-                session_id: live_session.id,
-            },
+            vec![
+                (
+                    Scope::Server,
+                    Event::ThreadCreated {
+                        thread_id: thread.id.clone(),
+                        session_id: live_session.id,
+                    },
+                ),
+                (Scope::Thread(thread.id.clone()), commands_updated),
+            ],
         )?;
         drop(deleting);
         Ok(thread)
@@ -13926,6 +13947,10 @@ impl Engine {
             normalize_thinking_option(&mut model_options, selected_model.as_ref());
         }
         let thinking_level = resolved_thinking_level(&model_options, selected_model.as_ref());
+        let session = self
+            .store
+            .session(&thread.session_id)?
+            .ok_or_else(|| EngineError::NotFound(format!("session {}", thread.session_id)))?;
         Ok(vec![
             Event::TurnStarted {
                 turn,
@@ -13935,7 +13960,35 @@ impl Engine {
                 supports_steering,
             },
             dispatched_prompt_event(turn, prompt),
+            // The slash-command roster is engine-owned and refreshed on every
+            // turn regardless of which provider or vendor runs it, so a skill
+            // added to the workspace mid-thread shows up at the next turn.
+            self.commands_updated_event(&session)?,
         ])
+    }
+
+    /// Skills visible to threads of `session`: the user's config-dir skills
+    /// plus the workspace's `.agents/skills`. This is the only skill roster
+    /// trouve honours; vendor-native skill directories are disabled in the
+    /// adapters.
+    fn session_skills(&self, session: &Session) -> Result<Vec<crate::skills::Skill>, EngineError> {
+        let workspace = self.store.workspace(&session.workspace_id)?;
+        Ok(crate::skills::discover(
+            self.config_dir.as_deref(),
+            workspace
+                .as_ref()
+                .map(|workspace| Path::new(&workspace.path)),
+        ))
+    }
+
+    fn commands_updated_event(&self, session: &Session) -> Result<Event, EngineError> {
+        Ok(Event::CommandsUpdated {
+            commands: self
+                .session_skills(session)?
+                .iter()
+                .map(crate::skills::Skill::command_info)
+                .collect(),
+        })
     }
 
     fn register_turn_steerer(&self, thread_id: &str, turn: u64) {
@@ -15666,6 +15719,13 @@ impl Engine {
 
         let mut system =
             context::system_prompt(&mode, self.config_dir.as_deref(), Path::new(&ws.path));
+        // A `/skill` message keeps the user's words in the transcript; the
+        // skill body rides in the system prompt for this turn instead.
+        let skills = crate::skills::discover(self.config_dir.as_deref(), Some(Path::new(&ws.path)));
+        if let Some(invocation) = crate::skills::invocation(&prompt.content, &skills) {
+            system.push_str("\n\n");
+            system.push_str(&crate::skills::invocation_block(&invocation));
+        }
         if background {
             // Context assembly intentionally layers trusted workspace
             // instructions after the persona. Repeat the immutable review
@@ -17825,6 +17885,15 @@ impl Engine {
             .iter()
             .map(|file| (file.attachment.clone(), file.relative_path.clone()))
             .collect::<Vec<_>>();
+        // Skills are engine-owned: the roster goes to the vendor as
+        // instructions and a leading `/skill` is expanded here, so no vendor
+        // ever routes the token through its own command or skill loader.
+        let skills = self.session_skills(session)?;
+        let content = if is_continuation {
+            content
+        } else {
+            crate::skills::expand_invocation(&content, &skills)
+        };
         let content = annotate_attachments(content, &prompt_files);
         let turn_attachments: Vec<trouve_agents::TurnAttachment> = images
             .into_iter()
@@ -17864,6 +17933,7 @@ impl Engine {
         let mut instructions = mode.system_prompt.trim().to_string();
         append_vendor_rendering_guidance(&mut instructions, automated_review);
         append_vendor_search_guidance(&mut instructions, mcp_bridge.is_some(), automated_review);
+        append_skills_catalog(&mut instructions, &skills);
         let full_tool_bridge = mcp_bridge
             .as_ref()
             .is_some_and(|bridge| bridge.bridge_tools);
@@ -18544,9 +18614,6 @@ impl Engine {
                             .push_str(&chunk);
                     }
                     persisted.push(Event::ToolOutput { call_id, chunk });
-                }
-                BackendEvent::CommandsUpdated { commands } => {
-                    persisted.push(Event::CommandsUpdated { commands });
                 }
                 BackendEvent::TodosUpdated { todos } => {
                     // Vendor-native plans are authoritative replacements just

@@ -51,6 +51,10 @@ const REAP_INTERVAL: Duration = Duration::from_secs(60);
 /// engine normally polls that stream immediately, but a continuously-ready
 /// steering producer must not grow process memory without bound.
 const PENDING_STEER_CAP: usize = 8;
+/// Claude Code's built-in tool that loads `.claude/skills`. Denied on every
+/// turn: trouve owns skill discovery (`.agents/skills`) and inlines an
+/// invoked skill before the prompt reaches Claude.
+const CLAUDE_NATIVE_SKILL_TOOL: &str = "Skill";
 
 fn claude_steer_message(prompt: String, attachments: Vec<TurnAttachment>) -> Value {
     let mut content = Vec::with_capacity(1 + attachments.len());
@@ -1492,6 +1496,11 @@ impl ClaudeBackend {
             // Anthropic redacts thinking text by default (empty blocks with
             // only a signature); this opts back in to summarized thinking.
             .args(["--thinking-display", "summarized"])
+            // Skills are engine-owned (`.agents/skills`, expanded by trouve
+            // before the prompt arrives). This switches off every Claude
+            // command surface at once: built-in commands, `.claude/commands`
+            // prompt files, and `.claude/skills`/plugin skills.
+            .arg("--disable-slash-commands")
             // Claude Code defers tool schemas behind a ToolSearch lookup by
             // default. The trouve bridge exposes only a handful of tools, so
             // load them upfront — no ToolSearch round-trip before the first
@@ -1572,11 +1581,20 @@ impl ClaudeBackend {
             cmd.arg("--strict-mcp-config");
             mcp_config_file = Some(file);
         }
+        // Skills are engine-owned (`.agents/skills`, expanded by trouve
+        // before the prompt arrives), so Claude's own skill loader stands
+        // down. The CLI honours one `--disallowedTools` list, so every
+        // denial below is gathered into it.
+        let mut disallowed_tools = vec![CLAUDE_NATIVE_SKILL_TOOL.to_string()];
         if let Some(bridge) = &turn.mcp_bridge {
             if bridge.bridge_tools {
-                if !bridge.disallowed_tools.is_empty() {
-                    cmd.args(["--disallowedTools", &bridge.disallowed_tools.join(",")]);
-                }
+                disallowed_tools.extend(
+                    bridge
+                        .disallowed_tools
+                        .iter()
+                        .filter(|tool| *tool != CLAUDE_NATIVE_SKILL_TOOL)
+                        .cloned(),
+                );
                 cmd.args(["--allowedTools", "mcp__trouve"]);
             } else {
                 // Approvals-only: Claude keeps its built-ins, but trouve's
@@ -1614,11 +1632,16 @@ impl ClaudeBackend {
                     .as_ref()
                     .is_some_and(|bridge| bridge.bridge_tools);
                 if !vendor_tools_stand_down {
-                    cmd.args(["--disallowedTools", "Write,Edit,MultiEdit,NotebookEdit"]);
+                    disallowed_tools.extend(
+                        ["Write", "Edit", "MultiEdit", "NotebookEdit"]
+                            .into_iter()
+                            .map(str::to_string),
+                    );
                 }
             }
             BackendPermission::Ask => {}
         }
+        cmd.args(["--disallowedTools", &disallowed_tools.join(",")]);
 
         let mut child = spawn_process_tree(&mut cmd).map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => BackendError::NotInstalled(self.command.clone()),
@@ -1696,31 +1719,18 @@ impl ClaudeBackend {
 fn map_event(ev: &Value) -> Vec<BackendEvent> {
     match ev["type"].as_str() {
         // Claude rotates session ids per run; always persist the latest.
-        // The init event also lists the accepted slash commands (names
-        // only), surfaced as prompt-box completions.
-        Some("system") if ev["subtype"].as_str() == Some("init") => {
-            let mut out: Vec<BackendEvent> = ev["session_id"]
-                .as_str()
-                .map(|sid| {
-                    vec![BackendEvent::SessionStarted {
-                        session_id: sid.to_string(),
-                    }]
-                })
-                .unwrap_or_default();
-            if let Some(cmds) = ev["slash_commands"].as_array() {
-                out.push(BackendEvent::CommandsUpdated {
-                    commands: cmds
-                        .iter()
-                        .filter_map(|c| c.as_str())
-                        .map(|name| trouve_protocol::CommandInfo {
-                            name: name.to_string(),
-                            description: String::new(),
-                        })
-                        .collect(),
-                });
-            }
-            out
-        }
+        // The init event also lists Claude's own slash commands; those are
+        // ignored because the engine owns the skill roster (see
+        // `trouve_core::skills`) and expands `/skill` before the prompt
+        // reaches this adapter.
+        Some("system") if ev["subtype"].as_str() == Some("init") => ev["session_id"]
+            .as_str()
+            .map(|sid| {
+                vec![BackendEvent::SessionStarted {
+                    session_id: sid.to_string(),
+                }]
+            })
+            .unwrap_or_default(),
         // Live deltas (--include-partial-messages). Text and thinking stream
         // here; the complete "assistant" event that follows repeats the same
         // content as whole blocks, so those are skipped below.

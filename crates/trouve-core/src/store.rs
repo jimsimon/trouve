@@ -8546,26 +8546,25 @@ impl Store {
     }
 
     /// Insert a thread (and optional spawn edge) together with its durable
-    /// creation edge. Parent ownership is validated in the same transaction.
-    pub(crate) fn insert_thread_with_event(
+    /// creation edge and any companion lifecycle events in one transaction,
+    /// so a thread never exists durably without them. Parent ownership is
+    /// validated in the same transaction.
+    pub(crate) fn insert_thread_with_events(
         &self,
         thread: &Thread,
         model_options: &serde_json::Map<String, serde_json::Value>,
         spawn: Option<(&str, &str)>,
-        event: Event,
-    ) -> Result<EventEnvelope> {
+        events: Vec<(Scope, Event)>,
+    ) -> Result<Vec<EventEnvelope>> {
         let pending = serialize_lifecycle_events(
-            vec![(Scope::Server, event)],
+            events,
             StoreMutation::InsertThread {
                 thread: Box::new(thread.clone()),
                 model_options: model_options.clone(),
                 spawn: spawn.map(|(parent, kind)| (parent.to_string(), kind.to_string())),
             },
         )?;
-        Ok(self
-            .append_pending_events(pending)?
-            .pop()
-            .expect("one lifecycle event returns one envelope"))
+        self.append_pending_events(pending)
     }
 
     /// Insert a spawned thread and its parent edge in one transaction. A

@@ -8629,7 +8629,7 @@
           },
           {
             "type": "object",
-            "description": "The slash commands / skills the vendor harness currently accepts in\nprompts. Replaces any previously announced list for the thread.",
+            "description": "The slash commands (engine-discovered skills from `<config>/skills`\nand `<workspace>/.agents/skills`) a prompt on this thread may start\nwith. Published on thread creation and refreshed at every turn start\nfor every provider and vendor route; replaces any previous list.",
             "required": [
               "commands",
               "type"

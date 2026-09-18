@@ -49,7 +49,8 @@ applicable row.
 | Tools | The effective Trouve tool schema is available and every side effect reaches `ToolExecutor` |
 | Permissions | read-only denies mutation; ask/allow-list produce one Trouve approval; yolo does not prompt |
 | External MCP | User/workspace/worktree servers preserve merge order, environment expansion, and first-use policy |
-| Interaction | questions, commands/skills, todos, attachments, steering, and subagents degrade only through an explicit internal capability check |
+| Interaction | questions, todos, attachments, steering, and subagents degrade only through an explicit internal capability check |
+| Skills | The engine-owned roster (`<config>/skills`, `.agents/skills`) reaches the model as instructions, `/skill` arrives already expanded, and the vendor's own skill/command loaders are switched off (see [integrations](integrations.md#skills)) |
 | Sessions | a second turn resumes; model A → B → A resumes A; cold process restart does not lose instructions |
 | Cancellation | cancel is acknowledged, pending tools terminate, and a replacement turn cannot overlap stale vendor work |
 | Failure | malformed frames, process exit, timeout, and partial streams end the turn once and leave no pending UI state |

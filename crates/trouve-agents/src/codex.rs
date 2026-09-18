@@ -710,7 +710,17 @@ fn codex_config_override(turn: &crate::BackendTurn) -> Value {
             json!({ "url": bridge.url, "default_tools_approval_mode": "approve" }),
         );
     }
-    let mut config = json!({ "show_raw_agent_reasoning": true });
+    // Skills are engine-owned: trouve advertises `.agents/skills` in the
+    // instructions and inlines an invoked skill into the prompt. Codex's own
+    // skill catalog block and bundled skills are switched off so the model
+    // sees exactly one roster.
+    let mut config = json!({
+        "show_raw_agent_reasoning": true,
+        "skills": {
+            "include_instructions": false,
+            "bundled": { "enabled": false },
+        },
+    });
     if !servers.is_empty() {
         config["mcp_servers"] = Value::Object(servers);
     }
@@ -8689,6 +8699,8 @@ cat > /dev/null
         let mut turn = bare_turn();
         let config = codex_config_override(&turn);
         assert_eq!(config["show_raw_agent_reasoning"], true);
+        assert_eq!(config["skills"]["include_instructions"], false);
+        assert_eq!(config["skills"]["bundled"]["enabled"], false);
         assert!(config["mcp_servers"].is_null());
 
         turn.mcp_servers.push(crate::McpServerLaunch {
