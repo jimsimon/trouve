@@ -1496,6 +1496,11 @@ impl ClaudeBackend {
             // Anthropic redacts thinking text by default (empty blocks with
             // only a signature); this opts back in to summarized thinking.
             .args(["--thinking-display", "summarized"])
+            // Skills are engine-owned (`.agents/skills`, expanded by trouve
+            // before the prompt arrives). This switches off every Claude
+            // command surface at once: built-in commands, `.claude/commands`
+            // prompt files, and `.claude/skills`/plugin skills.
+            .arg("--disable-slash-commands")
             // Claude Code defers tool schemas behind a ToolSearch lookup by
             // default. The trouve bridge exposes only a handful of tools, so
             // load them upfront — no ToolSearch round-trip before the first

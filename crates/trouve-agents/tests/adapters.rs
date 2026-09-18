@@ -2825,7 +2825,9 @@ EOF
     assert!(args.contains("--permission-prompt-tool"), "{args}");
     assert!(args.contains("mcp__trouve__approval_prompt"), "{args}");
     assert!(!args.contains("--dangerously-skip-permissions"), "{args}");
-    // Only Claude's native skill loader is denied: skills are engine-owned.
+    // Skills are engine-owned: Claude's command surface is off and only its
+    // native skill loader is denied as a tool.
+    assert!(args.contains("--disable-slash-commands"), "{args}");
     assert!(args.contains("--disallowedTools\nSkill\n"), "{args}");
     assert!(!args.contains("Write,Edit"), "{args}");
     assert!(

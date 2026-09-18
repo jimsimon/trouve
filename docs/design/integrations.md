@@ -94,10 +94,11 @@ The engine owns this roster for every route. On each turn it is:
 
 Vendor-native skill mechanisms are disabled so exactly one roster applies:
 Codex threads start with `skills.include_instructions = false` and
-`skills.bundled.enabled = false`, Claude runs with its `Skill` tool
-disallowed and its init-time slash-command list ignored, and the Cursor SDK
-bridge runs with `settingSources: []`. This repo dogfoods the mechanism
-(`.agents/skills/`).
+`skills.bundled.enabled = false` (its built-in `/` commands are TUI-only and
+never see prompt text), Claude runs with `--disable-slash-commands` (built-in
+commands, `.claude/commands`, and `.claude/skills`/plugin skills) plus its
+`Skill` tool disallowed, and the Cursor SDK bridge runs with
+`settingSources: []`. This repo dogfoods the mechanism (`.agents/skills/`).
 
 ## GitHub PRs
 
