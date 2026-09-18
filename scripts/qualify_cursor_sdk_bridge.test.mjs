@@ -61,6 +61,11 @@ import {
   startCallbackServer,
   withTimeout,
 } from "./qualify_cursor_sdk_bridge_full.mjs";
+import {
+  announcementTracker,
+  assertFinishedTurn,
+  streamAnnouncements,
+} from "./qualify_cursor_sdk_bridge_shared.mjs";
 
 async function listen(server) {
   await new Promise((accept, reject) => {
@@ -1107,4 +1112,106 @@ test("a signal received during startup prevents a later Bridge spawn", async () 
     signals.dispose();
     await rm(root, { recursive: true, force: true });
   }
+});
+
+function sharedTurnFixture({ announce = true, announceAtMs = 100 } = {}) {
+  const toolName = "trouve_shared_fixture";
+  const frames = [
+    {
+      sdkMessage: {
+        message: { type: "tool_call", name: "mcp", call_id: "call-1", status: "started" },
+      },
+    },
+    { result: { status: 3, runId: "run-1", result: { result: "FIXTURE_DONE" } } },
+    { done: { runId: "run-1" } },
+  ];
+  const announcedAtMs = new Map();
+  if (announce) announcedAtMs.set("call-1", announceAtMs);
+  streamAnnouncements.set(frames, announcedAtMs);
+  const callback = {
+    calls: [
+      {
+        toolName,
+        toolCallId: "call-1",
+        agentId: "agent-1",
+        startedAtMs: 101,
+        completedAtMs: 105,
+      },
+    ],
+  };
+  return { frames, callback, toolName };
+}
+
+test("shared qualification requires the Send stream to announce every callback", () => {
+  const announced = sharedTurnFixture();
+  const result = assertFinishedTurn(
+    announced.frames,
+    announced.callback,
+    "agent-1",
+    announced.toolName,
+    "FIXTURE_DONE",
+    "announced",
+  );
+  assert.equal(result.stream_announced_before_callback_completed, true);
+  assert.equal(result.stream_announcement_lead_ms, 1);
+
+  const unannounced = sharedTurnFixture({ announce: false });
+  assert.throws(
+    () =>
+      assertFinishedTurn(
+        unannounced.frames,
+        unannounced.callback,
+        "agent-1",
+        unannounced.toolName,
+        "FIXTURE_DONE",
+        "unannounced",
+      ),
+    /never announced the callback's call id/u,
+  );
+
+  const late = sharedTurnFixture({ announceAtMs: 106 });
+  assert.throws(
+    () =>
+      assertFinishedTurn(
+        late.frames,
+        late.callback,
+        "agent-1",
+        late.toolName,
+        "FIXTURE_DONE",
+        "late",
+      ),
+    /only after the callback completed/u,
+  );
+
+  const uninstrumented = sharedTurnFixture();
+  streamAnnouncements.delete(uninstrumented.frames);
+  assert.throws(
+    () =>
+      assertFinishedTurn(
+        uninstrumented.frames,
+        uninstrumented.callback,
+        "agent-1",
+        uninstrumented.toolName,
+        "FIXTURE_DONE",
+        "uninstrumented",
+      ),
+    /not instrumented/u,
+  );
+});
+
+test("announcement tracker records the first tool_call frame per call id and forwards frames", () => {
+  const announcedAtMs = new Map();
+  const forwarded = [];
+  const observe = announcementTracker(announcedAtMs, (frame) => forwarded.push(frame));
+  const started = { sdkMessage: { message: { type: "tool_call", call_id: "call-1" } } };
+  const completed = {
+    sdkMessage: { message: { type: "tool_call", call_id: "call-1", status: "completed" } },
+  };
+  observe(started);
+  const first = announcedAtMs.get("call-1");
+  observe(completed);
+  observe({ sdkMessage: { message: { type: "assistant" } } });
+  assert.equal(announcedAtMs.size, 1);
+  assert.equal(announcedAtMs.get("call-1"), first);
+  assert.equal(forwarded.length, 3);
 });

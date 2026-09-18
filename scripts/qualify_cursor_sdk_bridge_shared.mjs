@@ -202,7 +202,7 @@ function callbackFor(callback, toolName) {
   return calls[0];
 }
 
-function assertFinishedTurn(frames, callback, agentId, toolName, resultMarker, label) {
+export function assertFinishedTurn(frames, callback, agentId, toolName, resultMarker, label) {
   const terminal = exactTerminalResult(frames, label);
   if (!terminalStatusIsFinished(terminal.status)) {
     throw new QualificationError(`${label} ended with non-finished status ${terminal.status}`);
@@ -233,27 +233,33 @@ function assertFinishedTurn(frames, callback, agentId, toolName, resultMarker, l
   if (!finalText.includes(resultMarker)) {
     throw new QualificationError(`${label}: assistant did not use ${resultMarker}`);
   }
-  // The adapter holds a callback until the Send stream announces its call id.
-  // A Bridge that announced only after the callback returned would deadlock
-  // every tool call, so the announcement must land before completion. The
-  // lead may be slightly negative: the two channels are independent.
-  let streamAnnouncementLeadMs = null;
-  const announcedAtMs = streamAnnouncements.get(frames)?.get(call.toolCallId);
-  if (announcedAtMs !== undefined) {
-    if (call.completedAtMs !== null && announcedAtMs > call.completedAtMs) {
-      throw new QualificationError(
-        `${label}: Send stream announced the tool call only after the callback completed`,
-      );
-    }
-    streamAnnouncementLeadMs = Math.round(call.startedAtMs - announcedAtMs);
+  // The adapter refuses a callback until the Send stream announces its call
+  // id, so every qualified turn must observe that announcement, and it must
+  // land no later than the callback's completion (a Bridge that announced
+  // only afterwards would deadlock every tool call). The lead may be slightly
+  // negative: the two channels are independent.
+  const announcements = streamAnnouncements.get(frames);
+  if (announcements === undefined) {
+    throw new QualificationError(`${label}: turn was not instrumented for stream announcements`);
+  }
+  const announcedAtMs = announcements.get(call.toolCallId);
+  if (announcedAtMs === undefined) {
+    throw new QualificationError(
+      `${label}: Send stream never announced the callback's call id ${call.toolCallId}`,
+    );
+  }
+  if (call.completedAtMs !== null && announcedAtMs > call.completedAtMs) {
+    throw new QualificationError(
+      `${label}: Send stream announced the tool call only after the callback completed`,
+    );
   }
   return {
     run_id: terminal.runId ?? terminal.result?.runId,
     callback_tool: toolName,
     callback_agent_id_matched: true,
     callback_stream_id_correlated: true,
-    stream_announced_before_callback_completed: announcedAtMs !== undefined,
-    stream_announcement_lead_ms: streamAnnouncementLeadMs,
+    stream_announced_before_callback_completed: true,
+    stream_announcement_lead_ms: Math.round(call.startedAtMs - announcedAtMs),
     native_tools_present: false,
   };
 }
@@ -262,7 +268,22 @@ function assertFinishedTurn(frames, callback, agentId, toolName, resultMarker, l
 // array `send` resolves with. The production adapter dispatches a callback
 // only once the owning turn's stream has announced its call id, so the probe
 // must observe the announcement no later than the callback's completion.
-const streamAnnouncements = new WeakMap();
+export const streamAnnouncements = new WeakMap();
+
+/** Send-stream observer that records each call id's first announcement. */
+export function announcementTracker(announcedAtMs, onFrame) {
+  return (frame) => {
+    const message = frame.sdkMessage?.message;
+    if (
+      message?.type === "tool_call" &&
+      typeof message.call_id === "string" &&
+      !announcedAtMs.has(message.call_id)
+    ) {
+      announcedAtMs.set(message.call_id, performance.now());
+    }
+    onFrame?.(frame);
+  };
+}
 
 async function runToolTurn(bridge, agentId, toolName, resultMarker, timeoutMilliseconds) {
   const announcedAtMs = new Map();
@@ -278,13 +299,7 @@ async function runToolTurn(bridge, agentId, toolName, resultMarker, timeoutMilli
       options: { enableDeltas: true, enableSteps: true },
     },
     timeoutMilliseconds,
-    (frame) => {
-      const message = frame.sdkMessage?.message;
-      if (message?.type !== "tool_call" || typeof message.call_id !== "string") return;
-      if (!announcedAtMs.has(message.call_id)) {
-        announcedAtMs.set(message.call_id, performance.now());
-      }
-    },
+    announcementTracker(announcedAtMs),
   );
   streamAnnouncements.set(frames, announcedAtMs);
   return frames;
@@ -628,6 +643,7 @@ async function main() {
       (frames) => ({ frames, error: null }),
       (error) => ({ frames: null, error }),
     );
+    const survivingAnnouncedAtMs = new Map();
     const survivingSend = send(
       bridge,
       {
@@ -640,12 +656,15 @@ async function main() {
         options: { enableDeltas: true, enableSteps: true },
       },
       timeoutMilliseconds,
-      (frame) => {
+      announcementTracker(survivingAnnouncedAtMs, (frame) => {
         const runId = messageRunId(frame);
         if (runId !== undefined) cancelRunB.resolve(runId);
-      },
+      }),
     ).then(
-      (frames) => ({ frames, error: null }),
+      (frames) => {
+        streamAnnouncements.set(frames, survivingAnnouncedAtMs);
+        return { frames, error: null };
+      },
       (error) => ({ frames: null, error }),
     );
     const [runIdA, runIdB, cancelledRecord, survivingRecord] = await withTimeout(

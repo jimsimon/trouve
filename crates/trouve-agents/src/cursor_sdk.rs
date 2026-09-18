@@ -88,7 +88,14 @@ const MAX_ORPHANED_AGENTS_PER_PROCESS: usize = 16;
 const MAX_CALLBACK_REPLAY_RECORDS: usize = 64;
 const MAX_CALLBACK_REPLAY_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CALLBACK_CONCURRENCY: usize = 8;
-const MAX_CALLBACK_HTTP_CONCURRENCY: usize = MAX_CONCURRENT_TURNS * MAX_CALLBACK_CONCURRENCY;
+// Callbacks a route may hold while waiting for their Send-stream
+// announcement. Kept apart from execution permits so delayed retries the
+// stream never announces cannot occupy the route's dispatch capacity.
+const MAX_PENDING_CORROBORATION_PER_ROUTE: usize = 8;
+// Process-wide ingress covers every route's execution and pending slots so a
+// full pending pool on one route cannot consume another route's admission.
+const MAX_CALLBACK_HTTP_CONCURRENCY: usize =
+    MAX_CONCURRENT_TURNS * (MAX_CALLBACK_CONCURRENCY + MAX_PENDING_CORROBORATION_PER_ROUTE);
 const MAX_LEGACY_SESSION_MARKER_BYTES: u64 = 4 * 1024;
 const MIN_THREAD_GATE_SWEEP: usize = 64;
 const READY_PREFIX: &str = "cursor-sdk-bridge ready ";
@@ -1012,6 +1019,8 @@ impl BridgePool {
         })
     }
 
+    /// Admit a tool-capable turn to one of the callback-owner lanes that
+    /// size the shared callback ingress.
     async fn acquire_turn_admission(
         &self,
         cancel: &CancellationToken,
@@ -1032,6 +1041,8 @@ impl BridgePool {
             .await
     }
 
+    /// Wait for a permit on `lane`, giving up on pool closure, turn
+    /// cancellation, or the event consumer going away.
     async fn acquire_turn_lane(
         &self,
         lane: &Arc<Semaphore>,
@@ -1936,7 +1947,11 @@ struct CallbackRoute {
     allowed_tools: Arc<HashSet<String>>,
     http: reqwest::Client,
     supervisor: Arc<CallbackSupervisor>,
+    /// Execution permits: callbacks that are corroborated and dispatching.
     request_slots: Arc<Semaphore>,
+    /// Callbacks waiting for their Send-stream announcement. Separate from
+    /// `request_slots` so stale waiters cannot starve dispatchable calls.
+    pending_corroboration_slots: Arc<Semaphore>,
     identities: Arc<StdMutex<CallbackIdentities>>,
     streamed_call_ids: StdMutex<HashSet<CallbackKey>>,
     /// Bumped after every `streamed_call_ids` insertion so callbacks that
@@ -2016,6 +2031,8 @@ impl CallbackRoute {
         claim
     }
 
+    /// Record a `tool_call` id announced by this turn's Send stream, claiming
+    /// it for this route's generation and waking callbacks waiting on it.
     fn observe_stream_call_id(&self, call_id: &str) -> Result<(), String> {
         let call_id = callback_key(call_id);
         match self.claim_identity(call_id) {
@@ -2038,6 +2055,13 @@ impl CallbackRoute {
         }
     }
 
+    /// Whether a callback for `call_id` must wait for its Send-stream
+    /// announcement before dispatch. Owner-less test routes never wait.
+    fn requires_corroboration_wait(&self, call_id: &CallbackKey) -> bool {
+        self.owner_reusable.is_some() && !self.stream_announced(call_id)
+    }
+
+    /// Whether this turn's Send stream has already announced `call_id`.
     fn stream_announced(&self, call_id: &CallbackKey) -> bool {
         self.streamed_call_ids
             .lock()
@@ -2386,6 +2410,9 @@ impl CallbackRouter {
             http: self.http.clone(),
             supervisor: supervisor.clone(),
             request_slots: Arc::new(Semaphore::new(MAX_CALLBACK_CONCURRENCY)),
+            pending_corroboration_slots: Arc::new(Semaphore::new(
+                MAX_PENDING_CORROBORATION_PER_ROUTE,
+            )),
             identities: self.state.identities.clone(),
             streamed_call_ids: StdMutex::new(HashSet::new()),
             streamed_call_version: watch::Sender::new(0),
@@ -2535,6 +2562,8 @@ impl CallbackRouteLease {
         identities_correlated
     }
 
+    /// Remove this settled route from the router so its agent id can bind
+    /// again on the same listener.
     fn detach(&mut self) {
         if !self.active {
             return;
@@ -2602,6 +2631,10 @@ async fn authenticate_callback(
     next.run(request).await
 }
 
+/// Authenticated `CallCustomTool` ingress: resolve the agent's route, fence
+/// the call id against earlier generations, wait for the owning turn's Send
+/// stream to announce it, then execute (or replay) it through the turn's MCP
+/// endpoint under the route's execution permits.
 async fn custom_tool_callback(
     State(state): State<CallbackState>,
     Extension(ingress_generation): Extension<CallbackIngressGeneration>,
@@ -2634,13 +2667,6 @@ async fn custom_tool_callback(
             "callback agent route is shutting down",
         );
     }
-    let Ok(_route_permit) = route.request_slots.clone().try_acquire_owned() else {
-        return callback_error(
-            StatusCode::TOO_MANY_REQUESTS,
-            "resource_exhausted",
-            "too many custom-tool callback requests are active for this Cursor route",
-        );
-    };
     if request.tool_name.is_empty() || !request.args.is_object() {
         return callback_error(
             StatusCode::BAD_REQUEST,
@@ -2687,9 +2713,28 @@ async fn custom_tool_callback(
             );
         }
     }
-    // Bind the callback to the current turn before executing anything. The
-    // route permit held above bounds how many callbacks can wait here.
-    if !route.await_stream_corroboration(&call_key).await {
+    // Bind the callback to the current turn before it can hold an execution
+    // permit. Waiting callbacks draw from their own bounded pool so a burst
+    // of delayed, never-announced retries cannot occupy the route's
+    // execution capacity for the length of the corroboration window.
+    // Already-announced callbacks skip the pool entirely.
+    let corroborated = if route.requires_corroboration_wait(&call_key) {
+        let Ok(_pending_permit) = route
+            .pending_corroboration_slots
+            .clone()
+            .try_acquire_owned()
+        else {
+            return callback_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "resource_exhausted",
+                "too many custom-tool callbacks are awaiting Cursor turn corroboration for this route",
+            );
+        };
+        route.await_stream_corroboration(&call_key).await
+    } else {
+        true
+    };
+    if !corroborated {
         if route.accepting.load(Ordering::Acquire) {
             tracing::warn!(
                 "cursor: refusing custom-tool callback for agent {} whose call id the Send stream never announced",
@@ -2702,6 +2747,13 @@ async fn custom_tool_callback(
             "tool-call id was not announced by the active Cursor turn",
         );
     }
+    let Ok(_route_permit) = route.request_slots.clone().try_acquire_owned() else {
+        return callback_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "resource_exhausted",
+            "too many custom-tool callback requests are active for this Cursor route",
+        );
+    };
     let fingerprint = callback_fingerprint(&request);
     let (mut outcome, execute) = {
         let mut calls = route.supervisor.calls.lock().await;
@@ -5784,6 +5836,116 @@ server.serve_forever()
             "a refused unannounced callback quarantined the Bridge"
         );
 
+        callback.stop().await.unwrap();
+        mcp_server.abort();
+    }
+
+    #[tokio::test]
+    async fn unannounced_callbacks_do_not_hold_route_execution_permits() {
+        let mcp_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let mcp_server = tokio::spawn({
+            let mcp_calls = mcp_calls.clone();
+            async move {
+                axum::serve(
+                    listener,
+                    Router::new().route(
+                        "/mcp",
+                        post(move || {
+                            let mcp_calls = mcp_calls.clone();
+                            async move {
+                                mcp_calls.fetch_add(1, Ordering::AcqRel);
+                                Json(json!({
+                                    "jsonrpc": "2.0",
+                                    "id": "fixture",
+                                    "result": { "content": [] }
+                                }))
+                            }
+                        }),
+                    ),
+                )
+                .await
+            }
+        });
+        let callback = CallbackRouter::start(reqwest::Client::new()).await.unwrap();
+        let reusable = Arc::new(AtomicBool::new(true));
+        let mut route = callback
+            .register(
+                "agent-flooded".into(),
+                Some(format!("http://{address}/mcp")),
+                HashSet::from(["shared_tool".into()]),
+                CancellationToken::new(),
+                Some(Arc::downgrade(&reusable)),
+            )
+            .await
+            .unwrap();
+        let http = reqwest::Client::new();
+        let send_callback = |call_id: String| {
+            let http = http.clone();
+            let url = format!("{}{}", callback.url, CALLBACK_PATH);
+            let bearer = callback.bearer.clone();
+            tokio::spawn(async move {
+                http.post(url)
+                    .bearer_auth(bearer)
+                    .json(&json!({
+                        "toolName": "shared_tool",
+                        "toolCallId": call_id,
+                        "agentId": "agent-flooded",
+                        "args": {},
+                    }))
+                    .send()
+                    .await
+            })
+        };
+
+        // Fill the pending pool with retries this turn's stream never announces.
+        let stale = (0..MAX_PENDING_CORROBORATION_PER_ROUTE)
+            .map(|index| send_callback(format!("stale-{index}")))
+            .collect::<Vec<_>>();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while route.route.pending_corroboration_slots.available_permits() != 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("stale callbacks did not enter the pending-corroboration pool");
+        assert_eq!(
+            route.route.request_slots.available_permits(),
+            MAX_CALLBACK_CONCURRENCY,
+            "waiting callbacks consumed execution permits"
+        );
+
+        // One more unannounced callback is refused outright rather than queued.
+        let overflow = send_callback("stale-overflow".into())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(overflow.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // An announced callback dispatches without waiting for the stale
+        // waiters to time out.
+        route.route.observe_stream_call_id("live-call").unwrap();
+        let live = tokio::time::timeout(Duration::from_secs(2), send_callback("live-call".into()))
+            .await
+            .expect("an announced callback waited behind unannounced ones")
+            .unwrap()
+            .unwrap();
+        assert_eq!(live.status(), StatusCode::OK);
+        assert_eq!(mcp_calls.load(Ordering::Acquire), 1);
+
+        assert!(route.stop().await);
+        for request in stale {
+            let response = tokio::time::timeout(Duration::from_secs(2), request)
+                .await
+                .expect("route stop did not release a stale waiter")
+                .unwrap()
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+        assert_eq!(mcp_calls.load(Ordering::Acquire), 1);
         callback.stop().await.unwrap();
         mcp_server.abort();
     }
