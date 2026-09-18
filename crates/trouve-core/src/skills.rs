@@ -167,8 +167,11 @@ fn open_beneath(base: &Path, relative: &Path) -> Option<std::fs::File> {
     for directory in directories {
         parent = open_at(&parent, directory, libc::O_DIRECTORY)?;
     }
-    let file: std::fs::File = open_at(&parent, leaf, 0)?.into();
-    // A FIFO or device would block or stream; only regular files are skills.
+    // `O_NONBLOCK` keeps a FIFO from blocking the open until a writer
+    // appears (discovery runs synchronously at thread creation and turn
+    // start); it has no effect on regular-file reads. Anything that is not
+    // a regular file is then rejected outright.
+    let file: std::fs::File = open_at(&parent, leaf, libc::O_NONBLOCK)?.into();
     file.metadata().ok()?.is_file().then_some(file)
 }
 
@@ -548,6 +551,31 @@ mod tests {
             .collect();
         // `ship` is now a symlink too, so only `real` survives.
         assert_eq!(names, ["real"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_skill_files_are_skipped_without_blocking() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let dir = repo.join(".agents/skills/pipe");
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo =
+            std::ffi::CString::new(dir.join("SKILL.md").to_string_lossy().as_bytes()).unwrap();
+        // SAFETY: `fifo` is a valid NUL-terminated path for the call.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        write_skill(&repo, ".agents/skills/real", "# Real\n\nbody");
+
+        let started = std::time::Instant::now();
+        let names: Vec<_> = discover(None, Some(&repo))
+            .into_iter()
+            .map(|skill| skill.name)
+            .collect();
+        assert_eq!(names, ["real"]);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "a FIFO with no writer must not block discovery"
+        );
     }
 
     #[test]
