@@ -37,6 +37,12 @@ const MAX_DESCRIPTION_CHARS: usize = 200;
 /// Byte budget for the advertised catalog in a system prompt or vendor
 /// instructions. Entries past the budget are summarised as a count.
 const MAX_CATALOG_BYTES: usize = 12 * 1024;
+/// Deterministic cap on skill directories examined per root (sorted by
+/// name). Bounds discovery I/O, the persisted `CommandsUpdated` payload,
+/// and client state for a workspace with an enormous skills tree.
+const MAX_SKILLS_PER_ROOT: usize = 256;
+/// Longest publishable command name; longer names are not typed back.
+const MAX_COMMAND_NAME_CHARS: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Skill {
@@ -45,10 +51,12 @@ pub struct Skill {
     pub description: String,
     /// Absolute path to the SKILL.md file.
     pub path: PathBuf,
-    /// Canonical skills directory the file was discovered in. Reads verify
-    /// the file still resolves beneath it, so a symlink swapped in after
-    /// discovery cannot pull foreign content into a prompt.
-    root: PathBuf,
+    /// Canonical base (config dir or workspace root) and the link-free
+    /// relative path beneath it. Every read walks `relative` component by
+    /// component from `base` without following symlinks, so a link swapped
+    /// in after discovery cannot pull foreign content into a prompt.
+    base: PathBuf,
+    relative: PathBuf,
 }
 
 impl Skill {
@@ -73,7 +81,10 @@ pub struct Invocation<'s, 'p> {
 /// whitespace can be published as `/<name>` and typed back. Roster matching
 /// is the only other validity check.
 fn is_command_name(name: &str) -> bool {
-    !name.is_empty() && !name.starts_with('/') && !name.contains(char::is_whitespace)
+    !name.is_empty()
+        && name.chars().count() <= MAX_COMMAND_NAME_CHARS
+        && !name.starts_with('/')
+        && !name.contains(char::is_whitespace)
 }
 
 /// Split a leading `/name` off `prompt`. Only the first token counts, so
@@ -112,15 +123,72 @@ fn strip_front_matter(text: &str) -> &str {
     text
 }
 
-/// Bounded, confined read of a SKILL.md. The file must resolve (after
-/// following symlinks) beneath `root`, and at most [`MAX_SKILL_READ_BYTES`]
-/// are read. Returns the text and whether the file continued past the cap.
-fn read_confined(path: &Path, root: &Path) -> Option<(String, bool)> {
-    let canonical = path.canonicalize().ok()?;
-    if !canonical.starts_with(root) {
+/// Open `base/relative` without following any symlink: the base directory
+/// is opened by its canonical path, then every component is opened relative
+/// to the previous directory handle with `O_NOFOLLOW`. Because the walk uses
+/// handles rather than re-resolving a checked pathname, a concurrent writer
+/// swapping an ancestor for a symlink cannot redirect the open.
+#[cfg(unix)]
+fn open_beneath(base: &Path, relative: &Path) -> Option<std::fs::File> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let components: Vec<&std::ffi::OsStr> = relative
+        .components()
+        .map(|component| match component {
+            std::path::Component::Normal(name) => Some(name),
+            _ => None,
+        })
+        .collect::<Option<_>>()?;
+    let (leaf, directories) = components.split_last()?;
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    let mut parent: OwnedFd = options.open(base).ok()?.into();
+    let open_at = |parent: &OwnedFd, name: &std::ffi::OsStr, flags: libc::c_int| {
+        let name = CString::new(name.as_bytes()).ok()?;
+        // SAFETY: `parent` is an open descriptor and `name` a valid C string
+        // for the duration of the call; the returned fd is owned immediately.
+        let fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | flags,
+            )
+        };
+        (fd >= 0).then(|| {
+            // SAFETY: openat returned one newly-owned descriptor.
+            unsafe { OwnedFd::from_raw_fd(fd) }
+        })
+    };
+    for directory in directories {
+        parent = open_at(&parent, directory, libc::O_DIRECTORY)?;
+    }
+    let file: std::fs::File = open_at(&parent, leaf, 0)?.into();
+    // A FIFO or device would block or stream; only regular files are skills.
+    file.metadata().ok()?.is_file().then_some(file)
+}
+
+/// Portable fallback: verify the canonical target stays beneath `base`, then
+/// open. Not race-free, but symlink escapes at rest are still refused.
+#[cfg(not(unix))]
+fn open_beneath(base: &Path, relative: &Path) -> Option<std::fs::File> {
+    let canonical = base.join(relative).canonicalize().ok()?;
+    if !canonical.starts_with(base) {
         return None;
     }
     let file = std::fs::File::open(&canonical).ok()?;
+    file.metadata().ok()?.is_file().then_some(file)
+}
+
+/// Bounded, confined read of a SKILL.md beneath `base`. At most
+/// [`MAX_SKILL_READ_BYTES`] are read. Returns the text and whether the file
+/// continued past the cap.
+fn read_confined(base: &Path, relative: &Path) -> Option<(String, bool)> {
+    let file = open_beneath(base, relative)?;
     let mut bytes = Vec::new();
     file.take(MAX_SKILL_READ_BYTES as u64 + 1)
         .read_to_end(&mut bytes)
@@ -156,12 +224,12 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
 /// original `/skill` text.
 pub fn invocation_block(invocation: &Invocation<'_, '_>) -> String {
     let skill = invocation.skill;
-    let Some((raw, read_truncated)) = read_confined(&skill.path, &skill.root) else {
+    let Some((raw, read_truncated)) = read_confined(&skill.base, &skill.relative) else {
         return format!(
             "The user invoked `/{name}`, but its SKILL.md at {path} could not be read \
-             from within the approved skills directory (missing, unreadable, or a \
-             symlink leaving that directory). Tell the user the skill is unavailable \
-             and do not guess at its contents.",
+             from within its skills directory (missing, unreadable, or reached through \
+             a symlink). Tell the user the skill is unavailable and do not guess at \
+             its contents.",
             name = skill.name,
             path = skill.path.display(),
         );
@@ -243,20 +311,28 @@ fn parse_front_matter(text: &str) -> (Option<String>, Option<String>) {
     (name, description)
 }
 
-fn load_dir(dir: &Path, out: &mut BTreeMap<String, Skill>) {
-    // Canonicalise the root once; every SKILL.md must resolve beneath it.
-    let Ok(root) = dir.canonicalize() else {
+/// Load skills from `base/<skills_dir>/*/SKILL.md`. Directory listing is
+/// advisory (it only decides which names are tried); every read walks from
+/// the canonical `base` without following symlinks.
+fn load_dir(base: &Path, skills_dir: &Path, out: &mut BTreeMap<String, Skill>) {
+    let Ok(base) = base.canonicalize() else {
         return;
     };
-    let Ok(entries) = std::fs::read_dir(dir) else {
+    let dir = base.join(skills_dir);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
         return;
     };
-    for entry in entries.flatten() {
-        let skill_md = entry.path().join("SKILL.md");
-        let Some((text, _)) = read_confined(&skill_md, &root) else {
+    // Deterministic order and a hard cap: the same tree always yields the
+    // same roster, and a huge tree cannot make discovery unbounded.
+    let mut names: Vec<std::ffi::OsString> =
+        entries.flatten().map(|entry| entry.file_name()).collect();
+    names.sort();
+    for dir_name in names.into_iter().take(MAX_SKILLS_PER_ROOT) {
+        let relative = skills_dir.join(&dir_name).join("SKILL.md");
+        let Some((text, _)) = read_confined(&base, &relative) else {
             continue;
         };
-        let dir_name = entry.file_name().to_string_lossy().to_string();
+        let dir_name = dir_name.to_string_lossy().to_string();
         let (name, description) = parse_front_matter(&text);
         let name = name.unwrap_or(dir_name);
         if !is_command_name(&name) {
@@ -276,8 +352,9 @@ fn load_dir(dir: &Path, out: &mut BTreeMap<String, Skill>) {
             Skill {
                 name,
                 description,
-                path: skill_md,
-                root: root.clone(),
+                path: base.join(&relative),
+                base: base.clone(),
+                relative,
             },
         );
     }
@@ -287,10 +364,10 @@ fn load_dir(dir: &Path, out: &mut BTreeMap<String, Skill>) {
 pub fn discover(config_dir: Option<&Path>, workspace_root: Option<&Path>) -> Vec<Skill> {
     let mut skills = BTreeMap::new();
     if let Some(dir) = config_dir {
-        load_dir(&dir.join("skills"), &mut skills);
+        load_dir(dir, Path::new("skills"), &mut skills);
     }
     if let Some(root) = workspace_root {
-        load_dir(&root.join(".agents").join("skills"), &mut skills);
+        load_dir(root, Path::new(".agents/skills"), &mut skills);
     }
     skills.into_values().collect()
 }
@@ -405,7 +482,11 @@ mod tests {
             name: name.into(),
             description: description.into(),
             path: path.into(),
-            root: "/".into(),
+            base: "/".into(),
+            relative: Path::new(path)
+                .strip_prefix("/")
+                .unwrap_or(Path::new(path))
+                .to_path_buf(),
         }
     }
 
@@ -452,6 +533,38 @@ mod tests {
         let block = invocation_block(&invocation("/ship", &skills).unwrap());
         assert!(!block.contains("TOP SECRET"));
         assert!(block.contains("could not be read"));
+
+        // A symlinked skill *directory* is refused as well, even when its
+        // target lives inside the skills root: no component may be a link.
+        write_skill(&repo, ".agents/skills/real", "# Real\n\nreal body");
+        std::os::unix::fs::symlink(
+            repo.join(".agents/skills/real"),
+            repo.join(".agents/skills/alias"),
+        )
+        .unwrap();
+        let names: Vec<_> = discover(None, Some(&repo))
+            .into_iter()
+            .map(|skill| skill.name)
+            .collect();
+        // `ship` is now a symlink too, so only `real` survives.
+        assert_eq!(names, ["real"]);
+    }
+
+    #[test]
+    fn discovery_is_capped_and_deterministic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        for i in 0..MAX_SKILLS_PER_ROOT + 20 {
+            write_skill(&repo, &format!(".agents/skills/s{i:04}"), "body");
+        }
+        let skills = discover(None, Some(&repo));
+        assert_eq!(skills.len(), MAX_SKILLS_PER_ROOT);
+        assert_eq!(skills[0].name, "s0000");
+        assert_eq!(
+            skills.last().unwrap().name,
+            format!("s{:04}", MAX_SKILLS_PER_ROOT - 1)
+        );
+        assert_eq!(discover(None, Some(&repo)), skills);
     }
 
     #[test]
@@ -565,7 +678,11 @@ mod tests {
         assert_eq!(skills.len(), 2);
         let deploy = skills.iter().find(|s| s.name == "deploy").unwrap();
         assert_eq!(deploy.description, "Repo deploy skill");
-        assert!(deploy.path.starts_with(repo.join(".agents")));
+        assert!(
+            deploy
+                .path
+                .starts_with(repo.canonicalize().unwrap().join(".agents"))
+        );
         let review = skills.iter().find(|s| s.name == "review").unwrap();
         assert_eq!(review.description, "How to review PRs here.");
     }

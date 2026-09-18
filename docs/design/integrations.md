@@ -95,10 +95,14 @@ The engine owns this roster for every route. On each turn it is:
   vendor failover re-supplies it alongside the transcript handoff. The
   transcript always keeps the user's original `/skill ...` text.
 
-Skill files are workspace-controlled input. A `SKILL.md` is only read if it
-resolves (after following symlinks) beneath the skills directory it was
-discovered in, at most ~36 KiB of it is ever read, and a skill whose name
-cannot be typed back as a single `/token` is not published.
+Skill files are workspace-controlled input. Every `SKILL.md` is opened by
+walking `<skills dir>/<name>/SKILL.md` component by component from a handle
+on the canonical config dir or workspace root with `O_NOFOLLOW`, so no
+symlink at any level is followed and a link swapped in between discovery
+and invocation cannot redirect the read. At most ~36 KiB of a file is read,
+at most 256 skill directories per root are examined (sorted by name), and a
+skill whose name cannot be typed back as a single `/token` of ≤ 64
+characters is not published.
 
 Vendor-native skill mechanisms are disabled so exactly one roster applies:
 Codex threads start with `skills.include_instructions = false` and
