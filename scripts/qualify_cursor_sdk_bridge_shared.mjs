@@ -8,8 +8,9 @@
  * settlement and quarantine are covered by the Rust adapter tests. This exercises
  * per-agent Trouve-owned workspace routes and tool catalogs, concurrent sends,
  * cancellation isolation, vendor-capability warm close/resume, and cold resume after
- * a Bridge restart. Production rotates the process before routing one durable agent
- * id again because the callback wire carries no turn nonce.
+ * a Bridge restart. The callback wire carries no turn nonce, so production binds
+ * each callback to its turn by waiting for the Send stream to announce the call
+ * id; this probe records that the announcement precedes callback completion.
  *
  * The probe performs six paid local SDK turns. It never prints account identity
  * or CURSOR_API_KEY and removes all temporary state unless --keep-state is set.
@@ -201,7 +202,7 @@ function callbackFor(callback, toolName) {
   return calls[0];
 }
 
-function assertFinishedTurn(frames, callback, agentId, toolName, resultMarker, label) {
+export function assertFinishedTurn(frames, callback, agentId, toolName, resultMarker, label) {
   const terminal = exactTerminalResult(frames, label);
   if (!terminalStatusIsFinished(terminal.status)) {
     throw new QualificationError(`${label} ended with non-finished status ${terminal.status}`);
@@ -232,17 +233,61 @@ function assertFinishedTurn(frames, callback, agentId, toolName, resultMarker, l
   if (!finalText.includes(resultMarker)) {
     throw new QualificationError(`${label}: assistant did not use ${resultMarker}`);
   }
+  // The adapter refuses a callback until the Send stream announces its call
+  // id, so every qualified turn must observe that announcement, and it must
+  // land no later than the callback's completion (a Bridge that announced
+  // only afterwards would deadlock every tool call). The lead may be slightly
+  // negative: the two channels are independent.
+  const announcements = streamAnnouncements.get(frames);
+  if (announcements === undefined) {
+    throw new QualificationError(`${label}: turn was not instrumented for stream announcements`);
+  }
+  const announcedAtMs = announcements.get(call.toolCallId);
+  if (announcedAtMs === undefined) {
+    throw new QualificationError(
+      `${label}: Send stream never announced the callback's call id ${call.toolCallId}`,
+    );
+  }
+  if (call.completedAtMs !== null && announcedAtMs > call.completedAtMs) {
+    throw new QualificationError(
+      `${label}: Send stream announced the tool call only after the callback completed`,
+    );
+  }
   return {
     run_id: terminal.runId ?? terminal.result?.runId,
     callback_tool: toolName,
     callback_agent_id_matched: true,
     callback_stream_id_correlated: true,
+    stream_announced_before_callback_completed: true,
+    stream_announcement_lead_ms: Math.round(call.startedAtMs - announcedAtMs),
     native_tools_present: false,
   };
 }
 
+// First Send-stream `tool_call` announcement per call id, keyed by the frame
+// array `send` resolves with. The production adapter dispatches a callback
+// only once the owning turn's stream has announced its call id, so the probe
+// must observe the announcement no later than the callback's completion.
+export const streamAnnouncements = new WeakMap();
+
+/** Send-stream observer that records each call id's first announcement. */
+export function announcementTracker(announcedAtMs, onFrame) {
+  return (frame) => {
+    const message = frame.sdkMessage?.message;
+    if (
+      message?.type === "tool_call" &&
+      typeof message.call_id === "string" &&
+      !announcedAtMs.has(message.call_id)
+    ) {
+      announcedAtMs.set(message.call_id, performance.now());
+    }
+    onFrame?.(frame);
+  };
+}
+
 async function runToolTurn(bridge, agentId, toolName, resultMarker, timeoutMilliseconds) {
-  return send(
+  const announcedAtMs = new Map();
+  const frames = await send(
     bridge,
     {
       agentId,
@@ -254,7 +299,10 @@ async function runToolTurn(bridge, agentId, toolName, resultMarker, timeoutMilli
       options: { enableDeltas: true, enableSteps: true },
     },
     timeoutMilliseconds,
+    announcementTracker(announcedAtMs),
   );
+  streamAnnouncements.set(frames, announcedAtMs);
+  return frames;
 }
 
 async function processRssBytes(pid) {
@@ -595,6 +643,7 @@ async function main() {
       (frames) => ({ frames, error: null }),
       (error) => ({ frames: null, error }),
     );
+    const survivingAnnouncedAtMs = new Map();
     const survivingSend = send(
       bridge,
       {
@@ -607,12 +656,15 @@ async function main() {
         options: { enableDeltas: true, enableSteps: true },
       },
       timeoutMilliseconds,
-      (frame) => {
+      announcementTracker(survivingAnnouncedAtMs, (frame) => {
         const runId = messageRunId(frame);
         if (runId !== undefined) cancelRunB.resolve(runId);
-      },
+      }),
     ).then(
-      (frames) => ({ frames, error: null }),
+      (frames) => {
+        streamAnnouncements.set(frames, survivingAnnouncedAtMs);
+        return { frames, error: null };
+      },
       (error) => ({ frames: null, error }),
     );
     const [runIdA, runIdB, cancelledRecord, survivingRecord] = await withTimeout(
@@ -673,7 +725,7 @@ async function main() {
       surviving_callback_completed: survivingRecord.ok,
       surviving_turn: survived,
       adapter_route_settlement_covered_by:
-        "cursor_adapter_cancellation_settles_route_and_recycles_before_resume",
+        "cursor_adapter_cancellation_settles_route_and_reuses_bridge_on_resume",
     };
     if (!cancellation.surviving_callback_completed) {
       throw new QualificationError("parallel cancellation did not isolate the surviving agent");
@@ -747,8 +799,10 @@ async function main() {
       concurrent_sends: true,
       cancellation_isolated: true,
       warm_close_resume_vendor_capability: true,
-      production_same_agent_process_rotation_covered_by:
-        "cursor_adapter_cancellation_settles_route_and_recycles_before_resume",
+      production_same_agent_warm_resume_covered_by:
+        "cursor_adapter_cancellation_settles_route_and_reuses_bridge_on_resume",
+      production_callback_stream_corroboration_covered_by:
+        "retired_agent_id_rebinds_and_only_stream_announced_callbacks_execute",
       cold_process_resume: true,
       native_tools_present: false,
       warm_bridge_rss_bytes: warmRssBytes,
