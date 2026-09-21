@@ -6,6 +6,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [4.13.0] - 2026-09-21
+
+This release brings live steering and model options to automatic routes and
+reviewer personas, and keeps vendor reasoning grouped around the tool calls it
+led to.
+
 ### Added
 
 - **Steering on automatic model routes**: a thread on an `auto/<model>`
@@ -35,6 +41,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   every role that used automatic routing in both the review UI and the
   desktop app. Routes now share an option when they accept the same values,
   regardless of title or description text.
+- **Claude and Cursor reasoning stays beside the tool call it led to**:
+  thinking blocks now close at tool-call boundaries instead of merging the
+  whole turn's reasoning into one item ahead of every call. Claude error
+  results also close any open thinking block so failed turns no longer leave
+  reasoning displayed as still running.
 
 ## [4.12.0] - 2026-09-18
 
@@ -1594,6 +1605,7 @@ semble ([BENCHMARKS.md](BENCHMARKS.md)):
 - Incremental reindex (1 file touched): 0.86 s vs ~3 min (212x)
 - Warm query: 0.55 s vs 7.2 s (13x)
 
+[4.13.0]: https://github.com/jimsimon/trouve/compare/v4.12.0...v4.13.0
 [4.12.0]: https://github.com/jimsimon/trouve/compare/v4.11.0...v4.12.0
 [4.11.0]: https://github.com/jimsimon/trouve/compare/v4.10.1...v4.11.0
 [4.10.1]: https://github.com/jimsimon/trouve/compare/v4.10.0...v4.10.1

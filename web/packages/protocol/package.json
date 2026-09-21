@@ -1,6 +1,6 @@
 {
   "name": "@trouve-ai/protocol",
-  "version": "4.12.0",
+  "version": "4.13.0",
   "private": true,
   "type": "module",
   "description": "Typed trouve server protocol: OpenAPI-generated types, the fetch client, the cursor event stream, and CSP-safe runtime validators.",
@@ -30,7 +30,7 @@
     "node": ">=24"
   },
   "dependencies": {
-    "@trouve-ai/ui-foundation": "4.12.0",
+    "@trouve-ai/ui-foundation": "4.13.0",
     "openapi-fetch": "0.17.0"
   },
   "devDependencies": {

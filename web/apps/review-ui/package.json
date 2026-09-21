@@ -1,7 +1,7 @@
 {
   "name": "@trouve-ai/review-ui",
   "private": true,
-  "version": "4.12.0",
+  "version": "4.13.0",
   "type": "module",
   "description": "Self-hosted review site: a thin shell that serves the shared @trouve-ai/code-review dashboard behind nginx.",
   "license": "MIT",
@@ -19,10 +19,10 @@
     "node": ">=24"
   },
   "dependencies": {
-    "@trouve-ai/code-review": "4.12.0",
-    "@trouve-ai/content-rendering": "4.12.0",
-    "@trouve-ai/transcript": "4.12.0",
-    "@trouve-ai/ui-foundation": "4.12.0",
+    "@trouve-ai/code-review": "4.13.0",
+    "@trouve-ai/content-rendering": "4.13.0",
+    "@trouve-ai/transcript": "4.13.0",
+    "@trouve-ai/ui-foundation": "4.13.0",
     "lit": "^3.3.3"
   },
   "devDependencies": {
