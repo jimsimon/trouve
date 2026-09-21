@@ -1192,6 +1192,21 @@ impl AgentBackend for ClaudeBackend {
                     if let Some(sid) = ev["session_id"].as_str() {
                         *proc_.session.lock().unwrap() = Some(sid.to_string());
                     }
+                    // An error result ends the turn like a success result:
+                    // close any thinking still open so the reasoning that
+                    // streamed before the failure is finalized, not left
+                    // running. The send is best-effort because the error
+                    // follows either way.
+                    for out in projection.close_thinking() {
+                        let sent = tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => false,
+                            sent = tx.send(Ok(out)) => sent.is_ok(),
+                        };
+                        if !sent {
+                            break;
+                        }
+                    }
                     let _ = tx.send(Err(BackendError::Protocol(error))).await;
                     completed = true;
                     break;

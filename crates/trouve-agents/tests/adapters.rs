@@ -428,6 +428,45 @@ EOF
 }
 
 #[tokio::test]
+async fn claude_adapter_closes_open_thinking_before_an_error_result() {
+    let tmp = tempfile::tempdir().unwrap();
+    let stub = write_stub(
+        tmp.path(),
+        "claude-thinking-error",
+        r#"#!/bin/bash
+cat <<'EOF'
+{"type":"system","subtype":"init","session_id":"sess-err-1"}
+{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Halfway through"}}}
+{"type":"result","subtype":"error_during_execution","is_error":true,"session_id":"sess-err-2","result":"API connection lost"}
+EOF
+"#,
+    );
+    let backend = ClaudeBackend::new("claude-code", Some(stub));
+    let mut stream = start_turn(&backend, || {
+        turn(tmp.path().to_path_buf(), None, BackendPermission::ReadOnly)
+    })
+    .await;
+
+    assert!(matches!(
+        stream.next().await,
+        Some(Ok(BackendEvent::SessionStarted { session_id })) if session_id == "sess-err-1"
+    ));
+    assert!(matches!(
+        stream.next().await,
+        Some(Ok(BackendEvent::ThinkingDelta(text))) if text == "Halfway through"
+    ));
+    // The reasoning that streamed before the failure is finalized before
+    // the error is reported, so the transcript never shows it still running.
+    assert!(matches!(
+        stream.next().await,
+        Some(Ok(BackendEvent::ThinkingCompleted))
+    ));
+    let error = stream.next().await.unwrap().unwrap_err().to_string();
+    assert!(error.contains("API connection lost"), "{error}");
+    assert!(stream.next().await.is_none());
+}
+
+#[tokio::test]
 async fn claude_adapter_reads_subscription_usage() {
     let tmp = tempfile::tempdir().unwrap();
     let soon = chrono::Utc::now().timestamp() + 2 * 3600 + 600;
