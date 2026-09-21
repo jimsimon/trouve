@@ -1,6 +1,6 @@
 {
   "name": "@trouve-ai/code-review",
-  "version": "4.12.0",
+  "version": "4.13.0",
   "private": true,
   "type": "module",
   "description": "Lit code review dashboard shared by the self-hosted review site and the desktop app, drawn from the ui-foundation design system and rendering task activity through the shared transcript: the review operations screens, the parameterized review API client, protocol types, and the dashboard stylesheet.",
@@ -34,9 +34,9 @@
     "node": ">=24"
   },
   "dependencies": {
-    "@trouve-ai/protocol": "4.12.0",
-    "@trouve-ai/transcript": "4.12.0",
-    "@trouve-ai/ui-foundation": "4.12.0",
+    "@trouve-ai/protocol": "4.13.0",
+    "@trouve-ai/transcript": "4.13.0",
+    "@trouve-ai/ui-foundation": "4.13.0",
     "chart.js": "^4.5.0",
     "lit": "^3.3.3"
   }
