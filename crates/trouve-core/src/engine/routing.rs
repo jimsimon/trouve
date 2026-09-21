@@ -73,6 +73,20 @@ struct RouteAttemptFailure {
     kind: RouteFailureKind,
     message: String,
     safe_to_retry: bool,
+    /// The route streamed visible output (text or reasoning) before failing.
+    /// A same-route retry resends the original prompt, which is only correct
+    /// while the transcript still ends with that prompt.
+    produced_output: bool,
+}
+
+impl RouteAttemptFailure {
+    /// Whether one more attempt on the same route is worth trying before
+    /// failing over. Capacity and authentication failures are deterministic
+    /// for at least minutes; anything that already had side effects or
+    /// visible output cannot be replayed verbatim.
+    fn retryable_on_same_route(&self) -> bool {
+        self.kind == RouteFailureKind::Unavailable && self.safe_to_retry && !self.produced_output
+    }
 }
 
 enum RouteAttemptResult {
@@ -449,10 +463,11 @@ fn subscription_health_rank(health: &trouve_protocol::SubscriptionHealth) -> (u8
 fn native_attempt_failure(
     error: trouve_providers::ProviderError,
     side_effect_started: bool,
+    produced_output: bool,
 ) -> RouteAttemptFailure {
     let kind = if error.is_capacity_exhausted() {
         RouteFailureKind::Capacity
-    } else if matches!(&error, trouve_providers::ProviderError::Auth(_)) {
+    } else if error.is_authentication_failure() {
         RouteFailureKind::Authentication
     } else {
         RouteFailureKind::Unavailable
@@ -461,17 +476,19 @@ fn native_attempt_failure(
         kind,
         message: format!("provider error: {error}"),
         safe_to_retry: !side_effect_started,
+        produced_output,
     }
 }
 
-fn backend_attempt_failure(error: BackendError, side_effect_started: bool) -> RouteAttemptFailure {
+fn backend_attempt_failure(
+    error: BackendError,
+    side_effect_started: bool,
+    produced_output: bool,
+) -> RouteAttemptFailure {
     let capacity = error.is_capacity_exhausted();
     let kind = if capacity {
         RouteFailureKind::Capacity
-    } else if matches!(
-        &error,
-        BackendError::Auth(_) | BackendError::NotInstalled(_)
-    ) {
+    } else if error.is_authentication_failure() {
         RouteFailureKind::Authentication
     } else {
         RouteFailureKind::Unavailable
@@ -480,6 +497,7 @@ fn backend_attempt_failure(error: BackendError, side_effect_started: bool) -> Ro
         kind,
         message: format!("backend error: {error}"),
         safe_to_retry: !side_effect_started,
+        produced_output,
     }
 }
 
@@ -1531,60 +1549,85 @@ impl Engine {
                 .as_ref()
                 .context("model route attempt was not admitted")?
                 .attempt_order;
-            *active_attempt.lock().unwrap() = Some(RoutedAttemptSnapshot {
-                provider_id: route.provider_id.clone(),
-                provider_model: route.provider_model.clone(),
-                provider_generation: route.provider_generation,
-                attempt_order,
-            });
-            let result = match &route.executor {
-                ModelExecutor::Native(_) => {
-                    self.run_native_route(
-                        &session,
-                        thread,
-                        turn,
-                        &mode,
-                        &tool_ctx,
-                        route,
-                        &specs,
-                        &system,
-                        &stored_model_options,
-                        retrying,
-                        &mut native_iterations_left,
-                        &mut accounting,
-                        tools_enabled,
-                        &cancel,
-                    )
-                    .await
+            // A route that fails transiently before producing anything gets
+            // one more attempt under the same admission before the turn
+            // fails over. Failover rebuilds the transcript for a new vendor;
+            // this retry resends the original prompt to the same one.
+            let mut same_route_retried = false;
+            let result = loop {
+                *active_attempt.lock().unwrap() = Some(RoutedAttemptSnapshot {
+                    provider_id: route.provider_id.clone(),
+                    provider_model: route.provider_model.clone(),
+                    provider_generation: route.provider_generation,
+                    attempt_order,
+                });
+                let result = match &route.executor {
+                    ModelExecutor::Native(_) => {
+                        self.run_native_route(
+                            &session,
+                            thread,
+                            turn,
+                            &mode,
+                            &tool_ctx,
+                            route,
+                            &specs,
+                            &system,
+                            &stored_model_options,
+                            retrying,
+                            &mut native_iterations_left,
+                            &mut accounting,
+                            tools_enabled,
+                            &cancel,
+                        )
+                        .await
+                    }
+                    ModelExecutor::Backend(_) => {
+                        self.run_backend_route(
+                            &session,
+                            thread,
+                            turn,
+                            &mode,
+                            route,
+                            &backend_content,
+                            &backend_attachments,
+                            &history_before,
+                            &stored_model_options,
+                            retrying,
+                            permission,
+                            &mut github_repository,
+                            &mut accounting,
+                            tools_enabled,
+                            prompt.background,
+                            &cancel,
+                        )
+                        .await
+                    }
+                };
+                active_attempt.lock().unwrap().take();
+                let result = result?;
+                if cancel.is_cancelled() {
+                    break RouteAttemptResult::Cancelled;
                 }
-                ModelExecutor::Backend(_) => {
-                    self.run_backend_route(
-                        &session,
-                        thread,
-                        turn,
-                        &mode,
-                        route,
-                        &backend_content,
-                        &backend_attachments,
-                        &history_before,
-                        &stored_model_options,
-                        retrying,
-                        permission,
-                        &mut github_repository,
-                        &mut accounting,
-                        tools_enabled,
-                        prompt.background,
-                        &cancel,
-                    )
-                    .await
+                if let RouteAttemptResult::Failed(failure) = &result
+                    && !same_route_retried
+                    && failure.retryable_on_same_route()
+                {
+                    same_route_retried = true;
+                    tracing::warn!(
+                        model = %thread.model,
+                        provider = %route.provider_id,
+                        provider_model = %route.provider_model,
+                        error = %failure.message,
+                        "model route failed before producing output; retrying once on the same route"
+                    );
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => break RouteAttemptResult::Cancelled,
+                        _ = tokio::time::sleep(SAME_ROUTE_RETRY_DELAY) => {}
+                    }
+                    continue;
                 }
-            };
-            active_attempt.lock().unwrap().take();
-            let result = result?;
-            let result = if cancel.is_cancelled() {
-                RouteAttemptResult::Cancelled
-            } else {
-                result
+                break result;
             };
 
             match result {
@@ -1847,6 +1890,9 @@ impl Engine {
             let mut text = String::new();
             let mut tool_calls = Vec::new();
             let mut reasoning = Vec::new();
+            // Any client-visible output (text, streamed thinking, reasoning
+            // blocks) makes a verbatim same-route retry unsafe.
+            let mut produced_output = false;
             let attempt_error = match provider
                 .stream_chat(&route.provider_model, &messages, specs, &model_options)
                 .await
@@ -1871,6 +1917,7 @@ impl Engine {
                                 break;
                             }
                             Ok(ProviderEvent::TextDelta(delta)) => {
+                                produced_output = true;
                                 text.push_str(&delta);
                                 self.store.append_event(
                                     scope.clone(),
@@ -1879,6 +1926,7 @@ impl Engine {
                             }
                             Ok(ProviderEvent::ThinkingStarted { .. }) => {}
                             Ok(ProviderEvent::ThinkingDelta { id, text }) => {
+                                produced_output = true;
                                 self.store.append_event(
                                     scope.clone(),
                                     Event::AssistantThinking {
@@ -1894,7 +1942,10 @@ impl Engine {
                                     Event::AssistantThinkingCompleted { turn, id: Some(id) },
                                 )?;
                             }
-                            Ok(ProviderEvent::Reasoning(block)) => reasoning.push(block),
+                            Ok(ProviderEvent::Reasoning(block)) => {
+                                produced_output = true;
+                                reasoning.push(block);
+                            }
                             Ok(ProviderEvent::ToolCall(call)) => tool_calls.push(call),
                             Ok(ProviderEvent::Completed { usage }) => {
                                 completed = true;
@@ -1934,6 +1985,7 @@ impl Engine {
                 return Ok(RouteAttemptResult::Failed(native_attempt_failure(
                     error,
                     side_effect_started,
+                    produced_output,
                 )));
             }
 
@@ -2061,6 +2113,9 @@ impl Engine {
         )));
         let mut text = String::new();
         let mut reasoning = Vec::new();
+        // Any client-visible output (text, streamed thinking, reasoning
+        // blocks) makes a verbatim same-route retry unsafe.
+        let mut produced_output = false;
         let error = match provider
             .stream_chat(&route.provider_model, &messages, &[], model_options)
             .await
@@ -2081,6 +2136,7 @@ impl Engine {
                     };
                     match event {
                         Ok(ProviderEvent::TextDelta(delta)) => {
+                            produced_output = true;
                             text.push_str(&delta);
                             self.store.append_event(
                                 scope.clone(),
@@ -2089,6 +2145,7 @@ impl Engine {
                         }
                         Ok(ProviderEvent::ThinkingStarted { .. }) => {}
                         Ok(ProviderEvent::ThinkingDelta { id, text }) => {
+                            produced_output = true;
                             self.store.append_event(
                                 scope.clone(),
                                 Event::AssistantThinking {
@@ -2104,7 +2161,10 @@ impl Engine {
                                 Event::AssistantThinkingCompleted { turn, id: Some(id) },
                             )?;
                         }
-                        Ok(ProviderEvent::Reasoning(block)) => reasoning.push(block),
+                        Ok(ProviderEvent::Reasoning(block)) => {
+                            produced_output = true;
+                            reasoning.push(block);
+                        }
                         Ok(ProviderEvent::Completed { usage }) => {
                             completed = true;
                             accounting.add_native(&self.model_catalog, route, &usage);
@@ -2169,6 +2229,7 @@ impl Engine {
             return Ok(RouteAttemptResult::Failed(native_attempt_failure(
                 error,
                 side_effect_started,
+                produced_output,
             )));
         }
         if text.trim().is_empty() {
@@ -2394,7 +2455,7 @@ impl Engine {
             }
             Err(error) => {
                 return Ok(RouteAttemptResult::Failed(backend_attempt_failure(
-                    error, false,
+                    error, false, false,
                 )));
             }
         };
@@ -2426,6 +2487,9 @@ impl Engine {
         let mut open_tools = HashSet::new();
         let mut seen_tool_cards = HashSet::new();
         let mut side_effect_started = false;
+        // Any visible output (text, progress, or reasoning) makes a verbatim
+        // same-route retry unsafe: the client has already seen this attempt.
+        let mut produced_output = false;
         let mut tool_calls =
             HashMap::<String, (String, serde_json::Value, PullRequestCreationRequest)>::new();
         let mut tool_started_at = HashMap::<String, Instant>::new();
@@ -2570,11 +2634,13 @@ impl Engine {
                     }
                 }
                 BackendEvent::TextDelta(delta) => {
+                    produced_output = true;
                     text.push_str(&delta);
                     segment.push_str(&delta);
                     persisted.push(Event::AssistantDelta { turn, text: delta });
                 }
                 BackendEvent::ProgressDelta(delta) => {
+                    produced_output = true;
                     if !segment.is_empty() {
                         persisted.push(Event::AssistantMessage {
                             turn,
@@ -2587,6 +2653,7 @@ impl Engine {
                     persisted.push(Event::AssistantProgressCompleted { turn });
                 }
                 BackendEvent::ThinkingDelta(delta) => {
+                    produced_output = true;
                     if !segment.is_empty() {
                         persisted.push(Event::AssistantMessage {
                             turn,
@@ -2743,6 +2810,9 @@ impl Engine {
                     model,
                     thinking_level,
                 } => {
+                    // Spawning a collaborator is a side effect: it may run
+                    // tools of its own, so this attempt cannot be replayed.
+                    side_effect_started = true;
                     flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
                     let vendor_session_id = session_id.clone();
                     let prompt_announced =
@@ -3084,6 +3154,9 @@ impl Engine {
                     // Vendor question extensions are another engine-served
                     // interaction path. Reserve before publishing or waiting
                     // so they share the same hard review-turn allowance.
+                    // Asking the user is a side effect too: a replay would
+                    // ask again.
+                    side_effect_started = true;
                     self.automated_review_tool_budgets.reserve(&thread.id)?;
                     if !segment.is_empty() {
                         persisted.push(Event::AssistantMessage {
@@ -3251,6 +3324,7 @@ impl Engine {
             return Ok(RouteAttemptResult::Failed(backend_attempt_failure(
                 error,
                 side_effect_started,
+                produced_output,
             )));
         }
 
@@ -3323,6 +3397,18 @@ mod tests {
         calls: Arc<AtomicUsize>,
     }
 
+    /// Fails the first `failures` chat requests with a transient error, then
+    /// answers normally. Models a provider that is reachable but briefly
+    /// unable to serve (credential refresh race, cold-start exit).
+    struct FlakyCatalogProvider {
+        id: String,
+        calls: Arc<AtomicUsize>,
+        failures: usize,
+        /// Stream a thinking delta before each injected failure, so the
+        /// client has seen output from the attempt.
+        fail_after_thinking: bool,
+    }
+
     struct BlockingFailingPinnedProvider {
         started: Arc<tokio::sync::Semaphore>,
         release: Arc<tokio::sync::Semaphore>,
@@ -3356,6 +3442,32 @@ mod tests {
     struct RecordingBackend {
         turns: Arc<Mutex<Vec<RecordedBackendTurn>>>,
     }
+
+    /// Fails the first `failures` turns in the given `shape`, then answers
+    /// normally. Records the session each attempt was asked to resume.
+    struct FlakyBackend {
+        sessions: ResumedSessions,
+        failures: usize,
+        error: fn() -> BackendError,
+        shape: FlakyShape,
+    }
+
+    #[derive(Clone, Copy)]
+    enum FlakyShape {
+        /// `run_turn` itself errors before returning a stream (process
+        /// failed to spawn, transport refused).
+        BeforeStream,
+        /// The stream announces a session, then errors before any output
+        /// (a CLI that lost a credential refresh race on its first request).
+        AfterSessionStart,
+        /// The stream announces a session and streams reasoning, then errors
+        /// before any text.
+        AfterReasoning,
+    }
+
+    /// The `BackendTurn::session` each `FlakyBackend` attempt was asked to
+    /// resume, in call order.
+    type ResumedSessions = Arc<Mutex<Vec<Option<String>>>>;
 
     struct CancellableStartupBackend {
         started: Arc<tokio::sync::Semaphore>,
@@ -3419,6 +3531,56 @@ mod tests {
             Err(trouve_providers::ProviderError::Request(
                 "injected route outage".into(),
             ))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl trouve_providers::Provider for FlakyCatalogProvider {
+        fn id(&self) -> &str {
+            &self.id
+        }
+
+        fn shared_model_identity(&self, model: &str) -> Option<String> {
+            (model == "shared").then(|| model.to_string())
+        }
+
+        fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
+            vec![catalog_model(format!("{}/shared", self.id))]
+        }
+
+        async fn stream_chat(
+            &self,
+            _model: &str,
+            _messages: &[trouve_providers::Message],
+            _tools: &[trouve_providers::ToolSpec],
+            _options: &serde_json::Map<String, serde_json::Value>,
+        ) -> std::result::Result<trouve_providers::EventStream, trouve_providers::ProviderError>
+        {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call < self.failures {
+                if self.fail_after_thinking {
+                    return Ok(Box::pin(futures::stream::iter([
+                        Ok(trouve_providers::ProviderEvent::ThinkingDelta {
+                            id: "reasoning".into(),
+                            text: "Considering a rebase".into(),
+                        }),
+                        Err(trouve_providers::ProviderError::Request(
+                            "injected transient outage".into(),
+                        )),
+                    ])));
+                }
+                return Err(trouve_providers::ProviderError::Request(
+                    "injected transient outage".into(),
+                ));
+            }
+            Ok(Box::pin(futures::stream::iter([
+                Ok(trouve_providers::ProviderEvent::TextDelta(
+                    "Recovered on retry".into(),
+                )),
+                Ok(trouve_providers::ProviderEvent::Completed {
+                    usage: Usage::default(),
+                }),
+            ])))
         }
     }
 
@@ -3625,6 +3787,67 @@ mod tests {
             self.started.add_permits(1);
             turn.cancel.cancelled().await;
             Err(BackendError::Cancelled)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AgentBackend for FlakyBackend {
+        fn id(&self) -> &str {
+            "backend"
+        }
+
+        fn shared_model_identity(&self, model: &str) -> Option<String> {
+            (model == "shared").then(|| model.to_string())
+        }
+
+        fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
+            vec![catalog_model("backend/shared")]
+        }
+
+        fn status(&self) -> trouve_agents::BackendStatus {
+            trouve_agents::BackendStatus {
+                installed: true,
+                has_credentials: true,
+            }
+        }
+
+        async fn start_login(
+            &self,
+        ) -> std::result::Result<trouve_agents::BackendLogin, BackendError> {
+            unreachable!("routing test does not start a login")
+        }
+
+        async fn run_turn(
+            &self,
+            turn: BackendTurn,
+        ) -> std::result::Result<trouve_agents::BackendEventStream, BackendError> {
+            let attempt = {
+                let mut sessions = self.sessions.lock().unwrap();
+                sessions.push(turn.session.clone());
+                sessions.len() - 1
+            };
+            let session_id = format!("vendor-session-{attempt}");
+            if attempt < self.failures {
+                return match self.shape {
+                    FlakyShape::BeforeStream => Err((self.error)()),
+                    FlakyShape::AfterSessionStart => Ok(Box::pin(futures::stream::iter([
+                        Ok(BackendEvent::SessionStarted { session_id }),
+                        Err((self.error)()),
+                    ]))),
+                    FlakyShape::AfterReasoning => Ok(Box::pin(futures::stream::iter([
+                        Ok(BackendEvent::SessionStarted { session_id }),
+                        Ok(BackendEvent::ThinkingDelta("Considering a rebase".into())),
+                        Err((self.error)()),
+                    ]))),
+                };
+            }
+            Ok(Box::pin(futures::stream::iter([
+                Ok(BackendEvent::SessionStarted { session_id }),
+                Ok(BackendEvent::TextDelta("Recovered on retry".into())),
+                Ok(BackendEvent::Completed {
+                    usage: Usage::default(),
+                }),
+            ])))
         }
     }
 
@@ -3906,16 +4129,109 @@ mod tests {
         let native = native_attempt_failure(
             trouve_providers::ProviderError::Api("HTTP 429 Too Many Requests".into()),
             true,
+            false,
         );
         assert_eq!(native.kind, RouteFailureKind::Capacity);
         assert!(!native.safe_to_retry);
+        assert!(!native.retryable_on_same_route());
 
         let backend = backend_attempt_failure(
             BackendError::Protocol("HTTP 429 Too Many Requests".into()),
             true,
+            false,
         );
         assert_eq!(backend.kind, RouteFailureKind::Capacity);
         assert!(!backend.safe_to_retry);
+        assert!(!backend.retryable_on_same_route());
+    }
+
+    #[test]
+    fn transient_failures_before_output_retry_on_the_same_route() {
+        // The vendor CLI lost a credential refresh race before its first
+        // request: nothing was streamed, nothing was mutated.
+        let refresh_race = backend_attempt_failure(
+            BackendError::Protocol(
+                "Failed to refresh OAuth token: another Claude Code process is refreshing it"
+                    .into(),
+            ),
+            false,
+            false,
+        );
+        assert_eq!(refresh_race.kind, RouteFailureKind::Unavailable);
+        assert!(refresh_race.retryable_on_same_route());
+
+        let startup_exit = backend_attempt_failure(
+            BackendError::Io(std::io::Error::other("claude exited with status 1")),
+            false,
+            false,
+        );
+        assert!(startup_exit.retryable_on_same_route());
+
+        let native_transport = native_attempt_failure(
+            trouve_providers::ProviderError::Request("connection reset".into()),
+            false,
+            false,
+        );
+        assert_eq!(native_transport.kind, RouteFailureKind::Unavailable);
+        assert!(native_transport.retryable_on_same_route());
+    }
+
+    #[test]
+    fn same_route_retry_skips_deterministic_and_non_replayable_failures() {
+        // Quota exhaustion will not clear in seconds; go straight to failover.
+        let capacity = backend_attempt_failure(
+            BackendError::Protocol("HTTP 429 Too Many Requests".into()),
+            false,
+            false,
+        );
+        assert_eq!(capacity.kind, RouteFailureKind::Capacity);
+        assert!(capacity.safe_to_retry);
+        assert!(!capacity.retryable_on_same_route());
+
+        let auth = backend_attempt_failure(BackendError::Auth("logged out".into()), false, false);
+        assert_eq!(auth.kind, RouteFailureKind::Authentication);
+        assert!(!auth.retryable_on_same_route());
+
+        // A provider that rejects the key answers over HTTP, not with a
+        // local credential error; that is still not a transient outage.
+        let rejected_native = native_attempt_failure(
+            trouve_providers::ProviderError::Api(
+                "401 Unauthorized: {\"error\":{\"type\":\"authentication_error\"}}".into(),
+            ),
+            false,
+            false,
+        );
+        assert_eq!(rejected_native.kind, RouteFailureKind::Authentication);
+        assert!(!rejected_native.retryable_on_same_route());
+        let forbidden_native = native_attempt_failure(
+            trouve_providers::ProviderError::Api("403 Forbidden: permission denied".into()),
+            false,
+            false,
+        );
+        assert_eq!(forbidden_native.kind, RouteFailureKind::Authentication);
+        let rejected_backend = backend_attempt_failure(
+            BackendError::Protocol("API Error: 401 Unauthorized".into()),
+            false,
+            false,
+        );
+        assert_eq!(rejected_backend.kind, RouteFailureKind::Authentication);
+        assert!(!rejected_backend.retryable_on_same_route());
+
+        // Partial text is already in the transcript; resending the prompt
+        // verbatim would leave a dangling assistant turn before it.
+        let mid_stream =
+            backend_attempt_failure(BackendError::Protocol("stream closed".into()), false, true);
+        assert_eq!(mid_stream.kind, RouteFailureKind::Unavailable);
+        assert!(mid_stream.safe_to_retry);
+        assert!(!mid_stream.retryable_on_same_route());
+
+        // A tool already ran: neither a retry nor a failover may replay it.
+        let after_tool = native_attempt_failure(
+            trouve_providers::ProviderError::Request("connection reset".into()),
+            true,
+            false,
+        );
+        assert!(!after_tool.retryable_on_same_route());
     }
 
     #[test]
@@ -4259,8 +4575,8 @@ mod tests {
 
         assert_eq!(
             api_calls.load(Ordering::SeqCst),
-            1,
-            "events: {:?}",
+            2,
+            "a route that fails before producing output is retried once before failover; events: {:?}",
             store
                 .events_after(&Scope::Thread(thread.id.clone()), 0)
                 .unwrap()
@@ -4294,10 +4610,523 @@ mod tests {
 
         assert_eq!(
             api_calls.load(Ordering::SeqCst),
-            1,
+            2,
             "a healthy affinity should avoid replaying history to the failed API route"
         );
         assert_eq!(backend_turns.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn transient_route_failure_retries_in_place_before_failing_over() {
+        let data = tempfile::tempdir().unwrap();
+        let worktree = data.path().join("worktrees/retry-in-place");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let thread = routing_thread(&store, &worktree, "retry_in_place");
+        let flaky_calls = Arc::new(AtomicUsize::new(0));
+        let backend_turns = Arc::new(Mutex::new(Vec::new()));
+        let config = Config {
+            providers: BTreeMap::from([(
+                "backend".into(),
+                crate::config::ProviderConfig {
+                    kind: "claude-cli".into(),
+                    tool_bridge: Some(true),
+                    ..Default::default()
+                },
+            )]),
+            provider_order: vec!["flaky".into(), "backend".into()],
+            local_enabled: Some(false),
+            ..Default::default()
+        };
+        let engine = Arc::new(
+            Engine::new(store.clone(), data.path().into(), &config)
+                .with_provider(
+                    "flaky",
+                    Arc::new(FlakyCatalogProvider {
+                        id: "flaky".into(),
+                        calls: flaky_calls.clone(),
+                        failures: 1,
+                        fail_after_thinking: false,
+                    }),
+                )
+                .with_backend(
+                    "backend",
+                    Arc::new(trouve_agents::RetirementAwareBackend::new(Arc::new(
+                        RecordingBackend {
+                            turns: backend_turns.clone(),
+                        },
+                    ))),
+                ),
+        );
+        engine.set_base_url("http://127.0.0.1:4000");
+
+        engine
+            .send_message(&thread.id, "Start the task".into(), Vec::new())
+            .unwrap();
+        wait_for_terminal_turn(&engine, &store, &thread, 1).await;
+
+        let events = store
+            .events_after(&Scope::Thread(thread.id.clone()), 0)
+            .unwrap();
+        assert_eq!(
+            flaky_calls.load(Ordering::SeqCst),
+            2,
+            "the flaky route is retried once in place; events: {events:?}"
+        );
+        assert!(
+            backend_turns.lock().unwrap().is_empty(),
+            "a successful retry must not fail over (and replay) to the next provider"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event.event, Event::TurnCompleted { turn: 1, .. })),
+            "events: {events:?}"
+        );
+        let route_selections = events
+            .iter()
+            .filter(|event| matches!(event.event, Event::ModelRouteSelected { .. }))
+            .count();
+        assert_eq!(
+            route_selections, 1,
+            "a same-route retry is not a route change; events: {events:?}"
+        );
+        assert_eq!(
+            store.thread_route_affinity(&thread.id).unwrap(),
+            Some(("flaky".into(), "shared".into()))
+        );
+        let health = store.route_health().unwrap();
+        let flaky_health = health
+            .get(&("flaky".to_string(), "shared".to_string()))
+            .expect("the successful attempt records route health");
+        assert_eq!(
+            flaky_health.consecutive_failures, 0,
+            "a recovered retry must not open the route's circuit"
+        );
+        assert!(flaky_health.retry_after.is_none());
+    }
+
+    fn flaky_backend_engine(
+        store: &Store,
+        data: &Path,
+        failures: usize,
+        error: fn() -> BackendError,
+        shape: FlakyShape,
+    ) -> (Arc<Engine>, ResumedSessions) {
+        let sessions = Arc::new(Mutex::new(Vec::new()));
+        let config = Config {
+            providers: BTreeMap::from([(
+                "backend".into(),
+                crate::config::ProviderConfig {
+                    kind: "claude-cli".into(),
+                    tool_bridge: Some(true),
+                    ..Default::default()
+                },
+            )]),
+            local_enabled: Some(false),
+            ..Default::default()
+        };
+        let engine = Arc::new(
+            Engine::new(store.clone(), data.into(), &config).with_backend(
+                "backend",
+                Arc::new(trouve_agents::RetirementAwareBackend::new(Arc::new(
+                    FlakyBackend {
+                        sessions: sessions.clone(),
+                        failures,
+                        error,
+                        shape,
+                    },
+                ))),
+            ),
+        );
+        engine.set_base_url("http://127.0.0.1:4000");
+        (engine, sessions)
+    }
+
+    fn refresh_race_error() -> BackendError {
+        BackendError::Protocol(
+            "Failed to refresh OAuth token: another Claude Code process is refreshing it".into(),
+        )
+    }
+
+    fn capacity_error() -> BackendError {
+        BackendError::Protocol("HTTP 429 Too Many Requests".into())
+    }
+
+    fn turn_outcome(store: &Store, thread: &Thread, turn: u64) -> (bool, bool) {
+        let events = store
+            .events_after(&Scope::Thread(thread.id.clone()), 0)
+            .unwrap();
+        let completed = events
+            .iter()
+            .any(|event| matches!(event.event, Event::TurnCompleted { turn: t, .. } if t == turn));
+        let failed = events
+            .iter()
+            .any(|event| matches!(event.event, Event::TurnFailed { turn: t, .. } if t == turn));
+        (completed, failed)
+    }
+
+    #[tokio::test]
+    async fn concrete_backend_turn_retries_a_transient_stream_failure_in_place() {
+        let data = tempfile::tempdir().unwrap();
+        let worktree = data.path().join("worktrees/concrete-retry");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let thread = model_thread(&store, &worktree, "concrete_retry", "backend/shared");
+        let (engine, sessions) = flaky_backend_engine(
+            &store,
+            data.path(),
+            1,
+            refresh_race_error,
+            FlakyShape::AfterSessionStart,
+        );
+
+        engine
+            .send_message(&thread.id, "Rebase".into(), Vec::new())
+            .unwrap();
+        wait_for_terminal_turn(&engine, &store, &thread, 1).await;
+
+        let (completed, failed) = turn_outcome(&store, &thread, 1);
+        let sessions = sessions.lock().unwrap();
+        assert_eq!(
+            sessions.len(),
+            2,
+            "one in-place retry; sessions: {sessions:?}"
+        );
+        assert_eq!(
+            sessions[1].as_deref(),
+            Some("vendor-session-0"),
+            "the retry resumes the vendor session the failed attempt announced"
+        );
+        assert!(completed && !failed, "the retried turn completes normally");
+    }
+
+    #[tokio::test]
+    async fn concrete_backend_turn_retries_a_transient_startup_failure_in_place() {
+        let data = tempfile::tempdir().unwrap();
+        let worktree = data.path().join("worktrees/concrete-startup-retry");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let thread = model_thread(
+            &store,
+            &worktree,
+            "concrete_startup_retry",
+            "backend/shared",
+        );
+        let (engine, sessions) = flaky_backend_engine(
+            &store,
+            data.path(),
+            1,
+            || BackendError::Io(std::io::Error::other("claude exited with status 1")),
+            FlakyShape::BeforeStream,
+        );
+
+        engine
+            .send_message(&thread.id, "Rebase".into(), Vec::new())
+            .unwrap();
+        wait_for_terminal_turn(&engine, &store, &thread, 1).await;
+
+        let (completed, failed) = turn_outcome(&store, &thread, 1);
+        assert_eq!(
+            sessions.lock().unwrap().len(),
+            2,
+            "an error before the stream exists is retried once too"
+        );
+        assert!(completed && !failed);
+    }
+
+    #[tokio::test]
+    async fn concrete_backend_turn_retries_in_place_only_once() {
+        let data = tempfile::tempdir().unwrap();
+        let worktree = data.path().join("worktrees/concrete-retry-once");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let thread = model_thread(&store, &worktree, "concrete_retry_once", "backend/shared");
+        let (engine, sessions) = flaky_backend_engine(
+            &store,
+            data.path(),
+            2,
+            refresh_race_error,
+            FlakyShape::AfterSessionStart,
+        );
+
+        engine
+            .send_message(&thread.id, "Rebase".into(), Vec::new())
+            .unwrap();
+        wait_for_terminal_turn(&engine, &store, &thread, 1).await;
+
+        let (completed, failed) = turn_outcome(&store, &thread, 1);
+        assert_eq!(sessions.lock().unwrap().len(), 2);
+        assert!(
+            failed && !completed,
+            "a second failure surfaces to the user"
+        );
+    }
+
+    #[tokio::test]
+    async fn concrete_backend_turn_does_not_retry_capacity_exhaustion() {
+        let data = tempfile::tempdir().unwrap();
+        let worktree = data.path().join("worktrees/concrete-capacity");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let thread = model_thread(&store, &worktree, "concrete_capacity", "backend/shared");
+        let (engine, sessions) = flaky_backend_engine(
+            &store,
+            data.path(),
+            1,
+            capacity_error,
+            FlakyShape::AfterSessionStart,
+        );
+
+        engine
+            .send_message(&thread.id, "Rebase".into(), Vec::new())
+            .unwrap();
+        wait_for_terminal_turn(&engine, &store, &thread, 1).await;
+
+        let (completed, failed) = turn_outcome(&store, &thread, 1);
+        assert_eq!(
+            sessions.lock().unwrap().len(),
+            1,
+            "quota exhaustion will not clear in seconds; no retry"
+        );
+        assert!(failed && !completed);
+    }
+
+    #[tokio::test]
+    async fn automatic_backend_route_retries_a_transient_stream_failure_in_place() {
+        let data = tempfile::tempdir().unwrap();
+        let worktree = data.path().join("worktrees/auto-backend-retry");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let thread = routing_thread(&store, &worktree, "auto_backend_retry");
+        let (engine, sessions) = flaky_backend_engine(
+            &store,
+            data.path(),
+            1,
+            refresh_race_error,
+            FlakyShape::AfterSessionStart,
+        );
+
+        engine
+            .send_message(&thread.id, "Rebase".into(), Vec::new())
+            .unwrap();
+        wait_for_terminal_turn(&engine, &store, &thread, 1).await;
+
+        let (completed, failed) = turn_outcome(&store, &thread, 1);
+        let sessions = sessions.lock().unwrap();
+        assert_eq!(
+            sessions.len(),
+            2,
+            "one in-place retry; sessions: {sessions:?}"
+        );
+        assert_eq!(
+            sessions[1].as_deref(),
+            Some("vendor-session-0"),
+            "the retry resumes the vendor session the failed attempt announced"
+        );
+        assert!(completed && !failed);
+        assert_eq!(
+            store.thread_route_affinity(&thread.id).unwrap(),
+            Some(("backend".into(), "shared".into()))
+        );
+        let health = store.route_health().unwrap();
+        let backend_health = health
+            .get(&("backend".to_string(), "shared".to_string()))
+            .expect("the successful attempt records route health");
+        assert_eq!(backend_health.consecutive_failures, 0);
+    }
+
+    #[tokio::test]
+    async fn automatic_backend_route_does_not_replay_after_streamed_reasoning() {
+        let data = tempfile::tempdir().unwrap();
+        let worktree = data.path().join("worktrees/auto-backend-reasoning");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let thread = routing_thread(&store, &worktree, "auto_backend_reasoning");
+        let (engine, sessions) = flaky_backend_engine(
+            &store,
+            data.path(),
+            1,
+            refresh_race_error,
+            FlakyShape::AfterReasoning,
+        );
+
+        engine
+            .send_message(&thread.id, "Rebase".into(), Vec::new())
+            .unwrap();
+        wait_for_terminal_turn(&engine, &store, &thread, 1).await;
+
+        let (completed, failed) = turn_outcome(&store, &thread, 1);
+        assert_eq!(
+            sessions.lock().unwrap().len(),
+            1,
+            "reasoning the client already saw must not be replayed by a verbatim retry"
+        );
+        assert!(failed && !completed, "with no other route the turn fails");
+    }
+
+    #[tokio::test]
+    async fn concrete_backend_turn_does_not_replay_after_streamed_reasoning() {
+        let data = tempfile::tempdir().unwrap();
+        let worktree = data.path().join("worktrees/concrete-reasoning");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let thread = model_thread(&store, &worktree, "concrete_reasoning", "backend/shared");
+        let (engine, sessions) = flaky_backend_engine(
+            &store,
+            data.path(),
+            1,
+            refresh_race_error,
+            FlakyShape::AfterReasoning,
+        );
+
+        engine
+            .send_message(&thread.id, "Rebase".into(), Vec::new())
+            .unwrap();
+        wait_for_terminal_turn(&engine, &store, &thread, 1).await;
+
+        let (completed, failed) = turn_outcome(&store, &thread, 1);
+        assert_eq!(sessions.lock().unwrap().len(), 1);
+        assert!(failed && !completed);
+    }
+
+    #[tokio::test]
+    async fn native_route_does_not_replay_after_streamed_thinking() {
+        let data = tempfile::tempdir().unwrap();
+        let worktree = data.path().join("worktrees/native-thinking");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let thread = routing_thread(&store, &worktree, "native_thinking");
+        let flaky_calls = Arc::new(AtomicUsize::new(0));
+        let backend_turns = Arc::new(Mutex::new(Vec::new()));
+        let config = Config {
+            providers: BTreeMap::from([(
+                "backend".into(),
+                crate::config::ProviderConfig {
+                    kind: "claude-cli".into(),
+                    tool_bridge: Some(true),
+                    ..Default::default()
+                },
+            )]),
+            provider_order: vec!["flaky".into(), "backend".into()],
+            local_enabled: Some(false),
+            ..Default::default()
+        };
+        let engine = Arc::new(
+            Engine::new(store.clone(), data.path().into(), &config)
+                .with_provider(
+                    "flaky",
+                    Arc::new(FlakyCatalogProvider {
+                        id: "flaky".into(),
+                        calls: flaky_calls.clone(),
+                        failures: 1,
+                        fail_after_thinking: true,
+                    }),
+                )
+                .with_backend(
+                    "backend",
+                    Arc::new(trouve_agents::RetirementAwareBackend::new(Arc::new(
+                        RecordingBackend {
+                            turns: backend_turns.clone(),
+                        },
+                    ))),
+                ),
+        );
+        engine.set_base_url("http://127.0.0.1:4000");
+
+        engine
+            .send_message(&thread.id, "Start the task".into(), Vec::new())
+            .unwrap();
+        wait_for_terminal_turn(&engine, &store, &thread, 1).await;
+
+        assert_eq!(
+            flaky_calls.load(Ordering::SeqCst),
+            1,
+            "thinking the client already saw must not be replayed by a verbatim retry"
+        );
+        assert_eq!(
+            backend_turns.lock().unwrap().len(),
+            1,
+            "no side effect ran, so the turn still fails over to the next route"
+        );
+    }
+
+    #[tokio::test]
+    async fn persistent_route_failure_retries_once_then_fails_over() {
+        let data = tempfile::tempdir().unwrap();
+        let worktree = data.path().join("worktrees/retry-then-failover");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let thread = routing_thread(&store, &worktree, "retry_then_failover");
+        let flaky_calls = Arc::new(AtomicUsize::new(0));
+        let backend_turns = Arc::new(Mutex::new(Vec::new()));
+        let config = Config {
+            providers: BTreeMap::from([(
+                "backend".into(),
+                crate::config::ProviderConfig {
+                    kind: "claude-cli".into(),
+                    tool_bridge: Some(true),
+                    ..Default::default()
+                },
+            )]),
+            provider_order: vec!["flaky".into(), "backend".into()],
+            local_enabled: Some(false),
+            ..Default::default()
+        };
+        let engine = Arc::new(
+            Engine::new(store.clone(), data.path().into(), &config)
+                .with_provider(
+                    "flaky",
+                    Arc::new(FlakyCatalogProvider {
+                        id: "flaky".into(),
+                        calls: flaky_calls.clone(),
+                        // Would recover on a third call; the turn must not
+                        // keep hammering one route to find out.
+                        failures: 2,
+                        fail_after_thinking: false,
+                    }),
+                )
+                .with_backend(
+                    "backend",
+                    Arc::new(trouve_agents::RetirementAwareBackend::new(Arc::new(
+                        RecordingBackend {
+                            turns: backend_turns.clone(),
+                        },
+                    ))),
+                ),
+        );
+        engine.set_base_url("http://127.0.0.1:4000");
+
+        engine
+            .send_message(&thread.id, "Start the task".into(), Vec::new())
+            .unwrap();
+        wait_for_terminal_turn(&engine, &store, &thread, 1).await;
+
+        let events = store
+            .events_after(&Scope::Thread(thread.id.clone()), 0)
+            .unwrap();
+        assert_eq!(
+            flaky_calls.load(Ordering::SeqCst),
+            2,
+            "exactly one in-place retry; events: {events:?}"
+        );
+        assert_eq!(
+            backend_turns.lock().unwrap().len(),
+            1,
+            "the second failure fails over; events: {events:?}"
+        );
+        assert_eq!(
+            store.thread_route_affinity(&thread.id).unwrap(),
+            Some(("backend".into(), "shared".into()))
+        );
+        let health = store.route_health().unwrap();
+        let flaky_health = health
+            .get(&("flaky".to_string(), "shared".to_string()))
+            .expect("the failed route records health");
+        assert_eq!(
+            flaky_health.consecutive_failures, 1,
+            "the retry and the original attempt count as one failure"
+        );
     }
 
     #[tokio::test]
@@ -4435,7 +5264,12 @@ mod tests {
             .send_message(&thread.id, "Try bounded routes".into(), Vec::new())
             .unwrap();
         wait_for_terminal_turn(&engine, &store, &thread, 1).await;
-        assert_eq!(calls.load(Ordering::SeqCst), MAX_ROUTE_ATTEMPTS_PER_TURN);
+        // Each route is retried once in place before failover, so the route
+        // bound governs distinct providers tried, not raw provider calls.
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2 * MAX_ROUTE_ATTEMPTS_PER_TURN
+        );
         assert_eq!(
             store.route_health().unwrap().len(),
             MAX_ROUTE_ATTEMPTS_PER_TURN
@@ -4447,7 +5281,7 @@ mod tests {
         wait_for_terminal_turn(&engine, &store, &thread, 2).await;
         assert_eq!(
             calls.load(Ordering::SeqCst),
-            2 * MAX_ROUTE_ATTEMPTS_PER_TURN
+            4 * MAX_ROUTE_ATTEMPTS_PER_TURN
         );
         assert_eq!(
             store.route_health().unwrap().len(),

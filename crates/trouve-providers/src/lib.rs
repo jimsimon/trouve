@@ -129,6 +129,17 @@ impl ProviderError {
             Self::Auth(_) => false,
         }
     }
+
+    /// Whether the failure is a credential problem: either missing locally
+    /// or rejected by the provider (HTTP 401/403). Neither clears by
+    /// retrying, and both deserve the long authentication cooldown.
+    pub fn is_authentication_failure(&self) -> bool {
+        match self {
+            Self::Auth(_) => true,
+            Self::Api(message) => is_authentication_failure_message(message),
+            Self::Request(_) => false,
+        }
+    }
 }
 
 /// Whether a provider or vendor-backend error positively reports exhausted
@@ -149,6 +160,27 @@ pub fn is_capacity_exhaustion_message(message: &str) -> bool {
             "capacity_exhausted",
             "usage limit",
             "usage_limit",
+        ]
+        .iter()
+        .any(|signal| message.contains(signal))
+}
+
+/// Whether a provider or vendor-backend error reports rejected or missing
+/// credentials. Kept beside [`is_capacity_exhaustion_message`] so native and
+/// agent adapters classify these failures the same way: no retry, long
+/// cooldown, and a login prompt rather than a transient-outage message.
+pub fn is_authentication_failure_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    contains_standalone_token(&message, "401")
+        || contains_standalone_token(&message, "403")
+        || [
+            "unauthorized",
+            "authentication_error",
+            "authentication failed",
+            "invalid api key",
+            "invalid_api_key",
+            "invalid x-api-key",
+            "permission_denied",
         ]
         .iter()
         .any(|signal| message.contains(signal))
@@ -397,6 +429,36 @@ mod tests {
         ] {
             assert!(!is_capacity_exhaustion_message(message), "{message}");
         }
+    }
+
+    #[test]
+    fn authentication_messages_cover_rejected_and_missing_credentials() {
+        for message in [
+            "401 Unauthorized: {\"error\":{\"type\":\"authentication_error\"}}",
+            "403 Forbidden: permission denied",
+            "invalid x-api-key",
+            "Incorrect API key provided (invalid_api_key)",
+        ] {
+            assert!(is_authentication_failure_message(message), "{message}");
+            assert!(ProviderError::Api(message.into()).is_authentication_failure());
+        }
+        for message in [
+            "HTTP 429 Too Many Requests",
+            "500 Internal Server Error",
+            "request 4010 failed",
+            "version 1.403",
+            "connection reset",
+        ] {
+            assert!(!is_authentication_failure_message(message), "{message}");
+            assert!(!ProviderError::Api(message.into()).is_authentication_failure());
+        }
+        assert!(
+            ProviderError::Auth("OPENAI_API_KEY is not set".into()).is_authentication_failure()
+        );
+        // Transport errors never carry a provider verdict on credentials.
+        assert!(
+            !ProviderError::Request("401 in a proxy banner".into()).is_authentication_failure()
+        );
     }
 
     #[tokio::test]

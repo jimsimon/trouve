@@ -51,7 +51,7 @@ pub enum BackendPermission {
 }
 
 /// Everything a backend needs to run one turn.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct BackendTurn {
     /// Cooperative cancellation for every phase of this vendor turn. An
     /// adapter must not finish its stream after observing cancellation until
@@ -427,6 +427,17 @@ impl BackendError {
             return false;
         };
         trouve_providers::is_capacity_exhaustion_message(message)
+    }
+
+    /// Whether the failure is a credential or installation problem the user
+    /// must fix: the vendor is not logged in, not installed, or answered a
+    /// request with HTTP 401/403. None of these clear by retrying.
+    pub fn is_authentication_failure(&self) -> bool {
+        match self {
+            Self::Auth(_) | Self::NotInstalled(_) => true,
+            Self::Protocol(message) => trouve_providers::is_authentication_failure_message(message),
+            Self::Cancelled | Self::Io(_) => false,
+        }
     }
 }
 
