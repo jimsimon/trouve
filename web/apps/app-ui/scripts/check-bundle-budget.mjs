@@ -83,10 +83,13 @@ const entryLimit = mode === "desktop" ? 856_000 : 850_000;
 // embedded Review operations view brings them to 3,294,306 B and
 // 3,279,461 B. The protocol 9.9 `supports_steering` field on
 // `model.route_selected` and its generated validator bring them to
-// 3,295,013 B and 3,280,168 B. Preserve less than 2 kB of headroom for
-// each. Entry, worker, and largest-chunk budgets below still prevent one
-// bundle from hiding in the aggregate.
-const totalJavaScriptLimit = mode === "desktop" ? 3_296_500 : 3_281_500;
+// 3,295,013 B and 3,280,168 B. The protocol 9.10 persona
+// `default_model_options` schemas (AgentPersona and UpsertPersonaRequest
+// validators) and the persona settings panel preserving them bring them to
+// 3,296,673 B and 3,281,828 B. Preserve less than 2 kB of
+// headroom for each. Entry, worker, and largest-chunk budgets below still
+// prevent one bundle from hiding in the aggregate.
+const totalJavaScriptLimit = mode === "desktop" ? 3_298_500 : 3_283_500;
 // beautiful-mermaid 1.1 with elk.bundled emits 1,524,273 B (469 kB gzipped).
 // Preserve less than 6 kB of headroom.
 const diagramEngineLimit = 1_530_000;

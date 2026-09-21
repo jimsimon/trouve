@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 const read = (file: string): string => readFileSync(new URL(file, import.meta.url), "utf8");
 
 const repositoryEditor = read("./repositories-page.ts");
+const reviewerEditor = read("./reviewers-page.ts");
 const jobDetail = read("./job-detail.ts");
 const sharedViews = read("./shared-views.ts");
 const types = read("./types.ts");
@@ -89,6 +90,18 @@ describe("model-specific options", () => {
     expect(repositoryEditor).not.toMatch(/models\.find\(/u);
     // Overrides with only model options are retained.
     expect(repositoryEditor).toMatch(/Object\.keys\(updated\.model_options \?\? \{\}\)\.length > 0/u);
+  });
+
+  it("reviewer personas carry reusable model options", () => {
+    expect(types).toMatch(/model_options\?: ModelOptions \| undefined;\n  built_in: boolean;/u);
+    // The persona editor renders the same schema-driven controls and drops
+    // options the newly selected model does not advertise.
+    expect(reviewerEditor).toMatch(/\$\{modelOptionsSetting\(\{\s*model: reviewerModel,/u);
+    expect(reviewerEditor).toMatch(
+      /model_options: compatibleOptions\(this\.draft\.model_options, effectiveModel\)/u,
+    );
+    // Saving persists the options on the persona (an empty map clears them).
+    expect(api).toMatch(/default_model_options: reviewer\.model_options \?\? \{\}/u);
   });
 
   it("job details surface snapshotted model options", () => {

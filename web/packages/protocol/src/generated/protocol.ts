@@ -1809,6 +1809,14 @@ export interface components {
              *     None falls back to the global default model.
              */
             default_model?: string | null;
+            /**
+             * @description Non-thinking model options (for example `fast`) applied to threads
+             *     and review runs started with this persona. Thinking stays on
+             *     `default_thinking_level`. Empty means the model's own defaults.
+             */
+            default_model_options?: {
+                [key: string]: components["schemas"]["ModelOptionValue"];
+            };
             default_permission_mode?: null | components["schemas"]["PermissionMode"];
             /**
              * @description Preferred thinking setting for threads started with this persona. The value
@@ -5379,6 +5387,13 @@ export interface components {
         UpsertPersonaRequest: {
             allowed_tools?: string[];
             default_model?: string | null;
+            /**
+             * @description Non-thinking model options validated against `default_model` when one
+             *     is set. Omitted or empty clears the persona's options.
+             */
+            default_model_options?: {
+                [key: string]: components["schemas"]["ModelOptionValue"];
+            };
             default_permission_mode?: null | components["schemas"]["PermissionMode"];
             /** @description None uses the global default thinking level. */
             default_thinking_level?: string | null;

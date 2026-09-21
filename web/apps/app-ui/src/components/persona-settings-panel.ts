@@ -252,6 +252,9 @@ export class TrouvePersonaSettings extends withSignalTracking(LitElement) {
       default_model: defaultModel,
       default_permission_mode: permission === "" ? null : permission as PermissionMode,
       default_thinking_level: defaultThinking,
+      // The form has no control for these yet; keep whatever the review UI
+      // or a TOML file configured instead of clearing it on every save.
+      default_model_options: existing?.persona.default_model_options ?? {},
     };
     this.#busy = true;
     this.#message = `Saving ${id}…`;
@@ -379,6 +382,7 @@ export class TrouvePersonaSettings extends withSignalTracking(LitElement) {
         default_thinking_level: update.thinking === undefined
           ? mode.default_thinking_level ?? null
           : update.thinking,
+        default_model_options: mode.default_model_options ?? {},
       });
       const success = `Saved persona ${mode.id}.`;
       if (!await this.#reloadAfterMutation(success)) return;

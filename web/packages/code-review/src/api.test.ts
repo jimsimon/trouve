@@ -61,6 +61,7 @@ describe("review API client", () => {
       id: persona.id,
       name: "Renamed reviewer",
       prompt: "Updated prompt",
+      model_options: { fast: true },
     });
 
     expect(requests).toHaveLength(2);
@@ -75,7 +76,24 @@ describe("review API client", () => {
       default_permission_mode: null,
       default_model: null,
       default_thinking_level: null,
+      default_model_options: { fast: true },
     });
+  });
+
+  it("reviewers without model options clear the persona's options on save", async () => {
+    const requests = recordFetch((url) =>
+      url === "/v1/persona-infos"
+        ? new Response(JSON.stringify([{ persona, origin: "custom" }]))
+        : new Response(null, { status: 204 }),
+    );
+
+    await createReviewApi().saveReviewer({
+      id: persona.id,
+      name: persona.display_name,
+      prompt: persona.system_prompt,
+    });
+
+    expect(JSON.parse(String(requests[1]?.init?.body)).default_model_options).toEqual({});
   });
 
   it("model loading uses a static first-paint endpoint and a separate live route endpoint", async () => {

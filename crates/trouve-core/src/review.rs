@@ -3494,6 +3494,14 @@ impl Engine {
                     .default_thinking_level
                     .clone()
                     .or(existing.default_thinking_level);
+                // Merge key by key like the scalar defaults above: the
+                // persona file is canonical for every option it names, and
+                // the stored profile fills in the rest. Repository-specific
+                // reviewer overrides are applied later, per job, and still
+                // win over both.
+                for (key, value) in existing.model_options {
+                    reviewer.model_options.entry(key).or_insert(value);
+                }
             }
             reviewers.push(reviewer);
         }
@@ -15275,8 +15283,10 @@ fn apply_reviewer_overrides(
             if let Some(thinking_level) = &reviewer_override.thinking_level {
                 reviewer.default_thinking_level = Some(thinking_level.clone());
             }
-            if !reviewer_override.model_options.is_empty() {
-                reviewer.model_options = reviewer_override.model_options.clone();
+            // Overlay key by key: the repository decides every option it
+            // names, and the persona's remaining defaults still apply.
+            for (key, value) in &reviewer_override.model_options {
+                reviewer.model_options.insert(key.clone(), value.clone());
             }
             match reviewer_override.prompt_mode {
                 ReviewerPromptMode::Inherit => {}
@@ -31337,6 +31347,34 @@ rename to src/new.rs
         );
         assert_eq!(replaced[0].model.as_deref(), Some("openai/base"));
         assert_eq!(replaced[0].prompt, "Review only authorization changes.");
+    }
+
+    #[test]
+    fn repository_reviewer_options_win_key_by_key_over_persona_defaults() {
+        let mut reviewer = crate::reviewers::built_in_reviewers().remove(0);
+        reviewer.model_options = serde_json::Map::from_iter([
+            ("fast".into(), serde_json::json!(true)),
+            ("temperature".into(), serde_json::json!(0.2)),
+        ]);
+        let resolved = apply_reviewer_overrides(
+            vec![reviewer.clone()],
+            &[ReviewerOverride {
+                reviewer_id: reviewer.id.clone(),
+                model: None,
+                thinking_level: None,
+                model_options: serde_json::Map::from_iter([(
+                    "fast".into(),
+                    serde_json::json!(false),
+                )]),
+                prompt_mode: ReviewerPromptMode::Inherit,
+                prompt: String::new(),
+            }],
+        );
+        assert_eq!(resolved[0].model_options["fast"], false);
+        assert_eq!(resolved[0].model_options["temperature"], 0.2);
+        let dispatched = reviewer_model_options(&resolved[0]);
+        assert_eq!(dispatched["fast"], false);
+        assert_eq!(dispatched["temperature"], 0.2);
     }
 
     #[test]

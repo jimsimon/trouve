@@ -307,6 +307,23 @@ fn thinking_schema(model: &trouve_protocol::ModelInfo) -> Option<(Vec<String>, O
     })
 }
 
+/// The parts of an option property that decide whether two routes accept the
+/// same values. Vendors describe the same control with different `title` and
+/// `description` text (Codex's `fast` carries a description, Cursor's a
+/// title), and that wording must not hide a portable option from automatic
+/// selections.
+fn portable_option_shape(property: &serde_json::Value) -> serde_json::Value {
+    let Some(object) = property.as_object() else {
+        return property.clone();
+    };
+    let shape: serde_json::Map<String, serde_json::Value> = object
+        .iter()
+        .filter(|(key, _)| !matches!(key.as_str(), "title" | "description" | "x-enumNames"))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    serde_json::Value::Object(shape)
+}
+
 fn routed_options_schema(models: &[&trouve_protocol::ModelInfo]) -> serde_json::Value {
     let mut properties = models
         .first()
@@ -314,12 +331,14 @@ fn routed_options_schema(models: &[&trouve_protocol::ModelInfo]) -> serde_json::
         .cloned()
         .unwrap_or_default();
     properties.retain(|key, value| {
-        !THINKING_OPTION_KEYS.contains(&key.as_str())
-            && models.iter().skip(1).all(|model| {
+        !THINKING_OPTION_KEYS.contains(&key.as_str()) && {
+            let shape = portable_option_shape(value);
+            models.iter().skip(1).all(|model| {
                 model.options_schema["properties"]
                     .get(key)
-                    .is_some_and(|candidate| candidate == value)
+                    .is_some_and(|candidate| portable_option_shape(candidate) == shape)
             })
+        }
     });
 
     let mut schemas = models.iter().map(|model| thinking_schema(model));
@@ -4329,6 +4348,17 @@ mod tests {
     fn multi_route_schema_and_options_preserve_only_portable_settings() {
         let model = |provider_id: &str, thinking_key: &str, default: &str, provider_only: bool| {
             let mut candidate = model_candidate(provider_id, "shared", Some("shared"));
+            // Vendors word the same control differently: Codex describes
+            // `fast`, Cursor titles it. Only the accepted values must agree.
+            let fast = if provider_only {
+                serde_json::json!({
+                    "type": "boolean",
+                    "default": false,
+                    "description": "1.5x speed, increased usage"
+                })
+            } else {
+                serde_json::json!({"title": "Fast", "type": "boolean", "default": false})
+            };
             let mut properties = serde_json::Map::from_iter([
                 (
                     thinking_key.to_string(),
@@ -4338,9 +4368,13 @@ mod tests {
                         "default": default
                     }),
                 ),
+                ("fast".into(), fast),
                 (
-                    "fast".into(),
-                    serde_json::json!({"type": "boolean", "default": false}),
+                    "verbosity".into(),
+                    serde_json::json!({
+                        "type": "string",
+                        "enum": if provider_only { ["low", "high"] } else { ["low", "medium"] }
+                    }),
                 ),
             ]);
             if provider_only {
@@ -4383,6 +4417,20 @@ mod tests {
                 .options_schema
                 .pointer("/properties/provider_only")
                 .is_none()
+        );
+        assert!(
+            automatic
+                .options_schema
+                .pointer("/properties/verbosity")
+                .is_none(),
+            "routes that accept different values do not share the option"
+        );
+        assert_eq!(
+            automatic
+                .options_schema
+                .pointer("/properties/fast/description"),
+            Some(&serde_json::json!("1.5x speed, increased usage")),
+            "the first route's wording describes the shared option"
         );
 
         let stored = serde_json::Map::from_iter([

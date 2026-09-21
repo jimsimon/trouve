@@ -8,12 +8,19 @@ import {
   defaultThinkingSelection,
   modelForSelection,
   modelSelectionValue,
+  sanitizeModelOptions,
   thinkingOptions,
 } from "./model-settings";
 import { selectValue } from "./select-value";
-import { modelCatalogStatus, modelChoices, pageHeader, thinkingSetting } from "./shared-views";
+import {
+  modelCatalogStatus,
+  modelChoices,
+  modelOptionsSetting,
+  pageHeader,
+  thinkingSetting,
+} from "./shared-views";
 import { html } from "./template";
-import type { Model, ReviewerProfile } from "./types";
+import type { Model, ModelOptions, ReviewerProfile } from "./types";
 
 /** The `#/reviewers` screen body: one editor per persona plus the creation form. */
 export function reviewersPage({
@@ -137,6 +144,18 @@ export class ReviewerEditor extends ReviewElement {
     const message = this.message.message;
     const reviewerModel = modelForSelection(models, draft.model || defaultModel);
     const reviewerThinking = thinkingOptions(reviewerModel);
+    // Like the repository editor: drop options the newly selected model does
+    // not advertise, but keep stored options when the effective model is not
+    // in the loaded catalog so the server can re-validate them on save.
+    const compatibleOptions = (
+      configured: ModelOptions | undefined,
+      model: Model | undefined,
+    ): ModelOptions | undefined => {
+      if (!configured || !Object.keys(configured).length) return undefined;
+      if (!model) return configured;
+      const sanitized = sanitizeModelOptions(model, configured);
+      return Object.keys(sanitized).length ? sanitized : undefined;
+    };
     return html`<form class="panel reviewer-editor" @submit=${(event: Event) => void this.submit(event)}>
       <header>
         <div>
@@ -171,14 +190,16 @@ export class ReviewerEditor extends ReviewElement {
           ?disabled=${!modelsLoaded}
           @change=${(event: Event) => {
             const model = targetValue(event) || undefined;
+            const effectiveModel = modelForSelection(models, model || defaultModel);
             this.draft = {
               ...this.draft,
               model,
               default_thinking_level:
                 defaultThinkingSelection(
-                  modelForSelection(models, model || defaultModel),
+                  effectiveModel,
                   this.draft.default_thinking_level,
                 ) || undefined,
+              model_options: compatibleOptions(this.draft.model_options, effectiveModel),
             };
           }}
         >
@@ -204,6 +225,17 @@ export class ReviewerEditor extends ReviewElement {
         })}
         <small>Sets this persona's reusable reasoning default. Repository-specific overrides take precedence; otherwise Inherit follows the Review persona default.</small>
       </label>
+      ${modelOptionsSetting({
+        model: reviewerModel,
+        options: draft.model_options,
+        disabled: !modelsLoaded,
+        onChange: (options) => {
+          this.draft = {
+            ...this.draft,
+            model_options: Object.keys(options).length ? options : undefined,
+          };
+        },
+      })}
       <div class="action-row">
         <button type="submit" ?disabled=${busy}>
           ${busy ? "Saving…" : reviewer ? "Save persona" : "Create persona"}
