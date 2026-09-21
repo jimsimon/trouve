@@ -151,7 +151,60 @@ impl TurnAccounting {
     }
 }
 
+/// Steering capability installed for one concrete route attempt.
+///
+/// An automatic selection publishes `supports_steering: false` on
+/// `turn.started` because its provider is unknown until route discovery. Each
+/// selected route then installs (or withholds) its own receiver before its
+/// `model.route_selected` event is committed, and the registry entry lives
+/// exactly as long as that attempt: a failover to a route that cannot steer
+/// removes the capability again, and one that can installs a fresh channel.
+struct RouteSteering<'a> {
+    receiver: Option<tokio::sync::mpsc::Receiver<SteerTurnCommand>>,
+    mutation_lane_state: tokio::sync::watch::Sender<SteerMutationLaneState>,
+    guard: Option<ActiveTurnSteererGuard<'a>>,
+}
+
+impl RouteSteering<'_> {
+    fn disabled() -> Self {
+        let (mutation_lane_state, _) = tokio::sync::watch::channel(SteerMutationLaneState::Idle);
+        Self {
+            receiver: None,
+            mutation_lane_state,
+            guard: None,
+        }
+    }
+
+    fn enabled(&self) -> bool {
+        self.guard.is_some()
+    }
+
+    /// Stop accepting steering for the attempt that owned this capability.
+    /// Closing the receiver before removing the registry entry makes a send
+    /// that raced removal fail promptly; the terminal drain then answers
+    /// every command that was already admitted.
+    fn finish(mut self, reason: &str) {
+        close_steer_receiver(&mut self.receiver);
+        drop(self.guard.take());
+        let mut no_pending = None;
+        let mut deferred = Vec::new();
+        reject_steer_commands(&mut self.receiver, &mut no_pending, &mut deferred, reason);
+    }
+}
+
 impl ModelCandidate {
+    /// Whether a turn running on this route accepts additional user input
+    /// without cancelling or starting another turn. Native providers always
+    /// do (guidance joins the transcript at the next model boundary); vendor
+    /// agents only when their protocol can append to a live turn.
+    fn supports_steering(&self, tools_enabled: bool) -> bool {
+        tools_enabled
+            && match &self.executor {
+                ModelExecutor::Native(_) => true,
+                ModelExecutor::Backend(backend) => backend.supports_steering(),
+            }
+    }
+
     fn automatic_selection_id(&self) -> Option<String> {
         self.shared_model_id
             .as_deref()
@@ -600,6 +653,42 @@ pub(super) fn unfinished_collaborator_reason(
 }
 
 impl Engine {
+    /// Install the steering receiver for one route attempt before its
+    /// selection is published, mirroring the concrete-turn invariant that the
+    /// advertised capability and the receiver become visible together.
+    fn begin_route_steering(
+        &self,
+        thread_id: &str,
+        turn: u64,
+        route: &ModelCandidate,
+        tools_enabled: bool,
+    ) -> RouteSteering<'_> {
+        if !route.supports_steering(tools_enabled) {
+            return RouteSteering::disabled();
+        }
+        self.register_turn_steerer(thread_id, turn);
+        let pending = self.take_turn_steerer(thread_id, turn).or_else(|| {
+            self.register_turn_steerer(thread_id, turn);
+            self.take_turn_steerer(thread_id, turn)
+        });
+        let (receiver, mutation_lane_state) = match pending {
+            Some(pending) => (Some(pending.receiver), pending.mutation_lane_state),
+            None => {
+                let (state, _) = tokio::sync::watch::channel(SteerMutationLaneState::Idle);
+                (None, state)
+            }
+        };
+        RouteSteering {
+            receiver,
+            mutation_lane_state,
+            guard: Some(ActiveTurnSteererGuard {
+                registry: &self.turn_steerers,
+                thread_id: thread_id.to_string(),
+                turn,
+            }),
+        }
+    }
+
     /// Model-selector catalog for current clients. Shared hosted models have
     /// an `auto/<model>` entry plus one concrete entry per provider. Local,
     /// loopback, and transport-owned models remain concrete-only.
@@ -1371,7 +1460,11 @@ impl Engine {
             .map(|candidate| candidate.info.context_window)
             .filter(|window| *window > 0)
             .min();
-        self.store.append_event(
+        // The receiver is installed before the selection is committed so a
+        // client that sees `supports_steering: true` can steer immediately.
+        let mut route_steering =
+            Some(self.begin_route_steering(&thread.id, turn, first_route, tools_enabled));
+        if let Err(error) = self.store.append_event(
             scope.clone(),
             Event::ModelRouteSelected {
                 turn,
@@ -1379,8 +1472,14 @@ impl Engine {
                 provider_id: first_route.provider_id.clone(),
                 provider_model: first_route.provider_model.clone(),
                 reason: trouve_protocol::ModelRouteReason::Initial,
+                supports_steering: route_steering.as_ref().is_some_and(RouteSteering::enabled),
             },
-        )?;
+        ) {
+            if let Some(steering) = route_steering.take() {
+                steering.finish("turn no longer accepts steering");
+            }
+            return Err(error);
+        }
         // Compaction summarizes only earlier transcript rows and preserves
         // the accepted current user message as the final row. If a backend is
         // selected first and later hands off to native execution, the native
@@ -1513,7 +1612,8 @@ impl Engine {
                     continue;
                 }
                 route_admission = Some(self.turn_scheduler.admit(&capacity_model, &cancel).await?);
-                self.store.append_event(
+                let steering = self.begin_route_steering(&thread.id, turn, route, tools_enabled);
+                if let Err(error) = self.store.append_event(
                     scope.clone(),
                     Event::ModelRouteSelected {
                         turn,
@@ -1522,9 +1622,17 @@ impl Engine {
                         provider_model: route.provider_model.clone(),
                         reason: failover_reason
                             .unwrap_or(trouve_protocol::ModelRouteReason::RouteFailover),
+                        supports_steering: steering.enabled(),
                     },
-                )?;
+                ) {
+                    steering.finish("turn no longer accepts steering");
+                    return Err(error);
+                }
+                route_steering = Some(steering);
             }
+            let mut steering = route_steering
+                .take()
+                .unwrap_or_else(RouteSteering::disabled);
             let retrying = route_index > 0;
             attempted_candidates += 1;
             let attempt_order = route_admission
@@ -1553,6 +1661,8 @@ impl Engine {
                         &mut native_iterations_left,
                         &mut accounting,
                         tools_enabled,
+                        &mut steering.receiver,
+                        &steering.mutation_lane_state,
                         &cancel,
                     )
                     .await
@@ -1574,12 +1684,25 @@ impl Engine {
                         &mut accounting,
                         tools_enabled,
                         prompt.background,
+                        &mut steering.receiver,
+                        &steering.mutation_lane_state,
                         &cancel,
                     )
                     .await
                 }
             };
             active_attempt.lock().unwrap().take();
+            // The attempt's steering capability ends with the attempt. A
+            // failover route installs its own receiver before it is published;
+            // guidance that was still queued for the ended route is answered
+            // rather than silently carried across providers.
+            steering.finish(if cancel.is_cancelled() {
+                "turn cancelled"
+            } else if matches!(result, Ok(RouteAttemptResult::Completed)) {
+                "turn no longer accepts steering"
+            } else {
+                "provider route ended before steering could be applied"
+            });
             let result = result?;
             let result = if cancel.is_cancelled() {
                 RouteAttemptResult::Cancelled
@@ -1812,6 +1935,8 @@ impl Engine {
         iterations_left: &mut usize,
         accounting: &mut TurnAccounting,
         tools_enabled: bool,
+        steer_rx: &mut Option<tokio::sync::mpsc::Receiver<SteerTurnCommand>>,
+        steer_mutation_lane_state: &tokio::sync::watch::Sender<SteerMutationLaneState>,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<RouteAttemptResult> {
         let ModelExecutor::Native(provider) = &route.executor else {
@@ -1819,6 +1944,11 @@ impl Engine {
         };
         let scope = Scope::Thread(thread.id.clone());
         let model_options = model_options_for_schema(stored_model_options, &route.info);
+        // Steering joins the transcript only at model-invocation boundaries,
+        // exactly as on a concrete native turn: commands received while a
+        // response streams or its tool batch runs wait for that boundary.
+        let mut pending_native_steer = None;
+        let mut boundary_steers = Vec::new();
         // Keep one sanitized transcript in memory for the provider tool loop.
         // Every assistant/tool message is still persisted immediately, then
         // appended here for the next iteration without re-reading and
@@ -1840,13 +1970,46 @@ impl Engine {
 
         while *iterations_left > 0 {
             if cancel.is_cancelled() {
+                reject_steer_commands(
+                    steer_rx,
+                    &mut pending_native_steer,
+                    &mut boundary_steers,
+                    "turn cancelled",
+                );
                 return Ok(RouteAttemptResult::Cancelled);
             }
             *iterations_left -= 1;
 
+            // Guidance received while tools were finishing belongs before the
+            // next model invocation, in arrival order.
+            loop {
+                let command = match steer_rx.as_mut().map(|rx| rx.try_recv()) {
+                    Some(Ok(command)) => command,
+                    Some(Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)) => {
+                        *steer_rx = None;
+                        break;
+                    }
+                    Some(Err(tokio::sync::mpsc::error::TryRecvError::Empty)) | None => break,
+                };
+                if let Some(prompt) = self
+                    .accept_native_steer_command(
+                        session,
+                        thread,
+                        turn,
+                        cancel,
+                        steer_mutation_lane_state,
+                        command,
+                    )
+                    .await?
+                {
+                    messages.push(Message::User(prompt));
+                }
+            }
+
             let mut text = String::new();
             let mut tool_calls = Vec::new();
             let mut reasoning = Vec::new();
+            let mut consecutive_provider_events = 0usize;
             let attempt_error = match provider
                 .stream_chat(&route.provider_model, &messages, specs, &model_options)
                 .await
@@ -1857,14 +2020,32 @@ impl Engine {
                     let mut error = None;
                     let mut completed = false;
                     loop {
+                        let steer_reserved = !cancel.is_cancelled()
+                            && reserve_ready_steer_after_event_budget(
+                                steer_rx,
+                                &mut pending_native_steer,
+                                &mut consecutive_provider_events,
+                            );
                         let event = tokio::select! {
                             biased;
                             _ = cancel.cancelled() => break,
-                            event = stream.next() => match event {
+                            event = stream.next(), if !steer_reserved => match event {
                                 Some(event) => event,
                                 None => break,
                             },
+                            steer = receive_steer_command(
+                                steer_rx,
+                                &mut pending_native_steer,
+                                true,
+                            ), if !cancel.is_cancelled() => {
+                                match steer {
+                                    Some(command) => boundary_steers.push(command),
+                                    None => *steer_rx = None,
+                                }
+                                continue;
+                            }
                         };
+                        consecutive_provider_events += 1;
                         match event {
                             Err(provider_error) => {
                                 error = Some(provider_error);
@@ -1911,6 +2092,22 @@ impl Engine {
                 }
             };
 
+            // Catch every message that arrived at the exact response boundary.
+            // They stay pending until this provider turn, including its tool
+            // batch, has settled.
+            if !cancel.is_cancelled() {
+                loop {
+                    match steer_rx.as_mut().map(|rx| rx.try_recv()) {
+                        Some(Ok(command)) => boundary_steers.push(command),
+                        Some(Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)) => {
+                            *steer_rx = None;
+                            break;
+                        }
+                        Some(Err(tokio::sync::mpsc::error::TryRecvError::Empty)) | None => break,
+                    }
+                }
+            }
+
             if let Some(error) = attempt_error {
                 if !text.is_empty() {
                     self.store.append_event(
@@ -1931,6 +2128,12 @@ impl Engine {
                         })?,
                     )?;
                 }
+                reject_steer_commands(
+                    steer_rx,
+                    &mut pending_native_steer,
+                    &mut boundary_steers,
+                    "provider route ended before steering could be applied",
+                );
                 return Ok(RouteAttemptResult::Failed(native_attempt_failure(
                     error,
                     side_effect_started,
@@ -1957,6 +2160,12 @@ impl Engine {
                         })?,
                     )?;
                 }
+                reject_steer_commands(
+                    steer_rx,
+                    &mut pending_native_steer,
+                    &mut boundary_steers,
+                    "turn cancelled",
+                );
                 return Ok(RouteAttemptResult::Cancelled);
             }
 
@@ -1988,6 +2197,28 @@ impl Engine {
                 messages.push(assistant);
             }
             if tool_calls.is_empty() {
+                // Guidance that arrived during a tool-free response still
+                // deserves an answer: run one more model pass with it instead
+                // of completing the route.
+                let had_boundary_steers = !boundary_steers.is_empty();
+                for command in boundary_steers.drain(..) {
+                    if let Some(prompt) = self
+                        .accept_native_steer_command(
+                            session,
+                            thread,
+                            turn,
+                            cancel,
+                            steer_mutation_lane_state,
+                            command,
+                        )
+                        .await?
+                    {
+                        messages.push(Message::User(prompt));
+                    }
+                }
+                if had_boundary_steers {
+                    continue;
+                }
                 return Ok(RouteAttemptResult::Completed);
             }
             // Classify before dispatch: after a mutation-capable call begins,
@@ -2002,11 +2233,57 @@ impl Engine {
             // Keep the same read-only concurrency and mutation barriers used
             // by concrete-model turns. Route failover must not change tool
             // scheduling semantics merely because the model was automatic.
-            let results = self
-                .handle_tool_calls_parallel(
-                    session, thread, turn, mode, tool_ctx, tool_calls, cancel,
-                )
-                .await;
+            let tool_batch = self.handle_tool_calls_parallel(
+                session, thread, turn, mode, tool_ctx, tool_calls, cancel,
+            );
+            tokio::pin!(tool_batch);
+            // Text-only guidance accepted while tools run is durable at once;
+            // it joins the in-memory transcript after this batch's results so
+            // the provider still sees every tool result directly after its
+            // call. Attachment-bearing guidance needs the mutation lane the
+            // tools may hold, so it waits for the batch boundary.
+            let mut accepted_during_tools = Vec::new();
+            let results = loop {
+                tokio::select! {
+                    biased;
+                    results = &mut tool_batch => break results,
+                    steer = receive_steer_command(
+                        steer_rx,
+                        &mut pending_native_steer,
+                        true,
+                    ), if !cancel.is_cancelled() => {
+                        let Some(command) = steer else {
+                            *steer_rx = None;
+                            continue;
+                        };
+                        if command.attachment_rows.is_empty() {
+                            if let Some(prompt) = self
+                                .accept_native_steer_command(
+                                    session,
+                                    thread,
+                                    turn,
+                                    cancel,
+                                    steer_mutation_lane_state,
+                                    command,
+                                )
+                                .await?
+                            {
+                                accepted_during_tools.push(prompt);
+                            }
+                        } else {
+                            boundary_steers.push(command);
+                        }
+                    }
+                }
+            };
+            if cancel.is_cancelled() {
+                reject_steer_commands(
+                    steer_rx,
+                    &mut pending_native_steer,
+                    &mut boundary_steers,
+                    "turn cancelled",
+                );
+            }
             for (call_id, result) in results {
                 let (result_content, images) = result?;
                 let result = Message::ToolResult {
@@ -2018,7 +2295,34 @@ impl Engine {
                     .append_message(&thread.id, &serde_json::to_value(&result)?)?;
                 messages.push(result);
             }
+            for prompt in accepted_during_tools {
+                messages.push(Message::User(prompt));
+            }
+            for command in boundary_steers.drain(..) {
+                if let Some(prompt) = self
+                    .accept_native_steer_command(
+                        session,
+                        thread,
+                        turn,
+                        cancel,
+                        steer_mutation_lane_state,
+                        command,
+                    )
+                    .await?
+                {
+                    messages.push(Message::User(prompt));
+                }
+            }
         }
+
+        // The bounded final-report pass is not an agent loop and cannot apply
+        // further guidance.
+        reject_steer_commands(
+            steer_rx,
+            &mut pending_native_steer,
+            &mut boundary_steers,
+            "turn no longer accepts steering",
+        );
 
         self.run_native_iteration_summary(
             thread,
@@ -2213,6 +2517,8 @@ impl Engine {
         accounting: &mut TurnAccounting,
         tools_enabled: bool,
         attach_background: bool,
+        steer_rx: &mut Option<tokio::sync::mpsc::Receiver<SteerTurnCommand>>,
+        steer_mutation_lane_state: &tokio::sync::watch::Sender<SteerMutationLaneState>,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<RouteAttemptResult> {
         let ModelExecutor::Backend(backend) = &route.executor else {
@@ -2443,27 +2749,133 @@ impl Engine {
         let mut suppressed_bridge_calls = HashSet::new();
         let mut persisted = Vec::new();
         let mut persist_deadline = None;
+        let mut pending_steer = None;
+        let mut pending_steer_lane = None;
+        let mut pending_steer_permit = None;
+        let mut consecutive_backend_events = 0usize;
         let event_loop_result: Result<()> = async {
           if let Some(error) = post_start_persistence_error {
               return Err(error);
           }
           loop {
             let flush_at = persist_deadline.unwrap_or_else(Instant::now);
-            let input = tokio::select! {
-                biased;
-                _ = cancel.cancelled() => break,
-                _ = tokio::time::sleep_until(flush_at.into()), if persist_deadline.is_some() => {
-                    flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
-                    flush_backend_collaborator_batches(&self.store, &mut collaborators).await?;
-                    persist_deadline = None;
-                    continue;
+            let steer_reserved = active_vendor_session.is_some()
+                && !cancel.is_cancelled()
+                && reserve_ready_steer_after_event_budget(
+                    steer_rx,
+                    &mut pending_steer,
+                    &mut consecutive_backend_events,
+                );
+            let input = if pending_steer_lane.is_some() {
+                // Poll lane acquisition ahead of the backend stream so a
+                // continuously-ready stream cannot starve it. If the lane is
+                // still held, the future stays pending and ToolCompleted can
+                // flow through the event branch to release it.
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        reject_pending_steer(&mut pending_steer, "turn cancelled");
+                        steer_mutation_lane_state.send_replace(SteerMutationLaneState::Idle);
+                        drop(pending_steer_lane.take());
+                        drop(pending_steer_permit.take());
+                        break;
+                    }
+                    approval = pending_backend_approvals.next(), if !pending_backend_approvals.is_empty() => {
+                        BackendLoopInput::Approval(
+                            approval.expect("non-empty approval queue must yield an outcome")
+                        )
+                    }
+                    permit = async {
+                        pending_steer_lane
+                            .as_mut()
+                            .expect("guarded pending steering lane future")
+                            .await
+                    } => {
+                        pending_steer_lane = None;
+                        steer_mutation_lane_state.send_replace(SteerMutationLaneState::Idle);
+                        pending_steer_permit = Some(permit);
+                        continue;
+                    }
+                    event = stream.next() => BackendLoopInput::Event(event),
+                    _ = tokio::time::sleep_until(flush_at.into()), if persist_deadline.is_some() => {
+                        flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
+                        flush_backend_collaborator_batches(&self.store, &mut collaborators).await?;
+                        persist_deadline = None;
+                        continue;
+                    }
                 }
-                approval = pending_backend_approvals.next(), if !pending_backend_approvals.is_empty() => {
-                    BackendLoopInput::Approval(
-                        approval.expect("non-empty approval queue must yield an outcome")
-                    )
+            } else {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        reject_pending_steer(&mut pending_steer, "turn cancelled");
+                        drop(pending_steer_permit.take());
+                        break;
+                    }
+                    _ = tokio::time::sleep_until(flush_at.into()), if persist_deadline.is_some() => {
+                        flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
+                        flush_backend_collaborator_batches(&self.store, &mut collaborators).await?;
+                        persist_deadline = None;
+                        continue;
+                    }
+                    approval = pending_backend_approvals.next(), if !pending_backend_approvals.is_empty() => {
+                        BackendLoopInput::Approval(
+                            approval.expect("non-empty approval queue must yield an outcome")
+                        )
+                    }
+                    // Persist vendor output that is already available before
+                    // accepting simultaneously-ready steering. This preserves
+                    // the causal order observed at the backend boundary.
+                    event = stream.next(), if !steer_reserved => BackendLoopInput::Event(event),
+                    steer = receive_steer_command(
+                        steer_rx,
+                        &mut pending_steer,
+                        active_vendor_session.is_some(),
+                    ), if !cancel.is_cancelled() => {
+                        let Some(command) = steer else {
+                            *steer_rx = None;
+                            continue;
+                        };
+                        let materialization_permit = if command.attachment_rows.is_empty() {
+                            None
+                        } else if let Some(permit) = pending_steer_permit.take() {
+                            Some(permit)
+                        } else {
+                            // Wait for actual lane availability as another
+                            // select branch. Backend events and approval
+                            // outcomes continue to flow while the future is
+                            // pending, including the completion that releases
+                            // an in-flight mutation.
+                            pending_steer = Some(command);
+                            steer_mutation_lane_state.send_replace(SteerMutationLaneState::Waiting);
+                            let engine = self.clone();
+                            let session_id = session.id.clone();
+                            pending_steer_lane = Some(
+                                async move { engine.tool_mutation_permit(&session_id).await }.boxed(),
+                            );
+                            consecutive_backend_events = 0;
+                            continue;
+                        };
+                        flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
+                        flush_backend_collaborator_batches(&self.store, &mut collaborators).await?;
+                        persist_deadline = None;
+                        self.accept_backend_steer_command(
+                            session,
+                            thread,
+                            turn,
+                            backend,
+                            active_vendor_session
+                                .as_deref()
+                                .expect("steering branch requires a backend session"),
+                            cancel,
+                            materialization_permit,
+                            command,
+                        )
+                        .await?;
+                        consecutive_backend_events = 0;
+                        continue;
+                    }
                 }
-                event = stream.next() => BackendLoopInput::Event(event),
             };
             let event = match input {
                 BackendLoopInput::Event(None) => {
@@ -3138,6 +3550,16 @@ impl Engine {
         if let Err(error) = event_loop_result {
             attempt_error = Some(error);
         }
+        reject_pending_steer(
+            &mut pending_steer,
+            if cancel.is_cancelled() {
+                "turn cancelled"
+            } else {
+                "provider route ended before steering could be applied"
+            },
+        );
+        drop(pending_steer_lane.take());
+        drop(pending_steer_permit.take());
         let abort_backend = attempt_error.is_some()
             || backend_error.is_some()
             || cancel.is_cancelled()
@@ -3359,6 +3781,12 @@ mod tests {
 
     struct CancellableStartupBackend {
         started: Arc<tokio::sync::Semaphore>,
+    }
+
+    /// A vendor agent whose live turn waits for steering before it completes.
+    struct SteerableRoutingBackend {
+        steers: Arc<Mutex<Vec<(String, String)>>>,
+        release: tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     }
 
     fn catalog_model(id: impl Into<String>) -> trouve_protocol::ModelInfo {
@@ -3625,6 +4053,92 @@ mod tests {
             self.started.add_permits(1);
             turn.cancel.cancelled().await;
             Err(BackendError::Cancelled)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AgentBackend for SteerableRoutingBackend {
+        fn id(&self) -> &str {
+            "steerable"
+        }
+
+        fn shared_model_identity(&self, model: &str) -> Option<String> {
+            (model == "shared").then(|| model.to_string())
+        }
+
+        fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
+            vec![catalog_model("steerable/shared")]
+        }
+
+        fn status(&self) -> trouve_agents::BackendStatus {
+            trouve_agents::BackendStatus {
+                installed: true,
+                has_credentials: true,
+            }
+        }
+
+        fn supports_steering(&self) -> bool {
+            true
+        }
+
+        async fn steer_turn(
+            &self,
+            steer: trouve_agents::BackendSteer,
+        ) -> std::result::Result<(), BackendError> {
+            self.steers
+                .lock()
+                .unwrap()
+                .push((steer.session, steer.prompt));
+            let release =
+                self.release.lock().await.take().ok_or_else(|| {
+                    BackendError::Protocol("no active steerable vendor turn".into())
+                })?;
+            let _ = release.send(());
+            Ok(())
+        }
+
+        async fn start_login(
+            &self,
+        ) -> std::result::Result<trouve_agents::BackendLogin, BackendError> {
+            unreachable!("routing test does not start a login")
+        }
+
+        async fn run_turn(
+            &self,
+            turn: BackendTurn,
+        ) -> std::result::Result<trouve_agents::BackendEventStream, BackendError> {
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            *self.release.lock().await = Some(release_tx);
+            let cancel = turn.cancel.clone();
+            let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+            tokio::spawn(async move {
+                let _ = tx
+                    .send(Ok(BackendEvent::SessionStarted {
+                        session_id: "steerable-vendor-session".into(),
+                    }))
+                    .await;
+                let _ = tx
+                    .send(Ok(BackendEvent::ThinkingDelta("Initial direction.".into())))
+                    .await;
+                let released = tokio::select! {
+                    _ = cancel.cancelled() => false,
+                    released = release_rx => released.is_ok(),
+                };
+                if !released {
+                    return;
+                }
+                let _ = tx
+                    .send(Ok(BackendEvent::TextDelta("Steering applied.".into())))
+                    .await;
+                let _ = tx
+                    .send(Ok(BackendEvent::Completed {
+                        usage: Usage::default(),
+                    }))
+                    .await;
+            });
+            Ok(Box::pin(futures::stream::poll_fn(move |cx| {
+                rx.poll_recv(cx)
+            })))
         }
     }
 
@@ -4403,6 +4917,187 @@ mod tests {
             store.route_health().unwrap().is_empty(),
             "user cancellation is not provider failure"
         );
+    }
+
+    fn route_selections(store: &Store, thread: &Thread) -> Vec<(String, bool)> {
+        store
+            .events_after(&Scope::Thread(thread.id.clone()), 0)
+            .unwrap()
+            .iter()
+            .filter_map(|event| match &event.event {
+                Event::ModelRouteSelected {
+                    provider_id,
+                    supports_steering,
+                    ..
+                } => Some((provider_id.clone(), *supports_steering)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn automatic_route_accepts_steering_when_its_provider_supports_it() {
+        let data = tempfile::tempdir().unwrap();
+        let worktree = data.path().join("worktrees/steerable-route");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let thread = routing_thread(&store, &worktree, "steerable_route");
+        let steers = Arc::new(Mutex::new(Vec::new()));
+        let config = Config {
+            providers: BTreeMap::from([(
+                "steerable".into(),
+                crate::config::ProviderConfig {
+                    kind: "claude-cli".into(),
+                    tool_bridge: Some(true),
+                    ..Default::default()
+                },
+            )]),
+            local_enabled: Some(false),
+            ..Default::default()
+        };
+        let engine = Arc::new(
+            Engine::new(store.clone(), data.path().into(), &config).with_backend(
+                "steerable",
+                Arc::new(SteerableRoutingBackend {
+                    steers: steers.clone(),
+                    release: tokio::sync::Mutex::new(None),
+                }),
+            ),
+        );
+        engine.set_base_url("http://127.0.0.1:4000");
+
+        engine
+            .send_message(&thread.id, "Begin the task".into(), Vec::new())
+            .unwrap();
+        // The automatic selector cannot advertise steering before a route
+        // exists; the selected route installs the receiver and publishes the
+        // capability together.
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while store
+                .events_after(&Scope::Thread(thread.id.clone()), 0)
+                .unwrap()
+                .iter()
+                .all(|event| !matches!(event.event, Event::AssistantThinking { .. }))
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("steerable vendor turn did not start");
+        assert!(
+            store
+                .events_after(&Scope::Thread(thread.id.clone()), 0)
+                .unwrap()
+                .iter()
+                .any(|event| matches!(
+                    event.event,
+                    Event::TurnStarted {
+                        turn: 1,
+                        supports_steering: false,
+                        ..
+                    }
+                ))
+        );
+        assert_eq!(
+            route_selections(&store, &thread),
+            vec![("steerable".to_string(), true)]
+        );
+        assert!(engine.turn_accepts_steering(&thread.id, 1));
+
+        let accepted = engine
+            .steer_turn(&thread.id, "Prioritize the regression.".into(), Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(accepted.turn, 1);
+        wait_for_terminal_turn(&engine, &store, &thread, 1).await;
+
+        let events = store
+            .events_after(&Scope::Thread(thread.id.clone()), 0)
+            .unwrap();
+        assert!(events.iter().any(|event| matches!(
+            &event.event,
+            Event::TurnSteered { turn: 1, content, .. } if content == "Prioritize the regression."
+        )));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event.event, Event::TurnCompleted { turn: 1, .. }))
+        );
+        assert_eq!(
+            steers.lock().unwrap().as_slice(),
+            [(
+                "steerable-vendor-session".to_string(),
+                "Prioritize the regression.".to_string()
+            )]
+        );
+        assert!(
+            !engine.turn_accepts_steering(&thread.id, 1),
+            "the route's steering registration must end with its attempt"
+        );
+        let (_, view) = store
+            .thread_view_snapshot(&thread.id, None, 100, false)
+            .unwrap();
+        assert_eq!(view.turn_steerable.get(&1), Some(&true));
+    }
+
+    #[tokio::test]
+    async fn automatic_failover_to_a_non_steerable_route_withdraws_steering() {
+        let data = tempfile::tempdir().unwrap();
+        let worktree = data.path().join("worktrees/withdrawn-steering");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let thread = routing_thread(&store, &worktree, "withdrawn_steering");
+        let api_calls = Arc::new(AtomicUsize::new(0));
+        let backend_turns = Arc::new(Mutex::new(Vec::new()));
+        let config = Config {
+            providers: BTreeMap::from([(
+                "backend".into(),
+                crate::config::ProviderConfig {
+                    kind: "claude-cli".into(),
+                    tool_bridge: Some(true),
+                    ..Default::default()
+                },
+            )]),
+            provider_order: vec!["api".into(), "backend".into()],
+            local_enabled: Some(false),
+            ..Default::default()
+        };
+        let engine = Arc::new(
+            Engine::new(store.clone(), data.path().into(), &config)
+                .with_provider(
+                    "api",
+                    Arc::new(FailingCatalogProvider {
+                        id: "api".into(),
+                        calls: api_calls.clone(),
+                    }),
+                )
+                .with_backend(
+                    "backend",
+                    Arc::new(RecordingBackend {
+                        turns: backend_turns.clone(),
+                    }),
+                ),
+        );
+        engine.set_base_url("http://127.0.0.1:4000");
+
+        engine
+            .send_message(&thread.id, "Start the task".into(), Vec::new())
+            .unwrap();
+        wait_for_terminal_turn(&engine, &store, &thread, 1).await;
+
+        // The native API route accepts guidance at model boundaries; the
+        // recording vendor agent cannot append to a live turn, so the
+        // failover selection withdraws the capability it had advertised.
+        assert_eq!(
+            route_selections(&store, &thread),
+            vec![("api".to_string(), true), ("backend".to_string(), false)]
+        );
+        assert_eq!(backend_turns.lock().unwrap().len(), 1);
+        assert!(!engine.turn_accepts_steering(&thread.id, 1));
+        let (_, view) = store
+            .thread_view_snapshot(&thread.id, None, 100, false)
+            .unwrap();
+        assert_eq!(view.turn_steerable.get(&1), Some(&false));
     }
 
     #[tokio::test]

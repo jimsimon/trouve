@@ -733,10 +733,12 @@ impl ThreadViewModel {
                 turn,
                 provider_id,
                 provider_model,
+                supports_steering,
                 ..
             } => {
                 self.turn_models
                     .insert(*turn, format!("{provider_id}/{provider_model}"));
+                self.turn_steerable.insert(*turn, *supports_steering);
                 self.items.iter().rposition(
                     |item| matches!(item, ChatItem::TurnStatus { turn: item_turn, .. } if item_turn == turn),
                 )
@@ -1561,12 +1563,25 @@ mod tests {
             provider_id: "codex".into(),
             provider_model: "gpt-5.6-sol".into(),
             reason: trouve_protocol::ModelRouteReason::Initial,
+            supports_steering: true,
         }));
 
         assert_eq!(
             vm.turn_models.get(&1).map(String::as_str),
             Some("codex/gpt-5.6-sol")
         );
+        assert_eq!(vm.turn_steerable.get(&1), Some(&true));
+
+        vm.apply(&env(Event::ModelRouteSelected {
+            turn: 1,
+            model: "auto/gpt-5.6-sol".into(),
+            provider_id: "cursor".into(),
+            provider_model: "gpt-5.6-sol".into(),
+            reason: trouve_protocol::ModelRouteReason::RouteFailover,
+            supports_steering: false,
+        }));
+
+        assert_eq!(vm.turn_steerable.get(&1), Some(&false));
     }
 
     #[test]

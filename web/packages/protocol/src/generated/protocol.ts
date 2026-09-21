@@ -3381,6 +3381,13 @@ export interface components {
             provider_id: string;
             provider_model: string;
             reason: components["schemas"]["ModelRouteReason"];
+            /**
+             * @description Whether the selected route accepts additional user input without
+             *     cancelling or starting another turn. Automatic selections publish
+             *     `supports_steering: false` on `turn.started`; this per-route value
+             *     replaces it, and a failover to another route replaces it again.
+             */
+            supports_steering?: boolean;
             /** Format: int64 */
             turn: number;
             /** @enum {string} */
