@@ -14111,13 +14111,22 @@ impl Engine {
         })
     }
 
-    async fn accept_native_steer_command(
+    /// Deliver one steering command to the vendor turn running on `backend`.
+    /// Attachment-bearing commands must arrive with the session mutation
+    /// lane already reserved. Vendor rejections and materialization failures
+    /// answer the request and return `Ok(())`; only a durable-commit failure
+    /// after the vendor accepted the guidance is an error, because the turn
+    /// must then stop rather than let its context diverge from the log.
+    #[allow(clippy::too_many_arguments)]
+    async fn accept_backend_steer_command(
         &self,
         session: &Session,
         thread: &Thread,
         turn: u64,
+        backend: &Arc<dyn AgentBackend>,
+        vendor_session: &str,
         cancel: &tokio_util::sync::CancellationToken,
-        mutation_lane_state: &tokio::sync::watch::Sender<SteerMutationLaneState>,
+        materialization_permit: Option<SessionMutationPermit>,
         command: SteerTurnCommand,
     ) -> Result<()> {
         let scope = Scope::Thread(thread.id.clone());
@@ -14129,9 +14138,159 @@ impl Engine {
             response,
             _permit,
         } = command;
+        // Cancellation can arrive while the selected steer command flushes
+        // pending backend events. Reject it before either persisting the
+        // user message or calling the backend.
         if cancel.is_cancelled() {
             response.send(Err("turn cancelled".into()));
             return Ok(());
+        }
+        let staged = attachment_rows
+            .iter()
+            .map(|(attachment, path)| AttachmentMaterializationFile {
+                attachment: attachment.clone(),
+                source: PathBuf::from(path),
+            })
+            .collect::<Vec<_>>();
+        // Text-only steering does not touch the worktree and must reach the
+        // active vendor turn even while one of its tools owns the session
+        // mutation lane.
+        let materialized = if staged.is_empty() {
+            Vec::new()
+        } else {
+            let _materialization_permit =
+                materialization_permit.expect("attachment steering must reserve the mutation lane");
+            match self
+                .executor
+                .materialize_attachments(&AttachmentMaterialization {
+                    source_root: self.data_dir.join("attachments"),
+                    managed_worktree_root: self.data_dir.join("worktrees"),
+                    worktree: PathBuf::from(&session.worktree_path),
+                    files: staged,
+                    cancel: cancel.clone(),
+                })
+                .await
+            {
+                Ok(materialized) => materialized,
+                Err(error) => {
+                    response.send(Err(error.clone()));
+                    return Ok(());
+                }
+            }
+        };
+        let materialized_paths = materialized
+            .iter()
+            .map(|file| file.absolute_path.clone())
+            .collect::<Vec<_>>();
+        let (images, files): (Vec<_>, Vec<_>) = materialized
+            .into_iter()
+            .partition(|file| file.attachment.mime.starts_with("image/"));
+        let prompt_files = files
+            .iter()
+            .map(|file| (file.attachment.clone(), file.relative_path.clone()))
+            .collect::<Vec<_>>();
+        let backend_prompt = annotate_attachments(content.clone(), &prompt_files);
+        let backend_attachments = images
+            .into_iter()
+            .map(|file| trouve_agents::TurnAttachment {
+                name: file.attachment.name,
+                mime: file.attachment.mime,
+                bytes: file.bytes,
+                local_path: Some(file.absolute_path),
+            })
+            .collect();
+        let payload = match serde_json::to_value(Message::User(backend_prompt.clone())) {
+            Ok(payload) => payload,
+            Err(error) => {
+                let mut message = error.to_string();
+                if let Err(cleanup) =
+                    self.rollback_materialized_attachment_paths(session, &materialized_paths)
+                {
+                    message.push_str(&format!(
+                        "; materialized attachment rollback failed: {cleanup}"
+                    ));
+                }
+                let error = anyhow!(message);
+                response.send(Err(error.to_string()));
+                return Err(error);
+            }
+        };
+        let backend_result = backend
+            .steer_turn(BackendSteer {
+                cancel: cancel.clone(),
+                session: vendor_session.to_string(),
+                prompt: backend_prompt,
+                attachments: backend_attachments,
+            })
+            .await;
+        if let Err(error) = backend_result {
+            let mut message = error.to_string();
+            if let Err(cleanup) =
+                self.rollback_materialized_attachment_paths(session, &materialized_paths)
+            {
+                message.push_str(&format!(
+                    "; materialized attachment rollback failed: {cleanup}"
+                ));
+            }
+            response.send(Err(message));
+            return Ok(());
+        }
+        // Only vendor-accepted guidance becomes durable. If this commit fails
+        // after delivery, fail the turn: continuing would let later context
+        // diverge from the event log.
+        if let Err(error) = self.store.append_event_with_message(
+            scope,
+            Event::TurnSteered {
+                turn,
+                content,
+                attachments,
+            },
+            &thread.id,
+            &payload,
+            attachment_rows,
+            attachment_cleanup.claim(),
+        ) {
+            let mut message = error.to_string();
+            if let Err(cleanup) =
+                self.rollback_materialized_attachment_paths(session, &materialized_paths)
+            {
+                message.push_str(&format!(
+                    "; materialized attachment rollback failed: {cleanup}"
+                ));
+            }
+            response.send(Err(message));
+            return Err(error);
+        }
+        attachment_cleanup.disarm();
+        response.send(Ok(()));
+        Ok(())
+    }
+
+    /// Append one steering command to a native provider transcript at a safe
+    /// model-invocation boundary. Returns the provider-facing user prompt when
+    /// the guidance became durable so callers that keep an in-memory
+    /// transcript can extend it without re-reading the store.
+    async fn accept_native_steer_command(
+        &self,
+        session: &Session,
+        thread: &Thread,
+        turn: u64,
+        cancel: &tokio_util::sync::CancellationToken,
+        mutation_lane_state: &tokio::sync::watch::Sender<SteerMutationLaneState>,
+        command: SteerTurnCommand,
+    ) -> Result<Option<String>> {
+        let scope = Scope::Thread(thread.id.clone());
+        let SteerTurnCommand {
+            content,
+            attachments,
+            attachment_rows,
+            mut attachment_cleanup,
+            response,
+            _permit,
+        } = command;
+        if cancel.is_cancelled() {
+            response.send(Err("turn cancelled".into()));
+            return Ok(None);
         }
 
         let staged = attachment_rows
@@ -14150,7 +14309,7 @@ impl Engine {
                 _ = cancel.cancelled() => {
                     mutation_lane_state.send_replace(SteerMutationLaneState::Idle);
                     response.send(Err("turn cancelled".into()));
-                    return Ok(());
+                    return Ok(None);
                 }
                 permit = self.tool_mutation_permit(&session.id) => permit,
             };
@@ -14170,7 +14329,7 @@ impl Engine {
                 Ok(materialized) => materialized,
                 Err(error) => {
                     response.send(Err(error.clone()));
-                    return Ok(());
+                    return Ok(None);
                 }
             }
         };
@@ -14180,7 +14339,7 @@ impl Engine {
             .map(|file| (file.attachment.clone(), file.relative_path.clone()))
             .collect::<Vec<_>>();
         let provider_prompt = annotate_attachments(content.clone(), &prompt_files);
-        let payload = match serde_json::to_value(Message::User(provider_prompt)) {
+        let payload = match serde_json::to_value(Message::User(provider_prompt.clone())) {
             Ok(payload) => payload,
             Err(error) => {
                 let mut message = error.to_string();
@@ -14218,7 +14377,7 @@ impl Engine {
         }
         attachment_cleanup.disarm();
         response.send(Ok(()));
-        Ok(())
+        Ok(Some(provider_prompt))
     }
 
     /// Whether the current turn has accepted attachment-bearing steering and
@@ -18139,144 +18298,19 @@ impl Engine {
                     };
                     flush_backend_event_batch(&self.store, &scope, &mut persisted).await?;
                     persist_deadline = None;
-                    let SteerTurnCommand {
-                        content,
-                        attachments,
-                        attachment_rows,
-                        mut attachment_cleanup,
-                        response,
-                        _permit,
-                    } = command;
-                    // Cancellation can arrive while the selected steer command
-                    // flushes pending backend events. Reject it before either
-                    // persisting the user message or calling the backend.
-                    if cancel.is_cancelled() {
-                        response.send(Err("turn cancelled".into()));
-                        continue;
-                    }
-                    let staged = attachment_rows
-                        .iter()
-                        .map(|(attachment, path)| AttachmentMaterializationFile {
-                            attachment: attachment.clone(),
-                            source: PathBuf::from(path),
-                        })
-                        .collect::<Vec<_>>();
-                    // Text-only steering does not touch the worktree and must
-                    // reach the active vendor turn even while one of its tools
-                    // owns the session mutation lane.
-                    let materialized = if staged.is_empty() {
-                        Vec::new()
-                    } else {
-                        let _materialization_permit = materialization_permit
-                            .expect("attachment steering must reserve the mutation lane");
-                        match self.executor.materialize_attachments(
-                            &AttachmentMaterialization {
-                                source_root: self.data_dir.join("attachments"),
-                                managed_worktree_root: self.data_dir.join("worktrees"),
-                                worktree: PathBuf::from(&session.worktree_path),
-                                files: staged,
-                                cancel: cancel.clone(),
-                            },
-                        ).await {
-                            Ok(materialized) => materialized,
-                            Err(error) => {
-                                response.send(Err(error.clone()));
-                                consecutive_backend_events = 0;
-                                continue;
-                            }
-                        }
-                    };
-                    let materialized_paths = materialized
-                        .iter()
-                        .map(|file| file.absolute_path.clone())
-                        .collect::<Vec<_>>();
-                    let (images, files): (Vec<_>, Vec<_>) = materialized
-                        .into_iter()
-                        .partition(|file| file.attachment.mime.starts_with("image/"));
-                    let prompt_files = files
-                        .iter()
-                        .map(|file| (file.attachment.clone(), file.relative_path.clone()))
-                        .collect::<Vec<_>>();
-                    let backend_prompt = annotate_attachments(content.clone(), &prompt_files);
-                    let backend_attachments = images
-                        .into_iter()
-                        .map(|file| trouve_agents::TurnAttachment {
-                            name: file.attachment.name,
-                            mime: file.attachment.mime,
-                            bytes: file.bytes,
-                            local_path: Some(file.absolute_path),
-                        })
-                        .collect();
-                    let payload = match serde_json::to_value(Message::User(backend_prompt.clone())) {
-                        Ok(payload) => payload,
-                        Err(error) => {
-                            let mut message = error.to_string();
-                            if let Err(cleanup) = self.rollback_materialized_attachment_paths(
-                                session,
-                                &materialized_paths,
-                            ) {
-                                message.push_str(&format!(
-                                    "; materialized attachment rollback failed: {cleanup}"
-                                ));
-                            }
-                            let error = anyhow!(message);
-                            response.send(Err(error.to_string()));
-                            return Err(error);
-                        }
-                    };
-                    let backend_result = backend
-                        .steer_turn(BackendSteer {
-                            cancel: cancel.clone(),
-                            session: active_vendor_session
-                                .clone()
-                                .expect("steering branch requires a backend session"),
-                            prompt: backend_prompt.clone(),
-                            attachments: backend_attachments,
-                        })
-                        .await;
-                    if let Err(error) = backend_result {
-                        let mut message = error.to_string();
-                        if let Err(cleanup) = self.rollback_materialized_attachment_paths(
-                            session,
-                            &materialized_paths,
-                        ) {
-                            message.push_str(&format!(
-                                "; materialized attachment rollback failed: {cleanup}"
-                            ));
-                        }
-                        response.send(Err(message.clone()));
-                        consecutive_backend_events = 0;
-                        continue;
-                    }
-                    // Only vendor-accepted guidance becomes durable. If this
-                    // commit fails after delivery, fail the turn: continuing
-                    // would let later context diverge from the event log.
-                    if let Err(error) = self.store.append_event_with_message(
-                        scope.clone(),
-                        Event::TurnSteered {
-                            turn,
-                            content,
-                            attachments,
-                        },
-                        &thread.id,
-                        &payload,
-                        attachment_rows,
-                        attachment_cleanup.claim(),
-                    ) {
-                        let mut message = error.to_string();
-                        if let Err(cleanup) = self.rollback_materialized_attachment_paths(
-                            session,
-                            &materialized_paths,
-                        ) {
-                            message.push_str(&format!(
-                                "; materialized attachment rollback failed: {cleanup}"
-                            ));
-                        }
-                        response.send(Err(message));
-                        return Err(error);
-                    }
-                    attachment_cleanup.disarm();
-                    response.send(Ok(()));
+                    self.accept_backend_steer_command(
+                        session,
+                        thread,
+                        turn,
+                        &backend,
+                        active_vendor_session
+                            .as_deref()
+                            .expect("steering branch requires a backend session"),
+                        &cancel,
+                        materialization_permit,
+                        command,
+                    )
+                    .await?;
                     consecutive_backend_events = 0;
                     continue;
                 }

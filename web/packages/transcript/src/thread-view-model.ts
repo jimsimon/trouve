@@ -685,6 +685,9 @@ export class ThreadViewModel {
           envelope.turn,
           `${envelope.provider_id}/${envelope.provider_model}`,
         );
+        // An automatic selection cannot advertise steering on turn.started;
+        // the concrete route does, and a failover replaces it again.
+        this.turnSteerable.set(envelope.turn, envelope.supports_steering ?? false);
         return true;
       case "turn.phase_changed":
         this.turnPhase = envelope.phase;

@@ -97,6 +97,7 @@ describe("ThreadViewModel", () => {
 
     expect(vm.turnModels.get(4)).toBe("codex/gpt-5.6-sol");
     expect(vm.usageModel()).toBe("codex/gpt-5.6-sol");
+    expect(vm.turnSteerable.get(4)).toBe(false);
 
     // A newer turn without usage does not take ownership of the previous
     // completed-turn usage shown beside the composer.
@@ -116,6 +117,40 @@ describe("ThreadViewModel", () => {
       model: "auto/gpt-5.6-sol",
     }));
     expect(vm.usageModel()).toBe("codex/gpt-5.6-sol");
+  });
+
+  it("follows the selected automatic route's steering capability", () => {
+    const vm = new ThreadViewModel();
+    vm.apply(envelope(1, {
+      type: "turn.started",
+      turn: 4,
+      mode: "code",
+      model: "auto/gpt-5.6-sol",
+      supports_steering: false,
+    }));
+    expect(vm.turnSteerable.get(4)).toBe(false);
+
+    vm.apply(envelope(2, {
+      type: "model.route_selected",
+      turn: 4,
+      model: "auto/gpt-5.6-sol",
+      provider_id: "codex",
+      provider_model: "gpt-5.6-sol",
+      reason: "initial",
+      supports_steering: true,
+    }));
+    expect(vm.turnSteerable.get(4)).toBe(true);
+
+    vm.apply(envelope(3, {
+      type: "model.route_selected",
+      turn: 4,
+      model: "auto/gpt-5.6-sol",
+      provider_id: "cursor",
+      provider_model: "gpt-5.6-sol",
+      reason: "route_failover",
+    }));
+    expect(vm.turnSteerable.get(4)).toBe(false);
+    expect(vm.turnModels.get(4)).toBe("cursor/gpt-5.6-sol");
   });
 
   it("bumps the items revision only for events that can touch the transcript", () => {

@@ -391,7 +391,11 @@ pub use requests::*;
 // ServerInfo.catalog_available and the server.model_catalog_changed event
 // report whether the public catalog has been downloaded, and vendor-backed
 // providers (Codex, Cursor) refresh their rosters from their CLIs (additive).
-pub const PROTOCOL_VERSION: &str = "9.8";
+// 9.9: automatic model routes accept in-flight steering when the selected
+// route's provider supports it; `model.route_selected.supports_steering`
+// replaces the turn's initial capability on every route selection and
+// failover (additive).
+pub const PROTOCOL_VERSION: &str = "9.9";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";
 pub const ERROR_CODE_GITHUB_REAUTHENTICATION_REQUIRED: &str = "github_reauthentication_required";

@@ -702,6 +702,12 @@ pub enum Event {
         provider_id: String,
         provider_model: String,
         reason: ModelRouteReason,
+        /// Whether the selected route accepts additional user input without
+        /// cancelling or starting another turn. Automatic selections publish
+        /// `supports_steering: false` on `turn.started`; this per-route value
+        /// replaces it, and a failover to another route replaces it again.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        supports_steering: bool,
     },
     /// The preference order used by provider-neutral model routing changed.
     /// Carries a full replacement snapshot for replay and reconnect.
@@ -778,10 +784,52 @@ mod tests {
             provider_id: "provider".into(),
             provider_model: "shared".into(),
             reason: ModelRouteReason::CapacityFailover,
+            supports_steering: false,
         };
         let value = serde_json::to_value(event).unwrap();
         assert_eq!(value["reason"], "capacity_failover");
         assert!(serde_json::from_value::<ModelRouteReason>(serde_json::json!("other")).is_err());
+    }
+
+    #[test]
+    fn model_route_selected_steering_is_additive() {
+        let historical: Event = serde_json::from_value(serde_json::json!({
+            "type": "model.route_selected",
+            "turn": 1,
+            "model": "auto/shared",
+            "provider_id": "provider",
+            "provider_model": "shared",
+            "reason": "initial"
+        }))
+        .unwrap();
+        assert!(matches!(
+            historical,
+            Event::ModelRouteSelected {
+                supports_steering: false,
+                ..
+            }
+        ));
+
+        let steerable = serde_json::to_value(Event::ModelRouteSelected {
+            turn: 1,
+            model: "auto/shared".into(),
+            provider_id: "provider".into(),
+            provider_model: "shared".into(),
+            reason: ModelRouteReason::Initial,
+            supports_steering: true,
+        })
+        .unwrap();
+        assert_eq!(steerable["supports_steering"], true);
+        let silent = serde_json::to_value(Event::ModelRouteSelected {
+            turn: 1,
+            model: "auto/shared".into(),
+            provider_id: "provider".into(),
+            provider_model: "shared".into(),
+            reason: ModelRouteReason::Initial,
+            supports_steering: false,
+        })
+        .unwrap();
+        assert!(silent.get("supports_steering").is_none());
     }
 
     #[test]

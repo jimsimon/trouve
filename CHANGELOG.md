@@ -6,6 +6,20 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Steering on automatic model routes**: a thread on an `auto/<model>`
+  selection can now be steered while its turn runs whenever the concrete
+  route the turn landed on supports it. The composer shows the steering
+  control once `model.route_selected` reports `supports_steering: true` and
+  hides it again if a failover moves the turn to a provider that cannot
+  accept live guidance. Native API routes accept steering at model
+  boundaries exactly like a pinned selection; vendor-agent routes accept it
+  through the same per-backend capability as a pinned backend.
+- **Client/server compatibility**: protocol compatibility advances to 9.9 for
+  the additive `model.route_selected.supports_steering` field. Upgrade the
+  desktop or PWA client and `trouve-server` together.
+
 ## [4.12.0] - 2026-09-18
 
 This release adds resilient provider-neutral model routing and live vendor

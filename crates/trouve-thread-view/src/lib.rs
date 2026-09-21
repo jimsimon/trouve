@@ -145,11 +145,18 @@ impl ThreadProjection {
                 turn,
                 provider_id,
                 provider_model,
+                supports_steering,
                 ..
             } => {
                 self.snapshot
                     .turn_models
                     .insert(*turn, format!("{provider_id}/{provider_model}"));
+                // The concrete route owns the capability an automatic
+                // selection could not advertise on turn.started; a failover
+                // replaces it again.
+                self.snapshot
+                    .turn_steerable
+                    .insert(*turn, *supports_steering);
             }
             Event::TurnPhaseChanged { phase, .. } => {
                 self.snapshot.turn_phase = Some(*phase);
@@ -1069,6 +1076,7 @@ mod tests {
                 provider_id: "codex".into(),
                 provider_model: "gpt-5.6-sol".into(),
                 reason: trouve_protocol::ModelRouteReason::Initial,
+                supports_steering: true,
             },
         ));
 
@@ -1076,6 +1084,26 @@ mod tests {
             projection.snapshot.turn_models.get(&9).map(String::as_str),
             Some("codex/gpt-5.6-sol")
         );
+        assert_eq!(projection.snapshot.turn_steerable.get(&9), Some(&true));
+
+        projection.apply(&envelope(
+            3,
+            2,
+            Event::ModelRouteSelected {
+                turn: 9,
+                model: "auto/gpt-5.6-sol".into(),
+                provider_id: "cursor".into(),
+                provider_model: "gpt-5.6-sol".into(),
+                reason: trouve_protocol::ModelRouteReason::RouteFailover,
+                supports_steering: false,
+            },
+        ));
+
+        assert_eq!(
+            projection.snapshot.turn_models.get(&9).map(String::as_str),
+            Some("cursor/gpt-5.6-sol")
+        );
+        assert_eq!(projection.snapshot.turn_steerable.get(&9), Some(&false));
     }
 
     #[test]

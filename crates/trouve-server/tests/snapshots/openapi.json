@@ -7,7 +7,7 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "9.8"
+    "version": "9.9"
   },
   "paths": {
     "/v1/approvals": {
@@ -9539,6 +9539,10 @@
               },
               "reason": {
                 "$ref": "#/components/schemas/ModelRouteReason"
+              },
+              "supports_steering": {
+                "type": "boolean",
+                "description": "Whether the selected route accepts additional user input without\ncancelling or starting another turn. Automatic selections publish\n`supports_steering: false` on `turn.started`; this per-route value\nreplaces it, and a failover to another route replaces it again."
               },
               "turn": {
                 "type": "integer",
