@@ -8978,6 +8978,44 @@ impl Engine {
         Ok(personas)
     }
 
+    /// A persona's non-thinking model options must be wire-representable
+    /// scalars and must not compete with `default_thinking_level`. When the
+    /// persona pins a model they are also checked against that model's
+    /// advertised schema; an inheriting persona resolves its model per thread
+    /// or review run, where unsupported keys are dropped for the route.
+    async fn validate_persona_model_options(
+        &self,
+        options: &serde_json::Map<String, serde_json::Value>,
+        model: Option<&str>,
+    ) -> Result<(), EngineError> {
+        if options.is_empty() {
+            return Ok(());
+        }
+        if let Some((name, _)) = options
+            .iter()
+            .find(|(_, value)| !value.is_string() && !value.is_number() && !value.is_boolean())
+        {
+            return Err(EngineError::BadRequest(format!(
+                "default_model_options.{name} must be a string, number, or boolean"
+            )));
+        }
+        if has_thinking_option(options) {
+            return Err(EngineError::BadRequest(
+                "default_model_options cannot set thinking; use default_thinking_level".into(),
+            ));
+        }
+        let Some(model) = model else {
+            return Ok(());
+        };
+        let model_info = self.resolve_model_info(model).await?;
+        validate_model_options(options, &model_info).map_err(|error| match error {
+            EngineError::BadRequest(message) => {
+                EngineError::BadRequest(format!("default_model_options: {message}"))
+            }
+            other => other,
+        })
+    }
+
     /// Create or update a user-level persona. Saving under a built-in id
     /// customizes that built-in; the file lands in `<config>/personas/`.
     pub async fn upsert_persona(
@@ -9003,6 +9041,11 @@ impl Engine {
             validate_model_selection(model)?;
         }
         validate_thinking_level(req.default_thinking_level.as_deref())?;
+        self.validate_persona_model_options(
+            &req.default_model_options,
+            req.default_model.as_deref(),
+        )
+        .await?;
         let persona = AgentPersona {
             id: id.to_string(),
             display_name: req.display_name,
@@ -9013,6 +9056,7 @@ impl Engine {
             default_permission_mode: req.default_permission_mode,
             default_model: req.default_model,
             default_thinking_level: req.default_thinking_level,
+            default_model_options: req.default_model_options,
         };
         let mutation = self.persona_mutations.clone().lock_owned().await;
         if legacy_reviewer {
@@ -13147,6 +13191,13 @@ impl Engine {
             .or_else(|| mode.default_model.clone())
             .unwrap_or_else(|| global_defaults.model.clone());
         let mut model_options = req.model_options;
+        // Persona option defaults (for example `fast`) fill in whatever the
+        // request left unset; the request always wins for keys it names.
+        for (key, value) in &mode.default_model_options {
+            model_options
+                .entry(key.clone())
+                .or_insert_with(|| value.clone());
+        }
         // `thinking_level` is the canonical inherited key. Before a turn it
         // is resolved to the selected model's advertised key
         // (reasoning_effort, effort, ...), or removed for models that do not
@@ -23740,7 +23791,126 @@ mod tests {
             default_permission_mode: None,
             default_model: None,
             default_thinking_level: None,
+            default_model_options: Default::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn persona_model_options_are_validated_persisted_and_seed_new_threads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let workspace = trouve_protocol::Workspace {
+            id: "ws_persona_options".into(),
+            name: "persona options".into(),
+            path: tmp.path().display().to_string(),
+        };
+        store.insert_workspace(&workspace).unwrap();
+        let session = Session {
+            id: "se_persona_options".into(),
+            workspace_id: workspace.id.clone(),
+            title: "Persona options".into(),
+            branch: "trouve/persona-options".into(),
+            worktree_path: workspace.path.clone(),
+            base_ref: "main".into(),
+            archived: false,
+            active: false,
+            created_at: chrono::Utc::now(),
+        };
+        store.insert_session(&session).unwrap();
+        let config = Config {
+            local_enabled: Some(false),
+            ..Default::default()
+        };
+        let engine = Engine::new(store.clone(), tmp.path().join("data"), &config)
+            .with_config_dir(Some(tmp.path().join("config")));
+
+        let mut request = persona_request("Fast reviewer");
+        request.group = trouve_protocol::PersonaGroup::Reviewer;
+        request.default_model_options =
+            serde_json::Map::from_iter([("thinking_level".into(), serde_json::json!("high"))]);
+        let error = engine
+            .upsert_persona("fast-reviewer", request.clone())
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("default_thinking_level"),
+            "thinking must stay on its dedicated field: {error}"
+        );
+        request.default_model_options =
+            serde_json::Map::from_iter([("fast".into(), serde_json::json!({"nested": true}))]);
+        let error = engine
+            .upsert_persona("fast-reviewer", request.clone())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("string, number, or boolean"));
+
+        // An inheriting persona resolves its model per thread or review run,
+        // so scalar options are accepted without a pinned model.
+        request.default_model_options =
+            serde_json::Map::from_iter([("fast".into(), serde_json::Value::Bool(true))]);
+        engine
+            .upsert_persona("fast-reviewer", request.clone())
+            .await
+            .unwrap();
+        let persona = engine
+            .resolve_personas(None)
+            .unwrap()
+            .into_iter()
+            .find(|persona| persona.id == "fast-reviewer")
+            .unwrap();
+        assert_eq!(persona.default_model_options, request.default_model_options);
+        let reviewer = engine
+            .code_review_reviewer_catalog()
+            .unwrap()
+            .into_iter()
+            .find(|reviewer| reviewer.id == "fast-reviewer")
+            .unwrap();
+        assert_eq!(
+            reviewer.model_options, request.default_model_options,
+            "review runs read the persona's options through the reviewer catalog"
+        );
+
+        // New threads inherit the persona's options unless the request names
+        // the same key itself.
+        let inherited = engine
+            .create_thread(CreateThreadRequest {
+                session_id: session.id.clone(),
+                title: None,
+                mode: Some("fast-reviewer".into()),
+                model: Some("codex/gpt-5.6-sol".into()),
+                model_options: serde_json::Map::new(),
+                permission_mode: None,
+            })
+            .unwrap();
+        assert_eq!(inherited.model_options["fast"], true);
+        let explicit = engine
+            .create_thread(CreateThreadRequest {
+                session_id: session.id.clone(),
+                title: None,
+                mode: Some("fast-reviewer".into()),
+                model: Some("codex/gpt-5.6-sol".into()),
+                model_options: serde_json::Map::from_iter([(
+                    "fast".into(),
+                    serde_json::Value::Bool(false),
+                )]),
+                permission_mode: None,
+            })
+            .unwrap();
+        assert_eq!(explicit.model_options["fast"], false);
+
+        // Omitting the map clears the persona's options.
+        request.default_model_options = serde_json::Map::new();
+        engine
+            .upsert_persona("fast-reviewer", request)
+            .await
+            .unwrap();
+        let persona = engine
+            .resolve_personas(None)
+            .unwrap()
+            .into_iter()
+            .find(|persona| persona.id == "fast-reviewer")
+            .unwrap();
+        assert!(persona.default_model_options.is_empty());
     }
 
     struct RejectingPersonaDeletionExecutor {
@@ -23944,6 +24114,7 @@ mod tests {
             default_permission_mode: policy.default_permission_mode,
             default_model: policy.default_model,
             default_thinking_level: policy.default_thinking_level,
+            default_model_options: policy.default_model_options,
         };
 
         engine
@@ -24003,6 +24174,7 @@ mod tests {
             default_permission_mode: None,
             default_model: None,
             default_thinking_level: None,
+            default_model_options: Default::default(),
         };
         personas::upsert_user_persona(&workspace.join(".agents"), &workspace_persona).unwrap();
         assert!(
@@ -24166,6 +24338,7 @@ mod tests {
             default_permission_mode: None,
             default_model: None,
             default_thinking_level: None,
+            default_model_options: Default::default(),
         };
         personas::upsert_user_persona(&config_dir, &persona).unwrap();
         let store = Store::open_in_memory().unwrap();

@@ -52,6 +52,9 @@ export interface ReviewerProfile {
   prompt: string;
   model?: string | undefined;
   default_thinking_level?: string | undefined;
+  /** Reusable non-thinking options (for example `fast`) for the persona's
+   * effective model. Repository overrides take precedence. */
+  model_options?: ModelOptions | undefined;
   built_in: boolean;
 }
 
@@ -523,6 +526,7 @@ export interface AgentPersona {
   default_permission_mode?: string;
   default_model?: string | undefined;
   default_thinking_level?: string | undefined;
+  default_model_options?: ModelOptions | undefined;
 }
 
 export interface PersonaInfo {

@@ -103,6 +103,7 @@ pub fn reviewer_as_persona(reviewer: &ReviewerProfile) -> AgentPersona {
         default_permission_mode: None,
         default_model: reviewer.model.clone(),
         default_thinking_level: reviewer.default_thinking_level.clone(),
+        default_model_options: reviewer.model_options.clone(),
     }
 }
 
@@ -113,7 +114,7 @@ pub fn persona_as_reviewer(persona: &AgentPersona, built_in: bool) -> ReviewerPr
         prompt: persona.system_prompt.clone(),
         model: persona.default_model.clone(),
         default_thinking_level: persona.default_thinking_level.clone(),
-        model_options: Default::default(),
+        model_options: persona.default_model_options.clone(),
         built_in,
     }
 }
@@ -234,12 +235,21 @@ mod tests {
             default_permission_mode: Some(trouve_protocol::PermissionMode::Ask),
             default_model: Some("provider/default".into()),
             default_thinking_level: Some("medium".into()),
+            default_model_options: serde_json::Map::from_iter([(
+                "fast".into(),
+                serde_json::Value::Bool(true),
+            )]),
         };
         let merged = persona_as_reviewer(&persona, true);
         assert_eq!(merged.name, "Correctness");
         assert_eq!(merged.prompt, "Canonical prompt");
         assert_eq!(merged.model.as_deref(), Some("provider/default"));
         assert_eq!(merged.default_thinking_level.as_deref(), Some("medium"));
+        assert_eq!(merged.model_options["fast"], true);
         assert!(merged.built_in);
+        assert_eq!(
+            reviewer_as_persona(&merged).default_model_options,
+            persona.default_model_options
+        );
     }
 }

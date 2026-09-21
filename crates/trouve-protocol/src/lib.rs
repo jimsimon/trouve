@@ -395,7 +395,11 @@ pub use requests::*;
 // route's provider supports it; `model.route_selected.supports_steering`
 // replaces the turn's initial capability on every route selection and
 // failover (additive).
-pub const PROTOCOL_VERSION: &str = "9.9";
+// 9.10: personas carry `default_model_options` (for example `fast`) that seed
+// threads and reviewer runs started with them, and automatic model entries
+// keep an option when every route accepts the same values even if vendors
+// word its title or description differently (additive).
+pub const PROTOCOL_VERSION: &str = "9.10";
 pub const EVENT_CURSOR_HEADER: &str = "x-trouve-event-cursor";
 pub const ERROR_CODE_SESSION_DIFF_TOO_LARGE: &str = "session_diff_too_large";
 pub const ERROR_CODE_GITHUB_REAUTHENTICATION_REQUIRED: &str = "github_reauthentication_required";

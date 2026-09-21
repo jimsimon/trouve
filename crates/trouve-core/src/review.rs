@@ -3494,6 +3494,9 @@ impl Engine {
                     .default_thinking_level
                     .clone()
                     .or(existing.default_thinking_level);
+                if reviewer.model_options.is_empty() {
+                    reviewer.model_options = existing.model_options;
+                }
             }
             reviewers.push(reviewer);
         }

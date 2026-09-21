@@ -73,6 +73,12 @@ pub struct AgentPersona {
     /// None falls back to the global default thinking level.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_thinking_level: Option<String>,
+    /// Non-thinking model options (for example `fast`) applied to threads
+    /// and review runs started with this persona. Thinking stays on
+    /// `default_thinking_level`. Empty means the model's own defaults.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    #[schema(value_type = std::collections::BTreeMap<String, ModelOptionValue>)]
+    pub default_model_options: serde_json::Map<String, serde_json::Value>,
 }
 
 /// A persona plus where it came from, for the settings UI.
@@ -105,6 +111,11 @@ pub struct UpsertPersonaRequest {
     /// None uses the global default thinking level.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_thinking_level: Option<String>,
+    /// Non-thinking model options validated against `default_model` when one
+    /// is set. Omitted or empty clears the persona's options.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    #[schema(value_type = std::collections::BTreeMap<String, ModelOptionValue>)]
+    pub default_model_options: serde_json::Map<String, serde_json::Value>,
 }
 
 // --- server info ---------------------------------------------------------

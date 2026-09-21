@@ -118,6 +118,7 @@ pub fn builtin_personas() -> Vec<AgentPersona> {
             default_permission_mode: None,
             default_model: None,
             default_thinking_level: None,
+            default_model_options: Default::default(),
         },
         AgentPersona {
             id: "plan".into(),
@@ -154,6 +155,7 @@ pub fn builtin_personas() -> Vec<AgentPersona> {
             default_permission_mode: None,
             default_model: None,
             default_thinking_level: None,
+            default_model_options: Default::default(),
         },
         AgentPersona {
             id: REVIEW_PERSONA_ID.into(),
@@ -176,6 +178,7 @@ pub fn builtin_personas() -> Vec<AgentPersona> {
             // adjudication reliable while explicit persona settings can
             // still move narrower work up or down.
             default_thinking_level: Some("medium".into()),
+            default_model_options: Default::default(),
         },
     ]
 }
@@ -208,6 +211,7 @@ pub fn fallback_persona() -> AgentPersona {
         default_permission_mode: None,
         default_model: None,
         default_thinking_level: None,
+        default_model_options: Default::default(),
     }
 }
 
@@ -747,6 +751,7 @@ mod tests {
             default_permission_mode: None,
             default_model: None,
             default_thinking_level: None,
+            default_model_options: Default::default(),
         };
 
         let secured = secure_automated_review_persona(persona);
@@ -823,6 +828,10 @@ default_permission_mode = "ask"
         plan.display_name = "My Plan".into();
         plan.default_model = Some("openai/gpt-4.1-mini".into());
         plan.default_thinking_level = Some("high".into());
+        plan.default_model_options = serde_json::Map::from_iter([
+            ("fast".into(), serde_json::Value::Bool(true)),
+            ("temperature".into(), serde_json::json!(0.25)),
+        ]);
         upsert_user_persona(config, &plan).unwrap();
         let custom = AgentPersona {
             id: "docs".into(),
@@ -834,6 +843,7 @@ default_permission_mode = "ask"
             default_permission_mode: None,
             default_model: None,
             default_thinking_level: None,
+            default_model_options: Default::default(),
         };
         upsert_user_persona(config, &custom).unwrap();
 
@@ -849,6 +859,12 @@ default_permission_mode = "ask"
             by_id("plan").persona.default_thinking_level.as_deref(),
             Some("high")
         );
+        // Model options survive the TOML round trip with their scalar types.
+        assert_eq!(
+            by_id("plan").persona.default_model_options,
+            plan.default_model_options
+        );
+        assert!(by_id("docs").persona.default_model_options.is_empty());
         assert_eq!(by_id("docs").origin, "custom");
         assert_eq!(by_id("code").origin, "builtin");
         // Built-ins keep canonical order; customs sort after.

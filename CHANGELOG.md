@@ -19,6 +19,22 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Client/server compatibility**: protocol compatibility advances to 9.9 for
   the additive `model.route_selected.supports_steering` field. Upgrade the
   desktop or PWA client and `trouve-server` together.
+- **Reviewer personas carry model options**: personas gain
+  `default_model_options` (for example Codex or Cursor `fast`). The reviewer
+  persona editor in the review UI exposes the same schema-driven controls the
+  repository page already had for the coordinator, router, and analyst; the
+  options seed review runs for that persona (repository overrides still win)
+  and new desktop threads started with the persona. Protocol compatibility
+  advances to 9.10 (additive).
+
+### Fixed
+
+- **Fast mode disappeared from automatic model selections**: `auto/<model>`
+  entries dropped any option whose vendor wording differed between routes, so
+  once Codex described `fast` and Cursor titled it, the toggle vanished from
+  every role that used automatic routing in both the review UI and the
+  desktop app. Routes now share an option when they accept the same values,
+  regardless of title or description text.
 
 ## [4.12.0] - 2026-09-18
 

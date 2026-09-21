@@ -5170,6 +5170,16 @@
             ],
             "description": "Preferred model for threads started with this persona (\"provider/model\").\nNone falls back to the global default model."
           },
+          "default_model_options": {
+            "type": "object",
+            "description": "Non-thinking model options (for example `fast`) applied to threads\nand review runs started with this persona. Thinking stays on\n`default_thinking_level`. Empty means the model's own defaults.",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/ModelOptionValue"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
           "default_permission_mode": {
             "oneOf": [
               {
@@ -14769,6 +14779,16 @@
               "string",
               "null"
             ]
+          },
+          "default_model_options": {
+            "type": "object",
+            "description": "Non-thinking model options validated against `default_model` when one\nis set. Omitted or empty clears the persona's options.",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/ModelOptionValue"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
           },
           "default_permission_mode": {
             "oneOf": [

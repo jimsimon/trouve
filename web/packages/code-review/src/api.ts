@@ -240,6 +240,7 @@ export function createReviewApi({
         default_permission_mode: policy.default_permission_mode ?? null,
         default_model: reviewer.model || null,
         default_thinking_level: reviewer.default_thinking_level || null,
+        default_model_options: reviewer.model_options ?? {},
       }),
     });
   };
@@ -267,6 +268,7 @@ export function createReviewApi({
         default_permission_mode: persona.default_permission_mode ?? null,
         default_model: persona.default_model ?? null,
         default_thinking_level: persona.default_thinking_level ?? null,
+        default_model_options: persona.default_model_options ?? {},
       }),
     });
   const resetPersona = (id: string): Promise<void> =>
