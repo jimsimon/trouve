@@ -2237,12 +2237,14 @@ impl Engine {
                 session, thread, turn, mode, tool_ctx, tool_calls, cancel,
             );
             tokio::pin!(tool_batch);
-            // Text-only guidance accepted while tools run is durable at once;
-            // it joins the in-memory transcript after this batch's results so
-            // the provider still sees every tool result directly after its
-            // call. Attachment-bearing guidance needs the mutation lane the
-            // tools may hold, so it waits for the batch boundary.
-            let mut accepted_during_tools = Vec::new();
+            // Guidance that arrives while tools run waits for the batch
+            // boundary. This route keeps its transcript in memory, so
+            // accepting a command here would persist the user message ahead
+            // of the tool results the provider must see directly after their
+            // calls; deferring keeps the durable and live orderings identical
+            // for restarts and cross-provider handoffs. Attachment-bearing
+            // guidance additionally needs the mutation lane the tools may
+            // hold. The bounded command keeps its queue permit while it waits.
             let results = loop {
                 tokio::select! {
                     biased;
@@ -2252,26 +2254,9 @@ impl Engine {
                         &mut pending_native_steer,
                         true,
                     ), if !cancel.is_cancelled() => {
-                        let Some(command) = steer else {
-                            *steer_rx = None;
-                            continue;
-                        };
-                        if command.attachment_rows.is_empty() {
-                            if let Some(prompt) = self
-                                .accept_native_steer_command(
-                                    session,
-                                    thread,
-                                    turn,
-                                    cancel,
-                                    steer_mutation_lane_state,
-                                    command,
-                                )
-                                .await?
-                            {
-                                accepted_during_tools.push(prompt);
-                            }
-                        } else {
-                            boundary_steers.push(command);
+                        match steer {
+                            Some(command) => boundary_steers.push(command),
+                            None => *steer_rx = None,
                         }
                     }
                 }
@@ -2294,9 +2279,6 @@ impl Engine {
                 self.store
                     .append_message(&thread.id, &serde_json::to_value(&result)?)?;
                 messages.push(result);
-            }
-            for prompt in accepted_during_tools {
-                messages.push(Message::User(prompt));
             }
             for command in boundary_steers.drain(..) {
                 if let Some(prompt) = self
