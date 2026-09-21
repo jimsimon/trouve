@@ -3815,6 +3815,10 @@ impl RunProjection {
                 // name (`mcp`) on some Bridge versions, but their call id is a
                 // turn-specific identity fence for delayed callback retries.
                 "tool_call" => {
+                    // A tool call is a block boundary: reasoning streamed
+                    // before it belongs in front of the call, not merged
+                    // with whatever the model thinks after the result.
+                    self.close_thinking(events, cancel).await?;
                     if let Some(route) = self.callback_route.as_ref() {
                         let observed = payload
                             .get("call_id")
@@ -5072,7 +5076,7 @@ server.serve_forever()
     }
 
     #[tokio::test]
-    async fn projection_keeps_streamed_thinking_in_one_block() {
+    async fn projection_closes_thinking_on_completed_text_and_tool_boundaries() {
         let (sender_tx, sender_rx) = tokio::sync::oneshot::channel();
         let mut stream = Box::pin(async_stream(move |events| async move {
             let _ = sender_tx.send(events);
@@ -5087,6 +5091,10 @@ server.serve_forever()
             json!({ "sdkMessage": { "message": { "type": "thinking", "subtype": "completed" } } }),
             json!({ "sdkMessage": { "message": { "type": "thinking", "text": "Next" } } }),
             json!({ "sdkMessage": { "message": { "type": "thinking", "text": " block" } } }),
+            // A tool call closes the open block so the reasoning that led
+            // to the call renders before it.
+            json!({ "sdkMessage": { "message": { "type": "tool_call", "name": "mcp", "call_id": "call-1", "status": "started" } } }),
+            json!({ "sdkMessage": { "message": { "type": "thinking", "text": "After the tool." } } }),
             json!({ "sdkMessage": { "message": { "type": "assistant", "text": "Done." } } }),
             json!({ "sdkMessage": { "message": { "type": "thinking", "text": "Trailing" } } }),
             json!({
@@ -5128,6 +5136,8 @@ server.serve_forever()
                 "thinking:The user",
                 "thinking-completed",
                 "thinking:Next block",
+                "thinking-completed",
+                "thinking:After the tool.",
                 "thinking-completed",
                 "text:Done.",
                 "thinking:Trailing",

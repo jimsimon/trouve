@@ -1160,6 +1160,7 @@ impl AgentBackend for ClaudeBackend {
             let _registration_guard = registration_guard;
 
             let mut completed = false;
+            let mut projection = StreamProjection::default();
             loop {
                 let line = tokio::select! {
                     biased;
@@ -1195,7 +1196,7 @@ impl AgentBackend for ClaudeBackend {
                     completed = true;
                     break;
                 }
-                let events = map_event(&ev);
+                let events = projection.map_event(&ev);
                 // Track the session the process is holding so the next
                 // turn's reuse check compares against the current id.
                 for out in &events {
@@ -1692,7 +1693,75 @@ impl ClaudeBackend {
     }
 }
 
+/// Per-turn state for mapping Claude Code stream-json events.
+///
+/// Thinking streams as `thinking_delta` fragments and the CLI forwards the
+/// API's own block boundaries (`content_block_stop`). Closing the reasoning
+/// item on that boundary lets the transcript interleave reasoning with the
+/// tool calls that follow it instead of merging a whole turn's reasoning
+/// into one block, and it never cuts reasoning mid-sentence because the
+/// boundary is the model's, not ours.
+#[derive(Default)]
+struct StreamProjection {
+    /// A streamed thinking block is open and has not been closed yet.
+    thinking_open: bool,
+}
+
+impl StreamProjection {
+    /// Map one Claude Code stream-json event to zero or more backend events.
+    fn map_event(&mut self, ev: &Value) -> Vec<BackendEvent> {
+        match ev["type"].as_str() {
+            Some("stream_event") => {
+                let event = &ev["event"];
+                let delta = &event["delta"];
+                match (event["type"].as_str(), delta["type"].as_str()) {
+                    (_, Some("thinking_delta")) => {
+                        let mut out = Vec::new();
+                        // Redacted thinking arrives as empty deltas carrying
+                        // only a token estimate; there is nothing to show,
+                        // so drop them.
+                        if let Some(text) = delta["thinking"].as_str().filter(|t| !t.is_empty()) {
+                            self.thinking_open = true;
+                            out.push(BackendEvent::ThinkingDelta(text.to_string()));
+                        }
+                        out
+                    }
+                    // The API streams one content block at a time, so a
+                    // block ending while thinking is open ends that block.
+                    (Some("content_block_stop"), _) => self.close_thinking(),
+                    (_, Some("text_delta")) => {
+                        let mut out = self.close_thinking();
+                        if let Some(text) = delta["text"].as_str().filter(|t| !t.is_empty()) {
+                            out.push(BackendEvent::TextDelta(text.to_string()));
+                        }
+                        out
+                    }
+                    _ => vec![],
+                }
+            }
+            // Tool calls and the terminal result are block boundaries too;
+            // close any thinking left open if the stop event was not
+            // forwarded so reasoning still lands before the tools it led to.
+            Some("assistant") | Some("result") => {
+                let mut out = self.close_thinking();
+                out.extend(map_event(ev));
+                out
+            }
+            _ => map_event(ev),
+        }
+    }
+
+    fn close_thinking(&mut self) -> Vec<BackendEvent> {
+        if std::mem::take(&mut self.thinking_open) {
+            vec![BackendEvent::ThinkingCompleted]
+        } else {
+            vec![]
+        }
+    }
+}
+
 /// Map one Claude Code stream-json event to zero or more backend events.
+/// Stateless: thinking-block boundaries are handled by `StreamProjection`.
 fn map_event(ev: &Value) -> Vec<BackendEvent> {
     match ev["type"].as_str() {
         // Claude rotates session ids per run; always persist the latest.
@@ -1721,27 +1790,9 @@ fn map_event(ev: &Value) -> Vec<BackendEvent> {
             }
             out
         }
-        // Live deltas (--include-partial-messages). Text and thinking stream
-        // here; the complete "assistant" event that follows repeats the same
-        // content as whole blocks, so those are skipped below.
-        Some("stream_event") => {
-            let delta = &ev["event"]["delta"];
-            match delta["type"].as_str() {
-                Some("text_delta") => delta["text"]
-                    .as_str()
-                    .filter(|t| !t.is_empty())
-                    .map(|t| vec![BackendEvent::TextDelta(t.to_string())])
-                    .unwrap_or_default(),
-                // Redacted thinking arrives as empty deltas carrying only a
-                // token estimate; there is nothing to show, so drop them.
-                Some("thinking_delta") => delta["thinking"]
-                    .as_str()
-                    .filter(|t| !t.is_empty())
-                    .map(|t| vec![BackendEvent::ThinkingDelta(t.to_string())])
-                    .unwrap_or_default(),
-                _ => vec![],
-            }
-        }
+        // Live deltas (--include-partial-messages) are mapped by
+        // `StreamProjection`; the complete "assistant" event that follows
+        // repeats the same content as whole blocks, so those are skipped.
         Some("assistant") => {
             let mut out = Vec::new();
             if let Some(blocks) = ev["message"]["content"].as_array() {
@@ -2940,5 +2991,103 @@ cat >/dev/null
         if let BackendEvent::SessionStarted { session_id } = &events[0] {
             assert_eq!(session_id, "session-success-xyz789");
         }
+    }
+
+    fn stream_event(event: Value) -> Value {
+        json!({ "type": "stream_event", "event": event })
+    }
+
+    fn label(event: &BackendEvent) -> String {
+        match event {
+            BackendEvent::ThinkingDelta(text) => format!("thinking:{text}"),
+            BackendEvent::ThinkingCompleted => "thinking-completed".into(),
+            BackendEvent::TextDelta(text) => format!("text:{text}"),
+            BackendEvent::ToolStarted { call_id, .. } => format!("tool:{call_id}"),
+            other => panic!("unexpected event {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_projection_closes_thinking_on_its_block_boundary() {
+        let mut projection = StreamProjection::default();
+        let frames = [
+            stream_event(json!({ "type": "content_block_start", "index": 0,
+                "content_block": { "type": "thinking", "thinking": "" } })),
+            stream_event(json!({ "type": "content_block_delta", "index": 0,
+                "delta": { "type": "thinking_delta", "thinking": "Look at" } })),
+            stream_event(json!({ "type": "content_block_delta", "index": 0,
+                "delta": { "type": "thinking_delta", "thinking": " the file." } })),
+            stream_event(json!({ "type": "content_block_delta", "index": 0,
+                "delta": { "type": "signature_delta", "signature": "sig" } })),
+            stream_event(json!({ "type": "content_block_stop", "index": 0 })),
+            stream_event(json!({ "type": "content_block_start", "index": 1,
+                "content_block": { "type": "tool_use", "id": "t1", "name": "Read" } })),
+            stream_event(json!({ "type": "content_block_delta", "index": 1,
+                "delta": { "type": "input_json_delta", "partial_json": "{}" } })),
+            stream_event(json!({ "type": "content_block_stop", "index": 1 })),
+            json!({ "type": "assistant", "message": { "content": [
+                { "type": "thinking", "thinking": "Look at the file.", "signature": "sig" },
+                { "type": "tool_use", "id": "t1", "name": "Read", "input": {} },
+            ] } }),
+            stream_event(json!({ "type": "content_block_delta", "index": 0,
+                "delta": { "type": "thinking_delta", "thinking": "Now answer." } })),
+            stream_event(json!({ "type": "content_block_stop", "index": 0 })),
+            stream_event(json!({ "type": "content_block_delta", "index": 1,
+                "delta": { "type": "text_delta", "text": "Done." } })),
+            stream_event(json!({ "type": "content_block_stop", "index": 1 })),
+        ];
+        let observed: Vec<String> = frames
+            .iter()
+            .flat_map(|frame| projection.map_event(frame))
+            .map(|event| label(&event))
+            .collect();
+        assert_eq!(
+            observed,
+            [
+                "thinking:Look at",
+                "thinking: the file.",
+                "thinking-completed",
+                "tool:t1",
+                "thinking:Now answer.",
+                "thinking-completed",
+                "text:Done.",
+            ]
+        );
+    }
+
+    #[test]
+    fn stream_projection_closes_thinking_without_a_forwarded_stop_event() {
+        let mut projection = StreamProjection::default();
+        let frames = [
+            stream_event(json!({ "type": "content_block_delta", "index": 0,
+                "delta": { "type": "thinking_delta", "thinking": "Plan." } })),
+            json!({ "type": "assistant", "message": { "content": [
+                { "type": "tool_use", "id": "t1", "name": "Bash", "input": { "command": "ls" } },
+            ] } }),
+            stream_event(json!({ "type": "content_block_delta", "index": 0,
+                "delta": { "type": "thinking_delta", "thinking": "Reply." } })),
+            stream_event(json!({ "type": "content_block_delta", "index": 1,
+                "delta": { "type": "text_delta", "text": "Hi." } })),
+            // Redacted thinking: empty delta, never opens a block.
+            stream_event(json!({ "type": "content_block_delta", "index": 2,
+                "delta": { "type": "thinking_delta", "thinking": "", "estimated_tokens": 5 } })),
+            stream_event(json!({ "type": "content_block_stop", "index": 2 })),
+        ];
+        let observed: Vec<String> = frames
+            .iter()
+            .flat_map(|frame| projection.map_event(frame))
+            .map(|event| label(&event))
+            .collect();
+        assert_eq!(
+            observed,
+            [
+                "thinking:Plan.",
+                "thinking-completed",
+                "tool:t1",
+                "thinking:Reply.",
+                "thinking-completed",
+                "text:Hi.",
+            ]
+        );
     }
 }
