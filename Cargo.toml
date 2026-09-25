@@ -45,7 +45,7 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 toml = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-utoipa = { version = "5", features = ["chrono"] }
+utoipa = { version = "6", features = ["chrono"] }
 url = "2"
 uuid = { version = "1", features = ["v4"] }
 windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
