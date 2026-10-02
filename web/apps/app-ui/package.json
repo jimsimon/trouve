@@ -54,9 +54,9 @@
     "openapi-fetch": "0.17.0"
   },
   "devDependencies": {
-    "@axe-core/playwright": "4.12.1",
+    "@axe-core/playwright": "4.13.0",
     "@lit-labs/ssr": "4.1.0",
-    "@playwright/test": "1.62.0",
+    "@playwright/test": "1.63.0",
     "@types/node": "^24.0.0",
     "openapi-typescript": "7.13.0",
     "typescript": "^5.9.3",
