@@ -45,7 +45,7 @@ jobs:
           ref: ${{ env.RELEASE_TAG }}
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
-          python-version: "3.11.9"
+          python-version: "3.14.8"
       - name: Manifests in sync and tag matches workspace version
         run: |
           python3 scripts/sync_versions.py --check
@@ -63,7 +63,7 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ env.RELEASE_TAG }}
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
           cache: npm
@@ -74,7 +74,7 @@ jobs:
       - name: Build desktop UI
         working-directory: web/apps/app-ui
         run: npm run build
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: desktop-ui-build
           path: web/apps/app-ui/dist/desktop
@@ -89,7 +89,7 @@ jobs:
           persist-credentials: false
           ref: ${{ env.RELEASE_TAG }}
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
           cache: npm
@@ -110,7 +110,7 @@ jobs:
           npm run generate:sbom
           cp THIRD_PARTY_NOTICES.md ../../../target/release-compliance/THIRD_PARTY_NOTICES-WEB.md
           cp dist/npm-sbom.cdx.json ../../../target/release-compliance/npm-sbom.cdx.json
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-compliance
           path: target/release-compliance
@@ -212,7 +212,7 @@ jobs:
         run: |
           cd target/${{ matrix.target }}/release
           Compress-Archive -Path trouve-server.exe -DestinationPath "trouve-server-$env:RELEASE_TAG-${{ matrix.target }}.zip"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: trouve-server-${{ matrix.target }}
           path: |
@@ -291,7 +291,7 @@ jobs:
         run: |
           cd target/${{ matrix.target }}/release
           Compress-Archive -Path trouve.exe -DestinationPath "trouve-$env:RELEASE_TAG-${{ matrix.target }}.zip"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: matrix.app
         with:
           name: trouve-${{ matrix.target }}
@@ -313,7 +313,7 @@ jobs:
         run: |
           cd target/${{ matrix.target }}/release
           Compress-Archive -Path trouve-search.exe -DestinationPath "trouve-search-$env:RELEASE_TAG-${{ matrix.target }}.zip"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: github.event_name == 'push'
         with:
           name: trouve-search-${{ matrix.target }}
@@ -629,7 +629,7 @@ jobs:
         with:
           path: artifacts
           merge-multiple: true
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
