@@ -34,7 +34,7 @@ jobs:
         run: cargo fmt --all --check
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 24
+          node-version: 26
       - name: Web workspace formatting
         working-directory: web
         run: npm run format:check
@@ -49,7 +49,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 24
+          node-version: 26
           cache: npm
           cache-dependency-path: web/package-lock.json
       - name: Install web workspace dependencies
@@ -112,7 +112,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 24
+          node-version: 26
           cache: npm
           cache-dependency-path: web/package-lock.json
       - name: Install web workspace dependencies
@@ -157,7 +157,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 24
+          node-version: 26
       - name: Version sync tests
         run: python3 -m unittest scripts/test_sync_versions.py
       - name: Versions in sync
@@ -254,7 +254,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 24
+          node-version: 26
           cache: npm
           cache-dependency-path: npm/package-lock.json
       # npm/ is an npm workspace; one install links the local packages

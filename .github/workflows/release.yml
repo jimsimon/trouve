@@ -65,7 +65,7 @@ jobs:
           ref: ${{ env.RELEASE_TAG }}
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 24
+          node-version: 26
           cache: npm
           cache-dependency-path: web/package-lock.json
       - name: Install web workspace dependencies
@@ -91,7 +91,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 24
+          node-version: 26
           cache: npm
           cache-dependency-path: web/package-lock.json
       - name: Generate release compliance artifacts
@@ -631,7 +631,7 @@ jobs:
           merge-multiple: true
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 24
+          node-version: 26
           registry-url: https://registry.npmjs.org
       - name: Stage platform binaries
         run: python3 scripts/stage_npm_binaries.py artifacts
