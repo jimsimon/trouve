@@ -30,7 +30,7 @@ fontdb = "0.23.0"
 fs4 = "0.13"
 hmac = "0.12"
 hex = "0.4"
-jsonwebtoken = { version = "11.0", features = ["rust_crypto"] }
+jsonwebtoken = { version = "12.0", features = ["rust_crypto"] }
 octocrab = "0.54"
 reqwest = { version = "0.13", default-features = false, features = ["form", "json", "query", "stream", "rustls"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
