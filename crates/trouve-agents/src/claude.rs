@@ -1095,6 +1095,7 @@ impl AgentBackend for ClaudeBackend {
             (lines, registration_guard, Some(active_turn))
         };
         proc_.touch();
+        let resumed = turn.session.is_some();
 
         // Deliver the prompt before handing back the stream: the caller's
         // startup pacing treats a returned stream as "the vendor has the
@@ -1207,7 +1208,7 @@ impl AgentBackend for ClaudeBackend {
                             break;
                         }
                     }
-                    let _ = tx.send(Err(BackendError::Protocol(error))).await;
+                    let _ = tx.send(Err(turn_failure(error, resumed))).await;
                     completed = true;
                     break;
                 }
@@ -1249,16 +1250,36 @@ impl AgentBackend for ClaudeBackend {
                 // Stdout closed without a result. Terminate and acknowledge
                 // any surviving descendants before releasing the pool key.
                 let error = match pool.terminate_and_remove(&thread_id, &proc_).await {
-                    Ok(status) => BackendError::Protocol(format!(
-                        "claude exited with {status:?}: {}",
-                        proc_.stderr_tail.lock().unwrap().trim()
-                    )),
+                    Ok(status) => turn_failure(
+                        format!(
+                            "claude exited with {status:?}: {}",
+                            proc_.stderr_tail.lock().unwrap().trim()
+                        ),
+                        resumed,
+                    ),
                     Err(error) => error,
                 };
                 let _ = tx.send(Err(error)).await;
             }
         });
         Ok(stream.boxed())
+    }
+}
+
+/// Claude Code prunes idle transcripts on its own retention schedule, so a
+/// session id stored long ago can stop resolving. The CLI rejects such a
+/// `--resume` before running anything, either as an error result or by
+/// exiting with this message on stderr.
+const MISSING_SESSION_MARKER: &str = "No conversation found with session ID";
+
+/// Classify a failed turn. A resumed turn whose session the CLI could not
+/// find is reported distinctly so the engine can start a fresh session; the
+/// marker is ignored for fresh sessions, where it cannot describe a resume.
+fn turn_failure(message: String, resumed: bool) -> BackendError {
+    if resumed && message.contains(MISSING_SESSION_MARKER) {
+        BackendError::SessionNotFound(message)
+    } else {
+        BackendError::Protocol(message)
     }
 }
 
@@ -2635,6 +2656,85 @@ exit 7
         assert_pids_gone(&leaders).await;
         assert_pids_gone(&descendants).await;
         assert!(backend.pool.procs.lock().await.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn pruned_resume_reports_session_not_found_and_fresh_session_recovers() {
+        let directory = tempfile::tempdir().unwrap();
+        let stub = write_claude_stub(
+            directory.path(),
+            "claude-pruned",
+            r#"#!/bin/sh
+resumed=
+for arg in "$@"; do
+  if [ "$arg" = "--resume" ]; then resumed=1; fi
+done
+IFS= read -r prompt
+if [ -n "$resumed" ]; then
+  printf '%s\n' '{"type":"result","subtype":"error_during_execution","is_error":true,"errors":["No conversation found with session ID: pruned"]}'
+else
+  printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"session_id":"fresh","result":"ok"}'
+fi
+"#,
+        );
+        let backend = ClaudeBackend::new("claude-code", Some(stub.to_string_lossy().into_owned()));
+        let collect = |session: Option<&str>| {
+            let mut turn = lifecycle_turn(
+                directory.path(),
+                "pruned-thread",
+                "model-a",
+                tokio_util::sync::CancellationToken::new(),
+            );
+            turn.session = session.map(str::to_string);
+            let backend = &backend;
+            async move {
+                let mut stream = backend.run_turn(turn).await.unwrap();
+                let mut events = Vec::new();
+                while let Some(event) = tokio::time::timeout(Duration::from_secs(5), stream.next())
+                    .await
+                    .expect("Claude stub turn did not finish")
+                {
+                    events.push(event);
+                }
+                events
+            }
+        };
+
+        let resumed = collect(Some("pruned")).await;
+        assert!(
+            matches!(
+                resumed.as_slice(),
+                [Err(BackendError::SessionNotFound(message))] if message.contains("pruned")
+            ),
+            "{resumed:?}"
+        );
+
+        let fresh = collect(None).await;
+        assert!(
+            fresh
+                .iter()
+                .any(|event| matches!(event, Ok(BackendEvent::Completed { .. }))),
+            "{fresh:?}"
+        );
+        assert!(fresh.iter().all(Result::is_ok), "{fresh:?}");
+    }
+
+    #[test]
+    fn missing_session_marker_only_classifies_resumed_turns() {
+        let message = "No conversation found with session ID: abc".to_string();
+        assert!(matches!(
+            turn_failure(message.clone(), true),
+            BackendError::SessionNotFound(_)
+        ));
+        assert!(matches!(
+            turn_failure(message, false),
+            BackendError::Protocol(_)
+        ));
+        assert!(matches!(
+            turn_failure("You've reached your usage limit".into(), true),
+            BackendError::Protocol(_)
+        ));
     }
 
     #[cfg(target_os = "linux")]

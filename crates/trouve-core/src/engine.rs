@@ -2662,6 +2662,11 @@ struct BackendTurnContinuation {
     /// Vendor passes already run after the first, checked against
     /// `MAX_SUBAGENT_CONTINUATIONS`.
     passes: usize,
+    /// Set when this pass reruns one whose resumed vendor session no longer
+    /// existed: the number of transcript messages that preceded the pass's
+    /// prompt. The prompt is already stored, so the rerun hands off exactly
+    /// that history to a fresh session and does not store the prompt again.
+    fresh_session_history: Option<usize>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -17932,6 +17937,24 @@ impl Engine {
         Ok(())
     }
 
+    /// Forget the vendor session a backend reported as gone. Returns whether
+    /// the attempt had resumed one, i.e. whether rerunning it can start a
+    /// fresh session; an attempt that was already fresh has nothing to
+    /// forget and must surface the error.
+    fn forget_stale_backend_session(
+        &self,
+        thread_id: &str,
+        backend_id: &str,
+        resumed_session: Option<&str>,
+    ) -> Result<bool> {
+        let Some(session_id) = resumed_session else {
+            return Ok(false);
+        };
+        self.store
+            .clear_backend_session(thread_id, backend_id, session_id)?;
+        Ok(true)
+    }
+
     /// Run one turn through an external agent backend. The vendor harness
     /// plans, calls tools, and edits the worktree; we persist its events,
     /// gate its approval requests through our permission layer, and keep the
@@ -17966,6 +17989,9 @@ impl Engine {
         // (results of awaited subagents fed back to the model). The turn was
         // already admitted and its queued prompt consumed on the first pass.
         let is_continuation = continuation.is_some();
+        let fresh_session_history = continuation
+            .as_ref()
+            .and_then(|continuation| continuation.fresh_session_history);
         let mut model_options = self.store.thread_model_options(&thread.id)?;
         let model_catalog_started = Instant::now();
         let model_catalog = tokio::select! {
@@ -17996,9 +18022,12 @@ impl Engine {
         // A vendor session retains the tools it was created with. Restricted
         // repair turns therefore start fresh; their prompt carries the
         // malformed output explicitly, so they do not need vendor history.
-        let (resume, handoff) = if tools_enabled {
+        let (resume, handoff, history_len) = if tools_enabled {
             let resume = self.store.backend_session(&thread.id, backend_id)?;
-            let payloads = self.store.messages(&thread.id)?;
+            let mut payloads = self.store.messages(&thread.id)?;
+            if let Some(history_len) = fresh_session_history {
+                payloads.truncate(history_len);
+            }
             let unseen = match &resume {
                 // A compaction can shrink the transcript below the watermark;
                 // handing off the fresh summary again covers that.
@@ -18010,11 +18039,12 @@ impl Engine {
                 .filter_map(|p| serde_json::from_value(p.clone()).ok())
                 .collect();
             let handoff = render_history_digest(&messages, resume.is_some());
-            (resume, handoff)
+            (resume, handoff, payloads.len())
         } else {
-            (None, None)
+            (None, None, 0)
         };
         let vendor_session = resume.map(|(id, _)| id);
+        let resumed_session = vendor_session.clone();
         let mut active_vendor_session = vendor_session.clone();
         if let Some(vendor_session_id) = active_vendor_session.as_deref() {
             self.bridged_tool_owners
@@ -18035,6 +18065,9 @@ impl Engine {
             .iter()
             .map(|file| (file.attachment.clone(), file.relative_path.clone()))
             .collect::<Vec<_>>();
+        // Kept only for a fresh-session rerun, which starts from the same
+        // inputs as this pass.
+        let original_content = resumed_session.is_some().then(|| content.clone());
         let content = annotate_attachments(content, &prompt_files);
         let turn_attachments: Vec<trouve_agents::TurnAttachment> = images
             .into_iter()
@@ -18045,10 +18078,12 @@ impl Engine {
                 local_path: Some(file.absolute_path),
             })
             .collect();
-        self.store.append_message(
-            &thread.id,
-            &serde_json::to_value(Message::User(content.clone()))?,
-        )?;
+        if fresh_session_history.is_none() {
+            self.store.append_message(
+                &thread.id,
+                &serde_json::to_value(Message::User(content.clone()))?,
+            )?;
+        }
         if !is_continuation && !self.store.finish_queued_prompt(queued_prompt_id)? {
             bail!("queued prompt {queued_prompt_id} vanished before turn start");
         }
@@ -18464,6 +18499,52 @@ impl Engine {
                             &mut pending_steer,
                             "turn ended before steering could be applied",
                         );
+                        // A vendor that could not find the resumed session
+                        // did no work. Forget the id and rerun this pass
+                        // once as a fresh session, handing off the whole
+                        // transcript, instead of failing every later turn.
+                        if matches!(error, BackendError::SessionNotFound(_))
+                            && text.is_empty()
+                            && seen_tool_cards.is_empty()
+                            && let Some(original_content) = original_content
+                            && self.forget_stale_backend_session(
+                                &thread.id,
+                                backend_id,
+                                resumed_session.as_deref(),
+                            )?
+                        {
+                            tracing::warn!(
+                                thread_id = %thread.id,
+                                turn,
+                                backend = %backend_id,
+                                "vendor session no longer exists; retrying with a fresh session"
+                            );
+                            drop(stream);
+                            return Box::pin(self.run_backend_turn(
+                                session,
+                                thread,
+                                turn,
+                                mode,
+                                backend_id,
+                                backend,
+                                model_name,
+                                original_content,
+                                attachments,
+                                cancel,
+                                queued_prompt_id,
+                                tools_enabled,
+                                attach_background,
+                                provider_wait_ms,
+                                steer_rx,
+                                steer_mutation_lane_state,
+                                Some(BackendTurnContinuation {
+                                    usage: usage_total,
+                                    passes,
+                                    fresh_session_history: Some(history_len),
+                                }),
+                            ))
+                            .await;
+                        }
                         return Err(anyhow!("backend stream error: {error}"));
                     }
                 },
@@ -19169,6 +19250,7 @@ impl Engine {
                     Some(BackendTurnContinuation {
                         usage: usage_total,
                         passes: passes + 1,
+                        fresh_session_history: None,
                     }),
                 ))
                 .await;

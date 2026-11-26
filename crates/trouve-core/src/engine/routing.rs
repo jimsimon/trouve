@@ -73,6 +73,10 @@ struct RouteAttemptFailure {
     kind: RouteFailureKind,
     message: String,
     safe_to_retry: bool,
+    /// The vendor rejected the resumed session before doing any work and the
+    /// stored session id has been forgotten: the same route can run again
+    /// as a fresh session without counting against its health.
+    retry_fresh_session: bool,
 }
 
 enum RouteAttemptResult {
@@ -533,6 +537,7 @@ fn native_attempt_failure(
         kind,
         message: format!("provider error: {error}"),
         safe_to_retry: !side_effect_started,
+        retry_fresh_session: false,
     }
 }
 
@@ -552,6 +557,7 @@ fn backend_attempt_failure(error: BackendError, side_effect_started: bool) -> Ro
         kind,
         message: format!("backend error: {error}"),
         safe_to_retry: !side_effect_started,
+        retry_fresh_session: false,
     }
 }
 
@@ -1687,27 +1693,53 @@ impl Engine {
                     .await
                 }
                 ModelExecutor::Backend(_) => {
-                    self.run_backend_route(
-                        &session,
-                        thread,
-                        turn,
-                        &mode,
-                        route,
-                        &backend_content,
-                        &backend_attachments,
-                        &history_before,
-                        &stored_model_options,
-                        retrying,
-                        permission,
-                        &mut github_repository,
-                        &mut accounting,
-                        tools_enabled,
-                        prompt.background,
-                        &mut steering.receiver,
-                        &steering.mutation_lane_state,
-                        &cancel,
-                    )
-                    .await
+                    let mut fresh_session_retried = false;
+                    loop {
+                        let result = self
+                            .run_backend_route(
+                                &session,
+                                thread,
+                                turn,
+                                &mode,
+                                route,
+                                &backend_content,
+                                &backend_attachments,
+                                &history_before,
+                                &stored_model_options,
+                                retrying,
+                                permission,
+                                &mut github_repository,
+                                &mut accounting,
+                                tools_enabled,
+                                prompt.background,
+                                &mut steering.receiver,
+                                &steering.mutation_lane_state,
+                                &cancel,
+                            )
+                            .await;
+                        // The stored vendor session is gone and has been
+                        // forgotten: rerun this route once as a fresh
+                        // session. It is the same attempt, not a failover,
+                        // so route health and affinity are untouched.
+                        if !fresh_session_retried
+                            && !cancel.is_cancelled()
+                            && matches!(
+                                &result,
+                                Ok(RouteAttemptResult::Failed(failure))
+                                    if failure.retry_fresh_session
+                            )
+                        {
+                            fresh_session_retried = true;
+                            tracing::warn!(
+                                thread_id = %thread.id,
+                                turn,
+                                provider = %route.provider_id,
+                                "vendor session no longer exists; retrying with a fresh session"
+                            );
+                            continue;
+                        }
+                        break result;
+                    }
                 }
             };
             active_attempt.lock().unwrap().take();
@@ -2558,6 +2590,7 @@ impl Engine {
             render_history_digest(&messages, resume.is_some())
         };
         let vendor_session = resume.map(|(id, _)| id);
+        let resumed_session = vendor_session.clone();
         let mut active_vendor_session = vendor_session.clone();
         if let Some(vendor_session_id) = active_vendor_session.as_deref() {
             self.bridged_tool_owners
@@ -2700,9 +2733,15 @@ impl Engine {
                 return Ok(RouteAttemptResult::Cancelled);
             }
             Err(error) => {
-                return Ok(RouteAttemptResult::Failed(backend_attempt_failure(
-                    error, false,
-                )));
+                let stale_session = matches!(error, BackendError::SessionNotFound(_));
+                let mut failure = backend_attempt_failure(error, false);
+                failure.retry_fresh_session = stale_session
+                    && self.forget_stale_backend_session(
+                        &thread.id,
+                        backend_id,
+                        resumed_session.as_deref(),
+                    )?;
+                return Ok(RouteAttemptResult::Failed(failure));
             }
         };
         // The vendor accepted the turn; another turn may begin its own
@@ -3671,10 +3710,20 @@ impl Engine {
         }
 
         if let Some(error) = backend_error {
-            return Ok(RouteAttemptResult::Failed(backend_attempt_failure(
-                error,
-                side_effect_started,
-            )));
+            // A vendor that could not find the resumed session did no work.
+            // Forget the id so the caller can rerun this route fresh, with
+            // the whole transcript handed off, instead of failing over.
+            let stale_session = matches!(error, BackendError::SessionNotFound(_))
+                && !side_effect_started
+                && text.is_empty();
+            let mut failure = backend_attempt_failure(error, side_effect_started);
+            failure.retry_fresh_session = stale_session
+                && self.forget_stale_backend_session(
+                    &thread.id,
+                    backend_id,
+                    resumed_session.as_deref(),
+                )?;
+            return Ok(RouteAttemptResult::Failed(failure));
         }
 
         if cancel.is_cancelled() || backend_cancelled {
@@ -3783,6 +3832,15 @@ mod tests {
     struct CancellableStartupBackend {
         started: Arc<tokio::sync::Semaphore>,
     }
+
+    /// A vendor agent that has pruned every session it is asked to resume
+    /// and serves fresh sessions normally. Records `(session, prompt)`.
+    struct PrunedSessionBackend {
+        turns: Arc<Mutex<Vec<PrunedSessionTurn>>>,
+    }
+
+    /// The vendor session a turn asked to resume, and its prompt.
+    type PrunedSessionTurn = (Option<String>, String);
 
     /// A vendor agent whose live turn waits for steering before it completes.
     struct SteerableRoutingBackend {
@@ -4018,6 +4076,167 @@ mod tests {
                 },
             )])))
         }
+    }
+
+    #[async_trait::async_trait]
+    impl AgentBackend for PrunedSessionBackend {
+        fn id(&self) -> &str {
+            "backend"
+        }
+
+        fn shared_model_identity(&self, model: &str) -> Option<String> {
+            (model == "shared").then(|| model.to_string())
+        }
+
+        fn models(&self) -> Vec<trouve_protocol::ModelInfo> {
+            vec![catalog_model("backend/shared")]
+        }
+
+        fn status(&self) -> trouve_agents::BackendStatus {
+            trouve_agents::BackendStatus {
+                installed: true,
+                has_credentials: true,
+            }
+        }
+
+        async fn start_login(
+            &self,
+        ) -> std::result::Result<trouve_agents::BackendLogin, BackendError> {
+            unreachable!("routing test does not start a login")
+        }
+
+        async fn run_turn(
+            &self,
+            turn: BackendTurn,
+        ) -> std::result::Result<trouve_agents::BackendEventStream, BackendError> {
+            let resumed = turn.session.clone();
+            self.turns.lock().unwrap().push((turn.session, turn.prompt));
+            let events = match resumed {
+                Some(session) => vec![Err(BackendError::SessionNotFound(format!(
+                    "No conversation found with session ID: {session}"
+                )))],
+                None => vec![
+                    Ok(BackendEvent::SessionStarted {
+                        session_id: "fresh-session".into(),
+                    }),
+                    Ok(BackendEvent::TextDelta("Recovered answer.".into())),
+                    Ok(BackendEvent::Completed {
+                        usage: Usage::default(),
+                    }),
+                ],
+            };
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
+    /// Run one turn on a thread whose stored vendor session was pruned and
+    /// assert the turn recovers through a single fresh-session rerun.
+    async fn assert_pruned_vendor_session_recovers(suffix: &str, model: &str) {
+        let data = tempfile::tempdir().unwrap();
+        let worktree = data.path().join("worktrees").join(suffix);
+        std::fs::create_dir_all(&worktree).unwrap();
+        let store = Store::open_in_memory().unwrap();
+        let thread = model_thread(&store, &worktree, suffix, model);
+        for message in [
+            Message::User("Earlier question".into()),
+            Message::Assistant {
+                content: "Earlier answer".into(),
+                tool_calls: Vec::new(),
+                reasoning: Vec::new(),
+            },
+        ] {
+            store
+                .append_message(&thread.id, &serde_json::to_value(message).unwrap())
+                .unwrap();
+        }
+        store
+            .set_backend_session_at_watermark(&thread.id, "backend", "pruned-session", 2)
+            .unwrap();
+        let turns = Arc::new(Mutex::new(Vec::new()));
+        let config = Config {
+            providers: BTreeMap::from([(
+                "backend".into(),
+                crate::config::ProviderConfig {
+                    kind: "claude-cli".into(),
+                    tool_bridge: Some(true),
+                    ..Default::default()
+                },
+            )]),
+            provider_order: vec!["backend".into()],
+            local_enabled: Some(false),
+            ..Default::default()
+        };
+        let engine = Arc::new(
+            Engine::new(store.clone(), data.path().into(), &config).with_backend(
+                "backend",
+                Arc::new(PrunedSessionBackend {
+                    turns: turns.clone(),
+                }),
+            ),
+        );
+        engine.set_base_url("http://127.0.0.1:4000");
+
+        engine
+            .send_message(&thread.id, "Newest question".into(), Vec::new())
+            .unwrap();
+        wait_for_terminal_turn(&engine, &store, &thread, 1).await;
+
+        let events = store
+            .events_after(&Scope::Thread(thread.id.clone()), 0)
+            .unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event.event, Event::TurnCompleted { turn: 1, .. })),
+            "events: {events:?}"
+        );
+        {
+            let turns = turns.lock().unwrap();
+            assert_eq!(turns.len(), 2, "{turns:?}");
+            assert_eq!(turns[0].0.as_deref(), Some("pruned-session"));
+            // The resumed attempt had seen the whole history already.
+            assert!(!turns[0].1.contains("Earlier question"), "{turns:?}");
+            // The fresh session is handed the transcript the vendor lost.
+            assert_eq!(turns[1].0, None);
+            assert!(turns[1].1.contains("Earlier question"), "{turns:?}");
+            assert!(turns[1].1.contains("Earlier answer"), "{turns:?}");
+            assert_eq!(
+                turns[1].1.matches("Newest question").count(),
+                1,
+                "{turns:?}"
+            );
+        }
+        let (session, _) = store
+            .backend_session(&thread.id, "backend")
+            .unwrap()
+            .expect("the fresh vendor session is stored");
+        assert_eq!(session, "fresh-session");
+        let users = store
+            .messages(&thread.id)
+            .unwrap()
+            .into_iter()
+            .filter_map(|payload| serde_json::from_value::<Message>(payload).ok())
+            .filter(|message| matches!(message, Message::User(text) if text.contains("Newest question")))
+            .count();
+        assert_eq!(users, 1, "the rerun must not store the prompt twice");
+        assert!(
+            store
+                .route_health()
+                .unwrap()
+                .values()
+                .all(|health| health.consecutive_failures == 0),
+            "a pruned vendor session is not a route failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn automatic_route_recovers_from_a_pruned_vendor_session() {
+        assert_pruned_vendor_session_recovers("pruned_auto", "auto/shared").await;
+    }
+
+    #[tokio::test]
+    async fn pinned_backend_recovers_from_a_pruned_vendor_session() {
+        assert_pruned_vendor_session_recovers("pruned_pinned", "backend/shared").await;
     }
 
     #[async_trait::async_trait]

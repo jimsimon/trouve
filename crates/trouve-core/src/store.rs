@@ -17402,6 +17402,25 @@ impl Store {
         Ok(())
     }
 
+    /// Forget a vendor session the backend reported as gone, so the next
+    /// attempt starts fresh and hands off the whole transcript. Matching the
+    /// session id keeps a late report about an old session from discarding a
+    /// newer one. Returns whether a row was removed.
+    pub fn clear_backend_session(
+        &self,
+        thread_id: &str,
+        backend: &str,
+        backend_session_id: &str,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let removed = conn.execute(
+            "DELETE FROM backend_sessions
+             WHERE thread_id = ?1 AND backend IN (?2, '') AND backend_session_id = ?3",
+            params![thread_id, backend, backend_session_id],
+        )?;
+        Ok(removed > 0)
+    }
+
     /// Record how far through the transcript a backend's vendor session is
     /// (called at the end of its turns). No-op when the backend never
     /// reported a session — with nothing to resume, the next turn hands
@@ -21568,6 +21587,58 @@ mod tests {
             store.backend_session("th_legacy", "claude").unwrap(),
             None,
             "legacy fallback row should be gone after a keyed write"
+        );
+    }
+
+    #[test]
+    fn clear_backend_session_removes_only_the_reported_session() {
+        let store = Store::open_in_memory().unwrap();
+        seed_thread(&store, "th_gone");
+        store
+            .set_backend_session("th_gone", "claude", "claude-sess")
+            .unwrap();
+        store
+            .set_backend_session("th_gone", "codex", "codex-sess")
+            .unwrap();
+
+        // A report about a session that was already replaced changes nothing.
+        assert!(
+            !store
+                .clear_backend_session("th_gone", "claude", "older-sess")
+                .unwrap()
+        );
+        assert!(
+            store
+                .clear_backend_session("th_gone", "claude", "claude-sess")
+                .unwrap()
+        );
+        assert_eq!(store.backend_session("th_gone", "claude").unwrap(), None);
+        assert_eq!(
+            store.backend_session("th_gone", "codex").unwrap(),
+            Some(("codex-sess".into(), 0))
+        );
+
+        // A migrated backend-less row resumes under any backend, so it is
+        // cleared the same way.
+        seed_thread(&store, "th_gone_legacy");
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO backend_sessions (thread_id, backend, backend_session_id)
+                 VALUES ('th_gone_legacy', '', 'old-sess')",
+                [],
+            )
+            .unwrap();
+        assert!(
+            store
+                .clear_backend_session("th_gone_legacy", "claude", "old-sess")
+                .unwrap()
+        );
+        assert_eq!(
+            store.backend_session("th_gone_legacy", "claude").unwrap(),
+            None
         );
     }
 
