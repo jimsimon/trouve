@@ -6172,6 +6172,25 @@ test("queued prompts reorder from the keyboard without visible move arrows", asy
   await expect(first).not.toHaveAttribute("data-keyboard-reordering", "true");
   expect(submittedOrders).toEqual([]);
 
+  // A pick-up never strands the row: moving focus away or using the pointer
+  // on the queue drops it and leaves every action available.
+  await first.press("Space");
+  await first.press("End");
+  await expect(first).toHaveAttribute("data-keyboard-reordering", "true");
+  await expect(first).toBeFocused();
+  await expect(first.locator('[data-queue-action="delete"]')).toBeEnabled();
+  await page.getByRole("textbox", { name: "Message", exact: true }).focus();
+  await expect(first).not.toHaveAttribute("data-keyboard-reordering", "true");
+  await expect(rows.nth(0)).toHaveAttribute("data-queue-id", "qp_first");
+  await first.focus();
+  await first.press("Space");
+  await expect(first).toHaveAttribute("data-keyboard-reordering", "true");
+  await page.locator('[data-queue-id="qp_second"] p').dispatchEvent("pointerdown");
+  await expect(first).not.toHaveAttribute("data-keyboard-reordering", "true");
+  await expect(first).toHaveAttribute("draggable", "true");
+  expect(submittedOrders).toEqual([]);
+
+  await first.focus();
   await first.press("Space");
   await first.press("End");
   await first.press("Space");
