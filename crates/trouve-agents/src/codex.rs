@@ -295,13 +295,22 @@ impl AgentBackend for CodexBackend {
         let live = server
             .request_with_cancel("model/list", json!({}), Some(cancel), RequestFence::None)
             .await?;
-        let seed = self.catalog.owned_provider_models(CODEX_CATALOG_PROVIDER);
+        // Patches come from the bundled seed, never the previous roster:
+        // everything else in a roster entry is re-derived from the live list.
+        let seed = self.catalog.seed_provider_models(CODEX_CATALOG_PROVIDER);
+        let previous = self.catalog.owned_provider_models(CODEX_CATALOG_PROVIDER);
         let roster = crate::codex_roster::rebuild_codex_roster(&live, &seed, |slug| {
             self.catalog.has_source_model("openai", slug)
         })
         .map_err(|e| BackendError::Protocol(format!("rebuilding Codex model roster: {e}")))?;
-        let added: Vec<_> = roster.keys().filter(|id| !seed.contains_key(*id)).collect();
-        let removed: Vec<_> = seed.keys().filter(|id| !roster.contains_key(*id)).collect();
+        let added: Vec<_> = roster
+            .keys()
+            .filter(|id| !previous.contains_key(*id))
+            .collect();
+        let removed: Vec<_> = previous
+            .keys()
+            .filter(|id| !roster.contains_key(*id))
+            .collect();
         if !added.is_empty() || !removed.is_empty() {
             tracing::info!(
                 backend = %self.id,
@@ -9152,7 +9161,7 @@ for line in sys.stdin:
         let models = backend.list_models().await;
         assert_eq!(
             models.len(),
-            5,
+            10,
             "bundled seed until the first roster refresh"
         );
         assert!(backend.server.lock().await.is_none());
@@ -9171,13 +9180,13 @@ for line in sys.stdin:
         let backend =
             CodexBackend::new("codex", None).with_catalog(Arc::new(ModelsDevCatalog::fixture()));
         let models = backend.models();
-        assert_eq!(models.len(), 5);
+        assert_eq!(models.len(), 10);
         let sol = models
             .iter()
             .find(|model| model.id == "codex/gpt-5.6-sol")
             .unwrap();
         assert_eq!(sol.display_name, "GPT-5.6 Sol");
-        assert_eq!(sol.context_window, 500_000, "seed overrides the API limit");
+        assert_eq!(sol.context_window, 272_000, "seed overrides the API limit");
         assert_eq!(sol.input_price_per_mtok, None);
         assert_eq!(sol.output_price_per_mtok, None);
         // Until the roster refresh replaces them, reasoning levels come from
@@ -9195,16 +9204,11 @@ for line in sys.stdin:
             Some("medium")
         );
 
-        let gpt_55 = models
-            .iter()
-            .find(|model| model.id == "codex/gpt-5.5")
-            .unwrap();
-        assert_eq!(gpt_55.context_window, 400_000);
         let astra = models
             .iter()
             .find(|model| model.id == "codex/gpt-6-astra")
             .unwrap();
-        assert_eq!(astra.context_window, 1_050_000);
+        assert_eq!(astra.context_window, 272_000);
     }
 
     #[test]
@@ -9260,18 +9264,37 @@ for line in sys.stdin:
         .unwrap();
         std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
 
+        // An expired roster written by an older release, whose Sol limit the
+        // bundled seed has since corrected.
         let data_dir = tempfile::tempdir().unwrap();
+        let rosters = data_dir.path().join("rosters");
+        std::fs::create_dir_all(&rosters).unwrap();
+        std::fs::write(
+            rosters.join("openai-codex.json"),
+            serde_json::to_vec(&json!({
+                "version": 1,
+                "fetched_at": 0,
+                "models": {
+                    "gpt-5.6-sol": {
+                        "base_model": "openai/gpt-5.6-sol",
+                        "limit": {"context": 500000, "input": 372000, "output": 128000}
+                    },
+                    "gpt-6-astra": {"base_model": "openai/gpt-6-astra"}
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
         let catalog = Arc::new(ModelsDevCatalog::fixture_for_data_dir(data_dir.path()));
         let backend = CodexBackend::new("codex", Some(stub.to_string_lossy().into_owned()))
             .with_catalog(catalog.clone());
-        assert!(
-            backend
-                .models()
-                .iter()
-                .any(|model| model.id == "codex/gpt-6-astra"),
-            "bundled seed serves until the first refresh"
-        );
-        assert!(backend.model_roster_is_stale(), "no roster yet");
+        let stale = backend.models();
+        let stale_sol = stale
+            .iter()
+            .find(|model| model.id == "codex/gpt-5.6-sol")
+            .unwrap();
+        assert_eq!(stale_sol.context_window, 500_000);
+        assert!(backend.model_roster_is_stale(), "roster is past its TTL");
 
         assert!(
             backend
@@ -9291,7 +9314,10 @@ for line in sys.stdin:
             .iter()
             .find(|model| model.id == "codex/gpt-5.6-sol")
             .unwrap();
-        assert_eq!(sol.context_window, 500_000, "seed limit survives");
+        assert_eq!(
+            sol.context_window, 272_000,
+            "the bundled seed limit replaces the previous roster's"
+        );
         assert_eq!(
             sol.options_schema.pointer("/properties/fast/type"),
             Some(&json!("boolean")),

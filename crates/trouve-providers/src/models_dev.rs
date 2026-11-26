@@ -444,10 +444,20 @@ impl ModelsDevCatalog {
         write_json_atomically(path, bytes).await
     }
 
+    /// The bundled seed patches for a trouve-owned provider, regardless of
+    /// any refreshed roster. A roster rebuild starts from these rather than
+    /// from the previous roster, so hand-authored extras (context limits,
+    /// slug remaps) survive refreshes and a release that adds, corrects or
+    /// drops a seed entry reaches installs that already persisted a roster.
+    pub fn seed_provider_models(&self, provider: &str) -> BTreeMap<String, Value> {
+        let state = self.state.read().unwrap();
+        overlay_provider_by_setup_id(&state.owned, provider)
+            .map(|provider| provider.models.clone())
+            .unwrap_or_default()
+    }
+
     /// The overlay patches currently in effect for a trouve-owned provider:
-    /// the refreshed roster when one exists, otherwise the bundled seed. A
-    /// roster rebuild starts from this so hand-authored extras (transport
-    /// options, context limits) survive refreshes.
+    /// the refreshed roster when one exists, otherwise the bundled seed.
     pub fn owned_provider_models(&self, provider: &str) -> BTreeMap<String, Value> {
         let state = self.state.read().unwrap();
         owned_provider_models(&state, provider)
@@ -1498,9 +1508,9 @@ mod tests {
     fn trouve_owned_codex_seed_overrides_only_what_codex_serves_differently() {
         let catalog = ModelsDevCatalog::fixture();
         let models = catalog.provider_models("openai-codex", "codex", OptionsDialect::CodexCli);
-        assert_eq!(models.len(), 5, "seed = models with Codex-specific limits");
+        assert_eq!(models.len(), 10, "seed = models with Codex-specific limits");
 
-        // Codex serves Sol at a 500k window although the API record says 1.05M;
+        // Codex serves Sol at a 272k window although the API record says 1.05M;
         // everything else (name, pricing, reasoning levels) is inherited until
         // the roster refresh brings the live values.
         let sol = models
@@ -1508,7 +1518,7 @@ mod tests {
             .find(|model| model.id == "codex/gpt-5.6-sol")
             .unwrap();
         assert_eq!(sol.display_name, "GPT-5.6 Sol");
-        assert_eq!(sol.context_window, 500_000);
+        assert_eq!(sol.context_window, 272_000);
         assert_eq!(sol.input_price_per_mtok, Some(4.0));
         assert_eq!(
             sol.options_schema
@@ -1525,15 +1535,39 @@ mod tests {
             .find(|model| model.id == "codex/gpt-6-astra")
             .unwrap();
         assert_eq!(astra.display_name, "GPT-6 Astra");
-        assert_eq!(astra.context_window, 1_050_000);
-        assert_eq!(
-            catalog
-                .model_record("openai-codex", "gpt-5.5")
-                .unwrap()
-                .limit
-                .input,
-            Some(272_000)
+        assert_eq!(astra.context_window, 272_000);
+        assert!(
+            catalog.model_record("openai-codex", "gpt-5.5").is_none(),
+            "models Codex withdrew leave the seed"
         );
+
+        // Every seed entry states the window Codex serves, split the way
+        // models.dev splits a context limit.
+        let seed = catalog.seed_provider_models("openai-codex");
+        assert_eq!(seed.len(), 10);
+        for (id, patch) in &seed {
+            assert_eq!(patch["base_model"], format!("openai/{id}"));
+            let limit = &patch["limit"];
+            assert_eq!(
+                limit["context"].as_u64().unwrap(),
+                limit["input"].as_u64().unwrap() + limit["output"].as_u64().unwrap(),
+                "{id}"
+            );
+        }
+        assert_eq!(
+            seed.len(),
+            models.len(),
+            "every seed entry resolves against its public record"
+        );
+        let window = |id: &str| {
+            models
+                .iter()
+                .find(|model| model.id == format!("codex/{id}"))
+                .unwrap()
+                .context_window
+        };
+        assert_eq!(window("gpt-6.2-sol"), 500_000);
+        assert_eq!(window("gpt-6.2-astra"), 272_000);
 
         // The direct API surface remains the upstream models.dev record.
         assert_eq!(
@@ -1562,10 +1596,21 @@ mod tests {
             [
                 "cursor/composer-2.5",
                 "cursor/default",
+                "cursor/gemini-3-flash",
                 "cursor/gemini-3.1-pro",
-                "cursor/gemini-3.7-flash"
+                "cursor/gemini-3.7-flash",
+                "cursor/glm-5p3",
+                "cursor/glm-5p3-flash"
             ]
         );
+
+        // Cursor spells GLM 5.3 with a `p`; the seed points it at the record.
+        let glm = models
+            .iter()
+            .find(|model| model.id == "cursor/glm-5p3")
+            .unwrap();
+        assert_eq!(glm.display_name, "GLM 5.3");
+        assert_eq!(glm.context_window, 1_000_000);
 
         // A Cursor slug that differs from the models.dev id is remapped.
         let gemini = models
@@ -1699,12 +1744,15 @@ mod tests {
                 .pointer("/properties/thinking_budget_tokens/minimum"),
             Some(&json!(1024))
         );
-        assert!(
+        // models.dev also declares an on/off toggle for this model; that is
+        // the only level surfaced, never an invented low/medium/high ladder.
+        assert_eq!(
             model
                 .options_schema
-                .pointer("/properties/thinking_level")
-                .is_none()
+                .pointer("/properties/thinking_level/enum"),
+            Some(&json!(["off", "on"]))
         );
+        assert!(model.options_schema.pointer("/properties/effort").is_none());
     }
 
     #[test]
@@ -1901,7 +1949,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(codex.display_name, "Remote Sol");
-        assert_eq!(codex.context_window, 500_000);
+        assert_eq!(codex.context_window, 272_000);
         assert_eq!(codex.input_price_per_mtok, Some(9.0));
         assert_eq!(
             codex
@@ -1951,6 +1999,12 @@ mod tests {
         );
         assert!(!catalog.roster_needs_refresh("openai-codex"));
         assert_eq!(catalog.owned_provider_models("openai-codex").len(), 2);
+        assert!(
+            catalog
+                .seed_provider_models("openai-codex")
+                .contains_key("gpt-6.2-sol"),
+            "the bundled seed stays readable behind a roster"
+        );
 
         let luna = catalog
             .model(

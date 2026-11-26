@@ -64,6 +64,10 @@ or pricing.
   Codex-specific context limits, slug remaps to models.dev records, image
   support and limits for vendor-only models. Roster entries for public models
   inherit display metadata, limits and pricing through `base_model` as before.
+  Every rebuild starts from the seed bundled with the running release, never
+  from the previous roster: everything else in a roster entry is re-derived
+  from the live list, so a release that adds, corrects or drops a seed entry
+  takes effect at the next refresh.
 - Rosters are never rebuilt against an empty catalog, so inheritance links
   are only written once the public records exist.
 

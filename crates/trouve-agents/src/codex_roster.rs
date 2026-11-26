@@ -6,16 +6,16 @@
 //! efforts each supports, but carries no context limits or pricing. Those
 //! still come from the catalog, so each live model becomes an overlay patch
 //! that inherits from its `openai/<slug>` public record when one exists.
-//! Seed patches (bundled or previously refreshed) are kept for models that
-//! remain available so hand-authored extras such as the Fast option survive;
-//! models missing from the live list are dropped.
+//! Bundled seed patches are kept for models that remain available so
+//! hand-authored extras such as Codex-specific context limits survive; models
+//! missing from the live list are dropped.
 
 use std::collections::BTreeMap;
 
 use serde_json::{Map, Value, json};
 
 /// Build the overlay patches for every non-hidden model in a `model/list`
-/// result. `seed` supplies the current patches for the provider and
+/// result. `seed` supplies the bundled patches for the provider and
 /// `has_base(slug)` reports whether `openai/<slug>` exists in the public
 /// catalog. Fails when the response yields no models so a bad reply never
 /// replaces a working roster.

@@ -8,16 +8,15 @@
 //! parameter ids become the option-schema property names as-is. Public models
 //! served through Cursor inherit limits and display metadata from their
 //! models.dev record via `base_model`; Cursor-only models (Auto, Composer)
-//! get a minimal record. Seed patches (bundled or previously refreshed) are
-//! kept for models that remain available; models missing from the live list
-//! are dropped.
+//! get a minimal record. Bundled seed patches are kept for models that remain
+//! available; models missing from the live list are dropped.
 
 use std::collections::BTreeMap;
 
 use serde_json::{Map, Value, json};
 
 /// Build overlay patches for every model in a `ListModels` result. `seed`
-/// supplies the current patches for the provider and `has_source(provider,
+/// supplies the bundled patches for the provider and `has_source(provider,
 /// model)` reports whether the public catalog has that record. Fails when the
 /// response yields no models so a bad reply never replaces a working roster.
 pub fn rebuild_cursor_roster(
@@ -115,6 +114,10 @@ fn public_base(id: &str, has_source: &impl Fn(&str, &str) -> bool) -> Option<Str
         &["moonshotai"]
     } else if id.starts_with("glm-") {
         &["zai", "zhipuai"]
+    } else if id.starts_with("muse-") {
+        &["meta"]
+    } else if id.starts_with("deepseek-") {
+        &["deepseek"]
     } else {
         &[]
     };
@@ -369,6 +372,15 @@ mod tests {
         );
         assert!(roster["grok-4.6"].get("base_model").is_none());
         assert!(roster["muse-spark-1.3"].get("base_model").is_none());
+
+        let roster = rebuild_cursor_roster(&live, &BTreeMap::new(), |p, m| {
+            (p, m) == ("meta", "muse-spark-1.3")
+        })
+        .unwrap();
+        assert_eq!(
+            roster["muse-spark-1.3"]["base_model"],
+            "meta/muse-spark-1.3"
+        );
     }
 
     #[test]
