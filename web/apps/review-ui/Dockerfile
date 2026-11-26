@@ -1,6 +1,6 @@
 # Build context is the `web/` npm workspace root so the workspace lockfile
 # and sibling manifests are visible; see docker-compose.review.yml.
-FROM node:24-alpine AS build
+FROM node:26-alpine AS build
 WORKDIR /web
 # Every workspace manifest is required for `npm ci` to validate the lockfile,
 # even though only this app's dependency subtree is installed.
