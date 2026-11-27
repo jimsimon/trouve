@@ -10,7 +10,7 @@ description = "External agent backends (Codex app-server, Cursor Agent SDK, Clau
 [dependencies]
 async-trait.workspace = true
 axum.workspace = true
-base64 = "0.22"
+base64 = "0.23"
 bytes.workspace = true
 chrono.workspace = true
 dirs.workspace = true
