@@ -3417,11 +3417,16 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
       threadAvailable: this.threadId !== "",
       queueLength: queue.length,
       turnRunning,
-      busy: queueMutationBusy || keyboardReordering,
+      busy: queueMutationBusy,
       connectivityBlocked,
     });
     return html`
-      <section class="queue-panel" aria-busy=${queueMutationBusy ? "true" : "false"}>
+      <section
+        class="queue-panel"
+        aria-busy=${queueMutationBusy ? "true" : "false"}
+        @pointerdown=${this.#abandonQueueKeyboardReorder}
+        @focusout=${this.#queuePanelFocusOut}
+      >
         <header>
           <span role="status" aria-live="polite">${queue.length} queued prompt${queue.length === 1 ? "" : "s"}</span>
           ${turnRunning
@@ -5415,6 +5420,32 @@ export class TrouveThreadScreen extends withSignalTracking(LitElement) {
     this.requestUpdate();
     void this.updateComplete.then(() => this.#focusQueueRowNow(promptId));
   }
+
+  /** A keyboard pick-up is only meaningful while its row holds focus. Any
+   * pointer interaction with the queue, or focus settling elsewhere, drops it
+   * so the row can never be left stranded in the reordering state. */
+  readonly #abandonQueueKeyboardReorder = (): void => {
+    if (this.#queueKeyboardDragId === "" || this.#queueBusy !== "") return;
+    this.#queueKeyboardDragId = "";
+    this.#queueKeyboardOrder = [];
+    this.#queueStatus = "Queue reordering canceled.";
+    this.requestUpdate();
+  };
+
+  readonly #queuePanelFocusOut = (): void => {
+    const promptId = this.#queueKeyboardDragId;
+    if (promptId === "") return;
+    // Moving the picked-up row re-inserts its element, which drops focus until
+    // the post-render refocus. Decide only once that has settled.
+    void this.updateComplete.then(() => {
+      setTimeout(() => {
+        if (this.#queueKeyboardDragId !== promptId) return;
+        const active = document.activeElement;
+        if (active instanceof HTMLElement && active.dataset["queueId"] === promptId) return;
+        this.#abandonQueueKeyboardReorder();
+      }, 0);
+    });
+  };
 
   async #commitQueueKeyboardReorder(): Promise<void> {
     const services = this.#services.value;
