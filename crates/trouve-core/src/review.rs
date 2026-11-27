@@ -5670,7 +5670,9 @@ impl Engine {
         let mut first_failure = None;
         for attempt in 0..REVIEW_WORKSPACE_CLEANUP_FOREGROUND_ATTEMPTS {
             let cleanup = {
+                // `try_update` replaces `fetch_update` from Rust 1.95; the workspace MSRV is 1.92.
                 #[cfg(test)]
+                #[allow(deprecated)]
                 if self
                     .code_review
                     .injected_workspace_cleanup_failures
@@ -5769,7 +5771,9 @@ impl Engine {
         &self,
         intent: &crate::store::ReviewWorkspaceCleanupIntent,
     ) -> Result<(), EngineError> {
+        // `try_update` replaces `fetch_update` from Rust 1.95; the workspace MSRV is 1.92.
         #[cfg(test)]
+        #[allow(deprecated)]
         if self
             .code_review
             .injected_workspace_cleanup_failures
