@@ -6,6 +6,26 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **Codex and Cursor catalog overrides cover the current models**: the
+  bundled Codex overrides now describe the ten models Codex serves today
+  (GPT-5.6 Luna/Sol/Terra, GPT-6 Astra/Luna/Sol, GPT-6.1 Sol/Terra and
+  GPT-6.2 Astra/Sol) with the context window Codex reports for each: 500k
+  for GPT-6.1 Sol, GPT-6.1 Terra and GPT-6.2 Sol, 272k for the rest, instead
+  of the 1.05M API limit. GPT-5.5, which Codex withdrew, is gone. Cursor's
+  `glm-5p3`, `glm-5p3-flash` and `gemini-3-flash` slugs now inherit limits
+  and capabilities from their public records, and Cursor's Muse and DeepSeek
+  models do so whenever the public catalog has a record under the same id.
+
+### Fixed
+
+- **Catalog override updates reach existing installs**: a vendor roster
+  refresh now starts from the overrides bundled with the running release
+  instead of from the previously saved roster. Before, an install that had
+  already saved a roster never picked up a new or corrected override, and a
+  model first seen before its public record existed stayed without limits.
+
 ## [4.13.0] - 2026-09-21
 
 This release brings live steering and model options to automatic routes and

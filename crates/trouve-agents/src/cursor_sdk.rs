@@ -444,14 +444,23 @@ impl AgentBackend for CursorBackend {
             return Ok(false);
         }
         let live = self.list_models_via_bridge(&api_key, cancel).await?;
-        let seed = self.catalog.owned_provider_models(CURSOR_CATALOG_PROVIDER);
+        // Patches come from the bundled seed, never the previous roster:
+        // everything else in a roster entry is re-derived from the live list.
+        let seed = self.catalog.seed_provider_models(CURSOR_CATALOG_PROVIDER);
+        let previous = self.catalog.owned_provider_models(CURSOR_CATALOG_PROVIDER);
         let roster =
             crate::cursor_roster::rebuild_cursor_roster(&live, &seed, |provider, model| {
                 self.catalog.has_source_model(provider, model)
             })
             .map_err(|e| BackendError::Protocol(format!("rebuilding Cursor model roster: {e}")))?;
-        let added: Vec<_> = roster.keys().filter(|id| !seed.contains_key(*id)).collect();
-        let removed: Vec<_> = seed.keys().filter(|id| !roster.contains_key(*id)).collect();
+        let added: Vec<_> = roster
+            .keys()
+            .filter(|id| !previous.contains_key(*id))
+            .collect();
+        let removed: Vec<_> = previous
+            .keys()
+            .filter(|id| !roster.contains_key(*id))
+            .collect();
         if !added.is_empty() || !removed.is_empty() {
             tracing::info!(
                 backend = %self.id,

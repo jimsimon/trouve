@@ -64,6 +64,7 @@ sequentially.
 | [0052](0052-owned-os-sandbox-for-shell-commands.md) | Trouve owns an OS sandbox for shell commands | Proposed |
 | [0053](0053-policy-ordered-cross-adapter-model-routing.md) | Policy-ordered cross-adapter model routing | Partially superseded by 0054 |
 | [0054](0054-explicit-and-sticky-model-route-selection.md) | Explicit and sticky model route selection | Accepted |
-| [0055](0055-downloaded-model-catalog-and-vendor-rosters.md) | Downloaded model catalog and vendor-refreshed rosters | Accepted (amends 0016, 0020; scoped amendment to 0050) |
+| [0055](0055-downloaded-model-catalog-and-vendor-rosters.md) | Downloaded model catalog and vendor-refreshed rosters | Accepted (amends 0016, 0020; scoped amendment to 0050); amended by 0058 |
 | [0056](0056-shared-lit-web-packages-and-review-ui.md) | Shared Lit web packages and review UI | Amended by 0057 |
 | [0057](0057-review-ui-on-the-desktop-design-system.md) | Review UI on the desktop design system | Accepted |
+| [0058](0058-roster-rebuilds-start-from-the-bundled-seed.md) | Roster rebuilds start from the bundled seed | Accepted (amends 0055) |

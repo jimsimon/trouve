@@ -3,21 +3,12 @@
     "id": "openai-codex",
     "name": "OpenAI Codex",
     "models": {
-      "gpt-5.5": {
-        "id": "gpt-5.5",
-        "base_model": "openai/gpt-5.5",
-        "limit": {
-          "context": 400000,
-          "input": 272000,
-          "output": 128000
-        }
-      },
       "gpt-5.6-luna": {
         "id": "gpt-5.6-luna",
         "base_model": "openai/gpt-5.6-luna",
         "limit": {
-          "context": 500000,
-          "input": 372000,
+          "context": 272000,
+          "input": 144000,
           "output": 128000
         }
       },
@@ -25,8 +16,8 @@
         "id": "gpt-5.6-sol",
         "base_model": "openai/gpt-5.6-sol",
         "limit": {
-          "context": 500000,
-          "input": 372000,
+          "context": 272000,
+          "input": 144000,
           "output": 128000
         }
       },
@@ -34,8 +25,8 @@
         "id": "gpt-5.6-terra",
         "base_model": "openai/gpt-5.6-terra",
         "limit": {
-          "context": 500000,
-          "input": 372000,
+          "context": 272000,
+          "input": 144000,
           "output": 128000
         }
       },
@@ -43,8 +34,62 @@
         "id": "gpt-6-astra",
         "base_model": "openai/gpt-6-astra",
         "limit": {
-          "context": 1050000,
-          "input": 922000,
+          "context": 272000,
+          "input": 144000,
+          "output": 128000
+        }
+      },
+      "gpt-6-luna": {
+        "id": "gpt-6-luna",
+        "base_model": "openai/gpt-6-luna",
+        "limit": {
+          "context": 272000,
+          "input": 144000,
+          "output": 128000
+        }
+      },
+      "gpt-6-sol": {
+        "id": "gpt-6-sol",
+        "base_model": "openai/gpt-6-sol",
+        "limit": {
+          "context": 272000,
+          "input": 144000,
+          "output": 128000
+        }
+      },
+      "gpt-6.1-sol": {
+        "id": "gpt-6.1-sol",
+        "base_model": "openai/gpt-6.1-sol",
+        "limit": {
+          "context": 500000,
+          "input": 372000,
+          "output": 128000
+        }
+      },
+      "gpt-6.1-terra": {
+        "id": "gpt-6.1-terra",
+        "base_model": "openai/gpt-6.1-terra",
+        "limit": {
+          "context": 500000,
+          "input": 372000,
+          "output": 128000
+        }
+      },
+      "gpt-6.2-astra": {
+        "id": "gpt-6.2-astra",
+        "base_model": "openai/gpt-6.2-astra",
+        "limit": {
+          "context": 272000,
+          "input": 144000,
+          "output": 128000
+        }
+      },
+      "gpt-6.2-sol": {
+        "id": "gpt-6.2-sol",
+        "base_model": "openai/gpt-6.2-sol",
+        "limit": {
+          "context": 500000,
+          "input": 372000,
           "output": 128000
         }
       }
@@ -85,6 +130,11 @@
           }
         }
       },
+      "gemini-3-flash": {
+        "id": "gemini-3-flash",
+        "base_model": "google/gemini-3-flash-preview",
+        "name": "Gemini 3 Flash"
+      },
       "gemini-3.1-pro": {
         "id": "gemini-3.1-pro",
         "base_model": "google/gemini-3.1-pro-preview",
@@ -99,6 +149,16 @@
           "context": 1000000,
           "output": 65536
         }
+      },
+      "glm-5p3": {
+        "id": "glm-5p3",
+        "base_model": "zai/glm-5.3",
+        "name": "GLM 5.3"
+      },
+      "glm-5p3-flash": {
+        "id": "glm-5p3-flash",
+        "base_model": "zai/glm-5.3-flash",
+        "name": "GLM 5.3 Flash"
       }
     }
   }
