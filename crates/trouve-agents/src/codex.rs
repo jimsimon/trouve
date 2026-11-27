@@ -299,8 +299,8 @@ impl AgentBackend for CodexBackend {
         // everything else in a roster entry is re-derived from the live list.
         let seed = self.catalog.seed_provider_models(CODEX_CATALOG_PROVIDER);
         let previous = self.catalog.owned_provider_models(CODEX_CATALOG_PROVIDER);
-        let roster = crate::codex_roster::rebuild_codex_roster(&live, &seed, |slug| {
-            self.catalog.has_source_model("openai", slug)
+        let roster = crate::codex_roster::rebuild_codex_roster(&live, &seed, |provider, model| {
+            self.catalog.has_source_model(provider, model)
         })
         .map_err(|e| BackendError::Protocol(format!("rebuilding Codex model roster: {e}")))?;
         let added: Vec<_> = roster

@@ -16,13 +16,13 @@ use serde_json::{Map, Value, json};
 
 /// Build the overlay patches for every non-hidden model in a `model/list`
 /// result. `seed` supplies the bundled patches for the provider and
-/// `has_base(slug)` reports whether `openai/<slug>` exists in the public
-/// catalog. Fails when the response yields no models so a bad reply never
+/// `has_source(provider, model)` reports whether the public catalog has that
+/// record. Fails when the response yields no models so a bad reply never
 /// replaces a working roster.
 pub fn rebuild_codex_roster(
     live: &Value,
     seed: &BTreeMap<String, Value>,
-    has_base: impl Fn(&str) -> bool,
+    has_source: impl Fn(&str, &str) -> bool,
 ) -> Result<BTreeMap<String, Value>, String> {
     let Some(entries) = live.get("data").and_then(Value::as_array) else {
         return Err("model/list response has no `data` array".into());
@@ -35,14 +35,24 @@ pub fn rebuild_codex_roster(
         if slug.is_empty() || entry.get("hidden").and_then(Value::as_bool) == Some(true) {
             continue;
         }
-        let mut patch = match seed.get(slug) {
-            Some(patch) => patch.clone(),
-            None if has_base(slug) => json!({ "base_model": format!("openai/{slug}") }),
-            None => synthesized_patch(entry),
-        };
+        let seeded = seed.get(slug);
+        let mut patch = seeded.cloned().unwrap_or_else(|| Value::Object(Map::new()));
         let Some(object) = patch.as_object_mut() else {
             continue;
         };
+        // A patch may inherit only from a record the public catalog has. A
+        // seed link the catalog cannot resolve is dropped so the model stays
+        // listed, described by the vendor and the seed's own fields.
+        let dangling = crate::drop_unresolved_base(object, &has_source);
+        if seeded.is_none() || dangling {
+            if has_source("openai", slug) {
+                object.insert("base_model".into(), format!("openai/{slug}").into());
+            } else if let Value::Object(synthesized) = synthesized_patch(entry) {
+                for (key, value) in synthesized {
+                    object.entry(key).or_insert(value);
+                }
+            }
+        }
         object.insert("id".into(), Value::String(slug.into()));
         // A present effort list is authoritative even when empty (the vendor
         // withdrew the control); only an absent field keeps the seed's levels.
@@ -195,7 +205,7 @@ mod tests {
         let mut sol = live_entry("gpt-5.6-sol", &["low", "high", "ultra"], "low");
         sol["additionalSpeedTiers"] = json!(["fast"]);
         let live = json!({"data": [sol]});
-        let roster = rebuild_codex_roster(&live, &seed(), |_| true).unwrap();
+        let roster = rebuild_codex_roster(&live, &seed(), |_, _| true).unwrap();
         let sol = &roster["gpt-5.6-sol"];
         assert_eq!(sol["base_model"], "openai/gpt-5.6-sol");
         assert_eq!(sol["options"]["fast"]["type"], "boolean");
@@ -209,7 +219,7 @@ mod tests {
     #[test]
     fn drops_seed_models_missing_from_live() {
         let live = json!({"data": [live_entry("gpt-5.6-sol", &["low"], "low")]});
-        let roster = rebuild_codex_roster(&live, &seed(), |_| true).unwrap();
+        let roster = rebuild_codex_roster(&live, &seed(), |_, _| true).unwrap();
         assert!(!roster.contains_key("gpt-5.4-mini"));
         assert_eq!(roster.len(), 1);
     }
@@ -220,7 +230,8 @@ mod tests {
             live_entry("gpt-5.6-luna", &["low", "medium"], "medium"),
             live_entry("gpt-7-nova", &["high"], "high"),
         ]});
-        let roster = rebuild_codex_roster(&live, &seed(), |slug| slug == "gpt-5.6-luna").unwrap();
+        let roster =
+            rebuild_codex_roster(&live, &seed(), |_, slug| slug == "gpt-5.6-luna").unwrap();
         assert_eq!(roster["gpt-5.6-luna"]["base_model"], "openai/gpt-5.6-luna");
         assert_eq!(roster["gpt-5.6-luna"]["id"], "gpt-5.6-luna");
 
@@ -233,19 +244,38 @@ mod tests {
     }
 
     #[test]
+    fn seed_entries_stay_listed_when_their_base_is_not_in_the_catalog() {
+        let live = json!({"data": [live_entry("gpt-5.6-sol", &["low", "high"], "low")]});
+        let roster = rebuild_codex_roster(&live, &seed(), |_, _| false).unwrap();
+        let sol = &roster["gpt-5.6-sol"];
+        assert!(
+            sol.get("base_model").is_none(),
+            "an unresolvable link would hide the model"
+        );
+        assert_eq!(sol["name"], "GPT-5.6-SOL", "described by the vendor");
+        assert_eq!(sol["tool_call"], true);
+        assert_eq!(sol["attachment"], true);
+        assert_eq!(sol["limit"]["context"], 500000, "seed fields are kept");
+        assert_eq!(
+            sol["reasoning_options"][0]["values"],
+            json!(["low", "high"])
+        );
+    }
+
+    #[test]
     fn hidden_models_are_skipped_and_empty_responses_fail() {
         let mut hidden = live_entry("gpt-5.6-sol", &["low"], "low");
         hidden["hidden"] = json!(true);
         let live = json!({"data": [hidden]});
-        assert!(rebuild_codex_roster(&live, &seed(), |_| true).is_err());
-        assert!(rebuild_codex_roster(&json!({"data": []}), &seed(), |_| true).is_err());
-        assert!(rebuild_codex_roster(&json!({}), &seed(), |_| true).is_err());
+        assert!(rebuild_codex_roster(&live, &seed(), |_, _| true).is_err());
+        assert!(rebuild_codex_roster(&json!({"data": []}), &seed(), |_, _| true).is_err());
+        assert!(rebuild_codex_roster(&json!({}), &seed(), |_, _| true).is_err());
     }
 
     #[test]
     fn models_without_effort_metadata_keep_the_seed_efforts() {
         let live = json!({"data": [{"model": "gpt-5.6-sol", "hidden": false}]});
-        let roster = rebuild_codex_roster(&live, &seed(), |_| true).unwrap();
+        let roster = rebuild_codex_roster(&live, &seed(), |_, _| true).unwrap();
         assert_eq!(
             roster["gpt-5.6-sol"]["reasoning_options"][0]["values"],
             json!(["low", "medium"])
@@ -259,7 +289,7 @@ mod tests {
         entry["serviceTiers"] =
             json!([{"id": "priority", "name": "Fast", "description": "2x speed, increased usage"}]);
         let live = json!({"data": [entry, live_entry("gpt-5.3-codex-spark", &["low"], "low")]});
-        let roster = rebuild_codex_roster(&live, &BTreeMap::new(), |_| true).unwrap();
+        let roster = rebuild_codex_roster(&live, &BTreeMap::new(), |_, _| true).unwrap();
         assert_eq!(
             roster["gpt-5.6-luna"]["options"]["fast"],
             json!({"type": "boolean", "default": false, "description": "2x speed, increased usage"})
@@ -272,7 +302,7 @@ mod tests {
         let first = rebuild_codex_roster(
             &json!({"data": [live_entry("gpt-5.6-luna", &["low", "high"], "low")]}),
             &BTreeMap::new(),
-            |_| true,
+            |_, _| true,
         )
         .unwrap();
         assert_eq!(
@@ -282,11 +312,12 @@ mod tests {
 
         let mut withdrawn = live_entry("gpt-5.6-luna", &[], "");
         withdrawn["supportedReasoningEfforts"] = json!([]);
-        let second = rebuild_codex_roster(&json!({"data": [withdrawn]}), &first, |_| true).unwrap();
+        let second =
+            rebuild_codex_roster(&json!({"data": [withdrawn]}), &first, |_, _| true).unwrap();
         assert_eq!(second["gpt-5.6-luna"]["reasoning_options"], json!([]));
 
         let absent = json!({"model": "gpt-5.6-luna", "hidden": false});
-        let third = rebuild_codex_roster(&json!({"data": [absent]}), &first, |_| true).unwrap();
+        let third = rebuild_codex_roster(&json!({"data": [absent]}), &first, |_, _| true).unwrap();
         assert_eq!(
             third["gpt-5.6-luna"]["reasoning_options"][0]["values"],
             json!(["low", "high"]),
@@ -298,13 +329,14 @@ mod tests {
     fn withdrawn_fast_tier_is_dropped_on_the_next_rebuild() {
         let mut with_fast = live_entry("gpt-5.6-luna", &["low"], "low");
         with_fast["additionalSpeedTiers"] = json!(["fast"]);
-        let first = rebuild_codex_roster(&json!({"data": [with_fast]}), &BTreeMap::new(), |_| true)
-            .unwrap();
+        let first =
+            rebuild_codex_roster(&json!({"data": [with_fast]}), &BTreeMap::new(), |_, _| true)
+                .unwrap();
         assert!(first["gpt-5.6-luna"]["options"].get("fast").is_some());
 
         let without_fast = live_entry("gpt-5.6-luna", &["low"], "low");
         let second =
-            rebuild_codex_roster(&json!({"data": [without_fast]}), &first, |_| true).unwrap();
+            rebuild_codex_roster(&json!({"data": [without_fast]}), &first, |_, _| true).unwrap();
         assert!(
             second["gpt-5.6-luna"].get("options").is_none(),
             "the previous roster's fast option must not survive: {:?}",

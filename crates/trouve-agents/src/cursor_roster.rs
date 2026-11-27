@@ -13,7 +13,7 @@
 
 use std::collections::BTreeMap;
 
-use serde_json::{Map, Value, json};
+use serde_json::{Map, Value};
 
 /// Build overlay patches for every model in a `ListModels` result. `seed`
 /// supplies the bundled patches for the provider and `has_source(provider,
@@ -35,16 +35,20 @@ pub fn rebuild_cursor_roster(
         if id.is_empty() {
             continue;
         }
-        let mut patch = match seed.get(id) {
-            Some(patch) => patch.clone(),
-            None => match public_base(id, &has_source) {
-                Some(base) => json!({ "base_model": base }),
-                None => Value::Object(Map::new()),
-            },
-        };
+        let seeded = seed.get(id);
+        let mut patch = seeded.cloned().unwrap_or_else(|| Value::Object(Map::new()));
         let Some(object) = patch.as_object_mut() else {
             continue;
         };
+        // A patch may inherit only from a record the public catalog has. A
+        // seed remap the catalog cannot resolve is dropped so the model stays
+        // listed as a Cursor-only record.
+        let dangling = crate::drop_unresolved_base(object, &has_source);
+        if (seeded.is_none() || dangling)
+            && let Some(base) = public_base(id, &has_source)
+        {
+            object.insert("base_model".into(), Value::String(base));
+        }
         object.insert("id".into(), Value::String(id.into()));
         if let Some(name) = item
             .get("displayName")
@@ -240,6 +244,7 @@ fn parse_token_count(value: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn sol() -> Value {
         json!({
@@ -308,7 +313,10 @@ mod tests {
              "variants": [{"params": [{"id": "fast", "value": "true"}], "isDefault": true}]},
             {"id": "gemini-3.1-pro", "displayName": "Gemini 3.1 Pro"}
         ]});
-        let roster = rebuild_cursor_roster(&live, &seed, |_, _| false).unwrap();
+        let roster = rebuild_cursor_roster(&live, &seed, |p, m| {
+            (p, m) == ("google", "gemini-3.1-pro-preview")
+        })
+        .unwrap();
         assert_eq!(roster.len(), 3);
         assert!(!roster.contains_key("gone"));
 
@@ -381,6 +389,29 @@ mod tests {
             roster["muse-spark-1.3"]["base_model"],
             "meta/muse-spark-1.3"
         );
+    }
+
+    #[test]
+    fn seed_remaps_stay_listed_when_their_target_is_not_in_the_catalog() {
+        let mut seed = BTreeMap::new();
+        seed.insert(
+            "glm-5p3".to_string(),
+            json!({"id": "glm-5p3", "base_model": "zai/glm-5.3", "name": "GLM 5.3"}),
+        );
+        let live = json!({"items": [{"id": "glm-5p3", "displayName": "GLM 5.3"}]});
+
+        let roster = rebuild_cursor_roster(&live, &seed, |_, _| false).unwrap();
+        let glm = &roster["glm-5p3"];
+        assert!(
+            glm.get("base_model").is_none(),
+            "an unresolvable link would hide the model"
+        );
+        assert_eq!(glm["name"], "GLM 5.3");
+        assert_eq!(glm["tool_call"], true);
+
+        let roster =
+            rebuild_cursor_roster(&live, &seed, |p, m| (p, m) == ("zai", "glm-5.3")).unwrap();
+        assert_eq!(roster["glm-5p3"]["base_model"], "zai/glm-5.3");
     }
 
     #[test]

@@ -1533,6 +1533,27 @@ pub(crate) fn format_reset(at: i64) -> String {
     }
 }
 
+/// Remove a roster patch's `base_model` link when the public catalog has no
+/// such record, reporting whether a link was dropped. An overlay patch whose
+/// base cannot be resolved describes nothing, which would hide a model the
+/// vendor serves.
+pub(crate) fn drop_unresolved_base(
+    patch: &mut serde_json::Map<String, serde_json::Value>,
+    has_source: &impl Fn(&str, &str) -> bool,
+) -> bool {
+    let resolves = match patch.get("base_model") {
+        None => return false,
+        Some(base) => base
+            .as_str()
+            .and_then(|base| base.split_once('/'))
+            .is_some_and(|(provider, model)| has_source(provider, model)),
+    };
+    if !resolves {
+        patch.remove("base_model");
+    }
+    !resolves
+}
+
 #[cfg(test)]
 mod tests {
     use futures::StreamExt;
