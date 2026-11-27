@@ -294,6 +294,8 @@ struct LauncherReaper {
 }
 
 impl LauncherReaper {
+    // `try_update` replaces `fetch_update` from Rust 1.95; the workspace MSRV is 1.92.
+    #[allow(deprecated)]
     fn acquire(&self) -> Result<LauncherAdmission, OpenAttemptError> {
         self.active
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {

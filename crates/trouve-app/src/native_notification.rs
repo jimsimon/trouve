@@ -32,6 +32,8 @@ impl ActionListenerBudget {
         }
     }
 
+    // `try_update` replaces `fetch_update` from Rust 1.95; the workspace MSRV is 1.92.
+    #[allow(deprecated)]
     fn try_acquire(&self) -> Option<ActionListenerSlot> {
         self.active
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {

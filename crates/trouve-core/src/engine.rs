@@ -29142,6 +29142,8 @@ default_permission_mode = "ask"
 
     impl trouve_providers::secrets::SecretStore for BlockingReadProviderSecretStore {
         fn get(&self, key: &str) -> anyhow::Result<Option<String>> {
+            // `try_update` replaces `fetch_update` from Rust 1.95; the workspace MSRV is 1.92.
+            #[allow(deprecated)]
             let deferred = self
                 .reads_before_block
                 .fetch_update(

@@ -63,7 +63,9 @@ impl CleanupController {
         &self,
         child: &Arc<tokio::sync::Mutex<ProcessTreeChild>>,
     ) -> std::io::Result<std::process::ExitStatus> {
+        // `try_update` replaces `fetch_update` from Rust 1.95; the workspace MSRV is 1.92.
         #[cfg(test)]
+        #[allow(deprecated)]
         if self
             .injected_failures
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
