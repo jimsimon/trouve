@@ -414,6 +414,13 @@ pub enum BackendError {
     Auth(String),
     #[error("backend protocol error: {0}")]
     Protocol(String),
+    /// The vendor no longer has the session this turn tried to resume (for
+    /// example, its transcript retention removed it). The adapter reports
+    /// this only when the vendor rejected the resume before doing any work,
+    /// so the engine can forget the session id and start a fresh one from
+    /// its own transcript.
+    #[error("backend session not found: {0}")]
+    SessionNotFound(String),
     #[error("backend io error: {0}")]
     Io(#[from] std::io::Error),
 }
